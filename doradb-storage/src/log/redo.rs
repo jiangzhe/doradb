@@ -7,6 +7,7 @@ use error_stack::Report;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::mem;
+use std::result::Result as StdResult;
 
 /// Defines the code of redo operation on a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,7 +23,7 @@ impl TryFrom<u8> for RowRedoCode {
     type Error = ();
 
     #[inline]
-    fn try_from(code: u8) -> std::result::Result<Self, Self::Error> {
+    fn try_from(code: u8) -> StdResult<Self, Self::Error> {
         match code {
             1 => Ok(RowRedoCode::Insert),
             2 => Ok(RowRedoCode::Delete),
@@ -120,8 +121,11 @@ impl Deser for RowRedoKind {
 /// Represents a redo operation on a row.
 #[derive(Debug)]
 pub(crate) struct RowRedo {
+    /// Row page containing the changed row.
     pub(crate) page_id: PageID,
+    /// Logical row identifier affected by this redo operation.
     pub(crate) row_id: RowID,
+    /// Redo operation payload for the row.
     pub(crate) kind: RowRedoKind,
 }
 
@@ -160,6 +164,7 @@ impl Deser for RowRedo {
     }
 }
 
+/// Defines the code of redo operation on metadata and storage layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub(crate) enum DDLRedoCode {
@@ -175,7 +180,7 @@ impl TryFrom<u8> for DDLRedoCode {
     type Error = ();
 
     #[inline]
-    fn try_from(code: u8) -> std::result::Result<Self, Self::Error> {
+    fn try_from(code: u8) -> StdResult<Self, Self::Error> {
         match code {
             129 => Ok(DDLRedoCode::CreateTable),
             130 => Ok(DDLRedoCode::DropTable),
@@ -363,8 +368,9 @@ impl Deser for DDLRedo {
 /// Represents the redo logs of a transaction.
 #[derive(Default, Debug)]
 pub(crate) struct RedoLogs {
-    // Currently only one DDL per transaction is supported.
+    /// Optional DDL redo record. Currently only one DDL per transaction is supported.
     pub(crate) ddl: Option<Box<DDLRedo>>,
+    /// DML redo records grouped by table.
     pub(crate) dml: BTreeMap<TableID, TableDML>,
 }
 
@@ -448,6 +454,7 @@ impl Deser for RedoLogs {
     }
 }
 
+/// Identifies whether a redo transaction is user-initiated or internal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub(crate) enum RedoTrxKind {
@@ -459,7 +466,7 @@ impl TryFrom<u8> for RedoTrxKind {
     type Error = ();
 
     #[inline]
-    fn try_from(code: u8) -> std::result::Result<Self, Self::Error> {
+    fn try_from(code: u8) -> StdResult<Self, Self::Error> {
         match code {
             0 => Ok(RedoTrxKind::User),
             1 => Ok(RedoTrxKind::System),
@@ -471,7 +478,9 @@ impl TryFrom<u8> for RedoTrxKind {
 /// Redo header of a transaction.
 #[derive(Debug)]
 pub(crate) struct RedoHeader {
+    /// Commit timestamp assigned to the transaction.
     pub(crate) cts: TrxID,
+    /// Transaction source kind encoded in the redo stream.
     pub(crate) trx_kind: RedoTrxKind,
 }
 
@@ -510,6 +519,7 @@ impl Deser for RedoHeader {
 /// Represents the redo logs of a table.
 #[derive(Default, Debug)]
 pub(crate) struct TableDML {
+    /// Row redo records keyed by row identifier.
     pub(crate) rows: BTreeMap<RowID, RowRedo>,
 }
 

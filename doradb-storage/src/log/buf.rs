@@ -7,6 +7,10 @@ use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 
+/// Smallest valid transaction frame: redo header plus an empty redo payload.
+const MIN_TRX_LOG_FRAME_LEN: usize =
+    mem::size_of::<TrxID>() + mem::size_of::<u8>() + mem::size_of::<u8>() + mem::size_of::<u64>();
+
 /// Direct I/O buffer for one persisted redo group.
 ///
 /// The buffer reserves header space first, appends one or more length-prefixed
@@ -119,10 +123,6 @@ pub(crate) struct TrxLog {
     /// Transaction redo payload.
     pub(crate) payload: RedoLogs,
 }
-
-/// Smallest valid transaction frame: redo header plus an empty redo payload.
-const MIN_TRX_LOG_FRAME_LEN: usize =
-    mem::size_of::<TrxID>() + mem::size_of::<u8>() + mem::size_of::<u8>() + mem::size_of::<u64>();
 
 impl TrxLog {
     /// Build a transaction frame from redo header and payload values.

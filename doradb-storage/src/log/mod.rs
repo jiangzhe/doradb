@@ -38,7 +38,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::result::Result as StdResult;
+use std::str::{FromStr, from_utf8};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -94,11 +95,17 @@ impl AsRawFd for RedoLogFile {
 /// Allocation and real redo CTS range for one physical redo group write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RedoGroupWriteMeta {
+    /// Redo log file sequence receiving this group.
     pub(crate) file_seq: u32,
+    /// File descriptor used for the physical write.
     pub(crate) fd: RawFd,
+    /// Starting byte offset of the group write.
     pub(crate) offset: usize,
+    /// Ending byte offset after the group write.
     pub(crate) end_offset: usize,
+    /// Minimum redo CTS serialized in the group.
     pub(crate) min_redo_cts: TrxID,
+    /// Maximum redo CTS serialized in the group.
     pub(crate) max_redo_cts: TrxID,
 }
 
@@ -106,6 +113,11 @@ pub(crate) struct RedoGroupWriteMeta {
 struct RedoFileSealTarget {
     fd: RawFd,
     open_super_block: RedoSuperBlock,
+}
+
+struct CreatedLogFile {
+    log_file: RedoLogFile,
+    header_write: LogWriteSubmission,
 }
 
 /// File-system descriptor for one discovered redo log file.
@@ -117,17 +129,24 @@ pub(crate) struct RedoLogFileDescriptor {
     pub(crate) path: PathBuf,
 }
 
+/// Builder for the redo log runtime and its initial writable file.
 pub(crate) struct RedoLogInitializer {
+    /// Storage backend used by the redo log writer.
     pub(crate) ctx: StorageBackend,
+    /// Full file prefix for redo log file names.
     pub(crate) file_prefix: String,
+    /// Maximum size of each redo log file.
     pub(crate) file_max_size: usize,
+    /// Direct-I/O block size used for redo group writes.
     pub(crate) log_block_size: usize,
+    /// Maximum in-flight I/O depth for redo writes.
     pub(crate) io_depth: usize,
     /// Sequence for the next writable redo file.
     pub(crate) next_file_seq: u32,
 }
 
 impl RedoLogInitializer {
+    /// Create a redo log initializer and its storage backend.
     #[inline]
     pub(crate) fn new(
         file_prefix: String,
@@ -146,6 +165,7 @@ impl RedoLogInitializer {
         })
     }
 
+    /// Create the initial redo file and return the live redo log state.
     #[inline]
     pub(crate) fn finish(self, purge_tx: Sender<Purge>) -> Result<(RedoLog, Arc<Completion<()>>)> {
         let mut file_seq = self.next_file_seq;
@@ -195,31 +215,16 @@ impl RedoLogInitializer {
     }
 }
 
-#[inline]
-pub(crate) fn next_redo_file_seq(file_seq: u32) -> Result<u32> {
-    file_seq.checked_add(1).ok_or_else(|| {
-        Error::from(
-            Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
-                "redo log file family has terminal sequence {file_seq:08x}; cannot create next file"
-            )),
-        )
-    })
-}
-
+/// Pending redo write submitted to the storage backend.
 pub(crate) struct LogWriteSubmission {
     kind: LogWriteKind,
     operation: Operation,
 }
 
-enum LogWriteKind {
-    Group { cts: TrxID },
-    Header { completion: Arc<Completion<()>> },
-    Seal { log_file: Box<RedoLogFile> },
-}
-
 impl LogWriteSubmission {
+    /// Create a group write submission for the given file range and direct buffer.
     #[inline]
-    pub(crate) fn new(cts: TrxID, fd: std::os::fd::RawFd, offset: usize, buf: DirectBuf) -> Self {
+    pub(crate) fn new(cts: TrxID, fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
         LogWriteSubmission {
             kind: LogWriteKind::Group { cts },
             operation: Operation::pwrite_owned(fd, offset, buf),
@@ -273,6 +278,12 @@ impl IOSubmission for LogWriteSubmission {
     }
 }
 
+enum LogWriteKind {
+    Group { cts: TrxID },
+    Header { completion: Arc<Completion<()>> },
+    Seal { log_file: Box<RedoLogFile> },
+}
+
 enum LogWriteCompletion {
     Group {
         cts: TrxID,
@@ -291,6 +302,7 @@ enum LogWriteCompletion {
     },
 }
 
+/// Driver wrapper for redo log write submissions.
 pub(crate) struct LogWriteDriver {
     driver: SubmissionDriver<LogWriteSubmission>,
 }
@@ -319,10 +331,7 @@ impl LogWriteDriver {
     }
 
     #[inline]
-    fn push_write(
-        &mut self,
-        submission: LogWriteSubmission,
-    ) -> std::result::Result<(), LogWriteSubmission> {
+    fn push_write(&mut self, submission: LogWriteSubmission) -> StdResult<(), LogWriteSubmission> {
         self.driver.push(submission)
     }
 
@@ -365,6 +374,7 @@ impl LogWriteDriver {
     }
 }
 
+/// Shared redo log state used by commit admission and the log writer.
 pub(crate) struct RedoLog {
     /// Group commit state for the redo log.
     pub(crate) group_commit: CachePadded<MutexGroupCommit>,
@@ -464,13 +474,14 @@ impl RedoLog {
         )
     }
 
+    /// Enqueue a prepared transaction into group commit and return its optional sync waiter.
     #[inline]
     pub(crate) fn enqueue_precommit_group(
         &self,
         mut trx: PrecommitTrx,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
         wait_sync: bool,
-    ) -> std::result::Result<CommitJoin, Box<PrecommitTrx>> {
+    ) -> StdResult<CommitJoin, Box<PrecommitTrx>> {
         let cts = trx.cts;
         let log = if let Some(redo_bin) = trx.take_log() {
             // Serialize redo log to buffer.
@@ -566,6 +577,7 @@ impl RedoLog {
             .fetch_add(sync_nanos, Ordering::Relaxed);
     }
 
+    /// Take ownership of the redo write driver backend for the log thread.
     #[inline]
     pub(crate) fn take_log_write_driver(&self) -> LogWriteDriver {
         let backend = self
@@ -576,27 +588,37 @@ impl RedoLog {
         LogWriteDriver::new(backend)
     }
 
+    /// Return a snapshot of redo write backend statistics.
     #[inline]
     pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
         self.io_backend_stats.snapshot()
     }
 }
 
+/// Commit group state while its redo write and sync are being processed.
 pub(crate) struct SyncGroup {
+    /// Transactions covered by this ordered commit group.
     pub(crate) trx_list: Vec<PrecommitTrx>,
+    /// Maximum commit timestamp in the group.
     pub(crate) max_cts: TrxID,
+    /// Serialized redo byte count for the group.
     pub(crate) log_bytes: usize,
-    // Redo-bearing groups keep the borrowed log fd for the final fsync. No-log
-    // groups have no file allocation and therefore no sync target.
+    /// Redo-bearing groups keep the borrowed log fd for the final fsync. No-log
+    /// groups have no file allocation and therefore no sync target.
     pub(crate) log_fd: Option<RawFd>,
+    /// Physical write metadata recorded after the group becomes durable.
     pub(crate) write_meta: Option<RedoGroupWriteMeta>,
+    /// Pending write submission, if this group has redo bytes.
     pub(crate) write: Option<LogWriteSubmission>,
+    /// Buffer returned by completed redo write I/O.
     pub(crate) returned_buf: Option<DirectBuf>,
+    /// Completion notified when commit or cleanup finishes.
     pub(crate) completion: Arc<Completion<()>>,
+    /// Whether the group write has completed or no write was required.
     pub(crate) finished: bool,
-    // Redo logging is sequential: once one group fails, this group and every
-    // later group cannot be part of the durable prefix. Submitted IO may still
-    // complete later, but completion only returns buffers for recycling.
+    /// Redo logging is sequential: once one group fails, this group and every
+    /// later group cannot be part of the durable prefix. Submitted IO may still
+    /// complete later, but completion only returns buffers for recycling.
     pub(crate) failure_reason: Option<FailedPrecommitReason>,
 }
 
@@ -636,19 +658,30 @@ impl SyncGroup {
     }
 }
 
+/// Atomic counters maintained by the redo log writer.
 #[derive(Default)]
 pub(crate) struct RedoLogStats {
+    /// Number of commit groups completed.
     pub(crate) commit_count: AtomicUsize,
+    /// Number of transactions completed through redo.
     pub(crate) trx_count: AtomicUsize,
+    /// Total redo bytes written.
     pub(crate) log_bytes: AtomicUsize,
+    /// Number of redo file sync calls.
     pub(crate) sync_count: AtomicUsize,
+    /// Total nanoseconds spent in redo file sync calls.
     pub(crate) sync_nanos: AtomicUsize,
+    /// Number of best-effort redo file seal failures.
     pub(crate) seal_failure_count: AtomicUsize,
+    /// Number of transactions handed to purge.
     pub(crate) purge_trx_count: AtomicUsize,
+    /// Number of row versions purged.
     pub(crate) purge_row_count: AtomicUsize,
+    /// Number of index entries purged.
     pub(crate) purge_index_count: AtomicUsize,
 }
 
+/// Durability mode for syncing redo log writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LogSync {
     #[default]
@@ -664,7 +697,7 @@ impl FromStr for LogSync {
     type Err = Error;
 
     #[inline]
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> StdResult<Self, Self::Err> {
         if s.eq_ignore_ascii_case("fsync") {
             Ok(LogSync::Fsync)
         } else if s.eq_ignore_ascii_case("fdatasync") {
@@ -726,6 +759,7 @@ impl RedoFileSealAccumulator {
     }
 }
 
+/// Tracks sealed redo metadata and pending seal writes for rotated files.
 pub(crate) struct RedoFileSealer {
     accumulator: RedoFileSealAccumulator,
     seal_writes: VecDeque<LogWriteSubmission>,
@@ -734,6 +768,7 @@ pub(crate) struct RedoFileSealer {
 }
 
 impl RedoFileSealer {
+    /// Create a redo file sealer using the configured log-sync mode.
     #[inline]
     pub(crate) fn new(config: &TrxSysConfig) -> Self {
         RedoFileSealer {
@@ -744,6 +779,7 @@ impl RedoFileSealer {
         }
     }
 
+    /// Record one durable redo-bearing group for the current file seal.
     #[inline]
     pub(crate) fn record_group(&mut self, write_meta: RedoGroupWriteMeta) {
         self.accumulator.record_group(write_meta);
@@ -767,11 +803,12 @@ impl RedoFileSealer {
         }
     }
 
+    /// Queue a rotated log file for inactive-slot sealing.
     #[inline]
     pub(crate) fn enqueue_rotated_file(
         &mut self,
         log_file: RedoLogFile,
-    ) -> std::result::Result<(), FatalError> {
+    ) -> StdResult<(), FatalError> {
         let accumulator = mem::replace(&mut self.accumulator, RedoFileSealAccumulator::new());
         let submission = Self::prepare_seal_submission(log_file, accumulator)?;
         self.seal_writes.push_back(submission);
@@ -782,7 +819,7 @@ impl RedoFileSealer {
     fn prepare_seal_submission(
         log_file: RedoLogFile,
         accumulator: RedoFileSealAccumulator,
-    ) -> std::result::Result<LogWriteSubmission, FatalError> {
+    ) -> StdResult<LogWriteSubmission, FatalError> {
         if let Some(file_seq) = accumulator.file_seq {
             debug_assert_eq!(file_seq, log_file.file_seq());
         }
@@ -828,6 +865,7 @@ impl RedoFileSealer {
         None
     }
 
+    /// Drain all pending seal writes and return the first fatal seal error.
     #[inline]
     pub(crate) fn finish_pending(
         &mut self,
@@ -901,7 +939,7 @@ impl RedoFileSealer {
         &self,
         target: RedoFileSealTarget,
         write_driver: &mut LogWriteDriver,
-    ) -> std::result::Result<(), FatalError> {
+    ) -> StdResult<(), FatalError> {
         debug_assert_eq!(write_driver.pending_len(), 0);
         debug_assert_eq!(write_driver.submitted_len(), 0);
         let (fd, offset, buf) = build_sealed_header_write(target, self.accumulator)?;
@@ -950,34 +988,7 @@ impl RedoFileSealer {
     }
 }
 
-#[inline]
-fn build_sealed_header_write(
-    target: RedoFileSealTarget,
-    accumulator: RedoFileSealAccumulator,
-) -> std::result::Result<(RawFd, usize, DirectBuf), FatalError> {
-    let slot_no = inactive_slot_no(target.open_super_block.slot_no);
-    let sealed = RedoSuperBlock::sealed_from_open(
-        &target.open_super_block,
-        slot_no,
-        accumulator.durable_end_offset,
-        accumulator.redo_range(),
-    )
-    .map_err(|_| FatalError::RedoWrite)?;
-    let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
-    serialize_redo_super_block(buf.as_bytes_mut(), &sealed).map_err(|_| FatalError::RedoWrite)?;
-    Ok((target.fd, slot_offset(slot_no), buf))
-}
-
-#[inline]
-fn sync_sealed_header(log_sync: LogSync, fd: RawFd) -> std::result::Result<(), FatalError> {
-    let syncer = FileSyncer::from_borrowed_fd(fd);
-    match log_sync {
-        LogSync::Fsync => syncer.fsync().map_err(|_| FatalError::RedoSync),
-        LogSync::Fdatasync => syncer.fdatasync().map_err(|_| FatalError::RedoSync),
-        LogSync::None => Ok(()),
-    }
-}
-
+/// Processes redo write and sync work for commit groups.
 pub(crate) struct RedoLogWriter<'a> {
     trx_sys: &'a TransactionSystem,
     write_driver: &'a mut LogWriteDriver,
@@ -993,6 +1004,7 @@ pub(crate) struct RedoLogWriter<'a> {
 }
 
 impl<'a> RedoLogWriter<'a> {
+    /// Create a redo log writer bound to a transaction system and write driver.
     #[inline]
     pub(crate) fn new(
         trx_sys: &'a TransactionSystem,
@@ -1030,6 +1042,7 @@ impl<'a> RedoLogWriter<'a> {
         }
     }
 
+    /// Fail all pending redo work after a fatal storage error.
     #[inline]
     pub(crate) fn fail_pending(&mut self, sealer: &mut RedoFileSealer, err: Report<FatalError>) {
         self.shutdown = true;
@@ -1138,6 +1151,7 @@ impl<'a> RedoLogWriter<'a> {
         }
     }
 
+    /// Return whether this writer still owns pending group or header I/O.
     #[inline]
     pub(crate) fn has_pending_io(&self) -> bool {
         !self.sync_groups.is_empty()
@@ -1146,6 +1160,7 @@ impl<'a> RedoLogWriter<'a> {
             || self.inflight_headers > 0
     }
 
+    /// Return whether the writer has entered shutdown drain mode.
     #[inline]
     pub(crate) fn shutdown(&self) -> bool {
         self.shutdown
@@ -1481,6 +1496,133 @@ impl<'a> RedoLogWriter<'a> {
     }
 }
 
+/// Return the next redo log file sequence.
+#[inline]
+pub(crate) fn next_redo_file_seq(file_seq: u32) -> Result<u32> {
+    file_seq.checked_add(1).ok_or_else(|| {
+        Error::from(
+            Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
+                "redo log file family has terminal sequence {file_seq:08x}; cannot create next file"
+            )),
+        )
+    })
+}
+
+/// Discover redo log files in the configured single-stream file family.
+#[inline]
+pub(crate) fn discover_redo_log_files(
+    file_prefix: &str,
+    desc: bool,
+) -> Result<Vec<RedoLogFileDescriptor>> {
+    let pattern = format!("{}.*", Pattern::escape(file_prefix));
+    let mut files = vec![];
+    for entry in glob(&pattern).unwrap() {
+        let path = entry?;
+        let Some(suffix) = log_family_suffix(file_prefix, &path)? else {
+            continue;
+        };
+        if is_log_file_seq(suffix) {
+            let file_seq = parse_file_seq(&path)?;
+            files.push((file_seq, path));
+            continue;
+        }
+        if is_legacy_partitioned_log_suffix(suffix) {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "unsupported legacy partitioned redo log file: {}",
+                    path.display()
+                ))
+                .into());
+        }
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "invalid redo log file name for single-stream layout: {}",
+                path.display()
+            ))
+            .into());
+    }
+    files.sort_by_key(|(seq, _)| *seq);
+    validate_redo_log_file_sequences(file_prefix, &files)?;
+    let mut res = files
+        .into_iter()
+        .map(|(file_seq, path)| RedoLogFileDescriptor { file_seq, path })
+        .collect::<Vec<_>>();
+    if desc {
+        res.reverse();
+    }
+    Ok(res)
+}
+
+/// Parse the eight-hex redo file sequence suffix from a redo log path.
+#[inline]
+pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
+    let file_name = file_path
+        .file_name()
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("missing log file name: {}", file_path.display())),
+            )
+        })?
+        .to_str()
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "log file name must be valid UTF-8: {}",
+                    file_path.display()
+                )),
+            )
+        })?;
+    if file_name.len() < 9 {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("log file name is too short: {file_name}"))
+            .into());
+    }
+    // last 8 bytes are hex encoded.
+    let suffix = from_utf8(&file_name.as_bytes()[file_name.len() - 8..]).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "log file sequence suffix must be UTF-8: {file_name}"
+            )),
+        )
+    })?;
+    let file_seq = u32::from_str_radix(suffix, 16).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("log file sequence suffix must be hex: {file_name}")),
+        )
+    })?;
+    Ok(file_seq)
+}
+
+#[inline]
+fn build_sealed_header_write(
+    target: RedoFileSealTarget,
+    accumulator: RedoFileSealAccumulator,
+) -> StdResult<(RawFd, usize, DirectBuf), FatalError> {
+    let slot_no = inactive_slot_no(target.open_super_block.slot_no);
+    let sealed = RedoSuperBlock::sealed_from_open(
+        &target.open_super_block,
+        slot_no,
+        accumulator.durable_end_offset,
+        accumulator.redo_range(),
+    )
+    .map_err(|_| FatalError::RedoWrite)?;
+    let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
+    serialize_redo_super_block(buf.as_bytes_mut(), &sealed).map_err(|_| FatalError::RedoWrite)?;
+    Ok((target.fd, slot_offset(slot_no), buf))
+}
+
+#[inline]
+fn sync_sealed_header(log_sync: LogSync, fd: RawFd) -> StdResult<(), FatalError> {
+    let syncer = FileSyncer::from_borrowed_fd(fd);
+    match log_sync {
+        LogSync::Fsync => syncer.fsync().map_err(|_| FatalError::RedoSync),
+        LogSync::Fdatasync => syncer.fdatasync().map_err(|_| FatalError::RedoSync),
+        LogSync::None => Ok(()),
+    }
+}
+
 #[inline]
 fn shrink_inflight(
     tree: &mut BTreeMap<TrxID, SyncGroup>,
@@ -1520,11 +1662,6 @@ fn inactive_slot_no(slot_no: u32) -> u32 {
 #[inline]
 fn log_file_name(file_prefix: &str, file_seq: u32) -> String {
     format!("{file_prefix}.{file_seq:08x}")
-}
-
-struct CreatedLogFile {
-    log_file: RedoLogFile,
-    header_write: LogWriteSubmission,
 }
 
 /// Create a new log file and prepare its initial super-block write.
@@ -1575,50 +1712,6 @@ fn prepare_initial_redo_super_block(
     let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
     serialize_redo_super_block(buf.as_bytes_mut(), super_block)?;
     Ok(LogWriteSubmission::header(log_file.as_raw_fd(), 0, buf))
-}
-
-#[inline]
-pub(crate) fn discover_redo_log_files(
-    file_prefix: &str,
-    desc: bool,
-) -> Result<Vec<RedoLogFileDescriptor>> {
-    let pattern = format!("{}.*", Pattern::escape(file_prefix));
-    let mut files = vec![];
-    for entry in glob(&pattern).unwrap() {
-        let path = entry?;
-        let Some(suffix) = log_family_suffix(file_prefix, &path)? else {
-            continue;
-        };
-        if is_log_file_seq(suffix) {
-            let file_seq = parse_file_seq(&path)?;
-            files.push((file_seq, path));
-            continue;
-        }
-        if is_legacy_partitioned_log_suffix(suffix) {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "unsupported legacy partitioned redo log file: {}",
-                    path.display()
-                ))
-                .into());
-        }
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "invalid redo log file name for single-stream layout: {}",
-                path.display()
-            ))
-            .into());
-    }
-    files.sort_by_key(|(seq, _)| *seq);
-    validate_redo_log_file_sequences(file_prefix, &files)?;
-    let mut res = files
-        .into_iter()
-        .map(|(file_seq, path)| RedoLogFileDescriptor { file_seq, path })
-        .collect::<Vec<_>>();
-    if desc {
-        res.reverse();
-    }
-    Ok(res)
 }
 
 #[inline]
@@ -1708,48 +1801,6 @@ fn is_legacy_partitioned_log_suffix(value: &str) -> bool {
         && is_log_file_seq(seq)
 }
 
-#[inline]
-pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
-    let file_name = file_path
-        .file_name()
-        .ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("missing log file name: {}", file_path.display())),
-            )
-        })?
-        .to_str()
-        .ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "log file name must be valid UTF-8: {}",
-                    file_path.display()
-                )),
-            )
-        })?;
-    if file_name.len() < 9 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!("log file name is too short: {file_name}"))
-            .into());
-    }
-    // last 8 bytes are hex encoded.
-    let suffix =
-        std::str::from_utf8(&file_name.as_bytes()[file_name.len() - 8..]).map_err(|_| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "log file sequence suffix must be UTF-8: {file_name}"
-                )),
-            )
-        })?;
-    let file_seq = u32::from_str_radix(suffix, 16).map_err(|_| {
-        Error::from(
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("log file sequence suffix must be hex: {file_name}")),
-        )
-    })?;
-    Ok(file_seq)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1774,15 +1825,18 @@ mod tests {
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
     use crate::value::Val;
+    use event_listener::Event;
     use futures::task::noop_waker;
+    use smol::Timer;
+    use std::fmt::Debug;
     use std::fs::{self, File, OpenOptions};
     use std::future::Future;
-    use std::io::{Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
+    use std::io::{Error as IoError, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard, mpsc};
     use std::task::{Context, Poll};
-    use std::thread::JoinHandle;
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1797,7 +1851,7 @@ mod tests {
             if predicate() {
                 return;
             }
-            smol::Timer::after(TEST_WAIT_INTERVAL).await;
+            Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
     }
@@ -1953,32 +2007,32 @@ mod tests {
     }
 
     struct ControlledRedoWriteHookInner {
-        fd: std::os::fd::RawFd,
+        fd: RawFd,
         errno: Option<i32>,
         calls: AtomicUsize,
-        started: event_listener::Event,
+        started: Event,
         released: AtomicBool,
-        release: event_listener::Event,
+        release: Event,
     }
 
     impl ControlledRedoWriteHook {
-        fn new(fd: std::os::fd::RawFd, errno: i32) -> Self {
+        fn new(fd: RawFd, errno: i32) -> Self {
             Self::with_error(fd, Some(errno))
         }
 
-        fn success(fd: std::os::fd::RawFd) -> Self {
+        fn success(fd: RawFd) -> Self {
             Self::with_error(fd, None)
         }
 
-        fn with_error(fd: std::os::fd::RawFd, errno: Option<i32>) -> Self {
+        fn with_error(fd: RawFd, errno: Option<i32>) -> Self {
             Self {
                 inner: Arc::new(ControlledRedoWriteHookInner {
                     fd,
                     errno,
                     calls: AtomicUsize::new(0),
-                    started: event_listener::Event::new(),
+                    started: Event::new(),
                     released: AtomicBool::new(false),
-                    release: event_listener::Event::new(),
+                    release: Event::new(),
                 }),
             }
         }
@@ -2029,7 +2083,7 @@ mod tests {
                 smol::block_on(listener);
             }
             if let Some(errno) = self.inner.errno {
-                *res = Err(std::io::Error::from_raw_os_error(errno));
+                *res = Err(IoError::from_raw_os_error(errno));
             }
         }
     }
@@ -2040,26 +2094,26 @@ mod tests {
     }
 
     struct ControlledFileSyncHookInner {
-        fd: std::os::fd::RawFd,
+        fd: RawFd,
         kind: FileSyncKind,
         errno: i32,
         calls: AtomicUsize,
-        started: event_listener::Event,
+        started: Event,
         released: AtomicBool,
-        release: event_listener::Event,
+        release: Event,
     }
 
     impl ControlledFileSyncHook {
-        fn new(fd: std::os::fd::RawFd, kind: FileSyncKind, errno: i32) -> Self {
+        fn new(fd: RawFd, kind: FileSyncKind, errno: i32) -> Self {
             Self {
                 inner: Arc::new(ControlledFileSyncHookInner {
                     fd,
                     kind,
                     errno,
                     calls: AtomicUsize::new(0),
-                    started: event_listener::Event::new(),
+                    started: Event::new(),
                     released: AtomicBool::new(false),
-                    release: event_listener::Event::new(),
+                    release: Event::new(),
                 }),
             }
         }
@@ -2104,9 +2158,7 @@ mod tests {
                 }
                 smol::block_on(listener);
             }
-            *override_res = Some(Err(
-                std::io::Error::from_raw_os_error(self.inner.errno).into()
-            ));
+            *override_res = Some(Err(IoError::from_raw_os_error(self.inner.errno).into()));
         }
     }
 
@@ -2135,7 +2187,7 @@ mod tests {
     }
 
     fn spawn_sys_commit_wait(engine: EngineRef, marker: u64) -> JoinHandle<Result<TrxID>> {
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             smol::block_on(async move {
                 let mut sys_trx = engine.trx_sys.begin_sys_trx();
                 sys_trx.create_row_page(
@@ -2150,7 +2202,7 @@ mod tests {
         })
     }
 
-    fn assert_direct_fatal<T: std::fmt::Debug>(res: &Result<T>, expected: FatalError) {
+    fn assert_direct_fatal<T: Debug>(res: &Result<T>, expected: FatalError) {
         let err = match res {
             Ok(value) => panic!("expected fatal error, got {value:?}"),
             Err(err) => err,
@@ -2162,10 +2214,7 @@ mod tests {
         );
     }
 
-    fn assert_propagated_completion_fatal<T: std::fmt::Debug>(
-        res: &Result<T>,
-        expected: FatalError,
-    ) {
+    fn assert_propagated_completion_fatal<T: Debug>(res: &Result<T>, expected: FatalError) {
         let err = match res {
             Ok(value) => panic!("expected propagated completion failure, got {value:?}"),
             Err(err) => err,
@@ -2502,7 +2551,7 @@ mod tests {
             hook.wait_started(1).await;
             drop(commit_fut);
 
-            std::thread::scope(|scope| {
+            thread::scope(|scope| {
                 let (started_tx, started_rx) = mpsc::channel();
                 let (done_tx, done_rx) = mpsc::channel();
                 let shutdown_engine = &engine;
