@@ -15,6 +15,8 @@ use ordered_float::OrderedFloat;
 use std::borrow::Cow;
 use std::fmt;
 use std::mem;
+use std::ptr::copy_nonoverlapping;
+use std::str::from_utf8;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
@@ -22,14 +24,70 @@ use zerocopy::byteorder::little_endian::{
 };
 use zerocopy_derive::{FromBytes, IntoBytes, KnownLayout};
 
-/// Borrowed or owned row-page null bitmap words.
-pub(crate) type RowPageNullBitmap<'a> = Cow<'a, [u64]>;
+/// Sentinel row identifier used by index values that do not point to a row.
 pub(crate) const INVALID_ROW_ID: RowID = RowID::MAX;
 
+const ROW_PAGE_HEADER_SIZE: usize = 32;
+/// Bytes reserved at the end of every row page for spill-file checksums.
+pub(crate) const ROW_PAGE_FOOTER_SIZE: usize = BLOCK_INTEGRITY_TRAILER_SIZE;
+/// Bytes available to row-page logical content before the checksum footer.
+pub(crate) const ROW_PAGE_USABLE_SIZE: usize = PAGE_SIZE - ROW_PAGE_FOOTER_SIZE;
+const ROW_PAGE_DATA_SIZE: usize = ROW_PAGE_USABLE_SIZE - ROW_PAGE_HEADER_SIZE;
+
 const _: () = assert!(
-    { std::mem::size_of::<RowPageHeader>().is_multiple_of(8) },
+    { mem::size_of::<RowPageHeader>().is_multiple_of(8) },
     "RowPageHeader should have size align to 8 bytes"
 );
+
+const _: () = assert!(
+    { mem::size_of::<RowPageHeader>() == ROW_PAGE_HEADER_SIZE },
+    "RowPageHeader should have an explicit 32-byte layout"
+);
+
+const _: () = assert!(
+    { mem::size_of::<RowPage>() == PAGE_SIZE },
+    "RowPage should occupy exactly one buffer page"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, start_row_id) == 0 },
+    "RowPageHeader start_row_id offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, row_count_and_var_field_offset) == 8 },
+    "RowPageHeader row_count_and_var_field_offset offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, max_row_count) == 12 },
+    "RowPageHeader max_row_count offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, approx_deleted) == 26 },
+    "RowPageHeader approx_deleted offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, padding) == 28 },
+    "RowPageHeader padding offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPage, data) == ROW_PAGE_HEADER_SIZE },
+    "RowPage data offset should match RowPageHeader size"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPage, footer) == ROW_PAGE_USABLE_SIZE },
+    "RowPage checksum footer must start after logical usable bytes"
+);
+
+const _: () = assert_buffer_page::<RowPage>();
+
+/// Borrowed or owned row-page null bitmap words.
+pub(crate) type RowPageNullBitmap<'a> = Cow<'a, [u64]>;
 
 /// RowPage is the core data structure of row-store.
 /// Uses PAX format in order to be fast in both TP and
@@ -77,62 +135,12 @@ const _: () = assert!(
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, KnownLayout)]
 pub(crate) struct RowPage {
+    /// Native row-page header.
     pub header: RowPageHeader,
+    /// Logical row-page payload area.
     pub data: [u8; ROW_PAGE_DATA_SIZE],
     footer: [u8; ROW_PAGE_FOOTER_SIZE],
 }
-
-const ROW_PAGE_HEADER_SIZE: usize = 32;
-/// Bytes reserved at the end of every row page for spill-file checksums.
-pub(crate) const ROW_PAGE_FOOTER_SIZE: usize = BLOCK_INTEGRITY_TRAILER_SIZE;
-/// Bytes available to row-page logical content before the checksum footer.
-pub(crate) const ROW_PAGE_USABLE_SIZE: usize = PAGE_SIZE - ROW_PAGE_FOOTER_SIZE;
-const ROW_PAGE_DATA_SIZE: usize = ROW_PAGE_USABLE_SIZE - ROW_PAGE_HEADER_SIZE;
-
-const _: () = assert!(
-    { mem::size_of::<RowPageHeader>() == ROW_PAGE_HEADER_SIZE },
-    "RowPageHeader should have an explicit 32-byte layout"
-);
-
-const _: () = assert!(
-    { mem::size_of::<RowPage>() == PAGE_SIZE },
-    "RowPage should occupy exactly one buffer page"
-);
-
-const _: () = assert!(
-    { mem::offset_of!(RowPageHeader, start_row_id) == 0 },
-    "RowPageHeader start_row_id offset changed"
-);
-
-const _: () = assert!(
-    { mem::offset_of!(RowPageHeader, row_count_and_var_field_offset) == 8 },
-    "RowPageHeader row_count_and_var_field_offset offset changed"
-);
-
-const _: () = assert!(
-    { mem::offset_of!(RowPageHeader, max_row_count) == 12 },
-    "RowPageHeader max_row_count offset changed"
-);
-
-const _: () = assert!(
-    { mem::offset_of!(RowPageHeader, approx_deleted) == 26 },
-    "RowPageHeader approx_deleted offset changed"
-);
-
-const _: () = assert!(
-    { mem::offset_of!(RowPageHeader, padding) == 28 },
-    "RowPageHeader padding offset changed"
-);
-
-const _: () = assert!(
-    { mem::offset_of!(RowPage, data) == ROW_PAGE_HEADER_SIZE },
-    "RowPage data offset should match RowPageHeader size"
-);
-
-const _: () = assert!(
-    { mem::offset_of!(RowPage, footer) == ROW_PAGE_USABLE_SIZE },
-    "RowPage checksum footer must start after logical usable bytes"
-);
 
 impl RowPage {
     /// Initialize row page.
@@ -289,6 +297,7 @@ impl RowPage {
         }
     }
 
+    /// Extends the row count so the page includes the provided row id.
     #[inline]
     pub(crate) fn update_count_to_include_row_id(&mut self, row_id: RowID) {
         debug_assert!(row_id >= self.header.start_row_id);
@@ -405,6 +414,7 @@ impl RowPage {
         Select::Ok(row)
     }
 
+    /// Returns additional variable-length bytes needed to update an existing row.
     #[inline]
     pub(crate) fn var_len_for_update(&self, row_idx: usize, user_cols: &[UpdateCol]) -> usize {
         let row = self.row(row_idx);
@@ -461,6 +471,7 @@ impl RowPage {
         }
     }
 
+    /// Returns an exclusive mutable row wrapper for recovery and frozen-page rewrites.
     #[inline]
     pub(crate) fn row_mut_exclusive(
         &mut self,
@@ -619,6 +630,7 @@ impl RowPage {
         col_offset + row_idx * col_inline_len
     }
 
+    /// Atomically stores a fixed-width column value in its row slot.
     #[inline]
     pub(crate) fn update_val<V: Value>(&self, row_idx: usize, col_idx: usize, val: V) {
         let offset = self.val_offset(row_idx, col_idx, mem::size_of::<V>());
@@ -628,6 +640,7 @@ impl RowPage {
         unsafe { val.atomic_store(ptr) };
     }
 
+    /// Updates one column value and returns the next variable-length write offset.
     #[inline]
     pub(crate) fn update_col(
         &self,
@@ -686,6 +699,7 @@ impl RowPage {
         var_offset
     }
 
+    /// Updates one column value through exclusive page access.
     #[inline]
     pub(crate) fn update_col_exclusive(
         &mut self,
@@ -792,6 +806,7 @@ impl RowPage {
         }
     }
 
+    /// Stores a fixed-width column value through exclusive page access.
     #[inline]
     pub(crate) fn update_val_exclusive<V: Value>(
         &mut self,
@@ -806,11 +821,13 @@ impl RowPage {
         unsafe { val.store(ptr) };
     }
 
+    /// Updates the inline page-var descriptor for a variable-length column.
     #[inline]
     pub(crate) fn update_var(&self, row_idx: usize, col_idx: usize, var: PageVar) {
         self.update_val::<u64>(row_idx, col_idx, var.into_u64());
     }
 
+    /// Appends a variable-length value and returns its page descriptor and next offset.
     #[inline]
     pub(crate) fn add_var(&self, input: &[u8], var_offset: usize) -> (PageVar, usize) {
         let len = input.len();
@@ -902,16 +919,19 @@ impl RowPage {
         }
     }
 
+    /// Increments the approximate deleted-row counter.
     #[inline]
     pub(crate) fn inc_approx_deleted(&self) {
         self.header.approx_deleted.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Decrements the approximate deleted-row counter.
     #[inline]
     pub(crate) fn dec_approx_deleted(&self) {
         self.header.approx_deleted.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Sets a delete bitmap bit through exclusive page access.
     #[inline]
     pub(crate) fn set_deleted_exclusive(&mut self, row_idx: usize, deleted: bool) {
         let offset = self.header.del_bit_offset(row_idx);
@@ -1052,10 +1072,11 @@ impl RowPage {
         // Row/page lock protocol ensures no conflicting writer touches this range.
         unsafe {
             let dst = self.data().as_ptr().add(offset) as *mut u8;
-            std::ptr::copy_nonoverlapping(input.as_ptr(), dst, input.len());
+            copy_nonoverlapping(input.as_ptr(), dst, input.len());
         }
     }
 
+    /// Creates an empty zeroed row page for tests.
     #[cfg(test)]
     #[inline]
     pub(crate) fn new_test_page() -> Self {
@@ -1089,25 +1110,32 @@ unsafe impl BufferPage for RowPage {
     const KIND: BufferPageKind = BufferPageKind::RowPage;
 }
 
-const _: () = assert_buffer_page::<RowPage>();
-
 /// Native header stored at the front of every in-memory row page.
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, KnownLayout)]
 pub(crate) struct RowPageHeader {
+    /// First row id covered by this page.
     pub start_row_id: RowID,
     // higher two bytes is row count.
     // lower two bytes is var field offset.
     row_count_and_var_field_offset: AtomicU32,
+    /// Maximum number of row slots in this page.
     pub max_row_count: u16,
+    /// Number of user columns stored in each row.
     pub col_count: u16,
+    /// Offset of the delete bitmap within page data.
     pub del_bitmap_offset: u16,
+    /// Offset of the nullable-column bitmap list within page data.
     pub null_bitmap_list_offset: u16,
+    /// Offset of the fixed-column offset list within page data.
     pub col_offset_list_offset: u16,
+    /// Offset of the first fixed-width column payload within page data.
     pub fix_field_offset: u16,
+    /// End offset of the fixed-width column payload area within page data.
     pub fix_field_end: u16,
     // approximate deleted count, used by checkpoint thread
     // to estimate row count to migrate.
+    /// Approximate number of deleted rows on this page.
     pub approx_deleted: AtomicU16,
     padding: [u8; 4],
 }
@@ -1275,6 +1303,7 @@ impl NewRow<'_> {
         self.col_idx += 1;
     }
 
+    /// Adds one typed column value to the current row.
     #[inline]
     pub(crate) fn add_col(&mut self, col_layout: &TableColumnLayout, val: &Val) {
         match val {
@@ -1347,7 +1376,7 @@ pub(crate) trait RowRead {
     fn str(&self, col_idx: usize) -> Option<&str> {
         let page = self.page();
         let var = page.var(self.row_idx(), col_idx);
-        std::str::from_utf8(var.as_bytes(page.data())).ok()
+        from_utf8(var.as_bytes(page.data())).ok()
     }
 
     /// Returns RowID of current row.
@@ -1565,6 +1594,7 @@ impl RowMut<'_> {
         self.page.set_null(col_layout, self.row_idx, col_idx, null);
     }
 
+    /// Finishes the in-place row update.
     #[inline]
     pub(crate) fn finish(self) {
         debug_assert!(self.var_offset == self.var_end);
@@ -1620,11 +1650,44 @@ impl RowMutExclusive<'_> {
         // new row does not count to approx_deleted.
     }
 
+    /// Finishes an exclusive in-place row update.
     #[inline]
     pub(crate) fn finish_update(self) {
         debug_assert!(self.var_offset == self.var_end);
         debug_assert!(!self.page.is_deleted(self.row_idx));
     }
+}
+
+/// Returns estimation of maximum row count of a new page with average row length
+/// equal to given row length.
+#[inline]
+pub(crate) const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
+    let body_len = ROW_PAGE_USABLE_SIZE
+        .wrapping_sub(mem::size_of::<RowPageHeader>()) // header
+        .wrapping_sub(col_count * 2); // col offset (approx)
+    let estimated_row_size = row_len
+        + 1 // del bitmap (approx)
+        + col_count.div_ceil(8); // null bitmap (approx)
+    body_len / estimated_row_size
+}
+
+/// Rounds a byte length up to the next 8-byte boundary.
+#[inline]
+pub(crate) const fn align8(value: usize) -> usize {
+    value.div_ceil(8) * 8
+}
+
+/// Returns additional space of var-len data of the new row to be inserted.
+#[inline]
+pub(crate) fn var_len_for_insert(schema: &TableColumnLayout, cols: &[Val]) -> usize {
+    schema
+        .var_cols()
+        .iter()
+        .map(|idx| match &cols[*idx] {
+            Val::VarByte(var) if var.len() > PAGE_VAR_LEN_INLINE => var.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 #[inline]
@@ -1665,37 +1728,6 @@ const fn col_offset_list_len(col_count: usize) -> usize {
 #[inline]
 const fn col_inline_len(kind: ValKind, row_count: usize) -> usize {
     align8(kind.inline_len() * row_count)
-}
-
-/// Returns estimation of maximum row count of a new page with average row length
-/// equal to given row length.
-#[inline]
-pub(crate) const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
-    let body_len = ROW_PAGE_USABLE_SIZE
-        .wrapping_sub(mem::size_of::<RowPageHeader>()) // header
-        .wrapping_sub(col_count * 2); // col offset (approx)
-    let estimated_row_size = row_len
-        + 1 // del bitmap (approx)
-        + col_count.div_ceil(8); // null bitmap (approx)
-    body_len / estimated_row_size
-}
-
-#[inline]
-pub(crate) const fn align8(value: usize) -> usize {
-    value.div_ceil(8) * 8
-}
-
-/// Returns additional space of var-len data of the new row to be inserted.
-#[inline]
-pub(crate) fn var_len_for_insert(schema: &TableColumnLayout, cols: &[Val]) -> usize {
-    schema
-        .var_cols()
-        .iter()
-        .map(|idx| match &cols[*idx] {
-            Val::VarByte(var) if var.len() > PAGE_VAR_LEN_INLINE => var.len(),
-            _ => 0,
-        })
-        .sum()
 }
 
 #[cfg(test)]
