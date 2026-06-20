@@ -6,6 +6,18 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Write state of a row page tracked by its version map.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowPageState {
+    /// Page accepts foreground row writes.
+    Active = 0,
+    /// Page is frozen and no longer accepts ordinary row growth.
+    Frozen = 1,
+    /// Page is being converted by checkpoint.
+    Transition = 2,
+}
+
 /// RowVersionMap is a page-level hash map to store
 /// old versions of rows in row page.
 /// It also contains modification counter and max STS
@@ -15,9 +27,10 @@ pub(crate) struct RowVersionMap {
     // It wastes 16 bytes(one lock and one pointer)
     // for each row if no undo associated.
     entries: Box<[RwLock<Option<Box<RowUndoHead>>>]>,
-    // Column layout fixed when the version map is created.
-    // Currently it should be same as the table-file column layout because we
-    // do not support physical column-layout changes.
+    /// Column layout fixed when the version map is created.
+    ///
+    /// Currently it should be same as the table-file column layout because we
+    /// do not support physical column-layout changes.
     pub(crate) column_layout: Arc<TableColumnLayout>,
     // Monotonically increasing version number.
     // indicates whether the undo map is changed.
@@ -48,14 +61,6 @@ pub(crate) struct RowVersionMap {
     // It is guarded by rwlock so that checkpointer can block incoming
     // writers when switching frozen page to transition state.
     state: RwLock<RowPageState>,
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RowPageState {
-    Active = 0,
-    Frozen = 1,
-    Transition = 2,
 }
 
 impl RowVersionMap {
@@ -188,6 +193,7 @@ impl RowVersionMap {
     }
 }
 
+/// Shared guard over a row's undo head in the page version map.
 pub(crate) struct RowVersionReadGuard<'a> {
     g: RwLockReadGuard<'a, Option<Box<RowUndoHead>>>,
 }
@@ -200,6 +206,7 @@ impl<'a> Deref for RowVersionReadGuard<'a> {
     }
 }
 
+/// Exclusive guard over a row's undo head in the page version map.
 pub(crate) struct RowVersionWriteGuard<'a> {
     m: &'a RowVersionMap,
     g: RwLockWriteGuard<'a, Option<Box<RowUndoHead>>>,
@@ -208,6 +215,7 @@ pub(crate) struct RowVersionWriteGuard<'a> {
 }
 
 impl RowVersionWriteGuard<'_> {
+    /// Marks this guarded write as an insert or update for page-level tracking.
     #[inline]
     pub(crate) fn enable_ins_or_update(&mut self) {
         self.ins_or_update = true;

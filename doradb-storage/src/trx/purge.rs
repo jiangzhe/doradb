@@ -23,45 +23,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-#[inline]
-fn promote_delete_marker_if_needed(table: &Table, undo: &OwnedRowUndo) {
-    if matches!(&undo.kind, RowUndoKind::Delete) {
-        table
-            .deletion_buffer()
-            .promote_delete_marker_if_committed(undo.row_id);
-    }
-}
-
-#[inline]
-fn purge_undo_chain_from_page(
-    page_guard: PageSharedGuard<RowPage>,
-    undo: &OwnedRowUndo,
-    min_active_sts: TrxID,
-) {
-    let (ctx, page) = page_guard.ctx_and_page();
-    if !page.row_id_in_valid_range(undo.row_id) {
-        return;
-    }
-    let row_idx = page.row_idx(undo.row_id);
-    let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
-    access.purge_undo_chain(min_active_sts);
-}
-
-#[inline]
-fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Result<()>) -> bool {
-    match res {
-        Ok(()) => true,
-        Err(_) => {
-            // Runtime resource destruction is not replayable once purge has
-            // started mutating in-memory ownership. Treat any error here as a
-            // fatal storage failure: reject new work, let explicit shutdown join
-            // the worker later, and stop this purge cycle immediately.
-            let _ = trx_sys.poison_storage(FatalError::PurgeDeallocate);
-            false
-        }
-    }
-}
-
 /// Runtime table handle waiting for purge-horizon destruction after DROP TABLE.
 ///
 /// The catalog no longer exposes this table once foreground DROP TABLE commits,
@@ -69,8 +30,11 @@ fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Resu
 /// retain the runtime. Purge owns the final runtime destroy step so it can wait
 /// until the drop commit is older than every active snapshot.
 pub(crate) struct DroppedTableGcItem {
+    /// Dropped user table id.
     pub(crate) table_id: TableID,
+    /// Commit timestamp of the logical DROP TABLE.
     pub(crate) drop_cts: TrxID,
+    /// Runtime table handle retained until purge can destroy it.
     pub(crate) table: Arc<Table>,
 }
 
@@ -81,11 +45,14 @@ pub(crate) struct DroppedTableGcItem {
 /// file to replay the committed drop.
 #[derive(Clone, Copy)]
 pub(crate) struct DroppedTableFileDeleteItem {
+    /// Dropped user table id.
     pub(crate) table_id: TableID,
+    /// Commit timestamp of the logical DROP TABLE.
     pub(crate) drop_cts: TrxID,
 }
 
 impl DroppedTableFileDeleteItem {
+    /// Create a queued dropped-table file deletion item.
     #[inline]
     pub(crate) fn new(table_id: TableID, drop_cts: TrxID) -> Self {
         Self { table_id, drop_cts }
@@ -105,6 +72,7 @@ pub(crate) struct TableRootQueue {
 }
 
 impl TableRootQueue {
+    /// Retain an old table root until the fence timestamp is below the active horizon.
     #[inline]
     pub(crate) fn push_retained(&mut self, fence_ts: TrxID, old_root: OldRoot) {
         self.roots.push_back(RetainedTableRoot {
@@ -141,6 +109,7 @@ pub(crate) struct DroppedTableQueue {
 }
 
 impl DroppedTableQueue {
+    /// Build dropped-table queues seeded with checkpoint-gated file deletes.
     #[inline]
     pub(crate) fn from_file_deletes(file_deletes: Vec<DroppedTableFileDeleteItem>) -> Self {
         Self {
@@ -197,6 +166,7 @@ impl TransactionSystem {
         let _ = self.purge_tx.send(Purge::DroppedTable);
     }
 
+    /// Start the purge coordinator and optional executor threads.
     #[inline]
     pub(crate) fn start_purge_threads(
         trx_sys: QuiescentGuard<Self>,
@@ -245,6 +215,7 @@ impl TransactionSystem {
         }
     }
 
+    /// Calculate the purge horizon from active transaction buckets.
     #[inline]
     pub(crate) fn calc_min_active_sts_for_gc(&self) -> TrxID {
         // first, we load current STS as upperbound.
@@ -793,31 +764,6 @@ impl PurgeWork {
     }
 }
 
-#[inline]
-fn coalesce_purge_work<F>(
-    purge_chan: &Receiver<Purge>,
-    initial: Purge,
-    mut analyze_committed: F,
-) -> PurgeWork
-where
-    F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> bool,
-{
-    // Collapse queued lossy wakeups so bursts do not trigger repeated scans,
-    // while committed payload batches are recorded one by one and never
-    // coalesced away. `Stop` is a terminal shutdown barrier: messages before it
-    // have been absorbed, messages after it are intentionally ignored.
-    let mut work = PurgeWork::none();
-    if !work.absorb(initial, &mut analyze_committed) {
-        return work;
-    }
-    while let Ok(purge) = purge_chan.try_recv() {
-        if !work.absorb(purge, &mut analyze_committed) {
-            return work;
-        }
-    }
-    work
-}
-
 struct PurgeTask {
     gc_no: usize,
     min_active_sts: TrxID,
@@ -1050,6 +996,70 @@ impl PurgeExecutor {
     }
 }
 
+#[inline]
+fn coalesce_purge_work<F>(
+    purge_chan: &Receiver<Purge>,
+    initial: Purge,
+    mut analyze_committed: F,
+) -> PurgeWork
+where
+    F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> bool,
+{
+    // Collapse queued lossy wakeups so bursts do not trigger repeated scans,
+    // while committed payload batches are recorded one by one and never
+    // coalesced away. `Stop` is a terminal shutdown barrier: messages before it
+    // have been absorbed, messages after it are intentionally ignored.
+    let mut work = PurgeWork::none();
+    if !work.absorb(initial, &mut analyze_committed) {
+        return work;
+    }
+    while let Ok(purge) = purge_chan.try_recv() {
+        if !work.absorb(purge, &mut analyze_committed) {
+            return work;
+        }
+    }
+    work
+}
+
+#[inline]
+fn promote_delete_marker_if_needed(table: &Table, undo: &OwnedRowUndo) {
+    if matches!(&undo.kind, RowUndoKind::Delete) {
+        table
+            .deletion_buffer()
+            .promote_delete_marker_if_committed(undo.row_id);
+    }
+}
+
+#[inline]
+fn purge_undo_chain_from_page(
+    page_guard: PageSharedGuard<RowPage>,
+    undo: &OwnedRowUndo,
+    min_active_sts: TrxID,
+) {
+    let (ctx, page) = page_guard.ctx_and_page();
+    if !page.row_id_in_valid_range(undo.row_id) {
+        return;
+    }
+    let row_idx = page.row_idx(undo.row_id);
+    let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
+    access.purge_undo_chain(min_active_sts);
+}
+
+#[inline]
+fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Result<()>) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(_) => {
+            // Runtime resource destruction is not replayable once purge has
+            // started mutating in-memory ownership. Treat any error here as a
+            // fatal storage failure: reject new work, let explicit shutdown join
+            // the worker later, and stop this purge cycle immediately.
+            let _ = trx_sys.poison_storage(FatalError::PurgeDeallocate);
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,7 +1068,8 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::FatalError;
+    use crate::engine::Engine;
+    use crate::error::{FatalError, Result};
     use crate::id::{BlockID, RowID};
     use crate::index::{IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
@@ -1070,12 +1081,14 @@ mod tests {
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus};
     use crate::value::Val;
+    use smol::Timer;
     use std::sync::Arc;
+    use std::thread::sleep;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     #[inline]
-    fn full_pool_guards(engine: &crate::engine::Engine) -> PoolGuards {
+    fn full_pool_guards(engine: &Engine) -> PoolGuards {
         PoolGuards::builder()
             .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
             .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
@@ -1102,7 +1115,7 @@ mod tests {
             pool_guard: &PoolGuard,
             key: &[Val],
             ts: TrxID,
-        ) -> crate::error::Result<Option<(RowID, bool)>> {
+        ) -> Result<Option<(RowID, bool)>> {
             let layout = self.table.layout_snapshot();
             let index = layout.secondary_index(self.index_no)?;
             index
@@ -1119,7 +1132,7 @@ mod tests {
             row_id: RowID,
             merge_if_match_deleted: bool,
             ts: TrxID,
-        ) -> crate::error::Result<IndexInsert> {
+        ) -> Result<IndexInsert> {
             let layout = self.table.layout_snapshot();
             let index = layout.secondary_index(self.index_no)?;
             index
@@ -1136,7 +1149,7 @@ mod tests {
             old_row_id: RowID,
             ignore_del_mask: bool,
             ts: TrxID,
-        ) -> crate::error::Result<bool> {
+        ) -> Result<bool> {
             let layout = self.table.layout_snapshot();
             let index = layout.secondary_index(self.index_no)?;
             index
@@ -1153,7 +1166,7 @@ mod tests {
             old_row_id: RowID,
             new_row_id: RowID,
             ts: TrxID,
-        ) -> crate::error::Result<IndexCompareExchange> {
+        ) -> Result<IndexCompareExchange> {
             let layout = self.table.layout_snapshot();
             let index = layout.secondary_index(self.index_no)?;
             index
@@ -1168,7 +1181,7 @@ mod tests {
             pool_guard: &PoolGuard,
             values: &mut Vec<RowID>,
             ts: TrxID,
-        ) -> crate::error::Result<()> {
+        ) -> Result<()> {
             let layout = self.table.layout_snapshot();
             let index = layout.secondary_index(self.index_no)?;
             index
@@ -1191,7 +1204,7 @@ mod tests {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         cols: Vec<Val>,
-    ) -> crate::error::Result<RowID> {
+    ) -> Result<RowID> {
         stmt.table_insert_mvcc(table_id, cols).await
     }
 
@@ -1199,7 +1212,7 @@ mod tests {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         key: &SelectKey,
-    ) -> crate::error::Result<DeleteMvcc> {
+    ) -> Result<DeleteMvcc> {
         stmt.table_delete_unique_mvcc(table_id, key, false).await
     }
 
@@ -1326,7 +1339,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1377,7 +1390,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1445,7 +1458,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1529,7 +1542,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1617,7 +1630,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1724,7 +1737,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1838,7 +1851,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1855,7 +1868,7 @@ mod tests {
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
-            smol::Timer::after(Duration::from_secs(1)).await;
+            Timer::after(Duration::from_secs(1)).await;
             let init_stats = engine.inner().trx_sys.trx_sys_stats();
 
             let mut session = engine.new_session().unwrap();
@@ -1907,7 +1920,7 @@ mod tests {
                 if start.elapsed() >= Duration::from_secs(1) {
                     panic!("gc timeout");
                 } else {
-                    std::thread::sleep(Duration::from_millis(100));
+                    sleep(Duration::from_millis(100));
                 }
             }
             drop(session);
@@ -1926,7 +1939,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1943,7 +1956,7 @@ mod tests {
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
-            smol::Timer::after(Duration::from_millis(100)).await;
+            Timer::after(Duration::from_millis(100)).await;
             let init_stats = engine.inner().trx_sys.trx_sys_stats();
 
             let mut session = engine.new_session().unwrap();
@@ -1998,7 +2011,7 @@ mod tests {
                     gc_timeout = true;
                     break;
                 } else {
-                    std::thread::sleep(Duration::from_millis(100));
+                    sleep(Duration::from_millis(100));
                 }
             }
             if gc_timeout {

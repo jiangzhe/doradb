@@ -3475,6 +3475,7 @@ mod tests {
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::row::LockRowForWrite;
     use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::undo::RowUndoKind;
     use crate::value::Val;
     use error_stack::Report;
@@ -6182,7 +6183,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
             );
-            assert_eq!(engine.inner().trx_sys.fatal_rollback_retention_len(), 1);
+            assert_eq!(fatal_rollback_retention_count(&engine.inner().trx_sys), 1);
             assert!(
                 engine
                     .inner()
@@ -6291,7 +6292,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
             );
-            assert_eq!(engine.inner().trx_sys.fatal_rollback_retention_len(), 1);
+            assert_eq!(fatal_rollback_retention_count(&engine.inner().trx_sys), 1);
             assert!(!session.in_trx().unwrap());
 
             let err = trx.rollback().await.unwrap_err();

@@ -52,19 +52,21 @@ impl MutexGroupCommit {
 /// GroupCommit is optimization to group multiple transactions
 /// and perform single IO to speed up overall commit performance.
 pub(crate) struct GroupCommit {
-    // Commit group queue, there can be multiple groups in commit phase.
-    // Each of them submits one redo write through the log thread's
-    // backend-neutral driver and then waits for write completion plus the
-    // configured sync step.
+    /// Commit group queue, there can be multiple groups in commit phase.
+    ///
+    /// Each group submits one redo write through the log thread's backend-neutral driver and then
+    /// waits for write completion plus the configured sync step.
     pub(crate) queue: VecDeque<Commit>,
-    // Closed admission reason. Shutdown messages only wake the worker; this
-    // flag is the source of truth for rejecting new precommit handoffs.
+    /// Closed admission reason used to reject new precommit handoffs.
+    ///
+    /// Shutdown messages only wake the worker; this flag is the source of truth for admission.
     pub(crate) closed: Option<FailedPrecommitReason>,
-    // Current log file.
+    /// Current redo log file used for new durability groups.
     pub(crate) log_file: Option<RedoLogFile>,
 }
 
 impl GroupCommit {
+    /// Close group-commit admission with the first terminal reason.
     #[inline]
     pub(crate) fn close(&mut self, reason: FailedPrecommitReason) {
         if self.closed.is_none() {
@@ -73,17 +75,33 @@ impl GroupCommit {
     }
 }
 
+/// Queue item consumed by the log thread's group-commit loop.
 pub(crate) enum Commit {
+    /// Boundary marker that carries a switched-out redo file and its header write.
     LogFileBoundary {
+        /// Redo file whose groups must finish before the file can be sealed.
         ended_log_file: Option<RedoLogFile>,
+        /// Pending header write for the newly opened log file.
         header_write: LogWriteSubmission,
     },
+    /// Transaction group waiting for redo write and optional sync.
     Group(CommitGroup),
+    /// Shutdown marker for the log loop.
     Shutdown,
 }
 
+/// Shared ordered-completion waiter for a commit group.
 pub(crate) type CommitWaiter = Arc<Completion<()>>;
+/// Optional commit waiter returned to transactions that must observe ordered completion.
 pub(crate) type CommitJoin = Option<CommitWaiter>;
+
+/// Serialized redo buffer and target file allocation for a durability group.
+pub(crate) struct CommitGroupLog {
+    /// Target redo file allocation and CTS range metadata.
+    pub(crate) write_meta: RedoGroupWriteMeta,
+    /// Serialized redo bytes accumulated for this group.
+    pub(crate) log_buf: LogBuf,
+}
 
 /// CommitGroup groups multiple transactions with only
 /// one logical log IO and at most one fsync() call.
@@ -91,24 +109,24 @@ pub(crate) type CommitJoin = Option<CommitWaiter>;
 /// 1. Log block size, e.g. 16KB.
 /// 2. Timeout to wait for next transaction to join.
 pub(crate) struct CommitGroup {
+    /// Transactions accepted into this ordered group.
     pub(crate) trx_list: Vec<PrecommitTrx>,
+    /// Maximum CTS assigned to transactions in this group.
     pub(crate) max_cts: TrxID,
+    /// Serialized redo state for durability-required groups.
     pub(crate) log: Option<CommitGroupLog>,
+    /// Completion signaled after this group reaches its ordered terminal result.
     pub(crate) completion: Arc<Completion<()>>,
 }
 
-/// Serialized redo buffer and target file allocation for a durability group.
-pub(crate) struct CommitGroupLog {
-    pub(crate) write_meta: RedoGroupWriteMeta,
-    pub(crate) log_buf: LogBuf,
-}
-
 impl CommitGroup {
+    /// Returns whether this group has redo bytes that require persistence.
     #[inline]
     pub(crate) fn require_durability(&self) -> bool {
         self.log.is_some()
     }
 
+    /// Returns whether the transaction can join this existing group.
     #[inline]
     pub(crate) fn can_join(&self, trx: &PrecommitTrx) -> bool {
         if !trx.require_durability() {
@@ -123,6 +141,7 @@ impl CommitGroup {
         })
     }
 
+    /// Add a transaction to this group and return the waiter requested by the caller.
     #[inline]
     pub(crate) fn join(&mut self, mut trx: PrecommitTrx, wait_sync: bool) -> CommitJoin {
         debug_assert!(self.max_cts < trx.cts);
@@ -147,6 +166,7 @@ impl CommitGroup {
         wait_sync.then(|| Arc::clone(&self.completion))
     }
 
+    /// Convert this commit group into a sync group for redo completion.
     #[inline]
     pub(crate) fn into_sync_group(self) -> SyncGroup {
         let (log_bytes, log_fd, write_meta, write, finished) = match self.log {
@@ -197,6 +217,7 @@ mod tests {
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::value::Val;
     use std::collections::BTreeMap;
+    use std::iter::repeat_n;
 
     fn redo_bin(cts: TrxID) -> TrxLog {
         TrxLog::new(
@@ -211,7 +232,7 @@ mod tests {
     fn redo_bin_large(cts: TrxID) -> TrxLog {
         let mut rows = BTreeMap::new();
         // 3000-bytes string.
-        let s: String = std::iter::repeat_n('a', 3000).collect();
+        let s: String = repeat_n('a', 3000).collect();
         rows.insert(
             RowID::new(1u64),
             RowRedo {

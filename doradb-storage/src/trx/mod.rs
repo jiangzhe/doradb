@@ -51,15 +51,20 @@ use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::AsyncFnOnce;
+use std::ptr::addr_eq;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 pub use stmt::Statement;
+/// Minimum snapshot timestamp assigned by the transaction system.
 pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
+/// Exclusive upper bound for snapshot timestamps.
 pub(crate) const MAX_SNAPSHOT_TS: TrxID = TrxID::new(1 << 63);
+/// Exclusive upper bound for commit timestamps.
 pub(crate) const MAX_COMMIT_TS: TrxID = TrxID::new(1 << 63);
 // As active transaction id is always greater than STS, that means
 // visibility check can be simplified to "STS is larger".
+/// Minimum active transaction id derived from a snapshot timestamp.
 pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = TrxID::new((1 << 63) + 1);
 
 /// Public active transaction facade.
@@ -131,6 +136,7 @@ impl Transaction {
         TrxCheckout::new(entry, attachment, operation)
     }
 
+    /// Claim this transaction for an explicit terminal operation.
     #[inline]
     pub(crate) fn claim_terminal(
         &self,
@@ -186,8 +192,8 @@ impl Transaction {
         let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
         enum ExecOutcome<T> {
             Success(T),
-            StatementError(crate::error::Error),
-            FatalRollback(crate::error::Error),
+            StatementError(Error),
+            FatalRollback(Error),
         }
         let outcome = {
             let (inner, attachment) = checkout.inner_and_attachment_mut();
@@ -278,10 +284,13 @@ impl Drop for Transaction {
 
 /// Transaction begin result with separate public handle and registry entry.
 pub(crate) struct StartedTransaction {
+    /// Public transaction handle returned to the session.
     pub(crate) handle: Transaction,
+    /// Stable session-registry entry for the mutable transaction core.
     pub(crate) entry: Arc<TrxEntry>,
 }
 
+/// Shared transaction timestamp state referenced by row undo heads.
 pub(crate) struct SharedTrxStatus {
     ts: AtomicU64,
     preparing: AtomicBool,
@@ -359,12 +368,6 @@ impl SharedTrxStatus {
     }
 }
 
-/// Returns whether the transaction is committed.
-#[inline]
-pub(crate) fn trx_is_committed(ts: TrxID) -> bool {
-    ts < MIN_ACTIVE_TRX_ID
-}
-
 /// Proof that a runtime read is bound to a live transaction context.
 ///
 /// The proof carries only the transaction-context lifetime. Callers cannot
@@ -402,7 +405,7 @@ impl TrxContext {
     #[inline]
     pub(crate) fn is_same_trx(&self, undo_head: &RowUndoHead) -> bool {
         match &undo_head.next.main.status {
-            UndoStatus::Ref(arc) => std::ptr::addr_eq(self.status.as_ref(), arc.as_ref()),
+            UndoStatus::Ref(arc) => addr_eq(self.status.as_ref(), arc.as_ref()),
             _ => false,
         }
     }
@@ -702,19 +705,6 @@ impl TrxEffects {
     }
 }
 
-#[inline]
-fn is_catalog_metadata_ddl(ddl: Option<&DDLRedo>) -> bool {
-    matches!(
-        ddl,
-        Some(
-            DDLRedo::CreateTable(_)
-                | DDLRedo::DropTable(_)
-                | DDLRedo::CreateIndex { .. }
-                | DDLRedo::DropIndex { .. }
-        )
-    )
-}
-
 /// Registry-visible lifecycle for a session-owned transaction entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -809,6 +799,7 @@ pub(crate) struct TrxEntry {
 }
 
 impl TrxEntry {
+    /// Create a stable transaction entry for a checked-in mutable core.
     #[inline]
     pub(crate) fn new(inner: TrxInner) -> Arc<Self> {
         let trx_id = inner.trx_id();
@@ -949,6 +940,7 @@ impl TrxEntry {
         }
     }
 
+    /// Publish an in-progress terminal or failed state after the core was consumed.
     #[inline]
     pub(crate) fn publish_state(&self, state: TrxEntryState) {
         let inner_slot = self.inner.lock();
@@ -1100,6 +1092,7 @@ impl TrxCompletionClaim {
         })
     }
 
+    /// Claim an abandoned checked-in transaction for cleanup rollback.
     #[inline]
     pub(crate) fn cleanup(
         entry: Arc<TrxEntry>,
@@ -1150,9 +1143,13 @@ pub(crate) enum TrxCleanupReason {
 /// scanning abandoned sessions and waits for active transaction state to reach a
 /// terminal state before component teardown begins.
 pub(crate) struct TrxCleanupJob {
+    /// Engine retained until cleanup resolves this job.
     pub(crate) engine: EngineRef,
+    /// Session that owned the abandoned transaction.
     pub(crate) session_id: SessionID,
+    /// Transaction id to resolve in the session registry.
     pub(crate) trx_id: TrxID,
+    /// Reason this cleanup was queued.
     pub(crate) reason: TrxCleanupReason,
 }
 
@@ -1166,6 +1163,7 @@ pub(crate) enum FailedPrecommitReason {
 }
 
 impl FailedPrecommitReason {
+    /// Convert this failed-precommit reason into an operation error.
     #[inline]
     pub(crate) fn into_error(self, message: impl Into<String>) -> Error {
         match self {
@@ -1212,6 +1210,7 @@ pub(crate) struct FailedPrecommitCleanupJob {
 }
 
 impl FailedPrecommitCleanupJob {
+    /// Create a failed-precommit cleanup job for one redo group result.
     #[inline]
     pub(crate) fn new(
         trx_list: Vec<PrecommitTrx>,
@@ -1322,6 +1321,7 @@ pub(crate) struct TrxInner {
 }
 
 impl TrxInner {
+    /// Create a checked-in mutable transaction core.
     #[inline]
     pub(crate) fn new(trx_id: TrxID, sts: TrxID, gc_no: usize, session_id: SessionID) -> Self {
         let owner_group = LockOwnerGroup::Session(session_id);
@@ -1680,56 +1680,7 @@ impl Drop for TrxInner {
     }
 }
 
-#[inline]
-pub(crate) fn transaction_discarded_err(operation: &'static str) -> crate::error::Error {
-    Report::new(InternalError::ActiveTransactionDiscarded)
-        .attach(format!("operation={operation}"))
-        .into()
-}
-
-#[inline]
-fn transaction_entry_state_err(
-    trx_id: TrxID,
-    state: TrxEntryState,
-    operation: &'static str,
-) -> crate::error::Error {
-    match state {
-        TrxEntryState::CheckedOut
-        | TrxEntryState::CheckedOutAbandoned
-        | TrxEntryState::Committing
-        | TrxEntryState::RollingBack
-        | TrxEntryState::CleanupRunning => Report::new(OperationError::ExistingTransaction)
-            .attach(format!(
-                "{operation}: transaction is {}: trx_id={trx_id}",
-                state.label()
-            ))
-            .into(),
-        TrxEntryState::Abandoned => transaction_discarded_err(operation),
-        TrxEntryState::Terminal | TrxEntryState::Failed => transaction_discarded_err(operation),
-        TrxEntryState::Active => Report::new(InternalError::ActiveTransactionDiscarded)
-            .attach(format!(
-                "{operation}: transaction core is missing: trx_id={trx_id}"
-            ))
-            .into(),
-    }
-}
-
-#[inline]
-fn release_carried_transaction_locks(
-    lock_state: &mut Option<OwnerLockState>,
-    lock_manager: &mut Option<QuiescentGuard<LockManager>>,
-) -> usize {
-    match (lock_state.take(), lock_manager.take()) {
-        (Some(mut lock_state), Some(lock_manager)) => lock_state.release_all(&lock_manager),
-        (None, None) => 0,
-        (Some(_), None) => {
-            panic!("transaction lock state requires a lock manager guard")
-        }
-        (None, Some(_)) => {
-            panic!("transaction lock manager guard requires lock state")
-        }
-    }
-}
+/// Runtime effects moved out of an active transaction before CTS assignment.
 pub(crate) struct PreparedTrxPayload {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
@@ -1755,6 +1706,7 @@ impl PreparedTrxPayload {
 pub(crate) struct PreparedTrx {
     redo_bin: Option<TrxLog>,
     payload: Option<PreparedTrxPayload>,
+    /// Terminal session attachment carried until ordered commit or rollback cleanup.
     pub(crate) attachment: Option<TrxAttachment>,
     lock_manager: Option<QuiescentGuard<LockManager>>,
     lock_state: Option<OwnerLockState>,
@@ -1786,6 +1738,7 @@ impl PreparedTrx {
                 .unwrap_or(false)
     }
 
+    /// Fill the reserved commit timestamp and enter precommit state.
     #[inline]
     pub(crate) fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx {
         let redo_bin = if let Some(mut redo_bin) = self.redo_bin.take() {
@@ -1857,6 +1810,7 @@ impl Drop for PreparedTrx {
     }
 }
 
+/// Runtime effects retained while a precommit transaction waits for redo outcome.
 pub(crate) struct PrecommitTrxPayload {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
@@ -1914,12 +1868,17 @@ impl PrecommitTrxPayload {
 /// attachmentless system transaction, which is directly dropped after ordered
 /// completion.
 pub(crate) struct PrecommitTrx {
+    /// Commit timestamp reserved for this precommit transaction.
     pub(crate) cts: TrxID,
+    /// Recovery-visible redo record, when this transaction requires durability.
     pub(crate) redo_bin: Option<TrxLog>,
-    // Payload is only for user transaction
+    /// User transaction payload retained until ordered commit or rollback.
     pub(crate) payload: Option<PrecommitTrxPayload>,
+    /// Terminal session attachment for user transactions.
     pub(crate) attachment: Option<TrxAttachment>,
+    /// Lock manager retained to release transaction-owned locks.
     pub(crate) lock_manager: Option<QuiescentGuard<LockManager>>,
+    /// Transaction-owned lock state retained until terminal cleanup.
     pub(crate) lock_state: Option<OwnerLockState>,
 }
 
@@ -2089,12 +2048,14 @@ struct CommittedTrxPayload {
     gc_row_pages: Vec<PageID>,
 }
 
+/// Transaction payload handed from ordered commit into purge coordination.
 pub(crate) struct CommittedTrx {
     cts: TrxID,
     payload: Option<CommittedTrxPayload>,
 }
 
 impl CommittedTrx {
+    /// Returns the transaction snapshot timestamp for GC-aware user transactions.
     #[inline]
     pub(crate) fn sts(&self) -> Option<TrxID> {
         self.payload.as_ref().map(|p| p.sts)
@@ -2122,6 +2083,77 @@ impl CommittedTrx {
     }
 }
 
+/// Returns whether the transaction timestamp is committed.
+#[inline]
+pub(crate) fn trx_is_committed(ts: TrxID) -> bool {
+    ts < MIN_ACTIVE_TRX_ID
+}
+
+/// Build the standard error for using a discarded active transaction.
+#[inline]
+pub(crate) fn transaction_discarded_err(operation: &'static str) -> Error {
+    Report::new(InternalError::ActiveTransactionDiscarded)
+        .attach(format!("operation={operation}"))
+        .into()
+}
+
+#[inline]
+fn transaction_entry_state_err(
+    trx_id: TrxID,
+    state: TrxEntryState,
+    operation: &'static str,
+) -> Error {
+    match state {
+        TrxEntryState::CheckedOut
+        | TrxEntryState::CheckedOutAbandoned
+        | TrxEntryState::Committing
+        | TrxEntryState::RollingBack
+        | TrxEntryState::CleanupRunning => Report::new(OperationError::ExistingTransaction)
+            .attach(format!(
+                "{operation}: transaction is {}: trx_id={trx_id}",
+                state.label()
+            ))
+            .into(),
+        TrxEntryState::Abandoned => transaction_discarded_err(operation),
+        TrxEntryState::Terminal | TrxEntryState::Failed => transaction_discarded_err(operation),
+        TrxEntryState::Active => Report::new(InternalError::ActiveTransactionDiscarded)
+            .attach(format!(
+                "{operation}: transaction core is missing: trx_id={trx_id}"
+            ))
+            .into(),
+    }
+}
+
+#[inline]
+fn release_carried_transaction_locks(
+    lock_state: &mut Option<OwnerLockState>,
+    lock_manager: &mut Option<QuiescentGuard<LockManager>>,
+) -> usize {
+    match (lock_state.take(), lock_manager.take()) {
+        (Some(mut lock_state), Some(lock_manager)) => lock_state.release_all(&lock_manager),
+        (None, None) => 0,
+        (Some(_), None) => {
+            panic!("transaction lock state requires a lock manager guard")
+        }
+        (None, Some(_)) => {
+            panic!("transaction lock manager guard requires lock state")
+        }
+    }
+}
+
+#[inline]
+fn is_catalog_metadata_ddl(ddl: Option<&DDLRedo>) -> bool {
+    matches!(
+        ddl,
+        Some(
+            DDLRedo::CreateTable(_)
+                | DDLRedo::DropTable(_)
+                | DDLRedo::CreateIndex { .. }
+                | DDLRedo::DropIndex { .. }
+        )
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2147,15 +2179,22 @@ pub(crate) mod tests {
     };
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::row::ops::SelectKey;
-    use crate::session::tests::SessionTestExt;
+    use crate::session::{Session, tests::SessionTestExt};
     use crate::table::test_user_table_id;
     use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::sys::tests::{
+        TerminalRollbackTestHookGuard, fatal_rollback_retention_count,
+        install_terminal_rollback_test_hook,
+    };
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::{Val, ValKind};
     use event_listener::Listener;
-    use std::io;
+    use smol::Timer;
+    use std::cell::Cell;
+    use std::io::Error as IoError;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+    use std::thread::{scope, sleep, spawn};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -2227,7 +2266,7 @@ pub(crate) mod tests {
 
         fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if self.matches(op) {
-                *res = Err(io::Error::from_raw_os_error(self.errno));
+                *res = Err(IoError::from_raw_os_error(self.errno));
             }
         }
     }
@@ -2338,7 +2377,7 @@ pub(crate) mod tests {
             let engine_ref = engine.new_ref().unwrap();
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
-            let waiter = std::thread::spawn(move || {
+            let waiter = spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
                 engine_ref
                     .session_registry
@@ -2434,9 +2473,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn begin_production_test_transaction(
-        engine: &Engine,
-    ) -> (crate::session::Session, Transaction) {
+    fn begin_production_test_transaction(engine: &Engine) -> (Session, Transaction) {
         let mut session = engine.new_session().unwrap();
         let trx = session.begin_trx().unwrap();
         (session, trx)
@@ -2601,27 +2638,27 @@ pub(crate) mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done() {
             assert!(Instant::now() < deadline, "{message}");
-            std::thread::sleep(Duration::from_millis(1));
+            sleep(Duration::from_millis(1));
         }
     }
 
-    fn terminal_rollback_hook_test_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn terminal_rollback_hook_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    type TerminalRollbackRelease = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    type TerminalRollbackRelease = Arc<(Mutex<bool>, Condvar)>;
 
     fn install_blocking_terminal_rollback_hook(
         target_trx_id: TrxID,
         target_operation: &'static str,
     ) -> (
-        crate::trx::sys::tests::TerminalRollbackTestHookGuard,
+        TerminalRollbackTestHookGuard,
         mpsc::Receiver<&'static str>,
         TerminalRollbackRelease,
     ) {
         let (started_tx, started_rx) = mpsc::channel();
-        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
         let hook_release = Arc::clone(&release);
         let hook: Arc<dyn Fn(TrxID, &'static str) + Send + Sync> =
             Arc::new(move |trx_id, operation| {
@@ -2643,7 +2680,7 @@ pub(crate) mod tests {
                     "terminal rollback test hook was not released"
                 );
             });
-        let guard = crate::trx::sys::tests::install_terminal_rollback_test_hook(hook);
+        let guard = install_terminal_rollback_test_hook(hook);
         (guard, started_rx, release)
     }
 
@@ -2817,7 +2854,7 @@ pub(crate) mod tests {
             let waiter_status = Arc::clone(&status);
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
-            let waiter = std::thread::spawn(move || {
+            let waiter = spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
                 listener.wait();
                 done_tx
@@ -2872,7 +2909,7 @@ pub(crate) mod tests {
             let waiter_status = Arc::clone(&status);
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
-            let waiter = std::thread::spawn(move || {
+            let waiter = spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
                 listener.wait();
                 done_tx
@@ -3021,7 +3058,7 @@ pub(crate) mod tests {
                     .unwrap()
             );
 
-            let first_owner = std::cell::Cell::new(None);
+            let first_owner = Cell::new(None);
             trx.exec(async |stmt| {
                 let owner = stmt_tests::lock_owner(stmt);
                 first_owner.set(Some(owner));
@@ -3043,7 +3080,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-            let second_owner = std::cell::Cell::new(None);
+            let second_owner = Cell::new(None);
             trx.exec(async |stmt| {
                 let owner = stmt_tests::lock_owner(stmt);
                 second_owner.set(Some(owner));
@@ -3063,7 +3100,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-            let error_owner = std::cell::Cell::new(None);
+            let error_owner = Cell::new(None);
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     let owner = stmt_tests::lock_owner(stmt);
@@ -3460,7 +3497,7 @@ pub(crate) mod tests {
                 .expect("terminal rollback worker should start");
             drop(rollback);
 
-            std::thread::scope(|scope| {
+            scope(|scope| {
                 let (done_tx, done_rx) = mpsc::channel();
                 let shutdown_engine = &engine;
                 let shutdown = scope.spawn(move || {
@@ -3612,7 +3649,7 @@ pub(crate) mod tests {
             let large = "r".repeat(48 * 1024);
 
             fn precommit_with_cold_row_undo(
-                session: &mut crate::session::Session,
+                session: &mut Session,
                 table_id: TableID,
                 cts: TrxID,
             ) -> PrecommitTrx {
@@ -3682,7 +3719,7 @@ pub(crate) mod tests {
                     evicted = true;
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(50)).await;
+                Timer::after(Duration::from_millis(50)).await;
             }
             assert!(evicted, "failed-precommit rollback page should be evicted");
 
@@ -3710,7 +3747,7 @@ pub(crate) mod tests {
                 "latest precommit rollback should reload the evicted row page"
             );
             assert_eq!(
-                engine.inner().trx_sys.fatal_rollback_retention_len(),
+                fatal_rollback_retention_count(&engine.inner().trx_sys),
                 3,
                 "reverse cleanup should fail on the newest transaction first and retain older unprocessed payloads"
             );
@@ -3855,7 +3892,7 @@ pub(crate) mod tests {
             assert_eq!(table_file.active_root_unchecked().root_ts, TrxID::new(2));
 
             for _ in 0..10 {
-                smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                Timer::after(Duration::from_millis(10)).await;
                 assert_eq!(
                     old_root_drop_count(old_root_ptr),
                     drop_count_before,
@@ -3868,7 +3905,7 @@ pub(crate) mod tests {
                 if old_root_drop_count(old_root_ptr) > drop_count_before {
                     return;
                 }
-                smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                Timer::after(Duration::from_millis(10)).await;
             }
             panic!("old root was not released after the fence crossed the purge horizon");
         });
