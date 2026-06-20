@@ -7,7 +7,7 @@
 mod state;
 
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::{OperationError, Result};
+use crate::error::{Error, OperationError, Result};
 use crate::id::{SessionID, TableID, TrxID};
 use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -135,6 +135,7 @@ pub(crate) struct FreshLockGuard<'a> {
 }
 
 impl<'a> FreshLockGuard<'a> {
+    /// Creates a guard that releases a fresh grant on drop.
     #[inline]
     pub(crate) fn new(
         lock_manager: &'a LockManager,
@@ -150,6 +151,7 @@ impl<'a> FreshLockGuard<'a> {
         })
     }
 
+    /// Marks the guarded fresh lock as externally owned.
     #[inline]
     pub(crate) fn disarm(&mut self) {
         self.active = false;
@@ -1185,7 +1187,7 @@ fn upgrade_would_block_err(
     held: LockMode,
     requested: LockMode,
     owner: LockOwner,
-) -> crate::error::Error {
+) -> Error {
     Report::new(OperationError::LockUpgradeWouldBlock)
         .attach(format!(
             "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
@@ -1199,7 +1201,7 @@ fn conversion_not_supported_err(
     held: LockMode,
     requested: LockMode,
     owner: LockOwner,
-) -> crate::error::Error {
+) -> Error {
     Report::new(OperationError::LockConversionNotSupported)
         .attach(format!(
             "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
@@ -1215,7 +1217,7 @@ fn owner_group_conflict_err(
     owner: LockOwner,
     owner_group: LockOwnerGroup,
     held_owner: LockOwner,
-) -> crate::error::Error {
+) -> Error {
     Report::new(OperationError::LockOwnerGroupConflict)
         .attach(format!(
             "resource={resource:?}, owner={owner:?}, owner_group={owner_group:?}, \
@@ -1225,11 +1227,7 @@ fn owner_group_conflict_err(
 }
 
 #[inline]
-fn waiter_released_err(
-    resource: LockResource,
-    mode: LockMode,
-    owner: LockOwner,
-) -> crate::error::Error {
+fn waiter_released_err(resource: LockResource, mode: LockMode, owner: LockOwner) -> Error {
     Report::new(OperationError::LockWaiterReleased)
         .attach(format!(
             "resource={resource:?}, owner={owner:?}, mode={mode:?}"
@@ -1243,7 +1241,7 @@ fn waiter_failed_err(
     mode: LockMode,
     owner: LockOwner,
     error: OperationError,
-) -> crate::error::Error {
+) -> Error {
     Report::new(error)
         .attach(format!(
             "resource={resource:?}, owner={owner:?}, mode={mode:?}"
@@ -1254,6 +1252,7 @@ fn waiter_failed_err(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use smol::Timer;
     use std::time::Duration;
 
     /// Debug snapshot of all granted locks and queued waiters.
@@ -1425,7 +1424,7 @@ pub(crate) mod tests {
             if count_entries(&snapshot, resource, LockDebugEntryState::Waiting) == expected {
                 return;
             }
-            smol::Timer::after(Duration::from_millis(1)).await;
+            Timer::after(Duration::from_millis(1)).await;
         }
         panic!("waiter count did not reach {expected}");
     }
@@ -1445,7 +1444,7 @@ pub(crate) mod tests {
             if actual == expected {
                 return;
             }
-            smol::Timer::after(Duration::from_millis(1)).await;
+            Timer::after(Duration::from_millis(1)).await;
         }
         panic!("waiter guard count did not reach {expected}");
     }
