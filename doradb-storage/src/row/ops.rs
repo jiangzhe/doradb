@@ -6,18 +6,23 @@ use crate::value::Val;
 use serde::{Deserialize, Serialize};
 use std::mem;
 
+/// Logical lookup key for one table index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectKey {
+    /// Index ordinal in table metadata.
     pub index_no: usize,
+    /// Serialized key column values in index order.
     pub vals: Vec<Val>,
 }
 
 impl SelectKey {
+    /// Creates a lookup key from an index ordinal and key values.
     #[inline]
     pub fn new(index_no: usize, vals: Vec<Val>) -> Self {
         SelectKey { index_no, vals }
     }
 
+    /// Creates a lookup key with all key values set to null.
     #[inline]
     pub fn null(index_no: usize, val_count: usize) -> Self {
         SelectKey {
@@ -52,6 +57,7 @@ impl Deser for SelectKey {
     }
 }
 
+/// Row-page point-select result.
 pub(crate) enum Select<'a> {
     #[expect(dead_code, reason = "reserved Select::Ok")]
     Ok(Row<'a>),
@@ -60,6 +66,7 @@ pub(crate) enum Select<'a> {
     NotFound,
 }
 
+/// MVCC point-select result.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SelectMvcc {
     Found(Vec<Val>),
@@ -67,16 +74,19 @@ pub enum SelectMvcc {
 }
 
 impl SelectMvcc {
+    /// Returns whether the select found a visible row.
     #[inline]
     pub fn is_found(&self) -> bool {
         matches!(self, SelectMvcc::Found(_))
     }
 
+    /// Returns whether the select did not find a visible row.
     #[inline]
     pub fn not_found(&self) -> bool {
         matches!(self, SelectMvcc::NotFound)
     }
 
+    /// Unwraps the found row values.
     #[inline]
     pub fn unwrap_found(self) -> Vec<Val> {
         match self {
@@ -86,17 +96,20 @@ impl SelectMvcc {
     }
 }
 
+/// MVCC scan result.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScanMvcc {
     Rows(Vec<Vec<Val>>),
 }
 
 impl ScanMvcc {
+    /// Returns whether the scan result carries rows.
     #[inline]
     pub fn has_rows(&self) -> bool {
         matches!(self, ScanMvcc::Rows(_))
     }
 
+    /// Unwraps the scanned row values.
     #[inline]
     pub fn unwrap_rows(self) -> Vec<Vec<Val>> {
         match self {
@@ -105,12 +118,14 @@ impl ScanMvcc {
     }
 }
 
+/// Physical row-read result.
 pub(crate) enum ReadRow {
     Ok(Vec<Val>),
     NotFound,
     InvalidIndex,
 }
 
+/// Row-page insert result.
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved InsertRow"))]
 pub(crate) enum InsertRow {
     Ok(RowID),
@@ -126,6 +141,7 @@ impl InsertRow {
     }
 }
 
+/// Result of linking a unique-index entry to an older row version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkForUniqueIndex {
     Linked,
@@ -134,6 +150,7 @@ pub(crate) enum LinkForUniqueIndex {
     DuplicateKey,
 }
 
+/// Row-page in-place update result.
 pub(crate) enum Update {
     // RowID may change if the update is out-of-place.
     #[expect(dead_code, reason = "reserved Update::Ok")]
@@ -156,6 +173,7 @@ impl Update {
     }
 }
 
+/// MVCC update result.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateMvcc {
     Updated(RowID),
@@ -170,6 +188,7 @@ impl UpdateMvcc {
     }
 }
 
+/// Secondary-index update result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateIndex {
     // sometimes we may get back page guard to update next index.
@@ -179,12 +198,14 @@ pub(crate) enum UpdateIndex {
 }
 
 impl UpdateIndex {
+    /// Returns whether the index update succeeded.
     #[inline]
     pub(crate) fn is_updated(&self) -> bool {
         matches!(self, UpdateIndex::Updated)
     }
 }
 
+/// Secondary-index insert result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InsertIndex {
     Inserted,
@@ -192,6 +213,7 @@ pub(crate) enum InsertIndex {
     DuplicateKey,
 }
 
+/// Common access to update values stored in undo records.
 pub(crate) trait UndoVal {
     /// Returns column index.
     fn idx(&self) -> usize;
@@ -200,9 +222,12 @@ pub(crate) trait UndoVal {
     fn val(&self) -> &Val;
 }
 
+/// Column update value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateCol {
+    /// Column index to update.
     pub idx: usize,
+    /// New column value.
     pub val: Val,
 }
 
@@ -251,12 +276,16 @@ impl UndoVal for UpdateCol {
     }
 }
 
+/// Column value captured for undo processing.
 pub struct UndoCol {
+    /// Column index to restore.
     pub idx: usize,
+    /// Previous column value.
     pub val: Val,
     // If value is var-len field and not inlined,
     // we need to record its original offset in page
     // to support rollback without new allocation.
+    /// Previous out-of-line variable-length value offset, when available.
     pub var_offset: Option<u16>,
 }
 
@@ -272,17 +301,20 @@ impl UndoVal for UndoCol {
     }
 }
 
+/// Transactional row-update result.
 pub(crate) enum UpdateRow<'a> {
     Ok(RowMut<'a>),
     NoFreeSpaceOrFrozen(Vec<(Val, Option<u16>)>),
 }
 
+/// Row-page delete result.
 pub(crate) enum Delete {
     Ok,
     NotFound,
     AlreadyDeleted,
 }
 
+/// MVCC delete result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteMvcc {
     Deleted,
@@ -291,11 +323,13 @@ pub enum DeleteMvcc {
 }
 
 impl DeleteMvcc {
+    /// Returns whether the delete succeeded.
     #[inline]
     pub fn is_deleted(&self) -> bool {
         matches!(self, DeleteMvcc::Deleted)
     }
 
+    /// Returns whether the delete target was not found.
     #[inline]
     pub fn not_found(&self) -> bool {
         matches!(self, DeleteMvcc::NotFound)

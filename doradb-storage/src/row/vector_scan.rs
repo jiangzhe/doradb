@@ -20,38 +20,10 @@ use zerocopy::byteorder::little_endian::{
     U32 as LeU32, U64 as LeU64,
 };
 
-#[inline]
-fn column_scan_shape_mismatch() -> Error {
-    Report::new(InternalError::ColumnScanShapeMismatch).into()
-}
-
+/// Reusable column-oriented scan result buffer.
 pub(crate) struct ScanBuffer {
     cols: Vec<ColBuffer>,
     len: usize,
-}
-
-pub(crate) struct ScanColumn<'a> {
-    #[expect(dead_code, reason = "reserved col_idx")]
-    pub col_idx: usize,
-    pub null_bitmap: Option<&'a [u64]>,
-    pub values: ScanColumnValues<'a>,
-}
-
-pub(crate) enum ScanColumnValues<'a> {
-    I8(&'a [i8]),
-    U8(&'a [u8]),
-    I16(&'a [i16]),
-    U16(&'a [u16]),
-    I32(&'a [i32]),
-    U32(&'a [u32]),
-    F32(&'a [f32]),
-    I64(&'a [i64]),
-    U64(&'a [u64]),
-    F64(&'a [f64]),
-    VarByte {
-        offsets: &'a [(usize, usize)],
-        data: &'a [u8],
-    },
 }
 
 impl ScanBuffer {
@@ -262,6 +234,36 @@ impl ScanBuffer {
     }
 }
 
+/// Borrowed view of one scanned column in a scan buffer.
+pub(crate) struct ScanColumn<'a> {
+    /// Original table column index.
+    #[expect(dead_code, reason = "reserved col_idx")]
+    pub col_idx: usize,
+    /// Null bitmap for nullable columns.
+    pub null_bitmap: Option<&'a [u64]>,
+    /// Column values in scan-buffer storage.
+    pub values: ScanColumnValues<'a>,
+}
+
+/// Borrowed typed values for one scanned column.
+pub(crate) enum ScanColumnValues<'a> {
+    I8(&'a [i8]),
+    U8(&'a [u8]),
+    I16(&'a [i16]),
+    U16(&'a [u16]),
+    I32(&'a [i32]),
+    U32(&'a [u32]),
+    F32(&'a [f32]),
+    I64(&'a [i64]),
+    U64(&'a [u64]),
+    F64(&'a [f64]),
+    VarByte {
+        offsets: &'a [(usize, usize)],
+        data: &'a [u8],
+    },
+}
+
+/// Mutable storage for one scan-buffer column.
 pub(crate) struct ColBuffer {
     col_idx: usize,
     null_bitmap: Option<Vec<u64>>,
@@ -302,6 +304,42 @@ pub(crate) struct PageVectorView<'p, 'm> {
     // it can be modified to represent an old view when
     // MVCC is enabled.
     del_bitmap: Vec<u64>,
+}
+
+impl<'p, 'm> PageVectorView<'p, 'm> {
+    /// Create a page vector view.
+    #[inline]
+    pub(crate) fn new(page: &'p RowPage, col_layout: &'m TableColumnLayout) -> Self {
+        let row_count = page.header.row_count();
+        let del_bitmap = page.del_bitmap(row_count);
+        PageVectorView {
+            page,
+            col_layout,
+            row_count,
+            del_bitmap,
+        }
+    }
+
+    /// Count rows not deleted.
+    #[inline]
+    pub(crate) fn rows_non_deleted(&self) -> usize {
+        self.del_bitmap
+            .bitmap_range_iter(self.row_count)
+            .map(|(f, n)| if f { 0 } else { n })
+            .sum()
+    }
+
+    /// Returns range of non-deleted rows.
+    #[inline]
+    pub(crate) fn range_non_deleted(&self) -> BitmapRangeFilter<'_> {
+        self.del_bitmap.bitmap_range_filter(self.row_count, false)
+    }
+
+    /// Returns null bitmap and value data of given column.
+    #[inline]
+    pub(crate) fn col(&self, col_idx: usize) -> (Option<RowPageNullBitmap<'p>>, ValArrayRef<'p>) {
+        self.page.vals(self.col_layout, col_idx, self.row_count)
+    }
 }
 
 impl RowPage {
@@ -371,42 +409,6 @@ impl RowPage {
     }
 }
 
-impl<'p, 'm> PageVectorView<'p, 'm> {
-    /// Create a page vector view.
-    #[inline]
-    pub(crate) fn new(page: &'p RowPage, col_layout: &'m TableColumnLayout) -> Self {
-        let row_count = page.header.row_count();
-        let del_bitmap = page.del_bitmap(row_count);
-        PageVectorView {
-            page,
-            col_layout,
-            row_count,
-            del_bitmap,
-        }
-    }
-
-    /// Count rows not deleted.
-    #[inline]
-    pub(crate) fn rows_non_deleted(&self) -> usize {
-        self.del_bitmap
-            .bitmap_range_iter(self.row_count)
-            .map(|(f, n)| if f { 0 } else { n })
-            .sum()
-    }
-
-    /// Returns range of non-deleted rows.
-    #[inline]
-    pub(crate) fn range_non_deleted(&self) -> BitmapRangeFilter<'_> {
-        self.del_bitmap.bitmap_range_filter(self.row_count, false)
-    }
-
-    /// Returns null bitmap and value data of given column.
-    #[inline]
-    pub(crate) fn col(&self, col_idx: usize) -> (Option<RowPageNullBitmap<'p>>, ValArrayRef<'p>) {
-        self.page.vals(self.col_layout, col_idx, self.row_count)
-    }
-}
-
 /// Represents the safe typed value array in row page.
 pub(crate) enum ValArrayRef<'a> {
     I8(&'a [i8]),
@@ -420,6 +422,11 @@ pub(crate) enum ValArrayRef<'a> {
     U64(&'a [LeU64]),
     F64(&'a [LeF64]),
     VarByte(&'a [PageVar], &'a [u8]),
+}
+
+#[inline]
+fn column_scan_shape_mismatch() -> Error {
+    Report::new(InternalError::ColumnScanShapeMismatch).into()
 }
 
 #[cfg(test)]
