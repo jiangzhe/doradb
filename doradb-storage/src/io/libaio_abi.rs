@@ -1,5 +1,9 @@
 use libc::{c_int, c_long, timespec};
+use std::ptr::null_mut;
 
+pub use linux::*;
+
+/// libaio operation opcode values used in `iocb` submissions.
 #[expect(non_camel_case_types, reason = "ffi")]
 #[expect(dead_code, reason = "ffi")]
 pub enum io_iocb_cmd {
@@ -14,10 +18,13 @@ pub enum io_iocb_cmd {
     IO_CMD_PWRITEV = 8,
 }
 
+/// C-compatible vector buffer descriptor used by the libaio ABI.
 #[repr(C)]
 #[cfg_attr(feature = "libaio", expect(dead_code, reason = "ffi"))]
 pub struct iovec {
+    /// Base pointer of the vector buffer.
     pub iov_base: *mut u8,
+    /// Byte length of the vector buffer.
     pub iov_len: usize,
 }
 
@@ -53,7 +60,7 @@ mod linux {
                 aio_lio_opcode: io_iocb_cmd::IO_CMD_NOOP as u16,
                 aio_reqprio: 0,
                 aio_fildes: !0,
-                buf: std::ptr::null_mut(),
+                buf: null_mut(),
                 count: 0,
                 offset: 0,
                 _padding: 0,
@@ -72,7 +79,7 @@ mod linux {
             self.aio_lio_opcode = io_iocb_cmd::IO_CMD_NOOP as u16;
             self.aio_reqprio = 0;
             self.aio_fildes = !0;
-            self.buf = std::ptr::null_mut();
+            self.buf = null_mut();
             self.count = 0;
             self.offset = 0;
             self._padding = 0;
@@ -103,7 +110,7 @@ mod linux {
         fn default() -> Self {
             io_event {
                 data: 0,
-                obj: std::ptr::null_mut(),
+                obj: null_mut(),
                 res: 0,
                 res2: 0,
             }
@@ -142,15 +149,15 @@ mod linux {
         ) -> c_int;
     }
 }
-pub use linux::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     #[test]
     fn test_libaoi_abi_size() {
-        assert!(std::mem::size_of::<io_event>() == 32);
-        assert!(std::mem::size_of::<iocb>() == 64);
+        assert!(size_of::<io_event>() == 32);
+        assert!(size_of::<iocb>() == 64);
     }
 }

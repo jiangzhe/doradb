@@ -15,33 +15,32 @@ mod libaio_backend;
 
 use flume::{Receiver, SendError, Sender};
 use std::collections::VecDeque;
+use std::mem::replace;
 use std::os::unix::io::RawFd;
+use std::ptr::null_mut;
 use std::result::Result as StdResult;
 
 pub(crate) use backend::*;
 pub(crate) use buf::*;
 pub(crate) use completion::Completion;
 
+/// Canonical storage backend selected by cargo features.
 #[cfg(feature = "iouring")]
-/// Canonical storage backend selected by cargo features.
 pub(crate) use iouring_backend::IouringBackend as StorageBackend;
-#[cfg(feature = "libaio")]
 /// Canonical storage backend selected by cargo features.
+#[cfg(feature = "libaio")]
 pub(crate) use libaio_backend::LibaioBackend as StorageBackend;
-
-pub(crate) const STORAGE_SECTOR_SIZE: usize = 4096;
-
-/// Align given input length to storage sector size.
-#[inline]
-pub(crate) fn align_to_sector_size(len: usize) -> usize {
-    len.max(STORAGE_SECTOR_SIZE).div_ceil(STORAGE_SECTOR_SIZE) * STORAGE_SECTOR_SIZE
-}
 
 #[cfg(test)]
 pub(crate) use self::tests::{
     StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
     current_storage_backend_test_hook, install_storage_backend_test_hook,
 };
+
+/// Logical sector size required by storage Direct I/O buffers and offsets.
+pub(crate) const STORAGE_SECTOR_SIZE: usize = 4096;
+
+const INVALID_SLOT: u32 = u32::MAX;
 
 /// Buffer ownership model for one backend-agnostic IO operation.
 ///
@@ -167,10 +166,10 @@ impl Operation {
     /// Takes ownership of the direct buffer if this completion owns one.
     #[inline]
     pub(crate) fn take_buf(&mut self) -> Option<DirectBuf> {
-        match std::mem::replace(
+        match replace(
             &mut self.memory,
             IOMemory::Borrowed {
-                ptr: std::ptr::null_mut(),
+                ptr: null_mut(),
                 len: 0,
             },
         ) {
@@ -204,12 +203,14 @@ impl Operation {
     }
 }
 
+/// Direction of one backend IO operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IOKind {
     Read,
     Write,
 }
 
+/// Message delivered from IO clients to storage IO workers.
 pub(crate) enum IOMessage<T> {
     Shutdown,
     Req(T),
@@ -225,6 +226,7 @@ impl<T> IOMessage<T> {
     }
 }
 
+/// FIFO queue of backend-agnostic IO submissions prepared by a state machine.
 pub(crate) struct IOQueue<T> {
     reqs: VecDeque<T>,
 }
@@ -250,6 +252,7 @@ impl<T> IOQueue<T> {
         self.len() == 0
     }
 
+    /// Removes and returns up to `n` requests from the front of the queue.
     #[inline]
     pub(crate) fn drain_to(&mut self, n: usize) -> Vec<T> {
         let count = n.min(self.reqs.len());
@@ -262,11 +265,13 @@ impl<T> IOQueue<T> {
         true
     }
 
+    /// Appends one request to the back of the queue.
     #[inline]
     pub(crate) fn push(&mut self, req: T) {
         self.reqs.push_back(req);
     }
 
+    /// Removes and returns the request at the front of the queue.
     #[inline]
     pub(crate) fn pop_front(&mut self) -> Option<T> {
         self.reqs.pop_front()
@@ -283,7 +288,6 @@ pub(crate) trait IOSubmission {
     fn operation(&mut self) -> &mut Operation;
 }
 
-const INVALID_SLOT: u32 = u32::MAX;
 enum Entry<T> {
     Occupied(T),
     Vacant(u32),
@@ -367,7 +371,7 @@ impl<T> InflightSlots<T> {
             slot_ref.generation
         );
         let prev_head = self.free_head;
-        let entry = std::mem::replace(&mut slot_ref.entry, Entry::Vacant(prev_head));
+        let entry = replace(&mut slot_ref.entry, Entry::Vacant(prev_head));
         slot_ref.generation = slot_ref.generation.wrapping_add(1);
         self.free_head = slot;
         match entry {
@@ -388,7 +392,9 @@ struct InflightEntry<S, P> {
 
 /// One completed backend submission returned by [`SubmissionDriver`].
 pub(crate) struct CompletedSubmission<S> {
+    /// Original higher-level submission associated with this completion.
     pub(crate) submission: S,
+    /// Backend completion result for the submitted operation.
     pub(crate) result: StdIoResult<usize>,
 }
 
@@ -605,6 +611,7 @@ pub(crate) trait IOStateMachine {
 pub(crate) struct IOClient<T>(Sender<IOMessage<T>>);
 
 impl<T> IOClient<T> {
+    /// Creates one bounded worker ingress channel and its client handle.
     #[inline]
     pub(crate) fn bounded(backlog: usize) -> (Receiver<IOMessage<T>>, Self) {
         let (tx, rx) = flume::bounded(backlog);
@@ -648,9 +655,17 @@ impl<T> Clone for IOClient<T> {
     }
 }
 
+/// Align given input length to storage sector size.
+#[inline]
+pub(crate) fn align_to_sector_size(len: usize) -> usize {
+    len.max(STORAGE_SECTOR_SIZE).div_ceil(STORAGE_SECTOR_SIZE) * STORAGE_SECTOR_SIZE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::metadata;
+    use std::io::{Error as StdIoError, Result as IoResult};
     use std::mem::MaybeUninit;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
@@ -664,8 +679,8 @@ mod tests {
 
     impl StorageBackendFileIdentity {
         #[inline]
-        pub(crate) fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
-            let md = std::fs::metadata(path)?;
+        pub(crate) fn from_path(path: impl AsRef<Path>) -> IoResult<Self> {
+            let md = metadata(path)?;
             Ok(Self {
                 dev: md.dev(),
                 ino: md.ino(),
@@ -673,7 +688,7 @@ mod tests {
         }
 
         #[inline]
-        fn from_fd(fd: RawFd) -> std::io::Result<Self> {
+        fn from_fd(fd: RawFd) -> IoResult<Self> {
             // SAFETY: `fstat` initializes the output struct on success and does
             // not take ownership of the borrowed raw fd.
             unsafe {
@@ -685,7 +700,7 @@ mod tests {
                         ino: stat.st_ino,
                     })
                 } else {
-                    Err(std::io::Error::last_os_error())
+                    Err(StdIoError::last_os_error())
                 }
             }
         }
@@ -734,8 +749,7 @@ mod tests {
     type StorageBackendHook = Arc<dyn StorageBackendTestHook>;
 
     static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    static STORAGE_BACKEND_TEST_HOOK: std::sync::Mutex<Option<StorageBackendHook>> =
-        std::sync::Mutex::new(None);
+    static STORAGE_BACKEND_TEST_HOOK: Mutex<Option<StorageBackendHook>> = Mutex::new(None);
 
     #[inline]
     fn lock_storage_backend_test_hook_gate() -> MutexGuard<'static, ()> {
@@ -774,7 +788,7 @@ mod tests {
         hook: Option<StorageBackendHook>,
     ) -> Option<StorageBackendHook> {
         let mut guard = lock_storage_backend_test_hook_state();
-        std::mem::replace(&mut *guard, hook)
+        replace(&mut *guard, hook)
     }
 
     #[inline]

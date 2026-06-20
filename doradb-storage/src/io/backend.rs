@@ -1,8 +1,10 @@
+use std::io::Error as StdIoError;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) type StdIoResult<T> = StdResult<T, std::io::Error>;
+/// Standard IO result returned by backend completion paths.
+pub(crate) type StdIoResult<T> = StdResult<T, StdIoError>;
 
 /// Worker-owned completion token stored in backend user-data fields.
 ///
@@ -96,10 +98,12 @@ struct IOBackendStatsCounters {
     wait_completions: AtomicUsize,
 }
 
+/// Shared handle used to collect backend submit and wait statistics.
 #[derive(Clone, Default)]
 pub(crate) struct IOBackendStatsHandle(Arc<IOBackendStatsCounters>);
 
 impl IOBackendStatsHandle {
+    /// Returns a point-in-time snapshot of backend activity counters.
     #[inline]
     pub(crate) fn snapshot(&self) -> IOBackendStats {
         IOBackendStats {
@@ -110,6 +114,7 @@ impl IOBackendStatsHandle {
         }
     }
 
+    /// Records submit-or-wait calls and their elapsed time in nanoseconds.
     #[inline]
     pub(crate) fn record_submit_and_wait(&self, submit_and_wait_calls: usize, nanos: usize) {
         if submit_and_wait_calls != 0 {
@@ -124,6 +129,7 @@ impl IOBackendStatsHandle {
         }
     }
 
+    /// Records operations accepted by the backend submit path.
     #[inline]
     pub(crate) fn record_submitted_ops(&self, submitted_ops: usize) {
         if submitted_ops != 0 {
@@ -133,6 +139,7 @@ impl IOBackendStatsHandle {
         }
     }
 
+    /// Records completions returned by the backend wait path.
     #[inline]
     pub(crate) fn record_wait_completions(&self, wait_completions: usize) {
         if wait_completions != 0 {
@@ -142,6 +149,7 @@ impl IOBackendStatsHandle {
         }
     }
 
+    /// Returns the allocation identity of the shared stats counters.
     #[cfg(test)]
     #[inline]
     pub(crate) fn identity(&self) -> usize {
