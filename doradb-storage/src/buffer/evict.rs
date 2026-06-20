@@ -39,6 +39,7 @@ use crate::{IndexPool, MemPool};
 use error_stack::{Report, ensure};
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
+use smol::future::yield_now;
 use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
 use std::mem;
@@ -84,11 +85,13 @@ impl EvictableBufferPool {
         Ok(())
     }
 
+    /// Returns the runtime identity of this pool instance.
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
         self.arena.identity()
     }
 
+    /// Returns this evictable pool as a row-pool role.
     #[inline]
     pub(crate) fn row_pool_role(&self) -> RowPoolRole {
         self.role.row_pool_role()
@@ -224,7 +227,7 @@ impl EvictableBufferPool {
 
         match action {
             DispatchAction::RetryYield => {
-                smol::future::yield_now().await;
+                yield_now().await;
             }
             DispatchAction::Shutdown => {
                 return Err(Report::new(LifecycleError::Shutdown).into());
@@ -638,6 +641,22 @@ impl Supplier<FileSystemWorkers> for IndexPool {
     type Provision = SparseFile;
 }
 
+/// Backend-facing pool submission emitted by `EvictablePoolStateMachine`.
+pub(crate) enum EvictSubmission {
+    Read(PreparedEvictReadSubmission),
+    Write(PageIO),
+}
+
+impl IOSubmission for EvictSubmission {
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        match self {
+            EvictSubmission::Read(sub) => sub.operation(),
+            EvictSubmission::Write(sub) => sub.operation(),
+        }
+    }
+}
+
 /// IO worker state machine for [`EvictableBufferPool`].
 ///
 /// It translates high-level pool requests into concrete page IO submissions and
@@ -657,42 +676,6 @@ impl EvictablePoolStateMachine {
     #[inline]
     fn block_key(&self, page_id: PageID) -> BlockKey {
         BlockKey::new(self.file.file_id(), BlockID::from(u64::from(page_id)))
-    }
-}
-
-#[inline]
-fn write_evictable_spill_checksum(page: &mut Page) {
-    write_block_checksum(page);
-}
-
-#[inline]
-fn validate_evictable_spill_checksum(
-    page: &Page,
-    role: PoolRole,
-    page_id: PageID,
-) -> CompletionResult<()> {
-    validate_block_checksum(page).map_err(|err| {
-        let reason = *err.current_context();
-        err.change_context(CompletionErrorKind::DataIntegrity(reason))
-            .attach(format!(
-                "validate evictable spill page checksum: role={role:?}, page_id={page_id}"
-            ))
-    })
-}
-
-/// Backend-facing pool submission emitted by `EvictablePoolStateMachine`.
-pub(crate) enum EvictSubmission {
-    Read(PreparedEvictReadSubmission),
-    Write(PageIO),
-}
-
-impl IOSubmission for EvictSubmission {
-    #[inline]
-    fn operation(&mut self) -> &mut Operation {
-        match self {
-            EvictSubmission::Read(sub) => sub.operation(),
-            EvictSubmission::Write(sub) => sub.operation(),
-        }
     }
 }
 
@@ -1194,6 +1177,7 @@ impl EvictReadSubmission {
         }
     }
 
+    /// Returns the page id being reloaded.
     #[inline]
     pub(crate) fn page_id(&self) -> PageID {
         self.key
@@ -1242,8 +1226,8 @@ impl EvictReadSubmission {
         }
     }
 
-    #[inline]
     /// Fails the reload before worker completion and wakes joined readers.
+    #[inline]
     pub(crate) fn fail(mut self, err: Report<CompletionErrorKind>) {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
@@ -1251,17 +1235,18 @@ impl EvictReadSubmission {
         self.complete_waiters(Err(err));
     }
 
+    /// Records that the backend accepted this read submission into running state.
     #[inline]
     pub(crate) fn record_running(&self) {
         self.stats.add_running_reads(1);
     }
 
-    #[inline]
     /// Finalizes one worker-side evictable read completion.
     ///
     /// Successful full-page reads publish the reserved page back to `Hot`.
     /// Short reads and IO errors drop the reservation so memory accounting is
     /// rolled back before waiters are released.
+    #[inline]
     pub(crate) fn complete(mut self, res: StdIoResult<usize>) -> IOKind {
         let page_id = self.key;
         let result = match res {
@@ -1307,6 +1292,26 @@ impl EvictReadSubmission {
     }
 }
 
+impl Drop for EvictReadSubmission {
+    #[inline]
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        drop(self.reservation.take());
+        self.stats.add_completed_reads(1);
+        self.stats.add_read_errors(1);
+        self.complete_waiters(Err(CompletionErrorKind::report_internal(
+            InternalError::CompletionDropped,
+            format!(
+                "drop evict read submission before completion: page_id={}",
+                self.key
+            ),
+        )));
+    }
+}
+
+/// Prepared backend read operation for an evictable-pool reload.
 pub(crate) struct PreparedEvictReadSubmission {
     inner: EvictReadSubmission,
     block_key: BlockKey,
@@ -1335,88 +1340,6 @@ impl IOSubmission for PreparedEvictReadSubmission {
     fn operation(&mut self) -> &mut Operation {
         &mut self.operation
     }
-}
-
-impl Drop for EvictReadSubmission {
-    #[inline]
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        drop(self.reservation.take());
-        self.stats.add_completed_reads(1);
-        self.stats.add_read_errors(1);
-        self.complete_waiters(Err(CompletionErrorKind::report_internal(
-            InternalError::CompletionDropped,
-            format!(
-                "drop evict read submission before completion: page_id={}",
-                self.key
-            ),
-        )));
-    }
-}
-
-/// Build one evictable pool together with the storage-worker provision it needs.
-pub(crate) fn build_pool_with_swap_file_field(
-    config: EvictableBufferPoolConfig,
-    swap_file_field_name: &'static str,
-    fs: QuiescentGuard<FileSystem>,
-) -> Result<(EvictableBufferPool, SparseFile)> {
-    config.role.assert_valid("evictable buffer pool");
-    validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)
-        .map_err(Error::from)?;
-    // 1. Calculate memory usage.
-    let max_file_size = config.max_file_size.as_u64() as usize;
-    let max_mem_size = config.max_mem_size.as_u64() as usize;
-    let max_nbr = max_file_size / mem::size_of::<Page>();
-    // We need to hold all frames in-memory, even if many pages
-    // can not be loaded into memory at the same time.
-    let frame_total_bytes = frame_total_bytes(max_nbr);
-    assert!(
-        max_mem_size <= max_file_size,
-        "max mem size of buffer pool should be no more than max file size"
-    );
-    assert!(
-        max_mem_size > frame_total_bytes,
-        "max mem size of buffer pool can not hold all buffer frames"
-    );
-    let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
-    if max_nbr_in_mem < MIN_IN_MEM_PAGES {
-        return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
-            .attach(format!(
-                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, in_mem_pages={max_nbr_in_mem}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
-            ))
-            .into());
-    }
-    let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
-
-    // 2. Initialize memory of frames and pages.
-    let arena = QuiescentArena::new(max_nbr)?;
-
-    // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
-    let swap_file_path =
-        path_to_utf8(&config.data_swap_file, swap_file_field_name).map_err(Error::from)?;
-    let file = SparseFile::create_or_trunc(
-        swap_file_path,
-        max_file_size,
-        match config.role {
-            PoolRole::Mem => MEM_POOL_SWAP_FILE_ID,
-            PoolRole::Index => INDEX_POOL_SWAP_FILE_ID,
-            other => panic!("unsupported pool role {other:?} in swap-file persisted id"),
-        },
-    )?;
-    let pool = EvictableBufferPool {
-        alloc_map: AllocMap::new(max_nbr),
-        alloc_ev: Event::new(),
-        fs,
-        shutdown_flag: Arc::new(AtomicBool::new(false)),
-        in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
-        inflight_io: Arc::new(InflightIO::default()),
-        stats: BufferPoolStatsHandle::default(),
-        role: config.role,
-        arena,
-    };
-    Ok((pool, file))
 }
 
 struct IOStatus {
@@ -1590,6 +1513,89 @@ pub(crate) enum PoolRequest {
     BatchWrite(Vec<PageExclusiveGuard<Page>>, Arc<EventNotifyOnDrop>),
 }
 
+/// Build one evictable pool together with the storage-worker provision it needs.
+pub(crate) fn build_pool_with_swap_file_field(
+    config: EvictableBufferPoolConfig,
+    swap_file_field_name: &'static str,
+    fs: QuiescentGuard<FileSystem>,
+) -> Result<(EvictableBufferPool, SparseFile)> {
+    config.role.assert_valid("evictable buffer pool");
+    validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)
+        .map_err(Error::from)?;
+    // 1. Calculate memory usage.
+    let max_file_size = config.max_file_size.as_u64() as usize;
+    let max_mem_size = config.max_mem_size.as_u64() as usize;
+    let max_nbr = max_file_size / mem::size_of::<Page>();
+    // We need to hold all frames in-memory, even if many pages
+    // can not be loaded into memory at the same time.
+    let frame_total_bytes = frame_total_bytes(max_nbr);
+    assert!(
+        max_mem_size <= max_file_size,
+        "max mem size of buffer pool should be no more than max file size"
+    );
+    assert!(
+        max_mem_size > frame_total_bytes,
+        "max mem size of buffer pool can not hold all buffer frames"
+    );
+    let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
+    if max_nbr_in_mem < MIN_IN_MEM_PAGES {
+        return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
+            .attach(format!(
+                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, in_mem_pages={max_nbr_in_mem}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
+            ))
+            .into());
+    }
+    let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
+
+    // 2. Initialize memory of frames and pages.
+    let arena = QuiescentArena::new(max_nbr)?;
+
+    // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
+    let swap_file_path =
+        path_to_utf8(&config.data_swap_file, swap_file_field_name).map_err(Error::from)?;
+    let file = SparseFile::create_or_trunc(
+        swap_file_path,
+        max_file_size,
+        match config.role {
+            PoolRole::Mem => MEM_POOL_SWAP_FILE_ID,
+            PoolRole::Index => INDEX_POOL_SWAP_FILE_ID,
+            other => panic!("unsupported pool role {other:?} in swap-file persisted id"),
+        },
+    )?;
+    let pool = EvictableBufferPool {
+        alloc_map: AllocMap::new(max_nbr),
+        alloc_ev: Event::new(),
+        fs,
+        shutdown_flag: Arc::new(AtomicBool::new(false)),
+        in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
+        inflight_io: Arc::new(InflightIO::default()),
+        stats: BufferPoolStatsHandle::default(),
+        role: config.role,
+        arena,
+    };
+    Ok((pool, file))
+}
+
+#[inline]
+fn write_evictable_spill_checksum(page: &mut Page) {
+    write_block_checksum(page);
+}
+
+#[inline]
+fn validate_evictable_spill_checksum(
+    page: &Page,
+    role: PoolRole,
+    page_id: PageID,
+) -> CompletionResult<()> {
+    validate_block_checksum(page).map_err(|err| {
+        let reason = *err.current_context();
+        err.change_context(CompletionErrorKind::DataIntegrity(reason))
+            .attach(format!(
+                "validate evictable spill page checksum: role={role:?}, page_id={page_id}"
+            ))
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1611,9 +1617,11 @@ pub(crate) mod tests {
     use crate::index::BTreeNode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
-    use std::io;
+    use std::env::current_dir;
+    use std::io::Error as StdIoError;
     use std::ops::Deref;
     use std::path::PathBuf;
+    use std::slice::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
@@ -1744,7 +1752,7 @@ pub(crate) mod tests {
                 .expect("absolute test swap file must have a parent")
                 .to_path_buf()
         } else {
-            std::env::current_dir().unwrap()
+            current_dir().unwrap()
         };
         let fs_owner = build_test_fs_owner_in(&storage_root)?;
         let fs = fs_owner.guard();
@@ -1772,7 +1780,7 @@ pub(crate) mod tests {
                     ),
                 )
             } else {
-                (std::env::current_dir().unwrap(), swap_file.to_path_buf())
+                (current_dir().unwrap(), swap_file.to_path_buf())
             };
             let config = config.data_swap_file(data_swap_file);
             let engine = smol::block_on(async {
@@ -2162,9 +2170,7 @@ pub(crate) mod tests {
             page_guard.bf_mut().set_dirty(true);
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
 
-            owner
-                .inflight_io
-                .batch_writes(std::slice::from_ref(&page_guard));
+            owner.inflight_io.batch_writes(from_ref(&page_guard));
             let mut queue = IOQueue::with_capacity(1);
             let req = PoolRequest::BatchWrite(vec![page_guard], Arc::new(EventNotifyOnDrop::new()));
             assert!(state_machine.prepare_request(req, 1, &mut queue).is_none());
@@ -2182,7 +2188,7 @@ pub(crate) mod tests {
 
             let kind = state_machine.on_complete(
                 EvictSubmission::Write(sub),
-                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Err(StdIoError::from_raw_os_error(libc::EIO)),
             );
             assert_eq!(kind, StorageIOKind::Write);
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
@@ -2338,7 +2344,7 @@ pub(crate) mod tests {
                     page_guard,
                     batch_done: None,
                 }),
-                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Err(StdIoError::from_raw_os_error(libc::EIO)),
             );
 
             assert_eq!(kind, StorageIOKind::Write);
@@ -2346,7 +2352,7 @@ pub(crate) mod tests {
             let report = completion.wait_result().await.unwrap_err();
             assert_eq!(
                 *report.current_context(),
-                CompletionErrorKind::Io(io::Error::from_raw_os_error(libc::EIO).kind())
+                CompletionErrorKind::Io(StdIoError::from_raw_os_error(libc::EIO).kind())
             );
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
@@ -2469,13 +2475,13 @@ pub(crate) mod tests {
                     page_guard,
                     batch_done: None,
                 }),
-                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Err(StdIoError::from_raw_os_error(libc::EIO)),
             );
             assert_eq!(kind, StorageIOKind::Write);
             let report = completion.wait_result().await.unwrap_err();
             assert_eq!(
                 *report.current_context(),
-                CompletionErrorKind::Io(io::Error::from_raw_os_error(libc::EIO).kind())
+                CompletionErrorKind::Io(StdIoError::from_raw_os_error(libc::EIO).kind())
             );
 
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);

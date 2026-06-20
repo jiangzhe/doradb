@@ -13,13 +13,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Stdio, exit};
 use std::time::{SystemTime, UNIX_EPOCH};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Fields, ImplItem, Item, ItemImpl, ItemMod, ItemTrait, Path as SynPath, TraitItem,
-    Type, Visibility,
+    Attribute, Fields, ImplItem, Item, ItemImpl, ItemMod, ItemTrait, ItemUse, Path as SynPath,
+    TraitItem, Type, UseTree, Visibility,
 };
 
 const FMT_COMMAND: &[&str] = &["fmt", "--all", "--", "--check"];
@@ -62,6 +62,12 @@ struct TempSnapshot {
     path: PathBuf,
 }
 
+impl Drop for TempSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AuditFile {
     display_path: String,
@@ -74,9 +80,87 @@ struct Args {
     force_paths: Vec<PathBuf>,
 }
 
-impl Drop for TempSnapshot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+#[derive(Debug)]
+struct TestImportCandidate {
+    line: usize,
+    names: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct TestImportUsage {
+    test_module_refs: usize,
+    non_test_module_refs: usize,
+}
+
+impl TestImportUsage {
+    fn is_test_module_only(&self) -> bool {
+        self.test_module_refs > 0 && self.non_test_module_refs == 0
+    }
+}
+
+struct TestImportScopeVisitor<'a> {
+    imported_names: &'a BTreeSet<String>,
+    usage: BTreeMap<String, TestImportUsage>,
+    test_module_depth: usize,
+}
+
+impl<'ast> Visit<'ast> for TestImportScopeVisitor<'_> {
+    fn visit_item_mod(&mut self, item_mod: &'ast ItemMod) {
+        let entered_test_module = has_cfg_test(&item_mod.attrs);
+        if entered_test_module {
+            self.test_module_depth += 1;
+        }
+        visit::visit_item_mod(self, item_mod);
+        if entered_test_module {
+            self.test_module_depth -= 1;
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast SynPath) {
+        if let Some(segment) = path.segments.first() {
+            let name = segment.ident.to_string();
+            if self.imported_names.contains(&name) {
+                let usage = self.usage.entry(name).or_default();
+                if self.test_module_depth > 0 {
+                    usage.test_module_refs += 1;
+                } else {
+                    usage.non_test_module_refs += 1;
+                }
+            }
+        }
+        visit::visit_path(self, path);
+    }
+}
+
+struct QualifiedPathVisitor<'a> {
+    file_path: &'a str,
+    seen: BTreeSet<(usize, String)>,
+    violations: Vec<Violation>,
+}
+
+impl<'ast> Visit<'ast> for QualifiedPathVisitor<'_> {
+    fn visit_path(&mut self, path: &'ast SynPath) {
+        let separators = path.segments.len().saturating_sub(1);
+        if separators > 1 {
+            let line = span_line(path.span());
+            let path_text = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if self.seen.insert((line, path_text.clone())) {
+                self.violations.push(violation(
+                    self.file_path,
+                    line,
+                    "qualified-path",
+                    format!(
+                        "`{path_text}` contains more than one `::`; import it and use a shorter name"
+                    ),
+                ));
+            }
+        }
+        visit::visit_path(self, path);
     }
 }
 
@@ -92,7 +176,7 @@ fn main() {
             2
         }
     };
-    std::process::exit(code);
+    exit(code);
 }
 
 fn run() -> Result<i32, String> {
@@ -430,7 +514,8 @@ fn print_style_summary(label: &str, file_count: usize, violations: &[Violation])
 
 fn audit_content(path: &str, content: &str) -> Vec<Violation> {
     let lines = content.lines().map(str::to_string).collect::<Vec<_>>();
-    let parsed = match syn::parse_file(content) {
+    let parse_content = parseable_rust_content(content);
+    let parsed = match syn::parse_file(&parse_content) {
         Ok(parsed) => parsed,
         Err(err) => {
             return vec![Violation {
@@ -445,6 +530,7 @@ fn audit_content(path: &str, content: &str) -> Vec<Violation> {
     let mut out = Vec::new();
     check_top_level_order(path, &parsed.items, &mut out);
     check_tests_module(path, &parsed.items, &mut out);
+    check_test_import_scope(path, &parsed.items, &mut out);
     check_impl_adjacency(path, &parsed.items, &mut out);
     check_visible_docs(path, &parsed.items, &lines, &mut out);
     check_function_attributes(path, &parsed.items, &mut out);
@@ -457,6 +543,36 @@ fn audit_content(path: &str, content: &str) -> Vec<Violation> {
             .then(a.message.cmp(&b.message))
     });
     out
+}
+
+fn parseable_rust_content(content: &str) -> String {
+    let had_trailing_newline = content.ends_with('\n');
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut idx = 0;
+    if lines
+        .first()
+        .is_some_and(|line| line.starts_with("#!") && !line.starts_with("#!["))
+    {
+        lines[0].clear();
+        idx = 1;
+    }
+    if lines.get(idx).is_some_and(|line| line.trim() == "---") {
+        lines[idx].clear();
+        idx += 1;
+        while idx < lines.len() {
+            let closes_front_matter = lines[idx].trim() == "---";
+            lines[idx].clear();
+            idx += 1;
+            if closes_front_matter {
+                break;
+            }
+        }
+    }
+    let mut content = lines.join("\n");
+    if had_trailing_newline {
+        content.push('\n');
+    }
+    content
 }
 
 fn check_top_level_order(path: &str, items: &[Item], out: &mut Vec<Violation>) {
@@ -530,6 +646,118 @@ fn check_tests_module(path: &str, items: &[Item], out: &mut Vec<Violation>) {
                 ),
             ));
         }
+    }
+}
+
+fn check_test_import_scope(path: &str, items: &[Item], out: &mut Vec<Violation>) {
+    let candidates = test_import_candidates(items);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let imported_names = candidates
+        .iter()
+        .flat_map(|candidate| candidate.names.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut visitor = TestImportScopeVisitor {
+        imported_names: &imported_names,
+        usage: BTreeMap::new(),
+        test_module_depth: 0,
+    };
+    for item in items {
+        visitor.visit_item(item);
+    }
+
+    for candidate in candidates {
+        let test_only_names = candidate
+            .names
+            .iter()
+            .filter(|name| {
+                visitor
+                    .usage
+                    .get(*name)
+                    .is_some_and(TestImportUsage::is_test_module_only)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !test_only_names.is_empty() {
+            out.push(violation(
+                path,
+                candidate.line,
+                "test-import-scope",
+                format!(
+                    "{} only used from test-only modules; move the import into the module that directly uses it",
+                    format_imported_names(&test_only_names)
+                ),
+            ));
+        }
+    }
+}
+
+fn test_import_candidates(items: &[Item]) -> Vec<TestImportCandidate> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Use(item_use)
+                if has_cfg_test(&item_use.attrs)
+                    && matches!(item_use.vis, Visibility::Inherited) =>
+            {
+                test_import_candidate(item_use)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn test_import_candidate(item_use: &ItemUse) -> Option<TestImportCandidate> {
+    let mut names = BTreeSet::new();
+    collect_use_tree_names(&item_use.tree, &mut names);
+    (!names.is_empty()).then(|| TestImportCandidate {
+        line: span_line(item_use.use_token.span),
+        names,
+    })
+}
+
+fn collect_use_tree_names(tree: &UseTree, names: &mut BTreeSet<String>) {
+    match tree {
+        UseTree::Path(use_path) => collect_use_tree_names(&use_path.tree, names),
+        UseTree::Name(use_name) => {
+            let ident = use_name.ident.to_string();
+            if !ignored_import_name(&ident) {
+                names.insert(ident);
+            }
+        }
+        UseTree::Rename(use_rename) => {
+            let ident = use_rename.rename.to_string();
+            if !ignored_import_name(&ident) {
+                names.insert(ident);
+            }
+        }
+        UseTree::Group(use_group) => {
+            for tree in &use_group.items {
+                collect_use_tree_names(tree, names);
+            }
+        }
+        UseTree::Glob(_) => {}
+    }
+}
+
+fn ignored_import_name(ident: &str) -> bool {
+    matches!(ident, "_" | "self")
+}
+
+fn format_imported_names(names: &[String]) -> String {
+    match names {
+        [] => "import".to_string(),
+        [name] => format!("`{name}` is"),
+        _ => format!(
+            "imports {} are",
+            names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -924,38 +1152,6 @@ fn check_qualified_paths(path: &str, items: &[Item], out: &mut Vec<Violation>) {
         visitor.visit_item(item);
     }
     out.extend(visitor.violations);
-}
-
-struct QualifiedPathVisitor<'a> {
-    file_path: &'a str,
-    seen: BTreeSet<(usize, String)>,
-    violations: Vec<Violation>,
-}
-
-impl<'ast> Visit<'ast> for QualifiedPathVisitor<'_> {
-    fn visit_path(&mut self, path: &'ast SynPath) {
-        let separators = path.segments.len().saturating_sub(1);
-        if separators > 1 {
-            let line = span_line(path.span());
-            let path_text = path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect::<Vec<_>>()
-                .join("::");
-            if self.seen.insert((line, path_text.clone())) {
-                self.violations.push(violation(
-                    self.file_path,
-                    line,
-                    "qualified-path",
-                    format!(
-                        "`{path_text}` contains more than one `::`; import it and use a shorter name"
-                    ),
-                ));
-            }
-        }
-        visit::visit_path(self, path);
-    }
 }
 
 fn item_group(item: &Item) -> Option<(ItemGroup, &'static str)> {

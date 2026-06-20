@@ -9,29 +9,36 @@ use crate::id::PageID;
 use crate::latch::{GuardState, LatchFallbackMode, RawHybridGuard};
 use crate::ptr::UnsafePtr;
 use either::Either;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::mem;
 
+/// Typed access interface shared by page latch guards.
 pub(crate) trait PageGuard<T: 'static> {
+    /// Returns the typed page image protected by this guard.
     fn page(&self) -> &T;
 }
 
+/// Strategy used to acquire or verify a specific latch mode.
 pub(crate) trait LockStrategy {
     type Page;
     type Guard;
 
     const MODE: LatchFallbackMode;
 
+    /// Attempts to acquire the strategy's latch mode without waiting.
     fn try_lock(guard: &mut FacadePageGuard<Self::Page>) -> Validation<()>;
 
+    /// Converts a facade guard that is already in the required mode.
     fn must_locked(guard: FacadePageGuard<Self::Page>) -> Self::Guard;
 
+    /// Verifies or acquires the strategy's mode asynchronously.
     fn verify_lock_async<const PRE_VERIFY: bool>(
         guard: FacadePageGuard<Self::Page>,
     ) -> impl Future<Output = Validation<Self::Guard>>;
 }
 
+/// Lock strategy for shared page access.
 pub(crate) struct SharedLockStrategy<T: 'static> {
     _marker: PhantomData<T>,
 }
@@ -60,6 +67,7 @@ impl<T: 'static> LockStrategy for SharedLockStrategy<T> {
     }
 }
 
+/// Lock strategy that keeps an optimistic latch guard.
 pub(crate) struct OptimisticLockStrategy<T: 'static> {
     _marker: PhantomData<T>,
 }
@@ -84,10 +92,11 @@ impl<T: 'static> LockStrategy for OptimisticLockStrategy<T> {
     fn verify_lock_async<const PRE_VERIFY: bool>(
         guard: FacadePageGuard<T>,
     ) -> impl Future<Output = Validation<Self::Guard>> {
-        std::future::ready(Valid(guard))
+        ready(Valid(guard))
     }
 }
 
+/// Lock strategy for exclusive page access.
 pub(crate) struct ExclusiveLockStrategy<T: 'static> {
     _marker: PhantomData<T>,
 }
@@ -116,6 +125,7 @@ impl<T: 'static> LockStrategy for ExclusiveLockStrategy<T> {
     }
 }
 
+/// Raw latch guard paired with a pool keepalive.
 pub(crate) struct PageLatchGuard {
     // SAFETY: field order is part of the contract. `raw` must drop before
     // `keepalive` so unlock runs while pool provenance and quiescent liveness
@@ -127,6 +137,7 @@ pub(crate) struct PageLatchGuard {
 }
 
 impl PageLatchGuard {
+    /// Pairs a raw latch guard with the pool keepalive that makes it valid.
     #[inline]
     pub(crate) fn new(keepalive: PoolGuard, raw: RawHybridGuard) -> Self {
         Self { raw, keepalive }
@@ -223,6 +234,7 @@ impl PageLatchGuard {
     }
 }
 
+/// Version-checked page facade that can be converted into concrete guard modes.
 pub(crate) struct FacadePageGuard<T: 'static> {
     raw: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
@@ -231,6 +243,7 @@ pub(crate) struct FacadePageGuard<T: 'static> {
 }
 
 impl<T: 'static> FacadePageGuard<T> {
+    /// Creates a facade guard and captures the frame generation it observes.
     #[inline]
     pub(crate) fn new(raw: PageLatchGuard, bf: UnsafePtr<BufferFrame>) -> Self {
         let captured_generation = frame_ref(&bf).generation();
@@ -242,6 +255,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Returns the logical page id stored in the guarded frame.
     #[inline]
     #[cfg_attr(
         not(test),
@@ -251,6 +265,7 @@ impl<T: 'static> FacadePageGuard<T> {
         self.bf().page_id
     }
 
+    /// Returns the guarded frame header.
     #[inline]
     pub(crate) fn bf(&self) -> &BufferFrame {
         frame_ref(&self.bf)
@@ -285,6 +300,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Attempts to upgrade this facade to exclusive access.
     #[inline]
     pub(crate) fn try_exclusive(&mut self) -> Validation<()> {
         let was_optimistic = self.raw.state() == GuardState::Optimistic;
@@ -306,6 +322,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Verifies exclusive access asynchronously and returns an exclusive guard.
     #[inline]
     pub(crate) async fn verify_exclusive_async<const PRE_VERIFY: bool>(
         mut self,
@@ -322,11 +339,13 @@ impl<T: 'static> FacadePageGuard<T> {
         Valid(self.must_exclusive())
     }
 
+    /// Converts this facade into an exclusive guard without additional checks.
     #[inline]
     pub(crate) fn must_exclusive(self) -> PageExclusiveGuard<T> {
         self.into_exclusive_guard()
     }
 
+    /// Waits for exclusive access when the facade is optimistic.
     #[inline]
     pub(crate) async fn lock_exclusive_async(self) -> Option<PageExclusiveGuard<T>> {
         match self.raw.state() {
@@ -341,6 +360,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Attempts to acquire shared access or returns the original optimistic guard.
     #[inline]
     pub(crate) fn try_shared_either(
         mut self,
@@ -368,6 +388,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Attempts to acquire shared access without waiting.
     #[inline]
     pub(crate) fn try_shared(&mut self) -> Validation<()> {
         let was_optimistic = self.raw.state() == GuardState::Optimistic;
@@ -389,6 +410,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Verifies shared access asynchronously and returns a shared guard.
     #[inline]
     pub(crate) async fn verify_shared_async<const PRE_VERIFY: bool>(
         mut self,
@@ -405,11 +427,13 @@ impl<T: 'static> FacadePageGuard<T> {
         Valid(self.must_shared())
     }
 
+    /// Converts this facade into a shared guard without additional checks.
     #[inline]
     pub(crate) fn must_shared(self) -> PageSharedGuard<T> {
         self.into_shared_guard()
     }
 
+    /// Waits for shared access when the facade is optimistic.
     #[inline]
     pub(crate) async fn lock_shared_async(self) -> Option<PageSharedGuard<T>> {
         match self.raw.state() {
@@ -424,6 +448,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Converts this facade into a shared guard if it already owns shared access.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved try_into_shared"))]
     pub(crate) fn try_into_shared(self) -> Option<PageSharedGuard<T>> {
@@ -436,6 +461,7 @@ impl<T: 'static> FacadePageGuard<T> {
         Some(self.into_shared_guard())
     }
 
+    /// Converts this facade into an exclusive guard if it already owns exclusive access.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved try_into_exclusive"))]
     pub(crate) fn try_into_exclusive(self) -> Option<PageExclusiveGuard<T>> {
@@ -448,6 +474,7 @@ impl<T: 'static> FacadePageGuard<T> {
         Some(self.into_exclusive_guard())
     }
 
+    /// Downgrades this facade to an optimistic guard.
     #[inline]
     pub(crate) fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
@@ -458,16 +485,19 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Returns whether this facade currently owns exclusive access.
     #[inline]
     pub(crate) fn is_exclusive(&self) -> bool {
         self.raw.state() == GuardState::Exclusive
     }
 
+    /// Returns whether this facade currently owns shared access.
     #[inline]
     pub(crate) fn is_shared(&self) -> bool {
         self.raw.state() == GuardState::Shared
     }
 
+    /// Validates the latch version and captured frame generation.
     #[inline]
     pub(crate) fn validate(&self) -> Validation<()> {
         if self.validate_bool() {
@@ -477,11 +507,13 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Returns whether the latch version and captured frame generation still match.
     #[inline]
     pub(crate) fn validate_bool(&self) -> bool {
         self.raw.validate() && self.generation_matches()
     }
 
+    /// Reads a typed page reference and validates the guard afterward.
     #[inline]
     pub(crate) fn with_page_ref_validated<R, F>(&self, f: F) -> Validation<R>
     where
@@ -495,6 +527,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
+    /// Rolls back an exclusive-version change after a failed page-kind check.
     #[inline]
     pub(crate) fn rollback_exclusive_version_change(self) {
         assert!(
@@ -512,6 +545,7 @@ unsafe impl<T: Sync + 'static> Send for FacadePageGuard<T> {}
 // metadata plus shared access to `T`.
 unsafe impl<T: Sync + 'static> Sync for FacadePageGuard<T> {}
 
+/// Optimistic page guard that can later be locked or validated.
 pub(crate) struct PageOptimisticGuard<T: 'static> {
     raw: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
@@ -520,6 +554,7 @@ pub(crate) struct PageOptimisticGuard<T: 'static> {
 }
 
 impl<T> PageOptimisticGuard<T> {
+    /// Returns the logical page id stored in the guarded frame.
     #[inline]
     #[cfg_attr(
         not(test),
@@ -534,6 +569,7 @@ impl<T> PageOptimisticGuard<T> {
         generation_matches(&self.bf, self.captured_generation)
     }
 
+    /// Waits for shared access and returns `None` if the frame was reused.
     #[inline]
     pub(crate) async fn lock_shared_async(self) -> Option<PageSharedGuard<T>> {
         let raw = self.raw;
@@ -551,6 +587,7 @@ impl<T> PageOptimisticGuard<T> {
         })
     }
 
+    /// Attempts to acquire exclusive access without waiting.
     #[inline]
     pub(crate) fn try_exclusive(mut self) -> Validation<PageExclusiveGuard<T>> {
         verify!(self.raw.try_exclusive());
@@ -566,6 +603,7 @@ impl<T> PageOptimisticGuard<T> {
         })
     }
 
+    /// Waits for exclusive access and returns `None` if the frame was reused.
     #[inline]
     pub(crate) async fn lock_exclusive_async(self) -> Option<PageExclusiveGuard<T>> {
         let raw = self.raw;
@@ -584,6 +622,7 @@ impl<T> PageOptimisticGuard<T> {
         })
     }
 
+    /// Converts this optimistic guard back into a facade guard.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn facade(self) -> FacadePageGuard<T> {
@@ -603,6 +642,7 @@ unsafe impl<T: Sync + 'static> Send for PageOptimisticGuard<T> {}
 // read-only page access and validated frame lifetime.
 unsafe impl<T: Sync + 'static> Sync for PageOptimisticGuard<T> {}
 
+/// Shared latch guard for immutable typed page access.
 pub(crate) struct PageSharedGuard<T: 'static> {
     raw: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
@@ -618,6 +658,7 @@ impl<T: 'static> PageGuard<T> for PageSharedGuard<T> {
 }
 
 impl<T: 'static> PageSharedGuard<T> {
+    /// Downgrades this shared guard to an optimistic guard.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn downgrade(self) -> PageOptimisticGuard<T> {
@@ -629,16 +670,19 @@ impl<T: 'static> PageSharedGuard<T> {
         }
     }
 
+    /// Returns the guarded frame header.
     #[inline]
     pub(crate) fn bf(&self) -> &BufferFrame {
         frame_ref(&self.bf)
     }
 
+    /// Returns the logical page id stored in the guarded frame.
     #[inline]
     pub(crate) fn page_id(&self) -> PageID {
         self.bf().page_id
     }
 
+    /// Returns the logical page id plus captured frame generation.
     #[inline]
     pub(crate) fn versioned_page_id(&self) -> VersionedPageID {
         VersionedPageID {
@@ -647,6 +691,7 @@ impl<T: 'static> PageSharedGuard<T> {
         }
     }
 
+    /// Returns the frame context and typed page reference.
     #[inline]
     pub(crate) fn ctx_and_page(&self) -> (&FrameContext, &T) {
         let bf = self.bf();
@@ -655,6 +700,7 @@ impl<T: 'static> PageSharedGuard<T> {
         (undo_map, page)
     }
 
+    /// Converts this shared guard back into a facade and optionally marks dirty.
     #[inline]
     pub(crate) fn facade(self, dirty: bool) -> FacadePageGuard<T> {
         let bf = self.bf();
@@ -669,6 +715,7 @@ impl<T: 'static> PageSharedGuard<T> {
         }
     }
 
+    /// Marks the frame dirty before dropping this shared guard.
     #[inline]
     pub(crate) fn set_dirty(self) {
         let bf = self.bf();
@@ -685,6 +732,7 @@ unsafe impl<T: Sync + 'static> Send for PageSharedGuard<T> {}
 // metadata and shared access to `T`.
 unsafe impl<T: Sync + 'static> Sync for PageSharedGuard<T> {}
 
+/// Exclusive latch guard for mutable typed page access.
 pub(crate) struct PageExclusiveGuard<T: 'static> {
     raw: PageLatchGuard,
     bf: UnsafePtr<BufferFrame>,
@@ -709,6 +757,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
         unsafe { frame_mut(self.bf.clone()) }
     }
 
+    /// Downgrades this exclusive guard to an optimistic guard.
     #[inline]
     pub(crate) fn downgrade(self) -> PageOptimisticGuard<T> {
         PageOptimisticGuard {
@@ -719,6 +768,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
         }
     }
 
+    /// Downgrades this exclusive guard to a shared guard.
     #[inline]
     pub(crate) fn downgrade_shared(self) -> PageSharedGuard<T> {
         PageSharedGuard {
@@ -729,11 +779,13 @@ impl<T: 'static> PageExclusiveGuard<T> {
         }
     }
 
+    /// Returns the logical page id stored in the guarded frame.
     #[inline]
     pub(crate) fn page_id(&self) -> PageID {
         self.bf().page_id
     }
 
+    /// Returns the logical page id plus captured frame generation.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn versioned_page_id(&self) -> VersionedPageID {
@@ -743,21 +795,25 @@ impl<T: 'static> PageExclusiveGuard<T> {
         }
     }
 
+    /// Returns mutable access to the typed page image.
     #[inline]
     pub(crate) fn page_mut(&mut self) -> &mut T {
         page_mut(self.frame_mut())
     }
 
+    /// Returns the guarded frame header.
     #[inline]
     pub(crate) fn bf(&self) -> &BufferFrame {
         frame_ref(&self.bf)
     }
 
+    /// Returns mutable access to the guarded frame header.
     #[inline]
     pub(crate) fn bf_mut(&mut self) -> &mut BufferFrame {
         self.frame_mut()
     }
 
+    /// Returns mutable access to both the frame context and typed page image.
     #[inline]
     pub(crate) fn ctx_and_page_mut(&mut self) -> (&mut FrameContext, &mut T) {
         let bf = self.frame_mut();
@@ -770,6 +826,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
         (ctx, page)
     }
 
+    /// Converts this exclusive guard back into a facade and optionally marks dirty.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn facade(self, dirty: bool) -> FacadePageGuard<T> {
@@ -785,6 +842,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
         }
     }
 
+    /// Marks the frame dirty before dropping this exclusive guard.
     #[inline]
     pub(crate) fn set_dirty(self) {
         let bf = self.bf();
@@ -793,6 +851,7 @@ impl<T: 'static> PageExclusiveGuard<T> {
         }
     }
 
+    /// Returns whether the guarded frame is dirty.
     #[inline]
     pub(crate) fn is_dirty(&self) -> bool {
         self.bf().is_dirty()

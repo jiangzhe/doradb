@@ -11,17 +11,36 @@ use zerocopy::{FromBytes, IntoBytes, KnownLayout};
 
 pub(crate) use super::INVALID_PAGE_ID;
 
+/// Number of bytes in every buffer-pool page image.
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
-pub(crate) type Page = [u8; PAGE_SIZE];
 
 const _: () = assert!(
     { mem::size_of::<Page>() == PAGE_SIZE },
     "raw page byte array must be exactly PAGE_SIZE"
 );
 
+const _: () = assert_buffer_page::<Page>();
+
+/// Raw byte page image used by low-level IO paths.
+pub(crate) type Page = [u8; PAGE_SIZE];
+
+/// Convenient for IO thread to process, no matter
+/// what kind this page belongs to.
+impl sealed::Sealed for Page {}
+
+// SAFETY: `[u8; PAGE_SIZE]` is exactly one page, has no drop glue, and every
+// byte pattern is valid. It is used only as raw bytes under the buffer-pool
+// latch and IO ownership protocols.
+unsafe impl BufferPage for Page {
+    const KIND: BufferPageKind = BufferPageKind::RawBytes;
+}
+
+/// Page id plus frame generation captured by a guard or lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionedPageID {
+    /// Logical frame/page identifier.
     pub page_id: PageID,
+    /// Frame reuse generation observed with the id.
     pub generation: u64,
 }
 
@@ -103,6 +122,50 @@ pub(crate) unsafe trait BufferPage:
     }
 }
 
+/// IO direction or dependency state for one page operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IOKind {
+    Read,
+    Write,
+    // Because we gather write requests into batch.
+    // There can be short period the read requests runs
+    // concurrently while write requests are not submmitted.
+    // We let read wait for write, and let write overwrite
+    // this value.
+    ReadWaitForWrite,
+}
+
+/// One evictable-pool writeback submission owned by the generic IO worker.
+///
+/// Read-miss loads now use the shared generic read-load core in `buffer/load.rs`.
+pub(crate) struct PageIO {
+    /// Backing file/block identity for this IO.
+    pub(crate) block_key: BlockKey,
+    /// Backend operation descriptor for this page IO.
+    pub(crate) operation: Operation,
+    /// Exclusive guard retaining the page memory until IO completion.
+    pub(crate) page_guard: PageExclusiveGuard<Page>,
+    /// Batch-level completion token cloned into each write submission.
+    ///
+    /// The last drop notifies the evictor waiting for the whole write batch.
+    pub(crate) batch_done: Option<Arc<EventNotifyOnDrop>>,
+}
+
+impl PageIO {
+    /// Returns the evictable page id targeted by this submission.
+    #[inline]
+    pub(crate) fn page_id(&self) -> PageID {
+        self.page_guard.page_id()
+    }
+}
+
+impl IOSubmission for PageIO {
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        &mut self.operation
+    }
+}
+
 /// Compile-time contract assertion for buffer-pool page images.
 #[inline]
 pub(crate) const fn assert_buffer_page<T: BufferPage>() {
@@ -124,55 +187,3 @@ pub(crate) fn validate_frame_page_kind<T: BufferPage>(frame: &BufferFrame) -> Re
         ))
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IOKind {
-    Read,
-    Write,
-    // Because we gather write requests into batch.
-    // There can be short period the read requests runs
-    // concurrently while write requests are not submmitted.
-    // We let read wait for write, and let write overwrite
-    // this value.
-    ReadWaitForWrite,
-}
-
-/// One evictable-pool writeback submission owned by the generic IO worker.
-///
-/// Read-miss loads now use the shared generic read-load core in `buffer/load.rs`.
-pub(crate) struct PageIO {
-    pub(crate) block_key: BlockKey,
-    pub(crate) operation: Operation,
-    pub(crate) page_guard: PageExclusiveGuard<Page>,
-    // Batch-level completion token cloned into each write submission.
-    // The last drop notifies the evictor waiting for the whole write batch.
-    pub(crate) batch_done: Option<Arc<EventNotifyOnDrop>>,
-}
-
-impl PageIO {
-    /// Returns the evictable page id targeted by this submission.
-    #[inline]
-    pub(crate) fn page_id(&self) -> PageID {
-        self.page_guard.page_id()
-    }
-}
-
-impl IOSubmission for PageIO {
-    #[inline]
-    fn operation(&mut self) -> &mut Operation {
-        &mut self.operation
-    }
-}
-
-/// Convenient for IO thread to process, no matter
-/// what kind this page belongs to.
-impl sealed::Sealed for Page {}
-
-// SAFETY: `[u8; PAGE_SIZE]` is exactly one page, has no drop glue, and every
-// byte pattern is valid. It is used only as raw bytes under the buffer-pool
-// latch and IO ownership protocols.
-unsafe impl BufferPage for Page {
-    const KIND: BufferPageKind = BufferPageKind::RawBytes;
-}
-
-const _: () = assert_buffer_page::<Page>();

@@ -32,8 +32,11 @@ use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::hint::spin_loop;
 use std::mem;
 use std::os::fd::AsRawFd;
+use std::ptr::eq as ptr_eq;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zerocopy::FromZeros;
@@ -85,47 +88,6 @@ impl Drop for ReadonlyWriteLease {
             occ.remove();
         }
     }
-}
-
-/// Blocks same-key readonly misses while a CoW block write is pending.
-///
-/// The write barrier is allowed only when no same-key miss is still in flight.
-/// It installs a per-key write-blocked state before invalidating resident
-/// mappings, so new misses cannot load old disk bytes while the physical block
-/// write is queued or in flight.
-#[inline]
-pub(crate) fn begin_write_barrier(
-    pool: QuiescentGuard<ReadonlyBufferPool>,
-    file_id: FileID,
-    block_id: BlockID,
-) -> Result<ReadonlyWriteLease> {
-    let key = BlockKey::new(file_id, block_id);
-    {
-        // Keep the inflight entry guard scoped to this block; invalidation below
-        // touches the resident mapping table and must not nest DashMap locks.
-        match pool.inflights.entry(key) {
-            Entry::Vacant(vac) => {
-                vac.insert(InflightBlockState::WriteBlocked);
-            }
-            Entry::Occupied(mut occ) => match occ.get() {
-                InflightBlockState::Loading(inflight) if inflight.completed_result().is_none() => {
-                    return Err(Report::new(InternalError::ReadonlyWriteInflight)
-                        .attach(format!("key={key:?}"))
-                        .into());
-                }
-                InflightBlockState::Loading(_) => {
-                    occ.insert(InflightBlockState::WriteBlocked);
-                }
-                InflightBlockState::WriteBlocked => {
-                    return Err(Report::new(InternalError::ReadonlyWriteBlocked)
-                        .attach(format!("key={key:?}"))
-                        .into());
-                }
-            },
-        }
-    }
-    let _ = pool.invalidate_key(&key);
-    Ok(ReadonlyWriteLease::new(pool, key))
 }
 
 /// Global readonly cache owner shared across files.
@@ -203,7 +165,7 @@ impl ReadonlyBufferPool {
     async fn send_read_async(
         &self,
         req: ReadSubmission,
-    ) -> std::result::Result<(), flume::SendError<ReadSubmission>> {
+    ) -> StdResult<(), flume::SendError<ReadSubmission>> {
         self.fs.send_table_read_async(req).await
     }
 
@@ -228,12 +190,14 @@ impl ReadonlyBufferPool {
         self.stats.snapshot()
     }
 
+    /// Returns a cloneable pool guard for this readonly pool.
     #[inline]
     pub(crate) fn pool_guard(&self) -> PoolGuard {
         debug_assert!(!matches!(self.role, PoolRole::Invalid));
         self.arena.guard()
     }
 
+    /// Returns the runtime identity of this pool instance.
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
         self.arena.identity()
@@ -350,7 +314,7 @@ impl ReadonlyBufferPool {
         }
         let frame = frame_guard.bf_mut();
         let expected_frame = self.arena.frame(frame_id) as *const BufferFrame;
-        if !std::ptr::eq(frame as *const BufferFrame, expected_frame) {
+        if !ptr_eq(frame as *const BufferFrame, expected_frame) {
             return Err(Report::new(InternalError::ReadonlyFrameGuardMismatch)
                 .attach(format!("frame_id={frame_id}"))
                 .into());
@@ -492,7 +456,7 @@ impl ReadonlyBufferPool {
                 let _ = self.residency.move_resident_to_free(frame_id);
                 return;
             }
-            std::hint::spin_loop();
+            spin_loop();
         }
     }
 
@@ -540,6 +504,20 @@ impl ReadonlyBufferPool {
         }
     }
 }
+
+impl Drop for ReadonlyBufferPool {
+    #[inline]
+    fn drop(&mut self) {
+        self.signal_shutdown();
+    }
+}
+
+// SAFETY: the global pool coordinates shared state with atomics, dashmaps, and
+// page latches, while the arena keeps frame/page memory stable.
+unsafe impl Send for ReadonlyBufferPool {}
+// SAFETY: shared references only access thread-safe coordination state and
+// latch-protected frames.
+unsafe impl Sync for ReadonlyBufferPool {}
 
 impl QuiescentGuard<ReadonlyBufferPool> {
     /// Reads one persisted block through the shared readonly cache.
@@ -773,20 +751,6 @@ impl QuiescentGuard<ReadonlyBufferPool> {
     }
 }
 
-impl Drop for ReadonlyBufferPool {
-    #[inline]
-    fn drop(&mut self) {
-        self.signal_shutdown();
-    }
-}
-
-// SAFETY: the global pool coordinates shared state with atomics, dashmaps, and
-// page latches, while the arena keeps frame/page memory stable.
-unsafe impl Send for ReadonlyBufferPool {}
-// SAFETY: shared references only access thread-safe coordination state and
-// latch-protected frames.
-unsafe impl Sync for ReadonlyBufferPool {}
-
 #[derive(Clone, Copy)]
 struct InflightLoadValidation {
     file_kind: FileKind,
@@ -989,6 +953,7 @@ impl ReadSubmission {
         self.complete_inflight_once(Err(err));
     }
 
+    /// Records that the backend accepted this read submission into running state.
     #[inline]
     pub(crate) fn record_running(&self) {
         self.pool.stats.add_running_reads(1);
@@ -1327,6 +1292,47 @@ impl ReadonlyBlockGuard {
     }
 }
 
+/// Blocks same-key readonly misses while a CoW block write is pending.
+///
+/// The write barrier is allowed only when no same-key miss is still in flight.
+/// It installs a per-key write-blocked state before invalidating resident
+/// mappings, so new misses cannot load old disk bytes while the physical block
+/// write is queued or in flight.
+#[inline]
+pub(crate) fn begin_write_barrier(
+    pool: QuiescentGuard<ReadonlyBufferPool>,
+    file_id: FileID,
+    block_id: BlockID,
+) -> Result<ReadonlyWriteLease> {
+    let key = BlockKey::new(file_id, block_id);
+    {
+        // Keep the inflight entry guard scoped to this block; invalidation below
+        // touches the resident mapping table and must not nest DashMap locks.
+        match pool.inflights.entry(key) {
+            Entry::Vacant(vac) => {
+                vac.insert(InflightBlockState::WriteBlocked);
+            }
+            Entry::Occupied(mut occ) => match occ.get() {
+                InflightBlockState::Loading(inflight) if inflight.completed_result().is_none() => {
+                    return Err(Report::new(InternalError::ReadonlyWriteInflight)
+                        .attach(format!("key={key:?}"))
+                        .into());
+                }
+                InflightBlockState::Loading(_) => {
+                    occ.insert(InflightBlockState::WriteBlocked);
+                }
+                InflightBlockState::WriteBlocked => {
+                    return Err(Report::new(InternalError::ReadonlyWriteBlocked)
+                        .attach(format!("key={key:?}"))
+                        .into());
+                }
+            },
+        }
+    }
+    let _ = pool.invalidate_key(&key);
+    Ok(ReadonlyWriteLease::new(pool, key))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1364,6 +1370,9 @@ pub(crate) mod tests {
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
+    use smol::Timer;
+    use smol::future::yield_now;
+    use std::io::Error as StdIoError;
     use std::ops::Deref;
     use std::os::fd::{AsRawFd, RawFd};
     use std::sync::Arc;
@@ -1383,7 +1392,7 @@ pub(crate) mod tests {
             if predicate() {
                 return;
             }
-            smol::Timer::after(TEST_WAIT_INTERVAL).await;
+            Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
     }
@@ -1861,7 +1870,7 @@ pub(crate) mod tests {
                 smol::block_on(listener);
             }
             if let ControlledReadResult::Errno(errno) = self.inner.result {
-                *res = Err(std::io::Error::from_raw_os_error(errno));
+                *res = Err(StdIoError::from_raw_os_error(errno));
             }
         }
     }
@@ -2154,7 +2163,7 @@ pub(crate) mod tests {
             assert!(key_state_is_write_blocked(&global, &key));
 
             drop(writer);
-            smol::future::yield_now().await;
+            yield_now().await;
             assert!(key_state_is_write_blocked(&global, &key));
 
             let err = match disk_pool.read_block(&pool_guard, block_id).await {
@@ -2596,7 +2605,7 @@ pub(crate) mod tests {
                     .unwrap();
                 g.page()[..5].to_vec()
             });
-            smol::future::yield_now().await;
+            yield_now().await;
 
             read_hook.release();
 
@@ -2833,7 +2842,7 @@ pub(crate) mod tests {
                 );
 
             read_hook.wait_started(1).await;
-            smol::Timer::after(Duration::from_millis(10)).await;
+            Timer::after(Duration::from_millis(10)).await;
             read_hook.release();
 
             assert!(waiter1.await.as_ref().is_err_and(|err| matches!(
@@ -2905,7 +2914,7 @@ pub(crate) mod tests {
             });
 
             read_hook.wait_started(1).await;
-            smol::Timer::after(Duration::from_millis(10)).await;
+            Timer::after(Duration::from_millis(10)).await;
             read_hook.release();
 
             let err1 = match waiter1.await {

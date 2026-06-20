@@ -26,6 +26,8 @@ targets check only direct `.rs` children and do not recurse.
    - `cargo fmt --all -- --check`;
    - `cargo clippy -p doradb-storage --all-targets -- -D warnings`;
    - Rust style structure checks.
+   - top-level private `#[cfg(test)] use` imports must move into the
+     `#[cfg(test)]` module that directly uses them.
 3. If formatting or clippy fails, stop and report that gate failure. Do not continue with manual style review.
 4. If verifier diagnostics exist, report a concise summary grouped by file and rule.
 5. If no staged Rust files exist, report that no Rust style audit was needed.

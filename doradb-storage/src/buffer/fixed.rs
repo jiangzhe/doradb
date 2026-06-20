@@ -46,11 +46,13 @@ impl FixedBufferPool {
         })
     }
 
+    /// Returns the runtime identity of this pool instance.
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
         self.arena.identity()
     }
 
+    /// Returns this fixed pool as a row-pool role.
     #[inline]
     pub(crate) fn row_pool_role(&self) -> RowPoolRole {
         self.role.row_pool_role()
