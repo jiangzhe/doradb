@@ -111,6 +111,7 @@ impl OwnerLockState {
         }
     }
 
+    /// Records a lock grant in the owner-local cache.
     #[inline]
     pub(crate) fn cache_granted(&mut self, resource: LockResource, mode: LockMode) {
         if let Some(held) = self.held.get(&resource).copied() {
