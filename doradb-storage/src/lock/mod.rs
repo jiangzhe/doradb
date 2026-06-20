@@ -170,12 +170,15 @@ pub(crate) struct ScopedCatalogNamespaceLock<'a> {
     lock_manager: &'a LockManager,
     resource: LockResource,
     owner: LockOwner,
+    fresh: bool,
 }
 
 impl Drop for ScopedCatalogNamespaceLock<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.lock_manager.release(self.resource, self.owner);
+        if self.fresh {
+            self.lock_manager.release(self.resource, self.owner);
+        }
     }
 }
 
@@ -298,12 +301,14 @@ impl LockManager {
         owner_group: LockOwnerGroup,
     ) -> Result<ScopedCatalogNamespaceLock<'a>> {
         let resource = LockResource::CatalogNamespace;
-        self.acquire_grouped(resource, LockMode::Exclusive, owner, owner_group)
+        let grant = self
+            .acquire_grouped_with_grant(resource, LockMode::Exclusive, owner, owner_group)
             .await?;
         Ok(ScopedCatalogNamespaceLock {
             lock_manager: self,
             resource,
             owner,
+            fresh: grant == LockGrant::Fresh,
         })
     }
 
@@ -1853,6 +1858,48 @@ pub(crate) mod tests {
             1
         );
         assert_eq!(snapshot.entries[0].mode, LockMode::Exclusive);
+    }
+
+    #[test]
+    fn nested_catalog_namespace_scope_does_not_release_outer_grant() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let resource = LockResource::CatalogNamespace;
+            let owner = session(SessionID::new(7));
+            let owner_group = group(SessionID::new(7));
+
+            let outer = manager
+                .acquire_catalog_namespace_lock(owner, owner_group)
+                .await
+                .unwrap();
+            assert!(manager.owner_holds(resource, owner, LockMode::Exclusive));
+            {
+                let inner = manager
+                    .acquire_catalog_namespace_lock(owner, owner_group)
+                    .await
+                    .unwrap();
+                let snapshot = debug_snapshot(&manager);
+                assert_eq!(
+                    count_entries(&snapshot, resource, LockDebugEntryState::Granted),
+                    1
+                );
+                drop(inner);
+            }
+
+            assert!(manager.owner_holds(resource, owner, LockMode::Exclusive));
+            let snapshot = debug_snapshot(&manager);
+            assert_eq!(
+                count_entries(&snapshot, resource, LockDebugEntryState::Granted),
+                1
+            );
+            drop(outer);
+            assert!(!manager.owner_holds(resource, owner, LockMode::Exclusive));
+            let snapshot = debug_snapshot(&manager);
+            assert_eq!(
+                count_entries(&snapshot, resource, LockDebugEntryState::Granted),
+                0
+            );
+        });
     }
 
     #[test]

@@ -409,6 +409,11 @@ impl TableColumnLayout {
         col_types: Vec<ValType>,
         col_attrs: Vec<ColumnAttributes>,
     ) -> Result<Self> {
+        if col_names.is_empty() || col_types.is_empty() || col_attrs.is_empty() {
+            return Err(invalid_table_metadata(
+                "table column layout requires columns",
+            ));
+        }
         if col_names.len() != col_types.len() || col_names.len() != col_attrs.len() {
             return Err(invalid_table_metadata(format!(
                 "column metadata length mismatch: names={}, types={}, attrs={}",
@@ -1122,6 +1127,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         trx.rollback().await?;
         return Err(err);
     }
+    table_locks.fail_waiters_on_release(OperationError::TableDropping);
 
     let metadata = table.metadata().clone();
     let exec_res = execute_drop_table_catalog_cascade(&engine, &mut trx, table_id, &metadata).await;
@@ -1538,7 +1544,7 @@ mod tests {
     use crate::id::{SessionID, TableID, TrxID};
     use crate::io::install_storage_backend_test_hook;
     use crate::lock::tests::{LockDebugEntryState, try_acquire};
-    use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::lock::{LockMode, LockOwner, LockOwnerGroup, LockResource};
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use crate::table::TableLifecycleState;
@@ -1672,6 +1678,24 @@ mod tests {
         assert!(Arc::ptr_eq(&metadata.col, &dropped.col));
         assert_eq!(created.idx.active_index_count(), 1);
         assert_eq!(dropped.idx.active_index_count(), 0);
+    }
+
+    #[test]
+    fn test_table_metadata_rejects_deserialized_empty_columns() {
+        let brief = TableBriefMetadata {
+            col_names: vec![],
+            col_types: vec![],
+            col_attrs: vec![],
+            next_index_no: 0,
+            index_specs: vec![],
+        };
+
+        let err = TableMetadata::try_from(brief).unwrap_err();
+        let report = format!("{err:?}");
+        assert!(
+            report.contains("table column layout requires columns"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -3318,6 +3342,93 @@ mod tests {
                     .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
             );
             assert!(!drop_session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_drop_table_catalog_cascade_failure_fails_queued_locks_as_dropping() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut corrupt_session = engine.new_session().unwrap();
+            let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
+
+            corrupt_trx
+                .exec(async |stmt| {
+                    let deleted = engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .delete_by_index(stmt, table_id, 0)
+                        .await
+                        .unwrap();
+                    assert_eq!(deleted, 1);
+                    let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
+                        table_id,
+                        index_no: 0,
+                    });
+                    debug_assert!(old.is_none());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            corrupt_trx.commit().await.unwrap();
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+            let mut drop_session = engine.new_session().unwrap();
+            let drop_owner = LockOwner::Session(drop_session.id());
+            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                drop_owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+
+            let waiting_session_id = SessionID::new(91_501);
+            let waiting_owner = LockOwner::Session(waiting_session_id);
+            let waiting_group = LockOwnerGroup::Session(waiting_session_id);
+            let mut lock_fut = Box::pin(engine.lock_manager().acquire_grouped_table_locks(
+                table_id,
+                LockMode::Shared,
+                waiting_owner,
+                waiting_group,
+            ));
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            wait_for_lock_entry(
+                &engine,
+                waiting_owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
+            )
+            .await;
+
+            drop(publish_lease);
+            let err = drop_fut.await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::Poisoned)
+            );
+            let Err(waiter_err) = lock_fut.await else {
+                panic!("queued table lock waiter should fail after drop gate error");
+            };
+            assert_eq!(
+                waiter_err.operation_error(),
+                Some(OperationError::TableDropping)
+            );
+            drop(root_lease);
         });
     }
 
