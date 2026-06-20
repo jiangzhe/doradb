@@ -182,16 +182,24 @@ command.
 Use `task resolve` only after implementation, tests, and review are complete,
 and behavior is verified.
 
-1. Confirm known implementation/review issues are fixed or explicitly accepted/deferred.
-2. Synchronize the task doc implementation outcome by editing the task doc directly.
-3. Fill `Implementation Notes` with concrete implementation/test/review outcomes.
-4. Append unresolved future improvements to `Open Questions` when needed.
-5. Create/link follow-up backlog todos in `docs/backlogs/` for actionable deferred work (use `$backlog create` when creating new backlog docs manually).
+1. Run `$style-audit` branch-diff mode first:
+```bash
+tools/style_audit.rs --diff-base origin/main
+```
+   - This audits Rust files changed against `merge-base(origin/main, HEAD)`, so already committed task-branch code changes are included.
+   - If style-audit fails for formatting, clippy, or repository style diagnostics, stop `task resolve` immediately.
+   - Do not run later resolve steps, edit resolve docs, close backlogs, or sync RFCs after a failed style audit.
+   - Report the audit failure and leave fix strategy to the developer; do not auto-format, run fixes, or change implementation code as part of resolve.
+2. Confirm known implementation/review issues are fixed or explicitly accepted/deferred.
+3. Synchronize the task doc implementation outcome by editing the task doc directly.
+4. Fill `Implementation Notes` with concrete implementation/test/review outcomes.
+5. Append unresolved future improvements to `Open Questions` when needed.
+6. Create/link follow-up backlog todos in `docs/backlogs/` for actionable deferred work (use `$backlog create` when creating new backlog docs manually).
    - When the backlog captures work intentionally deferred to avoid disrupting current execution, include:
      - `Deferred From`: the current task doc and parent RFC doc when applicable.
      - `Deferral Context`: why the work is deferred now, what was learned during implementation, and what future planning should revisit or prefer.
-6. Keep `Implementation Notes` blank during design phase and fill it only in resolve phase.
-7. If the task is sourced from open backlog docs (tracked via `Source Backlogs:` in task doc), close/archive each source backlog during resolve.
+7. Keep `Implementation Notes` blank during design phase and fill it only in resolve phase.
+8. If the task is sourced from open backlog docs (tracked via `Source Backlogs:` in task doc), close/archive each source backlog during resolve.
    - Resolve id/path deterministically first when only id is available:
 ```bash
 tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
@@ -201,12 +209,12 @@ tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
    - If backlog close `detail`/`reference` text or RFC sync summary contains markdown, Rust code, or backticks, prefer `tools/backlog.rs ... --detail-file/--reference-file` and `tools/task.rs resolve-task-rfc --summary-file ...`.
-8. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
+9. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
 ```bash
 tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
 ```
 This command fetches `origin/main` and updates the local `docs/tasks/next-id` to at least the largest of the local value, fetched `origin/main` value, and `task id + 1`.
-9. `task resolve` must always check RFC parent linkage.
+10. `task resolve` must always check RFC parent linkage.
    - If task is a sub-task of an RFC, update corresponding RFC `Implementation Phases` during resolve:
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
@@ -215,7 +223,7 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
      phase-local choices, `After This Phase`, non-goals, or the following
      phase's assumptions, update that RFC phase text as part of resolve, then
      run the sync command.
-10. `task resolve` must not run `git commit` or `git push`.
+11. `task resolve` must not run `git commit` or `git push`.
    - Resolve updates are limited to document synchronization and related backlog/RFC tooling.
    - Leave commit/push decisions to an explicit user request or a separate workflow.
 

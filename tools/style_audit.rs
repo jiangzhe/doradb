@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio, exit};
+use std::process::{Command, Stdio, exit, id};
 use std::time::{SystemTime, UNIX_EPOCH};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -77,6 +77,7 @@ struct AuditFile {
 #[derive(Debug, Default)]
 struct Args {
     help: bool,
+    diff_base: Option<String>,
     force_paths: Vec<PathBuf>,
 }
 
@@ -165,7 +166,7 @@ impl<'ast> Visit<'ast> for QualifiedPathVisitor<'_> {
 }
 
 fn usage() -> &'static str {
-    "Usage: tools/style_audit.rs [--force-path <file-or-dir> ...]"
+    "Usage: tools/style_audit.rs [--diff-base <rev> | --force-path <file-or-dir> ...]"
 }
 
 fn main() {
@@ -185,7 +186,7 @@ fn run() -> Result<i32, String> {
         println!("{}", usage());
         return Ok(0);
     }
-    run_audit(&args.force_paths)
+    run_audit(&args)
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -199,11 +200,19 @@ fn parse_args() -> Result<Args, String> {
                 };
                 parsed.force_paths.push(PathBuf::from(path));
             }
+            "--diff-base" => {
+                let Some(diff_base) = args.next() else {
+                    return Err(format!("missing value for --diff-base\n{}", usage()));
+                };
+                if parsed.diff_base.replace(diff_base).is_some() {
+                    return Err(format!("--diff-base can only be provided once\n{}", usage()));
+                }
+            }
             "--help" | "-h" => {
                 if args.next().is_some() {
                     return Err(format!("unexpected arg\n{}", usage()));
                 }
-                if !parsed.force_paths.is_empty() {
+                if parsed.diff_base.is_some() || !parsed.force_paths.is_empty() {
                     return Err(format!(
                         "--help cannot be combined with other args\n{}",
                         usage()
@@ -215,15 +224,22 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unknown arg: {arg}\n{}", usage())),
         }
     }
+    if parsed.diff_base.is_some() && !parsed.force_paths.is_empty() {
+        return Err(format!(
+            "--diff-base cannot be combined with --force-path\n{}",
+            usage()
+        ));
+    }
     Ok(parsed)
 }
 
-fn run_audit(force_paths: &[PathBuf]) -> Result<i32, String> {
+fn run_audit(args: &Args) -> Result<i32, String> {
     let repo_root = repo_root()?;
-    if force_paths.is_empty() {
-        run_staged_audit(&repo_root)
-    } else {
-        run_forced_audit(&repo_root, force_paths)
+    match (args.force_paths.is_empty(), args.diff_base.as_deref()) {
+        (true, None) => run_staged_audit(&repo_root),
+        (true, Some(diff_base)) => run_branch_diff_audit(&repo_root, diff_base),
+        (false, None) => run_forced_audit(&repo_root, &args.force_paths),
+        (false, Some(_)) => unreachable!("validated by parse_args"),
     }
 }
 
@@ -257,6 +273,30 @@ fn run_staged_audit(repo_root: &Path) -> Result<i32, String> {
         })
         .collect::<Vec<_>>();
     audit_files("staged", &files)
+}
+
+fn run_branch_diff_audit(repo_root: &Path, diff_base: &str) -> Result<i32, String> {
+    let files = branch_diff_rust_files(repo_root, diff_base)?;
+    if files.is_empty() {
+        println!("style-audit: no Rust files changed against {diff_base}");
+        return Ok(0);
+    }
+
+    if let Some(result) = run_cargo_gate(repo_root, FMT_COMMAND)? {
+        print_gate_failure("cargo fmt --all -- --check", &result);
+        return Ok(1);
+    }
+
+    if let Some(result) = run_cargo_gate(repo_root, CLIPPY_COMMAND)? {
+        print_gate_failure(
+            "cargo clippy -p doradb-storage --all-targets -- -D warnings",
+            &result,
+        );
+        return Ok(1);
+    }
+
+    let label = format!("branch-diff against {diff_base}");
+    audit_files(&label, &files)
 }
 
 fn run_forced_audit(repo_root: &Path, force_paths: &[PathBuf]) -> Result<i32, String> {
@@ -342,6 +382,54 @@ fn staged_rust_files(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+fn branch_diff_rust_files(repo_root: &Path, diff_base: &str) -> Result<Vec<AuditFile>, String> {
+    let merge_base = merge_base(repo_root, diff_base)?;
+    let result = run_command(
+        repo_root,
+        "git",
+        &[
+            "diff",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-z",
+            &merge_base,
+            "--",
+            "*.rs",
+        ],
+    )?;
+    if result.code != Some(0) {
+        return Err(format!(
+            "failed to collect Rust files changed against {diff_base}\n{}{}",
+            result.stdout, result.stderr
+        ));
+    }
+
+    let mut files = result
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty() && path.ends_with(".rs"))
+        .map(|path| AuditFile {
+            display_path: normalize_path(Path::new(path)),
+            full_path: repo_root.join(path),
+        })
+        .filter(|file| file.full_path.is_file())
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| a.display_path.cmp(&b.display_path));
+    files.dedup_by(|a, b| a.display_path == b.display_path);
+    Ok(files)
+}
+
+fn merge_base(repo_root: &Path, diff_base: &str) -> Result<String, String> {
+    let result = run_command(repo_root, "git", &["merge-base", diff_base, "HEAD"])?;
+    if result.code != Some(0) {
+        return Err(format!(
+            "failed to resolve merge-base for {diff_base} and HEAD\n{}{}",
+            result.stdout, result.stderr
+        ));
+    }
+    Ok(result.stdout.trim().to_string())
+}
+
 fn forced_rust_files(repo_root: &Path, force_paths: &[PathBuf]) -> Result<Vec<AuditFile>, String> {
     let mut files = Vec::new();
     for force_path in force_paths {
@@ -406,7 +494,7 @@ fn export_index_snapshot(repo_root: &Path) -> Result<TempSnapshot, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("system clock before unix epoch: {e}"))?
         .as_nanos();
-    dir.push(format!("doradb-style-audit-{}-{nanos}", std::process::id()));
+    dir.push(format!("doradb-style-audit-{}-{nanos}", id()));
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
 
     let prefix = format!("{}/", normalize_path(&dir));

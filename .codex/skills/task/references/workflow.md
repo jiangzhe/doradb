@@ -153,16 +153,24 @@ Stop if `.worktrees/<task-id>` already exists or if `git worktree add` fails. Do
 Complete all items:
 
 1. Ensure implementation, tests, and review are complete before running resolve updates.
-2. Confirm known implementation/review issues are fixed or explicitly accepted/deferred.
-3. Edit the task doc directly and keep section structure consistent with `docs/tasks/000000-template.md`.
-4. Fill `Implementation Notes` with concrete implementation/test/review results.
-5. Append unresolved future improvements to `Open Questions` if they remain out of scope.
-6. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
-7. When a follow-up backlog item is intentionally deferred from current task/RFC execution, require backlog creation to include:
+2. Run `$style-audit` branch-diff mode before any other resolve action:
+```bash
+tools/style_audit.rs --diff-base origin/main
+```
+   - Audit Rust files changed against `merge-base(origin/main, HEAD)` so already committed task-branch code changes are included.
+   - Treat formatting, clippy, and repository style diagnostics as a hard resolve gate failure.
+   - If style-audit fails, stop immediately and do not edit task docs, close backlogs, or sync RFCs.
+   - Report the failure and leave fix strategy to the developer; do not auto-format, run fixes, or edit implementation code during resolve.
+3. Confirm known implementation/review issues are fixed or explicitly accepted/deferred.
+4. Edit the task doc directly and keep section structure consistent with `docs/tasks/000000-template.md`.
+5. Fill `Implementation Notes` with concrete implementation/test/review results.
+6. Append unresolved future improvements to `Open Questions` if they remain out of scope.
+7. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
+8. When a follow-up backlog item is intentionally deferred from current task/RFC execution, require backlog creation to include:
    - `Deferred From`: current task doc plus parent RFC when applicable.
    - `Deferral Context`: defer reason, findings, and direction hint.
-8. Link related backlog todos from task doc resolve updates.
-9. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
+9. Link related backlog todos from task doc resolve updates.
+10. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
    - Resolve backlog by id/path first when needed:
 ```bash
 tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
@@ -172,12 +180,12 @@ tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
    - If close `detail`/`reference` text is multiline or contains markdown/backticks, use `tools/backlog.rs close-doc --detail-file ... [--reference-file ...]`.
-10. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
+11. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
 ```bash
 tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
 ```
-11. Always check whether resolved task is an RFC sub-task.
-12. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
+12. Always check whether resolved task is an RFC sub-task.
+13. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
    - Use:
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
@@ -186,8 +194,8 @@ tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
    - If the task proposal or implementation changes phase prerequisites,
      phase-local choices, `After This Phase`, non-goals, or following-phase
      assumptions, update the RFC phase plan before or with the resolve sync.
-13. Do not run `git commit` or `git push` during `task resolve`.
-14. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
+14. Do not run `git commit` or `git push` during `task resolve`.
+15. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
 
 ## `task purge worktree` Checklist
 

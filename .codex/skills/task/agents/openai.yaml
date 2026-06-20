@@ -14,13 +14,17 @@ interface:
     decision-complete and sufficient for an implementation agent to start
     coding directly from the task worktree and doc without a separate planning
     command. Use $task resolve from the task worktree after implementation,
-    tests, and review are complete and known implementation/review issues are
-    fixed or explicitly accepted/deferred, including `tools/task.rs
-    resolve-task-next-id --task docs/tasks/<id>-<slug>.md` before RFC sync,
-    update RFC phase plans when proposals or implementation changed
-    prerequisites/phase-local choices, handle source backlog closure explicitly
-    through $backlog, and when deferring work into backlog include the current
-    task/RFC source plus defer reason, findings, and direction hint.
+    tests, and review are complete; run $style-audit branch-diff mode first as
+    `tools/style_audit.rs --diff-base origin/main` so committed task-branch
+    Rust changes are included, and stop without later resolve actions if it
+    fails, leaving fix strategy to the developer. After a passing style audit,
+    confirm known implementation/review issues are fixed or explicitly
+    accepted/deferred, including `tools/task.rs resolve-task-next-id --task
+    docs/tasks/<id>-<slug>.md` before RFC sync, update RFC phase plans when
+    proposals or implementation changed prerequisites/phase-local choices,
+    handle source backlog closure explicitly through $backlog, and when
+    deferring work into backlog include the current task/RFC source plus defer
+    reason, findings, and direction hint.
     Use $task purge worktree from the `main` dispatch worktree with
     `tools/task.rs purge-worktrees`, and only remove worktrees in `--apply` mode
     when the task is implemented, the worktree is clean, and the same-name

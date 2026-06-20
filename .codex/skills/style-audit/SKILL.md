@@ -1,11 +1,12 @@
 ---
 name: style-audit
-description: Audit staged Rust files for Doradb coding style using deterministic tooling and concise read-only review. Use when asked to check coding style, run a style audit/style auditor, validate staged Rust files before commit or PR, or report style violations in modified/staged files.
+description: Audit staged or branch-diff Rust files for Doradb coding style using deterministic tooling and concise read-only review. Use when asked to check coding style, run a style audit/style auditor, validate staged Rust files before commit or PR, validate task-branch Rust changes during task resolve, or report style violations in modified/staged files.
 ---
 
 # Style Audit Workflow
 
-Use this skill to audit staged Rust files without modifying the repository.
+Use this skill to audit staged or task-branch Rust files without modifying the
+repository.
 
 ## Required Flow
 
@@ -15,13 +16,22 @@ Use this skill to audit staged Rust files without modifying the repository.
 tools/style_audit.rs
 ```
 
+For `task resolve`, audit Rust files changed by the task branch against
+`origin/main` so already committed task-branch changes are included:
+
+```bash
+tools/style_audit.rs --diff-base origin/main
+```
+
 Use `tools/style_audit.rs --force-path <file-or-dir>` only when the user
 explicitly asks to check a specific unstaged file or directory. Directory
 targets check only direct `.rs` children and do not recurse.
 
 2. Treat the verifier as authoritative for mechanical checks:
-   - staged `.rs` files only;
-   - staged index content, not unstaged working-tree edits;
+   - default mode checks staged `.rs` files only;
+   - default mode reads staged index content, not unstaged working-tree edits;
+   - `--diff-base <rev>` working-tree Rust files changed against
+     `merge-base(<rev>, HEAD)`;
    - `--force-path` working-tree targets when explicitly requested;
    - `cargo fmt --all -- --check`;
    - `cargo clippy -p doradb-storage --all-targets -- -D warnings`;
@@ -30,7 +40,7 @@ targets check only direct `.rs` children and do not recurse.
      `#[cfg(test)]` module that directly uses them.
 3. If formatting or clippy fails, stop and report that gate failure. Do not continue with manual style review.
 4. If verifier diagnostics exist, report a concise summary grouped by file and rule.
-5. If no staged Rust files exist, report that no Rust style audit was needed.
+5. If no staged or branch-diff Rust files exist, report that no Rust style audit was needed.
 6. Do not edit files, run `cargo fmt`, run `cargo clippy --fix`, stage files, or otherwise mutate tracked repository state.
 
 ## Report Format
@@ -38,7 +48,8 @@ targets check only direct `.rs` children and do not recurse.
 Keep the output short:
 
 - state pass/fail;
-- include the number of Rust files checked and whether they were staged or forced-path targets;
+- include the number of Rust files checked and whether they were staged,
+  branch-diff, or forced-path targets;
 - list each violation as `path:line rule - message`;
 - include fmt/clippy command output only when that gate fails, trimmed to the actionable part.
 
