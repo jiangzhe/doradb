@@ -3,6 +3,7 @@ use crate::error::{ConfigError, ConfigResult};
 use error_stack::{Report, ResultExt, ensure};
 use std::path::Path;
 
+/// Return whether a catalog file name is a plain `.mtb` file name.
 pub(crate) fn validate_catalog_file_name(file_name: &str) -> bool {
     if file_name.is_empty() || !file_name.ends_with(".mtb") {
         return false;
@@ -10,6 +11,7 @@ pub(crate) fn validate_catalog_file_name(file_name: &str) -> bool {
     Path::new(file_name).file_name().and_then(|n| n.to_str()) == Some(file_name)
 }
 
+/// Return whether a redo log stem is a plain file name without glob characters.
 pub(crate) fn validate_log_file_stem(file_stem: &str) -> bool {
     if file_stem.is_empty() {
         return false;
@@ -22,6 +24,7 @@ pub(crate) fn validate_log_file_stem(file_stem: &str) -> bool {
         .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
 }
 
+/// Validate a configured swap-file path before storage-root resolution.
 pub(crate) fn validate_swap_file_path_candidate(
     field: &str,
     path: impl AsRef<Path>,
@@ -61,6 +64,7 @@ pub(crate) fn validate_swap_file_path_candidate(
     Ok(())
 }
 
+/// Convert a path to UTF-8 for configuration serialization and diagnostics.
 pub(crate) fn path_to_utf8<'a>(path: &'a Path, field: &str) -> ConfigResult<&'a str> {
     path.to_str().ok_or_else(|| {
         Report::new(ConfigError::PathMustBeUtf8).attach(format!("{field} must be valid UTF-8"))

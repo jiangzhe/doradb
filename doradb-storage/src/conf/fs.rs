@@ -10,15 +10,16 @@ use super::consts::{
     DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
 };
 
+/// Configuration for table and catalog file-system resources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSystemConfig {
-    // IO depth of reading/write table files.
+    /// IO depth for reading and writing table files.
     pub io_depth: usize,
-    // Data directory used for table and catalog files.
+    /// Data directory used for table and catalog files.
     pub data_dir: PathBuf,
-    // Global readonly buffer pool size in bytes.
+    /// Global readonly-buffer-pool size in bytes.
     pub readonly_buffer_size: usize,
-    // Catalog multi-table file name.
+    /// Catalog multi-table file name.
     pub catalog_file_name: String,
 }
 
@@ -71,6 +72,7 @@ impl FileSystemConfig {
         Ok((data_dir, self.catalog_file_name, self.io_depth))
     }
 
+    /// Build the table file-system and its storage IO worker.
     #[inline]
     pub(crate) fn build_engine_parts(self) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
         let (data_dir, catalog_file_name, io_depth) = self.validate_parts().map_err(Error::from)?;
