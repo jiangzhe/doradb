@@ -35,10 +35,16 @@ tools/style_audit.rs
 
 This command checks only staged `.rs` files, reads the staged index rather than
 unstaged working-tree edits, and reports formatting, clippy, and repository
-style violations. The project-scoped `style-auditor` subagent uses the
-`$style-audit` skill to run the same read-only audit in a separate context.
-For explicit unstaged checks, pass `--force-path <file-or-dir>`; directory
-targets check only direct `.rs` children and do not recurse.
+style violations. For explicit unstaged checks, pass
+`--force-path <file-or-dir>`; directory targets check only direct `.rs`
+children and do not recurse.
+
+During `task resolve`, audit task-branch Rust changes against `origin/main` so
+already committed implementation changes are included:
+
+```bash
+tools/style_audit.rs --diff-base origin/main
+```
 
 4. Run tests:
 
