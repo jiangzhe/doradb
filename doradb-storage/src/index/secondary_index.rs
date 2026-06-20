@@ -21,6 +21,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
 use error_stack::Report;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Result of attempting to insert a secondary-index entry.
@@ -135,11 +136,6 @@ pub(crate) struct SecondaryDiskTreeRuntime {
     kind: SecondaryDiskTreeRuntimeKind,
 }
 
-enum SecondaryDiskTreeRuntimeKind {
-    Unique(UniqueDiskTreeRuntime),
-    NonUnique(NonUniqueDiskTreeRuntime),
-}
-
 impl SecondaryDiskTreeRuntime {
     /// Create a cold-layer runtime for one table secondary index.
     #[inline]
@@ -235,7 +231,7 @@ impl SecondaryDiskTreeRuntime {
         &self,
         root_block_id: BlockID,
         disk_pool_guard: &PoolGuard,
-        out: &mut std::collections::BTreeSet<BlockID>,
+        out: &mut BTreeSet<BlockID>,
     ) -> Result<()> {
         match &self.kind {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
@@ -252,6 +248,11 @@ impl SecondaryDiskTreeRuntime {
             }
         }
     }
+}
+
+enum SecondaryDiskTreeRuntimeKind {
+    Unique(UniqueDiskTreeRuntime),
+    NonUnique(NonUniqueDiskTreeRuntime),
 }
 
 /// Owned user-table secondary-index storage.

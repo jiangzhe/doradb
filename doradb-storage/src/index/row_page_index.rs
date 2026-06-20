@@ -23,16 +23,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+/// Bytes in one row-page-index node.
 pub(crate) const ROW_PAGE_INDEX_NODE_SIZE: usize = PAGE_SIZE;
 /// Bytes reserved at the end of every row-page-index node for spill checksums.
 pub(crate) const ROW_PAGE_INDEX_NODE_FOOTER_SIZE: usize = BLOCK_INTEGRITY_TRAILER_SIZE;
 /// Bytes available to row-page-index node entries before the checksum footer.
 pub(crate) const ROW_PAGE_INDEX_NODE_USABLE_SIZE: usize =
     ROW_PAGE_INDEX_NODE_SIZE - ROW_PAGE_INDEX_NODE_FOOTER_SIZE;
+/// Bytes occupied by the row-page-index node header.
 pub(crate) const ROW_PAGE_INDEX_NODE_HEADER_SIZE: usize = mem::size_of::<RowPageIndexNodeHeader>();
+/// Bytes occupied by one row-page-index entry.
 pub(crate) const ENTRY_SIZE: usize = mem::size_of::<PageEntry>();
+/// Maximum number of child entries in one branch node.
 pub(crate) const NBR_ENTRIES_IN_BRANCH: usize =
     (ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE;
+/// Maximum number of row-page entries in one leaf node.
 pub(crate) const NBR_ROW_PAGE_ENTRIES_IN_LEAF: usize =
     (ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE;
 
@@ -77,6 +82,8 @@ const _: () = assert!(
     "ENTRY_SIZE must match PageEntry size"
 );
 
+const _: () = assert_buffer_page::<RowPageIndexNode>();
+
 enum InsertFreeListProbe<T> {
     Hit(T),
     Miss(InsertFreeListMiss),
@@ -94,7 +101,8 @@ enum InsertFreeListMiss {
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct RowPageIndexNode {
-    pub header: RowPageIndexNodeHeader,
+    /// Fixed node header containing height and row-id bounds.
+    pub(crate) header: RowPageIndexNodeHeader,
     data: [u8; ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE],
     footer: [u8; ROW_PAGE_INDEX_NODE_FOOTER_SIZE],
 }
@@ -268,29 +276,30 @@ unsafe impl BufferPage for RowPageIndexNode {
     const KIND: BufferPageKind = BufferPageKind::RowPageIndexNode;
 }
 
-const _: () = assert_buffer_page::<RowPageIndexNode>();
-
 /// Header metadata for one in-memory row-page-index node.
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct RowPageIndexNodeHeader {
-    // height of the node
-    pub height: u32,
-    // count of entry.
-    pub count: u32,
-    // start row id of the node.
-    pub start_row_id: RowID,
-    // end row id of the node.
-    // note: this value may not be valid if the node is branch.
-    pub end_row_id: RowID,
+    /// Height of the node, where zero means leaf.
+    pub(crate) height: u32,
+    /// Number of valid entries stored in the node.
+    pub(crate) count: u32,
+    /// Inclusive starting row id covered by the node.
+    pub(crate) start_row_id: RowID,
+    /// Exclusive ending row id covered by the node.
+    ///
+    /// This value may not be valid when the node is a branch.
+    pub(crate) end_row_id: RowID,
 }
 
-#[repr(C)]
 /// Entry mapping a row-id boundary to a row-page or child node page id.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct PageEntry {
-    pub row_id: RowID,
-    pub page_id: PageID,
+    /// Row-id boundary represented by this entry.
+    pub(crate) row_id: RowID,
+    /// Row page or child-node page id for this entry.
+    pub(crate) page_id: PageID,
 }
 
 impl PageEntry {
@@ -1187,10 +1196,11 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::frame::BufferFrame;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-    use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
+    use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, Page, VersionedPageID};
     use crate::buffer::test_page_id;
-    use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
+    use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
@@ -1206,25 +1216,21 @@ mod tests {
     use crate::value::ValKind;
     use semistr::SemiStr;
     use std::future::Future;
+    use std::io::Error as StdIoError;
+    use std::mem::size_of;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
     fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
-        QuiescentBox::new(
-            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, pool_size).unwrap(),
-        )
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Index, pool_size).unwrap())
     }
 
     fn owned_mem_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
-        QuiescentBox::new(
-            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Mem, pool_size).unwrap(),
-        )
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Mem, pool_size).unwrap())
     }
 
     fn fixed_pool_bytes(page_count: usize) -> usize {
-        page_count
-            * (std::mem::size_of::<crate::buffer::frame::BufferFrame>()
-                + std::mem::size_of::<crate::buffer::page::Page>())
+        page_count * (size_of::<BufferFrame>() + size_of::<Page>())
     }
 
     #[test]
@@ -1335,7 +1341,7 @@ mod tests {
             mode: LatchFallbackMode,
         ) -> Result<FacadePageGuard<T>> {
             if page_id == self.fail_page_id.load(Ordering::Acquire) {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
             }
             self.inner.get_page(guard, page_id, mode).await
         }
@@ -1376,7 +1382,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1437,7 +1443,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1731,7 +1737,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(100usize * 1024 * 1024)
                         .max_file_size(1024usize * 1024 * 1024),
                 )
@@ -1983,7 +1989,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )

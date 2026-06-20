@@ -2,6 +2,8 @@ use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::INVALID_ROW_ID;
 use crate::trx::sys::TransactionSystem;
 
+const U64_DELETE_BIT: u64 = 1u64 << 63;
+
 /// Value that can be masked as deleted.
 pub(crate) trait Maskable: Copy + PartialEq + Eq {
     const INVALID_VALUE: Self;
@@ -15,8 +17,6 @@ pub(crate) trait Maskable: Copy + PartialEq + Eq {
     /// Returns whether this value is masked as deleted.
     fn is_deleted(self) -> bool;
 }
-
-const U64_DELETE_BIT: u64 = 1u64 << 63;
 
 impl Maskable for RowID {
     const INVALID_VALUE: Self = INVALID_ROW_ID;
@@ -40,9 +40,13 @@ impl Maskable for RowID {
 /// Statistics of space used by nodes.
 #[derive(Debug, Default)]
 pub(crate) struct SpaceStatistics {
+    /// Number of nodes included in the statistic.
     pub(crate) nodes: usize,
+    /// Total addressable bytes across all included nodes.
     pub(crate) total_space: usize,
+    /// Bytes currently occupied by encoded entries.
     pub(crate) used_space: usize,
+    /// Bytes counted as effective payload after format overhead.
     pub(crate) effective_space: usize,
 }
 
@@ -52,6 +56,7 @@ pub(super) struct ParentPosition<G> {
     pub(super) idx: isize,
 }
 
+/// Redo context used when a row page is created through the index.
 #[derive(Clone, Copy)]
 pub(crate) struct RowPageCreateRedoCtx<'a> {
     trx_sys: &'a TransactionSystem,
@@ -59,6 +64,7 @@ pub(crate) struct RowPageCreateRedoCtx<'a> {
 }
 
 impl RowPageCreateRedoCtx<'_> {
+    /// Creates a redo context for row-page creation records.
     #[inline]
     pub(crate) fn new<'a>(
         trx_sys: &'a TransactionSystem,
@@ -67,6 +73,7 @@ impl RowPageCreateRedoCtx<'_> {
         RowPageCreateRedoCtx { trx_sys, table_id }
     }
 
+    /// Commits the system redo record for a newly allocated row page.
     #[inline]
     pub(crate) fn commit_row_page(
         &self,
