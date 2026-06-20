@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
 pub(crate) struct CatalogRedoEntry {
+    /// Catalog table that owns the row operation.
     pub(crate) table_id: TableID,
+    /// Redo operation applied to the catalog row.
     pub(crate) kind: RowRedoKind,
 }
 
@@ -37,18 +39,22 @@ pub(crate) enum CatalogCheckpointScanStopReason {
 
 /// Catalog checkpoint scan result consumed by apply phase.
 pub(crate) struct CatalogCheckpointBatch {
+    /// Catalog redo cursor at the start of this scan.
     pub(crate) replay_start_ts: TrxID,
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    #[cfg_attr(test, expect(dead_code, reason = "pending dead-code audit"))]
-    pub(crate) durable_upper_cts: TrxID,
+    /// Highest commit timestamp safely covered by the batch.
     pub(crate) safe_cts: TrxID,
+    /// Catalog table row redo operations folded into the checkpoint.
     pub(crate) catalog_ops: Vec<CatalogRedoEntry>,
+    /// Number of catalog DDL transactions included in the batch.
     pub(crate) catalog_ddl_txn_count: usize,
+    /// Reason the scan stopped.
     pub(crate) stop_reason: CatalogCheckpointScanStopReason,
 }
 
+/// Configuration for scanning catalog checkpoint redo logs.
 #[derive(Clone)]
 pub(crate) struct CatalogCheckpointScanConfig {
+    /// Redo log file prefix used to discover scan inputs.
     pub(crate) file_prefix: String,
 }
 
@@ -294,6 +300,7 @@ impl Catalog {
         )
     }
 
+    /// Scan catalog redo logs with an explicit replay window and log prefix.
     pub(crate) fn scan_checkpoint_batch_with_config(
         &self,
         replay_start_ts: TrxID,
@@ -305,7 +312,6 @@ impl Catalog {
         // redo record is proven safe to cover in this checkpoint.
         let mut batch = CatalogCheckpointBatch {
             replay_start_ts,
-            durable_upper_cts,
             safe_cts: replay_start_ts.saturating_sub(1),
             catalog_ops: vec![],
             catalog_ddl_txn_count: 0,
@@ -490,6 +496,9 @@ fn drop_table_has_catalog_table_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smol::Timer;
+    use smol::future::or;
+    use std::time::Duration;
 
     #[test]
     fn test_catalog_metadata_change_waits_for_active_checkpoint() {
@@ -575,8 +584,8 @@ mod tests {
                 let metadata_lease = second_waiter.await;
                 drop(metadata_lease);
             };
-            smol::future::or(waiter, async {
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+            or(waiter, async {
+                Timer::after(Duration::from_secs(1)).await;
                 panic!(
                     "second metadata-change waiter failed to acquire after pending cancellation"
                 );

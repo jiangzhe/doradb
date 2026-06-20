@@ -1,8 +1,5 @@
-use super::table::{
-    acquire_table_ddl_locks, precheck_index_ddl_target, reject_table_ddl_explicit_session_lock,
-    validated_index_ddl_target,
-};
-use crate::buffer::{EvictableBufferPool, PoolGuards};
+use super::table::{precheck_index_ddl_target, validated_index_ddl_target};
+use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{
     IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
 };
@@ -19,8 +16,6 @@ use crate::index::{
 use crate::log::redo::DDLRedo;
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowRead;
-#[cfg(test)]
-use crate::session::Session;
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::{Transaction, trx_is_committed};
@@ -49,313 +44,6 @@ pub(crate) enum IndexDdlRootProof {
     DurableAllocationOnly,
     /// The root proves the dropped index is inactive and its root slot is empty.
     DurableFinalDrop,
-}
-
-#[inline]
-fn invalid_index_ddl_root(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidRootInvariant)
-        .attach(message.into())
-        .into()
-}
-
-/// Build and publish a new secondary index for a user-table session request.
-pub(crate) async fn create_index_for_session(
-    session: SessionPin,
-    table_id: TableID,
-    index_spec: IndexSpec,
-) -> Result<IndexNo> {
-    let ctx = SessionDdlContext::new(&session)?;
-    let engine = ctx.engine.clone();
-    let guards = ctx.pool_guards.clone();
-    let lock_manager = engine.lock_manager();
-
-    // 1. Validate the target and acquire table-local DDL exclusion before
-    // deriving any new metadata or touching mutable table roots.
-    precheck_index_ddl_target(&guards, &engine, table_id, "create index").await?;
-    reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "create index")?;
-    // Keep these DDL locks alive through root publish and runtime layout
-    // install so foreground readers/writers cannot observe a partial index.
-    let _table_locks =
-        acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "create index").await?;
-    engine.trx_sys.ensure_runtime_healthy()?;
-    table.check_foreground_live("create index")?;
-
-    // 2. Exclude table and catalog checkpoints while catalog metadata,
-    // table-file roots, and runtime layout are temporarily out of sync.
-    // Keep both metadata-change leases alive until after the matching table
-    // root is published and the new runtime layout is installed.
-    let _table_metadata_lease = table.begin_metadata_change().await?;
-    let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
-
-    // 3. Allocate the stable table-local index number and prepare the new
-    // metadata/root shape, preserving existing sparse index slots.
-    let old_layout = table.layout_snapshot();
-    let old_metadata = old_layout.metadata();
-    let active_root = table.file().active_root_unchecked().clone();
-    validate_create_index_root_shape(table_id, &active_root, old_metadata)?;
-    let (index_no, new_metadata_value) = old_metadata.try_with_created_index(index_spec)?;
-    let new_metadata = Arc::new(new_metadata_value);
-    let index_no_usize = usize::from(index_no);
-    let new_index_spec = new_metadata.idx.require_index_spec(index_no_usize)?.clone();
-
-    let mut secondary_index_roots = active_root.secondary_index_roots.clone();
-    secondary_index_roots.resize(new_metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
-    let disk_runtime = SecondaryDiskTreeRuntime::new(
-        index_no_usize,
-        Arc::clone(&new_metadata),
-        Arc::clone(table.file()),
-        table.disk_pool().clone(),
-    )?;
-
-    // 4. Start the implicit DDL transaction and let the progress state own all
-    // rollback/destroy transitions from this point onward.
-    let trx = session.begin_trx("begin transaction")?;
-    let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
-    let build_ts = progress.build_ts();
-
-    let mut mutable_file = MutableTableFile::fork(
-        table.file(),
-        engine.table_fs.background_writes(),
-        table.disk_pool().clone(),
-    );
-
-    // 5. Build the cold DiskTree from the currently persisted live rows and
-    // stage the resulting root in the forked table file.
-    let cold_rows = collect_create_index_cold_rows(
-        &table,
-        &guards,
-        old_metadata,
-        &new_index_spec,
-        active_root.column_block_index_root,
-        active_root.pivot_row_id,
-    )
-    .await;
-    let cold_rows = match cold_rows {
-        Ok(cold_rows) => cold_rows,
-        Err(err) => {
-            return progress.rollback_before_catalog_commit(err).await;
-        }
-    };
-
-    let (cold_root, cold_unique_keys) = match build_create_index_disk_tree(
-        &mut mutable_file,
-        &disk_runtime,
-        &guards,
-        new_metadata.as_ref(),
-        &new_index_spec,
-        &cold_rows,
-        build_ts,
-    )
-    .await
-    {
-        Ok(res) => res,
-        Err(err) => {
-            return progress.rollback_before_catalog_commit(err).await;
-        }
-    };
-    secondary_index_roots[index_no_usize] = cold_root;
-    if let Err(err) = mutable_file.replace_metadata_and_secondary_index_roots(
-        Arc::clone(&new_metadata),
-        secondary_index_roots,
-    ) {
-        return progress.rollback_before_catalog_commit(err).await;
-    }
-
-    // 6. Build the hot MemIndex from row-store rows and assemble a runtime
-    // layout that future readers can install atomically.
-    let hot_rows =
-        match collect_create_index_hot_rows(&table, &old_layout, &guards, &new_index_spec).await {
-            Ok(hot_rows) => hot_rows,
-            Err(err) => {
-                return progress.rollback_before_catalog_commit(err).await;
-            }
-        };
-    match build_create_index_runtime_index(CreateIndexRuntimeBuild {
-        engine: &engine,
-        guards: &guards,
-        metadata: Arc::clone(&new_metadata),
-        index_spec: &new_index_spec,
-        disk_runtime,
-        hot_rows,
-        cold_unique_keys: &cold_unique_keys,
-        build_ts,
-    })
-    .await
-    {
-        Ok(index) => {
-            progress.stage_runtime_index(index);
-        }
-        Err(err) => {
-            return progress.rollback_before_catalog_commit(err).await;
-        }
-    }
-    let new_layout = match build_created_index_runtime_layout(
-        &old_layout,
-        Arc::clone(&new_metadata),
-        index_no_usize,
-        match progress.clone_staged_index_for_layout() {
-            Ok(index) => index,
-            Err(err) => {
-                return progress.rollback_before_catalog_commit(err).await;
-            }
-        },
-    ) {
-        Ok(layout) => layout,
-        Err(err) => {
-            return progress.rollback_before_catalog_commit(err).await;
-        }
-    };
-    progress.stage_layout(new_layout);
-
-    // 7. Persist catalog metadata and DDL redo in the implicit transaction.
-    // Until the table root publishes below, recovery treats this redo as
-    // provisional.
-    progress
-        .execute_catalog_update(new_metadata.as_ref(), &new_index_spec)
-        .await?;
-
-    let create_cts = progress.commit_catalog().await?;
-
-    // 8. Publish the table root that proves the new index metadata durable.
-    // Failure after catalog commit poisons storage per the RFC 0018 policy.
-    let root_publish = engine
-        .trx_sys
-        .publish_table_file_root(mutable_file, create_cts, false)
-        .await;
-    match root_publish {
-        Ok(_table_file) => {}
-        Err(err) => {
-            return progress
-                .cleanup_after_catalog_commit_failure("table root publish", err)
-                .await;
-        }
-    }
-
-    // 9. Install the new runtime layout last. Existing snapshots keep their old
-    // layout Arcs, while later foreground work observes the new index.
-    let new_layout = match progress.take_layout_for_install() {
-        Ok(layout) => layout,
-        Err(err) => {
-            return progress
-                .cleanup_after_catalog_commit_failure("runtime layout install", err)
-                .await;
-        }
-    };
-    if let Err(err) = table.install_runtime_layout(old_layout.generation(), new_layout) {
-        return progress
-            .cleanup_after_catalog_commit_failure("runtime layout install", err)
-            .await;
-    }
-    progress.mark_installed();
-
-    Ok(index_no)
-}
-
-/// Drop an active secondary index for a user-table session request.
-pub(crate) async fn drop_index_for_session(
-    session: SessionPin,
-    table_id: TableID,
-    index_no: IndexNo,
-) -> Result<()> {
-    let ctx = SessionDdlContext::new(&session)?;
-    let engine = ctx.engine.clone();
-    let guards = ctx.pool_guards.clone();
-    let lock_manager = engine.lock_manager();
-
-    precheck_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
-    reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "drop index")?;
-    let _table_locks =
-        acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
-    engine.trx_sys.ensure_runtime_healthy()?;
-    table.check_foreground_live("drop index")?;
-
-    let _table_metadata_lease = table.begin_metadata_change().await?;
-    let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
-
-    let old_layout = table.layout_snapshot();
-    let old_generation = old_layout.generation();
-    let old_metadata = old_layout.metadata();
-    let index_no_usize = usize::from(index_no);
-    let old_index_spec = old_metadata
-        .idx
-        .index_spec(index_no_usize)
-        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive metadata slot"))?
-        .clone();
-    old_layout.secondary_index(index_no_usize)?;
-
-    let active_root = table.file().active_root_unchecked().clone();
-    validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)?;
-    let new_metadata = Arc::new(old_metadata.try_without_index(index_no)?);
-
-    let mut secondary_index_roots = active_root.secondary_index_roots.clone();
-    secondary_index_roots[index_no_usize] = SUPER_BLOCK_ID;
-    let mut mutable_file = MutableTableFile::fork(
-        table.file(),
-        engine.table_fs.background_writes(),
-        table.disk_pool().clone(),
-    );
-    mutable_file.replace_metadata_and_secondary_index_roots(
-        Arc::clone(&new_metadata),
-        secondary_index_roots,
-    )?;
-
-    let new_layout = build_dropped_index_runtime_layout(
-        table_id,
-        &old_layout,
-        Arc::clone(&new_metadata),
-        index_no_usize,
-    )?;
-
-    let trx = session.begin_trx("begin transaction")?;
-    let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);
-    progress.stage_layout(new_layout);
-    progress.execute_catalog_update(&old_index_spec).await?;
-    let drop_cts = progress.commit_catalog().await?;
-
-    let root_publish = engine
-        .trx_sys
-        .publish_table_file_root(mutable_file, drop_cts, false)
-        .await;
-    match root_publish {
-        Ok(_table_file) => {}
-        Err(err) => {
-            return progress
-                .cleanup_after_catalog_commit_failure("table root publish", err)
-                .await;
-        }
-    }
-
-    let new_layout = match progress.take_layout_for_install() {
-        Ok(layout) => layout,
-        Err(err) => {
-            return progress
-                .cleanup_after_catalog_commit_failure("runtime layout install", err)
-                .await;
-        }
-    };
-    if let Err(err) = table.install_runtime_layout(old_generation, new_layout) {
-        return progress
-            .cleanup_after_catalog_commit_failure("runtime layout install", err)
-            .await;
-    }
-    progress.mark_installed();
-    drop(old_layout);
-
-    if let Err(err) = table.cleanup_retired_secondary_indexes(&guards).await {
-        return Err(poison_index_after_catalog_commit_with_source(
-            &engine,
-            IndexDdlKind::Drop,
-            table_id,
-            index_no,
-            "retired secondary-index cleanup",
-            err,
-        )
-        .into());
-    }
-
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -685,16 +373,6 @@ impl<'a> DropIndexProgress<'a> {
     }
 }
 
-async fn rollback_active_ddl_trx(trx: &mut Option<Transaction>) -> Result<()> {
-    let Some(trx) = trx.take() else {
-        return Ok(());
-    };
-    if trx.engine().is_some() {
-        trx.rollback().await?;
-    }
-    Ok(())
-}
-
 impl Drop for DropIndexProgress<'_> {
     #[inline]
     fn drop(&mut self) {
@@ -707,6 +385,416 @@ impl Drop for DropIndexProgress<'_> {
             self.phase
         );
     }
+}
+
+/// Build and publish a new secondary index for a user-table session request.
+pub(crate) async fn create_index_for_session(
+    session: SessionPin,
+    table_id: TableID,
+    index_spec: IndexSpec,
+) -> Result<IndexNo> {
+    let ctx = SessionDdlContext::new(&session)?;
+    let engine = ctx.engine.clone();
+    let guards = ctx.pool_guards.clone();
+    let lock_manager = engine.lock_manager();
+
+    // 1. Validate the target and acquire table-local DDL exclusion before
+    // deriving any new metadata or touching mutable table roots.
+    precheck_index_ddl_target(&guards, &engine, table_id, "create index").await?;
+    lock_manager.reject_table_ddl_explicit_session_lock(table_id, ctx.owner, "create index")?;
+    // Keep these DDL locks alive through root publish and runtime layout
+    // install so foreground readers/writers cannot observe a partial index.
+    let _table_locks = lock_manager
+        .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
+        .await?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "create index").await?;
+    engine.trx_sys.ensure_runtime_healthy()?;
+    table.check_foreground_live("create index")?;
+
+    // 2. Exclude table and catalog checkpoints while catalog metadata,
+    // table-file roots, and runtime layout are temporarily out of sync.
+    // Keep both metadata-change leases alive until after the matching table
+    // root is published and the new runtime layout is installed.
+    let _table_metadata_lease = table.begin_metadata_change().await?;
+    let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
+
+    // 3. Allocate the stable table-local index number and prepare the new
+    // metadata/root shape, preserving existing sparse index slots.
+    let old_layout = table.layout_snapshot();
+    let old_metadata = old_layout.metadata();
+    let active_root = table.file().active_root_unchecked().clone();
+    validate_create_index_root_shape(table_id, &active_root, old_metadata)?;
+    let (index_no, new_metadata_value) = old_metadata.try_with_created_index(index_spec)?;
+    let new_metadata = Arc::new(new_metadata_value);
+    let index_no_usize = usize::from(index_no);
+    let new_index_spec = new_metadata.idx.require_index_spec(index_no_usize)?.clone();
+
+    let mut secondary_index_roots = active_root.secondary_index_roots.clone();
+    secondary_index_roots.resize(new_metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
+    let disk_runtime = SecondaryDiskTreeRuntime::new(
+        index_no_usize,
+        Arc::clone(&new_metadata),
+        Arc::clone(table.file()),
+        table.disk_pool().clone(),
+    )?;
+
+    // 4. Start the implicit DDL transaction and let the progress state own all
+    // rollback/destroy transitions from this point onward.
+    let trx = session.begin_trx("begin transaction")?;
+    let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
+    let build_ts = progress.build_ts();
+
+    let mut mutable_file = MutableTableFile::fork(
+        table.file(),
+        engine.table_fs.background_writes(),
+        table.disk_pool().clone(),
+    );
+
+    // 5. Build the cold DiskTree from the currently persisted live rows and
+    // stage the resulting root in the forked table file.
+    let cold_rows = collect_create_index_cold_rows(
+        &table,
+        &guards,
+        old_metadata,
+        &new_index_spec,
+        active_root.column_block_index_root,
+        active_root.pivot_row_id,
+    )
+    .await;
+    let cold_rows = match cold_rows {
+        Ok(cold_rows) => cold_rows,
+        Err(err) => {
+            return progress.rollback_before_catalog_commit(err).await;
+        }
+    };
+
+    let (cold_root, cold_unique_keys) = match build_create_index_disk_tree(
+        &mut mutable_file,
+        &disk_runtime,
+        &guards,
+        new_metadata.as_ref(),
+        &new_index_spec,
+        &cold_rows,
+        build_ts,
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(err) => {
+            return progress.rollback_before_catalog_commit(err).await;
+        }
+    };
+    secondary_index_roots[index_no_usize] = cold_root;
+    if let Err(err) = mutable_file.replace_metadata_and_secondary_index_roots(
+        Arc::clone(&new_metadata),
+        secondary_index_roots,
+    ) {
+        return progress.rollback_before_catalog_commit(err).await;
+    }
+
+    // 6. Build the hot MemIndex from row-store rows and assemble a runtime
+    // layout that future readers can install atomically.
+    let hot_rows =
+        match collect_create_index_hot_rows(&table, &old_layout, &guards, &new_index_spec).await {
+            Ok(hot_rows) => hot_rows,
+            Err(err) => {
+                return progress.rollback_before_catalog_commit(err).await;
+            }
+        };
+    match build_create_index_runtime_index(CreateIndexRuntimeBuild {
+        engine: &engine,
+        guards: &guards,
+        metadata: Arc::clone(&new_metadata),
+        index_spec: &new_index_spec,
+        disk_runtime,
+        hot_rows,
+        cold_unique_keys: &cold_unique_keys,
+        build_ts,
+    })
+    .await
+    {
+        Ok(index) => {
+            progress.stage_runtime_index(index);
+        }
+        Err(err) => {
+            return progress.rollback_before_catalog_commit(err).await;
+        }
+    }
+    let new_layout = match build_created_index_runtime_layout(
+        &old_layout,
+        Arc::clone(&new_metadata),
+        index_no_usize,
+        match progress.clone_staged_index_for_layout() {
+            Ok(index) => index,
+            Err(err) => {
+                return progress.rollback_before_catalog_commit(err).await;
+            }
+        },
+    ) {
+        Ok(layout) => layout,
+        Err(err) => {
+            return progress.rollback_before_catalog_commit(err).await;
+        }
+    };
+    progress.stage_layout(new_layout);
+
+    // 7. Persist catalog metadata and DDL redo in the implicit transaction.
+    // Until the table root publishes below, recovery treats this redo as
+    // provisional.
+    progress
+        .execute_catalog_update(new_metadata.as_ref(), &new_index_spec)
+        .await?;
+
+    let create_cts = progress.commit_catalog().await?;
+
+    // 8. Publish the table root that proves the new index metadata durable.
+    // Failure after catalog commit poisons storage per the RFC 0018 policy.
+    let root_publish = engine
+        .trx_sys
+        .publish_table_file_root(mutable_file, create_cts, false)
+        .await;
+    match root_publish {
+        Ok(_table_file) => {}
+        Err(err) => {
+            return progress
+                .cleanup_after_catalog_commit_failure("table root publish", err)
+                .await;
+        }
+    }
+
+    // 9. Install the new runtime layout last. Existing snapshots keep their old
+    // layout Arcs, while later foreground work observes the new index.
+    let new_layout = match progress.take_layout_for_install() {
+        Ok(layout) => layout,
+        Err(err) => {
+            return progress
+                .cleanup_after_catalog_commit_failure("runtime layout install", err)
+                .await;
+        }
+    };
+    if let Err(err) = table.install_runtime_layout(old_layout.generation(), new_layout) {
+        return progress
+            .cleanup_after_catalog_commit_failure("runtime layout install", err)
+            .await;
+    }
+    progress.mark_installed();
+
+    Ok(index_no)
+}
+
+/// Drop an active secondary index for a user-table session request.
+pub(crate) async fn drop_index_for_session(
+    session: SessionPin,
+    table_id: TableID,
+    index_no: IndexNo,
+) -> Result<()> {
+    let ctx = SessionDdlContext::new(&session)?;
+    let engine = ctx.engine.clone();
+    let guards = ctx.pool_guards.clone();
+    let lock_manager = engine.lock_manager();
+
+    precheck_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
+    lock_manager.reject_table_ddl_explicit_session_lock(table_id, ctx.owner, "drop index")?;
+    let _table_locks = lock_manager
+        .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
+        .await?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
+    engine.trx_sys.ensure_runtime_healthy()?;
+    table.check_foreground_live("drop index")?;
+
+    let _table_metadata_lease = table.begin_metadata_change().await?;
+    let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
+
+    let old_layout = table.layout_snapshot();
+    let old_generation = old_layout.generation();
+    let old_metadata = old_layout.metadata();
+    let index_no_usize = usize::from(index_no);
+    let old_index_spec = old_metadata
+        .idx
+        .index_spec(index_no_usize)
+        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive metadata slot"))?
+        .clone();
+    old_layout.secondary_index(index_no_usize)?;
+
+    let active_root = table.file().active_root_unchecked().clone();
+    validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)?;
+    let new_metadata = Arc::new(old_metadata.try_without_index(index_no)?);
+
+    let mut secondary_index_roots = active_root.secondary_index_roots.clone();
+    secondary_index_roots[index_no_usize] = SUPER_BLOCK_ID;
+    let mut mutable_file = MutableTableFile::fork(
+        table.file(),
+        engine.table_fs.background_writes(),
+        table.disk_pool().clone(),
+    );
+    mutable_file.replace_metadata_and_secondary_index_roots(
+        Arc::clone(&new_metadata),
+        secondary_index_roots,
+    )?;
+
+    let new_layout = build_dropped_index_runtime_layout(
+        table_id,
+        &old_layout,
+        Arc::clone(&new_metadata),
+        index_no_usize,
+    )?;
+
+    let trx = session.begin_trx("begin transaction")?;
+    let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);
+    progress.stage_layout(new_layout);
+    progress.execute_catalog_update(&old_index_spec).await?;
+    let drop_cts = progress.commit_catalog().await?;
+
+    let root_publish = engine
+        .trx_sys
+        .publish_table_file_root(mutable_file, drop_cts, false)
+        .await;
+    match root_publish {
+        Ok(_table_file) => {}
+        Err(err) => {
+            return progress
+                .cleanup_after_catalog_commit_failure("table root publish", err)
+                .await;
+        }
+    }
+
+    let new_layout = match progress.take_layout_for_install() {
+        Ok(layout) => layout,
+        Err(err) => {
+            return progress
+                .cleanup_after_catalog_commit_failure("runtime layout install", err)
+                .await;
+        }
+    };
+    if let Err(err) = table.install_runtime_layout(old_generation, new_layout) {
+        return progress
+            .cleanup_after_catalog_commit_failure("runtime layout install", err)
+            .await;
+    }
+    progress.mark_installed();
+    drop(old_layout);
+
+    if let Err(err) = table.cleanup_retired_secondary_indexes(&guards).await {
+        return Err(poison_index_after_catalog_commit_with_source(
+            &engine,
+            IndexDdlKind::Drop,
+            table_id,
+            index_no,
+            "retired secondary-index cleanup",
+            err,
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Classify whether an active table root proves one index DDL redo durable.
+pub(crate) fn classify_index_ddl_root(
+    kind: IndexDdlKind,
+    table_id: TableID,
+    index_no: u16,
+    ddl_cts: TrxID,
+    active_root: Option<&ActiveRoot>,
+) -> Result<IndexDdlRootProof> {
+    // Root proof is deliberately conservative: without an active root there is
+    // no durable table state that can confirm whether this index DDL took
+    // effect, so recovery must treat the DDL marker as provisional.
+    let Some(active_root) = active_root else {
+        return Ok(IndexDdlRootProof::Provisional);
+    };
+    // A root older than the DDL commit timestamp cannot include the DDL's table
+    // metadata/root changes. It may still be a valid root, but it is not proof
+    // for this redo marker.
+    if active_root.root_ts < ddl_cts {
+        return Ok(IndexDdlRootProof::Provisional);
+    }
+
+    let metadata = &active_root.metadata;
+    let root_count = active_root.secondary_index_roots.len();
+    let slot_count = metadata.idx.index_slot_count();
+    // Metadata and sparse secondary-root slots describe the same index-number
+    // space. A mismatch means the active root itself is malformed, not merely
+    // inconclusive for this DDL marker.
+    if root_count != slot_count {
+        return Err(invalid_index_ddl_root(format!(
+            "index DDL root proof found secondary-root count mismatch: table_id={table_id}, index_no={index_no}, root_count={root_count}, metadata_slots={slot_count}, root_ts={}, ddl_cts={ddl_cts}",
+            active_root.root_ts
+        )));
+    }
+
+    // `next_index_no` is the allocation boundary. If the DDL's index number is
+    // still outside that boundary, the root cannot prove even allocation of the
+    // index number, regardless of create/drop kind.
+    if metadata.idx.next_index_no() <= index_no {
+        return Ok(IndexDdlRootProof::Provisional);
+    }
+
+    let Some(root_block_id) = active_root
+        .secondary_index_roots
+        .get(index_no as usize)
+        .copied()
+    else {
+        return Err(invalid_index_ddl_root(format!(
+            "index DDL root proof missing secondary-root slot: table_id={table_id}, index_no={index_no}, root_count={root_count}, root_ts={}, ddl_cts={ddl_cts}",
+            active_root.root_ts
+        )));
+    };
+
+    // From here the root is new enough and the index number has been allocated.
+    // The active metadata decides whether the final durable state keeps the
+    // index active or has made the slot inactive again.
+    let active = metadata.idx.index_spec(index_no as usize).is_some();
+    match (kind, active) {
+        // CREATE INDEX is fully durable when the later/equal root still exposes
+        // the created index as an active metadata entry.
+        (IndexDdlKind::Create, true) => Ok(IndexDdlRootProof::DurableFinalCreate),
+        (IndexDdlKind::Create, false) => {
+            // The create's index number was allocated, but a later root no
+            // longer has an active spec for it. This is valid only if the
+            // sparse root slot is empty, matching a subsequent durable drop.
+            if root_block_id != SUPER_BLOCK_ID {
+                return Err(invalid_index_ddl_root(format!(
+                    "inactive created index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_ts={}, ddl_cts={ddl_cts}",
+                    active_root.root_ts
+                )));
+            }
+            Ok(IndexDdlRootProof::DurableAllocationOnly)
+        }
+        // DROP INDEX is not proven by a root that still shows the index active.
+        // Recovery must leave this DDL marker provisional and use catalog redo
+        // replay decisions to converge from the durable root state.
+        (IndexDdlKind::Drop, true) => Ok(IndexDdlRootProof::Provisional),
+        (IndexDdlKind::Drop, false) => {
+            // DROP INDEX is durable when the root is new enough, the index
+            // number remains inside the allocation boundary, and the final slot
+            // is inactive with no remaining secondary-root block.
+            if root_block_id != SUPER_BLOCK_ID {
+                return Err(invalid_index_ddl_root(format!(
+                    "dropped index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_ts={}, ddl_cts={ddl_cts}",
+                    active_root.root_ts
+                )));
+            }
+            Ok(IndexDdlRootProof::DurableFinalDrop)
+        }
+    }
+}
+
+#[inline]
+fn invalid_index_ddl_root(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidRootInvariant)
+        .attach(message.into())
+        .into()
+}
+
+async fn rollback_active_ddl_trx(trx: &mut Option<Transaction>) -> Result<()> {
+    let Some(trx) = trx.take() else {
+        return Ok(());
+    };
+    if trx.engine().is_some() {
+        trx.rollback().await?;
+    }
+    Ok(())
 }
 
 #[inline]
@@ -1128,7 +1216,7 @@ fn validate_create_index_hot_unique_keys(
 
 async fn insert_create_index_unique_hot_rows(
     mem: &UniqueMemIndex<EvictableBufferPool>,
-    index_guard: &crate::buffer::PoolGuard,
+    index_guard: &PoolGuard,
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
 ) -> Result<()> {
@@ -1151,7 +1239,7 @@ async fn insert_create_index_unique_hot_rows(
 
 async fn insert_create_index_non_unique_hot_rows(
     mem: &NonUniqueMemIndex<EvictableBufferPool>,
-    index_guard: &crate::buffer::PoolGuard,
+    index_guard: &PoolGuard,
     hot_rows: &[CreateIndexRowEntry],
     build_ts: TrxID,
 ) -> Result<()> {
@@ -1392,97 +1480,6 @@ fn poison_index_after_catalog_commit_with_source(
         ))
 }
 
-/// Classify whether an active table root proves one index DDL redo durable.
-pub(crate) fn classify_index_ddl_root(
-    kind: IndexDdlKind,
-    table_id: TableID,
-    index_no: u16,
-    ddl_cts: TrxID,
-    active_root: Option<&ActiveRoot>,
-) -> Result<IndexDdlRootProof> {
-    // Root proof is deliberately conservative: without an active root there is
-    // no durable table state that can confirm whether this index DDL took
-    // effect, so recovery must treat the DDL marker as provisional.
-    let Some(active_root) = active_root else {
-        return Ok(IndexDdlRootProof::Provisional);
-    };
-    // A root older than the DDL commit timestamp cannot include the DDL's table
-    // metadata/root changes. It may still be a valid root, but it is not proof
-    // for this redo marker.
-    if active_root.root_ts < ddl_cts {
-        return Ok(IndexDdlRootProof::Provisional);
-    }
-
-    let metadata = &active_root.metadata;
-    let root_count = active_root.secondary_index_roots.len();
-    let slot_count = metadata.idx.index_slot_count();
-    // Metadata and sparse secondary-root slots describe the same index-number
-    // space. A mismatch means the active root itself is malformed, not merely
-    // inconclusive for this DDL marker.
-    if root_count != slot_count {
-        return Err(invalid_index_ddl_root(format!(
-            "index DDL root proof found secondary-root count mismatch: table_id={table_id}, index_no={index_no}, root_count={root_count}, metadata_slots={slot_count}, root_ts={}, ddl_cts={ddl_cts}",
-            active_root.root_ts
-        )));
-    }
-
-    // `next_index_no` is the allocation boundary. If the DDL's index number is
-    // still outside that boundary, the root cannot prove even allocation of the
-    // index number, regardless of create/drop kind.
-    if metadata.idx.next_index_no() <= index_no {
-        return Ok(IndexDdlRootProof::Provisional);
-    }
-
-    let Some(root_block_id) = active_root
-        .secondary_index_roots
-        .get(index_no as usize)
-        .copied()
-    else {
-        return Err(invalid_index_ddl_root(format!(
-            "index DDL root proof missing secondary-root slot: table_id={table_id}, index_no={index_no}, root_count={root_count}, root_ts={}, ddl_cts={ddl_cts}",
-            active_root.root_ts
-        )));
-    };
-
-    // From here the root is new enough and the index number has been allocated.
-    // The active metadata decides whether the final durable state keeps the
-    // index active or has made the slot inactive again.
-    let active = metadata.idx.index_spec(index_no as usize).is_some();
-    match (kind, active) {
-        // CREATE INDEX is fully durable when the later/equal root still exposes
-        // the created index as an active metadata entry.
-        (IndexDdlKind::Create, true) => Ok(IndexDdlRootProof::DurableFinalCreate),
-        (IndexDdlKind::Create, false) => {
-            // The create's index number was allocated, but a later root no
-            // longer has an active spec for it. This is valid only if the
-            // sparse root slot is empty, matching a subsequent durable drop.
-            if root_block_id != SUPER_BLOCK_ID {
-                return Err(invalid_index_ddl_root(format!(
-                    "inactive created index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_ts={}, ddl_cts={ddl_cts}",
-                    active_root.root_ts
-                )));
-            }
-            Ok(IndexDdlRootProof::DurableAllocationOnly)
-        }
-        // DROP INDEX is not proven by a root that still shows the index active.
-        // Recovery must leave this DDL marker provisional and use catalog redo
-        // replay decisions to converge from the durable root state.
-        (IndexDdlKind::Drop, true) => Ok(IndexDdlRootProof::Provisional),
-        (IndexDdlKind::Drop, false) => {
-            // DROP INDEX is durable when the root is new enough, the index
-            // number remains inside the allocation boundary, and the final slot
-            // is inactive with no remaining secondary-root block.
-            if root_block_id != SUPER_BLOCK_ID {
-                return Err(invalid_index_ddl_root(format!(
-                    "dropped index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_ts={}, ddl_cts={ddl_cts}",
-                    active_root.root_ts
-                )));
-            }
-            Ok(IndexDdlRootProof::DurableFinalDrop)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1496,10 +1493,13 @@ mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::row::ops::{DeleteMvcc, SelectKey};
+    use crate::session::Session;
     use crate::session::tests::SessionTestExt;
     use crate::table::CheckpointOutcome;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
+    use smol::Timer;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1806,7 +1806,7 @@ mod tests {
             engine.inner().trx_sys.request_table_root_retention_purge();
 
             for _ in 0..10 {
-                smol::Timer::after(Duration::from_millis(10)).await;
+                Timer::after(Duration::from_millis(10)).await;
                 assert_eq!(
                     old_root_drop_count(retained_root_ptr),
                     drop_count_before,
@@ -1820,7 +1820,7 @@ mod tests {
                 if old_root_drop_count(retained_root_ptr) > drop_count_before {
                     return;
                 }
-                smol::Timer::after(Duration::from_millis(10)).await;
+                Timer::after(Duration::from_millis(10)).await;
             }
             panic!("create index old root was not released after purge crossed the fence");
         });
@@ -2179,7 +2179,7 @@ mod tests {
     }
 
     fn lightweight_test_engine_config(
-        main_dir: impl Into<std::path::PathBuf>,
+        main_dir: impl Into<PathBuf>,
         log_file_stem: &str,
     ) -> EngineConfig {
         EngineConfig::default()
@@ -2333,7 +2333,7 @@ mod tests {
                 }
                 CheckpointOutcome::Delayed { reason } => {
                     last_delay = Some(reason);
-                    smol::Timer::after(Duration::from_millis(20)).await;
+                    Timer::after(Duration::from_millis(20)).await;
                 }
                 CheckpointOutcome::Cancelled { reason } => {
                     panic!("checkpoint should publish, cancelled by {reason:?}")

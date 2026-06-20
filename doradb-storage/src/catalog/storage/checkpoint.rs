@@ -948,7 +948,6 @@ mod tests {
     fn metadata_only_batch(replay_start_ts: TrxID) -> CatalogCheckpointBatch {
         CatalogCheckpointBatch {
             replay_start_ts,
-            durable_upper_cts: replay_start_ts,
             safe_cts: replay_start_ts,
             catalog_ops: Vec::new(),
             catalog_ddl_txn_count: 0,
@@ -1087,7 +1086,6 @@ mod tests {
             let table_id = USER_OBJ_ID_START + 4242;
             let batch = CatalogCheckpointBatch {
                 replay_start_ts,
-                durable_upper_cts: replay_start_ts,
                 safe_cts: replay_start_ts,
                 catalog_ops: vec![
                     CatalogRedoEntry {
