@@ -42,6 +42,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 pub(crate) use timeline::{RecoveryTimeline, TableReplayBounds};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserTableRedoAction {
+    Replay,
+    SkipCheckpointCoveredUnknownTable,
+}
+
 /// Recovery coordinator for checkpoint bootstrap, redo replay, and final repair.
 pub(crate) struct RecoveryCoordinator<'a> {
     /// Catalog, table files, and buffer-pool resources used by recovery.
@@ -60,6 +66,7 @@ pub(crate) struct RecoveryCoordinator<'a> {
 }
 
 impl<'a> RecoveryCoordinator<'a> {
+    /// Create a recovery coordinator from prepared resources and redo stream.
     #[inline]
     pub(crate) fn new(resources: RecoveryResources<'a>, redo_stream: RedoLogStream) -> Self {
         RecoveryCoordinator {
@@ -832,12 +839,6 @@ fn validate_create_table_reloaded_root_ts(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UserTableRedoAction {
-    Replay,
-    SkipCheckpointCoveredUnknownTable,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{RecoveryCoordinator, validate_create_table_reloaded_root_ts};
@@ -848,7 +849,8 @@ mod tests {
         USER_OBJ_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{CompletionErrorKind, DataIntegrityError, Error, OperationError};
+    use crate::engine::Engine;
+    use crate::error::{CompletionErrorKind, DataIntegrityError, Error, OperationError, Result};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::MutableTableFile;
@@ -865,15 +867,19 @@ mod tests {
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::serde::Ser;
-    use crate::session::tests::SessionTestExt;
+    use crate::session::{Session, tests::SessionTestExt};
     use crate::table::{CheckpointOutcome, DeleteMarker, Table};
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use crate::value::ValKind;
+    use smol::Timer;
+    use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::path::Path;
+    use std::iter::repeat_n;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -901,7 +907,7 @@ mod tests {
     }
 
     fn lightweight_recovery_engine_config(
-        main_dir: impl Into<std::path::PathBuf>,
+        main_dir: impl Into<PathBuf>,
         log_file_stem: &str,
     ) -> EngineConfig {
         EngineConfig::default()
@@ -929,7 +935,7 @@ mod tests {
     }
 
     fn corruption_recovery_engine_config(
-        main_dir: impl Into<std::path::PathBuf>,
+        main_dir: impl Into<PathBuf>,
         log_file_stem: &str,
     ) -> EngineConfig {
         lightweight_recovery_engine_config(main_dir, log_file_stem).trx(
@@ -1052,7 +1058,7 @@ mod tests {
     }
 
     fn log_recovery_for_engine<'a>(
-        engine: &'a crate::engine::Engine,
+        engine: &'a Engine,
         catalog_replay_start_ts: TrxID,
     ) -> RecoveryCoordinator<'a> {
         let buffers = RecoveryBuffers::new(
@@ -1104,7 +1110,7 @@ mod tests {
                     start_row_id: RowID::new(0),
                     end_row_id: RowID::new(1),
                 })),
-                dml: std::collections::BTreeMap::default(),
+                dml: BTreeMap::default(),
             },
         )
     }
@@ -1118,12 +1124,12 @@ mod tests {
                     pivor_row_id: RowID::new(0),
                     sts: cts,
                 })),
-                dml: std::collections::BTreeMap::default(),
+                dml: BTreeMap::default(),
             },
         )
     }
 
-    async fn checkpoint_published(table: &Table, session: &mut crate::session::Session) -> TrxID {
+    async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
         match session.checkpoint_table(table.table_id()).await.unwrap() {
             CheckpointOutcome::Published { checkpoint_ts } => checkpoint_ts,
             CheckpointOutcome::Delayed { reason } => {
@@ -1135,11 +1141,7 @@ mod tests {
         }
     }
 
-    async fn trx_insert_row(
-        trx: &mut Transaction,
-        table: &Table,
-        cols: Vec<Val>,
-    ) -> crate::error::Result<RowID> {
+    async fn trx_insert_row(trx: &mut Transaction, table: &Table, cols: Vec<Val>) -> Result<RowID> {
         trx_insert_row_by_id(trx, table.table_id(), cols).await
     }
 
@@ -1147,7 +1149,7 @@ mod tests {
         trx: &mut Transaction,
         table_id: TableID,
         cols: Vec<Val>,
-    ) -> crate::error::Result<RowID> {
+    ) -> Result<RowID> {
         trx.exec(async |stmt| stmt.table_insert_mvcc(table_id, cols).await)
             .await
     }
@@ -1156,7 +1158,7 @@ mod tests {
         trx: &mut Transaction,
         table: &Table,
         key: &SelectKey,
-    ) -> crate::error::Result<DeleteMvcc> {
+    ) -> Result<DeleteMvcc> {
         trx_delete_row_by_id(trx, table.table_id(), key).await
     }
 
@@ -1164,7 +1166,7 @@ mod tests {
         trx: &mut Transaction,
         table_id: TableID,
         key: &SelectKey,
-    ) -> crate::error::Result<DeleteMvcc> {
+    ) -> Result<DeleteMvcc> {
         trx.exec(async |stmt| stmt.table_delete_unique_mvcc(table_id, key, false).await)
             .await
     }
@@ -1174,7 +1176,7 @@ mod tests {
         table_id: TableID,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> crate::error::Result<UpdateMvcc> {
+    ) -> Result<UpdateMvcc> {
         trx.exec(async |stmt| stmt.table_update_unique_mvcc(table_id, key, update).await)
             .await
     }
@@ -1184,7 +1186,7 @@ mod tests {
         table: &Table,
         key: &SelectKey,
         user_read_set: &[usize],
-    ) -> crate::error::Result<SelectMvcc> {
+    ) -> Result<SelectMvcc> {
         trx.exec(async |stmt| {
             stmt.table_lookup_unique_mvcc(table.table_id(), key, user_read_set)
                 .await
@@ -1232,10 +1234,7 @@ mod tests {
         )
     }
 
-    async fn create_index_ddl_base_table(
-        engine: &crate::engine::Engine,
-        indexes: Vec<IndexSpec>,
-    ) -> TableID {
+    async fn create_index_ddl_base_table(engine: &Engine, indexes: Vec<IndexSpec>) -> TableID {
         let mut session = engine.new_session().unwrap();
         let table_id = session
             .create_table(TableSpec::new(index_ddl_columns()), indexes)
@@ -1245,10 +1244,7 @@ mod tests {
         table_id
     }
 
-    async fn commit_create_index_catalog_ddl(
-        engine: &crate::engine::Engine,
-        table_id: TableID,
-    ) -> TrxID {
+    async fn commit_create_index_catalog_ddl(engine: &Engine, table_id: TableID) -> TrxID {
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
@@ -1320,10 +1316,7 @@ mod tests {
         cts
     }
 
-    async fn commit_drop_index_catalog_ddl(
-        engine: &crate::engine::Engine,
-        table_id: TableID,
-    ) -> TrxID {
+    async fn commit_drop_index_catalog_ddl(engine: &Engine, table_id: TableID) -> TrxID {
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
@@ -1359,7 +1352,7 @@ mod tests {
     }
 
     async fn publish_index_metadata_root(
-        engine: &crate::engine::Engine,
+        engine: &Engine,
         table_id: TableID,
         metadata: Arc<TableMetadata>,
         cts: TrxID,
@@ -1394,7 +1387,7 @@ mod tests {
     }
 
     async fn assert_recovered_index_state(
-        engine: &crate::engine::Engine,
+        engine: &Engine,
         table_id: TableID,
         next_index_no: u16,
         index_one_active: bool,
@@ -1874,7 +1867,7 @@ mod tests {
         });
     }
 
-    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
+    fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: impl Into<u64>) {
         let page_id = page_id.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -1892,7 +1885,7 @@ mod tests {
     }
 
     fn rewrite_page_with_checksum(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         rewrite: impl FnOnce(&mut [u8]),
     ) {
@@ -1914,7 +1907,7 @@ mod tests {
     }
 
     fn corrupt_blob_header_kind(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         start_offset: u16,
     ) {
@@ -2107,7 +2100,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let s: String = std::iter::repeat_n('0', 100).collect();
+            let s: String = repeat_n('0', 100).collect();
             // insert
             for i in (0..DML_SIZE).step_by(INS_STEP) {
                 let mut trx = session.begin_trx().unwrap();
@@ -2123,7 +2116,7 @@ mod tests {
                 trx.commit().await.unwrap();
             }
             // update
-            let s2: String = std::iter::repeat_n('2', 100).collect();
+            let s2: String = repeat_n('2', 100).collect();
             for i in (0..DML_SIZE).step_by(UPD_STEP) {
                 let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
@@ -2829,7 +2822,7 @@ mod tests {
                     ready = true;
                     break;
                 }
-                smol::Timer::after(std::time::Duration::from_millis(20)).await;
+                Timer::after(Duration::from_millis(20)).await;
             }
             assert!(
                 ready,
@@ -3314,7 +3307,7 @@ mod tests {
                     ready = true;
                     break;
                 }
-                smol::Timer::after(std::time::Duration::from_millis(20)).await;
+                Timer::after(Duration::from_millis(20)).await;
             }
             assert!(
                 ready,

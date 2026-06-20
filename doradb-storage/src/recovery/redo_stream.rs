@@ -548,7 +548,7 @@ mod tests {
     use super::*;
     use crate::buffer::test_page_id;
     use crate::id::{RowID, TableID, TrxID};
-    use crate::io::IOBuf;
+    use crate::io::{DirectBuf, IOBuf};
     use crate::log::buf::LogBuf;
     use crate::log::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
@@ -612,11 +612,7 @@ mod tests {
         file.flush().unwrap();
     }
 
-    fn log_buf_with_header_range(
-        log: &TrxLog,
-        min_cts: TrxID,
-        max_cts: TrxID,
-    ) -> crate::io::DirectBuf {
+    fn log_buf_with_header_range(log: &TrxLog, min_cts: TrxID, max_cts: TrxID) -> DirectBuf {
         let body_len = log.ser_len();
         let mut buf = LogBuf::new(STORAGE_SECTOR_SIZE);
         buf.append_trx_log(log);
