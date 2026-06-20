@@ -92,9 +92,11 @@ impl IndexUndoLogs {
 
 /// One reversible index change recorded for rollback.
 pub(crate) struct IndexUndo {
+    /// Table whose index entry was changed.
     pub(crate) table_id: TableID,
-    // The new row id of index change.
+    /// Row version referenced by the new index entry.
     pub(crate) row_id: RowID,
+    /// Reversible index operation and rollback payload.
     pub(crate) kind: IndexUndoKind,
 }
 

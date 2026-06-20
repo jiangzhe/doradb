@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{CatalogTable, TableCache, is_catalog_obj_id};
-use crate::error::{FatalError, OperationError, Result};
+use crate::error::{Error, FatalError, OperationError, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
@@ -173,9 +173,8 @@ impl StmtEffects {
     ) -> Result<()> {
         #[cfg(test)]
         if tests::test_force_stmt_index_rollback_error_enabled() {
-            return Err(
-                error_stack::Report::new(crate::error::InternalError::InjectedTestFailure).into(),
-            );
+            use crate::error::InternalError;
+            return Err(Report::new(InternalError::InjectedTestFailure).into());
         }
         self.index_undo
             .rollback(table_cache, pool_guards, sts)
@@ -304,7 +303,7 @@ impl<'stmt> Statement<'stmt> {
     }
 
     #[inline]
-    fn table_not_found(table_id: TableID, operation: &'static str) -> crate::error::Error {
+    fn table_not_found(table_id: TableID, operation: &'static str) -> Error {
         Report::new(OperationError::TableNotFound)
             .attach(format!("operation={operation}, table_id={table_id}"))
             .into()
@@ -559,6 +558,7 @@ pub(crate) mod tests {
     use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
     use error_stack::Report;
     use std::cell::Cell;
+    use std::panic::catch_unwind;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -713,7 +713,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stmt_effects_drop_rejects_leaked_effects() {
-        let res = std::panic::catch_unwind(|| {
+        let res = catch_unwind(|| {
             let mut effects = StmtEffects::empty();
             effects.set_ddl_redo(DDLRedo::CreateTable(TableID::new(42)));
         });

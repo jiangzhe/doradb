@@ -12,6 +12,7 @@ pub(crate) struct SysTrx {
 }
 
 impl SysTrx {
+    /// Record creation of a row page in this system transaction's redo payload.
     #[inline]
     pub(crate) fn create_row_page(
         &mut self,

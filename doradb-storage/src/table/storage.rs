@@ -14,7 +14,7 @@ pub(crate) struct ColumnStorage {
     pub(crate) file: Arc<TableFile>,
     /// Read-only buffer pool used for persisted table-file pages.
     pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    /// Runtime delete-marker buffer for persisted rows updated after checkpoint.
+    /// Runtime delete-marker buffer shared by column-row access and persistence paths.
     pub(crate) deletion_buffer: ColumnDeletionBuffer,
     secondary_indexes: Box<[Option<SecondaryDiskTreeRuntime>]>,
 }

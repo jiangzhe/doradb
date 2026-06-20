@@ -39,11 +39,13 @@ impl<'a> RowReadAccess<'a> {
         }
     }
 
+    /// Returns the latest row image from the page.
     #[inline]
     pub(crate) fn row(&self) -> Row<'_> {
         self.page.row(self.row_idx)
     }
 
+    /// Returns the timestamp associated with this row read state, if present.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved ts"))]
     pub(crate) fn ts(&self) -> Option<TrxID> {
@@ -53,6 +55,7 @@ impl<'a> RowReadAccess<'a> {
         }
     }
 
+    /// Returns the current undo head for hot-row MVCC reads.
     #[inline]
     pub(crate) fn undo_head(&self) -> Option<&RowUndoHead> {
         match &self.state {
@@ -70,6 +73,7 @@ impl<'a> RowReadAccess<'a> {
         }
     }
 
+    /// Reads the latest physical row image without walking MVCC undo.
     #[inline]
     pub(crate) fn read_row_latest(
         &self,
@@ -94,6 +98,7 @@ impl<'a> RowReadAccess<'a> {
         ReadRow::Ok(vals)
     }
 
+    /// Reads the row version visible to the transaction context.
     #[inline]
     pub(crate) fn read_row_mvcc(
         &self,
@@ -488,8 +493,11 @@ impl<'a> RowReadAccess<'a> {
     }
 }
 
+/// Row-read storage state selected from the frame context.
 pub(crate) enum RowReadState<'a> {
+    /// Hot row page with a version map guard.
     RowVer(RowVersionReadGuard<'a>),
+    /// Recovery-time row page with a recovery timestamp map.
     Recover(&'a RowRecoveryMap),
 }
 
@@ -503,6 +511,7 @@ impl<'a> RowReadState<'a> {
     }
 }
 
+/// Iterator over all rows in a row page using one frame context.
 pub(crate) struct ReadAllRows<'a> {
     ctx: &'a FrameContext,
     page: &'a RowPage,
@@ -511,6 +520,7 @@ pub(crate) struct ReadAllRows<'a> {
 }
 
 impl<'a> ReadAllRows<'a> {
+    /// Create an iterator over all row indexes in the page.
     #[inline]
     pub(crate) fn new(page: &'a RowPage, ctx: &'a FrameContext) -> Self {
         let end_idx = page.header.row_count();
@@ -639,6 +649,7 @@ impl KeyVersion {
     }
 }
 
+/// Exclusive row write access with the row-version and page-state guards held.
 pub(crate) struct RowWriteAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
@@ -647,6 +658,7 @@ pub(crate) struct RowWriteAccess<'a> {
 }
 
 impl<'a> RowWriteAccess<'a> {
+    /// Acquire write access to one row and read-lock the page state.
     #[inline]
     pub(crate) fn new(
         page: &'a RowPage,
@@ -662,6 +674,7 @@ impl<'a> RowWriteAccess<'a> {
         Self::new_with_state_guard(page, ctx, row_idx, sts, ins_or_update, state_guard)
     }
 
+    /// Acquire write access using an existing page-state guard.
     #[inline]
     pub(crate) fn new_with_state_guard(
         page: &'a RowPage,
@@ -683,21 +696,25 @@ impl<'a> RowWriteAccess<'a> {
         }
     }
 
+    /// Returns the latest immutable row image.
     #[inline]
     pub(crate) fn row(&self) -> Row<'a> {
         self.page.row(self.row_idx)
     }
 
+    /// Returns a mutable row view for an update with the supplied variable range.
     #[inline]
     pub(crate) fn row_mut(&self, var_offset: usize, var_end: usize) -> RowMut<'_> {
         self.page.row_mut(self.row_idx, var_offset, var_end)
     }
 
+    /// Returns the row page state observed by this write access.
     #[inline]
     pub(crate) fn page_state(&self) -> RowPageState {
         *self._state_guard
     }
 
+    /// Marks the row as deleted in the page image.
     #[inline]
     pub(crate) fn delete_row(&mut self) {
         let res = self.page.set_deleted(self.row_idx, true);
@@ -705,6 +722,7 @@ impl<'a> RowWriteAccess<'a> {
         self.page.inc_approx_deleted();
     }
 
+    /// Prepare a row update or return the old image when space/state prevents it.
     #[inline]
     pub(crate) fn update_row(
         &self,
@@ -869,6 +887,7 @@ impl<'a> RowWriteAccess<'a> {
         }
     }
 
+    /// Link this row's unique-key branch to an older hot owner.
     #[inline]
     pub(crate) fn link_for_unique_index(
         &mut self,
@@ -889,6 +908,7 @@ impl<'a> RowWriteAccess<'a> {
         })
     }
 
+    /// Link this row's unique-key branch to an older cold terminal image.
     #[inline]
     pub(crate) fn link_for_unique_index_cold_terminal(
         &mut self,
@@ -1029,44 +1049,54 @@ impl<'a> RowWriteAccess<'a> {
         }
     }
 
+    /// Marks this guarded write as an insert or update for page-level tracking.
     #[inline]
     pub(crate) fn enable_ins_or_update(&mut self) {
         self.guard.enable_ins_or_update();
     }
 }
 
+/// Result of trying to install or reuse a row undo lock.
 pub(crate) enum LockUndo {
+    /// The row undo lock is available or installed.
     Ok,
+    /// Another active transaction owns the row.
     WriteConflict,
+    /// The index entry does not identify this row version.
     InvalidIndex,
-    // row is locked by a preparing transaction.
+    /// The row is locked by a preparing transaction.
     Preparing(Option<EventListener>),
 }
 
 impl LockUndo {
+    /// Returns whether the lock attempt succeeded.
     #[inline]
     pub(crate) fn is_ok(&self) -> bool {
         matches!(self, LockUndo::Ok)
     }
 }
 
+/// Result of locking one row for foreground write.
 pub(crate) enum LockRowForWrite<'a> {
-    // lock success, returns optional last commit timestamp.
+    /// Lock succeeded with optional write access.
     Ok(Option<RowWriteAccess<'a>>),
-    // lock fail, there is another transaction modifying this row.
+    /// Another transaction is modifying this row.
     WriteConflict,
-    // row is invalid through index lookup.
-    // this can happen when index entry is not garbage collected,
-    // so some old key points to new version.
+    /// Row is invalid through index lookup because an old key points to a new version.
     InvalidIndex,
-    // row page is transitioning, caller should retry.
+    /// Row page is transitioning and the caller should retry.
     RetryInTransition,
 }
 
+/// Result of searching a row's old versions for a unique-key owner.
 pub(crate) enum FindOldVersion {
+    /// Matching old version found with values, timestamp, and undo entry.
     Ok(Vec<Val>, TrxID, RowUndoRef),
+    /// Another active transaction owns a conflicting old version.
     WriteConflict,
+    /// A visible old version already owns the unique key.
     DuplicateKey,
+    /// No matching old version exists.
     None,
 }
 

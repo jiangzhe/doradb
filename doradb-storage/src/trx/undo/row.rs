@@ -102,21 +102,25 @@ impl fmt::Debug for RowUndoKind {
 pub(crate) struct RowUndoLogs(Vec<OwnedRowUndo>);
 
 impl RowUndoLogs {
+    /// Create an empty row undo buffer.
     #[inline]
     pub(crate) fn empty() -> Self {
         RowUndoLogs(vec![])
     }
 
+    /// Append a row undo entry to the transaction undo buffer.
     #[inline]
     pub(crate) fn push(&mut self, value: OwnedRowUndo) {
         self.0.push(value)
     }
 
+    /// Move all row undo entries from another buffer into this one.
     #[inline]
     pub(crate) fn merge(&mut self, other: &mut Self) {
         self.0.append(&mut other.0);
     }
 
+    /// Roll back row changes in reverse undo-log order.
     #[inline]
     pub(crate) async fn rollback(
         &mut self,
@@ -193,6 +197,7 @@ impl DerefMut for OwnedRowUndo {
 }
 
 impl OwnedRowUndo {
+    /// Create an owned row undo entry for a single row-page change.
     #[inline]
     pub(crate) fn new(
         table_id: TableID,
@@ -210,6 +215,7 @@ impl OwnedRowUndo {
         OwnedRowUndo(Box::new(entry))
     }
 
+    /// Return a non-owning reference that can be stored in row version chains.
     #[inline]
     pub(crate) fn leak(&self) -> RowUndoRef {
         RowUndoRef(NonNull::from(self.0.as_ref()))
@@ -268,6 +274,7 @@ impl Clone for RowUndoRef {
     }
 }
 
+/// Undo entry for one hot-row or cold-delete-buffer row version.
 pub(crate) struct RowUndo {
     /// Table containing the hot row or cold deletion marker.
     pub(crate) table_id: TableID,
@@ -297,7 +304,9 @@ pub(crate) struct RowUndo {
 /// be a hot row undo chain or a terminal cold row image reconstructed from the
 /// branch's undo values.
 pub(crate) struct NextRowUndo {
+    /// Main undo branch for older versions of the same hot row.
     pub(crate) main: MainBranch,
+    /// Runtime unique-index branches to older owners of matching keys.
     pub(crate) indexes: Vec<IndexBranch>,
 }
 
@@ -324,7 +333,9 @@ impl NextRowUndo {
 /// to the row. Unique-index branches are separate because a latest unique-key
 /// mapping may need to reach an older owner with a different RowID.
 pub(crate) struct MainBranch {
+    /// Next undo entry in the main row-version chain.
     pub(crate) entry: RowUndoRef,
+    /// Commit or active transaction status for the next undo entry.
     pub(crate) status: UndoStatus,
 }
 
@@ -340,6 +351,7 @@ pub(crate) enum UndoStatus {
 }
 
 impl UndoStatus {
+    /// Return the current transaction or commit timestamp represented here.
     #[inline]
     pub(crate) fn ts(&self) -> TrxID {
         match self {
@@ -348,6 +360,7 @@ impl UndoStatus {
         }
     }
 
+    /// Return whether an undo entry with this status is older than all readers.
     #[inline]
     pub(crate) fn can_purge(&mut self, min_active_sts: TrxID) -> bool {
         match self {
@@ -450,8 +463,11 @@ impl UndoStatus {
 ///                          └─────────────────┘   └───────┘                          
 /// ```
 pub(crate) struct IndexBranch {
+    /// Unique index key that requires this alternate version branch.
     pub(crate) key: SelectKey,
+    /// Hot or cold owner reached by this branch.
     pub(crate) target: IndexBranchTarget,
+    /// Before-image values used to reconstruct a cold terminal owner.
     pub(crate) undo_vals: Vec<UpdateCol>,
 }
 
@@ -475,6 +491,7 @@ pub(crate) enum IndexBranchTarget {
 }
 
 impl IndexBranchTarget {
+    /// Return the timestamp that determines when this branch can be purged.
     #[inline]
     pub(crate) fn purge_cts(&self) -> Option<TrxID> {
         match self {
@@ -484,15 +501,19 @@ impl IndexBranchTarget {
     }
 }
 
+/// Current undo-chain head stored on a row page.
 pub(crate) struct RowUndoHead {
+    /// Branches reachable from the newest row version.
     pub(crate) next: NextRowUndo,
-    // If a purge thread purge some logs from this chain,
-    // it will increase this field, so another thread may
-    // skip if it has been already processed.
+    /// Newest purge timestamp already processed for this chain.
+    ///
+    /// Purge workers advance this value after trimming logs so later workers
+    /// can skip chains they have already covered.
     pub(crate) purge_ts: TrxID,
 }
 
 impl RowUndoHead {
+    /// Create a row undo head for a newly installed undo entry.
     #[inline]
     pub(crate) fn new(status: Arc<SharedTrxStatus>, entry: RowUndoRef) -> Self {
         RowUndoHead {
@@ -513,6 +534,7 @@ impl RowUndoHead {
         self.next.main.status.ts()
     }
 
+    /// Return whether the owning transaction is in prepare state.
     #[inline]
     pub(crate) fn preparing(&self) -> bool {
         match &self.next.main.status {
@@ -521,6 +543,7 @@ impl RowUndoHead {
         }
     }
 
+    /// Register a listener for the owning transaction's prepare completion.
     #[inline]
     pub(crate) fn prepare_listener(&self) -> Option<EventListener> {
         match &self.next.main.status {
