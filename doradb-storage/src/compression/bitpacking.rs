@@ -4,26 +4,35 @@
 
 use crate::layout;
 use crate::lwc::LwcPrimitiveData;
+use std::iter::once;
 use std::mem;
 use zerocopy::IntoBytes;
 
 /// Data type that supports bitpacking.
 /// constant ZERO is used to unify both bitpacking and FOR+bitpacking.
 pub(crate) trait BitPackable: Copy {
+    /// Zero value for this primitive type.
     const ZERO: Self;
 
+    /// Returns `self - min` as a `u64` delta using wrapping arithmetic.
     fn sub_to_u64(self, min: Self) -> u64;
 
+    /// Returns `self - min` as a `u32` delta using wrapping arithmetic.
     fn sub_to_u32(self, min: Self) -> u32;
 
+    /// Adds a `u32` delta to this value using wrapping arithmetic.
     fn add_from_u32(self, delta: u32) -> Self;
 
+    /// Returns `self - min` as a `u16` delta using wrapping arithmetic.
     fn sub_to_u16(self, min: Self) -> u16;
 
+    /// Adds a `u16` delta to this value using wrapping arithmetic.
     fn add_from_u16(self, delta: u16) -> Self;
 
+    /// Returns `self - min` as a `u8` delta using wrapping arithmetic.
     fn sub_to_u8(self, min: Self) -> u8;
 
+    /// Adds a `u8` delta to this value using wrapping arithmetic.
     fn add_from_u8(self, delta: u8) -> Self;
 }
 
@@ -73,6 +82,281 @@ macro_rules! impl_bit_packable {
 }
 
 impl_bit_packable!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
+
+macro_rules! impl_lwc_bitpackable_data {
+    ($t:ident, $nbits:literal, $extendf:ident, $it:ident) => {
+        /// Frame-of-reference bitpacked data with sub-byte deltas.
+        pub(crate) struct $t<'a, T> {
+            /// Number of logical values represented by the packed bytes.
+            pub(crate) len: usize,
+            /// Minimum value used as the frame of reference.
+            pub(crate) min: T,
+            /// Packed delta bytes.
+            pub(crate) data: &'a [u8],
+        }
+
+        impl<'a, T: BitPackable> LwcPrimitiveData for $t<'a, T> {
+            type Value = T;
+            type Iter = $it<'a, T>;
+
+            #[inline]
+            fn len(&self) -> usize {
+                self.len
+            }
+
+            #[inline]
+            fn value(&self, idx: usize) -> Option<T> {
+                if idx < self.len {
+                    let byte_idx = (idx * $nbits) / 8;
+                    let bit_idx = (idx * $nbits) % 8;
+                    let delta = (self.data[byte_idx] >> bit_idx) & ((1 << $nbits) - 1);
+                    let v = self.min.add_from_u8(delta);
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+
+            #[inline]
+            fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+                $extendf(self.data, self.len, self.min, target);
+            }
+
+            #[inline]
+            fn iter(&self) -> Self::Iter {
+                $it {
+                    len: self.len,
+                    min: self.min,
+                    data: self.data,
+                    idx: 0,
+                }
+            }
+        }
+
+        /// Iterator over frame-of-reference bitpacked sub-byte values.
+        pub(crate) struct $it<'a, T> {
+            len: usize,
+            min: T,
+            data: &'a [u8],
+            idx: usize,
+        }
+
+        impl<T: BitPackable> Iterator for $it<'_, T> {
+            type Item = T;
+
+            #[inline]
+            fn next(&mut self) -> Option<T> {
+                if self.idx < self.len {
+                    let v = value_fbp::<T, $nbits>(self.data, self.min, self.idx);
+                    self.idx += 1;
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+}
+
+impl_lwc_bitpackable_data!(ForBitpacking1, 1, for_b1_unpack_extend, ForBitpacking1Iter);
+impl_lwc_bitpackable_data!(ForBitpacking2, 2, for_b2_unpack_extend, ForBitpacking2Iter);
+impl_lwc_bitpackable_data!(ForBitpacking4, 4, for_b4_unpack_extend, ForBitpacking4Iter);
+
+/// Frame-of-reference bitpacked data with one-byte deltas.
+pub(crate) struct ForBitpacking8<'a, T> {
+    /// Minimum value used as the frame of reference.
+    pub(crate) min: T,
+    /// One-byte delta storage.
+    pub(crate) data: &'a [u8],
+}
+
+impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking8<'a, T> {
+    type Value = T;
+    type Iter = ForBitpacking8Iter<'a, T>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    fn value(&self, idx: usize) -> Option<T> {
+        if idx < self.data.len() {
+            let v = self.min.add_from_u8(self.data[idx]);
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+        for_b8_unpack_extend(self.data, self.min, target);
+    }
+
+    #[inline]
+    fn iter(&self) -> Self::Iter {
+        ForBitpacking8Iter {
+            min: self.min,
+            data: self.data,
+            idx: 0,
+        }
+    }
+}
+
+/// Iterator over frame-of-reference bitpacked values with one-byte deltas.
+pub(crate) struct ForBitpacking8Iter<'a, T> {
+    min: T,
+    data: &'a [u8],
+    idx: usize,
+}
+
+impl<T: BitPackable> Iterator for ForBitpacking8Iter<'_, T> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.idx < self.data.len() {
+            let delta = self.data[self.idx];
+            self.idx += 1;
+            Some(self.min.add_from_u8(delta))
+        } else {
+            None
+        }
+    }
+}
+
+/// Frame-of-reference bitpacked data with two-byte deltas.
+pub(crate) struct ForBitpacking16<'a, T> {
+    /// Minimum value used as the frame of reference.
+    pub(crate) min: T,
+    /// Two-byte little-endian delta storage.
+    pub(crate) data: &'a [[u8; 2]],
+}
+
+impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking16<'a, T> {
+    type Value = T;
+    type Iter = ForBitpacking16Iter<'a, T>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    fn value(&self, idx: usize) -> Option<T> {
+        if idx < self.data.len() {
+            let u = self.data[idx];
+            let v = self.min.add_from_u16(u16::from_le_bytes(u));
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+        let input = self.data.as_bytes();
+        for_b16_unpack_extend(input, self.min, target);
+    }
+
+    #[inline]
+    fn iter(&self) -> Self::Iter {
+        ForBitpacking16Iter {
+            min: self.min,
+            data: self.data,
+            idx: 0,
+        }
+    }
+}
+
+/// Iterator over frame-of-reference bitpacked values with two-byte deltas.
+pub(crate) struct ForBitpacking16Iter<'a, T> {
+    min: T,
+    data: &'a [[u8; 2]],
+    idx: usize,
+}
+
+impl<T: BitPackable> Iterator for ForBitpacking16Iter<'_, T> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.idx < self.data.len() {
+            let delta = u16::from_le_bytes(self.data[self.idx]);
+            self.idx += 1;
+            Some(self.min.add_from_u16(delta))
+        } else {
+            None
+        }
+    }
+}
+
+/// Frame-of-reference bitpacked data with four-byte deltas.
+pub(crate) struct ForBitpacking32<'a, T> {
+    /// Minimum value used as the frame of reference.
+    pub(crate) min: T,
+    /// Four-byte little-endian delta storage.
+    pub(crate) data: &'a [[u8; 4]],
+}
+
+impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking32<'a, T> {
+    type Value = T;
+    type Iter = ForBitpacking32Iter<'a, T>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    fn value(&self, idx: usize) -> Option<T> {
+        if idx < self.data.len() {
+            let u = self.data[idx];
+            let v = self.min.add_from_u32(u32::from_le_bytes(u));
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+        let input = self.data.as_bytes();
+        for_b32_unpack_extend(input, self.min, target);
+    }
+
+    #[inline]
+    fn iter(&self) -> Self::Iter {
+        ForBitpacking32Iter {
+            min: self.min,
+            data: self.data,
+            idx: 0,
+        }
+    }
+}
+
+/// Iterator over frame-of-reference bitpacked values with four-byte deltas.
+pub(crate) struct ForBitpacking32Iter<'a, T> {
+    min: T,
+    data: &'a [[u8; 4]],
+    idx: usize,
+}
+
+impl<T: BitPackable> Iterator for ForBitpacking32Iter<'_, T> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.idx < self.data.len() {
+            let delta = u32::from_le_bytes(self.data[self.idx]);
+            self.idx += 1;
+            Some(self.min.add_from_u32(delta))
+        } else {
+            None
+        }
+    }
+}
 
 /// Returns number of bits and minimum value on input data.
 /// Returns None if not available.
@@ -229,6 +513,7 @@ pub(crate) fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T])
     }
 }
 
+/// Extends `res` with `len` FOR-unpacked values from 1-bit deltas.
 #[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
 pub(crate) fn for_b1_unpack_extend<T: BitPackable, E: Extend<T>>(
@@ -387,6 +672,7 @@ pub(crate) fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T])
     }
 }
 
+/// Extends `res` with `len` FOR-unpacked values from 2-bit deltas.
 #[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
 pub(crate) fn for_b2_unpack_extend<T: BitPackable, E: Extend<T>>(
@@ -542,6 +828,7 @@ pub(crate) fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T])
     }
 }
 
+/// Extends `res` with `len` FOR-unpacked values from 4-bit deltas.
 #[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
 pub(crate) fn for_b4_unpack_extend<T: BitPackable, E: Extend<T>>(
@@ -584,7 +871,7 @@ pub(crate) fn for_b4_unpack_extend<T: BitPackable, E: Extend<T>>(
         let packed = input[len / 2];
         let delta = packed & 15;
         let v = min.add_from_u8(delta);
-        res.extend(std::iter::once(v));
+        res.extend(once(v));
     }
 }
 
@@ -623,6 +910,7 @@ pub(crate) fn for_b8_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T])
     })
 }
 
+/// Extends `res` with FOR-unpacked values from 8-bit deltas.
 #[inline]
 pub(crate) fn for_b8_unpack_extend<T: BitPackable, E: Extend<T>>(
     input: &[u8],
@@ -673,6 +961,7 @@ pub(crate) fn for_b16_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]
     });
 }
 
+/// Extends `res` with FOR-unpacked values from 16-bit deltas.
 #[inline]
 pub(crate) fn for_b16_unpack_extend<T: BitPackable, E: Extend<T>>(
     input: &[u8],
@@ -727,6 +1016,7 @@ pub(crate) fn for_b32_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]
     });
 }
 
+/// Extends `res` with FOR-unpacked values from 32-bit deltas.
 #[inline]
 pub(crate) fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(
     input: &[u8],
@@ -741,265 +1031,12 @@ pub(crate) fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(
     }))
 }
 
-macro_rules! impl_lwc_bitpackable_data {
-    ($t:ident, $nbits:literal, $extendf:ident, $it:ident) => {
-        pub(crate) struct $t<'a, T> {
-            pub(crate) len: usize,
-            pub(crate) min: T,
-            pub(crate) data: &'a [u8],
-        }
-        impl<'a, T: BitPackable> LwcPrimitiveData for $t<'a, T> {
-            type Value = T;
-            type Iter = $it<'a, T>;
-
-            #[inline]
-            fn len(&self) -> usize {
-                self.len
-            }
-
-            #[inline]
-            fn value(&self, idx: usize) -> Option<T> {
-                if idx < self.len {
-                    let byte_idx = (idx * $nbits) / 8;
-                    let bit_idx = (idx * $nbits) % 8;
-                    let delta = (self.data[byte_idx] >> bit_idx) & ((1 << $nbits) - 1);
-                    let v = self.min.add_from_u8(delta);
-                    Some(v)
-                } else {
-                    None
-                }
-            }
-
-            #[inline]
-            fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-                $extendf(self.data, self.len, self.min, target);
-            }
-
-            #[inline]
-            fn iter(&self) -> Self::Iter {
-                $it {
-                    len: self.len,
-                    min: self.min,
-                    data: self.data,
-                    idx: 0,
-                }
-            }
-        }
-
-        pub(crate) struct $it<'a, T> {
-            len: usize,
-            min: T,
-            data: &'a [u8],
-            idx: usize,
-        }
-
-        impl<T: BitPackable> Iterator for $it<'_, T> {
-            type Item = T;
-            #[inline]
-            fn next(&mut self) -> Option<T> {
-                if self.idx < self.len {
-                    let v = value_fbp::<T, $nbits>(self.data, self.min, self.idx);
-                    self.idx += 1;
-                    Some(v)
-                } else {
-                    None
-                }
-            }
-        }
-    };
-}
-
 #[inline]
 fn value_fbp<T: BitPackable, const BITS: usize>(input: &[u8], min: T, idx: usize) -> T {
     let byte_idx = idx * BITS / 8;
     let bit_idx = idx * BITS % 8;
     let delta = (input[byte_idx] >> bit_idx) & ((1 << BITS) - 1);
     min.add_from_u8(delta)
-}
-
-impl_lwc_bitpackable_data!(ForBitpacking1, 1, for_b1_unpack_extend, ForBitpacking1Iter);
-impl_lwc_bitpackable_data!(ForBitpacking2, 2, for_b2_unpack_extend, ForBitpacking2Iter);
-impl_lwc_bitpackable_data!(ForBitpacking4, 4, for_b4_unpack_extend, ForBitpacking4Iter);
-
-pub(crate) struct ForBitpacking8<'a, T> {
-    pub(crate) min: T,
-    pub(crate) data: &'a [u8],
-}
-
-impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking8<'a, T> {
-    type Value = T;
-    type Iter = ForBitpacking8Iter<'a, T>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<T> {
-        if idx < self.data.len() {
-            let v = self.min.add_from_u8(self.data[idx]);
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        for_b8_unpack_extend(self.data, self.min, target);
-    }
-
-    #[inline]
-    fn iter(&self) -> Self::Iter {
-        ForBitpacking8Iter {
-            min: self.min,
-            data: self.data,
-            idx: 0,
-        }
-    }
-}
-
-pub(crate) struct ForBitpacking8Iter<'a, T> {
-    min: T,
-    data: &'a [u8],
-    idx: usize,
-}
-
-impl<T: BitPackable> Iterator for ForBitpacking8Iter<'_, T> {
-    type Item = T;
-    #[inline]
-    fn next(&mut self) -> Option<T> {
-        if self.idx < self.data.len() {
-            let delta = self.data[self.idx];
-            self.idx += 1;
-            Some(self.min.add_from_u8(delta))
-        } else {
-            None
-        }
-    }
-}
-
-pub(crate) struct ForBitpacking16<'a, T> {
-    pub(crate) min: T,
-    pub(crate) data: &'a [[u8; 2]],
-}
-
-impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking16<'a, T> {
-    type Value = T;
-    type Iter = ForBitpacking16Iter<'a, T>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<T> {
-        if idx < self.data.len() {
-            let u = self.data[idx];
-            let v = self.min.add_from_u16(u16::from_le_bytes(u));
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        let input = self.data.as_bytes();
-        for_b16_unpack_extend(input, self.min, target);
-    }
-
-    #[inline]
-    fn iter(&self) -> Self::Iter {
-        ForBitpacking16Iter {
-            min: self.min,
-            data: self.data,
-            idx: 0,
-        }
-    }
-}
-
-pub(crate) struct ForBitpacking16Iter<'a, T> {
-    min: T,
-    data: &'a [[u8; 2]],
-    idx: usize,
-}
-
-impl<T: BitPackable> Iterator for ForBitpacking16Iter<'_, T> {
-    type Item = T;
-    #[inline]
-    fn next(&mut self) -> Option<T> {
-        if self.idx < self.data.len() {
-            let delta = u16::from_le_bytes(self.data[self.idx]);
-            self.idx += 1;
-            Some(self.min.add_from_u16(delta))
-        } else {
-            None
-        }
-    }
-}
-
-pub(crate) struct ForBitpacking32<'a, T> {
-    pub(crate) min: T,
-    pub(crate) data: &'a [[u8; 4]],
-}
-
-impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking32<'a, T> {
-    type Value = T;
-    type Iter = ForBitpacking32Iter<'a, T>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<T> {
-        if idx < self.data.len() {
-            let u = self.data[idx];
-            let v = self.min.add_from_u32(u32::from_le_bytes(u));
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        let input = self.data.as_bytes();
-        for_b32_unpack_extend(input, self.min, target);
-    }
-
-    #[inline]
-    fn iter(&self) -> Self::Iter {
-        ForBitpacking32Iter {
-            min: self.min,
-            data: self.data,
-            idx: 0,
-        }
-    }
-}
-
-pub(crate) struct ForBitpacking32Iter<'a, T> {
-    min: T,
-    data: &'a [[u8; 4]],
-    idx: usize,
-}
-
-impl<T: BitPackable> Iterator for ForBitpacking32Iter<'_, T> {
-    type Item = T;
-    #[inline]
-    fn next(&mut self) -> Option<T> {
-        if self.idx < self.data.len() {
-            let delta = u32::from_le_bytes(self.data[self.idx]);
-            self.idx += 1;
-            Some(self.min.add_from_u32(delta))
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(test)]
