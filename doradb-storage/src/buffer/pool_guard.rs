@@ -9,6 +9,7 @@ pub struct PoolGuard {
 }
 
 impl PoolGuard {
+    /// Creates a pool guard branded with `identity`.
     #[inline]
     pub(crate) fn new(identity: PoolIdentity, keepalive: SyncQuiescentGuard<()>) -> Self {
         Self {
@@ -17,11 +18,13 @@ impl PoolGuard {
         }
     }
 
+    /// Returns the pool identity carried by this guard.
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
         self.identity
     }
 
+    /// Panics when this guard does not belong to `expected`.
     #[inline]
     pub(crate) fn assert_matches(&self, expected: PoolIdentity, context: &'static str) {
         let actual = self.identity();
@@ -34,15 +37,6 @@ impl PoolGuard {
 /// Bundle of pool guards used by storage operations that touch multiple pools.
 #[derive(Clone, Default)]
 pub struct PoolGuards {
-    meta: Option<PoolGuard>,
-    index: Option<PoolGuard>,
-    mem: Option<PoolGuard>,
-    disk: Option<PoolGuard>,
-}
-
-/// Builder for assembling a [`PoolGuards`] bundle by named pool role.
-#[derive(Default)]
-pub struct PoolGuardsBuilder {
     meta: Option<PoolGuard>,
     index: Option<PoolGuard>,
     mem: Option<PoolGuard>,
@@ -80,6 +74,7 @@ impl PoolGuards {
         require_guard_slot(self.disk.as_ref(), "disk")
     }
 
+    /// Returns the guard for `role`, if this bundle contains one.
     #[inline]
     pub(crate) fn try_guard(&self, role: PoolRole) -> Option<&PoolGuard> {
         match role {
@@ -91,10 +86,20 @@ impl PoolGuards {
         }
     }
 
+    /// Returns the guard for a row-pool role, if this bundle contains one.
     #[inline]
     pub(crate) fn try_row_guard(&self, role: RowPoolRole) -> Option<&PoolGuard> {
         self.try_guard(role.into())
     }
+}
+
+/// Builder for assembling a [`PoolGuards`] bundle by named pool role.
+#[derive(Default)]
+pub struct PoolGuardsBuilder {
+    meta: Option<PoolGuard>,
+    index: Option<PoolGuard>,
+    mem: Option<PoolGuard>,
+    disk: Option<PoolGuard>,
 }
 
 impl PoolGuardsBuilder {
@@ -168,9 +173,11 @@ fn pool_guard_identity_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quiescent::QuiescentBox;
+    use std::panic::catch_unwind;
 
     fn test_guard() -> PoolGuard {
-        let owner = Box::leak(Box::new(crate::quiescent::QuiescentBox::new(())));
+        let owner = Box::leak(Box::new(QuiescentBox::new(())));
         PoolGuard::new(owner.owner_identity(), owner.guard().into_sync())
     }
 
@@ -182,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_pool_guards_builder_rejects_duplicate_role() {
-        let result = std::panic::catch_unwind(|| {
+        let result = catch_unwind(|| {
             let _ = PoolGuards::builder()
                 .push(PoolRole::Meta, test_guard())
                 .push(PoolRole::Meta, test_guard())

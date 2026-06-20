@@ -54,6 +54,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Sentinel page id used when no real page id is available.
 pub(crate) const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
 
 /// Shared terminal-status cell for one page-sized buffer-pool IO operation.
@@ -131,10 +132,12 @@ struct BufferPoolStatsCounters {
     write_errors: AtomicUsize,
 }
 
+/// Cloneable writer handle for buffer-pool stats counters.
 #[derive(Clone, Default)]
 pub(crate) struct BufferPoolStatsHandle(Arc<BufferPoolStatsCounters>);
 
 impl BufferPoolStatsHandle {
+    /// Returns one point-in-time snapshot of all counters.
     #[inline]
     pub(crate) fn snapshot(&self) -> BufferPoolStats {
         BufferPoolStats {
@@ -152,21 +155,25 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Records one cache hit.
     #[inline]
     pub(crate) fn record_cache_hit(&self) {
         self.0.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one cache miss.
     #[inline]
     pub(crate) fn record_cache_miss(&self) {
         self.0.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one miss that joined an existing inflight load.
     #[inline]
     pub(crate) fn record_miss_join(&self) {
         self.0.miss_joins.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Adds queued read operations to the counter set.
     #[inline]
     pub(crate) fn add_queued_reads(&self, count: usize) {
         if count != 0 {
@@ -174,6 +181,7 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Adds running read operations to the counter set.
     #[inline]
     pub(crate) fn add_running_reads(&self, count: usize) {
         if count != 0 {
@@ -181,6 +189,7 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Adds completed read operations to the counter set.
     #[inline]
     pub(crate) fn add_completed_reads(&self, count: usize) {
         if count != 0 {
@@ -188,6 +197,7 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Adds failed read operations to the counter set.
     #[inline]
     pub(crate) fn add_read_errors(&self, count: usize) {
         if count != 0 {
@@ -195,6 +205,7 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Adds queued write operations to the counter set.
     #[inline]
     pub(crate) fn add_queued_writes(&self, count: usize) {
         if count != 0 {
@@ -202,6 +213,7 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Adds running write operations to the counter set.
     #[inline]
     pub(crate) fn add_running_writes(&self, count: usize) {
         if count != 0 {
@@ -209,6 +221,7 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Adds completed write operations to the counter set.
     #[inline]
     pub(crate) fn add_completed_writes(&self, count: usize) {
         if count != 0 {
@@ -216,6 +229,7 @@ impl BufferPoolStatsHandle {
         }
     }
 
+    /// Adds failed write operations to the counter set.
     #[inline]
     pub(crate) fn add_write_errors(&self, count: usize) {
         if count != 0 {

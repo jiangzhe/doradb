@@ -5,6 +5,7 @@ use crate::id::{BlockID, FileID, PageID, TrxID};
 use crate::latch::HybridLatch;
 use crate::recovery::RowRecoveryMap;
 use crate::trx::ver_map::RowVersionMap;
+use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -48,12 +49,14 @@ pub(crate) struct BufferFrame {
 }
 
 impl BufferFrame {
+    /// Returns the physical residency state recorded for this frame.
     #[inline]
     pub(crate) fn kind(&self) -> FrameKind {
         let value = self.frame_kind.load(Ordering::Acquire);
         FrameKind::from(value)
     }
 
+    /// Stores the physical residency state for this frame.
     #[inline]
     pub(crate) fn set_kind(&self, kind: FrameKind) {
         self.frame_kind.store(kind as u8, Ordering::Release);
@@ -72,6 +75,7 @@ impl BufferFrame {
         self.page_kind.store(kind as u8, Ordering::Release);
     }
 
+    /// Attempts to swap the physical residency state and returns the observed value.
     #[inline]
     pub(crate) fn compare_exchange_kind(
         &self,
@@ -89,21 +93,25 @@ impl BufferFrame {
         }
     }
 
+    /// Returns whether this frame contains unflushed page changes.
     #[inline]
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
     }
 
+    /// Returns the current reuse generation for this frame slot.
     #[inline]
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Advances the frame reuse generation and returns the new value.
     #[inline]
     pub(crate) fn bump_generation(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    /// Updates the dirty flag for this frame.
     #[inline]
     pub(crate) fn set_dirty(&self, dirty: bool) {
         self.dirty.store(dirty, Ordering::Release);
@@ -139,6 +147,7 @@ impl BufferFrame {
             .store(INVALID_BLOCK_ID.into(), Ordering::Release);
     }
 
+    /// Installs row-version context metadata for a row page.
     #[inline]
     pub(crate) fn init_undo_map(&mut self, column_layout: Arc<TableColumnLayout>, max_size: usize) {
         self.ctx = Some(Box::new(FrameContext::RowVerMap(RowVersionMap::new(
@@ -147,6 +156,7 @@ impl BufferFrame {
         ))));
     }
 
+    /// Installs row-recovery context metadata for a recovering row page.
     #[inline]
     pub(crate) fn init_recover_map(&mut self, create_cts: TrxID) {
         self.ctx = Some(Box::new(FrameContext::RowRecoveryMap(RowRecoveryMap::new(
@@ -170,7 +180,7 @@ impl Default for BufferFrame {
             persisted_block_id: AtomicU64::new(INVALID_BLOCK_ID.into()),
             has_persisted_block_key: AtomicBool::new(false),
             ctx: None,
-            page: std::ptr::null_mut(),
+            page: null_mut(),
         }
     }
 }
@@ -183,6 +193,7 @@ unsafe impl Send for BufferFrame {}
 // mutation goes through atomics or latch-protected metadata.
 unsafe impl Sync for BufferFrame {}
 
+/// Physical residency state of a buffer frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum FrameKind {
@@ -215,12 +226,14 @@ impl From<u8> for FrameKind {
     }
 }
 
+/// Optional page-specific context stored beside a frame header.
 pub(crate) enum FrameContext {
     RowVerMap(RowVersionMap),
     RowRecoveryMap(RowRecoveryMap),
 }
 
 impl FrameContext {
+    /// Returns the row-version map when this context stores one.
     #[inline]
     pub(crate) fn row_ver(&self) -> Option<&RowVersionMap> {
         match self {
@@ -229,6 +242,7 @@ impl FrameContext {
         }
     }
 
+    /// Returns the recovery map when this context stores one.
     #[inline]
     pub(crate) fn recover(&self) -> Option<&RowRecoveryMap> {
         match self {
@@ -237,6 +251,7 @@ impl FrameContext {
         }
     }
 
+    /// Returns the mutable recovery map when this context stores one.
     #[inline]
     pub(crate) fn recover_mut(&mut self) -> Option<&mut RowRecoveryMap> {
         match self {

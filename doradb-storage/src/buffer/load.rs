@@ -34,16 +34,16 @@ pub(crate) struct PageReservationGuard<R: PageReservation> {
 }
 
 impl<R: PageReservation> PageReservationGuard<R> {
-    #[inline]
     /// Wraps one live reservation so rollback happens automatically on drop.
+    #[inline]
     pub(crate) fn new(reservation: R) -> Self {
         PageReservationGuard {
             reservation: Some(reservation),
         }
     }
 
-    #[inline]
     /// Returns the reserved page bytes for validation before publish.
+    #[inline]
     pub(crate) fn page(&self) -> &Page {
         self.reservation
             .as_ref()
@@ -51,8 +51,8 @@ impl<R: PageReservation> PageReservationGuard<R> {
             .page()
     }
 
-    #[inline]
     /// Returns the reserved page bytes for mutation before publish.
+    #[inline]
     pub(crate) fn page_mut(&mut self) -> &mut Page {
         self.reservation
             .as_mut()
@@ -60,8 +60,8 @@ impl<R: PageReservation> PageReservationGuard<R> {
             .page_mut()
     }
 
-    #[inline]
     /// Consumes the guard and publishes the reserved page into its owning pool.
+    #[inline]
     pub(crate) fn publish(mut self) -> Result<PageID> {
         self.reservation
             .take()

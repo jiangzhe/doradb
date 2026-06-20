@@ -59,10 +59,12 @@ struct SharedPoolEvictorStatsCounters {
     index_runs: AtomicUsize,
 }
 
+/// Cloneable writer handle for shared-evictor stats counters.
 #[derive(Clone, Default)]
 pub(crate) struct SharedPoolEvictorStatsHandle(Arc<SharedPoolEvictorStatsCounters>);
 
 impl SharedPoolEvictorStatsHandle {
+    /// Returns one point-in-time snapshot of all counters.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
     pub(crate) fn snapshot(&self) -> SharedPoolEvictorStats {
@@ -140,128 +142,6 @@ impl ClockHand {
     }
 }
 
-/// Iterates the ordered resident-set according to clock-hand position.
-///
-/// The callback returns true to stop scanning and preserve next hand position.
-#[inline]
-pub(super) fn clock_collect<F>(
-    set: &BTreeSet<PageID>,
-    clock_hand: ClockHand,
-    mut callback: F,
-) -> Option<ClockHand>
-where
-    F: FnMut(PageID) -> bool,
-{
-    match clock_hand {
-        ClockHand::From(from) => {
-            let mut range = set.range(from);
-            while let Some(page_id) = range.next() {
-                if callback(*page_id) {
-                    if let Some(page_id) = range.next() {
-                        return Some(ClockHand::From(*page_id..));
-                    }
-                    return None;
-                }
-            }
-            None
-        }
-        ClockHand::FromTo(from, to) => {
-            let mut range = set.range(from);
-            while let Some(page_id) = range.next() {
-                if callback(*page_id) {
-                    if let Some(page_id) = range.next() {
-                        return Some(ClockHand::FromTo(*page_id.., to));
-                    }
-                    return Some(ClockHand::To(to));
-                }
-            }
-            range = set.range(to);
-            while let Some(page_id) = range.next() {
-                if callback(*page_id) {
-                    if let Some(page_id) = range.next() {
-                        return Some(ClockHand::Between(*page_id..to.end));
-                    }
-                    return None;
-                }
-            }
-            None
-        }
-        ClockHand::To(to) => {
-            let mut range = set.range(to);
-            while let Some(page_id) = range.next() {
-                if callback(*page_id) {
-                    if let Some(page_id) = range.next() {
-                        return Some(ClockHand::Between(*page_id..to.end));
-                    }
-                    return None;
-                }
-            }
-            None
-        }
-        ClockHand::Between(between) => {
-            let mut range = set.range(between.clone());
-            while let Some(page_id) = range.next() {
-                if callback(*page_id) {
-                    if let Some(page_id) = range.next() {
-                        return Some(ClockHand::Between(*page_id..between.end));
-                    }
-                    return None;
-                }
-            }
-            None
-        }
-    }
-}
-
-/// Collects up to `limit` page ids from the resident-set according to
-/// clock-hand position and returns the next hand state.
-#[inline]
-pub(super) fn clock_collect_batch(
-    set: &BTreeSet<PageID>,
-    clock_hand: ClockHand,
-    limit: usize,
-    out: &mut Vec<PageID>,
-) -> Option<ClockHand> {
-    if limit == 0 {
-        return Some(clock_hand);
-    }
-    clock_collect(set, clock_hand, |page_id| {
-        out.push(page_id);
-        out.len() >= limit
-    })
-}
-
-/// Applies one clock-sweep step and returns a page guard when a frame
-/// is selected for eviction.
-#[inline]
-pub(super) fn clock_sweep_candidate(
-    arena: &ArenaGuard,
-    page_id: PageID,
-) -> Option<PageExclusiveGuard<Page>> {
-    match arena.frame_kind(page_id) {
-        FrameKind::Uninitialized | FrameKind::Fixed | FrameKind::Evicting | FrameKind::Evicted => {
-            None
-        }
-        FrameKind::Cool => {
-            if let Some(page_guard) = arena.try_lock_page_exclusive(page_id) {
-                if page_guard
-                    .bf()
-                    .compare_exchange_kind(FrameKind::Cool, FrameKind::Evicting)
-                    != FrameKind::Cool
-                {
-                    return None;
-                }
-                return Some(page_guard);
-            }
-            None
-        }
-        FrameKind::Hot => {
-            let _ = arena.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
-            None
-        }
-    }
-}
-
 /// Eviction arbiter shared by evictable and readonly buffer pools.
 ///
 /// Semantics:
@@ -279,16 +159,19 @@ pub(crate) struct EvictionArbiter {
 }
 
 impl EvictionArbiter {
+    /// Returns a builder initialized with default eviction settings.
     #[inline]
     pub(crate) fn builder() -> EvictionArbiterBuilder {
         EvictionArbiterBuilder::default()
     }
 
+    /// Returns the sliding-window sample size used for allocation failures.
     #[inline]
     pub(crate) fn failure_window(&self) -> usize {
         self.failure_window
     }
 
+    /// Returns the free-frame target that triggers pressure eviction.
     #[inline]
     #[cfg_attr(
         not(test),
@@ -298,6 +181,7 @@ impl EvictionArbiter {
         self.target_free
     }
 
+    /// Returns the free-frame hysteresis margin used for stop checks.
     #[inline]
     #[cfg_attr(
         not(test),
@@ -532,6 +416,7 @@ impl EvictionArbiterBuilder {
 /// evict in the current pass.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EvictionDecision {
+    /// Number of resident pages to attempt evicting in this pass.
     pub(crate) batch_size: usize,
 }
 
@@ -736,13 +621,6 @@ pub(super) struct SharedEvictionDomain {
     policy: PressureDeltaClockPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SharedEvictionDomainId {
-    Readonly,
-    Mem,
-    Index,
-}
-
 impl SharedEvictionDomain {
     #[inline]
     pub(super) fn new<T>(
@@ -789,6 +667,13 @@ impl SharedEvictionDomain {
         self.runtime.notify_progress();
         true
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SharedEvictionDomainId {
+    Readonly,
+    Mem,
+    Index,
 }
 
 struct SharedEvictor {
@@ -888,17 +773,8 @@ impl SharedEvictor {
     }
 }
 
+/// Component marker that owns the shared pool-evictor worker thread.
 pub(crate) struct SharedPoolEvictorWorkers;
-
-pub(crate) struct SharedPoolEvictorWorkersOwned {
-    disk_pool: SyncQuiescentGuard<ReadonlyBufferPool>,
-    index_pool: SyncQuiescentGuard<EvictableBufferPool>,
-    mem_pool: SyncQuiescentGuard<EvictableBufferPool>,
-    shutdown_flag: Arc<AtomicBool>,
-    wake_event: Arc<Event>,
-    stats: SharedPoolEvictorStatsHandle,
-    evict_thread: Mutex<Option<JoinHandle<()>>>,
-}
 
 impl Component for SharedPoolEvictorWorkers {
     type Config = ();
@@ -965,6 +841,139 @@ impl Component for SharedPoolEvictorWorkers {
         component.wake_event.notify(usize::MAX);
         if let Some(handle) = component.evict_thread.lock().take() {
             handle.join().unwrap();
+        }
+    }
+}
+
+/// Owned runtime state for the shared pool-evictor component.
+pub(crate) struct SharedPoolEvictorWorkersOwned {
+    disk_pool: SyncQuiescentGuard<ReadonlyBufferPool>,
+    index_pool: SyncQuiescentGuard<EvictableBufferPool>,
+    mem_pool: SyncQuiescentGuard<EvictableBufferPool>,
+    shutdown_flag: Arc<AtomicBool>,
+    wake_event: Arc<Event>,
+    stats: SharedPoolEvictorStatsHandle,
+    evict_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Iterates the ordered resident-set according to clock-hand position.
+///
+/// The callback returns true to stop scanning and preserve next hand position.
+#[inline]
+pub(super) fn clock_collect<F>(
+    set: &BTreeSet<PageID>,
+    clock_hand: ClockHand,
+    mut callback: F,
+) -> Option<ClockHand>
+where
+    F: FnMut(PageID) -> bool,
+{
+    match clock_hand {
+        ClockHand::From(from) => {
+            let mut range = set.range(from);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::From(*page_id..));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::FromTo(from, to) => {
+            let mut range = set.range(from);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::FromTo(*page_id.., to));
+                    }
+                    return Some(ClockHand::To(to));
+                }
+            }
+            range = set.range(to);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..to.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::To(to) => {
+            let mut range = set.range(to);
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..to.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        ClockHand::Between(between) => {
+            let mut range = set.range(between.clone());
+            while let Some(page_id) = range.next() {
+                if callback(*page_id) {
+                    if let Some(page_id) = range.next() {
+                        return Some(ClockHand::Between(*page_id..between.end));
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Collects up to `limit` page ids from the resident-set according to
+/// clock-hand position and returns the next hand state.
+#[inline]
+pub(super) fn clock_collect_batch(
+    set: &BTreeSet<PageID>,
+    clock_hand: ClockHand,
+    limit: usize,
+    out: &mut Vec<PageID>,
+) -> Option<ClockHand> {
+    if limit == 0 {
+        return Some(clock_hand);
+    }
+    clock_collect(set, clock_hand, |page_id| {
+        out.push(page_id);
+        out.len() >= limit
+    })
+}
+
+/// Applies one clock-sweep step and returns a page guard when a frame
+/// is selected for eviction.
+#[inline]
+pub(super) fn clock_sweep_candidate(
+    arena: &ArenaGuard,
+    page_id: PageID,
+) -> Option<PageExclusiveGuard<Page>> {
+    match arena.frame_kind(page_id) {
+        FrameKind::Uninitialized | FrameKind::Fixed | FrameKind::Evicting | FrameKind::Evicted => {
+            None
+        }
+        FrameKind::Cool => {
+            if let Some(page_guard) = arena.try_lock_page_exclusive(page_id) {
+                if page_guard
+                    .bf()
+                    .compare_exchange_kind(FrameKind::Cool, FrameKind::Evicting)
+                    != FrameKind::Cool
+                {
+                    return None;
+                }
+                return Some(page_guard);
+            }
+            None
+        }
+        FrameKind::Hot => {
+            let _ = arena.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
+            None
         }
     }
 }

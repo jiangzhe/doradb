@@ -7,7 +7,9 @@ use crate::error::Result;
 use crate::id::PageID;
 use crate::ptr::UnsafePtr;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
+use std::ptr::{drop_in_place, from_ref};
 
+/// Cloneable guard that keeps arena frame/page mappings alive while accessed.
 #[derive(Clone)]
 pub(crate) struct ArenaGuard {
     inner: UnsafePtr<ArenaInner>,
@@ -22,11 +24,13 @@ impl ArenaGuard {
         unsafe { &*self.inner.0 }
     }
 
+    /// Returns the current frame state for `page_id`.
     #[inline]
     pub(crate) fn frame_kind(&self, page_id: PageID) -> FrameKind {
         self.inner().frame_kind(page_id)
     }
 
+    /// Atomically swaps the frame state when the observed state matches `old_kind`.
     #[inline]
     pub(crate) fn compare_exchange_frame_kind(
         &self,
@@ -38,6 +42,7 @@ impl ArenaGuard {
             .compare_exchange_frame_kind(page_id, old_kind, new_kind)
     }
 
+    /// Tries to acquire exclusive access to the raw page at `page_id`.
     #[inline]
     pub(crate) fn try_lock_page_exclusive(
         &self,
@@ -81,6 +86,7 @@ impl ArenaInner {
         })
     }
 
+    /// Returns a raw pointer to the frame header for `page_id`.
     #[inline]
     pub(crate) fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
         debug_assert!(usize::from(page_id) < self.capacity);
@@ -88,6 +94,7 @@ impl ArenaInner {
         unsafe { UnsafePtr(self.frames.add(usize::from(page_id))) }
     }
 
+    /// Returns the frame header for `page_id`.
     #[inline]
     pub(crate) fn frame(&self, page_id: PageID) -> &BufferFrame {
         let ptr = self.frame_ptr(page_id);
@@ -95,11 +102,13 @@ impl ArenaInner {
         unsafe { &*ptr.0 }
     }
 
+    /// Returns the current frame state for `page_id`.
     #[inline]
     pub(crate) fn frame_kind(&self, page_id: PageID) -> FrameKind {
         self.frame(page_id).kind()
     }
 
+    /// Atomically swaps the frame state when the observed state matches `old_kind`.
     #[inline]
     pub(crate) fn compare_exchange_frame_kind(
         &self,
@@ -111,6 +120,7 @@ impl ArenaInner {
             .compare_exchange_kind(old_kind, new_kind)
     }
 
+    /// Tries to lock `page_id` exclusively using the supplied pool keepalive.
     #[inline]
     pub(crate) fn try_lock_page_exclusive_with(
         &self,
@@ -133,13 +143,14 @@ impl Drop for ArenaInner {
         // destroys frames and unmaps the backing regions.
         unsafe {
             for frame_id in 0..self.capacity {
-                std::ptr::drop_in_place(self.frames.add(frame_id));
+                drop_in_place(self.frames.add(frame_id));
             }
             deallocate_frame_and_page_arrays(self.frames, self.pages, self.capacity);
         }
     }
 }
 
+/// Quiescent owner for one stable frame/page arena.
 pub(crate) struct QuiescentArena {
     // Field order is part of the safety contract. `keepalive` must drop before
     // `state` so owner teardown waits for all outstanding quiescent guards
@@ -150,6 +161,7 @@ pub(crate) struct QuiescentArena {
 }
 
 impl QuiescentArena {
+    /// Allocates one arena with `capacity` frame/page slots.
     #[inline]
     pub(crate) fn new(capacity: usize) -> Result<Self> {
         let keepalive = QuiescentBox::new(());
@@ -161,6 +173,7 @@ impl QuiescentArena {
         })
     }
 
+    /// Returns the runtime identity of this arena owner.
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
         self.identity
@@ -171,31 +184,36 @@ impl QuiescentArena {
         self.keepalive.guard()
     }
 
+    /// Returns a cloneable pool guard for accesses into this arena.
     #[inline]
     pub(crate) fn guard(&self) -> PoolGuard {
         PoolGuard::new(self.identity, self.quiescent_guard().into_sync())
     }
 
+    /// Converts a matching pool guard into an arena guard.
     #[inline]
     pub(crate) fn arena_guard(&self, guard: PoolGuard) -> ArenaGuard {
         guard.assert_matches(self.identity, "arena guard");
-        let inner = UnsafePtr(std::ptr::from_ref(&self.state).cast_mut());
+        let inner = UnsafePtr(from_ref(&self.state).cast_mut());
         ArenaGuard {
             inner,
             keepalive: guard,
         }
     }
 
+    /// Returns a raw pointer to the frame header for `page_id`.
     #[inline]
     pub(crate) fn frame_ptr(&self, page_id: PageID) -> UnsafePtr<BufferFrame> {
         self.state.frame_ptr(page_id)
     }
 
+    /// Returns the frame header for `page_id`.
     #[inline]
     pub(crate) fn frame(&self, page_id: PageID) -> &BufferFrame {
         self.state.frame(page_id)
     }
 
+    /// Initializes an allocated frame/page slot for logical page type `T`.
     #[inline]
     pub(crate) fn init_page<T: BufferPage>(
         &self,
@@ -225,6 +243,7 @@ impl QuiescentArena {
         guard
     }
 
+    /// Tries to acquire exclusive access to the raw page at `page_id`.
     #[inline]
     pub(crate) fn try_lock_page_exclusive(
         &self,

@@ -14,6 +14,7 @@ pub enum PoolRole {
 }
 
 impl PoolRole {
+    /// Panics when this role is [`PoolRole::Invalid`].
     #[inline]
     pub(crate) fn assert_valid(self, context: &'static str) {
         if matches!(self, Self::Invalid) {
@@ -21,6 +22,7 @@ impl PoolRole {
         }
     }
 
+    /// Converts metadata and memory roles to their row-pool selector.
     #[inline]
     pub(crate) fn row_pool_role(self) -> RowPoolRole {
         match self {
@@ -31,11 +33,22 @@ impl PoolRole {
     }
 }
 
+impl From<RowPoolRole> for PoolRole {
+    #[inline]
+    fn from(value: RowPoolRole) -> Self {
+        match value {
+            RowPoolRole::Meta => PoolRole::Meta,
+            RowPoolRole::Mem => PoolRole::Mem,
+        }
+    }
+}
+
 /// Runtime-only provenance token for one exact buffer-pool instance.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PoolIdentity(usize);
 
 impl PoolIdentity {
+    /// Creates an identity from a stable quiescent-owner address.
     #[inline]
     pub(crate) fn from_owner_addr(owner_addr: usize) -> Self {
         debug_assert_ne!(owner_addr, 0);
@@ -56,14 +69,4 @@ impl fmt::Debug for PoolIdentity {
 pub(crate) enum RowPoolRole {
     Meta = 1,
     Mem = 2,
-}
-
-impl From<RowPoolRole> for PoolRole {
-    #[inline]
-    fn from(value: RowPoolRole) -> Self {
-        match value {
-            RowPoolRole::Meta => PoolRole::Meta,
-            RowPoolRole::Mem => PoolRole::Mem,
-        }
-    }
 }

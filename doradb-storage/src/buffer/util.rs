@@ -8,6 +8,7 @@ use libc::{
     PROT_WRITE, c_void, madvise, mmap, munmap,
 };
 use std::mem;
+use std::ptr::{null_mut, write};
 
 pub(super) const SHARED_SAFETY_PAGES: usize = 10;
 
@@ -46,7 +47,7 @@ pub(super) unsafe fn initialize_frame_and_page_arrays(
         };
         for i in 0..capacity {
             let frame_ptr = frames.add(i);
-            std::ptr::write(frame_ptr, BufferFrame::default());
+            write(frame_ptr, BufferFrame::default());
             (*frame_ptr).page_id = PageID::from(i);
             (*frame_ptr).page = pages.add(i);
         }
@@ -78,7 +79,7 @@ pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
     // before being handed to callers.
     unsafe {
         let memory_chunk = mmap(
-            std::ptr::null_mut(),
+            null_mut(),
             total_bytes,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
