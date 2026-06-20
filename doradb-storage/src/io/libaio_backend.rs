@@ -6,7 +6,8 @@ use crate::error::{ConfigError, IoError, Result, StorageOp};
 use error_stack::Report;
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
-use std::io;
+use std::io::Error as StdIoError;
+use std::ptr::null_mut;
 use std::time::Instant;
 
 /// Concrete libaio context used by the current storage-engine backend.
@@ -37,7 +38,7 @@ impl LibaioBackend {
                 .attach(format!("max_events={max_events}"))
                 .into());
         }
-        let mut ctx = std::ptr::null_mut();
+        let mut ctx = null_mut();
         // SAFETY: `ctx` points to writable storage for the kernel-owned libaio
         // context handle, and the return code is checked before constructing
         // the Rust backend wrapper.
@@ -49,13 +50,14 @@ impl LibaioBackend {
                     stats: IOBackendStatsHandle::default(),
                 }),
                 ret => {
-                    let err = io::Error::from_raw_os_error(-ret);
+                    let err = StdIoError::from_raw_os_error(-ret);
                     Err(IoError::report_with_op(StorageOp::BackendSetup, err).into())
                 }
             }
         }
     }
 
+    /// Returns a cloneable handle to backend-owned submit/wait statistics.
     #[inline]
     pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
         self.stats.clone()
@@ -119,39 +121,13 @@ impl LibaioBackend {
             let res = if ev.res >= 0 {
                 Ok(ev.res as usize)
             } else {
-                let err = io::Error::from_raw_os_error(-ev.res as i32);
+                let err = StdIoError::from_raw_os_error(-ev.res as i32);
                 Err(err)
             };
             completed.push((BackendToken::from_raw(ev.data), res));
         }
         (wait_calls, completed)
     }
-}
-
-#[inline]
-fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
-    #[cfg(test)]
-    {
-        if let Some(hook) = tests::current_io_submit_hook() {
-            return hook(ctx, nr, ios);
-        }
-    }
-    // SAFETY: the caller forwards the live libaio context, request count, and
-    // pointer array exactly as required by `io_submit`.
-    unsafe { io_submit(ctx, nr, ios) }
-}
-
-#[inline]
-fn io_getevents_impl(ctx: io_context_t, min_nr: c_long, nr: c_long, events: *mut io_event) -> i32 {
-    #[cfg(test)]
-    {
-        if let Some(hook) = tests::current_io_getevents_hook() {
-            return hook(ctx, min_nr, nr, events);
-        }
-    }
-    // SAFETY: the caller provides a live libaio context plus an output buffer
-    // large enough for `nr` events, and uses the null timeout for blocking wait.
-    unsafe { io_getevents(ctx, min_nr, nr, events, std::ptr::null_mut()) }
 }
 
 impl Drop for LibaioBackend {
@@ -164,20 +140,6 @@ impl Drop for LibaioBackend {
         }
     }
 }
-
-/// Backend-owned libaio staging buffer for one worker.
-///
-/// This stores the pointer-array layout required by `io_submit` while keeping
-/// that ABI detail out of the scheduler contract.
-pub(crate) struct LibaioSubmitBatch {
-    staged: VecDeque<*mut iocb>,
-    prefix: Vec<*mut iocb>,
-}
-
-// SAFETY: the batch only stores raw pointers to prepared `iocb` objects owned
-// by the worker's inflight table. The whole batch is moved together with that
-// worker onto a single IO thread.
-unsafe impl Send for LibaioSubmitBatch {}
 
 impl IOBackend for LibaioBackend {
     type Prepared = Box<iocb>;
@@ -259,12 +221,53 @@ impl IOBackend for LibaioBackend {
     }
 }
 
+/// Backend-owned libaio staging buffer for one worker.
+///
+/// This stores the pointer-array layout required by `io_submit` while keeping
+/// that ABI detail out of the scheduler contract.
+pub(crate) struct LibaioSubmitBatch {
+    staged: VecDeque<*mut iocb>,
+    prefix: Vec<*mut iocb>,
+}
+
+// SAFETY: the batch only stores raw pointers to prepared `iocb` objects owned
+// by the worker's inflight table. The whole batch is moved together with that
+// worker onto a single IO thread.
+unsafe impl Send for LibaioSubmitBatch {}
+
+#[inline]
+fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
+    #[cfg(test)]
+    {
+        if let Some(hook) = tests::current_io_submit_hook() {
+            return hook(ctx, nr, ios);
+        }
+    }
+    // SAFETY: the caller forwards the live libaio context, request count, and
+    // pointer array exactly as required by `io_submit`.
+    unsafe { io_submit(ctx, nr, ios) }
+}
+
+#[inline]
+fn io_getevents_impl(ctx: io_context_t, min_nr: c_long, nr: c_long, events: *mut io_event) -> i32 {
+    #[cfg(test)]
+    {
+        if let Some(hook) = tests::current_io_getevents_hook() {
+            return hook(ctx, min_nr, nr, events);
+        }
+    }
+    // SAFETY: the caller provides a live libaio context plus an output buffer
+    // large enough for `nr` events, and uses the null timeout for blocking wait.
+    unsafe { io_getevents(ctx, min_nr, nr, events, null_mut()) }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::file::{FixedSizeBufferFreeList, SparseFile, UNTRACKED_FILE_ID};
     use crate::io::{IOBuf, IOSubmission, SubmissionDriver};
     use libc::EAGAIN;
+    use std::mem::replace;
     use std::os::fd::AsRawFd;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -285,7 +288,7 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn set_io_submit_hook(hook: Option<IoSubmitHook>) -> Option<IoSubmitHook> {
         let mut guard = IO_SUBMIT_HOOK.lock().unwrap();
-        std::mem::replace(&mut *guard, hook)
+        replace(&mut *guard, hook)
     }
 
     #[inline]
@@ -296,7 +299,7 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn set_io_getevents_hook(hook: Option<IoGeteventsHook>) -> Option<IoGeteventsHook> {
         let mut guard = IO_GETEVENTS_HOOK.lock().unwrap();
-        std::mem::replace(&mut *guard, hook)
+        replace(&mut *guard, hook)
     }
 
     #[test]
@@ -410,7 +413,7 @@ pub(crate) mod tests {
             // event buffer after asserting there is room for at least one entry.
             unsafe {
                 (*events).data = BackendToken::new(7, 3).raw();
-                (*events).obj = std::ptr::null_mut();
+                (*events).obj = null_mut();
                 (*events).res = 4096;
                 (*events).res2 = 0;
             }

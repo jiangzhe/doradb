@@ -3,18 +3,12 @@ use super::{
 };
 use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
 use error_stack::Report;
-use io_uring::{IoUring, opcode, squeue, types};
+use io_uring::opcode::{Read, Write};
+use io_uring::{IoUring, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
-use std::io;
+use std::io::Error as StdIoError;
 use std::time::Instant;
-
-#[inline]
-fn invalid_io_depth(max_events: usize) -> Error {
-    Report::new(ConfigError::InvalidIoDepth)
-        .attach(format!("max_events={max_events}"))
-        .into()
-}
 
 /// Concrete io_uring context used by the storage-engine backend.
 pub(crate) struct IouringBackend {
@@ -56,9 +50,135 @@ impl IouringBackend {
         self.stats.snapshot()
     }
 
+    /// Returns a cloneable handle to backend-owned submit/wait statistics.
     #[inline]
     pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
         self.stats.clone()
+    }
+
+    #[inline]
+    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) {
+        let target = limit.min(batch.staged.len());
+        if target == 0 {
+            return;
+        }
+
+        while batch.pending_sqes < target {
+            let Some(entry) = batch.staged.get(batch.pending_sqes) else {
+                break;
+            };
+            let push_res = {
+                let mut sq = self.ring.submission();
+                // SAFETY: the SQE is copied into the ring submission queue. The
+                // pointed-to IO memory is owned by the worker inflight entry and
+                // stays valid until completion is processed.
+                unsafe { sq.push(entry) }
+            };
+            if push_res.is_err() {
+                break;
+            }
+            batch.pending_sqes += 1;
+        }
+    }
+
+    #[inline]
+    fn take_completions(&mut self) -> Vec<(BackendToken, StdIoResult<usize>)> {
+        let mut completed = Vec::new();
+        let cq = self.ring.completion();
+        for cqe in cq {
+            let res = if cqe.result() >= 0 {
+                Ok(cqe.result() as usize)
+            } else {
+                Err(StdIoError::from_raw_os_error(-cqe.result()))
+            };
+            completed.push((BackendToken::from_raw(cqe.user_data()), res));
+        }
+        self.stats.record_wait_completions(completed.len());
+        completed
+    }
+}
+
+impl IOBackend for IouringBackend {
+    type Prepared = squeue::Entry;
+    type SubmitBatch = IouringSubmitBatch;
+    type Events = ();
+
+    #[inline]
+    fn max_events(&self) -> usize {
+        self.max_events()
+    }
+
+    #[inline]
+    fn new_submit_batch(&self) -> Self::SubmitBatch {
+        IouringSubmitBatch {
+            staged: VecDeque::with_capacity(self.max_events()),
+            pending_sqes: 0,
+        }
+    }
+
+    #[inline]
+    fn new_events(&self) -> Self::Events {}
+
+    #[inline]
+    fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
+        let fd = types::Fd(operation.fd());
+        let ptr = operation.as_mut_ptr();
+        let len = operation.len() as _;
+        let offset = operation.offset() as u64;
+        let entry = match operation.kind() {
+            IOKind::Read => Read::new(fd, ptr, len).offset(offset).build(),
+            IOKind::Write => Write::new(fd, ptr, len).offset(offset).build(),
+        };
+        entry.user_data(token.raw())
+    }
+
+    #[inline]
+    fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
+        batch.staged.push_back(prepared.clone());
+    }
+
+    #[inline]
+    fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
+        let start = Instant::now();
+        self.stage_pending_sqes(batch, limit);
+
+        if batch.pending_sqes == 0 {
+            return 0;
+        }
+
+        let outcome = submit_pending_sqes(
+            batch,
+            limit,
+            || self.ring.submit(),
+            |min_nr| self.ring.submit_and_wait(min_nr),
+        );
+        self.stats
+            .record_submit_and_wait(outcome.call_count, start.elapsed().as_nanos() as usize);
+        self.stats.record_submitted_ops(outcome.submitted);
+        outcome.submitted
+    }
+
+    #[inline]
+    fn wait_at_least(
+        &mut self,
+        _events: &mut Self::Events,
+        min_nr: usize,
+    ) -> Vec<(BackendToken, StdIoResult<usize>)> {
+        {
+            let cq = self.ring.completion();
+            if cq.len() < min_nr {
+                drop(cq);
+                let start = Instant::now();
+                let outcome =
+                    blocking_submit_and_wait(min_nr, |min_nr| self.ring.submit_and_wait(min_nr));
+                record_blocking_wait_stats(
+                    &self.stats,
+                    outcome,
+                    start.elapsed().as_nanos() as usize,
+                );
+            }
+        }
+        self.take_completions()
     }
 }
 
@@ -80,6 +200,13 @@ struct SubmitOutcome {
 struct BlockingWaitOutcome {
     submitted: usize,
     call_count: usize,
+}
+
+#[inline]
+fn invalid_io_depth(max_events: usize) -> Error {
+    Report::new(ConfigError::InvalidIoDepth)
+        .attach(format!("max_events={max_events}"))
+        .into()
 }
 
 #[inline]
@@ -185,140 +312,14 @@ fn record_blocking_wait_stats(
     stats.record_submitted_ops(outcome.submitted);
 }
 
-impl IouringBackend {
-    #[inline]
-    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) {
-        let target = limit.min(batch.staged.len());
-        if target == 0 {
-            return;
-        }
-
-        while batch.pending_sqes < target {
-            let Some(entry) = batch.staged.get(batch.pending_sqes) else {
-                break;
-            };
-            let push_res = {
-                let mut sq = self.ring.submission();
-                // SAFETY: the SQE is copied into the ring submission queue. The
-                // pointed-to IO memory is owned by the worker inflight entry and
-                // stays valid until completion is processed.
-                unsafe { sq.push(entry) }
-            };
-            if push_res.is_err() {
-                break;
-            }
-            batch.pending_sqes += 1;
-        }
-    }
-
-    #[inline]
-    fn take_completions(&mut self) -> Vec<(BackendToken, StdIoResult<usize>)> {
-        let mut completed = Vec::new();
-        let cq = self.ring.completion();
-        for cqe in cq {
-            let res = if cqe.result() >= 0 {
-                Ok(cqe.result() as usize)
-            } else {
-                Err(io::Error::from_raw_os_error(-cqe.result()))
-            };
-            completed.push((BackendToken::from_raw(cqe.user_data()), res));
-        }
-        self.stats.record_wait_completions(completed.len());
-        completed
-    }
-}
-
-impl IOBackend for IouringBackend {
-    type Prepared = squeue::Entry;
-    type SubmitBatch = IouringSubmitBatch;
-    type Events = ();
-
-    #[inline]
-    fn max_events(&self) -> usize {
-        self.max_events()
-    }
-
-    #[inline]
-    fn new_submit_batch(&self) -> Self::SubmitBatch {
-        IouringSubmitBatch {
-            staged: VecDeque::with_capacity(self.max_events()),
-            pending_sqes: 0,
-        }
-    }
-
-    #[inline]
-    fn new_events(&self) -> Self::Events {}
-
-    #[inline]
-    fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
-        let fd = types::Fd(operation.fd());
-        let ptr = operation.as_mut_ptr();
-        let len = operation.len() as _;
-        let offset = operation.offset() as u64;
-        let entry = match operation.kind() {
-            IOKind::Read => opcode::Read::new(fd, ptr, len).offset(offset).build(),
-            IOKind::Write => opcode::Write::new(fd, ptr, len).offset(offset).build(),
-        };
-        entry.user_data(token.raw())
-    }
-
-    #[inline]
-    fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-        batch.staged.push_back(prepared.clone());
-    }
-
-    #[inline]
-    fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
-        let start = Instant::now();
-        self.stage_pending_sqes(batch, limit);
-
-        if batch.pending_sqes == 0 {
-            return 0;
-        }
-
-        let outcome = submit_pending_sqes(
-            batch,
-            limit,
-            || self.ring.submit(),
-            |min_nr| self.ring.submit_and_wait(min_nr),
-        );
-        self.stats
-            .record_submit_and_wait(outcome.call_count, start.elapsed().as_nanos() as usize);
-        self.stats.record_submitted_ops(outcome.submitted);
-        outcome.submitted
-    }
-
-    #[inline]
-    fn wait_at_least(
-        &mut self,
-        _events: &mut Self::Events,
-        min_nr: usize,
-    ) -> Vec<(BackendToken, StdIoResult<usize>)> {
-        {
-            let cq = self.ring.completion();
-            if cq.len() < min_nr {
-                drop(cq);
-                let start = Instant::now();
-                let outcome =
-                    blocking_submit_and_wait(min_nr, |min_nr| self.ring.submit_and_wait(min_nr));
-                record_blocking_wait_stats(
-                    &self.stats,
-                    outcome,
-                    start.elapsed().as_nanos() as usize,
-                );
-            }
-        }
-        self.take_completions()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use io_uring::opcode;
+    use io_uring::opcode::Nop;
+    use std::io::Error as StdIoError;
 
     fn nop_entry() -> squeue::Entry {
-        opcode::Nop::new().build()
+        Nop::new().build()
     }
 
     fn submit_batch_with_pending(staged_len: usize, pending_sqes: usize) -> IouringSubmitBatch {
@@ -356,7 +357,7 @@ mod tests {
             2,
             || {
                 submit_calls += 1;
-                Err(io::Error::from_raw_os_error(EAGAIN))
+                Err(StdIoError::from_raw_os_error(EAGAIN))
             },
             |min_nr| {
                 assert_eq!(min_nr, 1);
@@ -376,7 +377,7 @@ mod tests {
         let outcome = submit_pending_sqes(
             &mut batch,
             3,
-            || Err(io::Error::from_raw_os_error(EBUSY)),
+            || Err(StdIoError::from_raw_os_error(EBUSY)),
             |min_nr| {
                 assert_eq!(min_nr, 1);
                 Ok(1)
@@ -408,7 +409,7 @@ mod tests {
             calls += 1;
             assert_eq!(min_nr, 4);
             if calls == 1 {
-                Err(io::Error::from_raw_os_error(EINTR))
+                Err(StdIoError::from_raw_os_error(EINTR))
             } else {
                 Ok(3)
             }

@@ -14,6 +14,11 @@ use parking_lot::Mutex;
 
 const PROPAGATE_ATTACHMENT: &str = "propagate from other threads";
 
+enum CompletionState<T> {
+    Running,
+    Completed(CompletionResult<T>),
+}
+
 /// Shared terminal-status cell for one asynchronous IO flow.
 ///
 /// Producers call [`Self::complete`] exactly once to publish the final result.
@@ -23,11 +28,6 @@ const PROPAGATE_ATTACHMENT: &str = "propagate from other threads";
 pub(crate) struct Completion<T> {
     state: Mutex<CompletionState<T>>,
     ev: Event,
-}
-
-enum CompletionState<T> {
-    Running,
-    Completed(CompletionResult<T>),
 }
 
 impl<T> Completion<T> {
@@ -52,20 +52,14 @@ impl<T> Completion<T> {
             self.ev.notify(usize::MAX);
         }
     }
-}
 
-impl<T> Default for Completion<T> {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: Clone> Completion<T> {
     /// Returns the propagated terminal result if this completion has already
     /// finished.
     #[inline]
-    pub(crate) fn completed_result(&self) -> Option<CompletionResult<T>> {
+    pub(crate) fn completed_result(&self) -> Option<CompletionResult<T>>
+    where
+        T: Clone,
+    {
         let state = self.state.lock();
         match &*state {
             CompletionState::Running => None,
@@ -75,7 +69,10 @@ impl<T: Clone> Completion<T> {
 
     /// Waits until completion and returns the propagated terminal result.
     #[inline]
-    pub(crate) async fn wait_result(&self) -> CompletionResult<T> {
+    pub(crate) async fn wait_result(&self) -> CompletionResult<T>
+    where
+        T: Clone,
+    {
         loop {
             listener!(self.ev => listener);
             if let Some(value) = self.completed_result() {
@@ -83,6 +80,13 @@ impl<T: Clone> Completion<T> {
             }
             listener.await;
         }
+    }
+}
+
+impl<T> Default for Completion<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -99,7 +103,7 @@ mod tests {
     use super::Completion;
     use crate::error::{CompletionErrorKind, IoError};
     use error_stack::Report;
-    use std::io::{self, ErrorKind as IoErrorKind};
+    use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 
     #[test]
     fn test_completion_completed_result_is_stable() {
@@ -154,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_completion_report_io_attaches_error_detail() {
-        let err = io::Error::new(IoErrorKind::PermissionDenied, "completion io denied");
+        let err = StdIoError::new(IoErrorKind::PermissionDenied, "completion io denied");
         let message = format!("{}", err);
 
         let report = CompletionErrorKind::report_io(err, "test completion io");
