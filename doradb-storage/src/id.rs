@@ -82,7 +82,7 @@ macro_rules! impl_id {
         impl ::std::fmt::Display for $name {
             #[inline]
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                self.0.fmt(f)
+                fmt::Display::fmt(&self.0, f)
             }
         }
     };
@@ -163,8 +163,11 @@ macro_rules! impl_id_bitpackable {
 }
 
 use crate::value::Val;
+use std::fmt::{self, LowerHex};
 use std::mem;
+use std::num::ParseIntError;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
+use std::result;
 
 impl_id! {
     /// Stable logical row identity within table data.
@@ -238,10 +241,7 @@ impl_id! {
 impl TableID {
     /// Parses a table identifier from a string in the given radix.
     #[inline]
-    pub fn from_str_radix(
-        src: &str,
-        radix: u32,
-    ) -> std::result::Result<Self, std::num::ParseIntError> {
+    pub fn from_str_radix(src: &str, radix: u32) -> result::Result<Self, ParseIntError> {
         u64::from_str_radix(src, radix).map(Self::new)
     }
 
@@ -267,10 +267,10 @@ impl Add<u64> for TableID {
     }
 }
 
-impl std::fmt::LowerHex for TableID {
+impl LowerHex for TableID {
     #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::LowerHex::fmt(&self.as_u64(), f)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        LowerHex::fmt(&self.as_u64(), f)
     }
 }
 
@@ -348,6 +348,7 @@ impl_id! {
 }
 
 impl PageID {
+    /// Creates a page identifier from little-endian bytes.
     #[inline]
     pub const fn from_le_bytes(bytes: [u8; mem::size_of::<u64>()]) -> Self {
         Self(u64::from_le_bytes(bytes))
@@ -439,6 +440,7 @@ impl_id! {
 }
 
 impl FileID {
+    /// Largest representable raw file identifier.
     pub(crate) const MAX: Self = Self(u64::MAX);
 }
 
@@ -551,11 +553,12 @@ impl_id_bitpackable!(BlockID);
 mod tests {
     use super::*;
     use crate::serde::{Deser, Ser};
+    use std::fmt::Debug;
     use std::num::IntErrorKind;
 
     fn assert_id_serde_roundtrip<T>(id: T, raw: u64)
     where
-        T: for<'a> Ser<'a> + Deser + Copy + Eq + std::fmt::Debug,
+        T: for<'a> Ser<'a> + Deser + Copy + Eq + Debug,
     {
         let start_idx = 3;
         let end_idx = start_idx + mem::size_of::<u64>();

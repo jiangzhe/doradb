@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) struct EventNotifyOnDrop(Event);
 
 impl EventNotifyOnDrop {
+    /// Creates an event wrapper that wakes listeners during drop.
     #[inline]
     pub(crate) fn new() -> Self {
         EventNotifyOnDrop(Event::new())
@@ -91,6 +92,7 @@ impl Default for ChangeNotifier {
 mod tests {
     use super::*;
     use std::sync::{Arc, mpsc};
+    use std::thread;
     use std::time::Duration;
 
     #[test]
@@ -122,7 +124,7 @@ mod tests {
 
         let waiter = {
             let notifier = Arc::clone(&notifier);
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
                 notifier.wait_since(observed_epoch);
                 done_tx.send(()).expect("waiter should report completion");

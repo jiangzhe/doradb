@@ -2,9 +2,29 @@ use std::alloc::{Layout, alloc};
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::iter::repeat_n;
 use std::mem::size_of;
-use std::mem::{self, ManuallyDrop};
+use std::mem::{self, ManuallyDrop, replace};
 use std::ops::{Deref, DerefMut};
+use std::ptr::{copy_nonoverlapping, replace as replace_ptr, write_bytes};
+
+/// Nullable memcmp encoding marker for null values.
+pub(crate) const NULL_FLAG: u8 = 0x01;
+/// Nullable memcmp encoding marker for non-null values.
+pub(crate) const NON_NULL_FLAG: u8 = 0x02;
+const FIX_SEG_FLAG: u8 = 0xff;
+const SEG_LEN: usize = 15;
+/// Minimum encoded length for a variable-width memcmp value.
+pub(crate) const MIN_VAR_MCF_LEN: usize = SEG_LEN + 1;
+/// Minimum encoded length for a nullable variable-width memcmp value.
+pub(crate) const MIN_VAR_NMCF_LEN: usize = MIN_VAR_MCF_LEN + 1;
+/// Inline-or-heap memcmp key header size.
+pub(crate) const MEM_CMP_KEY_LEN: usize = 32;
+/// Maximum bytes stored inline in a memcmp key.
+pub(crate) const MEM_CMP_KEY_INLINE: usize = MEM_CMP_KEY_LEN - size_of::<usize>();
+/// Prefix bytes mirrored in heap-backed memcmp keys.
+pub(crate) const MEM_CMP_KEY_HEAP_PREFIX: usize =
+    MEM_CMP_KEY_LEN - size_of::<usize>() - size_of::<Box<[u8]>>();
 
 /// Extendable byte container.
 pub(crate) trait BytesExtendable {
@@ -14,6 +34,7 @@ pub(crate) trait BytesExtendable {
     /// Extend from a byte slice.
     fn extend_from_byte_slice(&mut self, values: &[u8]);
 
+    /// Extend by repeating one byte `n` times.
     fn extend_repeat_n(&mut self, val: u8, n: usize);
 
     /// Update last byte.
@@ -33,7 +54,7 @@ impl BytesExtendable for Vec<u8> {
 
     #[inline]
     fn extend_repeat_n(&mut self, val: u8, n: usize) {
-        self.extend(std::iter::repeat_n(val, n))
+        self.extend(repeat_n(val, n))
     }
 
     #[inline]
@@ -78,13 +99,6 @@ pub(crate) trait MemCmpFormat {
     fn copy_mcf_to(&self, buf: &mut [u8], start_idx: usize) -> usize;
 }
 
-pub(crate) const NULL_FLAG: u8 = 0x01;
-pub(crate) const NON_NULL_FLAG: u8 = 0x02;
-const FIX_SEG_FLAG: u8 = 0xff;
-const SEG_LEN: usize = 15;
-pub(crate) const MIN_VAR_MCF_LEN: usize = SEG_LEN + 1;
-pub(crate) const MIN_VAR_NMCF_LEN: usize = MIN_VAR_MCF_LEN + 1;
-
 /// Nullable memory comparable format.
 pub(crate) trait NullableMemCmpFormat {
     /// Returns estimated length of the type.
@@ -103,6 +117,7 @@ pub(crate) trait NullableMemCmpFormat {
     fn copy_nmcf_to(&self, buf: &mut [u8], start_idx: usize) -> usize;
 }
 
+/// Marker value for null nullable memcmp encoding.
 pub(crate) struct Null;
 
 impl NullableMemCmpFormat for Null {
@@ -281,9 +296,13 @@ impl_mcf_for_f!(f64, 0.0f64, 0x8000_0000_0000_0000);
 impl_nmcf_for!(f32);
 impl_nmcf_for!(f64);
 
+/// Bytes encoded with segmented variable-width memcmp format.
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct SegmentedBytes<'a>(pub &'a [u8]);
+pub(crate) struct SegmentedBytes<'a>(
+    /// Bytes encoded with segmented variable-width memcmp format.
+    pub &'a [u8],
+);
 
 impl MemCmpFormat for SegmentedBytes<'_> {
     #[inline]
@@ -312,68 +331,13 @@ impl MemCmpFormat for SegmentedBytes<'_> {
 
 impl_nmcf_for!(SegmentedBytes<'_>);
 
-#[inline]
-fn extend_segmented_bytes<T: BytesExtendable>(bs: &[u8], buf: &mut T) {
-    if bs.is_empty() {
-        buf.extend_from_byte_slice(&[0; SEG_LEN + 1]); // last byte is zero
-        return;
-    }
-    let mut chunks = bs.chunks_exact(SEG_LEN);
-    if chunks.remainder().is_empty() {
-        for c in chunks {
-            buf.extend_from_byte_slice(c);
-            buf.push_byte(FIX_SEG_FLAG);
-        }
-        // update last byte as segment length
-        buf.update_last_byte(SEG_LEN as u8);
-        // *buf.last_mut().unwrap() = SEG_LEN as u8;
-    } else {
-        for c in chunks.by_ref() {
-            buf.extend_from_byte_slice(c);
-            buf.push_byte(FIX_SEG_FLAG);
-        }
-        buf.extend_from_byte_slice(chunks.remainder());
-        buf.extend_repeat_n(0x00, SEG_LEN - chunks.remainder().len());
-        buf.push_byte(chunks.remainder().len() as u8);
-    }
-}
-
-#[inline]
-fn copy_segmented_bytes(bs: &[u8], mut buf: &mut [u8]) -> usize {
-    if bs.is_empty() {
-        buf[..SEG_LEN + 1].iter_mut().for_each(|b| *b = 0);
-        return SEG_LEN + 1;
-    }
-    let mut chunks = bs.chunks_exact(SEG_LEN);
-    if chunks.remainder().is_empty() {
-        let mut offset = 0;
-        for c in chunks {
-            buf[offset..offset + SEG_LEN].copy_from_slice(c);
-            buf[offset + SEG_LEN] = FIX_SEG_FLAG;
-            offset += SEG_LEN + 1;
-        }
-        // update last byte as segment length
-        buf[offset - 1] = SEG_LEN as u8;
-        return offset;
-    }
-    let mut offset = 0usize;
-    for c in chunks.by_ref() {
-        debug_assert!(c.len() == SEG_LEN);
-        buf[..SEG_LEN].copy_from_slice(c);
-        buf[SEG_LEN] = FIX_SEG_FLAG;
-        buf = &mut buf[SEG_LEN + 1..];
-        offset += SEG_LEN + 1
-    }
-    let rem = chunks.remainder();
-    buf[..rem.len()].copy_from_slice(rem);
-    buf[rem.len()..SEG_LEN].iter_mut().for_each(|b| *b = 0);
-    buf[SEG_LEN] = chunks.remainder().len() as u8;
-    offset + SEG_LEN + 1
-}
-
+/// Bytes encoded without segment terminators.
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct NormalBytes<'a>(pub &'a [u8]);
+pub(crate) struct NormalBytes<'a>(
+    /// Bytes encoded as-is.
+    pub &'a [u8],
+);
 
 impl MemCmpFormat for NormalBytes<'_> {
     #[inline]
@@ -401,10 +365,12 @@ impl MemCmpFormat for NormalBytes<'_> {
 
 impl_nmcf_for!(NormalBytes<'_>);
 
-pub(crate) const MEM_CMP_KEY_LEN: usize = 32;
-pub(crate) const MEM_CMP_KEY_INLINE: usize = MEM_CMP_KEY_LEN - mem::size_of::<usize>();
-pub(crate) const MEM_CMP_KEY_HEAP_PREFIX: usize =
-    MEM_CMP_KEY_LEN - mem::size_of::<usize>() - mem::size_of::<Box<[u8]>>();
+/// Wrapper indicating that a value should be encoded with a non-null flag.
+#[repr(transparent)]
+pub(crate) struct Nullable<T>(
+    /// Wrapped non-null value.
+    pub T,
+);
 
 /// MemCmpKey is a key which can be directly memory compared.
 /// The underlying implementation is an inline key if length <= 24,
@@ -451,6 +417,7 @@ impl MemCmpKey {
         MemCmpKey(Inner::heap_alloc(len))
     }
 
+    /// Returns a zero-initialized key with the requested length.
     #[inline]
     pub(crate) fn arbitrary(len: usize) -> Self {
         if len <= MEM_CMP_KEY_INLINE {
@@ -525,57 +492,6 @@ impl From<Null> for MemCmpKey {
     }
 }
 
-macro_rules! impl_mem_cmp_key_from_non_nullable {
-    ($ty:ty) => {
-        impl From<$ty> for MemCmpKey {
-            #[inline]
-            fn from(value: $ty) -> Self {
-                let mut bytes = [0u8; mem::size_of::<$ty>()];
-                value.copy_mcf_to(&mut bytes, 0);
-                MemCmpKey::from(&bytes[..])
-            }
-        }
-    };
-}
-
-impl_mem_cmp_key_from_non_nullable!(i8);
-impl_mem_cmp_key_from_non_nullable!(i16);
-impl_mem_cmp_key_from_non_nullable!(i32);
-impl_mem_cmp_key_from_non_nullable!(i64);
-impl_mem_cmp_key_from_non_nullable!(u8);
-impl_mem_cmp_key_from_non_nullable!(u16);
-impl_mem_cmp_key_from_non_nullable!(u32);
-impl_mem_cmp_key_from_non_nullable!(u64);
-impl_mem_cmp_key_from_non_nullable!(f32);
-impl_mem_cmp_key_from_non_nullable!(f64);
-
-#[repr(transparent)]
-pub(crate) struct Nullable<T>(pub T);
-
-macro_rules! impl_mem_cmp_key_from_nullable {
-    ($ty:ty) => {
-        impl From<Nullable<$ty>> for MemCmpKey {
-            #[inline]
-            fn from(value: Nullable<$ty>) -> Self {
-                let mut bytes = [0u8; mem::size_of::<$ty>() + 1];
-                value.0.copy_nmcf_to(&mut bytes, 0);
-                MemCmpKey::from(&bytes[..])
-            }
-        }
-    };
-}
-
-impl_mem_cmp_key_from_nullable!(i8);
-impl_mem_cmp_key_from_nullable!(i16);
-impl_mem_cmp_key_from_nullable!(i32);
-impl_mem_cmp_key_from_nullable!(i64);
-impl_mem_cmp_key_from_nullable!(u8);
-impl_mem_cmp_key_from_nullable!(u16);
-impl_mem_cmp_key_from_nullable!(u32);
-impl_mem_cmp_key_from_nullable!(u64);
-impl_mem_cmp_key_from_nullable!(f32);
-impl_mem_cmp_key_from_nullable!(f64);
-
 impl Deref for MemCmpKey {
     type Target = [u8];
     #[inline]
@@ -639,6 +555,55 @@ impl fmt::Debug for MemCmpKey {
     }
 }
 
+macro_rules! impl_mem_cmp_key_from_non_nullable {
+    ($ty:ty) => {
+        impl From<$ty> for MemCmpKey {
+            #[inline]
+            fn from(value: $ty) -> Self {
+                let mut bytes = [0u8; mem::size_of::<$ty>()];
+                value.copy_mcf_to(&mut bytes, 0);
+                MemCmpKey::from(&bytes[..])
+            }
+        }
+    };
+}
+
+impl_mem_cmp_key_from_non_nullable!(i8);
+impl_mem_cmp_key_from_non_nullable!(i16);
+impl_mem_cmp_key_from_non_nullable!(i32);
+impl_mem_cmp_key_from_non_nullable!(i64);
+impl_mem_cmp_key_from_non_nullable!(u8);
+impl_mem_cmp_key_from_non_nullable!(u16);
+impl_mem_cmp_key_from_non_nullable!(u32);
+impl_mem_cmp_key_from_non_nullable!(u64);
+impl_mem_cmp_key_from_non_nullable!(f32);
+impl_mem_cmp_key_from_non_nullable!(f64);
+
+macro_rules! impl_mem_cmp_key_from_nullable {
+    ($ty:ty) => {
+        impl From<Nullable<$ty>> for MemCmpKey {
+            #[inline]
+            fn from(value: Nullable<$ty>) -> Self {
+                let mut bytes = [0u8; mem::size_of::<$ty>() + 1];
+                value.0.copy_nmcf_to(&mut bytes, 0);
+                MemCmpKey::from(&bytes[..])
+            }
+        }
+    };
+}
+
+impl_mem_cmp_key_from_nullable!(i8);
+impl_mem_cmp_key_from_nullable!(i16);
+impl_mem_cmp_key_from_nullable!(i32);
+impl_mem_cmp_key_from_nullable!(i64);
+impl_mem_cmp_key_from_nullable!(u8);
+impl_mem_cmp_key_from_nullable!(u16);
+impl_mem_cmp_key_from_nullable!(u32);
+impl_mem_cmp_key_from_nullable!(u64);
+impl_mem_cmp_key_from_nullable!(f32);
+impl_mem_cmp_key_from_nullable!(f64);
+
+/// Mutable guard that refreshes heap prefixes when dropped.
 pub(crate) struct ModifyInplaceGuard<'a>(&'a mut MemCmpKey);
 
 impl Deref for ModifyInplaceGuard<'_> {
@@ -713,7 +678,7 @@ impl Inner {
         // the heap variant.
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(value.len(), 1));
-            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
+            copy_nonoverlapping(value.as_ptr(), ptr, value.len());
             let data = Vec::from_raw_parts(ptr, value.len(), value.len()).into_boxed_slice();
             Inner::heap_inner(value.len(), prefix, data)
         }
@@ -740,7 +705,7 @@ impl Inner {
             // update first byte.
             *ptr = b;
             // copy data.
-            std::ptr::copy_nonoverlapping(value.as_ptr(), ptr.add(1), value.len());
+            copy_nonoverlapping(value.as_ptr(), ptr.add(1), value.len());
             let data = Vec::from_raw_parts(ptr, len, len).into_boxed_slice();
             Inner::heap_inner(len, prefix, data)
         }
@@ -770,34 +735,6 @@ impl Inner {
     }
 }
 
-/// Builds a boxed byte slice whose length is used as heap capacity.
-///
-/// # Safety
-///
-/// `ptr` must be allocated for `cap` bytes with alignment 1 and uniquely owned
-/// by the caller. The first `initialized_len` bytes must already be
-/// initialized, and `initialized_len` must not exceed `cap`.
-#[inline]
-unsafe fn boxed_slice_with_capacity(ptr: *mut u8, initialized_len: usize, cap: usize) -> Box<[u8]> {
-    debug_assert!(initialized_len <= cap);
-    if initialized_len < cap {
-        // SAFETY: the caller guarantees `ptr` is valid for `cap` bytes, and
-        // the range starts after the already initialized prefix.
-        unsafe { std::ptr::write_bytes(ptr.add(initialized_len), 0, cap - initialized_len) };
-    }
-    // SAFETY: the full `cap` byte range is initialized before ownership is
-    // transferred into the Vec.
-    unsafe { Vec::from_raw_parts(ptr, cap, cap).into_boxed_slice() }
-}
-
-#[inline]
-fn heap_prefix(data: &[u8]) -> [u8; MEM_CMP_KEY_HEAP_PREFIX] {
-    debug_assert!(data.len() >= MEM_CMP_KEY_HEAP_PREFIX);
-    let mut prefix = [0u8; MEM_CMP_KEY_HEAP_PREFIX];
-    prefix.copy_from_slice(&data[..MEM_CMP_KEY_HEAP_PREFIX]);
-    prefix
-}
-
 impl BytesExtendable for Inner {
     #[inline]
     fn push_byte(&mut self, value: u8) {
@@ -818,7 +755,7 @@ impl BytesExtendable for Inner {
                     let new_len = old_len + 1;
                     let new_cap = old_len * 2;
                     let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
-                    std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
+                    copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
                     *ptr.add(old_len) = value;
                     let data = boxed_slice_with_capacity(ptr, new_len, new_cap);
                     let prefix = heap_prefix(&data);
@@ -840,11 +777,11 @@ impl BytesExtendable for Inner {
                     } else {
                         let new_cap = old_len * 2;
                         let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, old_len);
+                        copy_nonoverlapping(data.as_ptr(), ptr, old_len);
                         *ptr.add(old_len) = value;
                         let new_data = boxed_slice_with_capacity(ptr, new_len, new_cap);
                         self.len = new_len;
-                        let old_box = std::mem::replace(data, new_data);
+                        let old_box = replace(data, new_data);
                         drop(old_box); // explicitly drop the old box.
                         // prefix not changed.
                     }
@@ -865,8 +802,8 @@ impl BytesExtendable for Inner {
                 if new_len > MEM_CMP_KEY_INLINE {
                     // new collection is on heap.
                     let ptr = alloc(Layout::from_size_align_unchecked(new_len, 1));
-                    std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
-                    std::ptr::copy_nonoverlapping(values.as_ptr(), ptr.add(old_len), values.len());
+                    copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
+                    copy_nonoverlapping(values.as_ptr(), ptr.add(old_len), values.len());
                     let data = Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice();
                     let prefix = heap_prefix(&data);
                     self.len = new_len;
@@ -890,8 +827,8 @@ impl BytesExtendable for Inner {
             // Double the old capacity to avoid frequent reallocations with small extentions.
             let new_cap = new_len.max(old_len * 2);
             let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, old_len);
-            std::ptr::copy_nonoverlapping(values.as_ptr(), ptr.add(old_len), values.len());
+            copy_nonoverlapping(data.as_ptr(), ptr, old_len);
+            copy_nonoverlapping(values.as_ptr(), ptr.add(old_len), values.len());
             let data = boxed_slice_with_capacity(ptr, new_len, new_cap);
             self.len = new_len;
             self.u.replace_heap_data(data);
@@ -911,8 +848,8 @@ impl BytesExtendable for Inner {
                 if new_len > MEM_CMP_KEY_INLINE {
                     // new collection is on heap.
                     let ptr = alloc(Layout::from_size_align_unchecked(new_len, 1));
-                    std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
-                    std::ptr::write_bytes(ptr.add(old_len), val, n);
+                    copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
+                    write_bytes(ptr.add(old_len), val, n);
                     let data = Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice();
                     let prefix = heap_prefix(&data);
                     self.len = new_len;
@@ -936,8 +873,8 @@ impl BytesExtendable for Inner {
             // Double the old capacity to avoid frequent reallocations with small extentions.
             let new_cap = new_len.max(old_len * 2);
             let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, old_len);
-            std::ptr::write_bytes(ptr.add(old_len), val, n);
+            copy_nonoverlapping(data.as_ptr(), ptr, old_len);
+            write_bytes(ptr.add(old_len), val, n);
             let data = boxed_slice_with_capacity(ptr, new_len, new_cap);
             self.len = new_len;
             self.u.replace_heap_data(data);
@@ -999,7 +936,7 @@ impl InlineOrHeap {
         // SAFETY: the caller guarantees `h.data` is initialized, so replacing it
         // and dropping the old boxed slice preserves ownership correctly.
         unsafe {
-            let old_data = std::ptr::replace(&mut (*self.h).data, data);
+            let old_data = replace_ptr(&mut (*self.h).data, data);
             drop(old_data);
         }
     }
@@ -1010,6 +947,93 @@ struct Heap {
     prefix: [u8; MEM_CMP_KEY_HEAP_PREFIX],
     // Use boxed slice because we need capacity when extend the key.
     data: Box<[u8]>,
+}
+
+#[inline]
+fn extend_segmented_bytes<T: BytesExtendable>(bs: &[u8], buf: &mut T) {
+    if bs.is_empty() {
+        buf.extend_from_byte_slice(&[0; SEG_LEN + 1]); // last byte is zero
+        return;
+    }
+    let mut chunks = bs.chunks_exact(SEG_LEN);
+    if chunks.remainder().is_empty() {
+        for c in chunks {
+            buf.extend_from_byte_slice(c);
+            buf.push_byte(FIX_SEG_FLAG);
+        }
+        // update last byte as segment length
+        buf.update_last_byte(SEG_LEN as u8);
+        // *buf.last_mut().unwrap() = SEG_LEN as u8;
+    } else {
+        for c in chunks.by_ref() {
+            buf.extend_from_byte_slice(c);
+            buf.push_byte(FIX_SEG_FLAG);
+        }
+        buf.extend_from_byte_slice(chunks.remainder());
+        buf.extend_repeat_n(0x00, SEG_LEN - chunks.remainder().len());
+        buf.push_byte(chunks.remainder().len() as u8);
+    }
+}
+
+#[inline]
+fn copy_segmented_bytes(bs: &[u8], mut buf: &mut [u8]) -> usize {
+    if bs.is_empty() {
+        buf[..SEG_LEN + 1].iter_mut().for_each(|b| *b = 0);
+        return SEG_LEN + 1;
+    }
+    let mut chunks = bs.chunks_exact(SEG_LEN);
+    if chunks.remainder().is_empty() {
+        let mut offset = 0;
+        for c in chunks {
+            buf[offset..offset + SEG_LEN].copy_from_slice(c);
+            buf[offset + SEG_LEN] = FIX_SEG_FLAG;
+            offset += SEG_LEN + 1;
+        }
+        // update last byte as segment length
+        buf[offset - 1] = SEG_LEN as u8;
+        return offset;
+    }
+    let mut offset = 0usize;
+    for c in chunks.by_ref() {
+        debug_assert!(c.len() == SEG_LEN);
+        buf[..SEG_LEN].copy_from_slice(c);
+        buf[SEG_LEN] = FIX_SEG_FLAG;
+        buf = &mut buf[SEG_LEN + 1..];
+        offset += SEG_LEN + 1
+    }
+    let rem = chunks.remainder();
+    buf[..rem.len()].copy_from_slice(rem);
+    buf[rem.len()..SEG_LEN].iter_mut().for_each(|b| *b = 0);
+    buf[SEG_LEN] = chunks.remainder().len() as u8;
+    offset + SEG_LEN + 1
+}
+
+/// Builds a boxed byte slice whose length is used as heap capacity.
+///
+/// # Safety
+///
+/// `ptr` must be allocated for `cap` bytes with alignment 1 and uniquely owned
+/// by the caller. The first `initialized_len` bytes must already be
+/// initialized, and `initialized_len` must not exceed `cap`.
+#[inline]
+unsafe fn boxed_slice_with_capacity(ptr: *mut u8, initialized_len: usize, cap: usize) -> Box<[u8]> {
+    debug_assert!(initialized_len <= cap);
+    if initialized_len < cap {
+        // SAFETY: the caller guarantees `ptr` is valid for `cap` bytes, and
+        // the range starts after the already initialized prefix.
+        unsafe { write_bytes(ptr.add(initialized_len), 0, cap - initialized_len) };
+    }
+    // SAFETY: the full `cap` byte range is initialized before ownership is
+    // transferred into the Vec.
+    unsafe { Vec::from_raw_parts(ptr, cap, cap).into_boxed_slice() }
+}
+
+#[inline]
+fn heap_prefix(data: &[u8]) -> [u8; MEM_CMP_KEY_HEAP_PREFIX] {
+    debug_assert!(data.len() >= MEM_CMP_KEY_HEAP_PREFIX);
+    let mut prefix = [0u8; MEM_CMP_KEY_HEAP_PREFIX];
+    prefix.copy_from_slice(&data[..MEM_CMP_KEY_HEAP_PREFIX]);
+    prefix
 }
 
 #[cfg(test)]
@@ -1483,7 +1507,7 @@ mod tests {
 
         let mut repeated = MemCmpKey::from(&[0x44, 0x55][..]);
         let mut expected = vec![0x44, 0x55];
-        expected.extend(std::iter::repeat_n(0x66, MEM_CMP_KEY_INLINE));
+        expected.extend(repeat_n(0x66, MEM_CMP_KEY_INLINE));
 
         repeated.extend_repeat_n(0x66, MEM_CMP_KEY_INLINE);
 

@@ -1,17 +1,27 @@
 use crate::id::RowID;
 use error_stack::Report;
 use std::array::TryFromSliceError;
-use std::fmt;
+use std::error::Error as StdError;
+use std::fmt::{self, Debug, Display};
 use std::io::{self, ErrorKind as IoErrorKind};
+use std::num::ParseIntError;
 use std::ops::ControlFlow;
+use std::result;
+use std::str::Utf8Error;
 use thiserror::Error as ThisError;
 
-pub type Result<T> = std::result::Result<T, Error>;
-pub(crate) type ConfigResult<T> = std::result::Result<T, Report<ConfigError>>;
-pub(crate) type DataIntegrityResult<T> = std::result::Result<T, Report<DataIntegrityError>>;
-pub(crate) type LifecycleResult<T> = std::result::Result<T, Report<LifecycleError>>;
-pub(crate) type FatalResult<T> = std::result::Result<T, Report<FatalError>>;
-pub(crate) type CompletionResult<T> = std::result::Result<T, Report<CompletionErrorKind>>;
+/// Storage result using the public storage error wrapper.
+pub type Result<T> = result::Result<T, Error>;
+/// Result carrying configuration-domain reports.
+pub(crate) type ConfigResult<T> = result::Result<T, Report<ConfigError>>;
+/// Result carrying data-integrity-domain reports.
+pub(crate) type DataIntegrityResult<T> = result::Result<T, Report<DataIntegrityError>>;
+/// Result carrying lifecycle-domain reports.
+pub(crate) type LifecycleResult<T> = result::Result<T, Report<LifecycleError>>;
+/// Result carrying fatal-domain reports.
+pub(crate) type FatalResult<T> = result::Result<T, Report<FatalError>>;
+/// Result carrying completion transport reports.
+pub(crate) type CompletionResult<T> = result::Result<T, Report<CompletionErrorKind>>;
 
 /// Public storage error boundary classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
@@ -290,21 +300,25 @@ pub(crate) enum InternalError {
 pub(crate) struct IoError(IoErrorKind);
 
 impl IoError {
+    /// Returns the underlying IO error kind.
     #[inline]
     pub(crate) fn kind(self) -> IoErrorKind {
         self.0
     }
 
+    /// Builds an IO-domain report from a standard IO error.
     #[inline]
     pub(crate) fn report(err: io::Error) -> Report<Self> {
         Report::new(Self::from(err.kind())).attach(format!("{}", err))
     }
 
+    /// Builds an IO-domain report annotated with the storage operation.
     #[inline]
     pub(crate) fn report_with_op(op: StorageOp, err: io::Error) -> Report<Self> {
         Report::new(Self::from(err.kind())).attach(format!("op={op}, {err}"))
     }
 
+    /// Builds an unexpected-EOF report with byte counts.
     #[inline]
     pub(crate) fn report_unexpected_eof(
         actual_bytes: usize,
@@ -315,6 +329,7 @@ impl IoError {
         ))
     }
 
+    /// Builds a send-failure report with additional context.
     #[inline]
     pub(crate) fn report_send(message: impl Into<String>) -> Report<Self> {
         Report::new(Self::from(IoErrorKind::BrokenPipe)).attach(message.into())
@@ -352,6 +367,7 @@ pub(crate) enum CompletionErrorKind {
 }
 
 impl CompletionErrorKind {
+    /// Builds a completion report from a standard IO error.
     #[inline]
     pub(crate) fn report_io(err: io::Error, message: impl Into<String>) -> Report<Self> {
         let kind = err.kind();
@@ -361,6 +377,7 @@ impl CompletionErrorKind {
             .attach(message.into())
     }
 
+    /// Builds a completion report for a short read.
     #[inline]
     pub(crate) fn report_unexpected_eof(
         actual_bytes: usize,
@@ -375,6 +392,7 @@ impl CompletionErrorKind {
             .attach(message.into())
     }
 
+    /// Builds a completion report for a send failure.
     #[inline]
     pub(crate) fn report_send(message: impl Into<String>) -> Report<Self> {
         Report::new(IoError::from(IoErrorKind::BrokenPipe))
@@ -382,6 +400,7 @@ impl CompletionErrorKind {
             .attach(message.into())
     }
 
+    /// Builds a completion report for a fatal storage error.
     #[inline]
     pub(crate) fn report_fatal(reason: FatalError, message: impl Into<String>) -> Report<Self> {
         Report::new(reason)
@@ -389,6 +408,7 @@ impl CompletionErrorKind {
             .attach(message.into())
     }
 
+    /// Builds a completion report for an internal storage error.
     #[inline]
     pub(crate) fn report_internal(
         reason: InternalError,
@@ -399,6 +419,7 @@ impl CompletionErrorKind {
             .attach(message.into())
     }
 
+    /// Converts a storage error into a completion-domain report.
     #[inline]
     pub(crate) fn report_error(err: Error, message: impl Into<String>) -> Report<Self> {
         let kind = Self::from_error(&err);
@@ -573,36 +594,43 @@ impl Error {
         self.0
     }
 
+    /// Returns an attached report frame of type `T`, when present.
     #[inline]
     pub(crate) fn downcast_ref<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.0.downcast_ref::<T>()
     }
 
+    /// Returns the attached data-integrity reason, when present.
     #[inline]
     pub(crate) fn data_integrity_error(&self) -> Option<DataIntegrityError> {
         self.downcast_ref::<DataIntegrityError>().copied()
     }
 
+    /// Returns the attached lifecycle reason, when present.
     #[inline]
     pub(crate) fn lifecycle_error(&self) -> Option<LifecycleError> {
         self.downcast_ref::<LifecycleError>().copied()
     }
 
+    /// Returns the attached resource reason, when present.
     #[inline]
     pub(crate) fn resource_error(&self) -> Option<ResourceError> {
         self.downcast_ref::<ResourceError>().copied()
     }
 
+    /// Returns the attached operation reason, when present.
     #[inline]
     pub(crate) fn operation_error(&self) -> Option<OperationError> {
         self.downcast_ref::<OperationError>().copied()
     }
 
+    /// Returns the attached completion reason, when present.
     #[inline]
     pub(crate) fn completion_error(&self) -> Option<CompletionErrorKind> {
         self.downcast_ref::<CompletionErrorKind>().copied()
     }
 
+    /// Converts a completion-domain report into the public storage error.
     #[inline]
     pub(crate) fn from_completion_report(
         report: Report<CompletionErrorKind>,
@@ -612,11 +640,13 @@ impl Error {
         Error(report.change_context(kind).attach(message.into()))
     }
 
+    /// Builds a generic internal storage error.
     #[inline]
     pub(crate) fn internal() -> Self {
         Report::new(InternalError::Generic).into()
     }
 
+    /// Builds an error for a secondary-index binding mismatch.
     #[inline]
     pub(crate) fn wrong_secondary_index_binding(
         expected: &'static str,
@@ -627,6 +657,7 @@ impl Error {
             .into()
     }
 
+    /// Builds an error for double allocation of a buffer page.
     #[inline]
     pub(crate) fn buffer_page_already_allocated() -> Self {
         Report::new(InternalError::BufferPageAlreadyAllocated).into()
@@ -640,16 +671,19 @@ impl Error {
             .into()
     }
 
+    /// Builds an error for missing column storage.
     #[inline]
     pub(crate) fn column_storage_missing() -> Self {
         Report::new(InternalError::ColumnStorageMissing).into()
     }
 
+    /// Builds an error for duplicate engine component registration.
     #[inline]
     pub(crate) fn engine_component_already_registered() -> Self {
         Report::new(InternalError::EngineComponentAlreadyRegistered).into()
     }
 
+    /// Builds an error for a missing component dependency.
     #[inline]
     pub(crate) fn engine_component_missing_dependency() -> Self {
         Report::new(InternalError::EngineComponentMissingDependency).into()
@@ -726,16 +760,16 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<std::str::Utf8Error> for Error {
+impl From<Utf8Error> for Error {
     #[inline]
-    fn from(_src: std::str::Utf8Error) -> Error {
+    fn from(_src: Utf8Error) -> Error {
         Report::new(DataIntegrityError::InvalidPayload).into()
     }
 }
 
-impl From<std::num::ParseIntError> for Error {
+impl From<ParseIntError> for Error {
     #[inline]
-    fn from(_src: std::num::ParseIntError) -> Error {
+    fn from(_src: ParseIntError) -> Error {
         Report::new(DataIntegrityError::InvalidPayload).into()
     }
 }
@@ -752,18 +786,18 @@ impl From<glob::GlobError> for Error {
 impl fmt::Display for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        Display::fmt(&self.0, f)
     }
 }
 
 impl fmt::Debug for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+        Debug::fmt(&self.0, f)
     }
 }
 
-impl std::error::Error for Error {}
+impl StdError for Error {}
 
 /// Validation of optimistic lock
 pub enum Validation<T> {
@@ -772,6 +806,7 @@ pub enum Validation<T> {
 }
 
 impl<T> Validation<T> {
+    /// Converts validation into `ControlFlow`.
     #[inline]
     pub fn branch(self) -> ControlFlow<(), T> {
         match self {
@@ -780,6 +815,7 @@ impl<T> Validation<T> {
         }
     }
 
+    /// Maps the valid value while preserving invalid state.
     #[inline]
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Validation<U> {
         match self {
@@ -788,6 +824,7 @@ impl<T> Validation<T> {
         }
     }
 
+    /// Chains validation-producing functions.
     #[inline]
     pub fn and_then<U, F>(self, f: F) -> Validation<U>
     where
@@ -799,6 +836,7 @@ impl<T> Validation<T> {
         }
     }
 
+    /// Returns the valid value or panics with `msg`.
     #[inline]
     pub fn expect(self, msg: &str) -> T {
         match self {
@@ -807,6 +845,7 @@ impl<T> Validation<T> {
         }
     }
 
+    /// Returns the valid value or panics with a default message.
     #[inline]
     pub fn unwrap(self) -> T {
         match self {
@@ -815,11 +854,13 @@ impl<T> Validation<T> {
         }
     }
 
+    /// Returns true when this validation is valid.
     #[inline]
     pub fn is_valid(&self) -> bool {
         matches!(self, Validation::Valid(_))
     }
 
+    /// Returns true when this validation is invalid.
     #[inline]
     pub fn is_invalid(&self) -> bool {
         matches!(self, Validation::Invalid)
@@ -859,12 +900,13 @@ macro_rules! verify_continue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Error as StdIoError;
 
     #[test]
     fn test_io_report_with_op_attaches_formatted_context() {
         let report = IoError::report_with_op(
             StorageOp::FileOpen,
-            io::Error::new(IoErrorKind::PermissionDenied, "open denied"),
+            StdIoError::new(IoErrorKind::PermissionDenied, "open denied"),
         );
 
         assert_eq!(
@@ -878,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_io_report_converts_to_top_level_io() {
-        let err = Error::from(IoError::report(io::Error::new(
+        let err = Error::from(IoError::report(StdIoError::new(
             IoErrorKind::WouldBlock,
             "not ready",
         )));

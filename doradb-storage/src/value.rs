@@ -6,45 +6,59 @@ use crate::memcmp::{
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use ordered_float::OrderedFloat;
-use serde::de::Visitor;
+use serde::de::{Error as DeError, Visitor};
 use serde::{Deserialize, Serialize};
 use std::alloc::{Layout as AllocLayout, alloc, dealloc};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::ptr::copy_nonoverlapping;
 use std::result::Result as StdResult;
+use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::str::from_utf8_unchecked;
 use std::sync::atomic::*;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+/// Number of bytes used by a page varlen field.
 pub(crate) const PAGE_VAR_HEADER: usize = 8;
+/// Maximum inline payload bytes for page varlen values.
 pub(crate) const PAGE_VAR_LEN_INLINE: usize = 6;
+/// Prefix bytes stored for outlined page varlen values.
 pub(crate) const PAGE_VAR_LEN_PREFIX: usize = 4;
 const _: () = assert!(mem::size_of::<PageVar>() == 8);
 
+/// Number of bytes used by an in-memory varlen field.
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved MEM_VAR_HEADER"))]
 pub(crate) const MEM_VAR_HEADER: usize = 16;
+/// Maximum inline payload bytes for in-memory varlen values.
 pub(crate) const MEM_VAR_LEN_INLINE: usize = 14;
+/// Prefix bytes stored for outlined in-memory varlen values.
 pub(crate) const MEM_VAR_LEN_PREFIX: usize = 6;
 const _: () = assert!(mem::size_of::<MemVar>() == 16);
 
+/// Logical value type and nullability metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValType {
+    /// Non-null physical value kind.
     pub kind: ValKind,
+    /// Whether the value may be null.
     pub nullable: bool,
 }
 
 impl ValType {
+    /// Creates value type metadata.
     #[inline]
     pub fn new(kind: ValKind, nullable: bool) -> Self {
         ValType { kind, nullable }
     }
 
+    /// Returns the inline byte length for this value kind.
     #[inline]
     pub fn inline_len(self) -> usize {
         self.kind.inline_len()
     }
 
-    // todo: replace with MemCmpKey support.
+    /// Returns fixed-width memcmp encoding length, or `None` for varlen kinds.
     #[inline]
     pub fn memcmp_encoded_len(self) -> Option<usize> {
         if self.kind.is_fixed() {
@@ -54,7 +68,7 @@ impl ValType {
         None
     }
 
-    // todo: replace with MemCmpKey support.
+    /// Returns the minimum memcmp encoding length, including nullable flag bytes.
     #[inline]
     pub fn memcmp_encoded_len_maybe_var(self) -> usize {
         if self.kind.is_fixed() {
@@ -101,6 +115,7 @@ impl Deser for ValType {
         ))
     }
 }
+/// Physical value kind code used in row serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValKind {
@@ -118,6 +133,7 @@ pub enum ValKind {
 }
 
 impl ValKind {
+    /// Returns the inline byte length for this kind.
     #[inline]
     pub const fn inline_len(self) -> usize {
         match self {
@@ -131,6 +147,7 @@ impl ValKind {
         }
     }
 
+    /// Returns true when values of this kind have fixed inline length.
     #[inline]
     pub fn is_fixed(self) -> bool {
         !matches!(self, ValKind::VarByte)
@@ -241,11 +258,13 @@ impl Hash for Val {
 }
 
 impl Val {
+    /// Returns true when this value is null.
     #[inline]
     pub fn is_null(&self) -> bool {
         matches!(self, Val::Null)
     }
 
+    /// Returns this value as `u8`, when it has that kind.
     #[inline]
     pub fn as_u8(&self) -> Option<u8> {
         match self {
@@ -254,6 +273,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `i8`, when it has that kind.
     #[inline]
     pub fn as_i8(&self) -> Option<i8> {
         match self {
@@ -262,6 +282,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `u16`, when it has that kind.
     #[inline]
     pub fn as_u16(&self) -> Option<u16> {
         match self {
@@ -270,6 +291,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `i16`, when it has that kind.
     #[inline]
     pub fn as_i16(&self) -> Option<i16> {
         match self {
@@ -278,6 +300,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `i32`, when it has that kind.
     #[inline]
     pub fn as_i32(&self) -> Option<i32> {
         match self {
@@ -286,6 +309,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `u32`, when it has that kind.
     #[inline]
     pub fn as_u32(&self) -> Option<u32> {
         match self {
@@ -294,6 +318,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `i64`, when it has that kind.
     #[inline]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
@@ -302,6 +327,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `u64`, when it has that kind.
     #[inline]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
@@ -310,6 +336,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `f32`, when it has that kind.
     #[inline]
     pub fn as_f32(&self) -> Option<f32> {
         match self {
@@ -318,6 +345,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as `f64`, when it has that kind.
     #[inline]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
@@ -326,6 +354,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as bytes, when it is varlen bytes.
     #[inline]
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
@@ -334,6 +363,7 @@ impl Val {
         }
     }
 
+    /// Returns this value as UTF-8 text, when it is varlen bytes.
     #[inline]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -342,6 +372,7 @@ impl Val {
         }
     }
 
+    /// Encodes this value into memcmp format for `ty`.
     #[inline]
     pub fn encode_memcmp(&self, ty: ValType, buf: &mut Vec<u8>) {
         if ty.nullable {
@@ -351,6 +382,7 @@ impl Val {
         }
     }
 
+    /// Returns the non-null kind for this value.
     #[inline]
     pub fn kind(&self) -> Option<ValKind> {
         let kind = match self {
@@ -370,6 +402,7 @@ impl Val {
         Some(kind)
     }
 
+    /// Returns true when this value is null or has the requested kind.
     #[inline]
     pub fn matches_kind(&self, kind: ValKind) -> bool {
         // null matches all types.
@@ -722,7 +755,7 @@ macro_rules! impl_value_fixed_size {
                 // SAFETY: the trait contract guarantees `ptr` points to a
                 // writable slot laid out as `$t`.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(self.to_le_bytes().as_ptr(), ptr, $size);
+                    copy_nonoverlapping(self.to_le_bytes().as_ptr(), ptr, $size);
                 }
             }
         }
@@ -755,7 +788,7 @@ impl Value for f32 {
         // SAFETY: the trait contract guarantees `ptr` points to a writable
         // 4-byte slot for storing the raw bits of this `f32`.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.to_bits().to_le_bytes().as_ptr(), ptr, 4);
+            copy_nonoverlapping(self.to_bits().to_le_bytes().as_ptr(), ptr, 4);
         }
     }
 }
@@ -777,7 +810,7 @@ impl Value for f64 {
         // SAFETY: the trait contract guarantees `ptr` points to a writable
         // 8-byte slot for storing the raw bits of this `f64`.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.to_bits().to_le_bytes().as_ptr(), ptr, 8);
+            copy_nonoverlapping(self.to_bits().to_le_bytes().as_ptr(), ptr, 8);
         }
     }
 }
@@ -824,6 +857,7 @@ impl ValBuffer {
         }
     }
 
+    /// Clears all buffered values while retaining allocation capacity.
     #[inline]
     pub(crate) fn clear(&mut self) {
         match self {
@@ -933,7 +967,7 @@ impl PageVar {
             } else {
                 let offset = u16::from_le_bytes([self.b[2], self.b[3]]) as usize;
                 let data = ptr.add(offset);
-                std::slice::from_raw_parts(data, len)
+                from_raw_parts(data, len)
             }
         }
     }
@@ -973,7 +1007,7 @@ impl PageVar {
                 debug_assert!(self.len() > PAGE_VAR_LEN_INLINE);
                 self.b[..2].copy_from_slice(&(val.len() as u16).to_le_bytes());
                 let offset = u16::from_le_bytes([self.b[2], self.b[3]]) as usize;
-                let target = std::slice::from_raw_parts_mut(ptr.add(offset), val.len());
+                let target = from_raw_parts_mut(ptr.add(offset), val.len());
                 target.copy_from_slice(val);
             } else {
                 // input is inlined.
@@ -985,19 +1019,22 @@ impl PageVar {
         }
     }
 
-    #[inline]
+    /// Creates a page varlen field from its raw little-endian representation.
     #[expect(dead_code, reason = "reserved from_u64")]
+    #[inline]
     pub(crate) fn from_u64(raw: u64) -> Self {
         PageVar {
             b: raw.to_le_bytes(),
         }
     }
 
+    /// Returns the raw little-endian representation.
     #[inline]
     pub(crate) fn into_u64(self) -> u64 {
         u64::from_le_bytes(self.b)
     }
 
+    /// Creates a page varlen field from stored bytes.
     #[inline]
     pub(crate) fn from_le_bytes(b: [u8; PAGE_VAR_HEADER]) -> Self {
         PageVar { b }
@@ -1046,6 +1083,7 @@ impl MemVar {
         }
     }
 
+    /// Creates an outlined `MemVar` from an owned boxed slice.
     #[inline]
     pub fn outline_boxed_slice(data: Box<[u8]>) -> Self {
         debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff);
@@ -1099,7 +1137,7 @@ impl MemVar {
         } else {
             // SAFETY: when `len` exceeds the inline threshold, the outlined
             // representation owns `ptr..ptr+len`.
-            unsafe { std::slice::from_raw_parts(self.o.ptr, len) }
+            unsafe { from_raw_parts(self.o.ptr, len) }
         }
     }
 
@@ -1110,14 +1148,14 @@ impl MemVar {
         if len <= MEM_VAR_LEN_INLINE {
             // SAFETY: callers only use `as_str` for values known to have been
             // constructed from valid UTF-8 bytes.
-            unsafe { std::str::from_utf8_unchecked(&self.i.data[..len]) }
+            unsafe { from_utf8_unchecked(&self.i.data[..len]) }
         } else {
             // SAFETY: callers only use `as_str` for values known to have been
             // constructed from valid UTF-8 bytes, and the outlined payload is
             // live for `self`'s lifetime.
             unsafe {
-                let bytes = std::slice::from_raw_parts(self.o.ptr, len);
-                std::str::from_utf8_unchecked(bytes)
+                let bytes = from_raw_parts(self.o.ptr, len);
+                from_utf8_unchecked(bytes)
             }
         }
     }
@@ -1238,7 +1276,7 @@ impl Visitor<'_> for MemVarVisitor {
 
     fn visit_bytes<E>(self, v: &[u8]) -> StdResult<Self::Value, E>
     where
-        E: serde::de::Error,
+        E: DeError,
     {
         if v.len() >= 0xffff {
             return fail_long_bytes();
@@ -1248,7 +1286,7 @@ impl Visitor<'_> for MemVarVisitor {
 
     fn visit_byte_buf<E>(self, v: Vec<u8>) -> StdResult<Self::Value, E>
     where
-        E: serde::de::Error,
+        E: DeError,
     {
         if v.len() >= 0xffff {
             return fail_long_bytes();
@@ -1258,7 +1296,7 @@ impl Visitor<'_> for MemVarVisitor {
 
     fn visit_str<E>(self, v: &str) -> StdResult<Self::Value, E>
     where
-        E: serde::de::Error,
+        E: DeError,
     {
         if v.len() >= 0xffff {
             return fail_long_bytes();
@@ -1268,20 +1306,13 @@ impl Visitor<'_> for MemVarVisitor {
 
     fn visit_string<E>(self, v: String) -> StdResult<Self::Value, E>
     where
-        E: serde::de::Error,
+        E: DeError,
     {
         if v.len() >= 0xffff {
             return fail_long_bytes();
         }
         Ok(MemVar::from(v.as_bytes()))
     }
-}
-
-#[inline]
-fn fail_long_bytes<T, E: serde::de::Error>() -> StdResult<T, E> {
-    Err(serde::de::Error::custom(
-        "MemVar does not support bytes longer than u16:MAX",
-    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1307,7 +1338,7 @@ impl Clone for MemVarOutline {
         unsafe {
             let layout = AllocLayout::from_size_align_unchecked(self.len as usize, 1);
             let ptr = alloc(layout);
-            std::ptr::copy_nonoverlapping(self.ptr, ptr, self.len as usize);
+            copy_nonoverlapping(self.ptr, ptr, self.len as usize);
             MemVarOutline {
                 len: self.len,
                 prefix: self.prefix,
@@ -1315,6 +1346,13 @@ impl Clone for MemVarOutline {
             }
         }
     }
+}
+
+#[inline]
+fn fail_long_bytes<T, E: DeError>() -> StdResult<T, E> {
+    Err(DeError::custom(
+        "MemVar does not support bytes longer than u16:MAX",
+    ))
 }
 
 #[cfg(test)]

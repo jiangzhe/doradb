@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use parking_lot::Mutex;
+use std::iter::once;
 use std::mem;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,8 +75,9 @@ pub(crate) trait Bitmap {
         }
     }
 
-    #[inline]
+    /// Counts bits matching `flag` within the first `len` bits.
     #[expect(dead_code, reason = "reserved bitmap_count")]
+    #[inline]
     fn bitmap_count(&self, len: usize, flag: bool) -> usize {
         self.bitmap_range_iter(len)
             .map(|(f, n)| if f == flag { n } else { 0 })
@@ -156,6 +158,7 @@ impl Bitmap for [u64] {
     }
 }
 
+/// Extends one bitmap with bits copied from another bitmap.
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved ExtendBitmap"))]
 pub(crate) trait ExtendBitmap {
     /// Extend existing bitmap with new bitmap.
@@ -187,7 +190,7 @@ impl ExtendBitmap for Vec<u64> {
         // with head of new bitmap and simplify the concat logic.
         let head = target[0] << shift_r;
         let source = &bm.bitmap_units()[..len.div_ceil(64)];
-        let pairs = source.iter().zip(std::iter::once(&head).chain(source));
+        let pairs = source.iter().zip(once(&head).chain(source));
         for (tgt, (l, r)) in target.iter_mut().zip(pairs) {
             *tgt = (l << shift_l) | (r >> shift_r);
         }
@@ -197,19 +200,7 @@ impl ExtendBitmap for Vec<u64> {
     }
 }
 
-/// Create a new bitmap with all zeros.
-#[inline]
-pub(crate) fn new_bitmap(nbr_of_bits: usize) -> Box<[u64]> {
-    let units = bitmap_required_units(nbr_of_bits);
-    vec![0u64; units].into_boxed_slice()
-}
-
-/// Returns required units of bitmap for given number of values.
-#[inline]
-pub(crate) const fn bitmap_required_units(count: usize) -> usize {
-    count.div_ceil(64)
-}
-
+/// Iterator over consecutive equal-bit ranges in a bitmap.
 #[derive(Debug, Clone)]
 pub(crate) struct BitmapRangeIter<'a> {
     u64s: &'a [u64],      // slice of u64
@@ -378,6 +369,7 @@ impl Iterator for BitmapRangeIter<'_> {
     }
 }
 
+/// Iterator adapter returning only bitmap ranges with a chosen flag.
 #[derive(Debug, Clone)]
 pub(crate) struct BitmapRangeFilter<'a> {
     range_iter: BitmapRangeIter<'a>,
@@ -407,6 +399,7 @@ impl Iterator for BitmapRangeFilter<'_> {
     }
 }
 
+/// Iterator over indexes of true bits in a bitmap.
 pub(crate) struct BitmapTrueIndexIter<'a> {
     range_iter: BitmapRangeIter<'a>,
     start: usize,
@@ -439,6 +432,7 @@ impl Iterator for BitmapTrueIndexIter<'_> {
     }
 }
 
+/// Mutable bitmap state plus the first word that may contain a free bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FreeBitmap {
     free_unit_idx: usize,
@@ -639,6 +633,19 @@ impl PartialEq for AllocMap {
 }
 
 impl Eq for AllocMap {}
+
+/// Create a new bitmap with all zeros.
+#[inline]
+pub(crate) fn new_bitmap(nbr_of_bits: usize) -> Box<[u64]> {
+    let units = bitmap_required_units(nbr_of_bits);
+    vec![0u64; units].into_boxed_slice()
+}
+
+/// Returns required units of bitmap for given number of values.
+#[inline]
+pub(crate) const fn bitmap_required_units(count: usize) -> usize {
+    count.div_ceil(64)
+}
 
 #[cfg(test)]
 mod tests {

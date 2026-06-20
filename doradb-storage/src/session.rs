@@ -1,8 +1,11 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards, PoolRole};
-use crate::catalog::{IndexNo, IndexSpec, TableSpec};
+use crate::catalog::{
+    IndexNo, IndexSpec, TableSpec, create_index_for_session, create_table_for_session,
+    drop_index_for_session, drop_table_for_session,
+};
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
-use crate::error::{LifecycleError, OperationError, Result};
+use crate::error::{Error, LifecycleError, OperationError, Result};
 use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::map::{FastDashMap, FastHashMap};
@@ -20,13 +23,18 @@ use std::sync::{Arc, Weak};
 
 /// Shared session-level DDL admission context.
 pub(crate) struct SessionDdlContext {
+    /// Engine handle used for catalog and table access.
     pub(crate) engine: EngineRef,
+    /// Pool guards retained for DDL work.
     pub(crate) pool_guards: PoolGuards,
+    /// Session-level lock owner.
     pub(crate) owner: LockOwner,
+    /// Session-level lock owner group.
     pub(crate) owner_group: LockOwnerGroup,
 }
 
 impl SessionDdlContext {
+    /// Creates DDL admission context from a pinned idle session.
     #[inline]
     pub(crate) fn new(session: &SessionPin) -> Result<Self> {
         if session.in_trx("session DDL")? {
@@ -58,6 +66,7 @@ pub struct Session {
 }
 
 impl Session {
+    /// Creates a weak public session handle.
     #[inline]
     pub(crate) fn new(engine: WeakEngineRef, id: SessionID) -> Self {
         Session {
@@ -127,7 +136,7 @@ impl Session {
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
         let session = self.pin("session DDL")?;
-        crate::catalog::create_table_for_session(session, table_spec, index_specs).await
+        create_table_for_session(session, table_spec, index_specs).await
     }
 
     /// Build and publish a new secondary index for an existing user table.
@@ -138,21 +147,21 @@ impl Session {
         index_spec: IndexSpec,
     ) -> Result<IndexNo> {
         let session = self.pin("session DDL")?;
-        crate::catalog::create_index_for_session(session, table_id, index_spec).await
+        create_index_for_session(session, table_id, index_spec).await
     }
 
     /// Logically drop an active secondary index from an existing user table.
     #[inline]
     pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
         let session = self.pin("session DDL")?;
-        crate::catalog::drop_index_for_session(session, table_id, index_no).await
+        drop_index_for_session(session, table_id, index_no).await
     }
 
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
         let session = self.pin("session DDL")?;
-        crate::catalog::drop_table_for_session(session, table_id).await
+        drop_table_for_session(session, table_id).await
     }
 
     /// Freeze row pages for an existing user table and return approximate non-deleted rows visited.
@@ -226,13 +235,6 @@ impl Session {
     }
 }
 
-#[inline]
-fn table_not_found_error(table_id: TableID, operation: &'static str) -> crate::error::Error {
-    Report::new(OperationError::TableNotFound)
-        .attach(format!("operation={operation}, table_id={table_id}"))
-        .into()
-}
-
 impl Drop for Session {
     #[inline]
     fn drop(&mut self) {
@@ -247,7 +249,9 @@ impl Drop for Session {
 
 /// One operation-scoped strong pin of a registry-owned session.
 pub(crate) struct SessionPin {
+    /// Engine handle retained for the duration of this operation.
     pub(crate) engine: EngineRef,
+    /// Strong reference to registry-owned session state.
     pub(crate) state: Arc<SessionState>,
 }
 
@@ -278,6 +282,7 @@ impl SessionPin {
         self.state.in_trx(operation)
     }
 
+    /// Resolve a live user table, checking cached entries first.
     #[inline]
     pub(crate) async fn resolve_user_table(
         &self,
@@ -297,6 +302,7 @@ impl SessionPin {
         Ok(table)
     }
 
+    /// Resolve an existing user table without requiring it to be foreground-live.
     #[inline]
     pub(crate) async fn resolve_existing_user_table(
         &self,
@@ -316,6 +322,7 @@ impl SessionPin {
         Ok(table)
     }
 
+    /// Finds an existing user table from cache or currently loaded catalog state.
     #[inline]
     pub(crate) fn find_existing_user_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
         if let Some(table) = self.state.cached_user_table(table_id) {
@@ -574,6 +581,7 @@ impl SessionRegistry {
         drop(removed);
     }
 
+    /// Notifies waiters about a transaction lifecycle change.
     #[inline]
     pub(crate) fn notify_trx_changed(&self) {
         self.trx_changes.notify();
@@ -647,11 +655,7 @@ impl SessionState {
     }
 
     #[inline]
-    fn active_transaction_err(
-        &self,
-        operation: &'static str,
-        entry: &TrxEntry,
-    ) -> crate::error::Error {
+    fn active_transaction_err(&self, operation: &'static str, entry: &TrxEntry) -> Error {
         Report::new(OperationError::ExistingTransaction)
             .attach(format!(
                 "{operation}: session_id={}, trx_id={}, state={:?}",
@@ -1034,7 +1038,14 @@ impl TrxAttachment {
 }
 
 #[inline]
-fn closed_session_error(id: SessionID, operation: &'static str) -> crate::error::Error {
+fn table_not_found_error(table_id: TableID, operation: &'static str) -> Error {
+    Report::new(OperationError::TableNotFound)
+        .attach(format!("operation={operation}, table_id={table_id}"))
+        .into()
+}
+
+#[inline]
+fn closed_session_error(id: SessionID, operation: &'static str) -> Error {
     Report::new(OperationError::NotSupported)
         .attach(format!(
             "{operation}: session is closed or abandoned: session_id={id}"
@@ -1043,7 +1054,7 @@ fn closed_session_error(id: SessionID, operation: &'static str) -> crate::error:
 }
 
 #[inline]
-fn stale_session_error(id: SessionID, operation: &'static str) -> crate::error::Error {
+fn stale_session_error(id: SessionID, operation: &'static str) -> Error {
     Report::new(LifecycleError::Shutdown)
         .attach(format!("{operation}: session is missing: session_id={id}"))
         .into()
@@ -1055,6 +1066,7 @@ pub(crate) mod tests {
     use crate::conf::EngineConfig;
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1225,7 +1237,7 @@ pub(crate) mod tests {
 
         let waiter = {
             let registry = Arc::clone(&registry);
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 ready_tx.send(()).expect("waiter should report ready");
                 registry.wait_for_trx_change_since(observed_epoch);
                 done_tx.send(()).expect("waiter should report completion");

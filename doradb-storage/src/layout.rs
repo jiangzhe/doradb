@@ -1,14 +1,8 @@
 use crate::error::{DataIntegrityError, Error, Result};
 use error_stack::Report;
+use std::any::type_name;
 use std::mem;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-#[inline]
-fn invalid_layout(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
-}
 
 /// Returns the byte representation of a zerocopy value.
 #[inline]
@@ -28,7 +22,7 @@ where
     T::ref_from_bytes(bytes).map_err(|_| {
         invalid_layout(format!(
             "invalid byte layout for {}: len={}",
-            std::any::type_name::<T>(),
+            type_name::<T>(),
             bytes.len()
         ))
     })
@@ -44,7 +38,7 @@ where
     T::mut_from_bytes(bytes).map_err(|_| {
         invalid_layout(format!(
             "invalid mutable byte layout for {}: len={len}",
-            std::any::type_name::<T>()
+            type_name::<T>()
         ))
     })
 }
@@ -60,14 +54,14 @@ where
         return Err(invalid_layout(format!(
             "invalid byte length {} for slice of {}",
             bytes.len(),
-            std::any::type_name::<T>()
+            type_name::<T>()
         )));
     }
     let count = bytes.len() / elem_len;
     <[T]>::ref_from_bytes_with_elems(bytes, count).map_err(|_| {
         invalid_layout(format!(
             "invalid byte layout for slice of {}: len={}",
-            std::any::type_name::<T>(),
+            type_name::<T>(),
             bytes.len()
         ))
     })
@@ -84,7 +78,7 @@ where
         return Err(invalid_layout(format!(
             "invalid mutable byte length {} for slice of {}",
             bytes.len(),
-            std::any::type_name::<T>()
+            type_name::<T>()
         )));
     }
     let len = bytes.len();
@@ -92,7 +86,7 @@ where
     <[T]>::mut_from_bytes_with_elems(bytes, count).map_err(|_| {
         invalid_layout(format!(
             "invalid mutable byte layout for slice of {}: len={}",
-            std::any::type_name::<T>(),
+            type_name::<T>(),
             len
         ))
     })
@@ -124,6 +118,13 @@ where
 {
     try_slice_from_bytes_mut(bytes)
         .expect("trusted bytes must match the requested mutable zerocopy slice")
+}
+
+#[inline]
+fn invalid_layout(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
 }
 
 #[cfg(test)]
