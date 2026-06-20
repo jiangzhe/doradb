@@ -2,6 +2,7 @@ use crate::error::{ConfigError, ConfigResult, Error, Result};
 use byte_unit::Byte;
 use error_stack::{Report, ResultExt, ensure};
 use serde::{Deserialize, Serialize};
+use std::env::current_dir;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
@@ -36,6 +37,7 @@ struct StoragePathResolveInput<'a> {
     index_swap_file: &'a Path,
 }
 
+/// Absolute engine paths resolved from storage-root-relative configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedStoragePaths {
     storage_root: PathBuf,
@@ -134,22 +136,27 @@ impl ResolvedStoragePaths {
         Ok(res)
     }
 
+    /// Return the resolved table-data directory.
     pub(crate) fn data_dir_path(&self) -> &Path {
         &self.data_dir
     }
 
+    /// Return the resolved redo-log directory.
     pub(crate) fn log_dir_path(&self) -> &Path {
         &self.log_dir
     }
 
+    /// Return the resolved data-buffer swap-file path.
     pub(crate) fn data_swap_file_path(&self) -> &Path {
         &self.data_swap_file
     }
 
+    /// Return the resolved index-buffer swap-file path.
     pub(crate) fn index_swap_file_path(&self) -> &Path {
         &self.index_swap_file
     }
 
+    /// Ensure configured storage directories and swap-file parent directories exist.
     pub(crate) fn ensure_directories(&self) -> Result<()> {
         fs::create_dir_all(&self.storage_root)?;
         fs::create_dir_all(&self.data_dir)?;
@@ -163,6 +170,7 @@ impl ResolvedStoragePaths {
         Ok(())
     }
 
+    /// Validate the durable storage-layout marker when it already exists.
     pub(crate) fn validate_marker_if_present(&self) -> Result<()> {
         let marker_path = self.marker_path();
         if !marker_path.exists() {
@@ -171,6 +179,7 @@ impl ResolvedStoragePaths {
         self.validate_marker(&marker_path)
     }
 
+    /// Persist the durable storage-layout marker, or validate it if another opener created it.
     pub(crate) fn persist_marker_if_missing(&self) -> Result<()> {
         let marker_path = self.marker_path();
         let marker = toml::to_string(&self.durable_layout).map_err(|_| Error::internal())?;
@@ -348,20 +357,24 @@ impl ResolvedStoragePaths {
     }
 }
 
-fn aliases_reserved_path(path: &Path, reserved: &Path) -> bool {
-    path == reserved || path.starts_with(reserved) || reserved.starts_with(path)
-}
-
 /// Storage-engine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    /// Root directory for all storage-engine files.
     pub(crate) storage_root: PathBuf,
+    /// Transaction-system configuration.
     pub(crate) trx: TrxSysConfig,
+    /// Metadata buffer-pool size.
     pub(crate) meta_buffer: Byte,
+    /// Index buffer-pool memory size.
     pub(crate) index_buffer: Byte,
+    /// Index-buffer swap-file path relative to `storage_root`.
     pub(crate) index_swap_file: PathBuf,
+    /// Maximum size allowed for the index-buffer swap file.
     pub(crate) index_max_file_size: Byte,
+    /// Data buffer-pool configuration.
     pub(crate) data_buffer: EvictableBufferPoolConfig,
+    /// Table and catalog file-system configuration.
     pub(crate) file: FileSystemConfig,
 }
 
@@ -382,54 +395,63 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// Set the root directory for storage-engine files.
     #[inline]
     pub fn storage_root(mut self, storage_root: impl Into<PathBuf>) -> Self {
         self.storage_root = storage_root.into();
         self
     }
 
+    /// Set the transaction-system configuration.
     #[inline]
     pub fn trx(mut self, trx: TrxSysConfig) -> Self {
         self.trx = trx;
         self
     }
 
+    /// Set the metadata buffer-pool size.
     #[inline]
     pub fn meta_buffer(mut self, meta_buffer: impl Into<Byte>) -> Self {
         self.meta_buffer = meta_buffer.into();
         self
     }
 
+    /// Set the index buffer-pool memory size.
     #[inline]
     pub fn index_buffer(mut self, index_buffer: impl Into<Byte>) -> Self {
         self.index_buffer = index_buffer.into();
         self
     }
 
+    /// Set the index-buffer swap-file path relative to `storage_root`.
     #[inline]
     pub fn index_swap_file(mut self, index_swap_file: impl Into<PathBuf>) -> Self {
         self.index_swap_file = index_swap_file.into();
         self
     }
 
+    /// Set the maximum size allowed for the index-buffer swap file.
     #[inline]
     pub fn index_max_file_size(mut self, index_max_file_size: impl Into<Byte>) -> Self {
         self.index_max_file_size = index_max_file_size.into();
         self
     }
 
+    /// Set the data buffer-pool configuration.
     #[inline]
     pub fn data_buffer(mut self, data_buffer: EvictableBufferPoolConfig) -> Self {
         self.data_buffer = data_buffer;
         self
     }
 
+    /// Set the table and catalog file-system configuration.
     #[inline]
     pub fn file(mut self, file: FileSystemConfig) -> Self {
         self.file = file;
         self
     }
 
+    /// Resolve and validate storage paths for engine startup.
     #[inline]
     pub(crate) fn resolve_storage_paths(&self) -> ConfigResult<ResolvedStoragePaths> {
         ResolvedStoragePaths::resolve(StoragePathResolveInput {
@@ -442,6 +464,10 @@ impl EngineConfig {
             index_swap_file: &self.index_swap_file,
         })
     }
+}
+
+fn aliases_reserved_path(path: &Path, reserved: &Path) -> bool {
+    path == reserved || path.starts_with(reserved) || reserved.starts_with(path)
 }
 
 fn parse_durable_layout(raw: &str) -> ConfigResult<DurableStorageLayout> {
@@ -475,7 +501,7 @@ fn resolve_storage_root(storage_root: &Path) -> ConfigResult<PathBuf> {
     if storage_root.is_absolute() {
         return Ok(storage_root.to_path_buf());
     }
-    std::env::current_dir()
+    current_dir()
         .map(|cwd| cwd.join(storage_root))
         .map_err(|err| {
             Report::new(ConfigError::PathMustBeRelativeToStorageRoot).attach(format!(
@@ -553,6 +579,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use error_stack::Report;
+    use std::fs::write;
     use tempfile::TempDir;
 
     fn assert_config_report(err: Report<ConfigError>, expected: ConfigError, snippets: &[&str]) {
@@ -634,7 +661,7 @@ mod tests {
         paths.ensure_directories().unwrap();
         // Keep the removed v1 field in this fixture to prove old partitioned
         // storage-layout markers are rejected by the version bump.
-        std::fs::write(
+        write(
             paths.marker_path(),
             r#"version = 1
 data_dir = "."
