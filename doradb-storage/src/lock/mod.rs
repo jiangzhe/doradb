@@ -165,6 +165,62 @@ impl Drop for FreshLockGuard<'_> {
     }
 }
 
+/// Scoped catalog namespace lock guard.
+pub(crate) struct ScopedCatalogNamespaceLock<'a> {
+    lock_manager: &'a LockManager,
+    resource: LockResource,
+    owner: LockOwner,
+}
+
+impl Drop for ScopedCatalogNamespaceLock<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock_manager.release(self.resource, self.owner);
+    }
+}
+
+/// Scoped table DDL lock guard for metadata and data resources.
+pub(crate) struct ScopedTableDdlLocks<'a> {
+    lock_manager: &'a LockManager,
+    table_id: TableID,
+    owner: LockOwner,
+    metadata_fresh: bool,
+    data_fresh: bool,
+    fail_waiters: Option<OperationError>,
+}
+
+impl ScopedTableDdlLocks<'_> {
+    /// Fail waiters with the provided error when releasing fresh locks.
+    #[inline]
+    pub(crate) fn fail_waiters_on_release(&mut self, error: OperationError) {
+        self.fail_waiters = Some(error);
+    }
+}
+
+impl Drop for ScopedTableDdlLocks<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.data_fresh {
+            let resource = LockResource::TableData(self.table_id);
+            if let Some(error) = self.fail_waiters {
+                self.lock_manager
+                    .release_and_fail_waiters(resource, self.owner, error);
+            } else {
+                self.lock_manager.release(resource, self.owner);
+            }
+        }
+        if self.metadata_fresh {
+            let resource = LockResource::TableMetadata(self.table_id);
+            if let Some(error) = self.fail_waiters {
+                self.lock_manager
+                    .release_and_fail_waiters(resource, self.owner, error);
+            } else {
+                self.lock_manager.release(resource, self.owner);
+            }
+        }
+    }
+}
+
 /// Standalone logical lock manager.
 pub(crate) struct LockManager {
     resources: Arc<FastDashMap<LockResource, ResourceState>>,
@@ -234,6 +290,23 @@ impl LockManager {
             .await
     }
 
+    /// Acquires the catalog namespace lock for grouped catalog DDL.
+    #[inline]
+    pub(crate) async fn acquire_catalog_namespace_lock<'a>(
+        &'a self,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> Result<ScopedCatalogNamespaceLock<'a>> {
+        let resource = LockResource::CatalogNamespace;
+        self.acquire_grouped(resource, LockMode::Exclusive, owner, owner_group)
+            .await?;
+        Ok(ScopedCatalogNamespaceLock {
+            lock_manager: self,
+            resource,
+            owner,
+        })
+    }
+
     /// Acquires the ordered metadata/data locks for a grouped table operation.
     #[inline]
     pub(crate) async fn acquire_grouped_table_locks<'a>(
@@ -256,6 +329,71 @@ impl LockManager {
         let data_guard = FreshLockGuard::new(self, data_resource, owner, data_grant);
 
         Ok((metadata_guard, data_guard))
+    }
+
+    /// Acquires scoped exclusive table DDL locks.
+    #[inline]
+    pub(crate) async fn acquire_table_ddl_locks<'a>(
+        &'a self,
+        table_id: TableID,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> Result<ScopedTableDdlLocks<'a>> {
+        let metadata_resource = LockResource::TableMetadata(table_id);
+        let metadata_grant = self
+            .acquire_grouped_with_grant(metadata_resource, LockMode::Exclusive, owner, owner_group)
+            .await?;
+        let mut metadata_guard =
+            FreshLockGuard::new(self, metadata_resource, owner, metadata_grant);
+
+        let data_resource = LockResource::TableData(table_id);
+        let data_grant = self
+            .acquire_grouped_with_grant(data_resource, LockMode::Exclusive, owner, owner_group)
+            .await?;
+        if let Some(guard) = metadata_guard.as_mut() {
+            guard.disarm();
+        }
+
+        Ok(ScopedTableDdlLocks {
+            lock_manager: self,
+            table_id,
+            owner,
+            metadata_fresh: metadata_grant == LockGrant::Fresh,
+            data_fresh: data_grant == LockGrant::Fresh,
+            fail_waiters: None,
+        })
+    }
+
+    /// Rejects table DDL when the session already holds explicit table locks.
+    #[inline]
+    pub(crate) fn reject_table_ddl_explicit_session_lock(
+        &self,
+        table_id: TableID,
+        owner: LockOwner,
+        operation: &'static str,
+    ) -> Result<()> {
+        // Table DDL uses the session owner for scoped DDL locks. If an explicit
+        // session table lock already exists, reusing that owner would become a
+        // same-owner conversion and scoped cleanup could not distinguish the
+        // DDL lock from the user-held session lock.
+        let metadata_locked = self.owner_holds(
+            LockResource::TableMetadata(table_id),
+            owner,
+            LockMode::Shared,
+        );
+        let data_locked = self.owner_holds(
+            LockResource::TableData(table_id),
+            owner,
+            LockMode::IntentShared,
+        );
+        if !metadata_locked && !data_locked {
+            return Ok(());
+        }
+        Err(Report::new(OperationError::LockOwnerGroupConflict)
+            .attach(format!(
+                "{operation} while session owns explicit table lock: table_id={table_id}, owner={owner:?}"
+            ))
+            .into())
     }
 
     #[inline]

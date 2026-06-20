@@ -8,6 +8,7 @@ pub type IndexNo = u16;
 /// User-facing table definition used by DDL/create-table paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSpec {
+    /// Ordered user column definitions for the table.
     pub columns: Vec<ColumnSpec>,
 }
 
@@ -22,8 +23,11 @@ impl TableSpec {
 /// Logical column definition in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSpec {
+    /// User-visible column name.
     pub column_name: SemiStr,
+    /// Logical value kind stored by the column.
     pub column_type: ValKind,
+    /// Column-level schema attributes.
     pub column_attributes: ColumnAttributes,
 }
 
@@ -46,7 +50,9 @@ impl ColumnSpec {
 /// Logical index definition in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSpec {
+    /// Ordered index key columns.
     pub cols: Vec<IndexKey>,
+    /// Index-level schema attributes.
     pub attributes: IndexAttributes,
 }
 
@@ -69,7 +75,9 @@ impl IndexSpec {
 /// index number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveIndexSpec {
+    /// Stable table-local index number.
     pub(crate) index_no: IndexNo,
+    /// Logical index definition stored in this slot.
     pub(crate) spec: IndexSpec,
 }
 
@@ -104,8 +112,9 @@ bitflags! {
 /// One indexed column descriptor inside an index definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexKey {
-    // This is user_col_idx. RowID is not included.
+    /// User-column number included in this key position.
     pub col_no: u16,
+    /// Sort direction for this key column.
     pub order: IndexOrder,
 }
 

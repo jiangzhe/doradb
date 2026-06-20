@@ -30,6 +30,7 @@ use crate::row::ops::SelectKey;
 use crate::table::{MemTable, Table, TableRuntimeLayout};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::undo::IndexUndo;
+use dashmap::mapref::entry::Entry::{Occupied, Vacant};
 use error_stack::Report;
 use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
@@ -37,22 +38,12 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// First table id reserved for user-managed objects.
 pub(crate) const USER_OBJ_ID_START: TableID = TableID::new(0x0001_0000_0000_0000);
-
-/// Return whether an object id belongs to user-managed catalog space.
-#[inline]
-pub(crate) const fn is_user_obj_id(obj_id: TableID) -> bool {
-    obj_id.as_u64() >= USER_OBJ_ID_START.as_u64()
-}
-
-/// Return whether an object id belongs to built-in catalog table space.
-#[inline]
-pub(crate) const fn is_catalog_obj_id(obj_id: TableID) -> bool {
-    !is_user_obj_id(obj_id)
-}
 
 /// Dedicated runtime wrapper for catalog logical tables.
 pub(crate) struct CatalogTable {
+    /// In-memory row store for this catalog table.
     pub(crate) mem: MemTable<FixedBufferPool, FixedBufferPool>,
 }
 
@@ -95,6 +86,7 @@ impl Deref for CatalogTable {
 pub(crate) struct Catalog {
     next_table_id: AtomicU64,
     user_tables: FastDashMap<TableID, Arc<Table>>,
+    /// Persistent storage for built-in catalog tables.
     pub(crate) storage: CatalogStorage,
     checkpoint_gate: CatalogCheckpointGate,
 }
@@ -425,15 +417,13 @@ impl Catalog {
     pub(crate) fn insert_user_table(&self, table: Arc<Table>) -> Result<()> {
         let table_id = table.table_id();
         match self.user_tables.entry(table_id) {
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
+            Vacant(entry) => {
                 entry.insert(table);
                 Ok(())
             }
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                Err(Report::new(OperationError::TableAlreadyExists)
-                    .attach(format!("insert user table runtime: table_id={table_id}"))
-                    .into())
-            }
+            Occupied(_) => Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!("insert user table runtime: table_id={table_id}"))
+                .into()),
         }
     }
 
@@ -442,45 +432,6 @@ impl Catalog {
     pub(crate) fn remove_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         self.user_tables.remove(&table_id).map(|(_, table)| table)
     }
-}
-
-#[inline]
-fn index_ddl_metadata_reconcilable(
-    table_id: TableID,
-    catalog: &TableMetadata,
-    file: &TableMetadata,
-) -> Result<bool> {
-    // The active table root may be ahead of checkpointed catalog rows: recovery
-    // can replay later index-DDL catalog rows to make catalog metadata catch up.
-    // The opposite direction is unrecoverable here because replay cannot make a
-    // table root that has already been opened acquire missing allocation state.
-    if file.idx.next_index_no() < catalog.idx.next_index_no() {
-        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-            .attach(format!(
-                "index-DDL reconciliation found catalog allocation ahead of table root: table_id={table_id}, catalog_next_index_no={}, file_next_index_no={}",
-                catalog.idx.next_index_no(),
-                file.idx.next_index_no()
-            ))
-            .into());
-    }
-    if catalog.col != file.col {
-        return Ok(false);
-    }
-
-    let max_slots = catalog
-        .idx
-        .index_slot_count()
-        .max(file.idx.index_slot_count());
-    for index_no in 0..max_slots {
-        let catalog_spec = catalog.idx.index_spec(index_no);
-        let file_spec = file.idx.index_spec(index_no);
-        if let (Some(catalog_spec), Some(file_spec)) = (catalog_spec, file_spec)
-            && catalog_spec != file_spec
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// User-table cache entry used by rollback and purge paths.
@@ -682,6 +633,57 @@ impl<'a> TableCache<'a> {
     }
 }
 
+/// Return whether an object id belongs to user-managed catalog space.
+#[inline]
+pub(crate) const fn is_user_obj_id(obj_id: TableID) -> bool {
+    obj_id.as_u64() >= USER_OBJ_ID_START.as_u64()
+}
+
+/// Return whether an object id belongs to built-in catalog table space.
+#[inline]
+pub(crate) const fn is_catalog_obj_id(obj_id: TableID) -> bool {
+    !is_user_obj_id(obj_id)
+}
+
+#[inline]
+fn index_ddl_metadata_reconcilable(
+    table_id: TableID,
+    catalog: &TableMetadata,
+    file: &TableMetadata,
+) -> Result<bool> {
+    // The active table root may be ahead of checkpointed catalog rows: recovery
+    // can replay later index-DDL catalog rows to make catalog metadata catch up.
+    // The opposite direction is unrecoverable here because replay cannot make a
+    // table root that has already been opened acquire missing allocation state.
+    if file.idx.next_index_no() < catalog.idx.next_index_no() {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "index-DDL reconciliation found catalog allocation ahead of table root: table_id={table_id}, catalog_next_index_no={}, file_next_index_no={}",
+                catalog.idx.next_index_no(),
+                file.idx.next_index_no()
+            ))
+            .into());
+    }
+    if catalog.col != file.col {
+        return Ok(false);
+    }
+
+    let max_slots = catalog
+        .idx
+        .index_slot_count()
+        .max(file.idx.index_slot_count());
+    for index_no in 0..max_slots {
+        let catalog_spec = catalog.idx.index_spec(index_no);
+        let file_spec = file.idx.index_spec(index_no);
+        if let (Some(catalog_spec), Some(file_spec)) = (catalog_spec, file_spec)
+            && catalog_spec != file_spec
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -700,11 +702,12 @@ pub(crate) mod tests {
     use semistr::SemiStr;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     #[inline]
     pub(crate) fn catalog_test_engine_config(
-        main_dir: impl Into<std::path::PathBuf>,
+        main_dir: impl Into<PathBuf>,
         log_file_stem: Option<&str>,
     ) -> EngineConfig {
         let mut trx = TrxSysConfig::default();
@@ -716,7 +719,7 @@ pub(crate) mod tests {
 
     #[inline]
     pub(crate) async fn open_catalog_test_engine(
-        main_dir: impl Into<std::path::PathBuf>,
+        main_dir: impl Into<PathBuf>,
         log_file_stem: Option<&str>,
     ) -> Engine {
         catalog_test_engine_config(main_dir, log_file_stem)
@@ -727,7 +730,7 @@ pub(crate) mod tests {
 
     #[inline]
     pub(crate) async fn expect_catalog_test_engine_error(
-        main_dir: impl Into<std::path::PathBuf>,
+        main_dir: impl Into<PathBuf>,
         log_file_stem: Option<&str>,
         expected_message: &str,
     ) -> Error {
@@ -857,7 +860,7 @@ pub(crate) mod tests {
         table_id
     }
 
-    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
+    fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: u64) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -874,7 +877,7 @@ pub(crate) mod tests {
     }
 
     fn rewrite_page_with_checksum(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: u64,
         rewrite: impl FnOnce(&mut [u8]),
     ) {
@@ -894,11 +897,7 @@ pub(crate) mod tests {
         file.flush().unwrap();
     }
 
-    fn corrupt_leaf_delete_codec(
-        path: impl AsRef<std::path::Path>,
-        page_id: u64,
-        prefix_idx: usize,
-    ) {
+    fn corrupt_leaf_delete_codec(path: impl AsRef<Path>, page_id: u64, prefix_idx: usize) {
         rewrite_page_with_checksum(path, page_id, |page| {
             let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 35;
             page[byte_offset] = 0xFF;
