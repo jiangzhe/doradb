@@ -24,8 +24,9 @@ pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
 pub(crate) use storage::ColumnStorage;
 #[cfg(test)]
-pub(crate) use tests::test_user_table_id;
+pub(crate) use tests::{test_hooks, test_user_table_id};
 
+use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
@@ -49,16 +50,22 @@ use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxReadProof, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
 use parking_lot::Mutex;
+use smol::Timer;
 use std::marker::PhantomData;
+use std::mem::take;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub(crate) struct Table {
+    /// Hot row-store and in-memory index runtime.
     pub(crate) mem: MemTable<EvictableBufferPool, EvictableBufferPool>,
+    /// Persisted column-store runtime and table file binding.
     pub(crate) storage: ColumnStorage,
     layout: Mutex<Arc<TableRuntimeLayout>>,
     retired_secondary_indexes: Mutex<Vec<RetiredSecondaryIndex>>,
+    /// Runtime lifecycle gates for foreground, checkpoint, and drop operations.
     pub(crate) lifecycle: TableLifecycle,
 }
 
@@ -68,7 +75,7 @@ impl Table {
     pub(crate) async fn new(
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool: QuiescentGuard<EvictableBufferPool>,
-        index_pool_guard: &crate::buffer::PoolGuard,
+        index_pool_guard: &PoolGuard,
         table_id: TableID,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
@@ -130,7 +137,7 @@ impl Table {
     #[inline]
     pub(crate) fn try_begin_checkpoint_publish(
         &self,
-    ) -> std::result::Result<CheckpointPublishLease<'_>, CheckpointCancelReason> {
+    ) -> StdResult<CheckpointPublishLease<'_>, CheckpointCancelReason> {
         self.lifecycle.try_begin_checkpoint_publish()
     }
 
@@ -144,7 +151,7 @@ impl Table {
     #[inline]
     pub(crate) fn try_begin_checkpoint_root_mutation(
         &self,
-    ) -> std::result::Result<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
+    ) -> StdResult<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
         self.lifecycle.try_begin_checkpoint_root_mutation()
     }
 
@@ -421,6 +428,7 @@ impl Table {
         self.storage.file()
     }
 
+    /// Find the current hot or persisted location for a row id.
     #[inline]
     pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> Result<RowLocation> {
         self.mem
@@ -537,7 +545,7 @@ impl Table {
             if stabilized {
                 break;
             }
-            smol::Timer::after(Duration::from_secs(1)).await;
+            Timer::after(Duration::from_secs(1)).await;
         }
         Ok(())
     }
@@ -652,7 +660,7 @@ impl Table {
     fn capture_delete_markers_for_transition(
         &self,
         page: &RowPage,
-        ctx: &crate::buffer::frame::FrameContext,
+        ctx: &FrameContext,
         cutoff_ts: TrxID,
     ) {
         let Some(map) = ctx.row_ver() else {
@@ -1121,7 +1129,7 @@ impl SecondaryIndexScopedBuilder {
 
     #[inline]
     async fn rollback(&mut self, pool_guard: &PoolGuard) {
-        for index in std::mem::take(&mut self.staged).into_iter().rev().flatten() {
+        for index in take(&mut self.staged).into_iter().rev().flatten() {
             // Keep the original construction error as the function result.
             let _ = index.destroy(pool_guard).await;
         }
@@ -1135,6 +1143,37 @@ impl SecondaryIndexScopedBuilder {
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
+}
+
+enum InsertRowIntoPage {
+    Ok(RowID, PageSharedGuard<RowPage>),
+    NoSpaceOrFrozen(Vec<Val>, RowUndoKind, Vec<IndexBranch>),
+}
+
+enum UpdateRowInplace {
+    // We keep row page lock if there is any index change,
+    // so we can read latest values from page.
+    // The hash map stores the changed column number and its old value.
+    // for other columns in the changed index, we can read value(old and new are same)
+    // from current page.
+    Ok(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>),
+    RowNotFound,
+    RowDeleted,
+    WriteConflict,
+    RetryInTransition,
+    NoFreeSpace(
+        RowID,
+        Vec<(Val, Option<u16>)>,
+        Vec<UpdateCol>,
+        PageSharedGuard<RowPage>,
+    ),
+}
+
+enum DeleteInternal {
+    Ok(PageSharedGuard<RowPage>),
+    NotFound,
+    WriteConflict,
+    RetryInTransition,
 }
 
 /// Build user-table dual-tree secondary indexes from fresh MemIndex backends
@@ -1254,37 +1293,6 @@ fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
     metadata.col.fix_len() + var_len
 }
 
-enum InsertRowIntoPage {
-    Ok(RowID, PageSharedGuard<RowPage>),
-    NoSpaceOrFrozen(Vec<Val>, RowUndoKind, Vec<IndexBranch>),
-}
-
-enum UpdateRowInplace {
-    // We keep row page lock if there is any index change,
-    // so we can read latest values from page.
-    // The hash map stores the changed column number and its old value.
-    // for other columns in the changed index, we can read value(old and new are same)
-    // from current page.
-    Ok(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>),
-    RowNotFound,
-    RowDeleted,
-    WriteConflict,
-    RetryInTransition,
-    NoFreeSpace(
-        RowID,
-        Vec<(Val, Option<u16>)>,
-        Vec<UpdateCol>,
-        PageSharedGuard<RowPage>,
-    ),
-}
-
-enum DeleteInternal {
-    Ok(PageSharedGuard<RowPage>),
-    NotFound,
-    WriteConflict,
-    RetryInTransition,
-}
-
 #[inline]
 fn index_key_is_changed(
     index_spec: &IndexSpec,
@@ -1350,26 +1358,10 @@ fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str
 }
 
 #[cfg(test)]
-pub(crate) mod test_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub(crate) fn set_test_force_lwc_build_error(enabled: bool) {
-        TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
-    }
-
-    pub(super) fn test_force_lwc_build_error_enabled() -> bool {
-        TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get())
-    }
-}
-
-#[cfg(test)]
 pub(crate) mod tests {
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::{PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
+    use crate::catalog::tests::table2;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
         USER_OBJ_ID_START,
@@ -1385,8 +1377,8 @@ pub(crate) mod tests {
     use crate::file::table_file::ActiveRoot;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{
-        COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
-        NonUniqueIndex, RowLocation, UniqueIndex,
+        COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex,
+        IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex,
     };
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
@@ -1402,13 +1394,30 @@ pub(crate) mod tests {
     use crate::trx::Transaction;
     use crate::trx::stmt::Statement;
     use crate::value::{Val, ValKind};
+    use smol::Timer;
     use std::fs::OpenOptions;
-    use std::io::{self, Read, Seek, SeekFrom, Write};
-    use std::path::PathBuf;
+    use std::io::{Error as IoError, Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    pub(crate) mod test_hooks {
+        use std::cell::Cell;
+
+        thread_local! {
+            static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+        }
+
+        pub(crate) fn set_test_force_lwc_build_error(enabled: bool) {
+            TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
+        }
+
+        pub(crate) fn test_force_lwc_build_error_enabled() -> bool {
+            TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get())
+        }
+    }
 
     pub(crate) const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
     pub(crate) const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -1571,7 +1580,7 @@ pub(crate) mod tests {
 
         fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if self.matches(op) {
-                *res = Err(io::Error::from_raw_os_error(self.errno));
+                *res = Err(IoError::from_raw_os_error(self.errno));
             }
         }
     }
@@ -1608,7 +1617,7 @@ pub(crate) mod tests {
     impl StorageBackendTestHook for FailingFirstWriteHook {
         fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if self.matches(op) && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                *res = Err(io::Error::from_raw_os_error(libc::EIO));
+                *res = Err(IoError::from_raw_os_error(libc::EIO));
             }
         }
     }
@@ -1669,7 +1678,7 @@ pub(crate) mod tests {
 
     #[inline]
     pub(crate) async fn create_table2_for_test(engine: &Engine) -> TableID {
-        crate::catalog::tests::table2(engine).await
+        table2(engine).await
     }
 
     #[inline]
@@ -1693,7 +1702,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn lightweight_test_engine_config(
-        main_dir: impl Into<std::path::PathBuf>,
+        main_dir: impl Into<PathBuf>,
         log_file_stem: &str,
     ) -> EngineConfig {
         EngineConfig::default()
@@ -1983,7 +1992,7 @@ pub(crate) mod tests {
             if !has_lock_resource(engine, owner, resource) {
                 return;
             }
-            smol::Timer::after(Duration::from_millis(1)).await;
+            Timer::after(Duration::from_millis(1)).await;
         }
         panic!("lock resource still present: owner={owner:?}, resource={resource:?}");
     }
@@ -1999,7 +2008,7 @@ pub(crate) mod tests {
             if has_lock_entry(engine, owner, resource, mode, state) {
                 return;
             }
-            smol::Timer::after(Duration::from_millis(1)).await;
+            Timer::after(Duration::from_millis(1)).await;
         }
         panic!(
             "lock entry not observed: owner={owner:?}, resource={resource:?}, mode={mode:?}, state={state:?}"
@@ -2085,7 +2094,7 @@ pub(crate) mod tests {
             old_row_id: RowID,
             new_row_id: RowID,
             ts: TrxID,
-        ) -> Result<crate::index::IndexCompareExchange> {
+        ) -> Result<IndexCompareExchange> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_unique(self.root)?
@@ -2334,7 +2343,7 @@ pub(crate) mod tests {
             if trx_sys.calc_min_active_sts_for_gc() > ts {
                 return;
             }
-            smol::Timer::after(Duration::from_millis(20)).await;
+            Timer::after(Duration::from_millis(20)).await;
         }
         panic!("GC cutoff did not advance past {ts}");
     }
@@ -2346,7 +2355,7 @@ pub(crate) mod tests {
                 CheckpointReadiness::Ready => return,
                 CheckpointReadiness::Delayed { reason } => {
                     last_delay = Some(reason);
-                    smol::Timer::after(Duration::from_millis(20)).await;
+                    Timer::after(Duration::from_millis(20)).await;
                 }
                 readiness => panic!("checkpoint readiness is not retryable: {readiness:?}"),
             }
@@ -2359,10 +2368,10 @@ pub(crate) mod tests {
 
     pub(crate) async fn wait_path_exists(path: &str, expected: bool) {
         for _ in 0..250 {
-            if std::path::Path::new(path).exists() == expected {
+            if Path::new(path).exists() == expected {
                 return;
             }
-            smol::Timer::after(Duration::from_millis(50)).await;
+            Timer::after(Duration::from_millis(50)).await;
         }
         panic!("path existence did not become {expected}: {path}");
     }
@@ -2376,7 +2385,7 @@ pub(crate) mod tests {
                 }
                 CheckpointOutcome::Delayed { reason } => {
                     last_delay = Some(reason);
-                    smol::Timer::after(Duration::from_millis(20)).await;
+                    Timer::after(Duration::from_millis(20)).await;
                 }
                 CheckpointOutcome::Cancelled { reason } => {
                     panic!("checkpoint should publish, cancelled by {reason:?}")
@@ -2389,10 +2398,7 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn assert_root_metadata_unchanged(
-        before: &crate::file::table_file::ActiveRoot,
-        table: &Table,
-    ) {
+    pub(crate) fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
         let after = table.file().active_root_unchecked();
         assert_eq!(after.root_ts, before.root_ts);
         assert_eq!(after.meta_block_id, before.meta_block_id);
@@ -2406,10 +2412,7 @@ pub(crate) mod tests {
         assert_eq!(after.secondary_index_roots, before.secondary_index_roots);
     }
 
-    pub(crate) fn corrupt_page_checksum(
-        path: impl AsRef<std::path::Path>,
-        page_id: impl Into<u64>,
-    ) {
+    pub(crate) fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: impl Into<u64>) {
         let page_id = page_id.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -2427,7 +2430,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn rewrite_page_with_checksum(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         rewrite: impl FnOnce(&mut [u8]),
     ) {
@@ -2449,7 +2452,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn corrupt_leaf_delete_codec(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         prefix_idx: usize,
     ) {
@@ -2460,7 +2463,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn corrupt_leaf_row_codec(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         prefix_idx: usize,
     ) {
@@ -2471,7 +2474,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn corrupt_leaf_block_id(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         prefix_idx: usize,
     ) {
@@ -2482,7 +2485,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn corrupt_leaf_short_delete_section_header(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         prefix_idx: usize,
     ) {
@@ -2531,7 +2534,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn corrupt_lwc_row_shape_fingerprint(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         page_id: impl Into<u64>,
     ) {
         rewrite_page_with_checksum(path, page_id, |page| {

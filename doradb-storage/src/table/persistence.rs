@@ -14,20 +14,19 @@ use crate::index::disk_tree::{
 use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
 use crate::log::redo::DDLRedo;
 use crate::lwc::PersistedLwcBlock;
+use crate::row::RowPage;
 use crate::session::SessionPin;
 use crate::table::{CheckpointCancelReason, Table, TableRuntimeLayout};
+#[cfg(test)]
+use crate::trx::tests::discard_transaction_after_fatal_rollback;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use std::collections::BTreeSet;
 
-const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
+#[cfg(test)]
+pub(crate) use tests::test_hooks;
 
-#[inline]
-fn invalid_index_spec(message: impl Into<String>) -> Error {
-    Report::new(ConfigError::InvalidIndexSpec)
-        .attach(message.into())
-        .into()
-}
+const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
 
 /// Cheap checkpoint scheduling decision for one user-table root snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,20 +79,6 @@ pub enum CheckpointOutcome {
         /// Diagnostic details explaining why checkpoint publication was cancelled.
         reason: CheckpointCancelReason,
     },
-}
-
-#[inline]
-fn checkpoint_outcome_from_readiness(readiness: CheckpointReadiness) -> Option<CheckpointOutcome> {
-    match readiness {
-        CheckpointReadiness::Ready => None,
-        CheckpointReadiness::Delayed { reason } => Some(CheckpointOutcome::Delayed { reason }),
-        CheckpointReadiness::TableDropping => Some(CheckpointOutcome::Cancelled {
-            reason: CheckpointCancelReason::TableDropping,
-        }),
-        CheckpointReadiness::TableNotFound => Some(CheckpointOutcome::Cancelled {
-            reason: CheckpointCancelReason::TableDropped,
-        }),
-    }
 }
 
 /// Diagnostic payload for normal checkpoint scheduling delay.
@@ -230,39 +215,6 @@ impl SecondaryIndexSidecar {
     }
 }
 
-fn normalize_unique_puts(puts: &mut Vec<EncodedRowEntry>) {
-    puts.sort_by(|left, right| left.key.cmp(&right.key));
-    let mut normalized: Vec<EncodedRowEntry> = Vec::with_capacity(puts.len());
-    for entry in puts.drain(..) {
-        if let Some(last) = normalized.last_mut()
-            && last.key == entry.key
-        {
-            last.row_id = entry.row_id;
-            continue;
-        }
-        normalized.push(entry);
-    }
-    *puts = normalized;
-}
-
-fn normalize_unique_deletes(deletes: &mut Vec<EncodedRowEntry>, puts: &[EncodedRowEntry]) {
-    deletes.sort_by(|left, right| {
-        left.key
-            .cmp(&right.key)
-            .then(left.row_id.cmp(&right.row_id))
-    });
-    deletes.dedup();
-    deletes.retain(|delete| {
-        puts.binary_search_by(|put| put.key.as_slice().cmp(delete.key.as_slice()))
-            .is_err()
-    });
-}
-
-fn normalize_encoded_keys(keys: &mut Vec<Vec<u8>>) {
-    keys.sort();
-    keys.dedup();
-}
-
 struct ActiveSecondaryIndexSidecar {
     index_no: usize,
     sidecar: SecondaryIndexSidecar,
@@ -295,7 +247,7 @@ impl SecondaryCheckpointSidecar {
     fn add_data_row(
         &mut self,
         metadata: &TableMetadata,
-        page: &crate::row::RowPage,
+        page: &RowPage,
         row_idx: usize,
         row_id: RowID,
     ) -> Result<()> {
@@ -366,6 +318,60 @@ pub(crate) fn secondary_disk_tree_encoder(
         types.push(ValType::new(ValKind::U64, false));
     }
     Ok(BTreeKeyEncoder::new(types))
+}
+
+#[inline]
+fn invalid_index_spec(message: impl Into<String>) -> Error {
+    Report::new(ConfigError::InvalidIndexSpec)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn checkpoint_outcome_from_readiness(readiness: CheckpointReadiness) -> Option<CheckpointOutcome> {
+    match readiness {
+        CheckpointReadiness::Ready => None,
+        CheckpointReadiness::Delayed { reason } => Some(CheckpointOutcome::Delayed { reason }),
+        CheckpointReadiness::TableDropping => Some(CheckpointOutcome::Cancelled {
+            reason: CheckpointCancelReason::TableDropping,
+        }),
+        CheckpointReadiness::TableNotFound => Some(CheckpointOutcome::Cancelled {
+            reason: CheckpointCancelReason::TableDropped,
+        }),
+    }
+}
+
+fn normalize_unique_puts(puts: &mut Vec<EncodedRowEntry>) {
+    puts.sort_by(|left, right| left.key.cmp(&right.key));
+    let mut normalized: Vec<EncodedRowEntry> = Vec::with_capacity(puts.len());
+    for entry in puts.drain(..) {
+        if let Some(last) = normalized.last_mut()
+            && last.key == entry.key
+        {
+            last.row_id = entry.row_id;
+            continue;
+        }
+        normalized.push(entry);
+    }
+    *puts = normalized;
+}
+
+fn normalize_unique_deletes(deletes: &mut Vec<EncodedRowEntry>, puts: &[EncodedRowEntry]) {
+    deletes.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then(left.row_id.cmp(&right.row_id))
+    });
+    deletes.dedup();
+    deletes.retain(|delete| {
+        puts.binary_search_by(|put| put.key.as_slice().cmp(delete.key.as_slice()))
+            .is_err()
+    });
+}
+
+fn normalize_encoded_keys(keys: &mut Vec<Vec<u8>>) {
+    keys.sort();
+    keys.dedup();
 }
 
 fn invalid_reachable_block(root_ts: TrxID, block_id: BlockID, message: impl Into<String>) -> Error {
@@ -915,6 +921,7 @@ impl Table {
 }
 
 impl Table {
+    /// Mark hot row pages frozen up to the requested row budget.
     pub(crate) async fn freeze(&self, session: SessionPin, max_rows: usize) -> Result<usize> {
         let guards = session.pool_guards();
         let mut rows = 0usize;
@@ -932,6 +939,7 @@ impl Table {
         Ok(rows)
     }
 
+    /// Return whether this table is ready for a checkpoint in the session.
     pub(crate) fn checkpoint_readiness(&self, session: &SessionPin) -> Result<CheckpointReadiness> {
         match self.lifecycle.state() {
             TableLifecycleState::Live => self.try_checkpoint_readiness_for_session(session),
@@ -940,6 +948,7 @@ impl Table {
         }
     }
 
+    /// Execute one user-table checkpoint attempt.
     pub(crate) async fn checkpoint(&self, session: SessionPin) -> Result<CheckpointOutcome> {
         if session.in_trx(CHECKPOINT_REQUIRES_IDLE_SESSION)? {
             return Err(Report::new(OperationError::NotSupported)
@@ -1008,12 +1017,11 @@ impl Table {
             .last()
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
-        let mut collect_secondary_row = |page: &crate::row::RowPage, row_idx, row_id| {
+        let mut collect_secondary_row = |page: &RowPage, row_idx, row_id| {
             secondary_sidecar.add_data_row(metadata, page, row_idx, row_id)
         };
         let collect_visible_row = (!metadata.idx.index_specs().is_empty()).then_some(
-            &mut collect_secondary_row
-                as &mut dyn FnMut(&crate::row::RowPage, usize, RowID) -> Result<()>,
+            &mut collect_secondary_row as &mut dyn FnMut(&RowPage, usize, RowID) -> Result<()>,
         );
         let (mut lwc_blocks, heap_redo_start_ts) = match self
             .build_lwc_blocks(
@@ -1146,7 +1154,7 @@ impl Table {
         #[cfg(test)]
         if test_hooks::test_force_post_publish_checkpoint_error_enabled() {
             let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
-            crate::trx::tests::discard_transaction_after_fatal_rollback(&mut trx);
+            discard_transaction_after_fatal_rollback(&mut trx);
             return Err(poison.into());
         }
 
@@ -1161,99 +1169,98 @@ impl Table {
 }
 
 #[cfg(test)]
-pub(crate) mod test_hooks {
-    use std::cell::{Cell, RefCell};
-    use std::future::Future;
-    use std::pin::Pin;
-
-    type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
-
-    thread_local! {
-        static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
-        static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
-        static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<TableHook>> =
-            const { RefCell::new(None) };
-        static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
-            const { RefCell::new(None) };
-    }
-
-    pub(crate) fn set_test_force_secondary_sidecar_error(enabled: bool) {
-        TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.set(enabled));
-    }
-
-    pub(super) fn test_force_secondary_sidecar_error_enabled() -> bool {
-        TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
-    }
-
-    pub(crate) fn set_test_force_post_publish_checkpoint_error(enabled: bool) {
-        TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.set(enabled));
-    }
-
-    pub(crate) struct ForcePostPublishCheckpointErrorGuard;
-
-    impl ForcePostPublishCheckpointErrorGuard {
-        pub(crate) fn new() -> Self {
-            set_test_force_post_publish_checkpoint_error(true);
-            Self
-        }
-    }
-
-    impl Drop for ForcePostPublishCheckpointErrorGuard {
-        fn drop(&mut self) {
-            set_test_force_post_publish_checkpoint_error(false);
-        }
-    }
-
-    pub(super) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
-        TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
-    }
-
-    pub(crate) fn set_test_checkpoint_after_readiness_hook<F, Fut>(hook: F)
-    where
-        F: FnOnce() -> Fut + 'static,
-        Fut: Future<Output = ()> + 'static,
-    {
-        TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| {
-            let old = slot
-                .borrow_mut()
-                .replace(Box::new(move || Box::pin(hook())));
-            assert!(old.is_none(), "checkpoint readiness hook already installed");
-        });
-    }
-
-    pub(crate) fn set_test_checkpoint_after_trx_start_hook<F, Fut>(hook: F)
-    where
-        F: FnOnce() -> Fut + 'static,
-        Fut: Future<Output = ()> + 'static,
-    {
-        TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| {
-            let old = slot
-                .borrow_mut()
-                .replace(Box::new(move || Box::pin(hook())));
-            assert!(
-                old.is_none(),
-                "checkpoint transaction-start hook already installed"
-            );
-        });
-    }
-
-    pub(super) async fn run_test_checkpoint_after_readiness_hook() {
-        let hook = TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| slot.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook().await;
-        }
-    }
-
-    pub(super) async fn run_test_checkpoint_after_trx_start_hook() {
-        let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook().await;
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
+    pub(crate) mod test_hooks {
+        use std::cell::{Cell, RefCell};
+        use std::future::Future;
+        use std::pin::Pin;
+
+        type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+
+        thread_local! {
+            static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
+            static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
+            static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<TableHook>> =
+                const { RefCell::new(None) };
+            static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
+                const { RefCell::new(None) };
+        }
+
+        pub(crate) fn set_test_force_secondary_sidecar_error(enabled: bool) {
+            TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.set(enabled));
+        }
+
+        pub(crate) fn test_force_secondary_sidecar_error_enabled() -> bool {
+            TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
+        }
+
+        pub(crate) fn set_test_force_post_publish_checkpoint_error(enabled: bool) {
+            TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.set(enabled));
+        }
+
+        pub(crate) struct ForcePostPublishCheckpointErrorGuard;
+
+        impl ForcePostPublishCheckpointErrorGuard {
+            pub(crate) fn new() -> Self {
+                set_test_force_post_publish_checkpoint_error(true);
+                Self
+            }
+        }
+
+        impl Drop for ForcePostPublishCheckpointErrorGuard {
+            fn drop(&mut self) {
+                set_test_force_post_publish_checkpoint_error(false);
+            }
+        }
+
+        pub(crate) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
+            TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
+        }
+
+        pub(crate) fn set_test_checkpoint_after_readiness_hook<F, Fut>(hook: F)
+        where
+            F: FnOnce() -> Fut + 'static,
+            Fut: Future<Output = ()> + 'static,
+        {
+            TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| {
+                let old = slot
+                    .borrow_mut()
+                    .replace(Box::new(move || Box::pin(hook())));
+                assert!(old.is_none(), "checkpoint readiness hook already installed");
+            });
+        }
+
+        pub(crate) fn set_test_checkpoint_after_trx_start_hook<F, Fut>(hook: F)
+        where
+            F: FnOnce() -> Fut + 'static,
+            Fut: Future<Output = ()> + 'static,
+        {
+            TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| {
+                let old = slot
+                    .borrow_mut()
+                    .replace(Box::new(move || Box::pin(hook())));
+                assert!(
+                    old.is_none(),
+                    "checkpoint transaction-start hook already installed"
+                );
+            });
+        }
+
+        pub(crate) async fn run_test_checkpoint_after_readiness_hook() {
+            let hook = TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+
+        pub(crate) async fn run_test_checkpoint_after_trx_start_hook() {
+            let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+    }
+
     use super::*;
     use crate::buffer::BufferPool;
     use crate::file::cow_file::tests::old_root_drop_count;
@@ -1272,6 +1279,7 @@ mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::ver_map::RowPageState;
     use futures::FutureExt;
+    use smol::Timer;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
@@ -2836,7 +2844,7 @@ mod tests {
                 if old_root_drop_count(retained_root_ptr) > drop_count_before {
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(20)).await;
+                Timer::after(Duration::from_millis(20)).await;
             }
             assert!(
                 old_root_drop_count(retained_root_ptr) > drop_count_before,
@@ -2936,7 +2944,7 @@ mod tests {
             let allocated_after = engine.inner().mem_pool.allocated();
             let mut reclaimed = allocated_after < allocated_before;
             for _ in 0..20 {
-                smol::Timer::after(Duration::from_millis(200)).await;
+                Timer::after(Duration::from_millis(200)).await;
                 let allocated_now = engine.inner().mem_pool.allocated();
                 if allocated_now < allocated_before {
                     reclaimed = true;

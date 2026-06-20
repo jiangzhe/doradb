@@ -10,13 +10,17 @@ use std::sync::Arc;
 
 /// Persisted column-store attachments associated with a user table runtime.
 pub(crate) struct ColumnStorage {
+    /// Durable table file backing persisted column blocks and secondary roots.
     pub(crate) file: Arc<TableFile>,
+    /// Read-only buffer pool used for persisted table-file pages.
     pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    /// Runtime delete-marker buffer for persisted rows updated after checkpoint.
     pub(crate) deletion_buffer: ColumnDeletionBuffer,
     secondary_indexes: Box<[Option<SecondaryDiskTreeRuntime>]>,
 }
 
 impl ColumnStorage {
+    /// Build persisted column storage from the currently active table root.
     #[inline]
     pub(crate) fn new(
         file: Arc<TableFile>,
