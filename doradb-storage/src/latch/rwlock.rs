@@ -126,28 +126,6 @@ impl RawRwLock {
     }
 }
 
-struct WriteGuardRollback<'a>(&'a RawRwLock);
-
-impl Drop for WriteGuardRollback<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        // SAFETY: this rollback helper only exists after `mu` was locked and the
-        // writer bit was set, so clearing the bit and unlocking `mu` is paired.
-        unsafe {
-            // rollback writer bit.
-            self.0.state.fetch_and(!WRITER_BIT, Ordering::SeqCst);
-            // Release `mu` before notifying `no_writer`.
-            //
-            // Waiters retry `mu.try_lock()` immediately after a wake. If we
-            // notify first, one waiter can consume the event, still observe
-            // the mutex as locked, and then sleep forever waiting for another
-            // writer release that never comes.
-            self.0.mu.unlock();
-            self.0.no_writer.notify(1);
-        }
-    }
-}
-
 // SAFETY: `RawRwLock` maintains the `parking_lot` raw-mutex contract and its
 // reader/writer state transitions with atomics plus event ordering.
 unsafe impl RawRwLockApi for RawRwLock {
@@ -270,13 +248,39 @@ unsafe impl RawRwLockDowngradeApi for RawRwLock {
     }
 }
 
+struct WriteGuardRollback<'a>(&'a RawRwLock);
+
+impl Drop for WriteGuardRollback<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: this rollback helper only exists after `mu` was locked and the
+        // writer bit was set, so clearing the bit and unlocking `mu` is paired.
+        unsafe {
+            // rollback writer bit.
+            self.0.state.fetch_and(!WRITER_BIT, Ordering::SeqCst);
+            // Release `mu` before notifying `no_writer`.
+            //
+            // Waiters retry `mu.try_lock()` immediately after a wake. If we
+            // notify first, one waiter can consume the event, still observe
+            // the mutex as locked, and then sleep forever waiting for another
+            // writer release that never comes.
+            self.0.mu.unlock();
+            self.0.no_writer.notify(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::join3;
     use parking_lot::RawRwLock as ParkingLotRawRwLock;
     use parking_lot::lock_api::RawRwLock as RawRwLockApi;
+    use smol::Timer;
+    use smol::future::or;
     use std::cell::UnsafeCell;
     use std::sync::Arc;
+    use std::thread::spawn;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -312,13 +316,13 @@ mod tests {
                 })
                 .detach();
             }
-            smol::Timer::after(Duration::from_millis(100)).await;
+            Timer::after(Duration::from_millis(100)).await;
             // SAFETY: the test still owns the original exclusive lock acquired
             // before spawning the waiters.
             unsafe {
                 rw.unlock_exclusive();
             }
-            smol::Timer::after(Duration::from_millis(100)).await;
+            Timer::after(Duration::from_millis(100)).await;
         })
     }
 
@@ -328,7 +332,7 @@ mod tests {
         let mut threads = vec![];
         for _ in 0..10 {
             let counter = Arc::clone(&counter);
-            let handle = std::thread::spawn(move || {
+            let handle = spawn(move || {
                 for _ in 0..10 {
                     counter.inc();
                 }
@@ -349,7 +353,7 @@ mod tests {
         let mut threads = vec![];
         for _ in 0..10 {
             let counter = Arc::clone(&counter);
-            let handle = std::thread::spawn(move || {
+            let handle = spawn(move || {
                 smol::block_on(async {
                     for _ in 0..10 {
                         counter.inc_async().await;
@@ -397,7 +401,7 @@ mod tests {
                 let release = {
                     let rw = Arc::clone(&rw);
                     async move {
-                        smol::Timer::after(Duration::from_millis(1)).await;
+                        Timer::after(Duration::from_millis(1)).await;
                         // SAFETY: the test still owns the initial exclusive
                         // lock until this release path runs.
                         unsafe {
@@ -406,10 +410,10 @@ mod tests {
                     }
                 };
                 let all = async {
-                    futures::future::join3(waiter1, waiter2, release).await;
+                    join3(waiter1, waiter2, release).await;
                 };
-                smol::future::or(all, async {
-                    smol::Timer::after(Duration::from_secs(1)).await;
+                or(all, async {
+                    Timer::after(Duration::from_secs(1)).await;
                     panic!("waiting writers failed to make progress after writer unlock");
                 })
                 .await;

@@ -2,7 +2,7 @@ use event_listener::{Event, IntoNotification, listener};
 use parking_lot::RawMutex as ParkingLotRawMutex;
 use parking_lot::lock_api::RawMutex as ParkingLotRawMutexAPI;
 use std::cell::UnsafeCell;
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
@@ -193,7 +193,7 @@ impl<'a, T: 'a> Drop for MutexGuard<'a, T> {
 
 impl<'a, T: fmt::Debug + 'a> fmt::Debug for MutexGuard<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
+        Debug::fmt(&**self, f)
     }
 }
 
@@ -208,7 +208,9 @@ mod tests {
     use super::*;
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::cell::UnsafeCell;
+    use std::env::var;
     use std::sync::Arc;
+    use std::thread::spawn;
     use std::time::Instant;
 
     #[test]
@@ -231,7 +233,7 @@ mod tests {
         let mut threads = vec![];
         for _ in 0..10 {
             let counter = Arc::clone(&counter);
-            let handle = std::thread::spawn(move || {
+            let handle = spawn(move || {
                 for _ in 0..10 {
                     counter.inc();
                 }
@@ -252,7 +254,7 @@ mod tests {
         let mut threads = vec![];
         for _ in 0..10 {
             let counter = Arc::clone(&counter);
-            let handle = std::thread::spawn(move || {
+            let handle = spawn(move || {
                 smol::block_on(async {
                     for _ in 0..10 {
                         counter.inc_async().await;
@@ -320,12 +322,12 @@ mod tests {
     fn test_raw_mutex_multi_threads() {
         const COUNT: usize = 500_000;
 
-        let threads = std::env::var("RAW_MUTEX_THREADS")
+        let threads = var("RAW_MUTEX_THREADS")
             .map_err(|_| ())
             .and_then(|s| s.parse::<usize>().map_err(|_| ()))
             .unwrap_or(4usize);
 
-        let sys_threads = std::env::var("RAW_MUTEX_SYS_THREADS")
+        let sys_threads = var("RAW_MUTEX_SYS_THREADS")
             .map_err(|_| ())
             .and_then(|s| s.parse::<usize>().map_err(|_| ()))
             .unwrap_or(1usize);
@@ -337,7 +339,7 @@ mod tests {
         let c1 = Arc::new(Counter::new());
         for _ in 0..threads {
             let c1 = Arc::clone(&c1);
-            let handle = std::thread::spawn(move || {
+            let handle = spawn(move || {
                 smol::block_on(async {
                     for _ in 0..COUNT {
                         if c1.inc() >= COUNT {
@@ -365,7 +367,7 @@ mod tests {
         let mut handles = Vec::with_capacity(sys_threads);
         for _ in 0..sys_threads {
             let c2 = Arc::new(Counter::new());
-            let h = std::thread::spawn(move || {
+            let h = spawn(move || {
                 smol::block_on(async {
                     let mut futs = FuturesUnordered::new();
                     for _ in 0..tasks_per_thread {
@@ -401,7 +403,7 @@ mod tests {
         let c3 = Arc::new(ParkingLotCounter::new());
         for _ in 0..threads {
             let c3 = Arc::clone(&c3);
-            let handle = std::thread::spawn(move || {
+            let handle = spawn(move || {
                 smol::block_on(async {
                     for _ in 0..COUNT {
                         if c3.inc() >= COUNT {

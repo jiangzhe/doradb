@@ -7,13 +7,16 @@ use parking_lot::lock_api::{
 };
 // use parking_lot::RawRwLock;
 use crate::latch::rwlock::RawRwLock;
+use std::hint::spin_loop;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Bit marking exclusive ownership in the latch version word.
 pub(crate) const LATCH_EXCLUSIVE_BIT: u64 = 1;
 
+/// Fallback strategy used when an optimistic latch observes an exclusive owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LatchFallbackMode {
     Shared,
@@ -63,6 +66,7 @@ pub(crate) struct HybridLatch {
 }
 
 impl HybridLatch {
+    /// Creates an unlocked latch with version 0.
     #[inline]
     pub(crate) const fn new() -> Self {
         HybridLatch {
@@ -71,6 +75,7 @@ impl HybridLatch {
         }
     }
 
+    /// Loads the current latch version with acquire ordering.
     #[inline]
     pub(crate) fn version_acq(&self) -> u64 {
         self.version.load(Ordering::Acquire)
@@ -98,6 +103,7 @@ impl HybridLatch {
         HybridGuard::from_raw(self.optimistic_spin_raw())
     }
 
+    /// Returns a raw optimistic guard after spinning while exclusive ownership is present.
     #[inline]
     pub(crate) fn optimistic_spin_raw(&self) -> RawHybridGuard {
         let mut ver: u64;
@@ -106,7 +112,7 @@ impl HybridLatch {
             if (ver & LATCH_EXCLUSIVE_BIT) != LATCH_EXCLUSIVE_BIT {
                 break;
             }
-            std::hint::spin_loop();
+            spin_loop();
         }
         RawHybridGuard::new(self, GuardState::Optimistic, ver)
     }
@@ -129,6 +135,7 @@ impl HybridLatch {
         }
     }
 
+    /// Returns an optimistic raw guard, or waits for a shared raw guard when exclusive-locked.
     #[inline]
     pub(crate) async fn optimistic_or_shared_raw(&self) -> RawHybridGuard {
         let ver = self.version_acq();
@@ -141,6 +148,7 @@ impl HybridLatch {
         }
     }
 
+    /// Returns an optimistic raw guard, or waits for an exclusive raw guard when exclusive-locked.
     #[inline]
     pub(crate) async fn optimistic_or_exclusive_raw(&self) -> RawHybridGuard {
         let ver = self.version_acq();
@@ -155,6 +163,7 @@ impl HybridLatch {
         }
     }
 
+    /// Returns a raw guard using the requested optimistic fallback strategy.
     #[inline]
     pub(crate) async fn optimistic_fallback_raw(&self, mode: LatchFallbackMode) -> RawHybridGuard {
         match mode {
@@ -170,6 +179,7 @@ impl HybridLatch {
         HybridGuard::from_raw(self.exclusive_async_raw().await)
     }
 
+    /// Acquires and returns a raw exclusive guard asynchronously.
     #[inline]
     pub(crate) async fn exclusive_async_raw(&self) -> RawHybridGuard {
         self.lock.lock_exclusive_async().await;
@@ -179,6 +189,7 @@ impl HybridLatch {
         RawHybridGuard::new(self, GuardState::Exclusive, ver + LATCH_EXCLUSIVE_BIT)
     }
 
+    /// Acquires and returns a raw shared guard asynchronously.
     #[inline]
     pub(crate) async fn shared_async_raw(&self) -> RawHybridGuard {
         self.lock.lock_shared_async().await;
@@ -186,6 +197,7 @@ impl HybridLatch {
         RawHybridGuard::new(self, GuardState::Shared, ver)
     }
 
+    /// Attempts to acquire a raw exclusive guard without blocking.
     #[inline]
     pub(crate) fn try_exclusive_raw(&self) -> Option<RawHybridGuard> {
         if self.lock.try_lock_exclusive() {
@@ -201,6 +213,7 @@ impl HybridLatch {
         None
     }
 
+    /// Attempts to acquire a raw shared guard without blocking.
     #[inline]
     pub(crate) fn try_shared_raw(&self) -> Option<RawHybridGuard> {
         if self.lock.try_lock_shared() {
@@ -211,6 +224,7 @@ impl HybridLatch {
     }
 }
 
+/// Acquisition mode currently held by a hybrid latch guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum GuardState {
@@ -240,6 +254,7 @@ impl RawHybridGuard {
         }
     }
 
+    /// Returns the current guard state.
     #[inline]
     pub(crate) fn state(&self) -> GuardState {
         self.state
@@ -254,11 +269,13 @@ impl RawHybridGuard {
         unsafe { self.lock.as_ref() }
     }
 
+    /// Returns whether the guard version still matches the latch version.
     #[inline]
     pub(crate) fn validate(&self) -> bool {
         self.lock_ref().version_match(self.version)
     }
 
+    /// Releases pessimistic ownership and downgrades this guard to optimistic mode.
     #[inline]
     pub(crate) fn downgrade(mut self) -> Self {
         match self.state {
@@ -279,6 +296,7 @@ impl RawHybridGuard {
         }
     }
 
+    /// Converts an exclusive guard into a shared guard.
     #[inline]
     pub(crate) fn downgrade_exclusive_to_shared(mut self) -> Self {
         debug_assert!(self.state == GuardState::Exclusive);
@@ -290,6 +308,7 @@ impl RawHybridGuard {
         self
     }
 
+    /// Attempts to validate and promote this guard to shared mode without blocking.
     #[inline]
     pub(crate) fn try_shared(&mut self) -> Validation<()> {
         match self.state {
@@ -308,6 +327,7 @@ impl RawHybridGuard {
         }
     }
 
+    /// Asynchronously validates and promotes this guard to shared mode.
     #[inline]
     pub(crate) async fn verify_shared_async<const PRE_VERIFY: bool>(&mut self) -> Validation<()> {
         match self.state {
@@ -327,12 +347,14 @@ impl RawHybridGuard {
         }
     }
 
+    /// Acquires shared ownership for an optimistic guard.
     #[inline]
     pub(crate) async fn shared_async(self) -> Self {
         debug_assert!(self.state == GuardState::Optimistic);
         self.lock_ref().shared_async_raw().await
     }
 
+    /// Attempts to validate and promote this guard to exclusive mode without blocking.
     #[inline]
     pub(crate) fn try_exclusive(&mut self) -> Validation<()> {
         match self.state {
@@ -354,6 +376,7 @@ impl RawHybridGuard {
         }
     }
 
+    /// Asynchronously validates and promotes this guard to exclusive mode.
     #[inline]
     pub(crate) async fn verify_exclusive_async<const PRE_VERIFY: bool>(
         &mut self,
@@ -379,6 +402,7 @@ impl RawHybridGuard {
         }
     }
 
+    /// Rolls back an exclusive acquisition and releases the exclusive raw lock.
     #[inline]
     pub(crate) fn rollback_exclusive_bit(mut self) {
         assert!(
@@ -392,6 +416,7 @@ impl RawHybridGuard {
         self.state = GuardState::Optimistic;
     }
 
+    /// Releases a shared raw lock and leaves this guard in optimistic mode.
     #[inline]
     pub(crate) fn rollback_shared_lock_in_place(&mut self) {
         assert!(
@@ -402,6 +427,7 @@ impl RawHybridGuard {
         self.state = GuardState::Optimistic;
     }
 
+    /// Rolls back the exclusive bit in place and leaves this guard in optimistic mode.
     #[inline]
     pub(crate) fn rollback_exclusive_bit_in_place(&mut self) {
         assert!(
@@ -416,12 +442,14 @@ impl RawHybridGuard {
         self.state = GuardState::Optimistic;
     }
 
+    /// Acquires exclusive ownership for an optimistic guard.
     #[inline]
     pub(crate) async fn exclusive_async(self) -> Self {
         debug_assert!(self.state == GuardState::Optimistic);
         self.lock_ref().exclusive_async_raw().await
     }
 
+    /// Refreshes an optimistic guard with the latch's current version.
     #[inline]
     pub(crate) fn refresh_version(&mut self) {
         debug_assert!(self.state == GuardState::Optimistic);
