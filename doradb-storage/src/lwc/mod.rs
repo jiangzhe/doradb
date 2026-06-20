@@ -14,76 +14,16 @@ use crate::id::RowID;
 use crate::io::DirectBuf;
 use crate::layout;
 use crate::row::RowPage;
-use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
+use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues, ValArrayRef};
 use crate::serde::{ForBitpackingSer, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
 use error_stack::Report;
 use std::borrow::Cow;
 use std::mem;
+use std::slice::Iter;
 use zerocopy::{Immutable, IntoBytes};
 
-#[inline]
-fn invalid_compressed_payload(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn lwc_block_encoding_invariant() -> Error {
-    Report::new(InternalError::LwcBlockEncodingInvariant).into()
-}
-
-#[inline]
-fn column_scan_shape_mismatch() -> Error {
-    Report::new(InternalError::ColumnScanShapeMismatch).into()
-}
-
-#[inline]
-fn lwc_payload_len_from_u64(len: u64, payload: &str) -> Result<usize> {
-    usize::try_from(len)
-        .map_err(|_| invalid_compressed_payload(format!("{payload} length exceeds usize::MAX")))
-}
-
-#[inline]
-fn checked_lwc_payload_len(len: usize, unit_len: usize, payload: &str) -> Result<usize> {
-    len.checked_mul(unit_len)
-        .ok_or_else(|| invalid_compressed_payload(format!("{payload} length overflows usize")))
-}
-
-#[inline]
-fn expect_exact_lwc_payload_len(
-    actual_len: usize,
-    expected_len: usize,
-    payload: &str,
-) -> Result<()> {
-    if actual_len != expected_len {
-        return Err(invalid_compressed_payload(format!(
-            "{payload} length mismatch: expected {expected_len}, actual {actual_len}"
-        )));
-    }
-    Ok(())
-}
-
-#[inline]
-fn flat_lwc_payload<'a>(
-    input: &'a [u8],
-    len: usize,
-    unit_len: usize,
-    payload: &str,
-) -> Result<&'a [u8]> {
-    let expected_len = checked_lwc_payload_len(len, unit_len, payload)?;
-    expect_exact_lwc_payload_len(input.len(), expected_len, payload)?;
-    Ok(input)
-}
-
-#[inline]
-fn for_bitpacking_lwc_payload(data: &[u8], len: usize, n_bits: usize) -> Result<&[u8]> {
-    let expected_bits = checked_lwc_payload_len(len, n_bits, "LWC FOR bitpacking payload")?;
-    let expected_len = expected_bits.div_ceil(8);
-    expect_exact_lwc_payload_len(data.len(), expected_len, "LWC FOR bitpacking payload")?;
-    Ok(data)
-}
+const LWC_BLOCK_HEADER_SIZE: usize = 24;
 
 /// Lightweight compressed data.
 pub(crate) enum LwcData<'a> {
@@ -449,6 +389,7 @@ pub(crate) trait LwcPrimitiveData {
     fn iter(&self) -> Self::Iter;
 }
 
+/// Serialized LWC compression code stored at the start of each column payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum LwcCode {
@@ -476,6 +417,7 @@ impl TryFrom<u8> for LwcCode {
     }
 }
 
+/// Borrowed primitive LWC payload reader.
 pub(crate) enum LwcPrimitive<'a> {
     FlatI8(FlatI8<'a>),
     FlatU8(FlatU8<'a>),
@@ -528,6 +470,7 @@ pub(crate) enum LwcPrimitive<'a> {
 }
 
 impl LwcPrimitive<'_> {
+    /// Returns the decoded value at `idx`.
     #[inline]
     pub(crate) fn value(&self, idx: usize) -> Option<Val> {
         match self {
@@ -582,110 +525,7 @@ impl LwcPrimitive<'_> {
     }
 }
 
-#[inline]
-fn flat_bytes_borrowed<'a, T, const N: usize>(input: &'a [T]) -> Cow<'a, [[u8; N]]>
-where
-    [T]: IntoBytes + Immutable,
-{
-    Cow::Borrowed(layout::slice_from_bytes::<[u8; N]>(input.as_bytes()))
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
+/// Serializer for primitive LWC column payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LwcPrimitiveSer<'a> {
     FlatI8(&'a [i8]),
@@ -710,6 +550,7 @@ pub(crate) enum LwcPrimitiveSer<'a> {
 }
 
 impl<'a> LwcPrimitiveSer<'a> {
+    /// Creates an i8 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_i8(input: &'a [i8]) -> Self {
         if input.is_empty() {
@@ -721,6 +562,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates a u8 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_u8(input: &'a [u8]) -> Self {
         if input.is_empty() {
@@ -732,6 +574,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates a u64 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_u64(input: &'a [u64]) -> Self {
         if input.is_empty() {
@@ -743,6 +586,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates an i16 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_i16(input: &'a [i16]) -> Self {
         match ForBitpackingSer::new(input) {
@@ -751,6 +595,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates a u16 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_u16(input: &'a [u16]) -> Self {
         match ForBitpackingSer::new(input) {
@@ -759,6 +604,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates an i32 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_i32(input: &'a [i32]) -> Self {
         match ForBitpackingSer::new(input) {
@@ -767,6 +613,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates a u32 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_u32(input: &'a [u32]) -> Self {
         match ForBitpackingSer::new(input) {
@@ -775,6 +622,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates an i64 serializer, choosing bitpacking when it is smaller.
     #[inline]
     pub(crate) fn new_i64(input: &'a [i64]) -> Self {
         match ForBitpackingSer::new(input) {
@@ -783,16 +631,19 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
+    /// Creates an f32 flat serializer.
     #[inline]
     pub(crate) fn new_f32(input: &'a [f32]) -> Self {
         LwcPrimitiveSer::FlatF32(flat_f32_bytes(input))
     }
 
+    /// Creates an f64 flat serializer.
     #[inline]
     pub(crate) fn new_f64(input: &'a [f64]) -> Self {
         LwcPrimitiveSer::FlatF64(flat_f64_bytes(input))
     }
 
+    /// Creates a borrowed varbyte flat serializer.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved new_bytes"))]
     pub(crate) fn new_bytes(offsets: &[u32], data: &[u8]) -> Result<Self> {
@@ -807,6 +658,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         }))
     }
 
+    /// Creates an owned varbyte flat serializer.
     #[inline]
     pub(crate) fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> Result<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
@@ -817,6 +669,7 @@ impl<'a> LwcPrimitiveSer<'a> {
         Ok(LwcPrimitiveSer::Bytes(LwcBytesSer { offsets, data }))
     }
 
+    /// Returns the wire compression code for this serializer.
     #[inline]
     pub(crate) fn code(&self) -> LwcCode {
         match self {
@@ -897,8 +750,6 @@ impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
     }
 }
 
-const LWC_BLOCK_HEADER_SIZE: usize = 24;
-
 struct LwcColumnStats {
     min_i64: i64,
     max_i64: i64,
@@ -939,18 +790,7 @@ impl LwcColumnStats {
             self.max_u64 = self.max_u64.max(value);
         }
     }
-}
 
-#[derive(Clone, Copy)]
-struct LwcColumnSnapshot {
-    initialized: bool,
-    min_i64: i64,
-    max_i64: i64,
-    min_u64: u64,
-    max_u64: u64,
-}
-
-impl LwcColumnStats {
     fn snapshot(&self) -> LwcColumnSnapshot {
         LwcColumnSnapshot {
             initialized: self.initialized,
@@ -970,12 +810,22 @@ impl LwcColumnStats {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LwcColumnSnapshot {
+    initialized: bool,
+    min_i64: i64,
+    max_i64: i64,
+    min_u64: u64,
+    max_u64: u64,
+}
+
 struct LwcSnapshot {
     row_count: usize,
     row_ids_len: usize,
     stats: Vec<LwcColumnSnapshot>,
 }
 
+/// Builder that accumulates row-page data into one persisted LWC block image.
 pub(crate) struct LwcBuilder<'a> {
     col_layout: &'a TableColumnLayout,
     buffer: ScanBuffer,
@@ -984,6 +834,7 @@ pub(crate) struct LwcBuilder<'a> {
 }
 
 impl<'a> LwcBuilder<'a> {
+    /// Creates an empty LWC builder for the provided column layout.
     pub(crate) fn new(col_layout: &'a TableColumnLayout) -> Self {
         let scan_set: Vec<_> = (0..col_layout.col_count()).collect();
         let stats = (0..col_layout.col_count())
@@ -998,27 +849,32 @@ impl<'a> LwcBuilder<'a> {
         }
     }
 
+    /// Returns whether no rows have been appended.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
+    /// Returns the number of rows currently buffered.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved row_count"))]
     pub(crate) fn row_count(&self) -> usize {
         self.buffer.len()
     }
 
+    /// Returns the row ids represented by the buffered rows.
     #[inline]
     pub(crate) fn row_ids(&self) -> &[RowID] {
         &self.row_ids
     }
 
+    /// Appends all non-deleted rows from `page` if the block still fits.
     pub(crate) fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
         let view = page.vector_view(self.col_layout);
         self.append_view(page, view)
     }
 
+    /// Appends rows described by `view` if the block still fits.
     pub(crate) fn append_view(
         &mut self,
         page: &RowPage,
@@ -1054,6 +910,7 @@ impl<'a> LwcBuilder<'a> {
         Ok(true)
     }
 
+    /// Builds a persisted LWC block with the supplied row-shape fingerprint.
     pub(crate) fn build(&self, row_shape_fingerprint: u128) -> Result<DirectBuf> {
         if self.buffer.is_empty() {
             return Err(Report::new(InternalError::LwcBuilderMisuse)
@@ -1185,11 +1042,7 @@ impl<'a> LwcBuilder<'a> {
         }
     }
 
-    fn scan_page_stats(
-        &mut self,
-        view: &crate::row::vector_scan::PageVectorView<'_, '_>,
-        row_ids: &[RowID],
-    ) -> Result<()> {
+    fn scan_page_stats(&mut self, view: &PageVectorView<'_, '_>, row_ids: &[RowID]) -> Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -1197,7 +1050,7 @@ impl<'a> LwcBuilder<'a> {
             let (null_bitmap, values) = view.col(col_idx);
             let null_bitmap = null_bitmap.as_deref();
             match values {
-                crate::row::vector_scan::ValArrayRef::I8(vals) => {
+                ValArrayRef::I8(vals) => {
                     self.update_stats_i64(
                         col_idx,
                         null_bitmap,
@@ -1206,7 +1059,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v as i64,
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::U8(vals) => {
+                ValArrayRef::U8(vals) => {
                     self.update_stats_u64(
                         col_idx,
                         null_bitmap,
@@ -1215,7 +1068,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v as u64,
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::I16(vals) => {
+                ValArrayRef::I16(vals) => {
                     self.update_stats_i64(
                         col_idx,
                         null_bitmap,
@@ -1224,7 +1077,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v.get() as i64,
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::U16(vals) => {
+                ValArrayRef::U16(vals) => {
                     self.update_stats_u64(
                         col_idx,
                         null_bitmap,
@@ -1233,7 +1086,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v.get() as u64,
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::I32(vals) => {
+                ValArrayRef::I32(vals) => {
                     self.update_stats_i64(
                         col_idx,
                         null_bitmap,
@@ -1242,7 +1095,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v.get() as i64,
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::U32(vals) => {
+                ValArrayRef::U32(vals) => {
                     self.update_stats_u64(
                         col_idx,
                         null_bitmap,
@@ -1251,7 +1104,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v.get() as u64,
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::I64(vals) => {
+                ValArrayRef::I64(vals) => {
                     self.update_stats_i64(
                         col_idx,
                         null_bitmap,
@@ -1260,7 +1113,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v.get(),
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::U64(vals) => {
+                ValArrayRef::U64(vals) => {
                     self.update_stats_u64(
                         col_idx,
                         null_bitmap,
@@ -1269,9 +1122,7 @@ impl<'a> LwcBuilder<'a> {
                         |v| v.get(),
                     );
                 }
-                crate::row::vector_scan::ValArrayRef::F32(_)
-                | crate::row::vector_scan::ValArrayRef::F64(_)
-                | crate::row::vector_scan::ValArrayRef::VarByte(_, _) => {}
+                ValArrayRef::F32(_) | ValArrayRef::F64(_) | ValArrayRef::VarByte(_, _) => {}
             }
         }
         Ok(())
@@ -1324,6 +1175,496 @@ impl<'a> LwcBuilder<'a> {
         total += estimate_columns_size(self.col_layout, &self.buffer, &self.stats, row_count)?;
         Ok(total)
     }
+}
+
+/// Flat borrowed i8 payload.
+pub(crate) struct FlatI8<'a>(&'a [u8]);
+
+impl<'a> LwcPrimitiveData for FlatI8<'a> {
+    type Value = i8;
+    type Iter = FlatI8Iter<'a>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn value(&self, idx: usize) -> Option<Self::Value> {
+        if idx < self.0.len() {
+            let v = self.0[idx] as i8;
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+        target.extend(self.iter())
+    }
+
+    #[inline]
+    fn iter(&self) -> FlatI8Iter<'a> {
+        FlatI8Iter(self.0.iter())
+    }
+}
+
+/// Iterator over a flat borrowed i8 payload.
+pub(crate) struct FlatI8Iter<'a>(Iter<'a, u8>);
+
+impl<'a> Iterator for FlatI8Iter<'a> {
+    type Item = i8;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|v| *v as i8)
+    }
+}
+
+/// Flat borrowed u8 payload.
+pub(crate) struct FlatU8<'a>(&'a [u8]);
+
+impl<'a> LwcPrimitiveData for FlatU8<'a> {
+    type Value = u8;
+    type Iter = FlatU8Iter<'a>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn value(&self, idx: usize) -> Option<Self::Value> {
+        if idx < self.0.len() {
+            let v = self.0[idx];
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+        target.extend(self.iter())
+    }
+
+    #[inline]
+    fn iter(&self) -> FlatU8Iter<'a> {
+        FlatU8Iter(self.0.iter())
+    }
+}
+
+/// Iterator over a flat borrowed u8 payload.
+pub(crate) struct FlatU8Iter<'a>(Iter<'a, u8>);
+
+impl<'a> Iterator for FlatU8Iter<'a> {
+    type Item = u8;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().copied()
+    }
+}
+
+/// Borrowed flat varbyte payload.
+pub(crate) struct LwcBytes<'a> {
+    offsets: &'a [[u8; 4]],
+    data: &'a [u8],
+}
+
+impl<'a> LwcBytes<'a> {
+    #[inline]
+    fn slice(&self, idx: usize) -> Option<&'a [u8]> {
+        if idx + 1 >= self.offsets.len() {
+            return None;
+        }
+        let start = u32::from_le_bytes(self.offsets[idx]) as usize;
+        let end = u32::from_le_bytes(self.offsets[idx + 1]) as usize;
+        if start > end || end > self.data.len() {
+            return None;
+        }
+        Some(&self.data[start..end])
+    }
+
+    /// Returns the varbyte value at `idx`.
+    #[inline]
+    pub(crate) fn value_at(&self, idx: usize) -> Option<MemVar> {
+        self.slice(idx).map(MemVar::from)
+    }
+}
+
+impl<'a> LwcPrimitiveData for LwcBytes<'a> {
+    type Value = MemVar;
+    type Iter = LwcBytesIter<'a>;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    #[inline]
+    fn value(&self, idx: usize) -> Option<Self::Value> {
+        self.value_at(idx)
+    }
+
+    #[inline]
+    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+        target.extend(self.iter());
+    }
+
+    #[inline]
+    fn iter(&self) -> Self::Iter {
+        LwcBytesIter {
+            offsets: self.offsets,
+            data: self.data,
+            idx: 0,
+        }
+    }
+}
+
+/// Iterator over borrowed flat varbyte values.
+pub(crate) struct LwcBytesIter<'a> {
+    offsets: &'a [[u8; 4]],
+    data: &'a [u8],
+    idx: usize,
+}
+
+impl<'a> Iterator for LwcBytesIter<'a> {
+    type Item = MemVar;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let res = LwcBytes {
+            offsets: self.offsets,
+            data: self.data,
+        }
+        .value_at(self.idx);
+        self.idx += 1;
+        res
+    }
+}
+
+/// Owned serializer for flat varbyte payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LwcBytesSer {
+    offsets: Vec<u32>,
+    data: Vec<u8>,
+}
+
+impl Ser<'_> for LwcBytesSer {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u64>() + self.offsets.len() * mem::size_of::<u32>() + self.data.len()
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        debug_assert!(!self.offsets.is_empty());
+        let mut idx = out.ser_u64(start_idx, (self.offsets.len() - 1) as u64);
+        for off in self.offsets.iter().copied() {
+            idx = out.ser_u32(idx, off);
+        }
+        out.ser_byte_slice(idx, &self.data)
+    }
+}
+
+/// Borrowed null bitmap payload.
+#[derive(Debug)]
+pub(crate) struct LwcNullBitmap<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> LwcNullBitmap<'a> {
+    /// Parses a length-prefixed null bitmap and returns the remaining payload.
+    #[inline]
+    pub(crate) fn from_bytes(input: &'a [u8]) -> Result<(Self, &'a [u8])> {
+        let (len, input) = read_le_u16(input)?;
+        let len = len as usize;
+        if input.len() < len {
+            return Err(invalid_compressed_payload(
+                "LWC null bitmap payload is shorter than declared length",
+            ));
+        }
+        let (bytes, rest) = input.split_at(len);
+        Ok((LwcNullBitmap { bytes }, rest))
+    }
+
+    /// Returns whether `row_idx` is marked null.
+    #[inline]
+    pub(crate) fn is_null(&self, row_idx: usize) -> bool {
+        let byte_idx = row_idx / 8;
+        if byte_idx >= self.bytes.len() {
+            return false;
+        }
+        let bit_mask = 1 << (row_idx % 8);
+        self.bytes[byte_idx] & bit_mask != 0
+    }
+
+    /// Returns the bitmap length in bytes.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Returns the raw bitmap bytes.
+    #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+/// Serializer for length-prefixed null bitmap payloads.
+pub(crate) struct LwcNullBitmapSer<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> LwcNullBitmapSer<'a> {
+    /// Creates a null bitmap serializer after validating the length prefix fits.
+    #[inline]
+    pub(crate) fn new(bytes: &'a [u8]) -> Result<Self> {
+        if bytes.len() > u16::MAX as usize {
+            return Err(invalid_compressed_payload(
+                "LWC null bitmap payload length exceeds u16::MAX",
+            ));
+        }
+        Ok(LwcNullBitmapSer { bytes })
+    }
+}
+
+impl Ser<'_> for LwcNullBitmapSer<'_> {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u16>() + self.bytes.len()
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u16(start_idx, self.bytes.len() as u16);
+        out.ser_byte_slice(idx, self.bytes)
+    }
+}
+
+macro_rules! impl_lwc_flat {
+    ($t:ident, $v:ty, $unit:ty, $it:ident) => {
+        pub(crate) struct $t<'a>(&'a [$unit]);
+
+        impl<'a> LwcPrimitiveData for $t<'a> {
+            type Value = $v;
+            type Iter = $it<'a>;
+
+            #[inline]
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+
+            #[inline]
+            fn value(&self, idx: usize) -> Option<Self::Value> {
+                if idx < self.0.len() {
+                    let u = self.0[idx];
+                    let v = <$v>::from_le_bytes(u);
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+
+            #[inline]
+            fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
+                target.extend(self.iter())
+            }
+
+            #[inline]
+            fn iter(&self) -> Self::Iter {
+                $it(self.0.iter())
+            }
+        }
+
+        pub(crate) struct $it<'a>(std::slice::Iter<'a, $unit>);
+
+        impl<'a> Iterator for $it<'a> {
+            type Item = $v;
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                self.0.next().map(|v| <$v>::from_le_bytes(*v))
+            }
+        }
+    };
+}
+
+impl_lwc_flat!(FlatI16, i16, [u8; 2], FlatI16Iter);
+impl_lwc_flat!(FlatU16, u16, [u8; 2], FlatU16Iter);
+impl_lwc_flat!(FlatI32, i32, [u8; 4], FlatI32Iter);
+impl_lwc_flat!(FlatU32, u32, [u8; 4], FlatU32Iter);
+impl_lwc_flat!(FlatI64, i64, [u8; 8], FlatI64Iter);
+impl_lwc_flat!(FlatU64, u64, [u8; 8], FlatU64Iter);
+impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
+impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
+
+#[inline]
+fn invalid_compressed_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn lwc_block_encoding_invariant() -> Error {
+    Report::new(InternalError::LwcBlockEncodingInvariant).into()
+}
+
+#[inline]
+fn column_scan_shape_mismatch() -> Error {
+    Report::new(InternalError::ColumnScanShapeMismatch).into()
+}
+
+#[inline]
+fn lwc_payload_len_from_u64(len: u64, payload: &str) -> Result<usize> {
+    usize::try_from(len)
+        .map_err(|_| invalid_compressed_payload(format!("{payload} length exceeds usize::MAX")))
+}
+
+#[inline]
+fn checked_lwc_payload_len(len: usize, unit_len: usize, payload: &str) -> Result<usize> {
+    len.checked_mul(unit_len)
+        .ok_or_else(|| invalid_compressed_payload(format!("{payload} length overflows usize")))
+}
+
+#[inline]
+fn expect_exact_lwc_payload_len(
+    actual_len: usize,
+    expected_len: usize,
+    payload: &str,
+) -> Result<()> {
+    if actual_len != expected_len {
+        return Err(invalid_compressed_payload(format!(
+            "{payload} length mismatch: expected {expected_len}, actual {actual_len}"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn flat_lwc_payload<'a>(
+    input: &'a [u8],
+    len: usize,
+    unit_len: usize,
+    payload: &str,
+) -> Result<&'a [u8]> {
+    let expected_len = checked_lwc_payload_len(len, unit_len, payload)?;
+    expect_exact_lwc_payload_len(input.len(), expected_len, payload)?;
+    Ok(input)
+}
+
+#[inline]
+fn for_bitpacking_lwc_payload(data: &[u8], len: usize, n_bits: usize) -> Result<&[u8]> {
+    let expected_bits = checked_lwc_payload_len(len, n_bits, "LWC FOR bitpacking payload")?;
+    let expected_len = expected_bits.div_ceil(8);
+    expect_exact_lwc_payload_len(data.len(), expected_len, "LWC FOR bitpacking payload")?;
+    Ok(data)
+}
+
+#[inline]
+fn flat_bytes_borrowed<'a, T, const N: usize>(input: &'a [T]) -> Cow<'a, [[u8; N]]>
+where
+    [T]: IntoBytes + Immutable,
+{
+    Cow::Borrowed(layout::slice_from_bytes::<[u8; N]>(input.as_bytes()))
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
 }
 
 #[inline]
@@ -1470,314 +1811,6 @@ fn estimate_bitpacked_size(range: u64, row_count: usize, unit: usize, flat: usiz
         + unit
         + (row_count * bits).div_ceil(8)
 }
-
-pub(crate) struct FlatI8<'a>(&'a [u8]);
-
-impl<'a> LwcPrimitiveData for FlatI8<'a> {
-    type Value = i8;
-    type Iter = FlatI8Iter<'a>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<Self::Value> {
-        if idx < self.0.len() {
-            let v = self.0[idx] as i8;
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        target.extend(self.iter())
-    }
-
-    #[inline]
-    fn iter(&self) -> FlatI8Iter<'a> {
-        FlatI8Iter(self.0.iter())
-    }
-}
-
-pub(crate) struct FlatI8Iter<'a>(std::slice::Iter<'a, u8>);
-
-impl<'a> Iterator for FlatI8Iter<'a> {
-    type Item = i8;
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|v| *v as i8)
-    }
-}
-
-pub(crate) struct FlatU8<'a>(&'a [u8]);
-
-impl<'a> LwcPrimitiveData for FlatU8<'a> {
-    type Value = u8;
-    type Iter = FlatU8Iter<'a>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<Self::Value> {
-        if idx < self.0.len() {
-            let v = self.0[idx];
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        target.extend(self.iter())
-    }
-
-    #[inline]
-    fn iter(&self) -> FlatU8Iter<'a> {
-        FlatU8Iter(self.0.iter())
-    }
-}
-
-pub(crate) struct FlatU8Iter<'a>(std::slice::Iter<'a, u8>);
-
-impl<'a> Iterator for FlatU8Iter<'a> {
-    type Item = u8;
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().copied()
-    }
-}
-
-pub(crate) struct LwcBytes<'a> {
-    offsets: &'a [[u8; 4]],
-    data: &'a [u8],
-}
-
-impl<'a> LwcBytes<'a> {
-    #[inline]
-    fn slice(&self, idx: usize) -> Option<&'a [u8]> {
-        if idx + 1 >= self.offsets.len() {
-            return None;
-        }
-        let start = u32::from_le_bytes(self.offsets[idx]) as usize;
-        let end = u32::from_le_bytes(self.offsets[idx + 1]) as usize;
-        if start > end || end > self.data.len() {
-            return None;
-        }
-        Some(&self.data[start..end])
-    }
-
-    #[inline]
-    pub(crate) fn value_at(&self, idx: usize) -> Option<MemVar> {
-        self.slice(idx).map(MemVar::from)
-    }
-}
-
-pub(crate) struct LwcBytesIter<'a> {
-    offsets: &'a [[u8; 4]],
-    data: &'a [u8],
-    idx: usize,
-}
-
-impl<'a> Iterator for LwcBytesIter<'a> {
-    type Item = MemVar;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let res = LwcBytes {
-            offsets: self.offsets,
-            data: self.data,
-        }
-        .value_at(self.idx);
-        self.idx += 1;
-        res
-    }
-}
-
-impl<'a> LwcPrimitiveData for LwcBytes<'a> {
-    type Value = MemVar;
-    type Iter = LwcBytesIter<'a>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<Self::Value> {
-        self.value_at(idx)
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        target.extend(self.iter());
-    }
-
-    #[inline]
-    fn iter(&self) -> Self::Iter {
-        LwcBytesIter {
-            offsets: self.offsets,
-            data: self.data,
-            idx: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LwcBytesSer {
-    offsets: Vec<u32>,
-    data: Vec<u8>,
-}
-
-impl Ser<'_> for LwcBytesSer {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>() + self.offsets.len() * mem::size_of::<u32>() + self.data.len()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        debug_assert!(!self.offsets.is_empty());
-        let mut idx = out.ser_u64(start_idx, (self.offsets.len() - 1) as u64);
-        for off in self.offsets.iter().copied() {
-            idx = out.ser_u32(idx, off);
-        }
-        out.ser_byte_slice(idx, &self.data)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct LwcNullBitmap<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> LwcNullBitmap<'a> {
-    #[inline]
-    pub(crate) fn from_bytes(input: &'a [u8]) -> Result<(Self, &'a [u8])> {
-        let (len, input) = read_le_u16(input)?;
-        let len = len as usize;
-        if input.len() < len {
-            return Err(invalid_compressed_payload(
-                "LWC null bitmap payload is shorter than declared length",
-            ));
-        }
-        let (bytes, rest) = input.split_at(len);
-        Ok((LwcNullBitmap { bytes }, rest))
-    }
-
-    #[inline]
-    pub(crate) fn is_null(&self, row_idx: usize) -> bool {
-        let byte_idx = row_idx / 8;
-        if byte_idx >= self.bytes.len() {
-            return false;
-        }
-        let bit_mask = 1 << (row_idx % 8);
-        self.bytes[byte_idx] & bit_mask != 0
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    pub(crate) fn as_bytes(&self) -> &'a [u8] {
-        self.bytes
-    }
-}
-
-pub(crate) struct LwcNullBitmapSer<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> LwcNullBitmapSer<'a> {
-    #[inline]
-    pub(crate) fn new(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.len() > u16::MAX as usize {
-            return Err(invalid_compressed_payload(
-                "LWC null bitmap payload length exceeds u16::MAX",
-            ));
-        }
-        Ok(LwcNullBitmapSer { bytes })
-    }
-}
-
-impl Ser<'_> for LwcNullBitmapSer<'_> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u16>() + self.bytes.len()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u16(start_idx, self.bytes.len() as u16);
-        out.ser_byte_slice(idx, self.bytes)
-    }
-}
-
-macro_rules! impl_lwc_flat {
-    ($t:ident, $v:ty, $unit:ty, $it:ident) => {
-        pub(crate) struct $t<'a>(&'a [$unit]);
-
-        impl<'a> LwcPrimitiveData for $t<'a> {
-            type Value = $v;
-            type Iter = $it<'a>;
-
-            #[inline]
-            fn len(&self) -> usize {
-                self.0.len()
-            }
-
-            #[inline]
-            fn value(&self, idx: usize) -> Option<Self::Value> {
-                if idx < self.0.len() {
-                    let u = self.0[idx];
-                    let v = <$v>::from_le_bytes(u);
-                    Some(v)
-                } else {
-                    None
-                }
-            }
-
-            #[inline]
-            fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-                target.extend(self.iter())
-            }
-
-            #[inline]
-            fn iter(&self) -> Self::Iter {
-                $it(self.0.iter())
-            }
-        }
-
-        pub(crate) struct $it<'a>(std::slice::Iter<'a, $unit>);
-
-        impl<'a> Iterator for $it<'a> {
-            type Item = $v;
-            #[inline]
-            fn next(&mut self) -> Option<Self::Item> {
-                self.0.next().map(|v| <$v>::from_le_bytes(*v))
-            }
-        }
-    };
-}
-
-impl_lwc_flat!(FlatI16, i16, [u8; 2], FlatI16Iter);
-impl_lwc_flat!(FlatU16, u16, [u8; 2], FlatU16Iter);
-impl_lwc_flat!(FlatI32, i32, [u8; 4], FlatI32Iter);
-impl_lwc_flat!(FlatU32, u32, [u8; 4], FlatU32Iter);
-impl_lwc_flat!(FlatI64, i64, [u8; 8], FlatI64Iter);
-impl_lwc_flat!(FlatU64, u64, [u8; 8], FlatU64Iter);
-impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
-impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
 
 #[inline]
 fn read_le_u64(input: &[u8]) -> Result<(u64, &[u8])> {
