@@ -62,6 +62,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
         }
     }
 
+    /// Scan slots whose keys start with `key` and invoke the callback for each.
     #[inline]
     pub(crate) async fn scan_prefix(&mut self, key: &[u8]) -> Result<()> {
         // find first leaf node of prefix key.
@@ -138,7 +139,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::FixedBufferPool;
+    use crate::buffer::{FixedBufferPool, PoolRole};
     use crate::error::InternalError;
     use crate::id::TrxID;
     use crate::index::btree::BTree;
@@ -146,13 +147,13 @@ mod tests {
     use crate::index::util::Maskable;
     use crate::quiescent::QuiescentBox;
     use error_stack::Report;
+    use std::mem::size_of;
 
     #[test]
     fn test_btree_scan_single_node() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
             );
             {
                 let pool_guard = (*pool).pool_guard();
@@ -226,8 +227,7 @@ mod tests {
         const PREFIX_LEN: usize = 992;
         smol::block_on(async {
             let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
             );
             {
                 let pool_guard = (*pool).pool_guard();
@@ -242,7 +242,7 @@ mod tests {
                         elem[..PREFIX_LEN].fill(b'x');
                         elem[0] = *prefix;
                         elem[PREFIX_LEN] = entry_idx as u8;
-                        elem[KEY_LEN - std::mem::size_of::<u32>()..]
+                        elem[KEY_LEN - size_of::<u32>()..]
                             .copy_from_slice(&(entry_idx as u32).to_be_bytes());
                         let res = tree
                             .insert(
@@ -305,8 +305,7 @@ mod tests {
     fn test_btree_scan_propagates_callback_error() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
-                    .unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
             let tree = BTree::new(pool.guard(), &pool_guard, true, TrxID::new(200))

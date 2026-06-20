@@ -4,6 +4,7 @@ use crate::memcmp::{
 use crate::value::{Val, ValKind, ValType};
 use std::borrow::Borrow;
 
+/// Memory-comparable encoded key used by B-tree nodes.
 pub(crate) type BTreeKey = MemCmpKey;
 
 trait KeyEncoder {
@@ -19,6 +20,7 @@ trait KeyEncoder {
     fn encode_copy(&self, key: &Val, buf: &mut [u8], start_idx: usize) -> usize;
 }
 
+/// Encoder for a single logical value into a memory-comparable B-tree key.
 pub(crate) struct SingleKeyEncoder(ValType);
 
 impl SingleKeyEncoder {
@@ -179,6 +181,7 @@ impl KeyEncoder for SegmentedBytesEncoder {
     }
 }
 
+/// Encoder for one non-final component of a composite B-tree key.
 pub(crate) enum PrefixKeyEncoder {
     Single(SingleKeyEncoder),
     Segmented(SegmentedBytesEncoder),
@@ -210,6 +213,7 @@ impl KeyEncoder for PrefixKeyEncoder {
     }
 }
 
+/// Encoder for single-column and composite B-tree keys.
 pub(crate) enum BTreeKeyEncoder {
     Single(SingleKeyEncoder),
     Multi {
@@ -415,6 +419,7 @@ mod tests {
     use super::*;
     use crate::memcmp::NULL_FLAG;
     use std::f64::consts::PI;
+    use std::slice::from_ref;
 
     #[test]
     fn test_single_key_encoder_basic() {
@@ -609,7 +614,7 @@ mod tests {
 
         for (ty, val, expected) in test_cases {
             let encoder = BTreeKeyEncoder::new(vec![ty]);
-            let key = encoder.encode(std::slice::from_ref(&val));
+            let key = encoder.encode(from_ref(&val));
             assert_eq!(key.as_bytes(), expected);
         }
 

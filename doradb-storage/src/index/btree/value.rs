@@ -6,6 +6,19 @@ use std::mem;
 use std::ops::Deref;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+/// Maximum byte width of a value that can be packed into a key suffix.
+pub(crate) const BTREE_VALUE_PACK_MAX_LEN: usize = 8;
+
+const BTREE_VALUE_U64_DELETE_BIT: u64 = 1u64 << 63;
+
+const _: () = assert!(BTreeU64::INVALID_VALUE.0 == INVALID_ROW_ID.as_u64());
+const _: () = assert!(BTreeU64::INVALID_VALUE.0 == INVALID_PAGE_ID.as_u64());
+
+const BTREE_VALUE_BYTE_DELETE_BIT: u8 = 1;
+
+/// Zero byte value used by non-unique indexes without a row-id payload.
+pub(crate) const BTREE_BYTE_ZERO: BTreeByte = BTreeByte(0);
+
 /// BTreeValue is the value type stored in leaf node.
 /// In branch node, the value type is always page id,
 /// which is a logical pointer to child node.
@@ -30,12 +43,12 @@ use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 pub(crate) trait BTreeValue: Maskable {
     const ENCODED_LEN: usize;
 
+    /// Encode this value in little-endian order into `dst`.
     fn encode_le(self, dst: &mut [u8]);
 
+    /// Decode this value from little-endian bytes in `src`.
     fn decode_le(src: &[u8]) -> Self;
 }
-
-pub(crate) const BTREE_VALUE_PACK_MAX_LEN: usize = 8;
 
 /// Defines how to unpack a value from key.
 pub(crate) trait BTreeValuePackable: BTreeValue {
@@ -62,6 +75,20 @@ pub(crate) trait BTreeValuePackable: BTreeValue {
 )]
 #[repr(transparent)]
 pub struct BTreeU64(u64);
+
+impl BTreeU64 {
+    /// Return the raw `u64` representation.
+    #[inline]
+    pub fn to_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Convert the value to a row identifier.
+    #[inline]
+    pub(crate) fn to_row_id(self) -> RowID {
+        RowID::new(self.0)
+    }
+}
 
 impl Deref for BTreeU64 {
     type Target = u64;
@@ -91,37 +118,6 @@ impl From<RowID> for BTreeU64 {
         BTreeU64(value.into())
     }
 }
-
-impl From<BTreeU64> for PageID {
-    #[inline]
-    fn from(value: BTreeU64) -> Self {
-        PageID::from(value.0)
-    }
-}
-
-impl From<BTreeU64> for RowID {
-    #[inline]
-    fn from(value: BTreeU64) -> Self {
-        RowID::from(value.0)
-    }
-}
-
-impl BTreeU64 {
-    #[inline]
-    pub fn to_u64(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub(crate) fn to_row_id(self) -> RowID {
-        RowID::new(self.0)
-    }
-}
-
-const BTREE_VALUE_U64_DELETE_BIT: u64 = 1u64 << 63;
-
-const _: () = assert!(BTreeU64::INVALID_VALUE.0 == INVALID_ROW_ID.as_u64());
-const _: () = assert!(BTreeU64::INVALID_VALUE.0 == INVALID_PAGE_ID.as_u64());
 
 impl Maskable for BTreeU64 {
     const INVALID_VALUE: Self = BTreeU64(!0);
@@ -167,6 +163,20 @@ impl BTreeValuePackable for BTreeU64 {
     }
 }
 
+impl From<BTreeU64> for PageID {
+    #[inline]
+    fn from(value: BTreeU64) -> Self {
+        PageID::from(value.0)
+    }
+}
+
+impl From<BTreeU64> for RowID {
+    #[inline]
+    fn from(value: BTreeU64) -> Self {
+        RowID::from(value.0)
+    }
+}
+
 /// U8 value type to support non-unique-index.
 /// Only one bit is used for delete flag.
 #[derive(
@@ -186,9 +196,6 @@ impl BTreeValuePackable for BTreeU64 {
 )]
 #[repr(transparent)]
 pub(crate) struct BTreeByte(u8);
-
-const BTREE_VALUE_BYTE_DELETE_BIT: u8 = 1;
-pub(crate) const BTREE_BYTE_ZERO: BTreeByte = BTreeByte(0);
 
 impl Maskable for BTreeByte {
     const INVALID_VALUE: Self = BTreeByte(!0);

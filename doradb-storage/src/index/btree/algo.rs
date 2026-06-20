@@ -13,11 +13,6 @@ use crate::index::btree::{
 use error_stack::Report;
 use std::ops::Range;
 
-#[inline]
-fn btree_pack_invariant() -> Error {
-    Report::new(InternalError::BTreePackInvariant).into()
-}
-
 /// One sorted slot entry to be packed into a `BTreeNode`.
 #[derive(Clone, Copy)]
 pub(crate) struct PackedNodeEntry<'a, V> {
@@ -113,19 +108,6 @@ pub(crate) enum MemTreeSiblingMergePlan {
     Full,
     /// The left anchor can absorb this many right-side slots.
     Partial { right_count: usize },
-}
-
-/// Select the exclusive upper fence for a packed sibling.
-///
-/// `packed` is the number of slot entries assigned to the current node. When a
-/// following entry remains, its key becomes this node's exclusive upper fence;
-/// otherwise the node is rightmost and remains open-ended.
-#[inline]
-fn packed_sibling_upper_fence<'a, V>(
-    entries: &'a [PackedNodeEntry<'a, V>],
-    packed: usize,
-) -> Option<&'a [u8]> {
-    entries.get(packed).map(|entry| entry.key)
 }
 
 /// Plan the largest valid packed prefix of sorted sibling entries.
@@ -325,6 +307,24 @@ where
     }
 }
 
+#[inline]
+fn btree_pack_invariant() -> Error {
+    Report::new(InternalError::BTreePackInvariant).into()
+}
+
+/// Select the exclusive upper fence for a packed sibling.
+///
+/// `packed` is the number of slot entries assigned to the current node. When a
+/// following entry remains, its key becomes this node's exclusive upper fence;
+/// otherwise the node is rightmost and remains open-ended.
+#[inline]
+fn packed_sibling_upper_fence<'a, V>(
+    entries: &'a [PackedNodeEntry<'a, V>],
+    packed: usize,
+) -> Option<&'a [u8]> {
+    entries.get(packed).map(|entry| entry.key)
+}
+
 fn finish_node_range<'a, V>(
     dst: &mut BTreeNode,
     src: &BTreeNode,
@@ -491,6 +491,7 @@ fn fences_fit(lower_fence: &[u8], upper_fence: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{ErrorKind, InternalError};
     use crate::index::btree::{BTREE_NODE_USABLE_SIZE, BTreeNil, BTreeNodeBox};
     use crate::index::util::Maskable;
 
@@ -789,12 +790,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.is_kind(crate::error::ErrorKind::Internal));
+        assert!(err.is_kind(ErrorKind::Internal));
         assert_eq!(
-            err.report()
-                .downcast_ref::<crate::error::InternalError>()
-                .copied(),
-            Some(crate::error::InternalError::BTreePackInvariant)
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::BTreePackInvariant)
         );
     }
 
