@@ -34,50 +34,12 @@ use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
+use smol::Timer;
 use std::collections::BTreeSet;
 use std::mem;
+use std::ptr::addr_eq;
 use std::sync::Arc;
-
-#[inline]
-fn invalid_lwc_payload(
-    file_kind: FileKind,
-    block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
-    let message = message.into();
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
-        ))
-        .into()
-}
-
-#[inline]
-fn cold_row_visible_for_scan(
-    deletion_buffer: &ColumnDeletionBuffer,
-    reader_sts: TrxID,
-    reader_status: &SharedTrxStatus,
-    row_id: RowID,
-    persisted_deleted: bool,
-) -> bool {
-    if persisted_deleted {
-        return false;
-    }
-    let Some(marker) = deletion_buffer.get(row_id) else {
-        return true;
-    };
-    match marker {
-        DeleteMarker::Committed(ts) => ts > reader_sts,
-        DeleteMarker::Ref(status) => {
-            let ts = status.ts();
-            if trx_is_committed(ts) {
-                ts > reader_sts
-            } else {
-                !std::ptr::addr_eq(status.as_ref(), reader_status)
-            }
-        }
-    }
-}
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub(super) struct RowIdMove {
@@ -105,18 +67,6 @@ pub(crate) struct UserTableAccessor<'a> {
     layout: &'a TableRuntimeLayout,
 }
 
-pub(super) enum IndexPurgeDecision {
-    Delete,
-    Keep,
-    RowPage(PageID),
-}
-
-pub(super) enum ColdRowUpdateRead {
-    Ok(Vec<Val>),
-    NotFound,
-    WriteConflict,
-}
-
 impl<'a> UserTableAccessor<'a> {
     /// Create a user-table accessor over an externally pinned layout snapshot.
     #[inline]
@@ -137,9 +87,7 @@ impl<'a> UserTableAccessor<'a> {
     fn user_sec_idx(&self) -> &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>] {
         self.layout().secondary_indexes()
     }
-}
 
-impl UserTableAccessor<'_> {
     #[inline]
     fn mem(&self) -> &MemTable<EvictableBufferPool, EvictableBufferPool> {
         &self.table.mem
@@ -2810,6 +2758,7 @@ impl UserTableAccessor<'_> {
         .await
     }
 
+    /// Scan cold and hot table rows visible to the transaction snapshot.
     pub(crate) async fn table_scan_mvcc<F>(
         &self,
         rt: TrxRuntime<'_>,
@@ -2846,6 +2795,7 @@ impl UserTableAccessor<'_> {
         .await
     }
 
+    /// Lookup one visible row through a unique secondary index.
     pub(crate) async fn index_lookup_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -2885,6 +2835,7 @@ impl UserTableAccessor<'_> {
         }
     }
 
+    /// Scan visible rows matching a non-unique secondary-index key.
     pub(crate) async fn index_scan_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -2934,6 +2885,7 @@ impl UserTableAccessor<'_> {
         Ok(ScanMvcc::Rows(res))
     }
 
+    /// Insert a new MVCC row and claim all secondary-index entries.
     pub(crate) async fn insert_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -2980,6 +2932,7 @@ impl UserTableAccessor<'_> {
         Ok(row_id)
     }
 
+    /// Update the visible row found through a unique secondary-index key.
     pub(crate) async fn update_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -3210,7 +3163,7 @@ impl UserTableAccessor<'_> {
                         .into());
                 }
                 UpdateRowInplace::RetryInTransition => {
-                    smol::Timer::after(std::time::Duration::from_millis(1)).await;
+                    Timer::after(Duration::from_millis(1)).await;
                 }
                 UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
                     // In-place update failed after the old row was locked and
@@ -3277,6 +3230,7 @@ impl UserTableAccessor<'_> {
         }
     }
 
+    /// Delete the visible row found through a unique secondary-index key.
     pub(crate) async fn delete_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -3402,7 +3356,7 @@ impl UserTableAccessor<'_> {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
                 DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
-                    smol::Timer::after(std::time::Duration::from_millis(1)).await;
+                    Timer::after(Duration::from_millis(1)).await;
                 }
                 DeleteInternal::Ok(page_guard) => {
                     // Mask every secondary-index entry for this hot row. The
@@ -3417,6 +3371,7 @@ impl UserTableAccessor<'_> {
         }
     }
 
+    /// Delete an obsolete secondary-index entry from a purge path.
     pub(crate) async fn delete_index(
         &self,
         guards: &PoolGuards,
@@ -3444,8 +3399,61 @@ impl UserTableAccessor<'_> {
     }
 }
 
+pub(super) enum IndexPurgeDecision {
+    Delete,
+    Keep,
+    RowPage(PageID),
+}
+
+pub(super) enum ColdRowUpdateRead {
+    Ok(Vec<Val>),
+    NotFound,
+    WriteConflict,
+}
+
+#[inline]
+fn invalid_lwc_payload(
+    file_kind: FileKind,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    let message = message.into();
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
+        ))
+        .into()
+}
+
+#[inline]
+fn cold_row_visible_for_scan(
+    deletion_buffer: &ColumnDeletionBuffer,
+    reader_sts: TrxID,
+    reader_status: &SharedTrxStatus,
+    row_id: RowID,
+    persisted_deleted: bool,
+) -> bool {
+    if persisted_deleted {
+        return false;
+    }
+    let Some(marker) = deletion_buffer.get(row_id) else {
+        return true;
+    };
+    match marker {
+        DeleteMarker::Committed(ts) => ts > reader_sts,
+        DeleteMarker::Ref(status) => {
+            let ts = status.ts();
+            if trx_is_committed(ts) {
+                ts > reader_sts
+            } else {
+                !addr_eq(status.as_ref(), reader_status)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-mod table_moved_tests {
+mod tests {
     use crate::buffer::BufferPool;
     use crate::buffer::frame::FrameKind;
     use crate::buffer::{PoolRole, test_frame_kind};
@@ -3470,7 +3478,9 @@ mod table_moved_tests {
     use crate::trx::undo::RowUndoKind;
     use crate::value::Val;
     use error_stack::Report;
-    use std::io;
+    use smol::Timer;
+    use std::io::Error as IoError;
+    use std::iter::repeat_n;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -5215,7 +5225,7 @@ mod table_moved_tests {
             {
                 let table_id = table3(&engine).await;
                 let mut session = engine.new_session().unwrap();
-                let s: String = std::iter::repeat_n('0', SIZE).collect();
+                let s: String = repeat_n('0', SIZE).collect();
                 // insert single row.
                 {
                     let insert = vec![Val::from(&s[..0])];
@@ -5255,7 +5265,7 @@ mod table_moved_tests {
             {
                 let table_id = table3(&engine).await;
                 let mut session = engine.new_session().unwrap();
-                let s: String = std::iter::repeat_n('0', SIZE).collect();
+                let s: String = repeat_n('0', SIZE).collect();
                 // insert 60 rows
                 for i in 0usize..COUNT {
                     let insert = vec![Val::from(&s[..BASE + i])];
@@ -5866,7 +5876,7 @@ mod table_moved_tests {
                     reclaimed = true;
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(200)).await;
+                Timer::after(Duration::from_millis(200)).await;
             }
             assert!(
                 reclaimed,
@@ -5936,7 +5946,7 @@ mod table_moved_tests {
                     reclaimed = true;
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(200)).await;
+                Timer::after(Duration::from_millis(200)).await;
             }
             assert!(
                 reclaimed,
@@ -6057,7 +6067,7 @@ mod table_moved_tests {
                     evicted = true;
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(50)).await;
+                Timer::after(Duration::from_millis(50)).await;
             }
             assert!(
                 evicted,
@@ -6072,7 +6082,7 @@ mod table_moved_tests {
                 libc::EIO,
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
-            let expected_error_kind = io::Error::from_raw_os_error(libc::EIO).kind();
+            let expected_error_kind = IoError::from_raw_os_error(libc::EIO).kind();
 
             let mut trx = session.begin_trx().unwrap();
             let res = trx_insert_row_by_id(
@@ -6144,7 +6154,7 @@ mod table_moved_tests {
                     evicted = true;
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(50)).await;
+                Timer::after(Duration::from_millis(50)).await;
             }
             assert!(evicted, "rollback row page should be evicted before repro");
 
@@ -6240,7 +6250,7 @@ mod table_moved_tests {
                             evicted = true;
                             break;
                         }
-                        smol::Timer::after(Duration::from_millis(50)).await;
+                        Timer::after(Duration::from_millis(50)).await;
                     }
                     assert!(
                         evicted,
@@ -6366,7 +6376,7 @@ mod table_moved_tests {
                 if stats.completed_writes > 0 && stats.write_errors == 0 {
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(50)).await;
+                Timer::after(Duration::from_millis(50)).await;
             }
 
             let stats = engine.inner().index_pool.stats();
@@ -6408,9 +6418,7 @@ mod table_moved_tests {
             let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem),
-                )
+                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
                 .trx(TrxSysConfig::default().log_file_stem("redo_secidx1"))
                 .build()
                 .await

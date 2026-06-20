@@ -2,7 +2,21 @@ use crate::error::{Error, InternalError, OperationError, Result};
 use crate::id::TableID;
 use error_stack::Report;
 use event_listener::{Event, listener};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+const TERMINAL_MASK: u32 = 0b11;
+const PUBLISH_SHIFT: u32 = 2;
+const PUBLISH_MASK: u32 = 0b11 << PUBLISH_SHIFT;
+const METADATA_CHANGE_SHIFT: u32 = 4;
+const METADATA_CHANGE_MASK: u32 = 0b11 << METADATA_CHANGE_SHIFT;
+const ROOT_MUTATION_ACTIVE_BIT: u32 = 1 << 6;
+const STATE_MASK: u32 =
+    TERMINAL_MASK | PUBLISH_MASK | METADATA_CHANGE_MASK | ROOT_MUTATION_ACTIVE_BIT;
+const INITIAL_STATE: u32 = (TableLifecycleState::Live as u32)
+    | ((PublishGateState::Open as u32) << PUBLISH_SHIFT)
+    | ((MetadataChangePhase::Open as u32) << METADATA_CHANGE_SHIFT);
 
 /// Normal checkpoint cancellation reasons for user-table checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,63 +59,6 @@ enum MetadataChangePhase {
     Pending = 1,
     Active = 2,
 }
-
-/// Volatile lifecycle, checkpoint, and metadata-change gates for one user table.
-///
-/// This is one atomically packed state machine with three domains that must stay
-/// coherent:
-///
-/// * table liveness: `Live -> Dropping -> Dropped`. This is terminal and never
-///   moves back to a previous state.
-/// * checkpoint publish admission: `Open` admits one publish lease, `Publishing`
-///   means that lease is active, `ClosingPublishing` means drop has started and
-///   is waiting for that lease to drain, and `Closed` means no publish lease may
-///   be acquired again. Legal combinations are:
-///   `Live + (Open | Publishing)`, `Dropping + (ClosingPublishing | Closed)`,
-///   and `Dropped + Closed`.
-/// * metadata/root exclusion: checkpoint root mutation and future index DDL are
-///   mutually exclusive. Legal combinations are `(Open, no root)`, `(Open, root)`,
-///   `(Pending, root)`, `(Pending, no root)`, and `(Active, no root)`. The
-///   `Pending, no root` combination is the handoff window after a checkpoint
-///   releases the root mutation lease and before the waiting metadata change
-///   future wakes. `Active` is only legal while the table is still `Live`.
-///
-/// `Dropping` and `Dropped` may temporarily coexist with an active checkpoint
-/// root-mutation lease or a pending metadata-change waiter that was admitted
-/// before drop closed the terminal state. Those leases/waiters are unwinding;
-/// no new checkpoint or metadata operation is admitted once the table is not
-/// `Live`.
-///
-/// Transition summary:
-///
-/// * checkpoint root mutation: `Live/Open/no root -> Live/Open/root`, then
-///   release returns to no root. If a metadata change is pending, release leaves
-///   `Pending/no root` so that waiter can become `Active`.
-/// * metadata change: `Open/no root -> Active -> Open`, or `Open/root ->
-///   Pending -> Active -> Open` after the checkpoint root-mutation lease ends.
-/// * checkpoint publish: while a root-mutation lease is active, `Live/Open ->
-///   Live/Publishing -> Live/Open`. If drop starts during publish, it becomes
-///   `Dropping/ClosingPublishing -> Dropping/Closed`.
-/// * drop: `Live/Open -> Dropping/Closed` when no publish lease is active, or
-///   `Live/Publishing -> Dropping/ClosingPublishing -> Dropping/Closed` when
-///   drop must drain an active publish lease. Runtime removal completes with
-///   `Dropping/Closed -> Dropped/Closed`.
-pub(crate) struct TableLifecycle {
-    state: AtomicU32,
-    changed: Event,
-}
-
-const TERMINAL_MASK: u32 = 0b11;
-const PUBLISH_SHIFT: u32 = 2;
-const PUBLISH_MASK: u32 = 0b11 << PUBLISH_SHIFT;
-const METADATA_CHANGE_SHIFT: u32 = 4;
-const METADATA_CHANGE_MASK: u32 = 0b11 << METADATA_CHANGE_SHIFT;
-const ROOT_MUTATION_ACTIVE_BIT: u32 = 1 << 6;
-const STATE_MASK: u32 =
-    TERMINAL_MASK | PUBLISH_MASK | METADATA_CHANGE_MASK | ROOT_MUTATION_ACTIVE_BIT;
-const INITIAL_STATE: u32 = (TableLifecycleState::Live as u32)
-    | ((PublishGateState::Open as u32) << PUBLISH_SHIFT)
-    | ((MetadataChangePhase::Open as u32) << METADATA_CHANGE_SHIFT);
 
 #[derive(Clone, Copy, Debug)]
 struct TableLifecycleInner {
@@ -196,6 +153,51 @@ impl TableLifecycleInner {
             true
         }
     }
+}
+
+/// Volatile lifecycle, checkpoint, and metadata-change gates for one user table.
+///
+/// This is one atomically packed state machine with three domains that must stay
+/// coherent:
+///
+/// * table liveness: `Live -> Dropping -> Dropped`. This is terminal and never
+///   moves back to a previous state.
+/// * checkpoint publish admission: `Open` admits one publish lease, `Publishing`
+///   means that lease is active, `ClosingPublishing` means drop has started and
+///   is waiting for that lease to drain, and `Closed` means no publish lease may
+///   be acquired again. Legal combinations are:
+///   `Live + (Open | Publishing)`, `Dropping + (ClosingPublishing | Closed)`,
+///   and `Dropped + Closed`.
+/// * metadata/root exclusion: checkpoint root mutation and future index DDL are
+///   mutually exclusive. Legal combinations are `(Open, no root)`, `(Open, root)`,
+///   `(Pending, root)`, `(Pending, no root)`, and `(Active, no root)`. The
+///   `Pending, no root` combination is the handoff window after a checkpoint
+///   releases the root mutation lease and before the waiting metadata change
+///   future wakes. `Active` is only legal while the table is still `Live`.
+///
+/// `Dropping` and `Dropped` may temporarily coexist with an active checkpoint
+/// root-mutation lease or a pending metadata-change waiter that was admitted
+/// before drop closed the terminal state. Those leases/waiters are unwinding;
+/// no new checkpoint or metadata operation is admitted once the table is not
+/// `Live`.
+///
+/// Transition summary:
+///
+/// * checkpoint root mutation: `Live/Open/no root -> Live/Open/root`, then
+///   release returns to no root. If a metadata change is pending, release leaves
+///   `Pending/no root` so that waiter can become `Active`.
+/// * metadata change: `Open/no root -> Active -> Open`, or `Open/root ->
+///   Pending -> Active -> Open` after the checkpoint root-mutation lease ends.
+/// * checkpoint publish: while a root-mutation lease is active, `Live/Open ->
+///   Live/Publishing -> Live/Open`. If drop starts during publish, it becomes
+///   `Dropping/ClosingPublishing -> Dropping/Closed`.
+/// * drop: `Live/Open -> Dropping/Closed` when no publish lease is active, or
+///   `Live/Publishing -> Dropping/ClosingPublishing -> Dropping/Closed` when
+///   drop must drain an active publish lease. Runtime removal completes with
+///   `Dropping/Closed -> Dropped/Closed`.
+pub(crate) struct TableLifecycle {
+    state: AtomicU32,
+    changed: Event,
 }
 
 impl TableLifecycle {
@@ -312,7 +314,7 @@ impl TableLifecycle {
     /// Attempts to enter the no-cancel checkpoint publish section.
     pub(crate) fn try_begin_checkpoint_publish(
         &self,
-    ) -> std::result::Result<CheckpointPublishLease<'_>, CheckpointCancelReason> {
+    ) -> StdResult<CheckpointPublishLease<'_>, CheckpointCancelReason> {
         loop {
             let (raw, state) = self.load_state("begin checkpoint publish enter");
             check_terminal_for_checkpoint(state.terminal)?;
@@ -425,7 +427,7 @@ impl TableLifecycle {
     #[inline]
     pub(crate) fn try_begin_checkpoint_root_mutation(
         &self,
-    ) -> std::result::Result<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
+    ) -> StdResult<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
         loop {
             let (raw, state) = self.load_state("begin checkpoint root mutation enter");
             check_terminal_for_checkpoint(state.terminal)?;
@@ -583,9 +585,9 @@ pub(crate) struct CheckpointPublishLease<'a> {
     lifecycle: &'a TableLifecycle,
 }
 
-impl std::fmt::Debug for CheckpointPublishLease<'_> {
+impl Debug for CheckpointPublishLease<'_> {
     #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("CheckpointPublishLease")
             .finish_non_exhaustive()
     }
@@ -603,9 +605,9 @@ pub(crate) struct TableMetadataChangeLease<'a> {
     lifecycle: &'a TableLifecycle,
 }
 
-impl std::fmt::Debug for TableMetadataChangeLease<'_> {
+impl Debug for TableMetadataChangeLease<'_> {
     #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("TableMetadataChangeLease")
             .finish_non_exhaustive()
     }
@@ -623,9 +625,9 @@ pub(crate) struct TableCheckpointRootMutationLease<'a> {
     lifecycle: &'a TableLifecycle,
 }
 
-impl std::fmt::Debug for TableCheckpointRootMutationLease<'_> {
+impl Debug for TableCheckpointRootMutationLease<'_> {
     #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("TableCheckpointRootMutationLease")
             .finish_non_exhaustive()
     }
@@ -641,7 +643,7 @@ impl Drop for TableCheckpointRootMutationLease<'_> {
 #[inline]
 fn check_terminal_for_checkpoint(
     state: TableLifecycleState,
-) -> std::result::Result<(), CheckpointCancelReason> {
+) -> StdResult<(), CheckpointCancelReason> {
     match state {
         TableLifecycleState::Live => Ok(()),
         TableLifecycleState::Dropping => Err(CheckpointCancelReason::TableDropping),
@@ -719,6 +721,7 @@ mod tests {
     use crate::table::tests::*;
     use crate::table::{CheckpointOutcome, CheckpointReadiness};
     use crate::value::Val;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     const TABLE_ID: TableID = TableID::new(42);
@@ -745,7 +748,7 @@ mod tests {
     #[test]
     fn test_drop_gate_waits_for_active_publish_lease_before_completing() {
         smol::block_on(async {
-            let lifecycle = std::sync::Arc::new(TableLifecycle::new());
+            let lifecycle = Arc::new(TableLifecycle::new());
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
             let lease = lifecycle.try_begin_checkpoint_publish().unwrap();
             let mut drop_fut = Box::pin(lifecycle.begin_drop(TABLE_ID));
@@ -776,7 +779,7 @@ mod tests {
     #[test]
     fn test_mark_dropped_requires_drained_publish_gate() {
         smol::block_on(async {
-            let lifecycle = std::sync::Arc::new(TableLifecycle::new());
+            let lifecycle = Arc::new(TableLifecycle::new());
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
             let publish_lease = lifecycle.try_begin_checkpoint_publish().unwrap();
             let mut drop_fut = Box::pin(lifecycle.begin_drop(TABLE_ID));

@@ -4,7 +4,7 @@ use super::{
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
-use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
+use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{Error, InternalError, OperationError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
@@ -18,16 +18,20 @@ use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{DeleteMvcc, InsertIndex, LinkForUniqueIndex, SelectKey};
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
-use crate::trx::TrxRuntime;
 use crate::trx::row::{
     FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
 };
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
+use crate::trx::{MIN_SNAPSHOT_TS, TrxRuntime};
 use crate::value::Val;
 use error_stack::Report;
+use smol::Timer;
+use std::mem::take;
+use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Shared in-memory table core used by both catalog and user tables.
 ///
@@ -53,95 +57,24 @@ use std::sync::Arc;
 /// 4. `sec_idx` plus `index_pool_role` own the in-memory secondary-index slots
 ///    for indexes that currently participate in hot-row access.
 pub(crate) struct MemTable<D: 'static, I: 'static> {
+    /// Logical table id for this in-memory runtime.
     pub(crate) table_id: TableID,
+    /// Immutable table metadata used for row and index interpretation.
     pub(crate) metadata: Arc<TableMetadata>,
+    /// Buffer pool that owns in-memory row pages.
     pub(crate) mem_pool: QuiescentGuard<D>,
+    /// Pool role used for row-page buffer access.
     pub(crate) row_pool_role: RowPoolRole,
+    /// Pool role used for in-memory secondary indexes.
     pub(crate) index_pool_role: PoolRole,
+    /// Hot row-id to row-page index.
     pub(crate) blk_idx: BlockIndex,
+    /// Sparse secondary-index runtimes for active in-memory indexes.
     pub(crate) sec_idx: Box<[Option<InMemorySecondaryIndex<I>>]>,
 }
 
-/// Stages newly built secondary indexes until the caller publishes them.
-///
-/// This keeps the build flow linear: construct each index, then either publish
-/// the whole batch on success or explicitly destroy already-built trees before
-/// returning the original build error.
-struct InMemorySecondaryIndexScopedBuilder<P: 'static> {
-    staged: Vec<Option<InMemorySecondaryIndex<P>>>,
-}
-
-impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
-    #[inline]
-    fn new(capacity: usize) -> Self {
-        let mut staged = Vec::with_capacity(capacity);
-        staged.resize_with(capacity, || None);
-        Self { staged }
-    }
-
-    #[inline]
-    async fn push_or_rollback(
-        &mut self,
-        index_no: usize,
-        built: Result<InMemorySecondaryIndex<P>>,
-        pool_guard: &PoolGuard,
-    ) -> Result<()> {
-        match built {
-            Ok(index) => {
-                debug_assert!(self.staged[index_no].is_none());
-                self.staged[index_no] = Some(index);
-                Ok(())
-            }
-            Err(err) => {
-                self.rollback(pool_guard).await;
-                Err(err)
-            }
-        }
-    }
-
-    #[inline]
-    async fn rollback(&mut self, pool_guard: &PoolGuard) {
-        for index in std::mem::take(&mut self.staged).into_iter().rev().flatten() {
-            // Keep the original construction error as the function result.
-            let _ = index.destroy(pool_guard).await;
-        }
-    }
-
-    #[inline]
-    fn publish(self) -> Box<[Option<InMemorySecondaryIndex<P>>]> {
-        self.staged.into_boxed_slice()
-    }
-}
-
-#[inline]
-pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
-    index_pool: QuiescentGuard<I>,
-    index_pool_guard: &PoolGuard,
-    metadata: &TableMetadata,
-    index_ts: TrxID,
-) -> Result<Box<[Option<InMemorySecondaryIndex<I>>]>> {
-    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
-    for (index_no, index_spec) in metadata.idx.active_indexes() {
-        let ty_infer = |col_no: usize| metadata.col.col_type(col_no);
-        builder
-            .push_or_rollback(
-                index_no,
-                InMemorySecondaryIndex::new(
-                    index_pool.clone(),
-                    index_pool_guard,
-                    index_spec,
-                    ty_infer,
-                    index_ts,
-                )
-                .await,
-                index_pool_guard,
-            )
-            .await?;
-    }
-    Ok(builder.publish())
-}
-
 impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
+    /// Create a MemTable with freshly built in-memory secondary indexes.
     #[inline]
     #[expect(clippy::too_many_arguments, reason = "code style")]
     pub(crate) async fn new(
@@ -199,6 +132,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self.sec_idx
     }
 
+    /// Return an active secondary-index runtime by stable index number.
     #[inline]
     pub(crate) fn require_sec_idx(&self, index_no: usize) -> Result<&InMemorySecondaryIndex<I>> {
         self.sec_idx
@@ -443,6 +377,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .ok_or_else(|| self.missing_pool_guard(operation, "row-page"))
     }
 
+    /// Return the pool guard used by in-memory secondary indexes.
     #[inline]
     pub(crate) fn index_pool_guard<'a>(&self, guards: &'a PoolGuards) -> Result<&'a PoolGuard> {
         guards
@@ -470,6 +405,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await
     }
 
+    /// Lock an in-memory row page for shared access if it is present.
     #[inline]
     pub(crate) async fn get_row_page_shared(
         &self,
@@ -488,6 +424,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await)
     }
 
+    /// Lock a specific row-page version for shared access if it is present.
     #[inline]
     pub(crate) async fn get_row_page_versioned_shared(
         &self,
@@ -508,6 +445,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         })
     }
 
+    /// Roll back one row undo record against hot row state or cold-row hooks.
     #[inline]
     pub(crate) async fn rollback_row_undo<F>(
         &self,
@@ -515,7 +453,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         rollback_sts: TrxID,
         on_cold_row_rollback: F,
-    ) -> std::result::Result<(), (Error, OwnedRowUndo)>
+    ) -> StdResult<(), (Error, OwnedRowUndo)>
     where
         F: FnOnce(RowID),
     {
@@ -544,6 +482,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         Ok(())
     }
 
+    /// Lock an in-memory row page for exclusive access if it is present.
     #[inline]
     pub(crate) async fn get_row_page_exclusive(
         &self,
@@ -562,6 +501,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await)
     }
 
+    /// Lock an existing in-memory row page for shared access.
     #[inline]
     pub(crate) async fn must_get_row_page_shared(
         &self,
@@ -579,6 +519,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             })
     }
 
+    /// Lock an existing in-memory row page for exclusive access.
     #[inline]
     pub(crate) async fn must_get_row_page_exclusive(
         &self,
@@ -596,6 +537,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             })
     }
 
+    /// Find or allocate a shared insert page with enough row capacity.
     #[inline]
     pub(crate) async fn try_get_insert_page(
         &self,
@@ -617,6 +559,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await
     }
 
+    /// Find or allocate an exclusive insert page with enough row capacity.
     #[inline]
     pub(crate) async fn get_insert_page_exclusive(
         &self,
@@ -638,6 +581,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await
     }
 
+    /// Allocate and lock a row page at an exact page id.
     #[inline]
     pub(crate) async fn allocate_row_page_at(
         &self,
@@ -659,6 +603,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await
     }
 
+    /// Cache an exclusive insert page for subsequent inserts.
     #[inline]
     pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
         self.blk_idx.cache_exclusive_insert_page(guard)
@@ -770,14 +715,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         Ok(())
     }
 
+    /// Find the current hot-row location in the in-memory block index.
     #[inline]
     pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> Result<RowLocation> {
         let meta_pool_guard = self.meta_pool_guard(guards, "find row")?;
         self.blk_idx.find_mem_row(meta_pool_guard, row_id).await
     }
-}
 
-impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     fn catalog_lwc_error<T>(&self, operation: &'static str, row_id: RowID) -> Result<T> {
         Err(Report::new(InternalError::Generic)
@@ -866,24 +810,12 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             .unique()
         {
             let res = self
-                .unique_insert_if_not_exists(
-                    guards,
-                    &key,
-                    row_id,
-                    false,
-                    crate::trx::MIN_SNAPSHOT_TS,
-                )
+                .unique_insert_if_not_exists(guards, &key, row_id, false, MIN_SNAPSHOT_TS)
                 .await?;
             assert!(res.is_ok());
         } else {
             let res = self
-                .non_unique_insert_if_not_exists(
-                    guards,
-                    &key,
-                    row_id,
-                    false,
-                    crate::trx::MIN_SNAPSHOT_TS,
-                )
+                .non_unique_insert_if_not_exists(guards, &key, row_id, false, MIN_SNAPSHOT_TS)
                 .await?;
             assert!(res.is_ok());
         }
@@ -899,10 +831,10 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     ) -> Result<bool> {
         let spec = self.metadata().idx.require_index_spec(key.index_no)?;
         if spec.unique() {
-            self.unique_compare_delete(guards, key, row_id, true, crate::trx::MIN_SNAPSHOT_TS)
+            self.unique_compare_delete(guards, key, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         } else {
-            self.non_unique_compare_delete(guards, key, row_id, true, crate::trx::MIN_SNAPSHOT_TS)
+            self.non_unique_compare_delete(guards, key, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         }
     }
@@ -1417,7 +1349,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         _min_active_sts: TrxID,
     ) -> Result<bool> {
         let (page_guard, row_id) = loop {
-            let sts = crate::trx::MIN_SNAPSHOT_TS;
+            let sts = MIN_SNAPSHOT_TS;
             match self.unique_lookup(guards, key, sts).await? {
                 None => return Ok(false),
                 Some((index_row_id, deleted)) => {
@@ -1426,13 +1358,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                     }
                     let Some(page_id) = self.index_purge_decision(guards, row_id).await? else {
                         return self
-                            .unique_compare_delete(
-                                guards,
-                                key,
-                                row_id,
-                                false,
-                                crate::trx::MIN_SNAPSHOT_TS,
-                            )
+                            .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
                             .await;
                     };
                     let Some(page_guard) = self
@@ -1449,7 +1375,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         if !access.any_version_matches_key(self.metadata(), key) {
             return self
-                .unique_compare_delete(guards, key, row_id, false, crate::trx::MIN_SNAPSHOT_TS)
+                .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -1464,7 +1390,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         _min_active_sts: TrxID,
     ) -> Result<bool> {
         let (page_guard, row_id) = loop {
-            let sts = crate::trx::MIN_SNAPSHOT_TS;
+            let sts = MIN_SNAPSHOT_TS;
             match self
                 .non_unique_lookup_unique(guards, key, row_id, sts)
                 .await?
@@ -1476,13 +1402,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                     }
                     let Some(page_id) = self.index_purge_decision(guards, row_id).await? else {
                         return self
-                            .non_unique_compare_delete(
-                                guards,
-                                key,
-                                row_id,
-                                false,
-                                crate::trx::MIN_SNAPSHOT_TS,
-                            )
+                            .non_unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
                             .await;
                     };
                     let Some(page_guard) = self
@@ -1499,12 +1419,13 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         if !access.any_version_matches_key(self.metadata(), key) {
             return self
-                .non_unique_compare_delete(guards, key, row_id, false, crate::trx::MIN_SNAPSHOT_TS)
+                .non_unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
     }
 
+    /// Insert one catalog row without transactional undo/redo state.
     #[inline]
     pub(crate) async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) -> Result<()> {
         debug_assert!(cols.len() == self.metadata().col.col_count());
@@ -1546,6 +1467,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         }
     }
 
+    /// Delete one catalog row through a unique index without transaction state.
     #[inline]
     pub(crate) async fn delete_unique_no_trx(
         &self,
@@ -1565,7 +1487,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             key.index_no,
             &key.vals
         ));
-        let sts = crate::trx::MIN_SNAPSHOT_TS;
+        let sts = MIN_SNAPSHOT_TS;
         let (mut page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
             None => unreachable!(),
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
@@ -1653,7 +1575,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             key.index_no,
             &key.vals
         ));
-        let sts = crate::trx::MIN_SNAPSHOT_TS;
+        let sts = MIN_SNAPSHOT_TS;
         let (page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
             None => return Ok(None),
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
@@ -1783,7 +1705,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
                 DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
-                    smol::Timer::after(std::time::Duration::from_millis(1)).await;
+                    Timer::after(Duration::from_millis(1)).await;
                 }
                 DeleteInternal::Ok(page_guard) => {
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard)
@@ -1820,6 +1742,86 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                 .await
         }
     }
+}
+
+/// Stages newly built secondary indexes until the caller publishes them.
+///
+/// This keeps the build flow linear: construct each index, then either publish
+/// the whole batch on success or explicitly destroy already-built trees before
+/// returning the original build error.
+struct InMemorySecondaryIndexScopedBuilder<P: 'static> {
+    staged: Vec<Option<InMemorySecondaryIndex<P>>>,
+}
+
+impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
+    #[inline]
+    fn new(capacity: usize) -> Self {
+        let mut staged = Vec::with_capacity(capacity);
+        staged.resize_with(capacity, || None);
+        Self { staged }
+    }
+
+    #[inline]
+    async fn push_or_rollback(
+        &mut self,
+        index_no: usize,
+        built: Result<InMemorySecondaryIndex<P>>,
+        pool_guard: &PoolGuard,
+    ) -> Result<()> {
+        match built {
+            Ok(index) => {
+                debug_assert!(self.staged[index_no].is_none());
+                self.staged[index_no] = Some(index);
+                Ok(())
+            }
+            Err(err) => {
+                self.rollback(pool_guard).await;
+                Err(err)
+            }
+        }
+    }
+
+    #[inline]
+    async fn rollback(&mut self, pool_guard: &PoolGuard) {
+        for index in take(&mut self.staged).into_iter().rev().flatten() {
+            // Keep the original construction error as the function result.
+            let _ = index.destroy(pool_guard).await;
+        }
+    }
+
+    #[inline]
+    fn publish(self) -> Box<[Option<InMemorySecondaryIndex<P>>]> {
+        self.staged.into_boxed_slice()
+    }
+}
+
+/// Build in-memory secondary indexes for every active index in table metadata.
+#[inline]
+pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
+    index_pool: QuiescentGuard<I>,
+    index_pool_guard: &PoolGuard,
+    metadata: &TableMetadata,
+    index_ts: TrxID,
+) -> Result<Box<[Option<InMemorySecondaryIndex<I>>]>> {
+    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
+    for (index_no, index_spec) in metadata.idx.active_indexes() {
+        let ty_infer = |col_no: usize| metadata.col.col_type(col_no);
+        builder
+            .push_or_rollback(
+                index_no,
+                InMemorySecondaryIndex::new(
+                    index_pool.clone(),
+                    index_pool_guard,
+                    index_spec,
+                    ty_infer,
+                    index_ts,
+                )
+                .await,
+                index_pool_guard,
+            )
+            .await?;
+    }
+    Ok(builder.publish())
 }
 
 #[cfg(test)]
@@ -1989,14 +1991,16 @@ mod tests {
         smol::block_on(async {
             use super::build_in_memory_secondary_indexes;
             use crate::buffer::FixedBufferPool;
+            use crate::buffer::frame::BufferFrame;
+            use crate::buffer::page::Page;
             use crate::catalog::{
                 ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
             };
             use crate::quiescent::QuiescentBox;
             use crate::value::ValKind;
+            use std::mem::size_of;
 
-            let pool_bytes = std::mem::size_of::<crate::buffer::frame::BufferFrame>()
-                + std::mem::size_of::<crate::buffer::page::Page>();
+            let pool_bytes = size_of::<BufferFrame>() + size_of::<Page>();
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, pool_bytes)
                     .expect("one-page fixed index pool should be constructible"),

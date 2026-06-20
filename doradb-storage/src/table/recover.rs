@@ -174,7 +174,7 @@ mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::PAGE_SIZE;
     use crate::catalog::{TableMetadata, USER_OBJ_ID_START};
-    use crate::error::{DataIntegrityError, Error};
+    use crate::error::{DataIntegrityError, Error, RecoveryDuplicateKey};
     use crate::id::RowID;
     use crate::id::{PageID, TrxID};
     use crate::index::IndexInsert;
@@ -196,7 +196,7 @@ mod tests {
         let err = ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(RowID::new(42), false))
             .unwrap_err();
         let duplicate = err
-            .downcast_ref::<crate::error::RecoveryDuplicateKey>()
+            .downcast_ref::<RecoveryDuplicateKey>()
             .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
         assert_eq!(duplicate.index_no, 3);
         assert_eq!(duplicate.row_id, RowID::new(42));

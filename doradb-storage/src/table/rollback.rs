@@ -9,13 +9,6 @@ use crate::row::ops::SelectKey;
 use crate::trx::undo::{IndexUndo, IndexUndoKind};
 use error_stack::Report;
 
-#[inline]
-fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str) -> Error {
-    Report::new(InternalError::SecondaryIndexKindMismatch)
-        .attach(format!("operation={operation}, expected={expected}"))
-        .into()
-}
-
 /// Rollback adapter for table-specific secondary-index runtimes.
 ///
 /// User tables route rollback through dual-tree secondary indexes, while
@@ -193,25 +186,6 @@ struct UserTableRollback<'a> {
     layout: &'a TableRuntimeLayout,
 }
 
-impl Table {
-    /// Roll back one secondary-index undo entry against a pinned runtime layout.
-    #[inline]
-    pub(crate) async fn rollback_index_entry_with_layout(
-        &self,
-        layout: &TableRuntimeLayout,
-        entry: IndexUndo,
-        guards: &PoolGuards,
-        ts: TrxID,
-    ) -> Result<()> {
-        UserTableRollback {
-            table: self,
-            layout,
-        }
-        .rollback_index_entry(entry, guards, ts)
-        .await
-    }
-}
-
 impl IndexRollback for UserTableRollback<'_> {
     type RowPool = EvictableBufferPool;
     type IndexPool = EvictableBufferPool;
@@ -312,6 +286,25 @@ impl IndexRollback for UserTableRollback<'_> {
             .non_unique_mem()?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
+    }
+}
+
+impl Table {
+    /// Roll back one secondary-index undo entry against a pinned runtime layout.
+    #[inline]
+    pub(crate) async fn rollback_index_entry_with_layout(
+        &self,
+        layout: &TableRuntimeLayout,
+        entry: IndexUndo,
+        guards: &PoolGuards,
+        ts: TrxID,
+    ) -> Result<()> {
+        UserTableRollback {
+            table: self,
+            layout,
+        }
+        .rollback_index_entry(entry, guards, ts)
+        .await
     }
 }
 
@@ -434,8 +427,16 @@ impl IndexRollback for CatalogTable {
     }
 }
 
+#[inline]
+fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str) -> Error {
+    Report::new(InternalError::SecondaryIndexKindMismatch)
+        .attach(format!("operation={operation}, expected={expected}"))
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::buffer::PoolRole;
     use crate::catalog::tests::table4;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{OperationError, Result};
@@ -850,9 +851,7 @@ mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem),
-                )
+                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
                 .trx(TrxSysConfig::default().log_file_stem("redo_secidx2"))
                 .build()
                 .await

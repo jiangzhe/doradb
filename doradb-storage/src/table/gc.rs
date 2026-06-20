@@ -15,20 +15,6 @@ use crate::value::Val;
 use error_stack::Report;
 use std::sync::Arc;
 
-#[inline]
-fn invalid_lwc_payload(
-    file_kind: FileKind,
-    block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
-    let message = message.into();
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
-        ))
-        .into()
-}
-
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SecondaryMemIndexCleanupStats {
@@ -53,6 +39,40 @@ pub struct SecondaryMemIndexCleanupIndexStats {
     pub skipped_live: usize,
     /// Number of hot delete overlays skipped before key materialization.
     pub skipped_hot_deleted: usize,
+}
+
+impl SecondaryMemIndexCleanupIndexStats {
+    #[inline]
+    fn new(index_no: usize, unique: bool) -> Self {
+        Self {
+            index_no,
+            unique,
+            scanned: 0,
+            removed: 0,
+            retained: 0,
+            skipped_live: 0,
+            skipped_hot_deleted: 0,
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, decision: CleanupDecision) {
+        self.scanned += 1;
+        match decision {
+            CleanupDecision::Remove => self.removed += 1,
+            CleanupDecision::Retain => self.retained += 1,
+        }
+    }
+
+    #[inline]
+    fn record_skipped_live(&mut self, count: usize) {
+        self.skipped_live += count;
+    }
+
+    #[inline]
+    fn record_skipped_hot_deleted(&mut self, count: usize) {
+        self.skipped_hot_deleted += count;
+    }
 }
 
 struct MemIndexCleanupSnapshot<'ctx> {
@@ -129,38 +149,18 @@ enum DeleteOverlayProof {
     ColdRowValues(Vec<Val>),
 }
 
-impl SecondaryMemIndexCleanupIndexStats {
-    #[inline]
-    fn new(index_no: usize, unique: bool) -> Self {
-        Self {
-            index_no,
-            unique,
-            scanned: 0,
-            removed: 0,
-            retained: 0,
-            skipped_live: 0,
-            skipped_hot_deleted: 0,
-        }
-    }
-
-    #[inline]
-    fn record(&mut self, decision: CleanupDecision) {
-        self.scanned += 1;
-        match decision {
-            CleanupDecision::Remove => self.removed += 1,
-            CleanupDecision::Retain => self.retained += 1,
-        }
-    }
-
-    #[inline]
-    fn record_skipped_live(&mut self, count: usize) {
-        self.skipped_live += count;
-    }
-
-    #[inline]
-    fn record_skipped_hot_deleted(&mut self, count: usize) {
-        self.skipped_hot_deleted += count;
-    }
+#[inline]
+fn invalid_lwc_payload(
+    file_kind: FileKind,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    let message = message.into();
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
+        ))
+        .into()
 }
 
 impl Table {
@@ -628,7 +628,7 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
 }
 
 #[cfg(test)]
-mod table_moved_tests {
+mod tests {
     use crate::catalog::IndexNo;
     use crate::error::{DataIntegrityError, OperationError};
     use crate::id::{RowID, TrxID};

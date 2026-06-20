@@ -5,13 +5,6 @@ use crate::index::SecondaryIndex;
 use error_stack::Report;
 use std::sync::Arc;
 
-#[inline]
-fn invalid_runtime_layout(message: impl Into<String>) -> Error {
-    Report::new(InternalError::Generic)
-        .attach(format!("invalid table runtime layout: {}", message.into()))
-        .into()
-}
-
 /// Immutable metadata and secondary-index runtime snapshot for a user table.
 pub(crate) struct TableRuntimeLayout {
     generation: u64,
@@ -151,9 +144,19 @@ impl TableRuntimeLayout {
 
 /// Retired user-table secondary-index runtime awaiting async MemIndex destroy.
 pub(crate) struct RetiredSecondaryIndex {
+    /// Stable secondary-index slot retired from the active runtime layout.
     pub(crate) index_no: usize,
+    /// Layout generation that retired this runtime index.
     pub(crate) retired_generation: u64,
+    /// Secondary-index runtime waiting for asynchronous MemIndex destruction.
     pub(crate) index: Arc<SecondaryIndex<EvictableBufferPool>>,
+}
+
+#[inline]
+fn invalid_runtime_layout(message: impl Into<String>) -> Error {
+    Report::new(InternalError::Generic)
+        .attach(format!("invalid table runtime layout: {}", message.into()))
+        .into()
 }
 
 #[cfg(test)]
