@@ -35,7 +35,7 @@ use parking_lot::RawMutex;
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use scopeguard::defer;
 use std::ffi::CString;
-use std::io;
+use std::io::{self, Error as StdIoError};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -116,13 +116,13 @@ impl SparseFile {
             if fd < 0 {
                 return Err(IoError::report_with_op(
                     StorageOp::FileCreate,
-                    io::Error::last_os_error(),
+                    StdIoError::last_os_error(),
                 )
                 .into());
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
-                let err = io::Error::last_os_error();
+                let err = StdIoError::last_os_error();
                 let _ = close(fd); // close file descriptor if truncate fail.
                 return Err(IoError::report_with_op(StorageOp::FileResize, err).into());
             }
@@ -151,13 +151,13 @@ impl SparseFile {
             if fd < 0 {
                 return Err(IoError::report_with_op(
                     StorageOp::FileCreate,
-                    io::Error::last_os_error(),
+                    StdIoError::last_os_error(),
                 )
                 .into());
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
-                let err = io::Error::last_os_error();
+                let err = StdIoError::last_os_error();
                 let _ = close(fd); // close file descriptor if truncate fail.
                 return Err(IoError::report_with_op(StorageOp::FileResize, err).into());
             }
@@ -176,7 +176,7 @@ impl SparseFile {
             if fd < 0 {
                 return Err(IoError::report_with_op(
                     StorageOp::FileOpen,
-                    io::Error::last_os_error(),
+                    StdIoError::last_os_error(),
                 )
                 .into());
             }
@@ -266,7 +266,7 @@ impl SparseFile {
             return Ok(());
         }
         debug_assert!(retcode == -1);
-        Err(io::Error::last_os_error())
+        Err(StdIoError::last_os_error())
     }
 
     /// Get the logical size and allocated size of this file.
@@ -289,33 +289,6 @@ impl Drop for SparseFile {
             close(self.fd);
         }
     }
-}
-
-#[inline]
-pub(crate) fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
-    // SAFETY: `fstat` fully initializes `stat` on success; `assume_init_ref` is used only
-    // when return code is 0.
-    unsafe {
-        let mut s = MaybeUninit::<stat>::zeroed();
-        let retcode = fstat(fd, s.as_mut_ptr());
-        if retcode == 0 {
-            let res = s.assume_init_ref();
-            let logical_size = res.st_size as usize;
-            let allocated_size = (res.st_blocks * 512) as usize;
-            return Ok((logical_size, allocated_size));
-        }
-        debug_assert!(retcode == -1);
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[inline]
-fn c_string_from_path(file_path: &str) -> Result<CString> {
-    CString::new(file_path).map_err(|_| {
-        Report::new(ConfigError::PathMustNotContainNul)
-            .attach(format!("path={file_path}"))
-            .into()
-    })
 }
 
 /// Worker-owned table-write request before the backend queue admits it.
@@ -374,6 +347,7 @@ impl WriteSubmission {
     }
 }
 
+/// Backend-prepared write submission retained until completion.
 pub(crate) struct PreparedWriteSubmission {
     key: BlockKey,
     _file: Arc<SparseFile>,
@@ -396,6 +370,7 @@ impl IOSubmission for PreparedWriteSubmission {
     }
 }
 
+/// Submission variants handled by the shared table-file IO worker.
 pub(crate) enum TableFsSubmission {
     Write(PreparedWriteSubmission),
     Read(ReadSubmission),
@@ -411,51 +386,7 @@ impl IOSubmission for TableFsSubmission {
     }
 }
 
-/// Write one direct buffer via async direct IO.
-///
-/// `key` identifies the persisted block targeted by this write for higher-layer
-/// invalidation and inflight bookkeeping.
-///
-#[inline]
-pub(crate) async fn write_direct(
-    key: BlockKey,
-    file: Arc<SparseFile>,
-    offset: usize,
-    buf: DirectBuf,
-    background_writes: &IOClient<BackgroundWriteRequest>,
-) -> Result<()> {
-    write_direct_with_lease(key, file, offset, buf, background_writes, None).await
-}
-
-/// Write one direct buffer while carrying an optional write barrier lease in
-/// the backend-owned submission.
-#[inline]
-pub(crate) async fn write_direct_with_lease(
-    key: BlockKey,
-    file: Arc<SparseFile>,
-    offset: usize,
-    buf: DirectBuf,
-    background_writes: &IOClient<BackgroundWriteRequest>,
-    write_lease: Option<ReadonlyWriteLease>,
-) -> Result<()> {
-    let (submission, completion) = WriteSubmission::prepare(key, file, offset, buf, write_lease);
-    if let Err(err) = background_writes
-        .send_async(BackgroundWriteRequest::Table(submission))
-        .await
-    {
-        let BackgroundWriteRequest::Table(_submission) = err.into_inner() else {
-            unreachable!("write_direct received unexpected background-write send error");
-        };
-        return Err(IoError::report_send("send background table write request").into());
-    }
-    completion.wait_result().await.map_err(|report| {
-        Error::from_completion_report(
-            report,
-            format!("wait for table file background write: key={key:?}, offset={offset}"),
-        )
-    })
-}
-
+/// State machine for preparing and completing table-file IO submissions.
 pub(crate) struct TableFsStateMachine;
 
 impl TableFsStateMachine {
@@ -465,6 +396,7 @@ impl TableFsStateMachine {
         TableFsStateMachine
     }
 
+    /// Queue or defer one table-read request depending on available backend capacity.
     #[inline]
     pub(crate) fn prepare_read_request(
         &mut self,
@@ -479,6 +411,7 @@ impl TableFsStateMachine {
         None
     }
 
+    /// Queue or defer one table-write request depending on available backend capacity.
     #[inline]
     pub(crate) fn prepare_write_request(
         &mut self,
@@ -493,6 +426,7 @@ impl TableFsStateMachine {
         None
     }
 
+    /// Records side effects when one table-file submission is accepted by the backend.
     #[inline]
     pub(crate) fn on_submit(&mut self, sub: &TableFsSubmission) {
         match sub {
@@ -503,6 +437,7 @@ impl TableFsStateMachine {
         }
     }
 
+    /// Completes one table-file submission and returns its IO kind.
     #[inline]
     pub(crate) fn on_complete(
         &mut self,
@@ -548,17 +483,18 @@ impl TableFsStateMachine {
     }
 }
 
-/// Borrowed file descriptor wrapper for fsync() and fdatasync().
-///
-/// `FileSyncer` does not own or close the descriptor. The caller must keep the
-/// underlying file descriptor open until the sync operation returns.
-pub(crate) struct FileSyncer(RawFd);
-
+/// Sync operation performed through a borrowed file descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileSyncKind {
     Fsync,
     Fdatasync,
 }
+
+/// Borrowed file descriptor wrapper for fsync() and fdatasync().
+///
+/// `FileSyncer` does not own or close the descriptor. The caller must keep the
+/// underlying file descriptor open until the sync operation returns.
+pub(crate) struct FileSyncer(RawFd);
 
 impl FileSyncer {
     /// Builds a syncer for a borrowed file descriptor.
@@ -570,11 +506,13 @@ impl FileSyncer {
         Self(fd)
     }
 
+    /// Flush file contents and metadata using `fsync`.
     #[inline]
     pub(crate) fn fsync(&self) -> Result<()> {
         self.sync(FileSyncKind::Fsync)
     }
 
+    /// Flush file contents using `fdatasync`.
     #[inline]
     pub(crate) fn fdatasync(&self) -> Result<()> {
         self.sync(FileSyncKind::Fdatasync)
@@ -584,7 +522,7 @@ impl FileSyncer {
     fn sync(&self, kind: FileSyncKind) -> Result<()> {
         #[cfg(test)]
         {
-            let op = tests::FileSyncOp::new(self.0, kind);
+            let op = FileSyncOp::new(self.0, kind);
             if let Some(hook) = tests::current_file_sync_test_hook() {
                 let mut override_res = None;
                 hook.on_sync(op, &mut override_res);
@@ -607,7 +545,7 @@ impl FileSyncer {
             return Ok(());
         }
         debug_assert!(ret == -1);
-        Err(IoError::report(io::Error::last_os_error()).into())
+        Err(IoError::report(StdIoError::last_os_error()).into())
     }
 }
 
@@ -649,10 +587,83 @@ impl FixedSizeBufferFreeList {
 
 impl Deref for FixedSizeBufferFreeList {
     type Target = FreeList<DirectBuf>;
+
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+/// Return the logical size and allocated size for one sparse-file descriptor.
+#[inline]
+pub(crate) fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
+    // SAFETY: `fstat` fully initializes `stat` on success; `assume_init_ref` is used only
+    // when return code is 0.
+    unsafe {
+        let mut s = MaybeUninit::<stat>::zeroed();
+        let retcode = fstat(fd, s.as_mut_ptr());
+        if retcode == 0 {
+            let res = s.assume_init_ref();
+            let logical_size = res.st_size as usize;
+            let allocated_size = (res.st_blocks * 512) as usize;
+            return Ok((logical_size, allocated_size));
+        }
+        debug_assert!(retcode == -1);
+        Err(StdIoError::last_os_error())
+    }
+}
+
+/// Write one direct buffer via async direct IO.
+///
+/// `key` identifies the persisted block targeted by this write for higher-layer
+/// invalidation and inflight bookkeeping.
+#[inline]
+pub(crate) async fn write_direct(
+    key: BlockKey,
+    file: Arc<SparseFile>,
+    offset: usize,
+    buf: DirectBuf,
+    background_writes: &IOClient<BackgroundWriteRequest>,
+) -> Result<()> {
+    write_direct_with_lease(key, file, offset, buf, background_writes, None).await
+}
+
+/// Write one direct buffer while carrying an optional write barrier lease in
+/// the backend-owned submission.
+#[inline]
+pub(crate) async fn write_direct_with_lease(
+    key: BlockKey,
+    file: Arc<SparseFile>,
+    offset: usize,
+    buf: DirectBuf,
+    background_writes: &IOClient<BackgroundWriteRequest>,
+    write_lease: Option<ReadonlyWriteLease>,
+) -> Result<()> {
+    let (submission, completion) = WriteSubmission::prepare(key, file, offset, buf, write_lease);
+    if let Err(err) = background_writes
+        .send_async(BackgroundWriteRequest::Table(submission))
+        .await
+    {
+        let BackgroundWriteRequest::Table(_submission) = err.into_inner() else {
+            unreachable!("write_direct received unexpected background-write send error");
+        };
+        return Err(IoError::report_send("send background table write request").into());
+    }
+    completion.wait_result().await.map_err(|report| {
+        Error::from_completion_report(
+            report,
+            format!("wait for table file background write: key={key:?}, offset={offset}"),
+        )
+    })
+}
+
+#[inline]
+fn c_string_from_path(file_path: &str) -> Result<CString> {
+    CString::new(file_path).map_err(|_| {
+        Report::new(ConfigError::PathMustNotContainNul)
+            .attach(format!("path={file_path}"))
+            .into()
+    })
 }
 
 #[cfg(test)]
@@ -669,7 +680,7 @@ mod tests {
     use crate::serde::{Deser, Ser};
     use crate::value::ValKind;
     use std::io::ErrorKind as IoErrorKind;
-    use std::mem;
+    use std::mem::{self, replace};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -759,7 +770,7 @@ mod tests {
     #[inline]
     pub(crate) fn set_file_sync_test_hook(hook: Option<FileSyncHook>) -> Option<FileSyncHook> {
         let mut guard = FILE_SYNC_TEST_HOOK.lock().unwrap();
-        std::mem::replace(&mut *guard, hook)
+        replace(&mut *guard, hook)
     }
 
     #[test]

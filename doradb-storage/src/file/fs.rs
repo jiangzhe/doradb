@@ -22,6 +22,8 @@ use crate::io::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
     IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
 };
+#[cfg(test)]
+use crate::io::{StorageBackendOp, current_storage_backend_test_hook};
 use crate::map::FastHashSet;
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
@@ -34,6 +36,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
+use std::mem::replace;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -1001,7 +1004,7 @@ impl<T> StorageInflightSlots<T> {
             slot_ref.generation
         );
         let prev_head = self.free_head;
-        let entry = std::mem::replace(&mut slot_ref.entry, StorageSlotEntry::Vacant(prev_head));
+        let entry = replace(&mut slot_ref.entry, StorageSlotEntry::Vacant(prev_head));
         slot_ref.generation = slot_ref.generation.wrapping_add(1);
         self.free_head = slot;
         match entry {
@@ -1195,7 +1198,7 @@ where
                 let limit = self.io_depth() - self.submitted;
                 let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
                 #[cfg(test)]
-                let hook = crate::io::current_storage_backend_test_hook();
+                let hook = current_storage_backend_test_hook();
                 for _ in 0..submit_count {
                     let slot = self
                         .staged_slots
@@ -1206,11 +1209,7 @@ where
                     #[cfg(test)]
                     if let Some(hook) = &hook {
                         let op = entry.submission.operation();
-                        hook.on_submit(crate::io::StorageBackendOp::new(
-                            op.kind(),
-                            op.fd(),
-                            op.offset(),
-                        ));
+                        hook.on_submit(StorageBackendOp::new(op.kind(), op.fd(), op.offset()));
                     }
                     // Submit-side bookkeeping runs only after the backend has
                     // accepted the prepared operation into this batch.
@@ -1231,10 +1230,10 @@ where
                     let (entry, res) = {
                         let mut entry = entry;
                         let mut res = res;
-                        if let Some(hook) = crate::io::current_storage_backend_test_hook() {
+                        if let Some(hook) = current_storage_backend_test_hook() {
                             let op = entry.submission.operation();
                             hook.on_complete(
-                                crate::io::StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
+                                StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
                                 &mut res,
                             );
                         }
@@ -1257,32 +1256,6 @@ where
             }
         }
     }
-}
-
-/// Build the filesystem facade together with the deferred shared worker state.
-#[inline]
-pub(crate) fn build_file_system(
-    io_depth: usize,
-    data_dir: PathBuf,
-    catalog_file_name: String,
-) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
-    let backend = StorageBackend::new(io_depth)?;
-    let stats = backend.stats_handle();
-    let (builder, table_reads, pool_reads, background_writes) =
-        StorageIOWorkerBuilder::new(backend);
-    Ok((
-        FileSystem {
-            table_reads,
-            pool_reads,
-            background_writes,
-            io_backend_stats: stats,
-            storage_service_stats: builder.stats.clone(),
-            configured_io_depth: io_depth,
-            data_dir,
-            catalog_file_name,
-        },
-        builder,
-    ))
 }
 
 /// Registered shutdown state for the running shared storage worker.
@@ -1634,7 +1607,7 @@ impl FileSystem {
                 );
                 if let Err(err) = mutable.commit().await {
                     drop(mtb);
-                    let _ = std::fs::remove_file(&file_path);
+                    let _ = fs::remove_file(&file_path);
                     return Err(err);
                 }
                 let _ = disk_pool;
@@ -1675,6 +1648,32 @@ impl Component for FileSystem {
     fn shutdown(_component: &Self::Owned) {}
 }
 
+/// Build the filesystem facade together with the deferred shared worker state.
+#[inline]
+pub(crate) fn build_file_system(
+    io_depth: usize,
+    data_dir: PathBuf,
+    catalog_file_name: String,
+) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
+    let backend = StorageBackend::new(io_depth)?;
+    let stats = backend.stats_handle();
+    let (builder, table_reads, pool_reads, background_writes) =
+        StorageIOWorkerBuilder::new(backend);
+    Ok((
+        FileSystem {
+            table_reads,
+            pool_reads,
+            background_writes,
+            io_backend_stats: stats,
+            storage_service_stats: builder.stats.clone(),
+            configured_io_depth: io_depth,
+            data_dir,
+            catalog_file_name,
+        },
+        builder,
+    ))
+}
+
 #[inline]
 fn path_to_string(path: &Path, field: &str) -> String {
     path_to_utf8(path, field)
@@ -1705,8 +1704,9 @@ pub(crate) mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::Page;
     use crate::buffer::{
-        BufferPool, PoolRole, SharedPoolEvictorWorkers, global_readonly_pool_scope,
-        table_readonly_pool, test_dispatch_dirty_pages, test_persist_and_evict_page,
+        BufferPool, EvictableBufferPool, PoolRole, SharedPoolEvictorWorkers,
+        global_readonly_pool_scope, table_readonly_pool, test_dispatch_dirty_pages,
+        test_persist_and_evict_page,
     };
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
@@ -1724,8 +1724,13 @@ pub(crate) mod tests {
     };
     use crate::latch::LatchFallbackMode;
     use crate::table::test_user_table_id;
+    use crate::trx::MIN_SNAPSHOT_TS;
     use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool, MetaPool};
+    use event_listener::Event;
+    use smol::Timer;
+    use std::fs::{create_dir, write};
+    use std::io::Error as StdIoError;
     use std::ops::Deref;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
@@ -1767,12 +1772,12 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        pub(crate) fn mem_pool(&self) -> QuiescentGuard<crate::buffer::EvictableBufferPool> {
+        pub(crate) fn mem_pool(&self) -> QuiescentGuard<EvictableBufferPool> {
             self.registry.dependency::<MemPool>().unwrap().clone_inner()
         }
 
         #[inline]
-        pub(crate) fn index_pool(&self) -> QuiescentGuard<crate::buffer::EvictableBufferPool> {
+        pub(crate) fn index_pool(&self) -> QuiescentGuard<EvictableBufferPool> {
             self.registry
                 .dependency::<IndexPool>()
                 .unwrap()
@@ -1932,13 +1937,13 @@ pub(crate) mod tests {
         blocked_kind: IOKind,
         blocked_file: StorageBackendFileIdentity,
         recorded_files: Vec<StorageBackendFileIdentity>,
-        submits: parking_lot::Mutex<Vec<StorageBackendOp>>,
+        submits: Mutex<Vec<StorageBackendOp>>,
         submit_count: AtomicUsize,
-        submit_ev: event_listener::Event,
+        submit_ev: Event,
         blocked_submits: AtomicUsize,
-        blocked_submit_ev: event_listener::Event,
+        blocked_submit_ev: Event,
         released: AtomicBool,
-        release_ev: event_listener::Event,
+        release_ev: Event,
     }
 
     impl ControlledStorageOpHook {
@@ -1955,13 +1960,13 @@ pub(crate) mod tests {
                     blocked_kind,
                     blocked_file,
                     recorded_files,
-                    submits: parking_lot::Mutex::new(Vec::new()),
+                    submits: Mutex::new(Vec::new()),
                     submit_count: AtomicUsize::new(0),
-                    submit_ev: event_listener::Event::new(),
+                    submit_ev: Event::new(),
                     blocked_submits: AtomicUsize::new(0),
-                    blocked_submit_ev: event_listener::Event::new(),
+                    blocked_submit_ev: Event::new(),
                     released: AtomicBool::new(false),
-                    release_ev: event_listener::Event::new(),
+                    release_ev: Event::new(),
                 }),
             }
         }
@@ -2069,7 +2074,7 @@ pub(crate) mod tests {
     impl StorageBackendTestHook for FailingFirstWriteHook {
         fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if self.matches(op) && !self.failed.swap(true, Ordering::SeqCst) {
-                *res = Err(std::io::Error::from_raw_os_error(libc::EIO));
+                *res = Err(StdIoError::from_raw_os_error(libc::EIO));
             }
         }
     }
@@ -2079,7 +2084,7 @@ pub(crate) mod tests {
             if predicate() {
                 return;
             }
-            smol::Timer::after(TEST_WAIT_INTERVAL).await;
+            Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
     }
@@ -2097,7 +2102,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
-            let global = crate::buffer::global_readonly_pool_scope(64 * 1024 * 1024);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
 
             {
                 let _hook = install_storage_backend_test_hook(Arc::new(
@@ -2120,10 +2125,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let snapshot = mtb.load_snapshot().unwrap();
-            assert_eq!(
-                snapshot.catalog_replay_start_ts,
-                crate::trx::MIN_SNAPSHOT_TS
-            );
+            assert_eq!(snapshot.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(snapshot.meta.next_table_id, USER_OBJ_ID_START);
             assert!(mtb.active_root_unchecked().meta_block_id > BlockID::new(0));
         });
@@ -2358,10 +2360,10 @@ pub(crate) mod tests {
         let present_path = fs.data_dir.join(user_table_file_name(present_id));
         let absent_path = fs.data_dir.join(user_table_file_name(absent_id));
         let future_path = fs.data_dir.join(user_table_file_name(future_id));
-        std::fs::write(&catalog_path, b"catalog").unwrap();
-        std::fs::write(&present_path, b"present").unwrap();
-        std::fs::write(&absent_path, b"absent").unwrap();
-        std::fs::write(&future_path, b"future").unwrap();
+        write(&catalog_path, b"catalog").unwrap();
+        write(&present_path, b"present").unwrap();
+        write(&absent_path, b"absent").unwrap();
+        write(&future_path, b"future").unwrap();
 
         let checkpointed_tables = [present_id].into_iter().collect::<FastHashSet<_>>();
         fs.cleanup_checkpoint_absent_user_table_files(USER_OBJ_ID_START + 4, &checkpointed_tables)
@@ -2380,8 +2382,8 @@ pub(crate) mod tests {
         let absent_id = USER_OBJ_ID_START + 2;
         let dir_path = fs.data_dir.join(user_table_file_name(dir_id));
         let absent_path = fs.data_dir.join(user_table_file_name(absent_id));
-        std::fs::create_dir(&dir_path).unwrap();
-        std::fs::write(&absent_path, b"absent").unwrap();
+        create_dir(&dir_path).unwrap();
+        write(&absent_path, b"absent").unwrap();
 
         fs.cleanup_checkpoint_absent_user_table_files(
             USER_OBJ_ID_START + 4,
@@ -2403,10 +2405,10 @@ pub(crate) mod tests {
         let recovered_path = fs.data_dir.join(user_table_file_name(recovered_id));
         let deferred_drop_path = fs.data_dir.join(user_table_file_name(deferred_drop_id));
         let orphan_path = fs.data_dir.join(user_table_file_name(orphan_id));
-        std::fs::write(&catalog_path, b"catalog").unwrap();
-        std::fs::write(&recovered_path, b"recovered").unwrap();
-        std::fs::write(&deferred_drop_path, b"deferred").unwrap();
-        std::fs::write(&orphan_path, b"orphan").unwrap();
+        write(&catalog_path, b"catalog").unwrap();
+        write(&recovered_path, b"recovered").unwrap();
+        write(&deferred_drop_path, b"deferred").unwrap();
+        write(&orphan_path, b"orphan").unwrap();
 
         fs.cleanup_recovery_absent_user_table_files(
             &[recovered_id].into_iter().collect::<FastHashSet<_>>(),

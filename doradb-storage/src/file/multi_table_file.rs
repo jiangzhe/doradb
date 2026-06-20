@@ -36,20 +36,6 @@ use std::sync::Arc;
 
 pub(crate) use crate::file::CATALOG_MTB_FILE_ID;
 
-#[inline]
-fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
-    Report::new(InternalError::MutableRootMetadataRegression)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
-    Report::new(InternalError::CatalogRootDescriptorInvariant)
-        .attach(message.into())
-        .into()
-}
-
 /// On-disk format version of `catalog.mtb`.
 pub(crate) const CATALOG_MTB_VERSION: u64 = 3;
 /// Reserved number of catalog logical-table root descriptors.
@@ -133,6 +119,7 @@ impl MultiTableActiveRoot {
         )
     }
 
+    /// Build meta-block serialization view for the current catalog root.
     #[inline]
     pub(crate) fn meta_block_ser_view(&self) -> MultiTableMetaBlockSerView<'_> {
         MultiTableMetaBlockSerView::new(&self.meta, &self.alloc_map)
@@ -160,97 +147,9 @@ pub(crate) struct MultiTableFileSnapshot {
     pub(crate) meta: MultiTableMetaBlock,
 }
 
-#[inline]
-fn parse_multi_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
-    parse_super_block(buf, MULTI_TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
-}
-
-#[inline]
-fn build_multi_table_super_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
-    Ok(build_super_block(
-        root.slot_no,
-        root.root_ts,
-        root.meta_block_id,
-    ))
-}
-
-#[inline]
-fn parse_multi_table_meta_block(
-    page_id: BlockID,
-    buf: &[u8],
-) -> Result<ParsedMeta<MultiTableMetaBlock>> {
-    let payload = validate_block(buf, MULTI_TABLE_META_BLOCK_SPEC)
-        .attach_with(|| {
-            format!(
-                "file={}, block=multi-table-meta, block_id={page_id}",
-                FileKind::CatalogMultiTableFile
-            )
-        })
-        .map_err(Error::from)?;
-    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|err| {
-        if err.data_integrity_error().is_some() {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={}, block=multi-table-meta, block_id={page_id}",
-                    FileKind::CatalogMultiTableFile
-                ))
-                .into()
-        } else {
-            err
-        }
-    })?;
-
-    Ok(ParsedMeta {
-        meta: MultiTableMetaBlock {
-            next_table_id: meta_block.next_table_id,
-            table_roots: meta_block.table_roots,
-        },
-        alloc_map: meta_block.alloc_map,
-    })
-}
-
-#[inline]
-fn validate_multi_table_root(
-    meta_block_id: BlockID,
-    parsed_meta: &ParsedMeta<MultiTableMetaBlock>,
-) -> Result<()> {
-    validate_active_meta_block_id(
-        &parsed_meta.alloc_map,
-        meta_block_id,
-        FileKind::CatalogMultiTableFile,
-        "multi-table-meta",
-    )
-}
-
-#[inline]
-fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
-    let meta_block = root.meta_block_ser_view();
-    let meta_len = meta_block.ser_len();
-    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
-        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
-            .attach(format!(
-                "multi-table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
-                max_payload_len(COW_FILE_PAGE_SIZE)
-            ))
-            .into());
-    }
-    let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-    let idx = write_block_header(buf.as_bytes_mut(), MULTI_TABLE_META_BLOCK_SPEC);
-    let idx = meta_block.ser(buf.as_bytes_mut(), idx);
-    debug_assert_eq!(idx, BLOCK_INTEGRITY_HEADER_SIZE + meta_len);
-    write_block_checksum(buf.as_bytes_mut());
-    Ok(buf)
-}
-
-#[inline]
-fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
-    CowCodec {
-        parse_super_block: parse_multi_table_super_block,
-        parse_meta_block: parse_multi_table_meta_block,
-        validate_root: validate_multi_table_root,
-        build_meta_block: build_multi_table_meta_block,
-        build_super_block: build_multi_table_super_block,
-    }
+pub(super) enum MultiTableFileOpenOutcome {
+    Created(Arc<MultiTableFile>),
+    Opened(Arc<MultiTableFile>),
 }
 
 /// Persistent file facade for unified catalog metadata (`catalog.mtb`).
@@ -261,11 +160,6 @@ fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
 /// - updates are published by writing new meta block then swapping active super block.
 pub(crate) struct MultiTableFile {
     file: CowFile<MultiTableMetaBlock>,
-}
-
-pub(super) enum MultiTableFileOpenOutcome {
-    Created(Arc<MultiTableFile>),
-    Opened(Arc<MultiTableFile>),
 }
 
 impl MultiTableFile {
@@ -339,11 +233,13 @@ impl MultiTableFile {
         })
     }
 
+    /// Returns this file's storage kind for validation and cache identity.
     #[inline]
     pub(crate) fn file_kind(&self) -> FileKind {
         FileKind::CatalogMultiTableFile
     }
 
+    /// Returns the backing sparse file.
     #[inline]
     pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
         self.file.sparse_file()
@@ -356,9 +252,7 @@ impl MultiTableFile {
     ) -> Option<OldMultiTableRoot> {
         self.file.swap_active_root(active_root)
     }
-}
 
-impl MultiTableFile {
     #[inline]
     fn file(&self) -> &CowFile<MultiTableMetaBlock> {
         &self.file
@@ -580,6 +474,113 @@ impl MutableCowFile for MutableMultiTableFile {
 pub(crate) type OldMultiTableRoot = OldCowRoot<MultiTableMetaBlock>;
 
 #[inline]
+fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
+    Report::new(InternalError::MutableRootMetadataRegression)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
+    Report::new(InternalError::CatalogRootDescriptorInvariant)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn parse_multi_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
+    parse_super_block(buf, MULTI_TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
+}
+
+#[inline]
+fn build_multi_table_super_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
+    Ok(build_super_block(
+        root.slot_no,
+        root.root_ts,
+        root.meta_block_id,
+    ))
+}
+
+#[inline]
+fn parse_multi_table_meta_block(
+    page_id: BlockID,
+    buf: &[u8],
+) -> Result<ParsedMeta<MultiTableMetaBlock>> {
+    let payload = validate_block(buf, MULTI_TABLE_META_BLOCK_SPEC)
+        .attach_with(|| {
+            format!(
+                "file={}, block=multi-table-meta, block_id={page_id}",
+                FileKind::CatalogMultiTableFile
+            )
+        })
+        .map_err(Error::from)?;
+    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|err| {
+        if err.data_integrity_error().is_some() {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={}, block=multi-table-meta, block_id={page_id}",
+                    FileKind::CatalogMultiTableFile
+                ))
+                .into()
+        } else {
+            err
+        }
+    })?;
+
+    Ok(ParsedMeta {
+        meta: MultiTableMetaBlock {
+            next_table_id: meta_block.next_table_id,
+            table_roots: meta_block.table_roots,
+        },
+        alloc_map: meta_block.alloc_map,
+    })
+}
+
+#[inline]
+fn validate_multi_table_root(
+    meta_block_id: BlockID,
+    parsed_meta: &ParsedMeta<MultiTableMetaBlock>,
+) -> Result<()> {
+    validate_active_meta_block_id(
+        &parsed_meta.alloc_map,
+        meta_block_id,
+        FileKind::CatalogMultiTableFile,
+        "multi-table-meta",
+    )
+}
+
+#[inline]
+fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
+    let meta_block = root.meta_block_ser_view();
+    let meta_len = meta_block.ser_len();
+    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
+        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
+            .attach(format!(
+                "multi-table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
+                max_payload_len(COW_FILE_PAGE_SIZE)
+            ))
+            .into());
+    }
+    let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+    let idx = write_block_header(buf.as_bytes_mut(), MULTI_TABLE_META_BLOCK_SPEC);
+    let idx = meta_block.ser(buf.as_bytes_mut(), idx);
+    debug_assert_eq!(idx, BLOCK_INTEGRITY_HEADER_SIZE + meta_len);
+    write_block_checksum(buf.as_bytes_mut());
+    Ok(buf)
+}
+
+#[inline]
+fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
+    CowCodec {
+        parse_super_block: parse_multi_table_super_block,
+        parse_meta_block: parse_multi_table_meta_block,
+        validate_root: validate_multi_table_root,
+        build_meta_block: build_multi_table_meta_block,
+        build_super_block: build_multi_table_super_block,
+    }
+}
+
+#[inline]
 fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID) -> DirectBuf {
     let mut buf = DirectBuf::zeroed(SUPER_BLOCK_SIZE);
     let ser_view = SuperBlockSerView {
@@ -615,7 +616,7 @@ mod tests {
     use crate::file::test_block_id;
     use crate::file::{build_test_fs, build_test_fs_in};
     use crate::io::IOBuf;
-    use std::fs::OpenOptions;
+    use std::fs::{OpenOptions, read, remove_file};
     use std::io::{Seek, SeekFrom, Write};
     use std::num::NonZeroU64;
 
@@ -704,7 +705,7 @@ mod tests {
 
             drop(mtb2);
             drop(fs);
-            let _ = std::fs::remove_file(path);
+            let _ = remove_file(path);
         });
     }
 
@@ -960,7 +961,7 @@ mod tests {
             drop(mtb);
             drop(fs);
 
-            let file_bytes = std::fs::read(&path).unwrap();
+            let file_bytes = read(&path).unwrap();
             let meta_offset = usize::from(active_meta_block_id) * COW_FILE_PAGE_SIZE;
             let meta_end = meta_offset + COW_FILE_PAGE_SIZE;
             let parsed_meta = parse_multi_table_meta_block(
