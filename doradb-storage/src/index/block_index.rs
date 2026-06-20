@@ -92,6 +92,7 @@ impl<P: BufferPool> BlockIndex<P> {
             .await
     }
 
+    /// Returns a shared row page suitable for appending rows, recording redo when requested.
     #[inline]
     pub(crate) async fn try_get_insert_page_with_redo<B: BufferPool>(
         &self,
@@ -114,6 +115,7 @@ impl<P: BufferPool> BlockIndex<P> {
             .await
     }
 
+    /// Returns an exclusive row page suitable for appending rows, recording redo when requested.
     #[inline]
     pub(crate) async fn get_insert_page_exclusive_with_redo<B: BufferPool>(
         &self,
@@ -277,7 +279,7 @@ mod tests {
     use super::*;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
     use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
-    use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
+    use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
@@ -288,9 +290,11 @@ mod tests {
     use crate::value::ValKind;
     use semistr::SemiStr;
     use std::future::Future;
+    use std::io::Error as StdIoError;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread::scope;
 
     // Test helper that lets us pause one row-index page fetch at a precise point.
     // The fallback test uses this to hold `find_row()` after the initial route
@@ -459,7 +463,7 @@ mod tests {
             mode: LatchFallbackMode,
         ) -> Result<FacadePageGuard<T>> {
             if page_id == self.fail_page_id.load(Ordering::Acquire) {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
             }
             self.inner.get_page(guard, page_id, mode).await
         }
@@ -492,15 +496,11 @@ mod tests {
     }
 
     fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
-        QuiescentBox::new(
-            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, pool_size).unwrap(),
-        )
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Index, pool_size).unwrap())
     }
 
     fn owned_mem_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
-        QuiescentBox::new(
-            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Mem, pool_size).unwrap(),
-        )
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Mem, pool_size).unwrap())
     }
 
     #[test]
@@ -549,8 +549,7 @@ mod tests {
     #[test]
     fn test_find_row_returns_error_when_column_route_has_no_storage() {
         let pool = QuiescentBox::new(
-            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
-                .unwrap(),
+            FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
         );
         let meta_guard = (*pool).pool_guard();
         let blk_idx = smol::block_on(BlockIndex::new(
@@ -576,8 +575,7 @@ mod tests {
     #[test]
     fn test_find_row_returns_error_when_column_fallback_has_no_storage() {
         let inner = QuiescentBox::new(
-            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
-                .unwrap(),
+            FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
         );
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
@@ -596,7 +594,7 @@ mod tests {
         .expect("test block-index construction should succeed");
         pool.set_stall_page_id(blk_idx.row.root_page_id());
 
-        std::thread::scope(|s| {
+        scope(|s| {
             // Start with row_id == pivot so the first route decision picks the row path.
             let blk_idx = &blk_idx;
             let meta_guard = meta_guard.clone();

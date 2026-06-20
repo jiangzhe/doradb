@@ -14,11 +14,13 @@ use crate::index::column_deletion_blob::{
 use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
+use blake3::Hasher;
 use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use zerocopy::byteorder::little_endian::{U32 as LeU32, U64 as LeU64};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -75,78 +77,6 @@ const ROW_SHAPE_FINGERPRINT_VERSION: u8 = 1;
 const ROW_SHAPE_KIND_DENSE: u8 = 1;
 const ROW_SHAPE_KIND_PRESENT_DELTA_LIST: u8 = 2;
 
-#[inline]
-fn column_block_index_invariant() -> Error {
-    Report::new(InternalError::ColumnBlockIndexInvariant).into()
-}
-
-#[inline]
-fn invalid_payload(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
-}
-
-#[repr(C)]
-#[derive(
-    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
-)]
-struct ColumnBlockLeafHeaderExt {
-    search_type: u8,
-    reserved: [u8; 7],
-}
-
-#[repr(C)]
-#[derive(
-    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
-)]
-struct ColumnBlockLeafEntryHeader {
-    block_id: [u8; 8],
-    row_shape_fingerprint: [u8; 16],
-    row_id_span: [u8; 4],
-    entry_len: [u8; 2],
-    row_section_len: [u8; 2],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColumnBlockLeafSearchType {
-    Plain,
-    DeltaU32,
-    DeltaU16,
-}
-
-impl ColumnBlockLeafSearchType {
-    #[inline]
-    fn encode(self) -> u8 {
-        match self {
-            ColumnBlockLeafSearchType::Plain => COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN,
-            ColumnBlockLeafSearchType::DeltaU32 => COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32,
-            ColumnBlockLeafSearchType::DeltaU16 => COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16,
-        }
-    }
-
-    #[inline]
-    fn decode(raw: u8) -> Result<Self> {
-        match raw {
-            COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN => Ok(ColumnBlockLeafSearchType::Plain),
-            COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32 => Ok(ColumnBlockLeafSearchType::DeltaU32),
-            COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16 => Ok(ColumnBlockLeafSearchType::DeltaU16),
-            _ => Err(invalid_payload(format!(
-                "invalid column block leaf search type {raw}"
-            ))),
-        }
-    }
-
-    #[inline]
-    fn prefix_size(self) -> usize {
-        match self {
-            ColumnBlockLeafSearchType::Plain => COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE,
-            ColumnBlockLeafSearchType::DeltaU32 => COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE,
-            ColumnBlockLeafSearchType::DeltaU16 => COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE,
-        }
-    }
-}
-
 /// Maximum number of logical entries that can fit in one leaf node.
 pub(crate) const COLUMN_BLOCK_MAX_ENTRIES: usize =
     COLUMN_BLOCK_LEAF_DATA_SIZE / COLUMN_BLOCK_MIN_LEAF_ENTRY_SIZE;
@@ -159,34 +89,13 @@ const _: () = assert!(mem::size_of::<ColumnBlockLeafEntryHeader>() == 32);
 const _: () = assert!(mem::size_of::<ColumnBlockBranchEntry>() == 16);
 const _: () = assert!(mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_NODE_PAYLOAD_SIZE);
 
-/// Persisted delete-domain tag stored in v2 leaf prefixes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ColumnDeleteDomain {
-    /// Delete payload units are `start_row_id`-relative row-id deltas.
-    RowIdDelta,
-    /// Delete payload units are row ordinals inside the authoritative row set.
-    Ordinal,
-}
-
-impl ColumnDeleteDomain {
-    #[inline]
-    fn encode(self) -> u8 {
-        match self {
-            ColumnDeleteDomain::RowIdDelta => COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
-            ColumnDeleteDomain::Ordinal => COLUMN_DELETE_DOMAIN_ORDINAL,
-        }
-    }
-
-    #[inline]
-    fn decode(raw: u8) -> Result<Self> {
-        match raw {
-            COLUMN_DELETE_DOMAIN_ROW_ID_DELTA => Ok(ColumnDeleteDomain::RowIdDelta),
-            COLUMN_DELETE_DOMAIN_ORDINAL => Ok(ColumnDeleteDomain::Ordinal),
-            _ => Err(invalid_payload(format!(
-                "invalid column delete domain {raw}"
-            ))),
-        }
-    }
+#[repr(C)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+struct ColumnBlockLeafHeaderExt {
+    search_type: u8,
+    reserved: [u8; 7],
 }
 
 impl ColumnBlockLeafHeaderExt {
@@ -202,6 +111,18 @@ impl ColumnBlockLeafHeaderExt {
     fn search_type(&self) -> Result<ColumnBlockLeafSearchType> {
         ColumnBlockLeafSearchType::decode(self.search_type)
     }
+}
+
+#[repr(C)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+struct ColumnBlockLeafEntryHeader {
+    block_id: [u8; 8],
+    row_shape_fingerprint: [u8; 16],
+    row_id_span: [u8; 4],
+    entry_len: [u8; 2],
+    row_section_len: [u8; 2],
 }
 
 impl ColumnBlockLeafEntryHeader {
@@ -250,6 +171,75 @@ impl ColumnBlockLeafEntryHeader {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColumnBlockLeafSearchType {
+    Plain,
+    DeltaU32,
+    DeltaU16,
+}
+
+impl ColumnBlockLeafSearchType {
+    #[inline]
+    fn encode(self) -> u8 {
+        match self {
+            ColumnBlockLeafSearchType::Plain => COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN,
+            ColumnBlockLeafSearchType::DeltaU32 => COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32,
+            ColumnBlockLeafSearchType::DeltaU16 => COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16,
+        }
+    }
+
+    #[inline]
+    fn decode(raw: u8) -> Result<Self> {
+        match raw {
+            COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN => Ok(ColumnBlockLeafSearchType::Plain),
+            COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32 => Ok(ColumnBlockLeafSearchType::DeltaU32),
+            COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16 => Ok(ColumnBlockLeafSearchType::DeltaU16),
+            _ => Err(invalid_payload(format!(
+                "invalid column block leaf search type {raw}"
+            ))),
+        }
+    }
+
+    #[inline]
+    fn prefix_size(self) -> usize {
+        match self {
+            ColumnBlockLeafSearchType::Plain => COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE,
+            ColumnBlockLeafSearchType::DeltaU32 => COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE,
+            ColumnBlockLeafSearchType::DeltaU16 => COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE,
+        }
+    }
+}
+
+/// Persisted delete-domain tag stored in v2 leaf prefixes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColumnDeleteDomain {
+    /// Delete payload units are `start_row_id`-relative row-id deltas.
+    RowIdDelta,
+    /// Delete payload units are row ordinals inside the authoritative row set.
+    Ordinal,
+}
+
+impl ColumnDeleteDomain {
+    #[inline]
+    fn encode(self) -> u8 {
+        match self {
+            ColumnDeleteDomain::RowIdDelta => COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
+            ColumnDeleteDomain::Ordinal => COLUMN_DELETE_DOMAIN_ORDINAL,
+        }
+    }
+
+    #[inline]
+    fn decode(raw: u8) -> Result<Self> {
+        match raw {
+            COLUMN_DELETE_DOMAIN_ROW_ID_DELTA => Ok(ColumnDeleteDomain::RowIdDelta),
+            COLUMN_DELETE_DOMAIN_ORDINAL => Ok(ColumnDeleteDomain::Ordinal),
+            _ => Err(invalid_payload(format!(
+                "invalid column delete domain {raw}"
+            ))),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(
     Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -287,8 +277,8 @@ impl DeleteSectionHeader {
     }
 }
 
-#[repr(C)]
 /// Header stored at the beginning of each on-disk column block-index node.
+#[repr(C)]
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub(crate) struct ColumnBlockNodeHeader {
     /// Tree height of this node. `0` denotes a leaf.
@@ -299,18 +289,6 @@ pub(crate) struct ColumnBlockNodeHeader {
     start_row_id: LeU64,
     /// Creation timestamp associated with this copy-on-write node version.
     create_ts: LeU64,
-}
-
-#[repr(C)]
-/// Branch entry mapping a child lower bound to a child block id.
-#[derive(
-    Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
-)]
-pub(crate) struct ColumnBlockBranchEntry {
-    /// Inclusive lower row-id bound routed to the child subtree.
-    start_row_id: LeU64,
-    /// Block id of the child node.
-    block_id: LeU64,
 }
 
 impl ColumnBlockNodeHeader {
@@ -346,6 +324,18 @@ impl ColumnBlockNodeHeader {
     }
 }
 
+/// Branch entry mapping a child lower bound to a child block id.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub(crate) struct ColumnBlockBranchEntry {
+    /// Inclusive lower row-id bound routed to the child subtree.
+    start_row_id: LeU64,
+    /// Block id of the child node.
+    block_id: LeU64,
+}
+
 impl ColumnBlockBranchEntry {
     #[inline]
     fn new(start_row_id: RowID, block_id: BlockID) -> Self {
@@ -366,11 +356,31 @@ impl ColumnBlockBranchEntry {
     }
 }
 
-#[repr(C)]
+trait ColumnBlockNodeRead {
+    fn header_ref(&self) -> &ColumnBlockNodeHeader;
+    fn data_ref(&self) -> &[u8];
+
+    #[inline]
+    fn is_leaf(&self) -> bool {
+        self.header_ref().height() == 0
+    }
+
+    #[inline]
+    fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
+        branch_entries_from_bytes(self.data_ref(), self.header_ref().count() as usize)
+    }
+
+    #[inline]
+    fn leaf_data_ref(&self) -> &[u8] {
+        &self.data_ref()[COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE..]
+    }
+}
+
 /// In-memory view of one persisted column block-index node payload.
 ///
 /// Leaves store a leaf-only header extension at the front of `data`, while
 /// branch nodes interpret the same region entirely as branch entries.
+#[repr(C)]
 #[derive(Clone)]
 pub(crate) struct ColumnBlockNode {
     /// Fixed-size persisted header shared by branch and leaf nodes.
@@ -413,6 +423,18 @@ impl ColumnBlockNode {
     }
 }
 
+impl ColumnBlockNodeRead for ColumnBlockNode {
+    #[inline]
+    fn header_ref(&self) -> &ColumnBlockNodeHeader {
+        &self.header
+    }
+
+    #[inline]
+    fn data_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 /// Validated row-shape metadata for one logical leaf entry before the backing
 /// LWC block id is assigned in the table file.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -451,21 +473,25 @@ impl ColumnBlockEntryShape {
         })
     }
 
+    /// Returns the inclusive lower row-id bound of this entry shape.
     #[inline]
     pub(crate) fn start_row_id(&self) -> RowID {
         self.start_row_id
     }
 
+    /// Returns the exclusive upper row-id bound of this entry shape.
     #[inline]
     pub(crate) fn end_row_id(&self) -> RowID {
         self.end_row_id
     }
 
+    /// Returns the canonical row-shape fingerprint for the entry shape.
     #[inline]
     pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         self.row_shape_fingerprint
     }
 
+    /// Updates the exclusive upper row-id bound and recomputes the row-shape fingerprint.
     pub(crate) fn set_end_row_id(&mut self, end_row_id: RowID) -> Result<()> {
         validate_row_ids(&self.row_ids, self.start_row_id, end_row_id)?;
         self.end_row_id = end_row_id;
@@ -474,12 +500,14 @@ impl ColumnBlockEntryShape {
         Ok(())
     }
 
+    /// Returns a copy of this shape using the requested delete-domain encoding.
     #[inline]
     pub(crate) fn with_delete_domain(mut self, delete_domain: ColumnDeleteDomain) -> Self {
         self.delete_domain = delete_domain;
         self
     }
 
+    /// Attaches the backing LWC block id, producing a complete leaf-entry input.
     #[inline]
     pub(crate) fn with_block_id(self, block_id: impl Into<BlockID>) -> ColumnBlockEntryInput {
         ColumnBlockEntryInput {
@@ -508,6 +536,7 @@ pub(crate) struct ColumnBlockEntryInput {
 }
 
 impl ColumnBlockEntryInput {
+    /// Returns the inclusive lower row-id bound of this completed entry input.
     #[inline]
     pub(crate) fn start_row_id(&self) -> RowID {
         self.start_row_id
@@ -733,42 +762,6 @@ impl LogicalRowSet {
             LogicalRowSet::DeltaList { deltas, .. } => deltas.get(idx).copied(),
         }
     }
-}
-
-fn row_shape_fingerprint_for_row_ids(
-    start_row_id: RowID,
-    end_row_id: RowID,
-    row_ids: &[RowID],
-) -> Result<u128> {
-    let row_set = LogicalRowSet::from_row_ids(start_row_id, end_row_id, row_ids)?;
-    logical_row_shape_fingerprint(start_row_id, &row_set)
-}
-
-fn logical_row_shape_fingerprint(start_row_id: RowID, row_set: &LogicalRowSet) -> Result<u128> {
-    let row_count =
-        u32::try_from(row_set.row_count()).map_err(|_| column_block_index_invariant())?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&[ROW_SHAPE_FINGERPRINT_VERSION]);
-    let sparse_deltas = match row_set {
-        LogicalRowSet::Dense { .. } => {
-            hasher.update(&[ROW_SHAPE_KIND_DENSE]);
-            None
-        }
-        LogicalRowSet::DeltaList { deltas, .. } => {
-            hasher.update(&[ROW_SHAPE_KIND_PRESENT_DELTA_LIST]);
-            Some(deltas.as_slice())
-        }
-    };
-    hasher.update(&start_row_id.to_le_bytes());
-    hasher.update(&row_count.to_le_bytes());
-    if let Some(deltas) = sparse_deltas {
-        for delta in deltas {
-            hasher.update(&delta.to_le_bytes());
-        }
-    }
-    let mut truncated = [0u8; mem::size_of::<u128>()];
-    truncated.copy_from_slice(&hasher.finalize().as_bytes()[..mem::size_of::<u128>()]);
-    Ok(u128::from_le_bytes(truncated))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1190,114 +1183,10 @@ impl<'a> LeafPrefixPlane<'a> {
     }
 }
 
-trait ColumnBlockNodeRead {
-    fn header_ref(&self) -> &ColumnBlockNodeHeader;
-    fn data_ref(&self) -> &[u8];
-
-    #[inline]
-    fn is_leaf(&self) -> bool {
-        self.header_ref().height() == 0
-    }
-    #[inline]
-    fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
-        branch_entries_from_bytes(self.data_ref(), self.header_ref().count() as usize)
-    }
-
-    #[inline]
-    fn leaf_data_ref(&self) -> &[u8] {
-        &self.data_ref()[COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE..]
-    }
-}
-
-impl ColumnBlockNodeRead for ColumnBlockNode {
-    #[inline]
-    fn header_ref(&self) -> &ColumnBlockNodeHeader {
-        &self.header
-    }
-
-    #[inline]
-    fn data_ref(&self) -> &[u8] {
-        &self.data
-    }
-}
-
-/// Snapshot reader and copy-on-write rewrite façade for one persisted column
-/// block-index tree root.
-pub(crate) struct ColumnBlockIndex<'a> {
-    file_kind: FileKind,
-    file: &'a Arc<SparseFile>,
-    disk_pool: &'a QuiescentGuard<ReadonlyBufferPool>,
-    disk_pool_guard: &'a PoolGuard,
-    root_block_id: BlockID,
-    end_row_id: RowID,
-}
-
 #[derive(Clone, Debug)]
 struct NodeRewriteResult {
     entries: Vec<ColumnBlockBranchEntry>,
     touched: bool,
-}
-
-#[inline]
-fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=column-block-index, block_id={block_id}"
-        ))
-        .into()
-}
-
-#[inline]
-fn invalid_blob_payload(file_kind: FileKind, block_id: BlockID) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=column-deletion-blob, block_id={block_id}"
-        ))
-        .into()
-}
-
-#[inline]
-fn validate_node_payload(page: &[u8], file_kind: FileKind, block_id: BlockID) -> Result<&[u8]> {
-    let payload = validate_block(page, COLUMN_BLOCK_INDEX_BLOCK_SPEC)
-        .attach_with(|| format!("file={file_kind}, block=column-block-index, block_id={block_id}"))
-        .map_err(Error::from)?;
-    let header =
-        layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
-            .map_err(|_| invalid_node_payload(file_kind, block_id))?;
-    let count = header.count() as usize;
-    if (header.height() == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
-        || (header.height() > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
-    {
-        return Err(invalid_node_payload(file_kind, block_id));
-    }
-    Ok(payload)
-}
-
-#[inline]
-pub(crate) fn validate_persisted_column_block_index_page(
-    page: &[u8],
-    file_kind: FileKind,
-    block_id: BlockID,
-) -> Result<()> {
-    validate_node_payload(page, file_kind, block_id).map(|_| ())
-}
-
-#[inline]
-fn validated_node_payload(page: &[u8]) -> &[u8] {
-    let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
-    &page[payload_start..payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE]
-}
-
-#[inline]
-fn branch_entries_from_bytes(data: &[u8], count: usize) -> &[ColumnBlockBranchEntry] {
-    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-    layout::slice_from_bytes(&data[..bytes_len])
-}
-
-#[inline]
-fn branch_entries_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnBlockBranchEntry] {
-    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-    layout::slice_from_bytes_mut(&mut data[..bytes_len])
 }
 
 struct ValidatedColumnBlockNode {
@@ -1443,6 +1332,31 @@ impl ColumnBlockNodeRead for ValidatedColumnBlockNode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedRowSectionMetadata {
+    row_count: u16,
+    first_present_delta: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedDeleteSectionMetadata {
+    delete_codec: u8,
+    delete_domain: ColumnDeleteDomain,
+    del_count: u16,
+    blob_ref: Option<BlobRef>,
+}
+
+/// Snapshot reader and copy-on-write rewrite façade for one persisted column
+/// block-index tree root.
+pub(crate) struct ColumnBlockIndex<'a> {
+    file_kind: FileKind,
+    file: &'a Arc<SparseFile>,
+    disk_pool: &'a QuiescentGuard<ReadonlyBufferPool>,
+    disk_pool_guard: &'a PoolGuard,
+    root_block_id: BlockID,
+    end_row_id: RowID,
+}
+
 impl<'a> ColumnBlockIndex<'a> {
     /// Creates a column block-index view for one root block snapshot.
     #[inline]
@@ -1464,6 +1378,7 @@ impl<'a> ColumnBlockIndex<'a> {
         }
     }
 
+    /// Returns the file kind used for validation diagnostics and reads.
     #[inline]
     pub(crate) fn file_kind(&self) -> FileKind {
         self.file_kind
@@ -2325,6 +2240,117 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 }
 
+/// Validates one persisted column block-index page.
+#[inline]
+pub(crate) fn validate_persisted_column_block_index_page(
+    page: &[u8],
+    file_kind: FileKind,
+    block_id: BlockID,
+) -> Result<()> {
+    validate_node_payload(page, file_kind, block_id).map(|_| ())
+}
+
+#[inline]
+fn column_block_index_invariant() -> Error {
+    Report::new(InternalError::ColumnBlockIndexInvariant).into()
+}
+
+#[inline]
+fn invalid_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=column-block-index, block_id={block_id}"
+        ))
+        .into()
+}
+
+#[inline]
+fn invalid_blob_payload(file_kind: FileKind, block_id: BlockID) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=column-deletion-blob, block_id={block_id}"
+        ))
+        .into()
+}
+
+#[inline]
+fn validate_node_payload(page: &[u8], file_kind: FileKind, block_id: BlockID) -> Result<&[u8]> {
+    let payload = validate_block(page, COLUMN_BLOCK_INDEX_BLOCK_SPEC)
+        .attach_with(|| format!("file={file_kind}, block=column-block-index, block_id={block_id}"))
+        .map_err(Error::from)?;
+    let header =
+        layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
+            .map_err(|_| invalid_node_payload(file_kind, block_id))?;
+    let count = header.count() as usize;
+    if (header.height() == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
+        || (header.height() > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
+    {
+        return Err(invalid_node_payload(file_kind, block_id));
+    }
+    Ok(payload)
+}
+
+#[inline]
+fn validated_node_payload(page: &[u8]) -> &[u8] {
+    let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
+    &page[payload_start..payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE]
+}
+
+#[inline]
+fn branch_entries_from_bytes(data: &[u8], count: usize) -> &[ColumnBlockBranchEntry] {
+    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+    layout::slice_from_bytes(&data[..bytes_len])
+}
+
+#[inline]
+fn branch_entries_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnBlockBranchEntry] {
+    let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
+    layout::slice_from_bytes_mut(&mut data[..bytes_len])
+}
+
+fn row_shape_fingerprint_for_row_ids(
+    start_row_id: RowID,
+    end_row_id: RowID,
+    row_ids: &[RowID],
+) -> Result<u128> {
+    let row_set = LogicalRowSet::from_row_ids(start_row_id, end_row_id, row_ids)?;
+    logical_row_shape_fingerprint(start_row_id, &row_set)
+}
+
+fn logical_row_shape_fingerprint(start_row_id: RowID, row_set: &LogicalRowSet) -> Result<u128> {
+    let row_count =
+        u32::try_from(row_set.row_count()).map_err(|_| column_block_index_invariant())?;
+    let mut hasher = Hasher::new();
+    hasher.update(&[ROW_SHAPE_FINGERPRINT_VERSION]);
+    let sparse_deltas = match row_set {
+        LogicalRowSet::Dense { .. } => {
+            hasher.update(&[ROW_SHAPE_KIND_DENSE]);
+            None
+        }
+        LogicalRowSet::DeltaList { deltas, .. } => {
+            hasher.update(&[ROW_SHAPE_KIND_PRESENT_DELTA_LIST]);
+            Some(deltas.as_slice())
+        }
+    };
+    hasher.update(&start_row_id.to_le_bytes());
+    hasher.update(&row_count.to_le_bytes());
+    if let Some(deltas) = sparse_deltas {
+        for delta in deltas {
+            hasher.update(&delta.to_le_bytes());
+        }
+    }
+    let mut truncated = [0u8; mem::size_of::<u128>()];
+    truncated.copy_from_slice(&hasher.finalize().as_bytes()[..mem::size_of::<u128>()]);
+    Ok(u128::from_le_bytes(truncated))
+}
+
 fn validate_row_ids(row_ids: &[RowID], start_row_id: RowID, end_row_id: RowID) -> Result<()> {
     if row_ids.is_empty() || start_row_id >= end_row_id {
         return Err(column_block_index_invariant());
@@ -2342,20 +2368,6 @@ fn validate_row_ids(row_ids: &[RowID], start_row_id: RowID, end_row_id: RowID) -
         prev = Some(*row_id);
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DecodedRowSectionMetadata {
-    row_count: u16,
-    first_present_delta: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DecodedDeleteSectionMetadata {
-    delete_codec: u8,
-    delete_domain: ColumnDeleteDomain,
-    del_count: u16,
-    blob_ref: Option<BlobRef>,
 }
 
 fn leaf_entry_slice(
@@ -3316,7 +3328,7 @@ where
 }
 
 #[inline]
-fn search_prefix_slice(search: std::result::Result<usize, usize>) -> Option<usize> {
+fn search_prefix_slice(search: StdResult<usize, usize>) -> Option<usize> {
     match search {
         Ok(idx) => Some(idx),
         Err(0) => None,

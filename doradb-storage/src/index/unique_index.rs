@@ -103,96 +103,6 @@ pub(crate) struct UniqueMemIndex<P: 'static> {
     encoder: BTreeKeyEncoder,
 }
 
-/// Encoded MemIndex state for one unique secondary-index entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UniqueMemIndexEntry {
-    /// Encoded logical secondary key in BTree order.
-    pub(crate) encoded_key: Vec<u8>,
-    /// Row id stored in the MemIndex entry with the delete bit stripped.
-    pub(crate) row_id: RowID,
-    /// Whether the MemIndex entry is a delete-shadow.
-    pub(crate) deleted: bool,
-}
-
-/// Bounded batch of unique MemIndex entries selected for cleanup processing.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct UniqueMemIndexCleanupBatch {
-    /// Cleanup candidates copied out of one MemIndex leaf.
-    pub(crate) entries: Vec<UniqueMemIndexEntry>,
-    /// Live entries skipped before encoded-key allocation.
-    pub(crate) skipped_live: usize,
-    /// Hot delete overlays skipped before encoded-key allocation.
-    pub(crate) skipped_hot_deleted: usize,
-}
-
-/// Leaf-bounded cleanup scanner for unique MemIndex entries.
-pub(crate) struct UniqueMemIndexCleanupScan<'a, P: 'static> {
-    cursor: BTreeNodeCursor<'a, P>,
-    pivot_row_id: RowID,
-    clean_live_entries: bool,
-    started: bool,
-}
-
-impl<'a, P: BufferPool> UniqueMemIndexCleanupScan<'a, P> {
-    #[inline]
-    fn new(
-        tree: &'a GenericBTree<P>,
-        pool_guard: &'a PoolGuard,
-        pivot_row_id: RowID,
-        clean_live_entries: bool,
-    ) -> Self {
-        Self {
-            cursor: tree.cursor(pool_guard, 0),
-            pivot_row_id,
-            clean_live_entries,
-            started: false,
-        }
-    }
-
-    /// Return the next leaf-bounded cleanup candidate batch.
-    #[inline]
-    pub(crate) async fn next_batch(&mut self) -> Result<Option<UniqueMemIndexCleanupBatch>> {
-        if !self.started {
-            self.cursor.seek(&[]).await?;
-            self.started = true;
-        }
-        let Some(guard) = self.cursor.next().await? else {
-            return Ok(None);
-        };
-
-        let node = guard.page();
-        let mut batch = UniqueMemIndexCleanupBatch::default();
-        for idx in 0..node.count() {
-            let value = node.value::<BTreeU64>(idx);
-            let row_id = value.value().to_row_id();
-            let deleted = value.is_deleted();
-            if row_id >= self.pivot_row_id {
-                if deleted {
-                    batch.skipped_hot_deleted += 1;
-                } else {
-                    batch.skipped_live += 1;
-                }
-                continue;
-            }
-            if !deleted && !self.clean_live_entries {
-                batch.skipped_live += 1;
-                continue;
-            }
-            let encoded_key = node.key_checked(idx).ok_or_else(|| {
-                Error::from(
-                    Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={idx}")),
-                )
-            })?;
-            batch.entries.push(UniqueMemIndexEntry {
-                encoded_key,
-                row_id,
-                deleted,
-            });
-        }
-        Ok(Some(batch))
-    }
-}
-
 impl<P: BufferPool> UniqueMemIndex<P> {
     /// Build a unique MemIndex from catalog index metadata.
     #[inline]
@@ -459,10 +369,100 @@ impl<P: BufferPool> UniqueIndex for UniqueMemIndex<P> {
     }
 }
 
+/// Encoded MemIndex state for one unique secondary-index entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UniqueMemIndexEntry {
+    /// Encoded logical secondary key in BTree order.
+    pub(crate) encoded_key: Vec<u8>,
+    /// Row id stored in the MemIndex entry with the delete bit stripped.
+    pub(crate) row_id: RowID,
+    /// Whether the MemIndex entry is a delete-shadow.
+    pub(crate) deleted: bool,
+}
+
+/// Bounded batch of unique MemIndex entries selected for cleanup processing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UniqueMemIndexCleanupBatch {
+    /// Cleanup candidates copied out of one MemIndex leaf.
+    pub(crate) entries: Vec<UniqueMemIndexEntry>,
+    /// Live entries skipped before encoded-key allocation.
+    pub(crate) skipped_live: usize,
+    /// Hot delete overlays skipped before encoded-key allocation.
+    pub(crate) skipped_hot_deleted: usize,
+}
+
+/// Leaf-bounded cleanup scanner for unique MemIndex entries.
+pub(crate) struct UniqueMemIndexCleanupScan<'a, P: 'static> {
+    cursor: BTreeNodeCursor<'a, P>,
+    pivot_row_id: RowID,
+    clean_live_entries: bool,
+    started: bool,
+}
+
+impl<'a, P: BufferPool> UniqueMemIndexCleanupScan<'a, P> {
+    #[inline]
+    fn new(
+        tree: &'a GenericBTree<P>,
+        pool_guard: &'a PoolGuard,
+        pivot_row_id: RowID,
+        clean_live_entries: bool,
+    ) -> Self {
+        Self {
+            cursor: tree.cursor(pool_guard, 0),
+            pivot_row_id,
+            clean_live_entries,
+            started: false,
+        }
+    }
+
+    /// Return the next leaf-bounded cleanup candidate batch.
+    #[inline]
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<UniqueMemIndexCleanupBatch>> {
+        if !self.started {
+            self.cursor.seek(&[]).await?;
+            self.started = true;
+        }
+        let Some(guard) = self.cursor.next().await? else {
+            return Ok(None);
+        };
+
+        let node = guard.page();
+        let mut batch = UniqueMemIndexCleanupBatch::default();
+        for idx in 0..node.count() {
+            let value = node.value::<BTreeU64>(idx);
+            let row_id = value.value().to_row_id();
+            let deleted = value.is_deleted();
+            if row_id >= self.pivot_row_id {
+                if deleted {
+                    batch.skipped_hot_deleted += 1;
+                } else {
+                    batch.skipped_live += 1;
+                }
+                continue;
+            }
+            if !deleted && !self.clean_live_entries {
+                batch.skipped_live += 1;
+                continue;
+            }
+            let encoded_key = node.key_checked(idx).ok_or_else(|| {
+                Error::from(
+                    Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={idx}")),
+                )
+            })?;
+            batch.entries.push(UniqueMemIndexEntry {
+                encoded_key,
+                row_id,
+                deleted,
+            });
+        }
+        Ok(Some(batch))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::FixedBufferPool;
+    use crate::buffer::{FixedBufferPool, PoolRole};
     use crate::index::btree::BTree;
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
@@ -471,11 +471,7 @@ mod tests {
     fn test_single_key_btree_unique_index() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024 * 1024,
-                )
-                .unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             {
                 let pool_guard = (*pool).pool_guard();
@@ -497,11 +493,7 @@ mod tests {
     fn test_multi_key_btree_unique_index() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024 * 1024,
-                )
-                .unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             {
                 let pool_guard = (*pool).pool_guard();
@@ -529,11 +521,7 @@ mod tests {
     fn test_unique_mem_index_compare_delete_encoded_entry_checks_snapshot() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024 * 1024,
-                )
-                .unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
             let index = UniqueMemIndex {
@@ -646,11 +634,7 @@ mod tests {
     fn test_unique_mem_index_cleanup_scan_filters_live_entries_by_policy() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(
-                    crate::buffer::PoolRole::Index,
-                    1024usize * 1024 * 1024,
-                )
-                .unwrap(),
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
             let index = UniqueMemIndex {
