@@ -1,6 +1,7 @@
 use crate::index::btree::KeyHeadInt;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+/// Number of persisted search hints stored in each B-tree node header.
 pub(crate) const BTREE_HINTS_LEN: usize = 8;
 
 /// BTreeHint is a search hint on each BTreeNode.
@@ -40,6 +41,7 @@ impl BTreeHints {
         }
     }
 
+    /// Update one persisted hint with a key head.
     #[inline]
     pub(crate) fn update(&mut self, idx: usize, key: KeyHeadInt) {
         self.0[idx] = key.to_le_bytes();

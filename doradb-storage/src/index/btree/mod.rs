@@ -32,8 +32,11 @@ pub(crate) use node::*;
 pub(crate) use scan::*;
 pub(crate) use value::*;
 
+/// Shared latch strategy used by B-tree traversal helpers.
 pub(crate) type SharedStrategy = SharedLockStrategy<BTreeNode>;
+/// Exclusive latch strategy used by B-tree mutation helpers.
 pub(crate) type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
+/// Optimistic latch strategy used by B-tree lookup helpers.
 pub(crate) type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
 
 macro_rules! verify_result {
@@ -45,6 +48,7 @@ macro_rules! verify_result {
     };
 }
 
+/// Result of inserting a key/value pair into a B-tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BTreeInsert<V: BTreeValue> {
     Ok(bool),
@@ -52,6 +56,7 @@ pub(crate) enum BTreeInsert<V: BTreeValue> {
 }
 
 impl<V: BTreeValue> BTreeInsert<V> {
+    /// Return whether the insert created a new visible entry.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved is_ok"))]
     pub(crate) fn is_ok(&self) -> bool {
@@ -59,6 +64,7 @@ impl<V: BTreeValue> BTreeInsert<V> {
     }
 }
 
+/// Result of deleting a key/value pair from a B-tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BTreeDelete {
     Ok,
@@ -67,12 +73,14 @@ pub(crate) enum BTreeDelete {
 }
 
 impl BTreeDelete {
+    /// Return whether the delete removed an entry.
     #[inline]
     pub(crate) fn is_ok(&self) -> bool {
         matches!(self, BTreeDelete::Ok)
     }
 }
 
+/// Result of updating a key/value pair in a B-tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BTreeUpdate<V: BTreeValue> {
     Ok(V),
@@ -81,11 +89,16 @@ pub(crate) enum BTreeUpdate<V: BTreeValue> {
 }
 
 impl<V: BTreeValue> BTreeUpdate<V> {
+    /// Return whether the update replaced an entry value.
     #[inline]
     pub(crate) fn is_ok(&self) -> bool {
         matches!(self, BTreeUpdate::Ok(_))
     }
 }
+
+/// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
+#[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+pub(crate) type BTree = GenericBTree<FixedBufferPool>;
 
 /// Generic B-Tree storage wrapper over a buffer-pool implementation.
 pub(crate) struct GenericBTree<P: 'static> {
@@ -97,10 +110,6 @@ pub(crate) struct GenericBTree<P: 'static> {
     // supports CoW operations.
     pool: QuiescentGuard<P>,
 }
-
-/// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
-#[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-pub(crate) type BTree = GenericBTree<FixedBufferPool>;
 
 impl<P: BufferPool> GenericBTree<P> {
     /// Create a new B-Tree index.
@@ -1223,25 +1232,6 @@ impl<P: BufferPool> GenericBTree<P> {
     }
 }
 
-#[inline]
-async fn revalidate_child_separator_for_split(
-    c_guard: PageOptimisticGuard<BTreeNode>,
-    sep_idx: usize,
-    sep_key: &[u8],
-) -> Option<PageExclusiveGuard<BTreeNode>> {
-    let c_guard = c_guard.lock_exclusive_async().await?;
-    let c_node = c_guard.page();
-    let new_sep_idx = c_node.find_separator();
-    if new_sep_idx != sep_idx {
-        return None;
-    }
-    let new_sep_key = c_node.create_sep_key(new_sep_idx, true);
-    if &new_sep_key[..] != sep_key {
-        return None;
-    }
-    Some(c_guard)
-}
-
 /// Controls how to access B-Tree nodes with coupling way.
 pub(crate) struct BTreeCoupling<S: LockStrategy> {
     // Parent position to locate target node.
@@ -1254,6 +1244,7 @@ impl<S: LockStrategy<Page = BTreeNode>> BTreeCoupling<S>
 where
     S::Guard: PageGuard<BTreeNode>,
 {
+    /// Create an empty coupling holder.
     #[inline]
     pub(crate) fn new() -> Self {
         BTreeCoupling {
@@ -1403,20 +1394,6 @@ impl SplitNode {
     }
 }
 
-#[inline]
-fn build_exhausted_parent_seek_key(node: &BTreeNode, key_buffer: &mut Vec<u8>) {
-    key_buffer.clear();
-    if node.has_no_upper_fence() {
-        return;
-    }
-    node.extend_upper_fence_key(key_buffer);
-}
-
-#[inline]
-fn make_strict_successor(key_buffer: &mut Vec<u8>) {
-    key_buffer.push(0);
-}
-
 /// Shared cursor of nodes at given height.
 /// At most two locks are held at the same time.
 ///
@@ -1454,6 +1431,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
         }
     }
 
+    /// Seek to the first node at this cursor height that may contain `key`.
     #[inline]
     pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
         self.coupling
@@ -1539,6 +1517,7 @@ pub(crate) struct BTreeCompactConfig {
 }
 
 impl BTreeCompactConfig {
+    /// Create a compaction configuration from low and high occupancy ratios.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "internal btree compaction"))]
     pub(crate) fn new(low_ratio: f64, high_ratio: f64) -> Result<Self> {
@@ -1593,6 +1572,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             == Some(exhausted_parent_page_id)
     }
 
+    /// Create a compactor over nodes at `height`.
     #[inline]
     pub(crate) fn new(
         tree: &'a GenericBTree<P>,
@@ -1615,6 +1595,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
         }
     }
 
+    /// Seek to the first compactable node at or after `key`.
     #[inline]
     pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
         self.coupling
@@ -1622,6 +1603,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             .await
     }
 
+    /// Compact nodes from the current height until the end of the tree.
     #[inline]
     pub(crate) async fn run_to_end(
         mut self,
@@ -1895,9 +1877,45 @@ enum BTreeCompact {
     ParentDone(PageID),
 }
 
+#[inline]
+async fn revalidate_child_separator_for_split(
+    c_guard: PageOptimisticGuard<BTreeNode>,
+    sep_idx: usize,
+    sep_key: &[u8],
+) -> Option<PageExclusiveGuard<BTreeNode>> {
+    let c_guard = c_guard.lock_exclusive_async().await?;
+    let c_node = c_guard.page();
+    let new_sep_idx = c_node.find_separator();
+    if new_sep_idx != sep_idx {
+        return None;
+    }
+    let new_sep_key = c_node.create_sep_key(new_sep_idx, true);
+    if &new_sep_key[..] != sep_key {
+        return None;
+    }
+    Some(c_guard)
+}
+
+#[inline]
+fn build_exhausted_parent_seek_key(node: &BTreeNode, key_buffer: &mut Vec<u8>) {
+    key_buffer.clear();
+    if node.has_no_upper_fence() {
+        return;
+    }
+    node.extend_upper_fence_key(key_buffer);
+}
+
+#[inline]
+fn make_strict_successor(key_buffer: &mut Vec<u8>) {
+    key_buffer.push(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::PoolRole;
+    use crate::buffer::frame::BufferFrame;
+    use crate::buffer::page::Page;
     use crate::error::ResourceError;
     use crate::map::FastHashMap;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -1905,7 +1923,10 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use rand_distr::{Distribution, Uniform};
     use std::collections::BTreeMap;
+    use std::mem::size_of;
     use std::sync::{Arc, Barrier, mpsc};
+    use std::task::Poll;
+    use std::thread;
     use std::time::Instant;
 
     const WIDE_KEY_LEN: usize = 1000;
@@ -1932,14 +1953,12 @@ mod tests {
     }
 
     fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
-        QuiescentBox::new(
-            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, pool_size).unwrap(),
-        )
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Index, pool_size).unwrap())
     }
 
     fn wide_test_key(i: u64) -> [u8; WIDE_KEY_LEN] {
         let mut key = [0u8; WIDE_KEY_LEN];
-        key[WIDE_KEY_LEN - std::mem::size_of::<u64>()..].copy_from_slice(&i.to_be_bytes());
+        key[WIDE_KEY_LEN - size_of::<u64>()..].copy_from_slice(&i.to_be_bytes());
         key
     }
 
@@ -2384,9 +2403,8 @@ mod tests {
         smol::block_on(async {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(
-                    crate::buffer::PoolRole::Index,
-                    2 * (std::mem::size_of::<crate::buffer::frame::BufferFrame>()
-                        + std::mem::size_of::<crate::buffer::page::Page>()),
+                    PoolRole::Index,
+                    2 * (size_of::<BufferFrame>() + size_of::<Page>()),
                 )
                 .unwrap(),
             );
@@ -2880,7 +2898,7 @@ mod tests {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
                     let insert_key = insert_key.to_vec();
-                    std::thread::spawn(move || {
+                    thread::spawn(move || {
                         smol::block_on(async {
                             let res = tree
                                 .try_find_leaf_with_optimistic_parent::<SharedStrategy>(
@@ -2907,7 +2925,7 @@ mod tests {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
                     let insert_key = insert_key.to_vec();
-                    std::thread::spawn(move || {
+                    thread::spawn(move || {
                         smol::block_on(async {
                             let insert_fut = tree.insert(
                                 &pool_guard,
@@ -2917,10 +2935,7 @@ mod tests {
                                 TrxID::new(202),
                             );
                             futures::pin_mut!(insert_fut);
-                            assert!(matches!(
-                                futures::poll!(insert_fut.as_mut()),
-                                std::task::Poll::Pending
-                            ));
+                            assert!(matches!(futures::poll!(insert_fut.as_mut()), Poll::Pending));
                             insert_started_tx.send(()).unwrap();
                             let res = insert_fut.await;
                             assert!(res.is_ok());
@@ -2962,7 +2977,7 @@ mod tests {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
                     let start = Arc::clone(&start);
-                    let handle = std::thread::spawn(move || {
+                    let handle = thread::spawn(move || {
                         start.wait();
                         smol::block_on(async {
                             let key = wide_test_key(j);
