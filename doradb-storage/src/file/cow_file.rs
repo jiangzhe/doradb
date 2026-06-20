@@ -13,9 +13,10 @@ use error_stack::Report;
 use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
+use std::io;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
-use std::ptr::NonNull;
+use std::ptr::{NonNull, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
@@ -32,8 +33,13 @@ pub(crate) const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub(crate) trait MutableCowFile {
+    /// Allocate one unpublished block id from the mutable root.
     fn allocate_block(&mut self) -> Result<BlockID>;
+
+    /// Roll back one unpublished block id allocated by this mutable writer.
     fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()>;
+
+    /// Write one CoW block into the backing file.
     fn write_block(
         &self,
         block_id: BlockID,
@@ -43,7 +49,10 @@ pub(crate) trait MutableCowFile {
 
 /// File wrapper that can own one mutable CoW writer claim.
 pub(crate) trait MutableWriterFile {
+    /// Claim exclusive mutable writer ownership for this file.
     fn claim_mutable_writer(&self);
+
+    /// Release exclusive mutable writer ownership for this file.
     fn release_mutable_writer(&self);
 }
 
@@ -63,6 +72,7 @@ impl<'a> CowWriteBarrier<'a> {
         Self::ReadonlyPool(pool)
     }
 
+    /// Start the readonly-cache write barrier for one physical block.
     #[inline]
     pub(crate) fn begin_write(
         self,
@@ -193,6 +203,22 @@ impl<M> ActiveRoot<M> {
         debug_assert!(effective_ts < MAX_SNAPSHOT_TS);
         self.effective_ts
             .store(effective_ts.as_u64(), Ordering::Release);
+    }
+}
+
+impl<M> Deref for ActiveRoot<M> {
+    type Target = M;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+
+impl<M> DerefMut for ActiveRoot<M> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.meta
     }
 }
 
@@ -340,35 +366,6 @@ impl<M> MutableCowRoot<M> {
     }
 }
 
-/// Allocates one CoW block id.
-#[inline]
-pub(crate) fn allocate_cow_block<M>(
-    root: &mut MutableCowRoot<M>,
-    capacity_context: &'static str,
-) -> Result<BlockID> {
-    root.try_allocate_block().ok_or_else(|| {
-        Error::from(
-            Report::new(ResourceError::StorageFileCapacityExceeded).attach(capacity_context),
-        )
-    })
-}
-
-impl<M> Deref for ActiveRoot<M> {
-    type Target = M;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.meta
-    }
-}
-
-impl<M> DerefMut for ActiveRoot<M> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.meta
-    }
-}
-
 /// Decoded meta-block payload used to assemble an active root.
 ///
 /// `parse_meta_block` returns this value so `CowFile` can reconstruct one
@@ -430,7 +427,7 @@ impl<M> CowFile<M> {
         }?;
         Ok(CowFile {
             file: Arc::new(file),
-            active_root: AtomicPtr::new(std::ptr::null_mut()),
+            active_root: AtomicPtr::new(null_mut()),
             mutable_inflight: AtomicBool::new(false),
             codec,
         })
@@ -449,7 +446,7 @@ impl<M> CowFile<M> {
         let file = SparseFile::open(file_path, file_id)?;
         Ok(CowFile {
             file: Arc::new(file),
-            active_root: AtomicPtr::new(std::ptr::null_mut()),
+            active_root: AtomicPtr::new(null_mut()),
             mutable_inflight: AtomicBool::new(false),
             codec,
         })
@@ -562,6 +559,7 @@ impl<M> CowFile<M> {
         .await
     }
 
+    /// Returns the backing sparse file.
     #[inline]
     pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
         &self.file
@@ -758,27 +756,6 @@ impl<M> CowFile<M> {
     }
 }
 
-#[inline]
-pub(crate) fn validate_active_meta_block_id(
-    alloc_map: &AllocMap,
-    meta_block_id: BlockID,
-    file_kind: FileKind,
-    block_kind: &'static str,
-) -> Result<()> {
-    let meta_block_idx = usize::from(meta_block_id);
-    if meta_block_idx == usize::from(SUPER_BLOCK_ID)
-        || meta_block_idx >= alloc_map.len()
-        || !alloc_map.is_allocated(meta_block_idx)
-    {
-        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-            .attach(format!(
-                "file={file_kind}, block={block_kind}, block_id={meta_block_id}"
-            ))
-            .into());
-    }
-    Ok(())
-}
-
 impl<M> Drop for CowFile<M> {
     #[inline]
     fn drop(&mut self) {
@@ -813,8 +790,43 @@ unsafe impl<M: Send> Send for OldCowRoot<M> {}
 // `ActiveRoot`; the guard only reclaims the pointer when owned and dropped.
 unsafe impl<M> Sync for OldCowRoot<M> {}
 
+/// Allocates one CoW block id.
 #[inline]
-fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
+pub(crate) fn allocate_cow_block<M>(
+    root: &mut MutableCowRoot<M>,
+    capacity_context: &'static str,
+) -> Result<BlockID> {
+    root.try_allocate_block().ok_or_else(|| {
+        Error::from(
+            Report::new(ResourceError::StorageFileCapacityExceeded).attach(capacity_context),
+        )
+    })
+}
+
+/// Validate that the active meta-block id is allocated and not the reserved super block.
+#[inline]
+pub(crate) fn validate_active_meta_block_id(
+    alloc_map: &AllocMap,
+    meta_block_id: BlockID,
+    file_kind: FileKind,
+    block_kind: &'static str,
+) -> Result<()> {
+    let meta_block_idx = usize::from(meta_block_id);
+    if meta_block_idx == usize::from(SUPER_BLOCK_ID)
+        || meta_block_idx >= alloc_map.len()
+        || !alloc_map.is_allocated(meta_block_idx)
+    {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "file={file_kind}, block={block_kind}, block_id={meta_block_id}"
+            ))
+            .into());
+    }
+    Ok(())
+}
+
+#[inline]
+fn remove_file_by_fd(fd: RawFd) -> io::Result<()> {
     let proc_path = format!("/proc/self/fd/{}", fd);
     let real_path = fs::read_link(&proc_path)?;
     fs::remove_file(real_path)

@@ -5,11 +5,16 @@ use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 
+/// On-disk super-block format version.
 pub(crate) const SUPER_BLOCK_VERSION: u64 = 1;
+/// Size in bytes of one ping-pong super-block slot.
 pub(crate) const SUPER_BLOCK_SIZE: usize = PAGE_SIZE / 2;
+/// Size in bytes of the checksummed super-block footer.
 pub(crate) const SUPER_BLOCK_FOOTER_SIZE: usize = mem::size_of::<SuperBlockFooter>();
+/// Byte offset where the footer starts inside one super-block slot.
 pub(crate) const SUPER_BLOCK_FOOTER_OFFSET: usize = SUPER_BLOCK_SIZE - SUPER_BLOCK_FOOTER_SIZE;
 
+/// Header fields stored at the front of every super-block slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SuperBlockHeader {
     /// Magic word of table file, by default 'DORA\0\0\0\0'
@@ -64,8 +69,10 @@ impl Deser for SuperBlockHeader {
     }
 }
 
+/// Super-block body fields covered by the footer checksum.
 #[derive(PartialEq, Eq)]
 pub(crate) struct SuperBlockBody {
+    /// Active meta-block id referenced by this super-block slot.
     pub(crate) meta_block_id: BlockID,
 }
 
@@ -96,9 +103,12 @@ impl Deser for SuperBlockBody {
     }
 }
 
+/// Footer fields stored at the end of every super-block slot.
 #[derive(Default, PartialEq, Eq)]
 pub(crate) struct SuperBlockFooter {
+    /// Blake3 checksum of the super-block bytes before the footer.
     pub(crate) b3sum: [u8; 32],
+    /// Checkpoint timestamp repeated from the header to detect torn writes.
     pub(crate) checkpoint_cts: TrxID,
 }
 
@@ -132,15 +142,22 @@ impl Ser<'_> for SuperBlockFooter {
     }
 }
 
+/// Fully decoded and validated super-block slot.
 #[derive(PartialEq, Eq)]
 pub(crate) struct SuperBlock {
+    /// Decoded super-block header.
     pub(crate) header: SuperBlockHeader,
+    /// Decoded super-block body.
     pub(crate) body: SuperBlockBody,
+    /// Decoded super-block footer.
     pub(crate) footer: SuperBlockFooter,
 }
 
+/// Borrowed serialization view used when writing one super-block slot.
 pub(crate) struct SuperBlockSerView {
+    /// Header to serialize.
     pub(crate) header: SuperBlockHeader,
+    /// Body to serialize.
     pub(crate) body: SuperBlockBody,
 }
 
@@ -157,6 +174,7 @@ impl Ser<'_> for SuperBlockSerView {
     }
 }
 
+/// Parse and validate one super-block slot.
 #[inline]
 pub(crate) fn parse_super_block(
     buf: &[u8],

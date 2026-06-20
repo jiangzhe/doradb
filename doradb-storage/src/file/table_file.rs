@@ -31,48 +31,10 @@ use futures::future::try_join_all;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+/// Magic bytes stored at the beginning of every user table-file super block.
 pub(crate) const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
 const TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION);
-
-#[inline]
-fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
-    Report::new(InternalError::SecondaryIndexOutOfBounds)
-        .attach(format!("index_no={index_no}, index_count={index_count}"))
-        .into()
-}
-
-#[inline]
-fn secondary_index_root_count_mismatch(root_count: usize, index_count: usize) -> Error {
-    Report::new(InternalError::SecondaryIndexRootCountMismatch)
-        .attach(format!(
-            "root_count={root_count}, index_count={index_count}"
-        ))
-        .into()
-}
-
-#[inline]
-fn secondary_index_root_inactive_slot_mismatch(index_no: usize, root: BlockID) -> Error {
-    Report::new(InternalError::SecondaryIndexRootCountMismatch)
-        .attach(format!(
-            "inactive index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
-        ))
-        .into()
-}
-
-#[inline]
-fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
-    Report::new(InternalError::MutableRootMetadataRegression)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn column_block_index_invariant(message: impl Into<String>) -> Error {
-    Report::new(InternalError::ColumnBlockIndexInvariant)
-        .attach(message.into())
-        .into()
-}
 
 /// Initial size of new table file.
 pub(crate) const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
@@ -164,109 +126,6 @@ impl ActiveRoot {
     }
 }
 
-#[inline]
-fn parse_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
-    parse_super_block(buf, TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
-}
-
-#[inline]
-fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
-    let payload = validate_block(buf, TABLE_META_BLOCK_SPEC)
-        .attach_with(|| {
-            format!(
-                "file={}, block=table-meta, block_id={page_id}",
-                FileKind::TableFile
-            )
-        })
-        .map_err(Error::from)?;
-    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|err| {
-        if err.data_integrity_error().is_some() {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={}, block=table-meta, block_id={page_id}",
-                    FileKind::TableFile
-                ))
-                .into()
-        } else {
-            err
-        }
-    })?;
-    Ok(ParsedMeta {
-        meta: TableMeta {
-            metadata: Arc::new(meta_block.schema),
-            column_block_index_root: meta_block.column_block_index_root,
-            secondary_index_roots: meta_block.secondary_index_roots,
-            pivot_row_id: meta_block.pivot_row_id,
-            heap_redo_start_ts: meta_block.heap_redo_start_ts,
-            deletion_cutoff_ts: meta_block.deletion_cutoff_ts,
-        },
-        alloc_map: meta_block.alloc_map,
-    })
-}
-
-#[inline]
-fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMeta>) -> Result<()> {
-    validate_active_meta_block_id(
-        &parsed_meta.alloc_map,
-        meta_block_id,
-        FileKind::TableFile,
-        "table-meta",
-    )
-}
-
-#[inline]
-fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
-    let meta_block = root.meta_block_ser_view()?;
-    let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-    let meta_len = meta_block.ser_len();
-    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
-        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
-            .attach(format!(
-                "table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
-                max_payload_len(COW_FILE_PAGE_SIZE)
-            ))
-            .into());
-    }
-    let meta_idx = write_block_header(meta_buf.as_bytes_mut(), TABLE_META_BLOCK_SPEC);
-    let meta_idx = meta_block.ser(meta_buf.as_bytes_mut(), meta_idx);
-    debug_assert_eq!(meta_idx, BLOCK_INTEGRITY_HEADER_SIZE + meta_len);
-    write_block_checksum(meta_buf.as_bytes_mut());
-    Ok(meta_buf)
-}
-
-#[inline]
-fn build_table_super_block(root: &ActiveRoot) -> Result<DirectBuf> {
-    let super_block = root.super_block_ser_view();
-    let mut buf = DirectBuf::zeroed(SUPER_BLOCK_SIZE);
-    let ser_len = super_block.ser_len();
-    if ser_len > SUPER_BLOCK_FOOTER_OFFSET {
-        // single super block cannot hold all data
-        unimplemented!("multiple pages are required to hold super data");
-    }
-    let ser_idx = super_block.ser(buf.as_bytes_mut(), 0);
-    debug_assert_eq!(ser_idx, ser_len);
-
-    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]);
-    let footer = SuperBlockFooter {
-        b3sum: *b3sum.as_bytes(),
-        checkpoint_cts: root.root_ts,
-    };
-    let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
-    debug_assert_eq!(ser_idx, SUPER_BLOCK_SIZE);
-    Ok(buf)
-}
-
-#[inline]
-fn table_codec() -> CowCodec<TableMeta> {
-    CowCodec {
-        parse_super_block: parse_table_super_block,
-        parse_meta_block: parse_table_meta_block,
-        validate_root: validate_table_root,
-        build_meta_block: build_table_meta_block,
-        build_super_block: build_table_super_block,
-    }
-}
-
 /// Table-file facade over generic copy-on-write file mechanics.
 pub(crate) struct TableFile {
     file: CowFile<TableMeta>,
@@ -322,11 +181,13 @@ impl TableFile {
         self.file.active_root_unchecked()
     }
 
+    /// Returns this file's storage kind for validation and cache identity.
     #[inline]
     pub(crate) fn file_kind(&self) -> FileKind {
         FileKind::TableFile
     }
 
+    /// Returns the backing sparse file.
     #[inline]
     pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
         self.file.sparse_file()
@@ -343,9 +204,7 @@ impl TableFile {
         self.active_root_unchecked()
             .install_effective_ts(effective_ts);
     }
-}
 
-impl TableFile {
     #[inline]
     fn file(&self) -> &CowFile<TableMeta> {
         &self.file
@@ -634,6 +493,7 @@ impl MutableTableFile {
         Ok(())
     }
 
+    /// Try to delete the table file if no shared owners remain.
     #[inline]
     pub(crate) fn try_delete(self) -> bool {
         let MutableTableFile {
@@ -702,6 +562,148 @@ pub(crate) struct LwcBlockPersist {
 ///
 /// Dropping this guard reclaims the replaced active-root pointer.
 pub(crate) type OldRoot = OldCowRoot<TableMeta>;
+
+#[inline]
+fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
+    Report::new(InternalError::SecondaryIndexOutOfBounds)
+        .attach(format!("index_no={index_no}, index_count={index_count}"))
+        .into()
+}
+
+#[inline]
+fn secondary_index_root_count_mismatch(root_count: usize, index_count: usize) -> Error {
+    Report::new(InternalError::SecondaryIndexRootCountMismatch)
+        .attach(format!(
+            "root_count={root_count}, index_count={index_count}"
+        ))
+        .into()
+}
+
+#[inline]
+fn secondary_index_root_inactive_slot_mismatch(index_no: usize, root: BlockID) -> Error {
+    Report::new(InternalError::SecondaryIndexRootCountMismatch)
+        .attach(format!(
+            "inactive index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
+        ))
+        .into()
+}
+
+#[inline]
+fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
+    Report::new(InternalError::MutableRootMetadataRegression)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn column_block_index_invariant(message: impl Into<String>) -> Error {
+    Report::new(InternalError::ColumnBlockIndexInvariant)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn parse_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
+    parse_super_block(buf, TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
+}
+
+#[inline]
+fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
+    let payload = validate_block(buf, TABLE_META_BLOCK_SPEC)
+        .attach_with(|| {
+            format!(
+                "file={}, block=table-meta, block_id={page_id}",
+                FileKind::TableFile
+            )
+        })
+        .map_err(Error::from)?;
+    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|err| {
+        if err.data_integrity_error().is_some() {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={}, block=table-meta, block_id={page_id}",
+                    FileKind::TableFile
+                ))
+                .into()
+        } else {
+            err
+        }
+    })?;
+    Ok(ParsedMeta {
+        meta: TableMeta {
+            metadata: Arc::new(meta_block.schema),
+            column_block_index_root: meta_block.column_block_index_root,
+            secondary_index_roots: meta_block.secondary_index_roots,
+            pivot_row_id: meta_block.pivot_row_id,
+            heap_redo_start_ts: meta_block.heap_redo_start_ts,
+            deletion_cutoff_ts: meta_block.deletion_cutoff_ts,
+        },
+        alloc_map: meta_block.alloc_map,
+    })
+}
+
+#[inline]
+fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMeta>) -> Result<()> {
+    validate_active_meta_block_id(
+        &parsed_meta.alloc_map,
+        meta_block_id,
+        FileKind::TableFile,
+        "table-meta",
+    )
+}
+
+#[inline]
+fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
+    let meta_block = root.meta_block_ser_view()?;
+    let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+    let meta_len = meta_block.ser_len();
+    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
+        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
+            .attach(format!(
+                "table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
+                max_payload_len(COW_FILE_PAGE_SIZE)
+            ))
+            .into());
+    }
+    let meta_idx = write_block_header(meta_buf.as_bytes_mut(), TABLE_META_BLOCK_SPEC);
+    let meta_idx = meta_block.ser(meta_buf.as_bytes_mut(), meta_idx);
+    debug_assert_eq!(meta_idx, BLOCK_INTEGRITY_HEADER_SIZE + meta_len);
+    write_block_checksum(meta_buf.as_bytes_mut());
+    Ok(meta_buf)
+}
+
+#[inline]
+fn build_table_super_block(root: &ActiveRoot) -> Result<DirectBuf> {
+    let super_block = root.super_block_ser_view();
+    let mut buf = DirectBuf::zeroed(SUPER_BLOCK_SIZE);
+    let ser_len = super_block.ser_len();
+    if ser_len > SUPER_BLOCK_FOOTER_OFFSET {
+        // single super block cannot hold all data
+        unimplemented!("multiple pages are required to hold super data");
+    }
+    let ser_idx = super_block.ser(buf.as_bytes_mut(), 0);
+    debug_assert_eq!(ser_idx, ser_len);
+
+    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]);
+    let footer = SuperBlockFooter {
+        b3sum: *b3sum.as_bytes(),
+        checkpoint_cts: root.root_ts,
+    };
+    let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
+    debug_assert_eq!(ser_idx, SUPER_BLOCK_SIZE);
+    Ok(buf)
+}
+
+#[inline]
+fn table_codec() -> CowCodec<TableMeta> {
+    CowCodec {
+        parse_super_block: parse_table_super_block,
+        parse_meta_block: parse_table_meta_block,
+        validate_root: validate_table_root,
+        build_meta_block: build_table_meta_block,
+        build_super_block: build_table_super_block,
+    }
+}
 
 #[cfg(test)]
 mod tests {

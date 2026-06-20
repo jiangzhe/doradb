@@ -17,58 +17,14 @@ pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
 pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 6;
-
-#[inline]
-fn invalid_payload(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn validate_alloc_map(alloc_map: &AllocMap) -> Result<()> {
-    if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
-        return Err(invalid_payload(
-            "allocation map must include allocated super block",
-        ));
-    }
-    Ok(())
-}
-
-#[inline]
-fn validate_secondary_index_roots(
-    secondary_index_roots: &[BlockID],
-    next_index_no: u16,
-    active_index_nos: impl IntoIterator<Item = usize>,
-) -> Result<()> {
-    let index_slot_count = next_index_no as usize;
-    if secondary_index_roots.len() != index_slot_count {
-        return Err(invalid_payload(format!(
-            "secondary index root count {} does not match next_index_no {}",
-            secondary_index_roots.len(),
-            next_index_no
-        )));
-    }
-
-    let mut active_slots = vec![false; index_slot_count];
-    for index_no in active_index_nos {
-        if let Some(active_slot) = active_slots.get_mut(index_no) {
-            *active_slot = true;
-        }
-    }
-    for (index_no, (&root, active)) in secondary_index_roots
-        .iter()
-        .zip(active_slots.iter())
-        .enumerate()
-    {
-        if !active && root != SUPER_BLOCK_ID {
-            return Err(invalid_payload(format!(
-                "inactive secondary index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
-            )));
-        }
-    }
-    Ok(())
-}
+/// Magic bytes stored at the beginning of every `catalog.mtb` meta block envelope.
+pub(crate) const MULTI_TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
+    [b'M', b'T', b'B', b'M', b'E', b'T', b'A', 0];
+/// Raw on-disk sentinel for one catalog table without a checkpointed root block.
+///
+/// This stays `0` because block `0` is reserved for the `catalog.mtb` super
+/// block and therefore cannot be a logical catalog-table root.
+const NO_ROOT_BLOCK_ID: u64 = 0;
 
 /// Parsed payload of one checksummed table meta block.
 ///
@@ -214,15 +170,6 @@ impl<'a> Ser<'a> for MetaBlockSerView<'a> {
     }
 }
 
-/// Magic bytes stored at the beginning of every `catalog.mtb` meta block envelope.
-pub(crate) const MULTI_TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
-    [b'M', b'T', b'B', b'M', b'E', b'T', b'A', 0];
-/// Raw on-disk sentinel for one catalog table without a checkpointed root block.
-///
-/// This stays `0` because block `0` is reserved for the `catalog.mtb` super
-/// block and therefore cannot be a logical catalog-table root.
-const NO_ROOT_BLOCK_ID: u64 = 0;
-
 /// Parsed payload of one checksummed `catalog.mtb` meta block.
 ///
 /// The shared block-integrity envelope is validated before this payload is
@@ -350,6 +297,58 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
         }
         self.alloc_map.ser(out, idx)
     }
+}
+
+#[inline]
+fn invalid_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn validate_alloc_map(alloc_map: &AllocMap) -> Result<()> {
+    if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
+        return Err(invalid_payload(
+            "allocation map must include allocated super block",
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_secondary_index_roots(
+    secondary_index_roots: &[BlockID],
+    next_index_no: u16,
+    active_index_nos: impl IntoIterator<Item = usize>,
+) -> Result<()> {
+    let index_slot_count = next_index_no as usize;
+    if secondary_index_roots.len() != index_slot_count {
+        return Err(invalid_payload(format!(
+            "secondary index root count {} does not match next_index_no {}",
+            secondary_index_roots.len(),
+            next_index_no
+        )));
+    }
+
+    let mut active_slots = vec![false; index_slot_count];
+    for index_no in active_index_nos {
+        if let Some(active_slot) = active_slots.get_mut(index_no) {
+            *active_slot = true;
+        }
+    }
+    for (index_no, (&root, active)) in secondary_index_roots
+        .iter()
+        .zip(active_slots.iter())
+        .enumerate()
+    {
+        if !active && root != SUPER_BLOCK_ID {
+            return Err(invalid_payload(format!(
+                "inactive secondary index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
