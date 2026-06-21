@@ -113,6 +113,7 @@ impl<T> FreeList<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smol::Timer;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -182,9 +183,9 @@ mod tests {
                 .detach();
             }
 
-            smol::Timer::after(Duration::from_millis(100)).await;
+            Timer::after(Duration::from_millis(100)).await;
             free_list.push(42);
-            smol::Timer::after(Duration::from_millis(100)).await;
+            Timer::after(Duration::from_millis(100)).await;
         })
     }
 }

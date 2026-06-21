@@ -23,9 +23,12 @@ use error_stack::{Report, ensure};
 use event_listener::{Event, Listener, listener};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
+use std::mem::forget;
 use std::ops::Deref;
+use std::result;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::thread::yield_now;
 
 const FIRST_SESSION_ID: SessionID = SessionID::new(1);
 // Engine lifecycle admission uses one packed atomic word so admission and
@@ -55,7 +58,7 @@ impl TryFrom<usize> for EngineLifecycleState {
     type Error = usize;
 
     #[inline]
-    fn try_from(value: usize) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: usize) -> result::Result<Self, Self::Error> {
         match value {
             x if x == EngineLifecycleState::Running.as_usize() => Ok(EngineLifecycleState::Running),
             x if x == EngineLifecycleState::ShuttingDown.as_usize() => {
@@ -263,6 +266,7 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Returns the shared engine runtime state.
     #[inline]
     pub(crate) fn inner(&self) -> &Arc<EngineInner> {
         &self.inner
@@ -398,7 +402,7 @@ impl Engine {
             // while it discovers admission is already closed. That raw Arc is
             // intentionally not a runtime ref, so there is no event to wait on.
             if runtime_refs == 0 {
-                std::thread::yield_now();
+                yield_now();
             }
         }
     }
@@ -449,7 +453,7 @@ impl Drop for Engine {
                     .take()
                     .expect("engine component registry is present until drop");
                 components.shutdown_all();
-                std::mem::forget(components);
+                forget(components);
             }
             panic!("fatal: engine shutdown failed: {err}");
         }
@@ -479,34 +483,7 @@ impl EngineRef {
     pub(crate) fn downgrade(&self) -> WeakEngineRef {
         WeakEngineRef(Arc::downgrade(&self.0))
     }
-}
 
-impl Clone for EngineRef {
-    #[inline]
-    fn clone(&self) -> Self {
-        let inner = Arc::clone(&self.0);
-        inner.lifecycle.retain_runtime_ref();
-        Self(inner)
-    }
-}
-
-impl Drop for EngineRef {
-    #[inline]
-    fn drop(&mut self) {
-        self.0.lifecycle.release_runtime_ref();
-    }
-}
-
-impl Deref for EngineRef {
-    type Target = EngineInner;
-
-    #[inline]
-    fn deref(&self) -> &EngineInner {
-        &self.0
-    }
-}
-
-impl EngineRef {
     /// Create a new session while the engine is still running.
     #[inline]
     #[cfg_attr(
@@ -539,6 +516,31 @@ impl EngineRef {
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn next_session_id(&self) -> SessionID {
         self.0.next_session_id()
+    }
+}
+
+impl Clone for EngineRef {
+    #[inline]
+    fn clone(&self) -> Self {
+        let inner = Arc::clone(&self.0);
+        inner.lifecycle.retain_runtime_ref();
+        Self(inner)
+    }
+}
+
+impl Drop for EngineRef {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.lifecycle.release_runtime_ref();
+    }
+}
+
+impl Deref for EngineRef {
+    type Target = EngineInner;
+
+    #[inline]
+    fn deref(&self) -> &EngineInner {
+        &self.0
     }
 }
 
@@ -760,15 +762,19 @@ mod tests {
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::session::tests::{SessionTestExt, session_registry_len};
+    use crate::trx::tests::add_pseudo_redo_log_entry;
+    use smol::Timer;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::Path;
     use std::sync::{Barrier, mpsc};
+    use std::thread::{self, sleep};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
 
-    fn test_engine_config_for(root: &std::path::Path) -> EngineConfig {
+    fn test_engine_config_for(root: &Path) -> EngineConfig {
         EngineConfig::default()
             .storage_root(root)
             .meta_buffer(TEST_POOL_BYTES)
@@ -791,7 +797,7 @@ mod tests {
                 Instant::now() < deadline,
                 "shutdown did not close admission before timeout"
             );
-            std::thread::yield_now();
+            yield_now();
         }
     }
 
@@ -799,7 +805,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done() {
             assert!(Instant::now() < deadline, "{message}");
-            std::thread::sleep(Duration::from_millis(1));
+            sleep(Duration::from_millis(1));
         }
     }
 
@@ -940,7 +946,7 @@ mod tests {
                 if waiter_seen {
                     break;
                 }
-                smol::Timer::after(Duration::from_millis(1)).await;
+                Timer::after(Duration::from_millis(1)).await;
             }
             assert!(waiter_seen);
 
@@ -951,31 +957,6 @@ mod tests {
                 Some(OperationError::LockWaiterReleased)
             );
             assert_eq!(engine.lock_manager().release_owner(blocking_owner), 1);
-        });
-    }
-
-    #[test]
-    fn test_engine_component_order_uses_shared_storage_and_evictor_workers() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
-
-            assert_eq!(
-                engine.components().component_names(),
-                vec![
-                    "fs",
-                    "disk_pool",
-                    "meta_pool",
-                    "index_pool",
-                    "mem_pool",
-                    "fs_workers",
-                    "shared_pool_evictor_workers",
-                    "lock_manager",
-                    "catalog",
-                    "trx_sys",
-                    "trx_sys_workers",
-                ]
-            );
         });
     }
 
@@ -1436,7 +1417,7 @@ mod tests {
         let engine_ref = engine.new_ref().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
 
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
@@ -1469,7 +1450,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
@@ -1503,7 +1484,7 @@ mod tests {
         let trx = session.begin_trx().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
 
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
@@ -1542,7 +1523,7 @@ mod tests {
         drop(trx);
         assert!(session.in_trx().unwrap());
 
-        std::thread::scope(|scope| {
+        thread::scope(|scope| {
             let shutdown_engine = &engine;
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
@@ -1707,7 +1688,7 @@ mod tests {
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            crate::trx::tests::add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx);
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
@@ -1749,7 +1730,7 @@ mod tests {
             let (started_tx, started_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
 
-            std::thread::scope(|scope| {
+            thread::scope(|scope| {
                 let shutdown_handle = scope.spawn(|| {
                     started_tx.send(()).unwrap();
                     engine.shutdown().unwrap();
@@ -1804,7 +1785,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            crate::trx::tests::add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx);
             let cts = trx.commit().await.unwrap();
             assert!(cts > TrxID::new(0));
             assert!(!session.in_trx().unwrap());
@@ -1926,7 +1907,7 @@ mod tests {
             let barrier = Arc::new(Barrier::new(3));
             let engine = &engine;
 
-            std::thread::scope(|scope| {
+            thread::scope(|scope| {
                 let shutdown_barrier = Arc::clone(&barrier);
                 let shutdown_handle = scope.spawn(move || {
                     shutdown_barrier.wait();

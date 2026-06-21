@@ -1,4 +1,5 @@
 use crate::buffer::PoolIdentity;
+use std::hint::spin_loop;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{NonNull, addr_of_mut};
@@ -87,36 +88,6 @@ impl QuiescentGuardCount {
     }
 }
 
-#[inline]
-fn wait_for_guard_count_zero(guard_count: &AtomicUsize) {
-    let mut attempts = 0u32;
-    // Owner teardown is cold, so use backoff here and keep guard release as a
-    // single atomic decrement on the hot path.
-    while guard_count.load(Ordering::Acquire) != 0 {
-        if attempts < OWNER_DROP_SPIN_LIMIT {
-            std::hint::spin_loop();
-        } else if attempts < OWNER_DROP_YIELD_LIMIT {
-            thread::yield_now();
-        } else {
-            let sleep_shift = (attempts - OWNER_DROP_YIELD_LIMIT).min(5);
-            let sleep_us =
-                (OWNER_DROP_INITIAL_SLEEP_US << sleep_shift).min(OWNER_DROP_MAX_SLEEP_US);
-            thread::sleep(Duration::from_micros(sleep_us));
-        }
-        attempts = attempts.saturating_add(1);
-    }
-}
-
-#[cold]
-fn guard_count_overflow() -> ! {
-    panic!("quiescent guard count overflow");
-}
-
-#[cold]
-fn guard_count_underflow() -> ! {
-    panic!("quiescent guard count underflow");
-}
-
 /// Owns a heap-allocated value that can be shared by quiescent guards.
 ///
 /// The owner allocation is pinned for the full lifetime of the box, so the
@@ -144,6 +115,7 @@ impl<T> QuiescentBox<T> {
         NonNull::from(self.inner.as_ref().get_ref())
     }
 
+    /// Returns a stable identity derived from the owner allocation.
     #[inline]
     pub(crate) fn owner_identity(&self) -> PoolIdentity {
         PoolIdentity::from_owner_addr(self.inner_ptr().as_ptr() as usize)
@@ -279,9 +251,40 @@ impl<T> Deref for SyncQuiescentGuard<T> {
     }
 }
 
+#[inline]
+fn wait_for_guard_count_zero(guard_count: &AtomicUsize) {
+    let mut attempts = 0u32;
+    // Owner teardown is cold, so use backoff here and keep guard release as a
+    // single atomic decrement on the hot path.
+    while guard_count.load(Ordering::Acquire) != 0 {
+        if attempts < OWNER_DROP_SPIN_LIMIT {
+            spin_loop();
+        } else if attempts < OWNER_DROP_YIELD_LIMIT {
+            thread::yield_now();
+        } else {
+            let sleep_shift = (attempts - OWNER_DROP_YIELD_LIMIT).min(5);
+            let sleep_us =
+                (OWNER_DROP_INITIAL_SLEEP_US << sleep_shift).min(OWNER_DROP_MAX_SLEEP_US);
+            thread::sleep(Duration::from_micros(sleep_us));
+        }
+        attempts = attempts.saturating_add(1);
+    }
+}
+
+#[cold]
+fn guard_count_overflow() -> ! {
+    panic!("quiescent guard count overflow");
+}
+
+#[cold]
+fn guard_count_underflow() -> ! {
+    panic!("quiescent guard count underflow");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -303,7 +306,7 @@ mod tests {
     fn test_quiescent_guard_deref_and_as_ptr() {
         let owner = QuiescentBox::new(String::from("hello"));
         let guard = owner.guard();
-        let owner_ptr = std::ptr::from_ref::<String>(&owner);
+        let owner_ptr = from_ref::<String>(&owner);
         assert_eq!(&*owner, "hello");
         assert_eq!(&*guard, "hello");
         assert_eq!(guard.as_ptr(), owner_ptr);
@@ -314,7 +317,7 @@ mod tests {
         let owner = QuiescentBox::new(vec![1u64, 2, 3, 4]);
         let guard = owner.guard();
         let guard_clone = guard.clone();
-        let owner_ptr = std::ptr::from_ref::<Vec<u64>>(&owner);
+        let owner_ptr = from_ref::<Vec<u64>>(&owner);
         assert_eq!(guard.as_ptr(), owner_ptr);
         assert_eq!(guard_clone.as_ptr(), owner_ptr);
         assert_eq!(guard.iter().sum::<u64>(), 10);
@@ -324,7 +327,7 @@ mod tests {
     #[test]
     fn test_quiescent_guard_is_send_for_sync_types() {
         let owner = QuiescentBox::new(vec![1u64, 2, 3, 4]);
-        let owner_ptr = std::ptr::from_ref::<Vec<u64>>(&owner) as usize;
+        let owner_ptr = from_ref::<Vec<u64>>(&owner) as usize;
         let mut handles = Vec::new();
         for _ in 0..4 {
             let guard = owner.guard();

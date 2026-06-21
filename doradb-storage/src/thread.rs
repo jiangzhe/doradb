@@ -1,5 +1,6 @@
-use std::thread::{self, JoinHandle};
+use std::thread::{self, Builder, JoinHandle};
 
+/// Spawns a named thread and logs its start and finish lifecycle.
 #[inline]
 pub(crate) fn spawn_named<S, F>(name: S, f: F) -> JoinHandle<()>
 where
@@ -7,7 +8,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     let thread_name = String::from(name);
-    thread::Builder::new()
+    Builder::new()
         .name(thread_name)
         .spawn(|| {
             let thd = thread::current();

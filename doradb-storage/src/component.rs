@@ -7,6 +7,7 @@ use std::any::{Any, TypeId};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One lifecycle-managed engine subsystem.
@@ -36,14 +37,17 @@ pub(crate) trait Component: Sized + 'static {
 
     const NAME: &'static str;
 
+    /// Builds and registers the component's owned runtime state.
     fn build(
         config: Self::Config,
         registry: &mut ComponentRegistry,
         shelf: ShelfScope<'_, Self>,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Derives the cloneable dependency handle from the registered owner.
     fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access;
 
+    /// Stops component-owned work before the owner is dropped.
     fn shutdown(component: &Self::Owned);
 }
 
@@ -55,9 +59,6 @@ pub(crate) trait Supplier<Down: Component>: Component {
 
 trait ErasedComponentBox: Send + Sync {
     fn shutdown(&self);
-
-    #[cfg(test)]
-    fn name(&self) -> &'static str;
 }
 
 struct TypedComponentBox<C: Component> {
@@ -68,12 +69,6 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
     #[inline]
     fn shutdown(&self) {
         C::shutdown(&self.owner);
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn name(&self) -> &'static str {
-        C::NAME
     }
 }
 
@@ -112,161 +107,6 @@ pub(crate) struct ComponentRegistry {
     access_map: FastHashMap<TypeId, Box<dyn Any + Send + Sync>>,
     boxed_vec: Vec<Box<dyn ErasedComponentBox>>,
     shutdown_started: AtomicBool,
-}
-
-type ShelfKey = (TypeId, TypeId);
-
-/// Build-only storage for transient provisions passed between components.
-pub(crate) struct Shelf {
-    parts: FastHashMap<ShelfKey, Box<dyn Any + Send>>,
-}
-
-impl Shelf {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            parts: FastHashMap::default(),
-        }
-    }
-
-    #[inline]
-    fn key<Up: Component, Down: Component>() -> ShelfKey {
-        (TypeId::of::<Up>(), TypeId::of::<Down>())
-    }
-
-    #[inline]
-    fn put<Up, Down>(&mut self, provision: <Up as Supplier<Down>>::Provision) -> Result<()>
-    where
-        Up: Supplier<Down>,
-        Down: Component,
-    {
-        let old = self
-            .parts
-            .insert(Self::key::<Up, Down>(), Box::new(provision));
-        if old.is_some() {
-            return Err(Report::new(InternalError::ComponentShelfDuplicateProvision)
-                .attach(format!("edge={} -> {}", Up::NAME, Down::NAME))
-                .into());
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn take<Up, Down>(&mut self) -> Option<<Up as Supplier<Down>>::Provision>
-    where
-        Up: Supplier<Down>,
-        Down: Component,
-    {
-        self.parts
-            .remove(&Self::key::<Up, Down>())
-            .map(|provision| {
-                *provision
-                    .downcast::<<Up as Supplier<Down>>::Provision>()
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "invalid shelf provision type for edge {} -> {}",
-                            Up::NAME,
-                            Down::NAME
-                        )
-                    })
-            })
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.parts.is_empty()
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        self.parts.clear();
-    }
-
-    #[inline]
-    pub(crate) fn scope<C: Component>(&mut self) -> ShelfScope<'_, C> {
-        ShelfScope {
-            shelf: self,
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// Component-scoped view over the shared build shelf.
-pub(crate) struct ShelfScope<'a, C> {
-    shelf: &'a mut Shelf,
-    _marker: PhantomData<fn() -> C>,
-}
-
-impl<'a, C: Component> ShelfScope<'a, C> {
-    #[inline]
-    pub(crate) fn put<Down>(&mut self, provision: <C as Supplier<Down>>::Provision) -> Result<()>
-    where
-        C: Supplier<Down>,
-        Down: Component,
-    {
-        self.shelf.put::<C, Down>(provision)
-    }
-
-    #[inline]
-    pub(crate) fn take<Up>(&mut self) -> Option<<Up as Supplier<C>>::Provision>
-    where
-        Up: Supplier<C>,
-    {
-        self.shelf.take::<Up, C>()
-    }
-
-    #[inline]
-    pub(crate) fn scope<Other: Component>(&mut self) -> ShelfScope<'_, Other> {
-        self.shelf.scope::<Other>()
-    }
-}
-
-/// Build-phase owner for the runtime registry and transient provisions.
-pub(crate) struct RegistryBuilder {
-    registry: Option<ComponentRegistry>,
-    shelf: Shelf,
-}
-
-impl RegistryBuilder {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            registry: Some(ComponentRegistry::new()),
-            shelf: Shelf::new(),
-        }
-    }
-
-    #[inline]
-    pub(crate) async fn build<C: Component>(&mut self, config: C::Config) -> Result<()> {
-        let registry = self
-            .registry
-            .as_mut()
-            .expect("registry builder is armed until finish");
-        let shelf = self.shelf.scope::<C>();
-        C::build(config, registry, shelf).await
-    }
-
-    #[inline]
-    pub(crate) fn finish(mut self) -> Result<ComponentRegistry> {
-        if !self.shelf.is_empty() {
-            return Err(Report::new(InternalError::ComponentShelfNotEmpty).into());
-        }
-        self.registry
-            .take()
-            .ok_or_else(|| Report::new(InternalError::ComponentRegistryMissing).into())
-    }
-}
-
-impl Drop for RegistryBuilder {
-    #[inline]
-    fn drop(&mut self) {
-        if let Some(registry) = self.registry.as_ref() {
-            registry.shutdown_all();
-        }
-        // Provisions can retain quiescent guards into registered owners, so the
-        // shelf must be drained before owner drop starts.
-        self.shelf.clear();
-    }
 }
 
 impl Default for ComponentRegistry {
@@ -342,15 +182,6 @@ impl ComponentRegistry {
             component.shutdown();
         }
     }
-
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn component_names(&self) -> Vec<&'static str> {
-        self.boxed_vec
-            .iter()
-            .map(|component| component.name())
-            .collect()
-    }
 }
 
 impl Drop for ComponentRegistry {
@@ -360,6 +191,167 @@ impl Drop for ComponentRegistry {
         while let Some(owner) = self.boxed_vec.pop() {
             drop(owner);
         }
+    }
+}
+
+type ShelfKey = (TypeId, TypeId);
+
+/// Build-only storage for transient provisions passed between components.
+pub(crate) struct Shelf {
+    parts: FastHashMap<ShelfKey, Box<dyn Any + Send>>,
+}
+
+impl Shelf {
+    /// Creates an empty build shelf.
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            parts: FastHashMap::default(),
+        }
+    }
+
+    fn key<Up: Component, Down: Component>() -> ShelfKey {
+        (TypeId::of::<Up>(), TypeId::of::<Down>())
+    }
+
+    fn put<Up, Down>(&mut self, provision: <Up as Supplier<Down>>::Provision) -> Result<()>
+    where
+        Up: Supplier<Down>,
+        Down: Component,
+    {
+        let old = self
+            .parts
+            .insert(Self::key::<Up, Down>(), Box::new(provision));
+        if old.is_some() {
+            return Err(Report::new(InternalError::ComponentShelfDuplicateProvision)
+                .attach(format!("edge={} -> {}", Up::NAME, Down::NAME))
+                .into());
+        }
+        Ok(())
+    }
+
+    fn take<Up, Down>(&mut self) -> Option<<Up as Supplier<Down>>::Provision>
+    where
+        Up: Supplier<Down>,
+        Down: Component,
+    {
+        self.parts
+            .remove(&Self::key::<Up, Down>())
+            .map(|provision| {
+                *provision
+                    .downcast::<<Up as Supplier<Down>>::Provision>()
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "invalid shelf provision type for edge {} -> {}",
+                            Up::NAME,
+                            Down::NAME
+                        )
+                    })
+            })
+    }
+
+    /// Returns whether the shelf still contains build provisions.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.parts.clear();
+    }
+
+    /// Creates a component-scoped shelf view.
+    #[inline]
+    pub(crate) fn scope<C: Component>(&mut self) -> ShelfScope<'_, C> {
+        ShelfScope {
+            shelf: self,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Component-scoped view over the shared build shelf.
+pub(crate) struct ShelfScope<'a, C> {
+    shelf: &'a mut Shelf,
+    _marker: PhantomData<fn() -> C>,
+}
+
+impl<'a, C: Component> ShelfScope<'a, C> {
+    /// Stores a provision from the scoped component to a downstream component.
+    #[inline]
+    pub(crate) fn put<Down>(&mut self, provision: <C as Supplier<Down>>::Provision) -> Result<()>
+    where
+        C: Supplier<Down>,
+        Down: Component,
+    {
+        self.shelf.put::<C, Down>(provision)
+    }
+
+    /// Takes a provision supplied by an upstream component.
+    #[inline]
+    pub(crate) fn take<Up>(&mut self) -> Option<<Up as Supplier<C>>::Provision>
+    where
+        Up: Supplier<C>,
+    {
+        self.shelf.take::<Up, C>()
+    }
+
+    /// Reborrows the shelf for another component scope.
+    #[inline]
+    pub(crate) fn scope<Other: Component>(&mut self) -> ShelfScope<'_, Other> {
+        self.shelf.scope::<Other>()
+    }
+}
+
+/// Build-phase owner for the runtime registry and transient provisions.
+pub(crate) struct RegistryBuilder {
+    registry: Option<ComponentRegistry>,
+    shelf: Shelf,
+}
+
+impl RegistryBuilder {
+    /// Creates a builder for component registration.
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            registry: Some(ComponentRegistry::new()),
+            shelf: Shelf::new(),
+        }
+    }
+
+    /// Builds one component with the provided config.
+    #[inline]
+    pub(crate) async fn build<C: Component>(&mut self, config: C::Config) -> Result<()> {
+        let registry = self
+            .registry
+            .as_mut()
+            .expect("registry builder is armed until finish");
+        let shelf = self.shelf.scope::<C>();
+        C::build(config, registry, shelf).await
+    }
+
+    /// Finishes the builder and returns the completed registry.
+    #[inline]
+    pub(crate) fn finish(mut self) -> Result<ComponentRegistry> {
+        if !self.shelf.is_empty() {
+            return Err(Report::new(InternalError::ComponentShelfNotEmpty).into());
+        }
+        self.registry
+            .take()
+            .ok_or_else(|| Report::new(InternalError::ComponentRegistryMissing).into())
+    }
+}
+
+impl Drop for RegistryBuilder {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.as_ref() {
+            registry.shutdown_all();
+        }
+        // Provisions can retain quiescent guards into registered owners, so the
+        // shelf must be drained before owner drop starts.
+        self.shelf.clear();
     }
 }
 
@@ -404,32 +396,36 @@ pool_access_newtype!(IndexPool, EvictableBufferPool);
 pool_access_newtype!(MemPool, EvictableBufferPool);
 pool_access_newtype!(DiskPool, ReadonlyBufferPool);
 
+/// Configuration for the metadata buffer pool.
 #[derive(Clone, Copy)]
 pub(crate) struct MetaPoolConfig {
+    /// Number of bytes reserved for metadata pages.
     pub(crate) bytes: usize,
 }
 
 impl MetaPoolConfig {
+    /// Creates metadata pool config with the given byte capacity.
     #[inline]
     pub(crate) fn new(bytes: usize) -> Self {
         Self { bytes }
     }
 }
 
+/// Configuration for the evictable index buffer pool.
 #[derive(Clone)]
 pub(crate) struct IndexPoolConfig {
+    /// Number of bytes reserved for index pages.
     pub(crate) bytes: usize,
-    pub(crate) swap_file: std::path::PathBuf,
+    /// Swap file path backing evicted index pages.
+    pub(crate) swap_file: PathBuf,
+    /// Maximum size of the swap file in bytes.
     pub(crate) max_file_size: usize,
 }
 
 impl IndexPoolConfig {
+    /// Creates index pool config with byte capacity, swap path, and file limit.
     #[inline]
-    pub(crate) fn new(
-        bytes: usize,
-        swap_file: impl Into<std::path::PathBuf>,
-        max_file_size: usize,
-    ) -> Self {
+    pub(crate) fn new(bytes: usize, swap_file: impl Into<PathBuf>, max_file_size: usize) -> Self {
         Self {
             bytes,
             swap_file: swap_file.into(),
@@ -438,12 +434,15 @@ impl IndexPoolConfig {
     }
 }
 
+/// Configuration for the readonly disk buffer pool.
 #[derive(Clone, Copy)]
 pub(crate) struct DiskPoolConfig {
+    /// Number of bytes reserved for cached disk pages.
     pub(crate) bytes: usize,
 }
 
 impl DiskPoolConfig {
+    /// Creates disk pool config with the given byte capacity.
     #[inline]
     pub(crate) fn new(bytes: usize) -> Self {
         Self { bytes }

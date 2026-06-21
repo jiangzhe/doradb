@@ -7,12 +7,11 @@ use error_stack::Report;
 use semistr::SemiStr;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fmt;
-use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroUsize;
 use zerocopy::IntoBytes;
 
+/// Byte-level serialization and deserialization operations over contiguous buffers.
 pub trait Serde {
     /// Serialize a u64 value to a byte slice.
     fn ser_u64(&mut self, idx: usize, val: u64) -> usize;
@@ -336,57 +335,6 @@ pub(crate) trait Deser: Sized {
 
 /// Optional lower bound for one serialized value.
 pub(crate) type MinBytesHint = Option<NonZeroUsize>;
-
-/// Build a positive serialized-size hint.
-#[inline]
-pub(crate) const fn min_bytes_hint(bytes: usize) -> MinBytesHint {
-    NonZeroUsize::new(bytes)
-}
-
-#[inline]
-fn validate_collection_len(
-    collection: &str,
-    len: usize,
-    remaining: usize,
-    element_min_bytes: MinBytesHint,
-) -> Result<()> {
-    if len == 0 {
-        return Ok(());
-    }
-    let Some(element_min_bytes) = element_min_bytes else {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "deserialize {collection} length has no minimum byte hint: len={len}"
-            ))
-            .into());
-    };
-    let Some(required_bytes) = len.checked_mul(element_min_bytes.get()) else {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "deserialize {collection} length overflows minimum byte count: len={len}, min_element_bytes={}",
-                element_min_bytes.get()
-            ))
-            .into());
-    };
-    if required_bytes > remaining {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "deserialize {collection} length exceeds remaining bytes by element hint: len={len}, remaining={remaining}, min_element_bytes={}, required_bytes={required_bytes}",
-                element_min_bytes.get()
-            ))
-            .into());
-    }
-    Ok(())
-}
-
-#[inline]
-fn combined_min_bytes(left: MinBytesHint, right: MinBytesHint) -> MinBytesHint {
-    let left = left?;
-    let right = right?;
-    left.get()
-        .checked_add(right.get())
-        .and_then(NonZeroUsize::new)
-}
 
 impl Ser<'_> for u64 {
     #[inline]
@@ -939,118 +887,6 @@ impl Deser for ActiveIndexSpec {
     }
 }
 
-/// A struct that serializes a length-prefixed object.
-///
-/// This struct is used to serialize a length-prefixed object.
-/// The length is serialized as a u64 value.
-/// The data is serialized using the Ser trait.
-pub(crate) struct LenPrefixSerView<'a, H, P> {
-    data_len: usize,
-    header: &'a H,
-    payload: &'a P,
-    _marker: PhantomData<(&'a H, &'a P)>,
-}
-
-impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixSerView<'a, H, P> {
-    /// Create a new LenPrefixStruct.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved new"))]
-    pub(crate) fn new(header: &'a H, payload: &'a P) -> Self {
-        let header_len = header.ser_len();
-        let payload_len = payload.ser_len();
-        let data_len = header_len + payload_len;
-        Self {
-            data_len,
-            header,
-            payload,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixSerView<'a, H, P> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>() + self.data_len
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        debug_assert!(self.data_len == self.header.ser_len() + self.payload.ser_len());
-        let mut idx = start_idx;
-        idx = out.ser_u64(idx, self.data_len as u64);
-        idx = self.header.ser(out, idx);
-        self.payload.ser(out, idx)
-    }
-}
-
-pub struct LenPrefixPod<H, P> {
-    data_len: usize,
-    pub header: H,
-    pub payload: P,
-}
-
-impl<H: fmt::Debug, P: fmt::Debug> fmt::Debug for LenPrefixPod<H, P> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LenPrefixPod")
-            .field("header", &self.header)
-            .field("payload", &self.payload)
-            .finish()
-    }
-}
-
-impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixPod<H, P> {
-    /// Create a new LenPrefixStruct.
-    #[inline]
-    #[expect(dead_code, reason = "reserved len-prefix serde container")]
-    pub fn new(header: H, payload: P) -> Self {
-        let header_len = header.ser_len();
-        let payload_len = payload.ser_len();
-        let data_len = header_len + payload_len;
-        Self {
-            data_len,
-            header,
-            payload,
-        }
-    }
-}
-
-impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixPod<H, P> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>() + self.data_len
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        debug_assert!(self.data_len == self.header.ser_len() + self.payload.ser_len());
-        let mut idx = start_idx;
-        idx = out.ser_u64(idx, self.data_len as u64);
-        idx = self.header.ser(out, idx);
-        self.payload.ser(out, idx)
-    }
-}
-
-impl<H: Deser, P: Deser> Deser for LenPrefixPod<H, P> {
-    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>());
-
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, data_len) = input.deser_u64(start_idx)?;
-        let (idx, header) = H::deser(input, idx)?;
-        let (idx, payload) = P::deser(input, idx)?;
-        Ok((
-            idx,
-            LenPrefixPod {
-                data_len: data_len as usize,
-                header,
-                payload,
-            },
-        ))
-    }
-}
-
 impl Ser<'_> for () {
     #[inline]
     fn ser_len(&self) -> usize {
@@ -1096,6 +932,7 @@ pub(crate) struct ForBitpackingSer<'a, T> {
 }
 
 impl<'a, T: BitPackable + Ord> ForBitpackingSer<'a, T> {
+    /// Creates a FOR+bitpacking serializer when packing can save space.
     #[inline]
     pub(crate) fn new(data: &'a [T]) -> Option<Self> {
         prepare_for_bitpacking(data).map(|info| ForBitpackingSer { data, info })
@@ -1144,7 +981,10 @@ impl<'a, T: BitPackable + Ord + Ser<'a>> Ser<'a> for ForBitpackingSer<'a, T> {
 
 /// FOR+bitpacking decompression.
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved ForBitpackingDeser"))]
-pub(crate) struct ForBitpackingDeser<T>(pub Vec<T>);
+pub(crate) struct ForBitpackingDeser<T>(
+    /// Decompressed values.
+    pub Vec<T>,
+);
 
 impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
@@ -1182,26 +1022,60 @@ impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
     }
 }
 
+/// Build a positive serialized-size hint.
+#[inline]
+pub(crate) const fn min_bytes_hint(bytes: usize) -> MinBytesHint {
+    NonZeroUsize::new(bytes)
+}
+
+#[inline]
+fn validate_collection_len(
+    collection: &str,
+    len: usize,
+    remaining: usize,
+    element_min_bytes: MinBytesHint,
+) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let Some(element_min_bytes) = element_min_bytes else {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "deserialize {collection} length has no minimum byte hint: len={len}"
+            ))
+            .into());
+    };
+    let Some(required_bytes) = len.checked_mul(element_min_bytes.get()) else {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "deserialize {collection} length overflows minimum byte count: len={len}, min_element_bytes={}",
+                element_min_bytes.get()
+            ))
+            .into());
+    };
+    if required_bytes > remaining {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "deserialize {collection} length exceeds remaining bytes by element hint: len={len}, remaining={remaining}, min_element_bytes={}, required_bytes={required_bytes}",
+                element_min_bytes.get()
+            ))
+            .into());
+    }
+    Ok(())
+}
+
+#[inline]
+fn combined_min_bytes(left: MinBytesHint, right: MinBytesHint) -> MinBytesHint {
+    let left = left?;
+    let right = right?;
+    left.get()
+        .checked_add(right.get())
+        .and_then(NonZeroUsize::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_len_prefix_struct_serde() {
-        let test_struct = TestStruct {
-            a: 1,
-            b: 2,
-            c: 3,
-            d: 4,
-        };
-        let len_prefix_struct = LenPrefixSerView::new(&(), &test_struct);
-        let mut out = vec![0; len_prefix_struct.ser_len()];
-        len_prefix_struct.ser(&mut out[..], 0);
-        println!("{:?}", out);
-        let (idx, pod) = LenPrefixPod::<(), TestStruct>::deser(&out[..], 0).unwrap();
-        assert_eq!(idx, out.len());
-        assert_eq!(pod.payload, test_struct);
-    }
 
     #[test]
     fn test_vec_serde() {
