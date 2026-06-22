@@ -50,12 +50,12 @@ impl MutexGroupCommit {
 }
 
 /// GroupCommit is optimization to group multiple transactions
-/// and perform single IO to speed up overall commit performance.
+/// and publish them through one ordered redo scheduler entry.
 pub(crate) struct GroupCommit {
     /// Commit group queue, there can be multiple groups in commit phase.
     ///
-    /// Each group submits one redo write through the log thread's backend-neutral driver and then
-    /// waits for write completion plus the configured sync step.
+    /// Redo-bearing groups become writer-owned physical requests in the log
+    /// thread; request ids, not commit timestamps, identify those IO requests.
     pub(crate) queue: VecDeque<Commit>,
     /// Closed admission reason used to reject new precommit handoffs.
     ///
@@ -103,11 +103,12 @@ pub(crate) struct CommitGroupLog {
     pub(crate) log_buf: LogBuf,
 }
 
-/// CommitGroup groups multiple transactions with only
-/// one logical log IO and at most one fsync() call.
-/// It is controlled by two parameters:
-/// 1. Log block size, e.g. 16KB.
-/// 2. Timeout to wait for next transaction to join.
+/// CommitGroup groups multiple transactions into one logical ordered commit unit.
+///
+/// The log thread may map that logical unit to one or more physical requests.
+/// Join admission is decided immediately at enqueue time: no-log transactions
+/// may join any group, and redo-bearing transactions may join only redo groups
+/// whose serialized buffer has enough remaining capacity.
 pub(crate) struct CommitGroup {
     /// Transactions accepted into this ordered group.
     pub(crate) trx_list: Vec<PrecommitTrx>,
@@ -166,10 +167,10 @@ impl CommitGroup {
         wait_sync.then(|| Arc::clone(&self.completion))
     }
 
-    /// Convert this commit group into a sync group for redo completion.
+    /// Convert this commit group into a sync group for redo publication.
     #[inline]
     pub(crate) fn into_sync_group(self) -> SyncGroup {
-        let (log_bytes, log_fd, write_meta, write, finished) = match self.log {
+        let (log_bytes, log_fd, write_meta, write) = match self.log {
             Some(log) => {
                 // Confirm data length in buffer header.
                 let write_meta = log.write_meta;
@@ -181,16 +182,10 @@ impl CommitGroup {
                     log_bytes,
                     Some(log_fd),
                     Some(write_meta),
-                    Some(LogWriteSubmission::new(
-                        self.max_cts,
-                        log_fd,
-                        write_meta.offset,
-                        buf,
-                    )),
-                    false,
+                    Some(LogWriteSubmission::new(log_fd, write_meta.offset, buf)),
                 )
             }
-            None => (0, None, None, None, true),
+            None => (0, None, None, None),
         };
         SyncGroup {
             trx_list: self.trx_list,
@@ -199,9 +194,9 @@ impl CommitGroup {
             log_fd,
             write_meta,
             write,
-            returned_buf: None,
+            returned_bufs: Vec::new(),
             completion: self.completion,
-            finished,
+            outstanding_requests: 0,
             failure_reason: None,
         }
     }
@@ -365,7 +360,7 @@ mod tests {
         let sync_group = no_log_group.into_sync_group();
         assert_eq!(sync_group.log_bytes, 0);
         assert!(sync_group.write.is_none());
-        assert!(sync_group.finished);
+        assert_eq!(sync_group.outstanding_requests, 0);
     }
 
     #[test]

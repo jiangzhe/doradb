@@ -142,7 +142,7 @@ Issue Labels:
   - existing follow-up for replacing mmap redo recovery reads.
 - [B2] `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
   - existing follow-up for commit-group construction and sync batching policy.
-- [B3] `docs/backlogs/000127-redo-io-request-id-prefix-sequencing.md`
+- [B3] `docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md`
   - existing follow-up for replacing CTS-keyed redo IO sequencing with
   writer-generated request ids and prefix tracking.
 
@@ -345,12 +345,12 @@ pwrite_owned}`.
   - Phase-local Choices: Exact internal data structure for prefix tracking,
     whether metadata writes consume the same capacity as data writes, and how
     much completion-drain API surface to add to `SubmissionDriver`.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: pending
-  - Implementation Summary: pending
+  - Task Doc: `docs/tasks/000186-redo-request-id-prefix-scheduler.md`
+  - Task Issue: `#749`
+  - Phase Status: done
+  - Implementation Summary: Implemented writer-generated LogRequestId ownership, LogPrefixTracker prefix finalization, side LogFileSealer seal tracking, and validation/style audit for Phase 1 without changing persisted redo format or Phase 2 prerequisites. [Task Resolve Sync: docs/tasks/000186-redo-request-id-prefix-scheduler.md @ 2026-06-22]
   - Related Backlogs:
-    - `docs/backlogs/000127-redo-io-request-id-prefix-sequencing.md`
+    - `docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md`
 
 - **Phase 2: Fixed-Block Format and Writer**
   - Scope: Define the new redo data-block format, add group-start metadata and
@@ -520,4 +520,4 @@ pwrite_owned}`.
 - `docs/transaction-system.md`
 - `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
 - `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
-- `docs/backlogs/000127-redo-io-request-id-prefix-sequencing.md`
+- `docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md`
