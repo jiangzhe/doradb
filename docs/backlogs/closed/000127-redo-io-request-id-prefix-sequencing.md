@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000186-redo-request-id-prefix-scheduler.md
+- Closed By: backlog close
+- Reference: docs/tasks/000186-redo-request-id-prefix-scheduler.md
+- Closed At: 2026-06-22

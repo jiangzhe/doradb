@@ -1,7 +1,7 @@
 ---
 id: 000186
 title: Redo Request-Id Prefix Scheduler
-status: proposal
+status: implemented
 created: 2026-06-21
 github_issue: 749
 ---
@@ -20,7 +20,7 @@ drain semantics.
 The result should make physical IO request identity independent from
 transaction metadata. Commit groups remain logical ordered units that carry CTS
 for transaction publication and durable metadata, while physical writes,
-headers, and seal writes are tracked by `RedoRequestId`. This prepares
+headers, and seal writes are tracked by `LogRequestId`. This prepares
 RFC-0021 Phase 2 to attach multiple fixed-block writes to one logical group
 without another scheduler rewrite.
 
@@ -38,12 +38,12 @@ RFC Phase:
 - Phase 1: Request-Id Prefix Scheduler
 
 Source Backlogs:
-- docs/backlogs/000127-redo-io-request-id-prefix-sequencing.md
+- docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md
 
 RFC-0021 Phase 1 starts from the RFC-0020 sealed-segment redo baseline. Today
 `RedoLogWriter` tracks group IO in `BTreeMap<TrxID, SyncGroup>`, while initial
 and rotation header writes use side queues/counters and rotated-file seal
-writes use `RedoFileSealer` side state. That split is workable for the current
+writes use `LogFileSealer` side state. That split is workable for the current
 one-group one-write model, but it cannot naturally represent future
 multi-block groups because CTS is transaction metadata, not physical IO request
 identity.
@@ -51,7 +51,7 @@ identity.
 This task resolves the RFC phase-local scheduler choices:
 - use a `VecDeque`-backed logical prefix tracker for ordered commit
   publication;
-- assign writer-generated `RedoRequestId` values to physical redo write,
+- assign writer-generated `LogRequestId` values to physical redo write,
   header, and seal submissions;
 - keep metadata writes capacity-consuming through the existing
   `LogWriteDriver`/`SubmissionDriver` path;
@@ -67,7 +67,7 @@ scheduler-only and preserves Phase 2 prerequisites.
 
 ## Goals
 
-- Introduce a small `RedoRequestId` generated only by the redo log thread.
+- Introduce a small `LogRequestId` generated only by the redo log thread.
 - Make completions identify physical requests by request ownership instead of
   `TrxID`.
 - Replace the CTS-keyed group inflight map with logical prefix entries ordered
@@ -105,16 +105,16 @@ scheduler-only and preserves Phase 2 prerequisites.
 ## Plan
 
 1. Add request and prefix identity types in `doradb-storage/src/log/mod.rs`.
-   - Add a compact `RedoRequestId` newtype over `u64`.
-   - Add a compact `RedoPrefixEntryId` newtype over `u64`.
+   - Add a compact `LogRequestId` newtype over `u64`.
+   - Add a compact `LogPrefixId` newtype over `u64`.
    - Add request-owner metadata carried inside `LogWriteSubmission`, for
      example:
 
      ```rust
-     struct RedoRequestOwner {
-         request_id: RedoRequestId,
-         entry_id: Option<RedoPrefixEntryId>,
-         kind: RedoRequestKind,
+     struct LogRequestOwner {
+         request_id: LogRequestId,
+         entry_id: Option<LogPrefixId>,
+         kind: LogRequestKind,
          group_write_idx: Option<usize>,
      }
      ```
@@ -137,27 +137,27 @@ scheduler-only and preserves Phase 2 prerequisites.
    - Introduce a structure similar to:
 
      ```rust
-     struct RedoPrefixTracker {
-         front_entry_id: RedoPrefixEntryId,
-         next_entry_id: RedoPrefixEntryId,
-         entries: VecDeque<RedoPrefixEntry>,
+     struct LogPrefixTracker {
+         front_id: LogPrefixId,
+         next_id: LogPrefixId,
+         entries: VecDeque<LogPrefixEntry>,
      }
      ```
 
    - Locate completed entries by computing the deque index from
-     `entry_id - front_entry_id`, validating that the index is in range and the
+     `entry_id - front_id`, validating that the index is in range and the
      stored id matches.
    - Keep entry lookup O(io_depth). A secondary entry map is unnecessary unless
      implementation finds the deque math makes the code less clear.
 
 4. Define prefix entries around logical publication, not physical IO.
-   - `RedoPrefixEntry::Header` owns a header completion and one request id. It
+   - `LogPrefixEntry::Header` owns a header completion and one request id. It
      is ready after the header write succeeds.
-   - `RedoPrefixEntry::Group` owns one `SyncGroup` and a request aggregation
+   - `LogPrefixEntry::Group` owns one `SyncGroup` and a request aggregation
      counter. It is ready when all group requests have completed successfully.
      In Phase 1, redo-bearing groups have one request and no-log groups have
      zero requests.
-   - `RedoPrefixEntry::SealDispatch` is a zero-IO marker. It owns the ended
+   - `LogPrefixEntry::SealDispatch` is a zero-IO marker. It owns the ended
      `RedoLogFile` and the accumulator snapshot needed to build the sealed
      header after all earlier old-file groups are durable.
    - Do not make rotated-file seal completion a prefix entry. Once
@@ -178,9 +178,9 @@ scheduler-only and preserves Phase 2 prerequisites.
      physical completions return.
 
 6. Keep seal work side-tracked but request-id based.
-   - Change `RedoFileSealer` from independent submission/counter state into a
+   - Change `LogFileSealer` from independent submission/counter state into a
      side metadata queue/tracker that uses `LogWriteSubmission` with
-     `RedoRequestOwner`.
+     `LogRequestOwner`.
    - Add a side `PendingSeal` state for a submitted seal write. It should own:
      - `request_id`;
      - ended `RedoLogFile`;
@@ -207,7 +207,7 @@ scheduler-only and preserves Phase 2 prerequisites.
 
 8. Rewrite completion handling.
    - `LogWriteDriver::wait_one()` should return a completion whose submission
-     includes `RedoRequestOwner`.
+     includes `LogRequestOwner`.
    - Header/group completions locate their prefix entry through `entry_id`.
    - Side seal completions update `PendingSeal` directly through owner kind and
      request id.
@@ -260,6 +260,35 @@ scheduler-only and preserves Phase 2 prerequisites.
 
 ## Implementation Notes
 
+- Implemented the Phase 1 scheduler with writer-generated `LogRequestId` and
+  `LogRequestOwner` metadata carried through `LogWriteSubmission` and
+  `LogWriteCompletion`.
+- Added `LogPrefixTracker` in `doradb-storage/src/log/prefix.rs` with
+  `LogPrefixId`, `LogPrefixKind::{Header, Group, SealDispatch}`, ordered
+  prefix lookup, request readiness, and sparse `VecDeque` shrink coverage.
+- Split rotated-file seal tracking into `doradb-storage/src/log/seal.rs` as
+  `LogFileSealer`, preserving configured seal sync for rotated files and
+  best-effort active-file sealing during shutdown.
+- Reworked `RedoLogWriter` finalization so IO completion only marks prefix
+  state ready; prefix finalization publishes headers/groups, syncs one file
+  descriptor at a time, records seal metadata, and dispatches side seals after
+  the old file prefix is durable.
+- Review follow-ups completed: commit-group join comments corrected,
+  prefix/seal path comments added, `LogWriteCompletion` simplified to reuse
+  `LogWriteKind`, redundant writer `written`/`failed_written` fields removed,
+  and failed-prefix cleanup now takes one fatal reason.
+- Final implementation uses `LogRequest*`, `LogPrefix*`, and `LogFileSealer`
+  names rather than the provisional `RedoRequest*`, `RedoPrefix*`, and
+  `RedoFileSealer` names from the original proposal.
+- Validation run during implementation:
+  - `cargo fmt --check`
+  - `cargo check -p doradb-storage --tests`
+  - `cargo nextest run -p doradb-storage log::tests::`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `git diff --check`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  - `tools/style_audit.rs --diff-base origin/main`
 
 ## Impacts
 
@@ -270,7 +299,7 @@ scheduler-only and preserves Phase 2 prerequisites.
   - `RedoLogWriter` should own request id allocation, prefix tracking,
     submission, completion routing, prefix finalization, and fail-pending
     updates.
-  - `RedoFileSealer` should become side request-id tracked metadata work rather
+  - `LogFileSealer` should become side request-id tracked metadata work rather
     than an independent submission/counter path.
   - `shrink_inflight` should be removed or replaced with prefix-tracker
     finalization helpers.
@@ -297,7 +326,7 @@ scheduler-only and preserves Phase 2 prerequisites.
     synchronize Phase 1 task doc/issue/status and note whether implementation
     changed any phase-local choice.
 
-- `docs/backlogs/000127-redo-io-request-id-prefix-sequencing.md`
+- `docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md`
   - This is the source backlog and should be closed during `task resolve` if
     the implementation completes the planned scheduler work.
 
@@ -349,13 +378,5 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-- Exact helper names and struct boundaries are implementation-local. Prefer
-  keeping new types inside `log/mod.rs` unless a narrow test helper in
-  `trx/group.rs` materially improves clarity.
-- If implementation finds that `RedoLogWriter` lifetime across loop iterations
-  makes request id allocation awkward, move the monotonic allocator into the
-  long-lived log-loop state rather than deriving ids from CTS or offsets.
-- If side seal failure after some newer groups have already been published
-  exposes a stronger recovery guarantee requirement than current behavior, stop
-  and update RFC-0021 instead of silently making seal completion a commit
-  prefix barrier.
+None. No follow-up backlog items were opened from this task; the source backlog
+is closed as implemented during task resolve.
