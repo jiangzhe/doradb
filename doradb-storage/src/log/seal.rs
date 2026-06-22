@@ -284,7 +284,7 @@ impl LogFileSealer {
         debug_assert_eq!(write_driver.pending_len(), 0);
         debug_assert_eq!(write_driver.submitted_len(), 0);
         let (fd, offset, buf) = build_sealed_header_write(target, self.accumulator)?;
-        let (submission, completion) = LogWriteSubmission::header(fd, offset, buf);
+        let (submission, _completion) = LogWriteSubmission::header(fd, offset, buf);
         if let Err(submission) = write_driver.push_write(submission) {
             submission.fail_unsubmitted_header(FatalError::RedoWrite);
             return Err(FatalError::RedoWrite);
@@ -298,35 +298,21 @@ impl LogFileSealer {
             buf,
             poison,
         } = write_driver.wait_one();
-        match kind {
-            LogWriteKind::Header { completion } => {
-                drop(buf);
-                if let Some(reason) = poison {
-                    completion.complete(Err(CompletionErrorKind::report_fatal(
-                        reason,
-                        "redo sealed super-block write failed",
-                    )));
-                    return Err(reason);
-                }
-                completion.complete(Ok(()));
-            }
-            LogWriteKind::Group => {
-                drop(buf);
-                completion.complete(Err(CompletionErrorKind::report_fatal(
-                    FatalError::RedoWrite,
-                    "redo sealed super-block write waited for unexpected group completion",
-                )));
-                return Err(FatalError::RedoWrite);
-            }
-            LogWriteKind::Seal { .. } => {
-                drop(buf);
-                completion.complete(Err(CompletionErrorKind::report_fatal(
-                    FatalError::RedoWrite,
-                    "redo sealed super-block write waited for unexpected seal completion",
-                )));
-                return Err(FatalError::RedoWrite);
-            }
+        // This best-effort shutdown path starts from an empty driver and
+        // submits exactly one header write above. Any other completion kind
+        // means the caller violated that isolation invariant.
+        let LogWriteKind::Header { completion } = kind else {
+            unreachable!("active file seal submits exactly one header write");
+        };
+        drop(buf);
+        if let Some(reason) = poison {
+            completion.complete(Err(CompletionErrorKind::report_fatal(
+                reason,
+                "redo sealed super-block write failed",
+            )));
+            return Err(reason);
         }
+        completion.complete(Ok(()));
         sync_sealed_header(self.log_sync, fd)
     }
 }

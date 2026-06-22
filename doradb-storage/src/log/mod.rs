@@ -955,6 +955,11 @@ impl<'a> RedoLogWriter<'a> {
             self.finalize_finished_prefix(sealer);
             self.shrink_prefix_if_sparse();
             self.submit_io(sealer);
+            // This may wait for rotated-file seal I/O even when no prefix
+            // group/header write is submitted. Rotated-file sealing is required
+            // maintenance for ended files: completion performs the configured
+            // seal sync and reports fatal errors. Only active-file sealing during
+            // clean shutdown is best-effort.
             self.wait_one_io_if_submitted(sealer);
             // The wait only marks a write finished; this publishes the durable
             // ordered prefix made ready by that completion.
