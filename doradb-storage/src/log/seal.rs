@@ -83,16 +83,16 @@ impl LogFileSealAccumulator {
     }
 }
 
+struct PendingSeal {
+    request_id: LogRequestId,
+}
+
 /// Tracks sealed redo metadata and pending seal writes for rotated files.
 pub(crate) struct LogFileSealer {
     accumulator: LogFileSealAccumulator,
     seal_writes: VecDeque<LogWriteSubmission>,
     inflight_seals: Vec<PendingSeal>,
     log_sync: LogSync,
-}
-
-struct PendingSeal {
-    request_id: LogRequestId,
 }
 
 impl LogFileSealer {
