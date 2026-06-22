@@ -1,7 +1,11 @@
 pub(crate) mod buf;
 pub(crate) mod format;
+mod prefix;
 pub(crate) mod redo;
+mod seal;
 
+use self::prefix::{LogPrefixEntry, LogPrefixId, LogPrefixKind, LogPrefixTracker};
+pub(crate) use self::seal::LogFileSealer;
 use crate::conf::TrxSysConfig;
 use crate::error::{
     CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, InternalError,
@@ -17,7 +21,7 @@ use crate::io::{
 use crate::log::buf::{LogBuf, TrxLog};
 use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoSuperBlock,
-    serialize_redo_super_block, slot_offset,
+    serialize_redo_super_block,
 };
 use crate::map::FastHashMap;
 use crate::serde::Ser;
@@ -34,7 +38,7 @@ use flume::Sender;
 use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -74,15 +78,6 @@ impl RedoLogFile {
     fn super_block(&self) -> RedoSuperBlock {
         self.super_block.clone()
     }
-
-    /// Return the target information required to seal this file.
-    #[inline]
-    fn seal_target(&self) -> RedoFileSealTarget {
-        RedoFileSealTarget {
-            fd: self.as_raw_fd(),
-            open_super_block: self.super_block(),
-        }
-    }
 }
 
 impl AsRawFd for RedoLogFile {
@@ -109,10 +104,62 @@ pub(crate) struct RedoGroupWriteMeta {
     pub(crate) max_redo_cts: TrxID,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RedoFileSealTarget {
-    fd: RawFd,
-    open_super_block: RedoSuperBlock,
+/// Writer-assigned identity for one physical redo IO request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogRequestId(u64);
+
+impl LogRequestId {
+    #[inline]
+    fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogRequestKind {
+    Group,
+    Header,
+    Seal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogRequestOwner {
+    request_id: LogRequestId,
+    entry_id: Option<LogPrefixId>,
+    kind: LogRequestKind,
+    group_write_idx: Option<usize>,
+}
+
+impl LogRequestOwner {
+    #[inline]
+    fn header(request_id: LogRequestId, entry_id: LogPrefixId) -> Self {
+        Self {
+            request_id,
+            entry_id: Some(entry_id),
+            kind: LogRequestKind::Header,
+            group_write_idx: None,
+        }
+    }
+
+    #[inline]
+    fn group(request_id: LogRequestId, entry_id: LogPrefixId, group_write_idx: usize) -> Self {
+        Self {
+            request_id,
+            entry_id: Some(entry_id),
+            kind: LogRequestKind::Group,
+            group_write_idx: Some(group_write_idx),
+        }
+    }
+
+    #[inline]
+    fn seal(request_id: LogRequestId) -> Self {
+        Self {
+            request_id,
+            entry_id: None,
+            kind: LogRequestKind::Seal,
+            group_write_idx: None,
+        }
+    }
 }
 
 struct CreatedLogFile {
@@ -217,6 +264,7 @@ impl RedoLogInitializer {
 
 /// Pending redo write submitted to the storage backend.
 pub(crate) struct LogWriteSubmission {
+    owner: Option<LogRequestOwner>,
     kind: LogWriteKind,
     operation: Operation,
 }
@@ -224,9 +272,10 @@ pub(crate) struct LogWriteSubmission {
 impl LogWriteSubmission {
     /// Create a group write submission for the given file range and direct buffer.
     #[inline]
-    pub(crate) fn new(cts: TrxID, fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
+    pub(crate) fn new(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
         LogWriteSubmission {
-            kind: LogWriteKind::Group { cts },
+            owner: None,
+            kind: LogWriteKind::Group,
             operation: Operation::pwrite_owned(fd, offset, buf),
         }
     }
@@ -235,6 +284,7 @@ impl LogWriteSubmission {
     fn header(fd: RawFd, offset: usize, buf: DirectBuf) -> (Self, Arc<Completion<()>>) {
         let completion = Arc::new(Completion::new());
         let submission = LogWriteSubmission {
+            owner: None,
             kind: LogWriteKind::Header {
                 completion: Arc::clone(&completion),
             },
@@ -247,10 +297,30 @@ impl LogWriteSubmission {
     fn seal(log_file: RedoLogFile, offset: usize, buf: DirectBuf) -> Self {
         let fd = log_file.as_raw_fd();
         LogWriteSubmission {
+            owner: None,
             kind: LogWriteKind::Seal {
                 log_file: Box::new(log_file),
             },
             operation: Operation::pwrite_owned(fd, offset, buf),
+        }
+    }
+
+    #[inline]
+    fn owner(&self) -> Option<LogRequestOwner> {
+        self.owner
+    }
+
+    #[inline]
+    fn attach_owner(&mut self, owner: LogRequestOwner) {
+        debug_assert!(self.owner.is_none() || self.owner == Some(owner));
+        self.owner = Some(owner);
+    }
+
+    #[inline]
+    fn header_completion(&self) -> Option<Arc<Completion<()>>> {
+        match &self.kind {
+            LogWriteKind::Header { completion } => Some(Arc::clone(completion)),
+            LogWriteKind::Group | LogWriteKind::Seal { .. } => None,
         }
     }
 
@@ -279,27 +349,16 @@ impl IOSubmission for LogWriteSubmission {
 }
 
 enum LogWriteKind {
-    Group { cts: TrxID },
+    Group,
     Header { completion: Arc<Completion<()>> },
     Seal { log_file: Box<RedoLogFile> },
 }
 
-enum LogWriteCompletion {
-    Group {
-        cts: TrxID,
-        buf: DirectBuf,
-        poison: Option<FatalError>,
-    },
-    Header {
-        completion: Arc<Completion<()>>,
-        buf: DirectBuf,
-        poison: Option<FatalError>,
-    },
-    Seal {
-        log_file: Box<RedoLogFile>,
-        buf: DirectBuf,
-        poison: Option<FatalError>,
-    },
+struct LogWriteCompletion {
+    owner: Option<LogRequestOwner>,
+    kind: LogWriteKind,
+    buf: DirectBuf,
+    poison: Option<FatalError>,
 }
 
 /// Driver wrapper for redo log write submissions.
@@ -313,6 +372,11 @@ impl LogWriteDriver {
         LogWriteDriver {
             driver: SubmissionDriver::new(backend),
         }
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.driver.capacity()
     }
 
     #[inline]
@@ -354,22 +418,11 @@ impl LogWriteDriver {
             Ok(_len) => Some(FatalError::RedoWrite),
             Err(_err) => Some(FatalError::RedoWrite),
         };
-        match submission.kind {
-            LogWriteKind::Group { cts } => LogWriteCompletion::Group {
-                cts,
-                buf,
-                poison: result,
-            },
-            LogWriteKind::Header { completion } => LogWriteCompletion::Header {
-                completion,
-                buf,
-                poison: result,
-            },
-            LogWriteKind::Seal { log_file } => LogWriteCompletion::Seal {
-                log_file,
-                buf,
-                poison: result,
-            },
+        LogWriteCompletion {
+            owner: submission.owner,
+            kind: submission.kind,
+            buf,
+            poison: result,
         }
     }
 }
@@ -595,11 +648,13 @@ impl RedoLog {
     }
 }
 
-/// Commit group state while its redo write and sync are being processed.
+/// Logical commit group state while redo requests and sync are being processed.
 pub(crate) struct SyncGroup {
     /// Transactions covered by this ordered commit group.
     pub(crate) trx_list: Vec<PrecommitTrx>,
     /// Maximum commit timestamp in the group.
+    ///
+    /// This is transaction publication metadata, not physical IO identity.
     pub(crate) max_cts: TrxID,
     /// Serialized redo byte count for the group.
     pub(crate) log_bytes: usize,
@@ -610,12 +665,12 @@ pub(crate) struct SyncGroup {
     pub(crate) write_meta: Option<RedoGroupWriteMeta>,
     /// Pending write submission, if this group has redo bytes.
     pub(crate) write: Option<LogWriteSubmission>,
-    /// Buffer returned by completed redo write I/O.
-    pub(crate) returned_buf: Option<DirectBuf>,
+    /// Buffers returned by completed redo write I/O.
+    pub(crate) returned_bufs: Vec<DirectBuf>,
     /// Completion notified when commit or cleanup finishes.
     pub(crate) completion: Arc<Completion<()>>,
-    /// Whether the group write has completed or no write was required.
-    pub(crate) finished: bool,
+    /// Number of physical write requests still owned by the backend driver.
+    pub(crate) outstanding_requests: usize,
     /// Redo logging is sequential: once one group fails, this group and every
     /// later group cannot be part of the durable prefix. Submitted IO may still
     /// complete later, but completion only returns buffers for recycling.
@@ -629,27 +684,50 @@ impl SyncGroup {
     }
 
     #[inline]
-    fn finish_write(&mut self, buf: DirectBuf) {
-        self.returned_buf = Some(buf);
-        self.finished = true;
+    fn restore_submission(&mut self, submission: LogWriteSubmission) {
+        debug_assert!(self.write.is_none());
+        self.write = Some(submission);
     }
 
     #[inline]
-    fn take_any_buf(&mut self) -> Option<DirectBuf> {
-        if let Some(buf) = self.returned_buf.take() {
-            return Some(buf);
-        }
-        self.write
+    fn mark_request_submitted(&mut self) {
+        self.outstanding_requests += 1;
+    }
+
+    #[inline]
+    fn finish_request(&mut self, buf: DirectBuf) {
+        self.outstanding_requests = self
+            .outstanding_requests
+            .checked_sub(1)
+            .expect("redo group completion must match outstanding request count");
+        self.returned_bufs.push(buf);
+    }
+
+    #[inline]
+    fn ready(&self) -> bool {
+        self.write.is_none() && self.outstanding_requests == 0
+    }
+
+    #[inline]
+    fn drain_buffers(&mut self) -> Vec<DirectBuf> {
+        let mut bufs = mem::take(&mut self.returned_bufs);
+        if let Some(buf) = self
+            .write
             .as_mut()
             .and_then(|submission| submission.operation.take_buf())
+        {
+            bufs.push(buf);
+        }
+        bufs
     }
 
     #[inline]
     fn fail_waiters(&mut self, trx_sys: &TransactionSystem, reason: FailedPrecommitReason) {
-        if self.failure_reason.is_some() {
+        if self.trx_list.is_empty() {
+            self.failure_reason.get_or_insert(reason);
             return;
         }
-        self.failure_reason = Some(reason);
+        self.failure_reason.get_or_insert(reason);
         let trx_list = mem::take(&mut self.trx_list);
         let completion = Arc::clone(&self.completion);
         trx_sys.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
@@ -679,6 +757,20 @@ pub(crate) struct RedoLogStats {
     pub(crate) purge_row_count: AtomicUsize,
     /// Number of index entries purged.
     pub(crate) purge_index_count: AtomicUsize,
+}
+
+#[derive(Default)]
+struct ReadyGroupPrefix {
+    /// Groups whose redo bytes form one durable publication prefix.
+    written: Vec<SyncGroup>,
+    /// Ready groups after the first failed group; these are cleanup-only.
+    failed: Vec<SyncGroup>,
+    trx_count: usize,
+    commit_count: usize,
+    log_bytes: usize,
+    /// Redo fd for `written`. A publish batch cannot span log files.
+    log_fd: Option<RawFd>,
+    failure_reason: Option<FailedPrecommitReason>,
 }
 
 /// Durability mode for syncing redo log writes.
@@ -712,293 +804,13 @@ impl FromStr for LogSync {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RedoFileSealAccumulator {
-    file_seq: Option<u32>,
-    durable_end_offset: usize,
-    min_redo_cts: Option<TrxID>,
-    max_redo_cts: Option<TrxID>,
-}
-
-impl RedoFileSealAccumulator {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            file_seq: None,
-            durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET,
-            min_redo_cts: None,
-            max_redo_cts: None,
-        }
-    }
-
-    #[inline]
-    fn record_group(&mut self, write_meta: RedoGroupWriteMeta) {
-        if let Some(file_seq) = self.file_seq {
-            debug_assert_eq!(file_seq, write_meta.file_seq);
-        } else {
-            self.file_seq = Some(write_meta.file_seq);
-        }
-        self.durable_end_offset = write_meta.end_offset;
-        self.min_redo_cts = Some(
-            self.min_redo_cts
-                .map_or(write_meta.min_redo_cts, |current| {
-                    current.min(write_meta.min_redo_cts)
-                }),
-        );
-        self.max_redo_cts = Some(
-            self.max_redo_cts
-                .map_or(write_meta.max_redo_cts, |current| {
-                    current.max(write_meta.max_redo_cts)
-                }),
-        );
-    }
-
-    #[inline]
-    fn redo_range(&self) -> Option<(TrxID, TrxID)> {
-        self.min_redo_cts.zip(self.max_redo_cts)
-    }
-}
-
-/// Tracks sealed redo metadata and pending seal writes for rotated files.
-pub(crate) struct RedoFileSealer {
-    accumulator: RedoFileSealAccumulator,
-    seal_writes: VecDeque<LogWriteSubmission>,
-    inflight_seals: usize,
-    log_sync: LogSync,
-}
-
-impl RedoFileSealer {
-    /// Create a redo file sealer using the configured log-sync mode.
-    #[inline]
-    pub(crate) fn new(config: &TrxSysConfig) -> Self {
-        RedoFileSealer {
-            accumulator: RedoFileSealAccumulator::new(),
-            seal_writes: VecDeque::new(),
-            inflight_seals: 0,
-            log_sync: config.log_sync,
-        }
-    }
-
-    /// Record one durable redo-bearing group for the current file seal.
-    #[inline]
-    pub(crate) fn record_group(&mut self, write_meta: RedoGroupWriteMeta) {
-        self.accumulator.record_group(write_meta);
-    }
-
-    #[inline]
-    fn has_pending(&self) -> bool {
-        !self.seal_writes.is_empty() || self.inflight_seals > 0
-    }
-
-    #[inline]
-    fn driver_owned_len(&self) -> usize {
-        self.inflight_seals
-    }
-
-    #[inline]
-    fn fail_unsubmitted(&mut self) {
-        let drained: Vec<_> = self.seal_writes.drain(..).collect();
-        for submission in drained {
-            submission.fail_unsubmitted_seal();
-        }
-    }
-
-    /// Queue a rotated log file for inactive-slot sealing.
-    #[inline]
-    pub(crate) fn enqueue_rotated_file(
-        &mut self,
-        log_file: RedoLogFile,
-    ) -> StdResult<(), FatalError> {
-        let accumulator = mem::replace(&mut self.accumulator, RedoFileSealAccumulator::new());
-        let submission = Self::prepare_seal_submission(log_file, accumulator)?;
-        self.seal_writes.push_back(submission);
-        Ok(())
-    }
-
-    #[inline]
-    fn prepare_seal_submission(
-        log_file: RedoLogFile,
-        accumulator: RedoFileSealAccumulator,
-    ) -> StdResult<LogWriteSubmission, FatalError> {
-        if let Some(file_seq) = accumulator.file_seq {
-            debug_assert_eq!(file_seq, log_file.file_seq());
-        }
-        let target = log_file.seal_target();
-        let (fd, offset, buf) = build_sealed_header_write(target, accumulator)?;
-        debug_assert_eq!(fd, log_file.as_raw_fd());
-        Ok(LogWriteSubmission::seal(log_file, offset, buf))
-    }
-
-    #[inline]
-    fn stage_ready(&mut self, write_driver: &mut LogWriteDriver) {
-        while let Some(submission) = self.seal_writes.pop_front() {
-            if write_driver.available_capacity() == 0 {
-                self.seal_writes.push_front(submission);
-                break;
-            }
-            if let Err(submission) = write_driver.push_write(submission) {
-                self.seal_writes.push_front(submission);
-                break;
-            }
-            self.inflight_seals += 1;
-        }
-    }
-
-    #[inline]
-    fn handle_completion(
-        &mut self,
-        trx_sys: &TransactionSystem,
-        log_file: Box<RedoLogFile>,
-        poison: Option<FatalError>,
-    ) -> Option<Report<FatalError>> {
-        self.inflight_seals = self
-            .inflight_seals
-            .checked_sub(1)
-            .expect("redo seal completion must match inflight seal count");
-        if let Some(reason) = poison {
-            return Some(trx_sys.poison_storage(reason));
-        }
-        if let Err(reason) = sync_sealed_header(self.log_sync, log_file.as_raw_fd()) {
-            return Some(trx_sys.poison_storage(reason));
-        }
-        drop(log_file);
-        None
-    }
-
-    /// Drain all pending seal writes and return the first fatal seal error.
-    #[inline]
-    pub(crate) fn finish_pending(
-        &mut self,
-        trx_sys: &TransactionSystem,
-        write_driver: &mut LogWriteDriver,
-    ) -> Option<Report<FatalError>> {
-        let mut first_err = None;
-        while self.has_pending() {
-            self.stage_ready(write_driver);
-            write_driver.submit_ready();
-            if write_driver.submitted_len() == 0 {
-                if first_err.is_none() {
-                    first_err = Some(trx_sys.poison_storage(FatalError::RedoWrite));
-                }
-                self.fail_unsubmitted();
-                break;
-            }
-            let completion = write_driver.wait_one();
-            match completion {
-                LogWriteCompletion::Seal {
-                    log_file,
-                    buf,
-                    poison,
-                } => {
-                    drop(buf);
-                    if let Some(err) = self.handle_completion(trx_sys, log_file, poison)
-                        && first_err.is_none()
-                    {
-                        first_err = Some(err);
-                    }
-                }
-                LogWriteCompletion::Header { .. } | LogWriteCompletion::Group { .. } => {
-                    unreachable!("redo file sealer must only drain seal completions");
-                }
-            }
-        }
-        first_err
-    }
-
-    /// Best-effort seal of the active file during clean shutdown.
-    #[inline]
-    pub(crate) fn seal_active_file_best_effort(
-        &mut self,
-        trx_sys: &TransactionSystem,
-        write_driver: &mut LogWriteDriver,
-    ) {
-        let target = {
-            let group_commit_g = trx_sys.redo_log.group_commit.lock();
-            group_commit_g
-                .log_file
-                .as_ref()
-                .map(RedoLogFile::seal_target)
-        };
-        let Some(target) = target else {
-            return;
-        };
-        if self
-            .seal_file_target_best_effort(target, write_driver)
-            .is_err()
-        {
-            trx_sys
-                .redo_log
-                .stats
-                .seal_failure_count
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    fn seal_file_target_best_effort(
-        &self,
-        target: RedoFileSealTarget,
-        write_driver: &mut LogWriteDriver,
-    ) -> StdResult<(), FatalError> {
-        debug_assert_eq!(write_driver.pending_len(), 0);
-        debug_assert_eq!(write_driver.submitted_len(), 0);
-        let (fd, offset, buf) = build_sealed_header_write(target, self.accumulator)?;
-        let (submission, completion) = LogWriteSubmission::header(fd, offset, buf);
-        if let Err(submission) = write_driver.push_write(submission) {
-            submission.fail_unsubmitted_header(FatalError::RedoWrite);
-            return Err(FatalError::RedoWrite);
-        }
-        if write_driver.submit_ready() == 0 && write_driver.submitted_len() == 0 {
-            return Err(FatalError::RedoWrite);
-        }
-        match write_driver.wait_one() {
-            LogWriteCompletion::Header {
-                completion,
-                buf,
-                poison,
-            } => {
-                drop(buf);
-                if let Some(reason) = poison {
-                    completion.complete(Err(CompletionErrorKind::report_fatal(
-                        reason,
-                        "redo sealed super-block write failed",
-                    )));
-                    return Err(reason);
-                }
-                completion.complete(Ok(()));
-            }
-            LogWriteCompletion::Group { buf, .. } => {
-                drop(buf);
-                completion.complete(Err(CompletionErrorKind::report_fatal(
-                    FatalError::RedoWrite,
-                    "redo sealed super-block write waited for unexpected group completion",
-                )));
-                return Err(FatalError::RedoWrite);
-            }
-            LogWriteCompletion::Seal { buf, .. } => {
-                drop(buf);
-                completion.complete(Err(CompletionErrorKind::report_fatal(
-                    FatalError::RedoWrite,
-                    "redo sealed super-block write waited for unexpected seal completion",
-                )));
-                return Err(FatalError::RedoWrite);
-            }
-        }
-        sync_sealed_header(self.log_sync, fd)
-    }
-}
-
 /// Processes redo write and sync work for commit groups.
 pub(crate) struct RedoLogWriter<'a> {
     trx_sys: &'a TransactionSystem,
     write_driver: &'a mut LogWriteDriver,
     log_block_size: usize,
-    header_writes: VecDeque<LogWriteSubmission>,
-    inflight_headers: usize,
-    inflight: BTreeMap<TrxID, SyncGroup>,
-    sync_groups: VecDeque<SyncGroup>,
-    written: Vec<SyncGroup>,
-    failed_written: Vec<SyncGroup>,
+    prefix: LogPrefixTracker,
+    next_request_id: u64,
     log_sync: LogSync,
     shutdown: bool,
 }
@@ -1015,15 +827,21 @@ impl<'a> RedoLogWriter<'a> {
             trx_sys,
             write_driver,
             log_block_size: config.log_block_size.as_u64() as usize,
-            header_writes: VecDeque::new(),
-            inflight_headers: 0,
-            inflight: BTreeMap::new(),
-            sync_groups: VecDeque::new(),
-            written: vec![],
-            failed_written: vec![],
+            prefix: LogPrefixTracker::new(),
+            next_request_id: 0,
             log_sync: config.log_sync,
             shutdown: false,
         }
+    }
+
+    #[inline]
+    fn next_request_id(&mut self) -> LogRequestId {
+        let request_id = LogRequestId::new(self.next_request_id);
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .expect("redo request id overflow");
+        request_id
     }
 
     #[inline]
@@ -1037,26 +855,19 @@ impl<'a> RedoLogWriter<'a> {
     #[inline]
     fn fail_sync_group(&self, sync_group: &mut SyncGroup, reason: FailedPrecommitReason) {
         sync_group.fail_waiters(self.trx_sys, reason);
-        if let Some(buf) = sync_group.take_any_buf() {
+        for buf in sync_group.drain_buffers() {
             self.recycle_buf(buf);
         }
     }
 
     /// Fail all pending redo work after a fatal storage error.
     #[inline]
-    pub(crate) fn fail_pending(&mut self, sealer: &mut RedoFileSealer, err: Report<FatalError>) {
+    pub(crate) fn fail_pending(&mut self, sealer: &mut LogFileSealer, err: Report<FatalError>) {
         self.shutdown = true;
-        let reason = FailedPrecommitReason::Fatal(*err.current_context());
         let fatal = *err.current_context();
+        let reason = FailedPrecommitReason::Fatal(fatal);
         sealer.fail_unsubmitted();
-        let drained_headers: Vec<_> = self.header_writes.drain(..).collect();
-        for header in drained_headers {
-            header.fail_unsubmitted_header(fatal);
-        }
-        let drained_sync_groups: Vec<_> = self.sync_groups.drain(..).collect();
-        for mut sync_group in drained_sync_groups {
-            self.fail_sync_group(&mut sync_group, reason);
-        }
+        self.fail_prefix_entries(fatal);
 
         let mut queued = Vec::new();
         {
@@ -1080,84 +891,100 @@ impl<'a> RedoLogWriter<'a> {
             let mut sync_group = group.into_sync_group();
             self.fail_sync_group(&mut sync_group, reason);
         }
+    }
 
-        for sync_group in self.inflight.values_mut() {
-            sync_group.fail_waiters(self.trx_sys, reason);
+    #[inline]
+    fn fail_prefix_entries(&mut self, fatal: FatalError) {
+        let reason = FailedPrecommitReason::Fatal(fatal);
+        let mut recycle = Vec::new();
+        for entry in &mut self.prefix.entries {
+            match &mut entry.kind {
+                LogPrefixKind::Header {
+                    write,
+                    ready,
+                    failure,
+                    ..
+                } => {
+                    if let Some(mut submission) = write.take() {
+                        let _ = submission.operation.take_buf();
+                        *ready = true;
+                    }
+                    if !*ready || failure.is_none() {
+                        *failure = Some(fatal);
+                    }
+                }
+                LogPrefixKind::Group { group } => {
+                    group.fail_waiters(self.trx_sys, reason);
+                    if group.write.is_some() {
+                        recycle.extend(group.drain_buffers());
+                        group.write = None;
+                    } else {
+                        recycle.extend(group.drain_buffers());
+                    }
+                    group.failure_reason.get_or_insert(reason);
+                }
+                LogPrefixKind::SealDispatch { log_file } => {
+                    drop(log_file.take());
+                }
+            }
+        }
+        for buf in recycle {
+            self.recycle_buf(buf);
         }
     }
 
-    /// Process single log file until it is full or shutdown.
     #[inline]
-    pub(crate) fn process_single_file(
-        &mut self,
-        sealer: &mut RedoFileSealer,
-    ) -> Option<RedoLogFile> {
+    fn shrink_prefix_if_sparse(&mut self) {
+        self.prefix.shrink_if_sparse(self.write_driver.capacity());
+    }
+
+    /// Process redo prefix work until shutdown.
+    #[inline]
+    pub(crate) fn process_until_shutdown(&mut self, sealer: &mut LogFileSealer) {
         loop {
             debug_assert!(
-                self.header_writes.len()
-                    + self.inflight_headers
-                    + self.sync_groups.len()
-                    + self.inflight.len()
-                    + sealer.driver_owned_len()
+                self.prefix.len() + self.prefix.driver_owned_len() + sealer.driver_owned_len()
                     >= self.write_driver.pending_len(),
                 "queued and inflight redo work should cover all driver-owned work"
             );
             // If shutdown flag is set, we still submit and finish all pending IOs,
             // but do not accept any new IO requests.
             if !self.shutdown {
-                let ended_log_file = self.fetch_io_reqs(sealer);
-                // End this loop if log file is full.
-                if ended_log_file.is_some() {
-                    return ended_log_file;
-                }
+                self.fetch_io_reqs(sealer);
             }
-            self.submit_io(sealer);
-            // Always try to publish the ordered prefix after submit. Some groups
-            // are already finished when they enter inflight, and a log rotation
-            // can leave finished inflight groups behind before the usual wait
-            // path gets another chance to run.
             self.finalize_finished_prefix(sealer);
+            self.shrink_prefix_if_sparse();
+            self.submit_io(sealer);
             self.wait_one_io_if_submitted(sealer);
             // The wait only marks a write finished; this publishes the durable
             // ordered prefix made ready by that completion.
             self.finalize_finished_prefix(sealer);
+            self.shrink_prefix_if_sparse();
 
-            if self.shutdown
-                && self.sync_groups.is_empty()
-                && self.inflight.is_empty()
-                && self.header_writes.is_empty()
-                && self.inflight_headers == 0
-            {
-                return None;
+            if self.shutdown && self.prefix.is_empty() {
+                return;
             }
         }
     }
 
     /// Finish pending group IOs and any boundary header write already staged.
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn finish_pending_io_and_header_write(&mut self, sealer: &mut RedoFileSealer) {
-        while !self.sync_groups.is_empty()
-            || !self.inflight.is_empty()
-            || !self.header_writes.is_empty()
-            || self.inflight_headers > 0
-        {
-            self.submit_io(sealer);
-            // Rotation can return from `process_single_file` before its
-            // post-wait finalization step. Drain any finished prefix even when
-            // there is no backend-submitted write to wait for.
+    pub(crate) fn finish_pending_io_and_header_write(&mut self, sealer: &mut LogFileSealer) {
+        while !self.prefix.is_empty() {
             self.finalize_finished_prefix(sealer);
+            self.shrink_prefix_if_sparse();
+            self.submit_io(sealer);
             self.wait_one_io_if_submitted(sealer);
             self.finalize_finished_prefix(sealer);
+            self.shrink_prefix_if_sparse();
         }
     }
 
     /// Return whether this writer still owns pending group or header I/O.
     #[inline]
     pub(crate) fn has_pending_io(&self) -> bool {
-        !self.sync_groups.is_empty()
-            || !self.inflight.is_empty()
-            || !self.header_writes.is_empty()
-            || self.inflight_headers > 0
+        !self.prefix.is_empty()
     }
 
     /// Return whether the writer has entered shutdown drain mode.
@@ -1166,10 +993,10 @@ impl<'a> RedoLogWriter<'a> {
         self.shutdown
     }
 
-    /// Fetch IO requests, returns ended log file if any.
+    /// Fetch queued commit work into the logical redo prefix.
     #[inline]
-    fn fetch_io_reqs(&mut self, sealer: &RedoFileSealer) -> Option<RedoLogFile> {
-        if self.write_driver.pending_len() == 0 && !sealer.has_pending() {
+    fn fetch_io_reqs(&mut self, sealer: &LogFileSealer) {
+        if self.write_driver.pending_len() == 0 && self.prefix.is_empty() && !sealer.has_pending() {
             // there is no processing IO, so we can block on waiting for next request.
             self.fetch_io_reqs_internal()
         } else {
@@ -1180,30 +1007,35 @@ impl<'a> RedoLogWriter<'a> {
     }
 
     #[inline]
-    fn fetch_io_reqs_internal(&mut self) -> Option<RedoLogFile> {
+    fn fetch_io_reqs_internal(&mut self) {
         loop {
             let mut group_commit_g = self.trx_sys.redo_log.group_commit.lock();
+            let mut fetched = false;
             loop {
                 match group_commit_g.queue.pop_front() {
                     None => break,
                     Some(Commit::Shutdown) => {
                         self.shutdown = true;
-                        return None;
+                        return;
                     }
                     Some(Commit::LogFileBoundary {
                         ended_log_file,
                         header_write,
                     }) => {
-                        self.header_writes.push_back(header_write);
-                        return ended_log_file;
+                        if let Some(log_file) = ended_log_file {
+                            self.prefix.push_seal_dispatch(log_file);
+                        }
+                        self.prefix.push_header(header_write);
+                        fetched = true;
                     }
                     Some(Commit::Group(cg)) => {
-                        self.sync_groups.push_back(cg.into_sync_group());
+                        self.prefix.push_group(cg.into_sync_group());
+                        fetched = true;
                     }
                 }
             }
-            if !self.header_writes.is_empty() || !self.sync_groups.is_empty() {
-                return None;
+            if fetched {
+                return;
             }
             self.trx_sys
                 .redo_log
@@ -1213,60 +1045,40 @@ impl<'a> RedoLogWriter<'a> {
     }
 
     #[inline]
-    fn try_fetch_io_reqs_internal(&mut self) -> Option<RedoLogFile> {
+    fn try_fetch_io_reqs_internal(&mut self) {
         // Single thread perform IO so here we only need to use sync mutex.
         let mut group_commit_g = self.trx_sys.redo_log.group_commit.lock();
         loop {
             match group_commit_g.queue.pop_front() {
                 None => {
-                    return None;
+                    return;
                 }
                 Some(Commit::Shutdown) => {
                     self.shutdown = true;
-                    return None;
+                    return;
                 }
                 Some(Commit::LogFileBoundary {
                     ended_log_file,
                     header_write,
                 }) => {
-                    self.header_writes.push_back(header_write);
-                    return ended_log_file;
+                    if let Some(log_file) = ended_log_file {
+                        self.prefix.push_seal_dispatch(log_file);
+                    }
+                    self.prefix.push_header(header_write);
                 }
                 Some(Commit::Group(cg)) => {
-                    self.sync_groups.push_back(cg.into_sync_group());
+                    self.prefix.push_group(cg.into_sync_group());
                 }
             }
         }
     }
 
     #[inline]
-    fn written_log_fd(&self) -> RawFd {
-        let mut log_fd = None;
-        for sync_group in &self.written {
-            if sync_group.log_bytes == 0 {
-                continue;
-            }
-            let sync_group_fd = sync_group
-                .log_fd
-                .expect("redo-bearing sync group must carry its log file fd");
-            if let Some(fd) = log_fd {
-                debug_assert_eq!(
-                    fd, sync_group_fd,
-                    "finished redo prefix must not cross log file boundaries"
-                );
-            } else {
-                log_fd = Some(sync_group_fd);
-            }
-        }
-        log_fd.expect("redo-bearing finished prefix must include a log file fd")
-    }
-
-    #[inline]
-    fn sync_written_prefix(&self, log_bytes: usize) -> Result<()> {
+    fn sync_written_prefix(&self, log_fd: Option<RawFd>, log_bytes: usize) -> Result<()> {
         if log_bytes == 0 {
             return Ok(());
         }
-        let log_fd = self.written_log_fd();
+        let log_fd = log_fd.expect("redo-bearing finished prefix must include a log file fd");
         let syncer = FileSyncer::from_borrowed_fd(log_fd);
         match self.log_sync {
             LogSync::Fsync => syncer.fsync(),
@@ -1277,221 +1089,434 @@ impl<'a> RedoLogWriter<'a> {
 
     /// Finalizes the ordered prefix whose redo writes are already finished.
     ///
-    /// This is a no-op when the first inflight group is not finished. Otherwise
-    /// it removes the finished CTS prefix, performs the configured file sync
-    /// when that prefix contains redo bytes, advances persisted CTS, commits
-    /// transactions, wakes waiters, recycles write buffers, and updates stats.
+    /// This is a no-op when the first prefix entry is not ready. Otherwise it
+    /// removes ready header barriers, dispatches old-file seal work, and
+    /// publishes the ready logical group prefix.
     ///
     /// Redo durability is sequential: this stops at the first unfinished group,
     /// and a failed group makes every later group cleanup-only even if its
     /// individual write has completed.
     #[inline]
-    fn finalize_finished_prefix(&mut self, sealer: &mut RedoFileSealer) {
-        self.written.clear();
-        self.failed_written.clear();
-        let (trx_count, commit_count, log_bytes, failure_reason) = shrink_inflight(
-            &mut self.inflight,
-            &mut self.written,
-            &mut self.failed_written,
-        );
-
-        if let Some(reason) = failure_reason {
-            // The first failed group ends the sequential redo prefix. Any
-            // later inflight group that has not finished yet must be failed
-            // now; it stays in `inflight` only until its IO completion returns
-            // the backend-owned buffer.
-            for sync_group in self.inflight.values_mut() {
-                sync_group.fail_waiters(self.trx_sys, reason);
-            }
-            let drained_failed: Vec<_> = self.failed_written.drain(..).collect();
-            for mut sync_group in drained_failed {
-                self.fail_sync_group(&mut sync_group, reason);
-            }
-        }
-
-        if !self.written.is_empty() {
-            let max_cts = self.written.last().unwrap().max_cts;
-
-            let start = Instant::now();
-            let sync_res = self.sync_written_prefix(log_bytes);
-            let sync_dur = start.elapsed();
-            if sync_res.is_err() {
-                let err = self.trx_sys.poison_storage(FatalError::RedoSync);
-                let reason = FailedPrecommitReason::Fatal(*err.current_context());
-                let drained_written: Vec<_> = self.written.drain(..).collect();
-                for mut sync_group in drained_written {
-                    self.fail_sync_group(&mut sync_group, reason);
-                }
-                self.fail_pending(sealer, err);
+    fn finalize_finished_prefix(&mut self, sealer: &mut LogFileSealer) {
+        loop {
+            let Some(front) = self.prefix.entries.front() else {
                 return;
-            }
-
-            for sync_group in &self.written {
-                if let Some(write_meta) = sync_group.write_meta {
-                    sealer.record_group(write_meta);
+            };
+            match &front.kind {
+                LogPrefixKind::Header { ready, .. } => {
+                    if !ready {
+                        return;
+                    }
+                    // Header writes are barriers between files. Complete the
+                    // header before any later group can be published.
+                    let entry = self
+                        .prefix
+                        .pop_front()
+                        .expect("front redo header prefix entry must exist");
+                    Self::complete_header_prefix_entry(entry);
                 }
-            }
-
-            self.trx_sys
-                .redo_log
-                .persisted_cts
-                .store(max_cts.as_u64(), Ordering::SeqCst);
-
-            // Put IO buffer back into free list.
-            let drained_written: Vec<_> = self.written.drain(..).collect();
-            for mut sync_group in drained_written {
-                debug_assert!(sync_group.failure_reason.is_none());
-                if let Some(buf) = sync_group.take_any_buf() {
-                    self.recycle_buf(buf);
-                }
-                // commit transactions to let waiting read operations to continue
-                let mut committed_trx_list: FastHashMap<usize, Vec<CommittedTrx>> =
-                    FastHashMap::default();
-                for trx in mem::take(&mut sync_group.trx_list) {
-                    let trx = trx.commit();
-                    if let Some(gc_no) = trx.gc_no() {
-                        // Only user transaction is involved in GC process.
-                        committed_trx_list.entry(gc_no).or_default().push(trx);
+                LogPrefixKind::SealDispatch { .. } => {
+                    // Rotation seal is side work for the old file. Dispatch it
+                    // in prefix order, then let the following header gate the
+                    // new file's groups.
+                    let entry = self
+                        .prefix
+                        .pop_front()
+                        .expect("front redo seal dispatch entry must exist");
+                    let LogPrefixKind::SealDispatch { log_file } = entry.kind else {
+                        unreachable!("front entry kind was checked")
+                    };
+                    if let Some(log_file) = log_file {
+                        let request_id = self.next_request_id();
+                        if let Err(reason) = sealer.enqueue_rotated_file(log_file, request_id) {
+                            let err = self.trx_sys.poison_storage(reason);
+                            self.fail_pending(sealer, err);
+                            return;
+                        }
                     }
                 }
-                // Handoff committed transaction payloads to the purge coordinator
-                // before waking commit waiters. The purge receiver must stay alive
-                // until redo has joined during worker shutdown.
-                if !committed_trx_list.is_empty() {
-                    self.trx_sys
-                        .redo_log
-                        .purge_tx
-                        .send(Purge::Committed(committed_trx_list))
-                        .expect(
-                            "purge coordinator receiver must stay alive until log thread stopped",
-                        );
+                LogPrefixKind::Group { group } => {
+                    if !group.ready() {
+                        return;
+                    }
+                    // A ready group prefix is the only point where transaction
+                    // waiters can be completed.
+                    self.finalize_ready_group_prefix(sealer);
                 }
-                sync_group.completion.complete(Ok(()));
+            }
+        }
+    }
+
+    #[inline]
+    fn complete_header_prefix_entry(entry: LogPrefixEntry) {
+        let LogPrefixKind::Header {
+            completion,
+            failure,
+            ..
+        } = entry.kind
+        else {
+            unreachable!("header prefix completion requires a header entry")
+        };
+        let Some(completion) = completion else {
+            return;
+        };
+        if let Some(reason) = failure {
+            completion.complete(Err(CompletionErrorKind::report_fatal(
+                reason,
+                "redo header write failed",
+            )));
+        } else {
+            completion.complete(Ok(()));
+        }
+    }
+
+    #[inline]
+    fn finalize_ready_group_prefix(&mut self, sealer: &mut LogFileSealer) {
+        let mut ready = self.drain_ready_group_prefix();
+
+        if let Some(reason) = ready.failure_reason {
+            // Redo is sequential: the first failed group turns every later
+            // queued group into cleanup-only work even if its own write is
+            // already complete.
+            for entry in &mut self.prefix.entries {
+                if let LogPrefixKind::Group { group } = &mut entry.kind {
+                    group.fail_waiters(self.trx_sys, reason);
+                    group.failure_reason.get_or_insert(reason);
+                }
+            }
+            for sync_group in &mut ready.failed {
+                self.fail_sync_group(sync_group, reason);
+            }
+        }
+
+        if ready.written.is_empty() {
+            return;
+        }
+
+        let max_cts = ready.written.last().unwrap().max_cts;
+        let start = Instant::now();
+        // Sync one file-local prefix before publishing its transactions and
+        // advancing persisted CTS.
+        let sync_res = self.sync_written_prefix(ready.log_fd, ready.log_bytes);
+        let sync_dur = start.elapsed();
+        if sync_res.is_err() {
+            let err = self.trx_sys.poison_storage(FatalError::RedoSync);
+            let reason = FailedPrecommitReason::Fatal(*err.current_context());
+            for sync_group in &mut ready.written {
+                self.fail_sync_group(sync_group, reason);
+            }
+            self.fail_pending(sealer, err);
+            return;
+        }
+
+        for sync_group in &ready.written {
+            if let Some(write_meta) = sync_group.write_meta {
+                // Seal metadata is file-local, so only record groups after the
+                // corresponding file prefix has become durable.
+                sealer.record_group(write_meta);
+            }
+        }
+
+        self.trx_sys
+            .redo_log
+            .persisted_cts
+            .store(max_cts.as_u64(), Ordering::SeqCst);
+
+        for mut sync_group in ready.written {
+            debug_assert!(sync_group.failure_reason.is_none());
+            for buf in sync_group.drain_buffers() {
+                self.recycle_buf(buf);
+            }
+            // commit transactions to let waiting read operations to continue
+            let mut committed_trx_list: FastHashMap<usize, Vec<CommittedTrx>> =
+                FastHashMap::default();
+            for trx in mem::take(&mut sync_group.trx_list) {
+                let trx = trx.commit();
+                if let Some(gc_no) = trx.gc_no() {
+                    // Only user transaction is involved in GC process.
+                    committed_trx_list.entry(gc_no).or_default().push(trx);
+                }
+            }
+            // Handoff committed transaction payloads to the purge coordinator
+            // before waking commit waiters. The purge receiver must stay alive
+            // until redo has joined during worker shutdown.
+            if !committed_trx_list.is_empty() {
+                self.trx_sys
+                    .redo_log
+                    .purge_tx
+                    .send(Purge::Committed(committed_trx_list))
+                    .expect("purge coordinator receiver must stay alive until log thread stopped");
+            }
+            sync_group.completion.complete(Ok(()));
+        }
+
+        self.trx_sys.redo_log.update_stats(
+            ready.trx_count,
+            ready.commit_count,
+            ready.log_bytes,
+            usize::from(ready.log_bytes > 0),
+            if ready.log_bytes > 0 {
+                sync_dur.as_nanos() as usize
+            } else {
+                0
+            },
+        );
+    }
+
+    #[inline]
+    fn drain_ready_group_prefix(&mut self) -> ReadyGroupPrefix {
+        let mut ready = ReadyGroupPrefix::default();
+
+        while let Some(front) = self.prefix.entries.front() {
+            let LogPrefixKind::Group { group } = &front.kind else {
+                break;
+            };
+            if !group.ready() {
+                break;
+            }
+            // Keep each durable publication batch on one physical redo file.
+            // Rotation normally inserts seal/header barriers, but this guard
+            // preserves the invariant even if adjacent ready groups differ.
+            if ready.failure_reason.is_none()
+                && group.failure_reason.is_none()
+                && group.log_bytes > 0
+            {
+                let group_fd = group
+                    .log_fd
+                    .expect("redo-bearing sync group must carry its log file fd");
+                if let Some(prefix_fd) = ready.log_fd {
+                    if prefix_fd != group_fd {
+                        break;
+                    }
+                } else {
+                    ready.log_fd = Some(group_fd);
+                }
             }
 
-            self.trx_sys.redo_log.update_stats(
-                trx_count,
-                commit_count,
-                log_bytes,
-                usize::from(log_bytes > 0),
-                if log_bytes > 0 {
-                    sync_dur.as_nanos() as usize
-                } else {
-                    0
-                },
-            );
+            let entry = self
+                .prefix
+                .pop_front()
+                .expect("front ready redo group entry must exist");
+            let LogPrefixKind::Group { group } = entry.kind else {
+                unreachable!("front group entry kind was checked")
+            };
+            if let Some(reason) = ready.failure_reason.or(group.failure_reason) {
+                ready.failure_reason = Some(reason);
+                // Failed groups and all later ready groups are removed from the
+                // prefix, but they are not counted as durable commits.
+                ready.failed.push(group);
+                continue;
+            }
+            ready.trx_count += group.trx_list.len();
+            ready.commit_count += 1;
+            ready.log_bytes += group.log_bytes;
+            ready.written.push(group);
         }
+
+        ready
     }
 
     /// Submit queued redo writes.
     ///
-    /// Boundary header writes are staged through the same async write driver as
-    /// group writes. Fetch stops at a log-file boundary, so groups after that
-    /// boundary are not collected until the header write has drained.
-    ///
-    /// Groups without redo bytes are already finished when they enter the
-    /// scheduler. This only admits them into `inflight`; callers must still run
-    /// `finalize_finished_prefix` after submit so those groups can unblock the
-    /// ordered prefix without a backend completion.
+    /// Header, group, and side seal writes share the same async write driver
+    /// capacity. Groups without redo bytes are ready as soon as they enter the
+    /// prefix and are published by `finalize_finished_prefix`.
     #[inline]
-    fn submit_io(&mut self, sealer: &mut RedoFileSealer) {
-        while let Some(submission) = self.header_writes.pop_front() {
+    fn submit_io(&mut self, sealer: &mut LogFileSealer) {
+        let mut idx = 0;
+        while idx < self.prefix.entries.len() {
             if self.write_driver.available_capacity() == 0 {
-                self.header_writes.push_front(submission);
                 break;
             }
-            if let Err(submission) = self.write_driver.push_write(submission) {
-                self.header_writes.push_front(submission);
-                break;
-            }
-            self.inflight_headers += 1;
-        }
-        while !self.sync_groups.is_empty() {
-            let mut sync_group = self
-                .sync_groups
-                .pop_front()
-                .expect("redo sync group queue length was checked");
-            let Some(submission) = sync_group.take_submission() else {
-                debug_assert!(sync_group.finished);
-                let res = self.inflight.insert(sync_group.max_cts, sync_group);
-                debug_assert!(res.is_none());
+            let entry_id = self.prefix.entries[idx].id;
+            let Some(mut submission) = self.take_prefix_submission(idx) else {
+                idx += 1;
                 continue;
             };
-            if self.write_driver.available_capacity() == 0 {
-                sync_group.write = Some(submission);
-                self.sync_groups.push_front(sync_group);
-                break;
-            }
+            let owner = self.ensure_submission_owner(&mut submission, entry_id);
             if let Err(submission) = self.write_driver.push_write(submission) {
-                sync_group.write = Some(submission);
-                self.sync_groups.push_front(sync_group);
+                self.restore_prefix_submission(idx, submission);
                 break;
             }
-            let res = self.inflight.insert(sync_group.max_cts, sync_group);
-            debug_assert!(res.is_none());
+            self.mark_prefix_submission_driver_owned(idx, owner);
+            idx += 1;
         }
         sealer.stage_ready(self.write_driver);
         self.write_driver.submit_ready();
     }
 
+    #[inline]
+    fn take_prefix_submission(&mut self, idx: usize) -> Option<LogWriteSubmission> {
+        let entry = self
+            .prefix
+            .entries
+            .get_mut(idx)
+            .expect("redo prefix index must be in range");
+        match &mut entry.kind {
+            LogPrefixKind::Header { write, .. } => write.take(),
+            LogPrefixKind::Group { group } => group.take_submission(),
+            LogPrefixKind::SealDispatch { .. } => None,
+        }
+    }
+
+    #[inline]
+    fn restore_prefix_submission(&mut self, idx: usize, submission: LogWriteSubmission) {
+        let entry = self
+            .prefix
+            .entries
+            .get_mut(idx)
+            .expect("redo prefix index must be in range");
+        match &mut entry.kind {
+            LogPrefixKind::Header { write, .. } => {
+                debug_assert!(write.is_none());
+                *write = Some(submission);
+            }
+            LogPrefixKind::Group { group } => group.restore_submission(submission),
+            LogPrefixKind::SealDispatch { .. } => {
+                unreachable!("seal dispatch entries do not own direct submissions")
+            }
+        }
+    }
+
+    #[inline]
+    fn ensure_submission_owner(
+        &mut self,
+        submission: &mut LogWriteSubmission,
+        entry_id: LogPrefixId,
+    ) -> LogRequestOwner {
+        if let Some(owner) = submission.owner() {
+            return owner;
+        }
+        let request_id = self.next_request_id();
+        let owner = match &submission.kind {
+            LogWriteKind::Header { .. } => LogRequestOwner::header(request_id, entry_id),
+            LogWriteKind::Group => LogRequestOwner::group(request_id, entry_id, 0),
+            LogWriteKind::Seal { .. } => {
+                unreachable!("side seal submissions receive owners in the sealer")
+            }
+        };
+        submission.attach_owner(owner);
+        owner
+    }
+
+    #[inline]
+    fn mark_prefix_submission_driver_owned(&mut self, idx: usize, owner: LogRequestOwner) {
+        let entry = self
+            .prefix
+            .entries
+            .get_mut(idx)
+            .expect("redo prefix index must be in range");
+        match &mut entry.kind {
+            LogPrefixKind::Header { .. } => {
+                debug_assert_eq!(owner.kind, LogRequestKind::Header);
+            }
+            LogPrefixKind::Group { group } => {
+                debug_assert_eq!(owner.kind, LogRequestKind::Group);
+                group.mark_request_submitted();
+            }
+            LogPrefixKind::SealDispatch { .. } => {
+                unreachable!("seal dispatch entries do not own direct submissions")
+            }
+        }
+    }
+
     /// Wait for one submitted redo write, if any, and mark its sync group finished.
     #[inline]
-    fn wait_one_io_if_submitted(&mut self, sealer: &mut RedoFileSealer) {
+    fn wait_one_io_if_submitted(&mut self, sealer: &mut LogFileSealer) {
         if self.write_driver.submitted_len() == 0 {
             return;
         }
-        let completion = self.write_driver.wait_one();
-        match completion {
-            LogWriteCompletion::Header {
-                completion,
-                buf,
-                poison,
-            } => {
-                self.inflight_headers = self
-                    .inflight_headers
-                    .checked_sub(1)
-                    .expect("redo header completion must match inflight header count");
+        let LogWriteCompletion {
+            owner,
+            kind,
+            buf,
+            poison,
+        } = self.write_driver.wait_one();
+        match kind {
+            LogWriteKind::Header { completion } => {
                 drop(buf);
-                if let Some(source) = poison {
-                    completion.complete(Err(CompletionErrorKind::report_fatal(
-                        source,
-                        "redo header write failed",
-                    )));
-                    let err = self.trx_sys.poison_storage(source);
-                    self.fail_pending(sealer, err);
-                } else {
-                    completion.complete(Ok(()));
-                }
-            }
-            LogWriteCompletion::Group { cts, buf, poison } => {
-                if let Some(source) = poison {
-                    let mut failed_group = self
-                        .inflight
-                        .remove(&cts)
-                        .expect("redo completion must match one inflight sync group");
-                    failed_group.finish_write(buf);
-                    let err = self.trx_sys.poison_storage(source);
-                    let reason = FailedPrecommitReason::Fatal(*err.current_context());
-                    self.fail_sync_group(&mut failed_group, reason);
-                    self.fail_pending(sealer, err);
+                let Some(owner) = owner else {
+                    if let Some(source) = poison {
+                        completion.complete(Err(CompletionErrorKind::report_fatal(
+                            source,
+                            "redo header write failed",
+                        )));
+                    } else {
+                        completion.complete(Ok(()));
+                    }
                     return;
-                }
-                let sync_group = self
-                    .inflight
-                    .get_mut(&cts)
-                    .expect("redo completion must match one inflight sync group");
-                sync_group.finish_write(buf);
-            }
-            LogWriteCompletion::Seal {
-                log_file,
-                buf,
-                poison,
-            } => {
-                drop(buf);
-                if let Some(err) = sealer.handle_completion(self.trx_sys, log_file, poison) {
+                };
+                debug_assert_eq!(owner.kind, LogRequestKind::Header);
+                let entry_id = owner
+                    .entry_id
+                    .expect("redo header request must carry a prefix entry id");
+                self.complete_header_request(entry_id, poison);
+                if let Some(source) = poison {
+                    let err = self.trx_sys.poison_storage(source);
                     self.fail_pending(sealer, err);
                 }
             }
+            LogWriteKind::Group => {
+                let owner = owner.expect("redo group completion must carry request owner");
+                debug_assert_eq!(owner.kind, LogRequestKind::Group);
+                let entry_id = owner
+                    .entry_id
+                    .expect("redo group request must carry a prefix entry id");
+                self.complete_group_request(entry_id, owner.group_write_idx, buf, poison);
+                if let Some(source) = poison {
+                    let err = self.trx_sys.poison_storage(source);
+                    self.fail_pending(sealer, err);
+                }
+            }
+            LogWriteKind::Seal { log_file } => {
+                drop(buf);
+                let owner = owner.expect("redo seal completion must carry request owner");
+                debug_assert_eq!(owner.kind, LogRequestKind::Seal);
+                if let Some(err) =
+                    sealer.handle_completion(self.trx_sys, owner.request_id, log_file, poison)
+                {
+                    self.fail_pending(sealer, err);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn complete_header_request(&mut self, entry_id: LogPrefixId, poison: Option<FatalError>) {
+        let entry = self
+            .prefix
+            .entry_mut(entry_id)
+            .expect("redo header completion must match one prefix entry");
+        let LogPrefixKind::Header { ready, failure, .. } = &mut entry.kind else {
+            panic!("redo header completion matched non-header prefix entry");
+        };
+        if failure.is_none() {
+            *failure = poison;
+        }
+        *ready = true;
+    }
+
+    #[inline]
+    fn complete_group_request(
+        &mut self,
+        entry_id: LogPrefixId,
+        group_write_idx: Option<usize>,
+        buf: DirectBuf,
+        poison: Option<FatalError>,
+    ) {
+        let entry = self
+            .prefix
+            .entry_mut(entry_id)
+            .expect("redo group completion must match one prefix entry");
+        let LogPrefixKind::Group { group } = &mut entry.kind else {
+            panic!("redo group completion matched non-group prefix entry");
+        };
+        debug_assert_eq!(group_write_idx, Some(0));
+        group.finish_request(buf);
+        if let Some(source) = poison {
+            group
+                .failure_reason
+                .get_or_insert(FailedPrecommitReason::Fatal(source));
         }
     }
 }
@@ -1593,70 +1618,6 @@ pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
         )
     })?;
     Ok(file_seq)
-}
-
-#[inline]
-fn build_sealed_header_write(
-    target: RedoFileSealTarget,
-    accumulator: RedoFileSealAccumulator,
-) -> StdResult<(RawFd, usize, DirectBuf), FatalError> {
-    let slot_no = inactive_slot_no(target.open_super_block.slot_no);
-    let sealed = RedoSuperBlock::sealed_from_open(
-        &target.open_super_block,
-        slot_no,
-        accumulator.durable_end_offset,
-        accumulator.redo_range(),
-    )
-    .map_err(|_| FatalError::RedoWrite)?;
-    let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
-    serialize_redo_super_block(buf.as_bytes_mut(), &sealed).map_err(|_| FatalError::RedoWrite)?;
-    Ok((target.fd, slot_offset(slot_no), buf))
-}
-
-#[inline]
-fn sync_sealed_header(log_sync: LogSync, fd: RawFd) -> StdResult<(), FatalError> {
-    let syncer = FileSyncer::from_borrowed_fd(fd);
-    match log_sync {
-        LogSync::Fsync => syncer.fsync().map_err(|_| FatalError::RedoSync),
-        LogSync::Fdatasync => syncer.fdatasync().map_err(|_| FatalError::RedoSync),
-        LogSync::None => Ok(()),
-    }
-}
-
-#[inline]
-fn shrink_inflight(
-    tree: &mut BTreeMap<TrxID, SyncGroup>,
-    buffer: &mut Vec<SyncGroup>,
-    failed_buffer: &mut Vec<SyncGroup>,
-) -> (usize, usize, usize, Option<FailedPrecommitReason>) {
-    let mut trx_count = 0;
-    let mut commit_count = 0;
-    let mut log_bytes = 0;
-    let mut failure_reason = None;
-    while let Some(entry) = tree.first_entry() {
-        let task = entry.get();
-        if !task.finished {
-            break; // stop at the transaction which is not persisted.
-        }
-        if let Some(reason) = failure_reason.or(task.failure_reason) {
-            // Redo records are sequential. The first failed group ends the
-            // durable prefix, so every finished group after it is cleanup-only
-            // even if its individual write completed successfully.
-            failure_reason = Some(reason);
-            failed_buffer.push(entry.remove());
-            continue;
-        }
-        trx_count += task.trx_list.len();
-        commit_count += 1;
-        log_bytes += task.log_bytes;
-        buffer.push(entry.remove());
-    }
-    (trx_count, commit_count, log_bytes, failure_reason)
-}
-
-#[inline]
-fn inactive_slot_no(slot_no: u32) -> u32 {
-    if slot_no == 0 { 1 } else { 0 }
 }
 
 #[inline]
@@ -1819,6 +1780,7 @@ mod tests {
     };
     use crate::log::format::{
         REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, parse_redo_super_block,
+        slot_offset,
     };
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind};
     use crate::recovery::redo_stream::{ReadLog, RedoLogSegment, RedoLogStream};
@@ -1907,13 +1869,10 @@ mod tests {
     ) -> PathBuf {
         let log_file = create_log_file_for_test(file_prefix, file_seq, 128 * 1024, 4096);
         let open = log_file.super_block();
-        let sealed = RedoSuperBlock::sealed_from_open(
-            &open,
-            inactive_slot_no(open.slot_no),
-            durable_end_offset,
-            redo_range,
-        )
-        .unwrap();
+        let slot_no = if open.slot_no == 0 { 1 } else { 0 };
+        let sealed =
+            RedoSuperBlock::sealed_from_open(&open, slot_no, durable_end_offset, redo_range)
+                .unwrap();
         let mut buf = vec![0; REDO_SUPER_BLOCK_SLOT_SIZE];
         serialize_redo_super_block(&mut buf, &sealed).unwrap();
         let path = PathBuf::from(log_file_name(file_prefix, file_seq));
@@ -1943,18 +1902,21 @@ mod tests {
         let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
         assert!(write_driver.push_write(header_write).is_ok());
         assert_eq!(write_driver.submit_ready(), 1);
-        match write_driver.wait_one() {
-            LogWriteCompletion::Header {
-                completion,
-                buf,
-                poison,
-            } => {
+        let LogWriteCompletion {
+            owner,
+            kind,
+            buf,
+            poison,
+        } = write_driver.wait_one();
+        match kind {
+            LogWriteKind::Header { completion } => {
                 drop(buf);
+                assert!(owner.is_none());
                 assert_eq!(poison, None);
                 completion.complete(Ok(()));
             }
-            LogWriteCompletion::Group { .. } => panic!("expected redo header write completion"),
-            LogWriteCompletion::Seal { .. } => panic!("expected redo header write completion"),
+            LogWriteKind::Group => panic!("expected redo header write completion"),
+            LogWriteKind::Seal { .. } => panic!("expected redo header write completion"),
         }
         assert!(header_completion.completed_result().unwrap().is_ok());
     }
@@ -2230,7 +2192,7 @@ mod tests {
     }
 
     fn record_seal_group(
-        sealer: &mut RedoFileSealer,
+        sealer: &mut LogFileSealer,
         log_file: &RedoLogFile,
         min_redo_cts: TrxID,
         max_redo_cts: TrxID,
@@ -2686,13 +2648,13 @@ mod tests {
         });
     }
 
-    fn sync_group_for_order_test(cts: TrxID, finished: bool, log_bytes: usize) -> SyncGroup {
-        sync_group_for_order_test_with_log_fd(cts, finished, log_bytes, None)
+    fn sync_group_for_order_test(cts: TrxID, ready: bool, log_bytes: usize) -> SyncGroup {
+        sync_group_for_order_test_with_log_fd(cts, ready, log_bytes, (log_bytes > 0).then_some(0))
     }
 
     fn sync_group_for_order_test_with_log_fd(
         cts: TrxID,
-        finished: bool,
+        ready: bool,
         log_bytes: usize,
         log_fd: Option<RawFd>,
     ) -> SyncGroup {
@@ -2720,68 +2682,111 @@ mod tests {
                     max_redo_cts: cts,
                 }),
             write: None,
-            returned_buf: None,
+            returned_bufs: Vec::new(),
             completion: Arc::new(Completion::new()),
-            finished,
+            outstanding_requests: usize::from(!ready),
             failure_reason: None,
         }
     }
 
     #[test]
-    fn test_shrink_inflight_preserves_order_with_no_log_groups() {
-        let mut inflight = BTreeMap::new();
-        let mut written = Vec::new();
-        let mut failed_written = Vec::new();
+    fn test_prefix_tracker_preserves_order_with_no_log_groups() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("prefix_order_no_log", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_order_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut writer =
+                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
 
-        inflight.insert(
-            TrxID::new(10),
-            sync_group_for_order_test(TrxID::new(10), false, 4096),
-        );
-        inflight.insert(
-            TrxID::new(11),
-            sync_group_for_order_test(TrxID::new(11), true, 0),
-        );
-        assert_eq!(
-            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
-            (0, 0, 0, None)
-        );
-        assert!(written.is_empty());
-        assert!(failed_written.is_empty());
-        assert_eq!(inflight.len(), 2);
+            writer
+                .prefix
+                .push_group(sync_group_for_order_test(TrxID::new(10), false, 4096));
+            writer
+                .prefix
+                .push_group(sync_group_for_order_test(TrxID::new(11), true, 0));
+            let ready = writer.drain_ready_group_prefix();
+            assert_eq!(ready.trx_count, 0);
+            assert_eq!(ready.commit_count, 0);
+            assert_eq!(ready.log_bytes, 0);
+            assert_eq!(ready.failure_reason, None);
+            assert!(ready.written.is_empty());
+            assert!(ready.failed.is_empty());
+            assert_eq!(writer.prefix.len(), 2);
 
-        inflight.get_mut(&TrxID::new(10)).unwrap().finished = true;
-        assert_eq!(
-            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
-            (2, 2, 4096, None)
-        );
-        assert_eq!(written.len(), 2);
-        assert_eq!(written[0].max_cts, TrxID::new(10));
-        assert_eq!(written[1].max_cts, TrxID::new(11));
-        assert!(failed_written.is_empty());
+            let LogPrefixKind::Group { group } =
+                &mut writer.prefix.entries.front_mut().unwrap().kind
+            else {
+                panic!("expected front group")
+            };
+            group.outstanding_requests = 0;
+
+            let ready = writer.drain_ready_group_prefix();
+            assert_eq!(ready.trx_count, 2);
+            assert_eq!(ready.commit_count, 2);
+            assert_eq!(ready.log_bytes, 4096);
+            assert_eq!(ready.failure_reason, None);
+            assert_eq!(ready.written.len(), 2);
+            assert_eq!(ready.written[0].max_cts, TrxID::new(10));
+            assert_eq!(ready.written[1].max_cts, TrxID::new(11));
+            assert!(ready.failed.is_empty());
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
     }
 
     #[test]
-    fn test_shrink_inflight_releases_no_log_prefix_without_later_log() {
-        let mut inflight = BTreeMap::new();
-        let mut written = Vec::new();
-        let mut failed_written = Vec::new();
+    fn test_prefix_tracker_releases_no_log_prefix_without_later_log() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("prefix_no_log_before_unfinished", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_no_log_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut writer =
+                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
 
-        inflight.insert(
-            TrxID::new(20),
-            sync_group_for_order_test(TrxID::new(20), true, 0),
-        );
-        inflight.insert(
-            TrxID::new(21),
-            sync_group_for_order_test(TrxID::new(21), false, 4096),
-        );
-        assert_eq!(
-            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
-            (1, 1, 0, None)
-        );
-        assert_eq!(written.len(), 1);
-        assert_eq!(written[0].max_cts, TrxID::new(20));
-        assert!(failed_written.is_empty());
-        assert!(inflight.contains_key(&TrxID::new(21)));
+            writer
+                .prefix
+                .push_group(sync_group_for_order_test(TrxID::new(20), true, 0));
+            writer
+                .prefix
+                .push_group(sync_group_for_order_test(TrxID::new(21), false, 4096));
+            let ready = writer.drain_ready_group_prefix();
+            assert_eq!(ready.trx_count, 1);
+            assert_eq!(ready.commit_count, 1);
+            assert_eq!(ready.log_bytes, 0);
+            assert_eq!(ready.failure_reason, None);
+            assert_eq!(ready.written.len(), 1);
+            assert_eq!(ready.written[0].max_cts, TrxID::new(20));
+            assert!(ready.failed.is_empty());
+            assert_eq!(writer.prefix.len(), 1);
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
     }
 
     #[test]
@@ -2802,7 +2807,7 @@ mod tests {
                 .log_sync(LogSync::None);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             let cts = TrxID::new(50);
 
             {
@@ -2811,13 +2816,12 @@ mod tests {
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
-                fp.inflight
-                    .insert(cts, sync_group_for_order_test(cts, true, 0));
+                fp.prefix
+                    .push_group(sync_group_for_order_test(cts, true, 0));
 
                 fp.finish_pending_io_and_header_write(&mut sealer);
 
-                assert!(fp.inflight.is_empty());
-                assert!(fp.sync_groups.is_empty());
+                assert!(fp.prefix.is_empty());
                 assert_eq!(fp.write_driver.pending_len(), 0);
                 assert_eq!(fp.write_driver.submitted_len(), 0);
             }
@@ -2836,7 +2840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_file_boundary_header_write_drains_before_following_group_submit() {
+    fn test_log_file_boundary_header_request_precedes_following_group_request() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("header_and_group_submit", LogSync::None).await;
@@ -2898,30 +2902,16 @@ mod tests {
             let hook = RecordingRedoWriteSubmitHook::default();
             let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(2).unwrap());
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
-                assert!(fp.fetch_io_reqs(&sealer).is_none());
+                fp.fetch_io_reqs(&sealer);
                 fp.submit_io(&mut sealer);
 
-                assert_eq!(
-                    hook.submits(),
-                    vec![StorageBackendOp::new(IOKind::Write, log_fd, 0)]
-                );
-                assert_eq!(fp.inflight_headers, 1);
-                assert!(fp.inflight.is_empty());
-
-                fp.finish_pending_io_and_header_write(&mut sealer);
-                assert!(fp.inflight.is_empty());
-                assert!(fp.sync_groups.is_empty());
-                assert_eq!(fp.write_driver.pending_len(), 0);
-
-                assert!(fp.fetch_io_reqs(&sealer).is_none());
-                fp.submit_io(&mut sealer);
                 assert_eq!(
                     hook.submits(),
                     vec![
@@ -2929,8 +2919,12 @@ mod tests {
                         StorageBackendOp::new(IOKind::Write, log_fd, group_offset),
                     ]
                 );
-                assert_eq!(fp.inflight.len(), 1);
+                assert_eq!(fp.next_request_id, 2);
+                assert_eq!(fp.prefix.driver_owned_len(), 2);
+
                 fp.finish_pending_io_and_header_write(&mut sealer);
+                assert!(fp.prefix.is_empty());
+                assert_eq!(fp.write_driver.pending_len(), 0);
             }
 
             assert_eq!(
@@ -2976,33 +2970,29 @@ mod tests {
                 .log_sync(LogSync::Fsync);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             let cts = TrxID::new(60);
 
-            let ended_log_file = {
+            {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
-                fp.inflight.insert(
+                fp.prefix.push_group(sync_group_for_order_test_with_log_fd(
                     cts,
-                    sync_group_for_order_test_with_log_fd(cts, true, 4096, Some(ended_fd)),
-                );
-
-                let ended_log_file = fp
-                    .process_single_file(&mut sealer)
-                    .expect("queued rotation should yield ended log file");
-                assert_eq!(ended_log_file.as_raw_fd(), ended_fd);
+                    true,
+                    4096,
+                    Some(ended_fd),
+                ));
+                fp.fetch_io_reqs(&sealer);
 
                 fp.finish_pending_io_and_header_write(&mut sealer);
 
-                assert!(fp.inflight.is_empty());
-                assert!(fp.sync_groups.is_empty());
+                assert!(fp.prefix.is_empty());
                 assert_eq!(fp.write_driver.pending_len(), 0);
                 assert_eq!(fp.write_driver.submitted_len(), 0);
-                ended_log_file
-            };
+            }
 
             assert_eq!(
                 harness
@@ -3018,7 +3008,6 @@ mod tests {
             assert_eq!(calls[0].fd(), ended_fd);
             assert_ne!(calls[0].fd(), current_fd);
 
-            drop(ended_log_file);
             drop(harness);
             engine.shutdown().unwrap();
         });
@@ -3049,9 +3038,11 @@ mod tests {
                 .log_sync(LogSync::None);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
 
-            sealer.enqueue_rotated_file(ended_log_file).unwrap();
+            sealer
+                .enqueue_rotated_file(ended_log_file, LogRequestId::new(100))
+                .unwrap();
             assert!(sealer.has_pending());
 
             {
@@ -3060,7 +3051,7 @@ mod tests {
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
-                assert!(writer.fetch_io_reqs(&sealer).is_none());
+                writer.fetch_io_reqs(&sealer);
                 writer.finish_pending_io_and_header_write(&mut sealer);
 
                 assert!(!writer.has_pending_io());
@@ -3109,7 +3100,7 @@ mod tests {
                 manual_redo_log_writer_for_seal(&engine, log_sync, harness_prefix);
             let end_offset = REDO_DEFAULT_DATA_START_OFFSET + 4096;
 
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             record_seal_group(
                 &mut sealer,
                 &ended_log_file,
@@ -3117,7 +3108,9 @@ mod tests {
                 TrxID::new(72),
                 end_offset,
             );
-            sealer.enqueue_rotated_file(ended_log_file).unwrap();
+            sealer
+                .enqueue_rotated_file(ended_log_file, LogRequestId::new(101))
+                .unwrap();
             assert!(sealer.has_pending());
             assert!(
                 sealer
@@ -3202,8 +3195,10 @@ mod tests {
             let (harness, mut write_driver) =
                 manual_redo_log_writer_for_seal(&engine, LogSync::None, harness_prefix);
 
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
-            sealer.enqueue_rotated_file(ended_log_file).unwrap();
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+            sealer
+                .enqueue_rotated_file(ended_log_file, LogRequestId::new(102))
+                .unwrap();
             assert!(
                 sealer
                     .finish_pending(&harness.trx_sys, &mut write_driver)
@@ -3252,8 +3247,10 @@ mod tests {
             let (harness, mut write_driver) =
                 manual_redo_log_writer_for_seal(&engine, LogSync::Fsync, harness_prefix);
 
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
-            sealer.enqueue_rotated_file(ended_log_file).unwrap();
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+            sealer
+                .enqueue_rotated_file(ended_log_file, LogRequestId::new(103))
+                .unwrap();
             assert!(
                 sealer
                     .finish_pending(&harness.trx_sys, &mut write_driver)
@@ -3302,7 +3299,7 @@ mod tests {
             hook.release();
             let _install = install_storage_backend_test_hook(Arc::new(hook));
 
-            let mut sealer = RedoFileSealer::new(&harness.trx_sys.config);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             sealer.seal_active_file_best_effort(&harness.trx_sys, &mut write_driver);
 
             assert!(harness.trx_sys.storage_poison_error().is_none());
@@ -3354,63 +3351,96 @@ mod tests {
     }
 
     #[test]
-    fn test_shrink_inflight_stops_at_failed_redo_boundary() {
-        let mut inflight = BTreeMap::new();
-        let mut written = Vec::new();
-        let mut failed_written = Vec::new();
-        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+    fn test_prefix_tracker_stops_at_failed_redo_boundary() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("prefix_failed_boundary", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_failed_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut writer =
+                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
+            let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+            let mut failed = sync_group_for_order_test(TrxID::new(31), true, 2048);
+            failed.failure_reason = Some(reason);
 
-        inflight.insert(
-            TrxID::new(30),
-            sync_group_for_order_test(TrxID::new(30), true, 1024),
-        );
-        inflight.insert(
-            TrxID::new(31),
-            sync_group_for_order_test(TrxID::new(31), true, 2048),
-        );
-        inflight.insert(
-            TrxID::new(32),
-            sync_group_for_order_test(TrxID::new(32), true, 4096),
-        );
-        inflight.get_mut(&TrxID::new(31)).unwrap().failure_reason = Some(reason);
+            writer
+                .prefix
+                .push_group(sync_group_for_order_test(TrxID::new(30), true, 1024));
+            writer.prefix.push_group(failed);
+            writer
+                .prefix
+                .push_group(sync_group_for_order_test(TrxID::new(32), true, 4096));
 
-        assert_eq!(
-            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
-            (1, 1, 1024, Some(reason))
-        );
-        assert!(inflight.is_empty());
-        assert_eq!(written.len(), 1);
-        assert_eq!(written[0].max_cts, TrxID::new(30));
-        assert_eq!(failed_written.len(), 2);
-        assert_eq!(failed_written[0].max_cts, TrxID::new(31));
-        assert_eq!(failed_written[1].max_cts, TrxID::new(32));
+            let ready = writer.drain_ready_group_prefix();
+            assert_eq!(ready.trx_count, 1);
+            assert_eq!(ready.commit_count, 1);
+            assert_eq!(ready.log_bytes, 1024);
+            assert_eq!(ready.failure_reason, Some(reason));
+            assert!(writer.prefix.is_empty());
+            assert_eq!(ready.written.len(), 1);
+            assert_eq!(ready.written[0].max_cts, TrxID::new(30));
+            assert_eq!(ready.failed.len(), 2);
+            assert_eq!(ready.failed[0].max_cts, TrxID::new(31));
+            assert_eq!(ready.failed[1].max_cts, TrxID::new(32));
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
     }
 
     #[test]
-    fn test_shrink_inflight_keeps_unfinished_groups_after_failed_boundary() {
-        let mut inflight = BTreeMap::new();
-        let mut written = Vec::new();
-        let mut failed_written = Vec::new();
-        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+    fn test_prefix_tracker_keeps_unfinished_groups_after_failed_boundary() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("prefix_failed_keeps_unfinished", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_failed_unfinished_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut writer =
+                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
+            let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+            let mut failed = sync_group_for_order_test(TrxID::new(40), true, 1024);
+            failed.failure_reason = Some(reason);
 
-        inflight.insert(
-            TrxID::new(40),
-            sync_group_for_order_test(TrxID::new(40), true, 1024),
-        );
-        inflight.insert(
-            TrxID::new(41),
-            sync_group_for_order_test(TrxID::new(41), false, 2048),
-        );
-        inflight.get_mut(&TrxID::new(40)).unwrap().failure_reason = Some(reason);
+            writer.prefix.push_group(failed);
+            writer
+                .prefix
+                .push_group(sync_group_for_order_test(TrxID::new(41), false, 2048));
 
-        assert_eq!(
-            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
-            (0, 0, 0, Some(reason))
-        );
-        assert!(written.is_empty());
-        assert_eq!(failed_written.len(), 1);
-        assert_eq!(failed_written[0].max_cts, TrxID::new(40));
-        assert!(inflight.contains_key(&TrxID::new(41)));
+            let ready = writer.drain_ready_group_prefix();
+            assert_eq!(ready.trx_count, 0);
+            assert_eq!(ready.commit_count, 0);
+            assert_eq!(ready.log_bytes, 0);
+            assert_eq!(ready.failure_reason, Some(reason));
+            assert!(ready.written.is_empty());
+            assert_eq!(ready.failed.len(), 1);
+            assert_eq!(ready.failed[0].max_cts, TrxID::new(40));
+            assert_eq!(writer.prefix.len(), 1);
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
     }
 
     #[test]
@@ -3705,7 +3735,6 @@ mod tests {
         assert!(
             write_driver
                 .push_write(LogWriteSubmission::new(
-                    cts,
                     old_log_file.as_raw_fd(),
                     group_offset,
                     direct_buf,
@@ -3713,18 +3742,20 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(write_driver.submit_ready(), 1);
-        match write_driver.wait_one() {
-            LogWriteCompletion::Group {
-                cts: completed_cts,
-                buf,
-                poison,
-            } => {
+        let LogWriteCompletion {
+            owner,
+            kind,
+            buf,
+            poison,
+        } = write_driver.wait_one();
+        match kind {
+            LogWriteKind::Group => {
                 drop(buf);
-                assert_eq!(completed_cts, cts);
+                assert!(owner.is_none());
                 assert_eq!(poison, None);
             }
-            LogWriteCompletion::Header { .. } => panic!("expected redo group write completion"),
-            LogWriteCompletion::Seal { .. } => panic!("expected redo group write completion"),
+            LogWriteKind::Header { .. } => panic!("expected redo group write completion"),
+            LogWriteKind::Seal { .. } => panic!("expected redo group write completion"),
         }
         drop(old_log_file);
 

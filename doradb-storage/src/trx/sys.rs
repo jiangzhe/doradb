@@ -9,7 +9,7 @@ use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionID, TrxID};
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
-use crate::log::{LogWriteDriver, RedoFileSealer, RedoLog, RedoLogWriter, parse_file_seq};
+use crate::log::{LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter, parse_file_seq};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::redo_stream::MmapLogReader;
 use crate::session::{SessionState, TrxAttachment};
@@ -936,32 +936,16 @@ impl TransactionSystem {
     pub(crate) fn log_loop(&self) {
         let redo_log = &*self.redo_log;
         let mut write_driver = redo_log.take_log_write_driver();
-        let mut sealer = RedoFileSealer::new(&self.config);
-        loop {
-            let shutdown = {
-                let mut writer = self.redo_log_writer(&self.config, &mut write_driver);
-                if let Some(ended_log_file) = writer.process_single_file(&mut sealer) {
-                    // Finished groups carry borrowed raw fds for sync. Keep the
-                    // switched-out file alive until every old-file group is
-                    // finalized.
-                    writer.finish_pending_io_and_header_write(&mut sealer);
-
-                    debug_assert!(!writer.has_pending_io());
-
-                    if let Err(reason) = sealer.enqueue_rotated_file(ended_log_file) {
-                        let err = self.poison_storage(reason);
-                        writer.fail_pending(&mut sealer, err);
-                    }
-                }
-                writer.shutdown()
-            };
-            if shutdown {
-                let _ = sealer.finish_pending(self, &mut write_driver);
-                if self.storage_poison_error().is_none() {
-                    sealer.seal_active_file_best_effort(self, &mut write_driver);
-                }
-                return;
-            }
+        let mut sealer = LogFileSealer::new(&self.config);
+        {
+            let mut writer = self.redo_log_writer(&self.config, &mut write_driver);
+            writer.process_until_shutdown(&mut sealer);
+            debug_assert!(writer.shutdown());
+            debug_assert!(!writer.has_pending_io());
+        }
+        let _ = sealer.finish_pending(self, &mut write_driver);
+        if self.storage_poison_error().is_none() {
+            sealer.seal_active_file_best_effort(self, &mut write_driver);
         }
     }
 
