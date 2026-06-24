@@ -238,7 +238,7 @@ impl LogFileSealer {
                         first_err = Some(err);
                     }
                 }
-                LogWriteKind::Header { .. } | LogWriteKind::Group => {
+                LogWriteKind::Header { .. } | LogWriteKind::Group { .. } => {
                     unreachable!("redo file sealer must only drain seal completions");
                 }
             }

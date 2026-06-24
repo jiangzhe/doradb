@@ -1,5 +1,5 @@
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::log::buf::TrxLog;
+use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::trx::PreparedTrx;
 use std::mem;

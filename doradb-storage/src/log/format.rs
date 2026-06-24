@@ -4,15 +4,15 @@ use crate::file::block_integrity::{
     write_block_checksum, write_block_header,
 };
 use crate::id::TrxID;
-use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
+use crate::io::STORAGE_SECTOR_SIZE;
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 
 /// Magic bytes stored in every redo file super-block header.
 pub(crate) const REDO_FILE_MAGIC: [u8; 8] = *b"DREDO\0\0\0";
-/// Redo file format version for checksum-protected group framing.
-pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 2;
+/// Redo file format version for fixed-block redo data framing.
+pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 3;
 /// Shared block-integrity envelope used by redo super-block slots.
 pub(crate) const REDO_SUPER_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(REDO_FILE_MAGIC, REDO_FILE_FORMAT_VERSION);
@@ -23,158 +23,126 @@ pub(crate) const REDO_SUPER_BLOCK_SLOT_SIZE: usize = STORAGE_SECTOR_SIZE;
 /// Offset where redo groups begin after the redundant super-block slots.
 pub(crate) const REDO_DEFAULT_DATA_START_OFFSET: usize =
     REDO_SUPER_BLOCK_SLOT_COUNT * REDO_SUPER_BLOCK_SLOT_SIZE;
-/// Serialized size of a redo group header.
-pub(crate) const REDO_GROUP_HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u64>() * 3;
+/// Serialized size of the common header at the front of every redo data block.
+pub(crate) const REDO_BLOCK_COMMON_HEADER_SIZE: usize =
+    mem::size_of::<u32>() + mem::size_of::<u8>() + mem::size_of::<u16>() + mem::size_of::<u32>();
+/// Serialized size of metadata present only on group-start redo data blocks.
+pub(crate) const REDO_GROUP_START_EXTENSION_SIZE: usize =
+    mem::size_of::<u64>() + mem::size_of::<u32>() + mem::size_of::<u64>() * 2;
 /// Serialized size of redo metadata inside a super-block integrity envelope.
 pub(crate) const REDO_SUPER_BLOCK_PAYLOAD_SIZE: usize =
     mem::size_of::<u32>() * 2 + mem::size_of::<u64>() * 6;
 
-/// Fixed prefix for one redo group.
-///
-/// The checksum covers every byte after the checksum field, including the
-/// remaining header fields, the logical group body, and any sector padding.
-/// `min_cts..=max_cts` is an integrity envelope for transaction records in
-/// the body; replay rejects records outside that inclusive range.
-///
-/// On disk:
-///
-/// ```text
-/// | Bytes  | Field    | Type | Encoding      |
-/// |--------|----------|------|---------------|
-/// | 0..4   | checksum | u32  | little-endian |
-/// | 4..12  | body_len | u64  | little-endian |
-/// | 12..20 | min_cts  | u64  | little-endian |
-/// | 20..28 | max_cts  | u64  | little-endian |
-/// ```
+/// Flag stored on the first block of every logical redo group.
+pub(crate) const REDO_BLOCK_GROUP_START: u8 = 0b0000_0001;
+/// Flag stored on the final block of every logical redo group.
+pub(crate) const REDO_BLOCK_GROUP_END: u8 = 0b0000_0010;
+const REDO_BLOCK_VALID_FLAGS: u8 = REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END;
+
+/// Common fixed header stored at the front of every redo data block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RedoGroupHeader {
-    /// CRC32 of the physical group bytes excluding this field.
+pub(crate) struct RedoBlockHeader {
+    /// CRC32 of this complete fixed-size block excluding this field.
     pub(crate) checksum: u32,
-    /// Logical body length in bytes, excluding this header and sector padding.
-    pub(crate) body_len: u64,
-    /// Lowest commit timestamp allowed in the group body.
-    pub(crate) min_cts: TrxID,
-    /// Highest commit timestamp allowed in the group body.
-    pub(crate) max_cts: TrxID,
+    /// Block role flags.
+    pub(crate) flags: u8,
+    /// Number of logical payload bytes stored in this block.
+    pub(crate) payload_len: u16,
+    /// Zero-based index of this block within its logical group.
+    pub(crate) group_block_idx: u32,
 }
 
-impl RedoGroupHeader {
-    /// Serialized byte size of the group header.
-    pub(crate) const SIZE: usize = REDO_GROUP_HEADER_SIZE;
+impl RedoBlockHeader {
+    /// Serialized byte size of the common block header.
+    pub(crate) const SIZE: usize = REDO_BLOCK_COMMON_HEADER_SIZE;
 
-    /// Build a header before checksum patching.
+    /// Build a block header before checksum patching.
     #[inline]
-    pub(crate) fn new(body_len: usize, min_cts: TrxID, max_cts: TrxID) -> Self {
-        RedoGroupHeader {
-            checksum: 0,
-            body_len: body_len as u64,
-            min_cts,
-            max_cts,
-        }
-    }
-
-    /// Convert the encoded body length to the host size type.
-    #[inline]
-    pub(crate) fn body_len_usize(self) -> Result<usize> {
-        usize::try_from(self.body_len).map_err(|_| {
+    pub(crate) fn new(flags: u8, payload_len: usize, group_block_idx: usize) -> Result<Self> {
+        let payload_len = u16::try_from(payload_len).map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "block=redo-group, body_len_exceeds_usize={}",
-                    self.body_len
-                ))
-                .into()
+                .attach(format!("block=redo-data, payload_len={payload_len}"))
+        })?;
+        let group_block_idx = u32::try_from(group_block_idx).map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=redo-data, group_block_idx={group_block_idx}"
+            ))
+        })?;
+        Ok(Self {
+            checksum: 0,
+            flags,
+            payload_len,
+            group_block_idx,
         })
     }
 
-    /// Returns true for the all-zero header used as the redo file EOF marker.
+    /// Returns true when this is the first block of a logical group.
     #[inline]
-    pub(crate) fn is_zero_eof(self) -> bool {
-        self.checksum == 0
-            && self.body_len == 0
-            && self.min_cts.as_u64() == 0
-            && self.max_cts.as_u64() == 0
+    pub(crate) fn is_group_start(self) -> bool {
+        self.flags & REDO_BLOCK_GROUP_START != 0
     }
 
-    /// Validate logical header fields after the zero EOF marker is handled.
+    /// Returns true when this is the final block of a logical group.
     #[inline]
-    pub(crate) fn validate(self) -> Result<()> {
-        if self.body_len == 0 {
+    pub(crate) fn is_group_end(self) -> bool {
+        self.flags & REDO_BLOCK_GROUP_END != 0
+    }
+
+    /// Return the encoded payload length as `usize`.
+    #[inline]
+    pub(crate) fn payload_len_usize(self) -> usize {
+        usize::from(self.payload_len)
+    }
+
+    /// Validate common header invariants for a fixed-size block.
+    #[inline]
+    pub(crate) fn validate(self, log_block_size: usize) -> Result<()> {
+        if self.flags & !REDO_BLOCK_VALID_FLAGS != 0 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("block=redo-group, body_len=0")
+                .attach(format!("block=redo-data, flags={:02x}", self.flags))
                 .into());
         }
-        if self.min_cts > self.max_cts {
+        if self.payload_len == 0 {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("block=redo-data, payload_len=0")
+                .into());
+        }
+        if self.is_group_start() != (self.group_block_idx == 0) {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "block=redo-group, min_cts={}, max_cts={}",
-                    self.min_cts, self.max_cts
+                    "block=redo-data, flags={:02x}, group_block_idx={}",
+                    self.flags, self.group_block_idx
                 ))
                 .into());
         }
-        self.body_len_usize()?;
+        let capacity = redo_block_payload_capacity(log_block_size, self.flags)?;
+        if self.payload_len_usize() > capacity {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "block=redo-data, payload_len={}, capacity={capacity}",
+                    self.payload_len
+                ))
+                .into());
+        }
         Ok(())
     }
 
-    /// Return the physical read stride for this logical group length.
-    ///
-    /// Normal groups occupy one log block even if the body is smaller. Larger
-    /// groups are rounded up to the next sector so direct I/O alignment remains
-    /// valid and checksum verification includes the persisted padding.
+    /// Verify that the persisted checksum matches this complete block image.
     #[inline]
-    pub(crate) fn physical_len(self, log_block_size: usize) -> Result<usize> {
-        let body_len = self.body_len_usize()?;
-        let logical_len = Self::SIZE.checked_add(body_len).ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("block=redo-group, body_len={body_len}")),
-            )
-        })?;
-        if logical_len <= log_block_size {
-            return Ok(log_block_size);
-        }
-        if logical_len > usize::MAX - (STORAGE_SECTOR_SIZE - 1) {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("block=redo-group, logical_len={logical_len}"))
-                .into());
-        }
-        Ok(align_to_sector_size(logical_len))
-    }
-
-    /// Compute and write the group checksum into the first four bytes.
-    ///
-    /// The caller must pass the full physical group buffer, including padding,
-    /// because replay verifies exactly the same byte range.
-    #[inline]
-    pub(crate) fn patch_checksum(group_bytes: &mut [u8]) -> Result<u32> {
-        if group_bytes.len() < mem::size_of::<u32>() {
+    pub(crate) fn verify_checksum(self, block: &[u8]) -> Result<()> {
+        if block.len() < Self::SIZE {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "block=redo-group, invalid_group_len={}",
-                    group_bytes.len()
+                    "block=redo-data, invalid_block_len={}",
+                    block.len()
                 ))
                 .into());
         }
-        let checksum = crc32fast::hash(&group_bytes[mem::size_of::<u32>()..]);
-        group_bytes.ser_u32(0, checksum);
-        Ok(checksum)
-    }
-
-    /// Verify that the persisted checksum matches the physical group bytes.
-    #[inline]
-    pub(crate) fn verify_checksum(self, group_bytes: &[u8]) -> Result<()> {
-        if group_bytes.len() < Self::SIZE {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "block=redo-group, invalid_group_len={}",
-                    group_bytes.len()
-                ))
-                .into());
-        }
-        let actual = crc32fast::hash(&group_bytes[mem::size_of::<u32>()..]);
+        let actual = crc32fast::hash(&block[mem::size_of::<u32>()..]);
         if actual != self.checksum {
             return Err(Report::new(DataIntegrityError::ChecksumMismatch)
                 .attach(format!(
-                    "block=redo-group, expected_checksum={:08x}, actual_checksum={actual:08x}",
+                    "block=redo-data, expected_checksum={:08x}, actual_checksum={actual:08x}",
                     self.checksum
                 ))
                 .into());
@@ -183,7 +151,7 @@ impl RedoGroupHeader {
     }
 }
 
-impl Ser<'_> for RedoGroupHeader {
+impl Ser<'_> for RedoBlockHeader {
     #[inline]
     fn ser_len(&self) -> usize {
         Self::SIZE
@@ -192,28 +160,147 @@ impl Ser<'_> for RedoGroupHeader {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = out.ser_u32(start_idx, self.checksum);
-        let idx = out.ser_u64(idx, self.body_len);
-        let idx = out.ser_u64(idx, self.min_cts.as_u64());
-        out.ser_u64(idx, self.max_cts.as_u64())
+        let idx = out.ser_u8(idx, self.flags);
+        let idx = out.ser_u16(idx, self.payload_len);
+        out.ser_u32(idx, self.group_block_idx)
     }
 }
 
-impl Deser for RedoGroupHeader {
-    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoGroupHeader::SIZE);
+impl Deser for RedoBlockHeader {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoBlockHeader::SIZE);
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, checksum) = input.deser_u32(start_idx)?;
-        let (idx, body_len) = input.deser_u64(idx)?;
-        let (idx, min_cts) = input.deser_u64(idx)?;
-        let (idx, max_cts) = input.deser_u64(idx)?;
+        let (idx, flags) = input.deser_u8(idx)?;
+        let (idx, payload_len) = input.deser_u16(idx)?;
+        let (idx, group_block_idx) = input.deser_u32(idx)?;
         Ok((
             idx,
-            RedoGroupHeader {
+            RedoBlockHeader {
                 checksum,
-                body_len,
-                min_cts: TrxID::new(min_cts),
-                max_cts: TrxID::new(max_cts),
+                flags,
+                payload_len,
+                group_block_idx,
+            },
+        ))
+    }
+}
+
+/// Group-level metadata stored immediately after the common header on a start block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RedoGroupStartExtension {
+    /// Logical payload bytes in the complete group.
+    pub(crate) group_payload_len: u64,
+    /// Number of fixed data blocks in this logical group.
+    pub(crate) group_block_count: u32,
+    /// Lowest commit timestamp allowed in transaction records.
+    pub(crate) min_redo_cts: TrxID,
+    /// Highest commit timestamp allowed in transaction records.
+    pub(crate) max_redo_cts: TrxID,
+}
+
+impl RedoGroupStartExtension {
+    /// Serialized byte size of the group-start extension.
+    pub(crate) const SIZE: usize = REDO_GROUP_START_EXTENSION_SIZE;
+
+    /// Build a group-start extension.
+    #[inline]
+    pub(crate) fn new(
+        group_payload_len: usize,
+        group_block_count: usize,
+        min_redo_cts: TrxID,
+        max_redo_cts: TrxID,
+    ) -> Result<Self> {
+        let group_block_count = u32::try_from(group_block_count).map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=redo-data, group_block_count={group_block_count}"
+            ))
+        })?;
+        Ok(Self {
+            group_payload_len: group_payload_len as u64,
+            group_block_count,
+            min_redo_cts,
+            max_redo_cts,
+        })
+    }
+
+    /// Return the group payload length as `usize`.
+    #[inline]
+    pub(crate) fn group_payload_len_usize(self) -> Result<usize> {
+        usize::try_from(self.group_payload_len).map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "block=redo-data, group_payload_len={}",
+                    self.group_payload_len
+                ))
+                .into()
+        })
+    }
+
+    /// Return the group block count as `usize`.
+    #[inline]
+    pub(crate) fn group_block_count_usize(self) -> usize {
+        self.group_block_count as usize
+    }
+
+    /// Validate group-start invariants.
+    #[inline]
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.group_payload_len == 0 {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("block=redo-data, group_payload_len=0")
+                .into());
+        }
+        if self.group_block_count == 0 {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("block=redo-data, group_block_count=0")
+                .into());
+        }
+        if self.min_redo_cts > self.max_redo_cts {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "block=redo-data, min_redo_cts={}, max_redo_cts={}",
+                    self.min_redo_cts, self.max_redo_cts
+                ))
+                .into());
+        }
+        self.group_payload_len_usize()?;
+        Ok(())
+    }
+}
+
+impl Ser<'_> for RedoGroupStartExtension {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        Self::SIZE
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u64(start_idx, self.group_payload_len);
+        let idx = out.ser_u32(idx, self.group_block_count);
+        let idx = out.ser_u64(idx, self.min_redo_cts.as_u64());
+        out.ser_u64(idx, self.max_redo_cts.as_u64())
+    }
+}
+
+impl Deser for RedoGroupStartExtension {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoGroupStartExtension::SIZE);
+
+    #[inline]
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, group_payload_len) = input.deser_u64(start_idx)?;
+        let (idx, group_block_count) = input.deser_u32(idx)?;
+        let (idx, min_redo_cts) = input.deser_u64(idx)?;
+        let (idx, max_redo_cts) = input.deser_u64(idx)?;
+        Ok((
+            idx,
+            RedoGroupStartExtension {
+                group_payload_len,
+                group_block_count,
+                min_redo_cts: TrxID::new(min_redo_cts),
+                max_redo_cts: TrxID::new(max_redo_cts),
             },
         ))
     }
@@ -391,6 +478,40 @@ impl Deser for RedoSuperBlock {
     }
 }
 
+/// Return the payload capacity of a redo group-start block.
+#[inline]
+pub(crate) fn redo_start_block_payload_capacity(log_block_size: usize) -> Result<usize> {
+    redo_block_payload_capacity(log_block_size, REDO_BLOCK_GROUP_START)
+}
+
+/// Return the payload capacity of a redo continuation block.
+#[inline]
+pub(crate) fn redo_continuation_block_payload_capacity(log_block_size: usize) -> Result<usize> {
+    redo_block_payload_capacity(log_block_size, 0)
+}
+
+/// Return true when a fixed redo data block is all zeroes.
+#[inline]
+pub(crate) fn is_zero_redo_block(block: &[u8]) -> bool {
+    block.iter().all(|&byte| byte == 0)
+}
+
+/// Compute and write the redo data block checksum into the first four bytes.
+#[inline]
+pub(crate) fn patch_redo_block_checksum(block: &mut [u8]) -> Result<u32> {
+    if block.len() < RedoBlockHeader::SIZE {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "block=redo-data, invalid_block_len={}",
+                block.len()
+            ))
+            .into());
+    }
+    let checksum = crc32fast::hash(&block[mem::size_of::<u32>()..]);
+    block.ser_u32(0, checksum);
+    Ok(checksum)
+}
+
 /// Return the byte offset for a super-block slot number.
 #[inline]
 pub(crate) fn slot_offset(slot_no: u32) -> usize {
@@ -502,6 +623,36 @@ pub(crate) fn select_redo_super_block(
     })
 }
 
+/// Return the serialized redo block header length implied by flags.
+#[inline]
+fn redo_block_header_len_for_flags(flags: u8) -> usize {
+    if flags & REDO_BLOCK_GROUP_START != 0 {
+        REDO_BLOCK_COMMON_HEADER_SIZE + REDO_GROUP_START_EXTENSION_SIZE
+    } else {
+        REDO_BLOCK_COMMON_HEADER_SIZE
+    }
+}
+
+/// Return the redo block payload capacity implied by block size and flags.
+#[inline]
+fn redo_block_payload_capacity(log_block_size: usize, flags: u8) -> Result<usize> {
+    let header_len = redo_block_header_len_for_flags(flags);
+    if log_block_size > u16::MAX as usize + header_len {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "block=redo-data, unsupported_log_block_size={log_block_size}"
+            ))
+            .into());
+    }
+    log_block_size.checked_sub(header_len).ok_or_else(|| {
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "block=redo-data, log_block_size={log_block_size}, flags={flags:02x}"
+            ))
+            .into()
+    })
+}
+
 /// Compare two already validated super-block candidates by generation.
 #[inline]
 fn is_newer_super_block(candidate: &RedoSuperBlock, current: &RedoSuperBlock) -> bool {
@@ -591,7 +742,9 @@ fn validate_sealed_segment_fields(super_block: &RedoSuperBlock) -> Result<()> {
 /// Return true when a persisted size is usable for direct I/O.
 #[inline]
 fn is_valid_aligned_size(size: usize) -> bool {
-    size >= STORAGE_SECTOR_SIZE && size.is_multiple_of(STORAGE_SECTOR_SIZE)
+    size >= STORAGE_SECTOR_SIZE
+        && size <= u16::MAX as usize + 1
+        && size.is_multiple_of(STORAGE_SECTOR_SIZE)
 }
 
 /// Return true when the file limit holds fixed slots plus whole log blocks.
@@ -631,46 +784,74 @@ mod tests {
     type CorruptCase = (&'static str, Box<dyn FnOnce(&mut [u8])>, DataIntegrityError);
 
     #[test]
-    fn redo_group_header_serializes_fixed_layout() {
-        let header = RedoGroupHeader {
+    fn redo_block_header_serializes_fixed_layout() {
+        let header = RedoBlockHeader {
             checksum: 0x1122_3344,
-            body_len: 0x0102_0304_0506_0708,
-            min_cts: TrxID::new(0x1112_1314_1516_1718),
-            max_cts: TrxID::new(0x2122_2324_2526_2728),
+            flags: REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END,
+            payload_len: 0x0102,
+            group_block_idx: 0x0304_0506,
         };
-        let mut buf = [0u8; RedoGroupHeader::SIZE];
+        let mut buf = [0u8; RedoBlockHeader::SIZE];
 
         let idx = header.ser(&mut buf[..], 0);
 
-        assert_eq!(idx, RedoGroupHeader::SIZE);
+        assert_eq!(idx, RedoBlockHeader::SIZE);
         assert_eq!(&buf[0..4], &0x1122_3344u32.to_le_bytes());
-        assert_eq!(&buf[4..12], &0x0102_0304_0506_0708u64.to_le_bytes());
-        assert_eq!(&buf[12..20], &0x1112_1314_1516_1718u64.to_le_bytes());
-        assert_eq!(&buf[20..28], &0x2122_2324_2526_2728u64.to_le_bytes());
+        assert_eq!(buf[4], REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END);
+        assert_eq!(&buf[5..7], &0x0102u16.to_le_bytes());
+        assert_eq!(&buf[7..11], &0x0304_0506u32.to_le_bytes());
 
-        let (idx, parsed) = RedoGroupHeader::deser(&buf[..], 0).unwrap();
-        assert_eq!(idx, RedoGroupHeader::SIZE);
+        let (idx, parsed) = RedoBlockHeader::deser(&buf[..], 0).unwrap();
+        assert_eq!(idx, RedoBlockHeader::SIZE);
         assert_eq!(parsed, header);
     }
 
     #[test]
-    fn redo_group_checksum_covers_header_body_and_padding() {
-        let mut group = vec![0u8; STORAGE_SECTOR_SIZE];
-        let header = RedoGroupHeader::new(16, TrxID::new(10), TrxID::new(12));
-        header.ser(&mut group[..], 0);
-        group[RedoGroupHeader::SIZE..RedoGroupHeader::SIZE + 16].copy_from_slice(&[7u8; 16]);
+    fn redo_group_start_extension_serializes_fixed_layout() {
+        let extension = RedoGroupStartExtension {
+            group_payload_len: 0x0102_0304_0506_0708,
+            group_block_count: 0x1112_1314,
+            min_redo_cts: TrxID::new(0x2122_2324_2526_2728),
+            max_redo_cts: TrxID::new(0x3132_3334_3536_3738),
+        };
+        let mut buf = [0u8; RedoGroupStartExtension::SIZE];
 
-        let checksum = RedoGroupHeader::patch_checksum(&mut group).unwrap();
-        assert_eq!(checksum, crc32fast::hash(&group[mem::size_of::<u32>()..]));
-        let (_, parsed) = RedoGroupHeader::deser(&group[..RedoGroupHeader::SIZE], 0).unwrap();
-        parsed.verify_checksum(&group).unwrap();
+        let idx = extension.ser(&mut buf[..], 0);
+
+        assert_eq!(idx, RedoGroupStartExtension::SIZE);
+        assert_eq!(&buf[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&buf[8..12], &0x1112_1314u32.to_le_bytes());
+        assert_eq!(&buf[12..20], &0x2122_2324_2526_2728u64.to_le_bytes());
+        assert_eq!(&buf[20..28], &0x3132_3334_3536_3738u64.to_le_bytes());
+
+        let (idx, parsed) = RedoGroupStartExtension::deser(&buf[..], 0).unwrap();
+        assert_eq!(idx, RedoGroupStartExtension::SIZE);
+        assert_eq!(parsed, extension);
+    }
+
+    #[test]
+    fn redo_block_checksum_covers_header_payload_and_padding() {
+        let mut block = vec![0u8; STORAGE_SECTOR_SIZE];
+        let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
+        let header =
+            RedoBlockHeader::new(REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END, 16, 0).unwrap();
+        header.ser(&mut block[..], 0);
+        RedoGroupStartExtension::new(16, 1, TrxID::new(10), TrxID::new(12))
+            .unwrap()
+            .ser(&mut block[..], RedoBlockHeader::SIZE);
+        block[payload_start..payload_start + 16].copy_from_slice(&[7u8; 16]);
+
+        let checksum = patch_redo_block_checksum(&mut block).unwrap();
+        assert_eq!(checksum, crc32fast::hash(&block[mem::size_of::<u32>()..]));
+        let (_, parsed) = RedoBlockHeader::deser(&block[..RedoBlockHeader::SIZE], 0).unwrap();
+        parsed.verify_checksum(&block).unwrap();
 
         for mutate in [
             mem::size_of::<u32>(),
-            RedoGroupHeader::SIZE,
+            payload_start,
             STORAGE_SECTOR_SIZE - 1,
         ] {
-            let mut corrupted = group.clone();
+            let mut corrupted = block.clone();
             corrupted[mutate] ^= 0x80;
             let err = parsed.verify_checksum(&corrupted).unwrap_err();
             assert_integrity_error(err, DataIntegrityError::ChecksumMismatch);
@@ -678,37 +859,41 @@ mod tests {
     }
 
     #[test]
-    fn redo_group_physical_len_uses_normal_stride_or_sector_alignment() {
-        let small = RedoGroupHeader::new(16, TrxID::new(1), TrxID::new(1));
+    fn redo_block_payload_capacity_uses_fixed_headers() {
         assert_eq!(
-            small.physical_len(STORAGE_SECTOR_SIZE).unwrap(),
-            STORAGE_SECTOR_SIZE
+            redo_start_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap(),
+            STORAGE_SECTOR_SIZE - RedoBlockHeader::SIZE - RedoGroupStartExtension::SIZE
         );
-
-        let large = RedoGroupHeader::new(STORAGE_SECTOR_SIZE, TrxID::new(1), TrxID::new(1));
         assert_eq!(
-            large.physical_len(STORAGE_SECTOR_SIZE).unwrap(),
-            STORAGE_SECTOR_SIZE * 2
+            redo_continuation_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap(),
+            STORAGE_SECTOR_SIZE - RedoBlockHeader::SIZE
         );
     }
 
     #[test]
-    fn redo_group_validate_rejects_invalid_header_invariants() {
-        let empty = RedoGroupHeader {
+    fn redo_block_validate_rejects_invalid_invariants() {
+        let empty = RedoBlockHeader {
             checksum: 1,
-            body_len: 0,
-            min_cts: TrxID::new(1),
-            max_cts: TrxID::new(1),
+            flags: REDO_BLOCK_GROUP_START,
+            payload_len: 0,
+            group_block_idx: 0,
         };
-        let err = empty.validate().unwrap_err();
+        let err = empty.validate(STORAGE_SECTOR_SIZE).unwrap_err();
         assert_integrity_error(err, DataIntegrityError::InvalidPayload);
 
-        let inverted_cts = RedoGroupHeader {
+        let continuation_with_zero_idx = RedoBlockHeader {
             checksum: 1,
-            body_len: 1,
-            min_cts: TrxID::new(2),
-            max_cts: TrxID::new(1),
+            flags: 0,
+            payload_len: 1,
+            group_block_idx: 0,
         };
+        let err = continuation_with_zero_idx
+            .validate(STORAGE_SECTOR_SIZE)
+            .unwrap_err();
+        assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+
+        let inverted_cts =
+            RedoGroupStartExtension::new(1, 1, TrxID::new(2), TrxID::new(1)).unwrap();
         let err = inverted_cts.validate().unwrap_err();
         assert_integrity_error(err, DataIntegrityError::InvalidPayload);
     }

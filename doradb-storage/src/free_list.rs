@@ -46,6 +46,10 @@ impl<T> FreeList<T> {
 
     /// Try pop data from free list.
     #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved opportunistic buffer reuse")
+    )]
     pub(crate) fn try_pop(&self, create_if_not_exists: bool) -> Option<T> {
         let mut g = self.data.lock();
         if !g.0.is_empty() {

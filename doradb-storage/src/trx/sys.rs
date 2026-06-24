@@ -9,9 +9,11 @@ use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionID, TrxID};
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
-use crate::log::{LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter, parse_file_seq};
+use crate::log::{
+    EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter, parse_file_seq,
+};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
-use crate::recovery::redo_stream::MmapLogReader;
+use crate::recovery::stream::MmapLogReader;
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
@@ -452,13 +454,26 @@ impl TransactionSystem {
         &self,
         redo_log: &RedoLog,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
-        trx: Box<PrecommitTrx>,
+        error: EnqueuePrecommitError,
     ) -> CommitRejection {
+        let EnqueuePrecommitError {
+            trx,
+            reason,
+            close_admission,
+        } = error;
         let cts = trx.cts;
-        let err = self.poison_storage(FatalError::RedoWrite);
-        let reason = FailedPrecommitReason::Fatal(*err.current_context());
-        group_commit_g.close(reason);
-        redo_log.group_commit.notify_one();
+        if close_admission {
+            let err = self.poison_storage(match reason {
+                FailedPrecommitReason::Fatal(reason) => reason,
+                FailedPrecommitReason::Resource(_) | FailedPrecommitReason::Shutdown => {
+                    FatalError::RedoWrite
+                }
+            });
+            let reason = FailedPrecommitReason::Fatal(*err.current_context());
+            group_commit_g.close(reason);
+            redo_log.group_commit.notify_one();
+            return CommitRejection { cts, trx, reason };
+        }
         CommitRejection { cts, trx, reason }
     }
 
@@ -475,7 +490,7 @@ impl TransactionSystem {
                 redo_log.group_commit.notify_one();
                 Ok(waiter)
             }
-            Err(trx) => Err(self.reject_group_creation_failure(redo_log, group_commit_g, trx)),
+            Err(error) => Err(self.reject_group_creation_failure(redo_log, group_commit_g, error)),
         }
     }
 
@@ -1231,12 +1246,12 @@ pub(crate) mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
     use crate::engine::Engine;
+    use crate::error::ResourceError;
     use crate::id::{PageID, RowID, TableID};
     use crate::log::LogSync;
     use crate::log::format::{REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE};
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::value::Val;
-    use std::fmt::Debug;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, OnceLock};
     use std::thread::{sleep, spawn, yield_now};
@@ -1337,18 +1352,6 @@ pub(crate) mod tests {
                 row_id: RowID::new(0),
                 kind: RowRedoKind::Insert(values),
             },
-        );
-    }
-
-    fn assert_direct_fatal<T: Debug>(res: &Result<T>, expected: FatalError) {
-        let err = match res {
-            Ok(value) => panic!("expected fatal error, got {value:?}"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.downcast_ref::<FatalError>().copied(),
-            Some(expected),
-            "{err:?}"
         );
     }
 
@@ -1583,15 +1586,12 @@ pub(crate) mod tests {
             add_large_system_redo(&mut sys_trx, 1024);
             let res = engine.inner().trx_sys.commit_sys(sys_trx);
 
-            assert_direct_fatal(&res, FatalError::RedoWrite);
-            assert!(
-                engine
-                    .inner()
-                    .trx_sys
-                    .ensure_runtime_healthy()
-                    .as_ref()
-                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.resource_error(),
+                Some(ResourceError::StorageFileCapacityExceeded)
             );
+            engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
         });
     }
 }

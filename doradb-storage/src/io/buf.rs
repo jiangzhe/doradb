@@ -95,6 +95,10 @@ impl DirectBuf {
 
     /// Returns length of data.
     #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved direct buffer logical length")
+    )]
     pub(crate) fn len(&self) -> usize {
         self.len
     }

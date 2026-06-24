@@ -1,7 +1,9 @@
 use crate::id::TrxID;
 use crate::io::Completion;
-use crate::log::buf::LogBuf;
-use crate::log::{LogWriteSubmission, RedoGroupWriteMeta, RedoLogFile, SyncGroup};
+use crate::log::block_group::LogBlockGroup;
+use crate::log::{
+    LogWriteSubmission, RedoGroupWriteAlloc, RedoGroupWriteMeta, RedoLogFile, SyncGroup,
+};
 use crate::serde::Ser;
 use crate::trx::{FailedPrecommitReason, PrecommitTrx};
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
@@ -97,10 +99,10 @@ pub(crate) type CommitJoin = Option<CommitWaiter>;
 
 /// Serialized redo buffer and target file allocation for a durability group.
 pub(crate) struct CommitGroupLog {
-    /// Target redo file allocation and CTS range metadata.
-    pub(crate) write_meta: RedoGroupWriteMeta,
-    /// Serialized redo bytes accumulated for this group.
-    pub(crate) log_buf: LogBuf,
+    /// Target redo file allocation.
+    pub(crate) alloc: RedoGroupWriteAlloc,
+    /// Logical redo group accumulated for fixed-block serialization.
+    pub(crate) group: LogBlockGroup,
 }
 
 /// CommitGroup groups multiple transactions into one logical ordered commit unit.
@@ -137,7 +139,7 @@ impl CommitGroup {
             return false;
         }
         self.log.as_ref().is_some_and(|log| {
-            log.log_buf
+            log.group
                 .capable_for(trx.redo_bin.as_ref().unwrap().ser_len())
         })
     }
@@ -151,13 +153,7 @@ impl CommitGroup {
                 .log
                 .as_mut()
                 .expect("durability transaction cannot join a no-log group");
-            log.log_buf.append_trx_log(&redo_bin);
-            let (min_redo_cts, max_redo_cts) = log
-                .log_buf
-                .redo_cts_range()
-                .expect("redo-bearing group must track a CTS range");
-            log.write_meta.min_redo_cts = min_redo_cts;
-            log.write_meta.max_redo_cts = max_redo_cts;
+            log.group.append_trx_log(redo_bin);
         }
         self.max_cts = trx.cts;
         // Session completion ownership stays with the queued PrecommitTrx. The
@@ -170,22 +166,40 @@ impl CommitGroup {
     /// Convert this commit group into a sync group for redo publication.
     #[inline]
     pub(crate) fn into_sync_group(self) -> SyncGroup {
-        let (log_bytes, log_fd, write_meta, write) = match self.log {
+        let (log_bytes, log_fd, write_meta, writes) = match self.log {
             Some(log) => {
-                // Confirm data length in buffer header.
-                let write_meta = log.write_meta;
-                let buf = log.log_buf.finish();
-                // We always write a complete page instead of partial data.
-                let log_bytes = buf.capacity();
-                let log_fd = write_meta.fd;
-                (
-                    log_bytes,
-                    Some(log_fd),
-                    Some(write_meta),
-                    Some(LogWriteSubmission::new(log_fd, write_meta.offset, buf)),
-                )
+                let alloc = log.alloc;
+                let (min_redo_cts, max_redo_cts) = log.group.redo_cts_range();
+                let write_meta = RedoGroupWriteMeta {
+                    file_seq: alloc.file_seq,
+                    fd: alloc.fd,
+                    offset: alloc.offset,
+                    end_offset: alloc.end_offset,
+                    min_redo_cts,
+                    max_redo_cts,
+                };
+                let blocks = log
+                    .group
+                    .finish()
+                    .expect("accepted redo group must materialize fixed blocks");
+                let mut writes = VecDeque::with_capacity(blocks.len());
+                let mut offset = alloc.offset;
+                let log_fd = alloc.fd;
+                for (group_write_idx, buf) in blocks.into_iter().enumerate() {
+                    let len = buf.capacity();
+                    writes.push_back(LogWriteSubmission::group(
+                        log_fd,
+                        offset,
+                        buf,
+                        group_write_idx,
+                    ));
+                    offset += len;
+                }
+                debug_assert_eq!(offset, alloc.end_offset);
+                let log_bytes = offset - alloc.offset;
+                (log_bytes, Some(log_fd), Some(write_meta), writes)
             }
-            None => (0, None, None, None),
+            None => (0, None, None, VecDeque::new()),
         };
         SyncGroup {
             trx_list: self.trx_list,
@@ -193,7 +207,7 @@ impl CommitGroup {
             log_bytes,
             log_fd,
             write_meta,
-            write,
+            writes,
             returned_bufs: Vec::new(),
             completion: self.completion,
             outstanding_requests: 0,
@@ -208,7 +222,7 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::id::{RowID, TableID};
     use crate::io::Completion;
-    use crate::log::buf::TrxLog;
+    use crate::log::block_group::TrxLog;
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::value::Val;
     use std::collections::BTreeMap;
@@ -225,9 +239,16 @@ mod tests {
     }
 
     fn redo_bin_large(cts: TrxID) -> TrxLog {
+        redo_bin_with_string_len(cts, 3000)
+    }
+
+    fn redo_bin_oversized(cts: TrxID) -> TrxLog {
+        redo_bin_with_string_len(cts, 8000)
+    }
+
+    fn redo_bin_with_string_len(cts: TrxID, string_len: usize) -> TrxLog {
         let mut rows = BTreeMap::new();
-        // 3000-bytes string.
-        let s: String = repeat_n('a', 3000).collect();
+        let s: String = repeat_n('a', string_len).collect();
         rows.insert(
             RowID::new(1u64),
             RowRedo {
@@ -280,20 +301,23 @@ mod tests {
         }
     }
 
-    fn log_group(cts: TrxID, log_buf: LogBuf) -> CommitGroup {
+    const TEST_LOG_BLOCK_SIZE: usize = 4096;
+
+    fn log_group(cts: TrxID, log_group: LogBlockGroup) -> CommitGroup {
+        let physical_len = log_group.physical_len();
+        let mut trx = precommit(cts);
+        clear_redo(&mut trx);
         CommitGroup {
-            trx_list: vec![precommit(cts)],
+            trx_list: vec![trx],
             max_cts: cts,
             log: Some(CommitGroupLog {
-                write_meta: RedoGroupWriteMeta {
+                alloc: RedoGroupWriteAlloc {
                     file_seq: 0,
                     fd: 0,
                     offset: 0,
-                    end_offset: log_buf.capacity(),
-                    min_redo_cts: cts,
-                    max_redo_cts: cts,
+                    end_offset: physical_len,
                 },
-                log_buf,
+                group: log_group,
             }),
             completion: Arc::new(Completion::new()),
         }
@@ -314,9 +338,9 @@ mod tests {
 
     #[test]
     fn test_commit_group_join_without_sync_listener() {
-        let mut log_buf = LogBuf::new(64);
-        log_buf.append_trx_log(&redo_bin(TrxID::new(1)));
-        let mut group = log_group(TrxID::new(1), log_buf);
+        let log_block_group =
+            LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(1))).unwrap();
+        let mut group = log_group(TrxID::new(1), log_block_group);
 
         let listener = group.join(precommit(TrxID::new(2)), false);
         assert!(listener.is_none());
@@ -329,9 +353,9 @@ mod tests {
 
     #[test]
     fn test_commit_group_can_join_respects_capacity() {
-        let mut log_buf = LogBuf::new(64);
-        log_buf.append_trx_log(&redo_bin(TrxID::new(100)));
-        let mut group = log_group(TrxID::new(1), log_buf);
+        let log_block_group =
+            LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(100))).unwrap();
+        let mut group = log_group(TrxID::new(1), log_block_group);
 
         let candidate1 = precommit_large(TrxID::new(2));
         assert!(group.can_join(&candidate1));
@@ -359,15 +383,15 @@ mod tests {
 
         let sync_group = no_log_group.into_sync_group();
         assert_eq!(sync_group.log_bytes, 0);
-        assert!(sync_group.write.is_none());
+        assert!(sync_group.writes.is_empty());
         assert_eq!(sync_group.outstanding_requests, 0);
     }
 
     #[test]
     fn test_commit_group_log_group_accepts_no_log_transaction() {
-        let mut log_buf = LogBuf::new(64);
-        log_buf.append_trx_log(&redo_bin(TrxID::new(10)));
-        let mut group = log_group(TrxID::new(10), log_buf);
+        let log_block_group =
+            LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(10))).unwrap();
+        let mut group = log_group(TrxID::new(10), log_block_group);
 
         assert!(group.require_durability());
         assert!(group.can_join(&precommit_no_log(TrxID::new(11))));
@@ -378,5 +402,27 @@ mod tests {
         for trx in &mut group.trx_list {
             clear_redo(trx);
         }
+    }
+
+    #[test]
+    fn test_commit_group_oversized_transaction_becomes_multi_block_group() {
+        let oversized = redo_bin_oversized(TrxID::new(20));
+        let log_block_group = LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, oversized).unwrap();
+        assert!(log_block_group.is_multi_block());
+        let mut group = log_group(TrxID::new(20), log_block_group);
+
+        let mut redo_candidate = precommit(TrxID::new(21));
+        assert!(!group.can_join(&redo_candidate));
+        clear_redo(&mut redo_candidate);
+        assert!(group.can_join(&precommit_no_log(TrxID::new(22))));
+        let _ = group.join(precommit_no_log(TrxID::new(22)), false);
+
+        let sync_group = group.into_sync_group();
+        assert!(sync_group.writes.len() > 1);
+        assert_eq!(
+            sync_group.log_bytes,
+            sync_group.writes.len() * TEST_LOG_BLOCK_SIZE
+        );
+        assert_eq!(sync_group.max_cts, TrxID::new(22));
     }
 }

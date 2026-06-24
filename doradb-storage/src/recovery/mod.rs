@@ -12,9 +12,9 @@
 //! We separate all transactions into two kinds:
 //! 1. DDL involved transactions
 //! 2. DML-only transactions
-pub(crate) mod redo_stream;
 mod resources;
 mod row_state;
+pub(crate) mod stream;
 mod timeline;
 
 use crate::buffer::BufferPool;
@@ -26,14 +26,14 @@ use crate::catalog::{
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
-use crate::log::buf::TrxLog;
+use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::row::RowPage;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::purge::DroppedTableFileDeleteItem;
-use redo_stream::RedoLogStream;
+use stream::RedoLogStream;
 
 use error_stack::Report;
 pub(crate) use resources::{RecoveryBuffers, RecoveryResources};
@@ -857,10 +857,11 @@ mod tests {
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex};
     use crate::log::LogSync;
-    use crate::log::buf::TrxLog;
+    use crate::log::block_group::TrxLog;
     use crate::log::format::{
-        REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoGroupHeader,
-        RedoSuperBlock, serialize_redo_super_block, slot_offset,
+        REDO_BLOCK_GROUP_END, REDO_BLOCK_GROUP_START, REDO_DEFAULT_DATA_START_OFFSET,
+        REDO_SUPER_BLOCK_SLOT_SIZE, RedoBlockHeader, RedoGroupStartExtension, RedoSuperBlock,
+        serialize_redo_super_block, slot_offset,
     };
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::recovery::{RecoveryBuffers, RecoveryResources, RowRecoveryMap, TableReplayBounds};
@@ -1016,14 +1017,17 @@ mod tests {
         }
 
         let mut group = vec![0u8; CORRUPTION_RECOVERY_LOG_BLOCK_SIZE];
-        let header = RedoGroupHeader {
+        let header = RedoBlockHeader {
             checksum: 1,
-            body_len: 1,
-            min_cts: cts,
-            max_cts: cts,
+            flags: REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END,
+            payload_len: 1,
+            group_block_idx: 0,
         };
         let body_offset = header.ser(&mut group[..], 0);
-        assert_eq!(body_offset, RedoGroupHeader::SIZE);
+        assert_eq!(body_offset, RedoBlockHeader::SIZE);
+        let body_offset = RedoGroupStartExtension::new(1, 1, cts, cts)
+            .unwrap()
+            .ser(&mut group[..], body_offset);
         group[body_offset] = 0x7f;
         file.seek(SeekFrom::Start(REDO_DEFAULT_DATA_START_OFFSET as u64))
             .unwrap();

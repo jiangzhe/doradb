@@ -29,7 +29,8 @@ use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableCache, is_catalog_obj_id};
 use crate::engine::{EngineRef, WeakEngineRef};
 use crate::error::{
-    CompletionErrorKind, Error, FatalError, InternalError, LifecycleError, OperationError, Result,
+    CompletionErrorKind, Error, FatalError, InternalError, LifecycleError, OperationError,
+    ResourceError, Result,
 };
 use crate::id::{PageID, RowID, SessionID, TableID, TrxID};
 use crate::io::Completion;
@@ -37,7 +38,7 @@ use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
     StmtNo,
 };
-use crate::log::buf::TrxLog;
+use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
@@ -1158,6 +1159,8 @@ pub(crate) struct TrxCleanupJob {
 pub(crate) enum FailedPrecommitReason {
     /// Redo write, submit, or sync failed after precommit handoff.
     Fatal(FatalError),
+    /// A single precommit group exceeded an intrinsic redo resource limit.
+    Resource(ResourceError),
     /// Group commit admission closed for engine shutdown.
     Shutdown,
 }
@@ -1168,6 +1171,9 @@ impl FailedPrecommitReason {
     pub(crate) fn into_error(self, message: impl Into<String>) -> Error {
         match self {
             FailedPrecommitReason::Fatal(reason) => {
+                Report::new(reason).attach(message.into()).into()
+            }
+            FailedPrecommitReason::Resource(reason) => {
                 Report::new(reason).attach(message.into()).into()
             }
             FailedPrecommitReason::Shutdown => Report::new(LifecycleError::Shutdown)
@@ -1182,6 +1188,9 @@ impl FailedPrecommitReason {
             FailedPrecommitReason::Fatal(reason) => {
                 CompletionErrorKind::report_fatal(reason, message)
             }
+            FailedPrecommitReason::Resource(reason) => Report::new(reason)
+                .change_context(CompletionErrorKind::Resource(reason))
+                .attach(message.into()),
             FailedPrecommitReason::Shutdown => Report::new(LifecycleError::Shutdown)
                 .change_context(CompletionErrorKind::Lifecycle(LifecycleError::Shutdown))
                 .attach(message.into()),

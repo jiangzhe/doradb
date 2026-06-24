@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-06-22`
+- Generated on: `2026-06-24`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log,recovery}`
 
@@ -41,7 +41,7 @@
 | `doradb-storage/src/io/mod.rs` | io | 4 | 2 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 4 | 4 |
 | `doradb-storage/src/index/block_index_root.rs` | index | 3 | 3 |
-| `doradb-storage/src/recovery/redo_stream.rs` | recovery | 3 | 3 |
+| `doradb-storage/src/recovery/stream.rs` | recovery | 3 | 3 |
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/frame.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/page.rs` | buffer | 2 | 1 |
