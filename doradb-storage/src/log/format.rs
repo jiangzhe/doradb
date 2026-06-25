@@ -871,31 +871,82 @@ mod tests {
     }
 
     #[test]
-    fn redo_block_validate_rejects_invalid_invariants() {
-        let empty = RedoBlockHeader {
-            checksum: 1,
-            flags: REDO_BLOCK_GROUP_START,
-            payload_len: 0,
-            group_block_idx: 0,
-        };
-        let err = empty.validate(STORAGE_SECTOR_SIZE).unwrap_err();
-        assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+    fn redo_block_validate_rejects_invalid_header_invariants() {
+        let start_capacity = redo_start_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
+        let continuation_capacity =
+            redo_continuation_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
+        let cases = [
+            RedoBlockHeader {
+                checksum: 1,
+                flags: REDO_BLOCK_GROUP_START,
+                payload_len: 0,
+                group_block_idx: 0,
+            },
+            RedoBlockHeader {
+                checksum: 1,
+                flags: 0b1000_0000,
+                payload_len: 1,
+                group_block_idx: 0,
+            },
+            RedoBlockHeader {
+                checksum: 1,
+                flags: REDO_BLOCK_GROUP_START,
+                payload_len: 1,
+                group_block_idx: 1,
+            },
+            RedoBlockHeader {
+                checksum: 1,
+                flags: 0,
+                payload_len: 1,
+                group_block_idx: 0,
+            },
+            RedoBlockHeader {
+                checksum: 1,
+                flags: REDO_BLOCK_GROUP_START,
+                payload_len: u16::try_from(start_capacity + 1).unwrap(),
+                group_block_idx: 0,
+            },
+            RedoBlockHeader {
+                checksum: 1,
+                flags: 0,
+                payload_len: u16::try_from(continuation_capacity + 1).unwrap(),
+                group_block_idx: 1,
+            },
+        ];
 
-        let continuation_with_zero_idx = RedoBlockHeader {
-            checksum: 1,
-            flags: 0,
-            payload_len: 1,
-            group_block_idx: 0,
-        };
-        let err = continuation_with_zero_idx
-            .validate(STORAGE_SECTOR_SIZE)
-            .unwrap_err();
-        assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+        for header in cases {
+            let err = header.validate(STORAGE_SECTOR_SIZE).unwrap_err();
+            assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+        }
+    }
 
-        let inverted_cts =
-            RedoGroupStartExtension::new(1, 1, TrxID::new(2), TrxID::new(1)).unwrap();
-        let err = inverted_cts.validate().unwrap_err();
-        assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+    #[test]
+    fn redo_group_start_extension_rejects_invalid_metadata() {
+        let cases = [
+            RedoGroupStartExtension {
+                group_payload_len: 0,
+                group_block_count: 1,
+                min_redo_cts: TrxID::new(1),
+                max_redo_cts: TrxID::new(1),
+            },
+            RedoGroupStartExtension {
+                group_payload_len: 1,
+                group_block_count: 0,
+                min_redo_cts: TrxID::new(1),
+                max_redo_cts: TrxID::new(1),
+            },
+            RedoGroupStartExtension {
+                group_payload_len: 1,
+                group_block_count: 1,
+                min_redo_cts: TrxID::new(2),
+                max_redo_cts: TrxID::new(1),
+            },
+        ];
+
+        for extension in cases {
+            let err = extension.validate().unwrap_err();
+            assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+        }
     }
 
     #[test]

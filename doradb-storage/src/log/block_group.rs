@@ -621,10 +621,35 @@ mod tests {
     }
 
     #[test]
+    fn test_block_count_for_payload_uses_start_and_continuation_boundaries() {
+        let start_capacity = redo_start_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
+        let continuation_capacity =
+            redo_continuation_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
+        let cases = [
+            (1, 1),
+            (start_capacity, 1),
+            (start_capacity + 1, 2),
+            (start_capacity + continuation_capacity, 2),
+            (start_capacity + continuation_capacity + 1, 3),
+        ];
+
+        for (payload_len, expected_block_count) in cases {
+            assert_eq!(
+                block_count_for_payload(STORAGE_SECTOR_SIZE, payload_len).unwrap(),
+                expected_block_count
+            );
+        }
+
+        assert!(block_count_for_payload(RedoBlockHeader::SIZE - 1, 1).is_err());
+    }
+
+    #[test]
     fn test_log_block_group_materializes_multi_block_group() {
         let cts = TrxID::new(11);
         let log = large_trx_log(cts);
         let payload_len = log.ser_len();
+        let mut expected_payload = vec![0u8; payload_len];
+        log.ser(&mut expected_payload[..], 0);
         let block_count = block_count_for_payload(STORAGE_SECTOR_SIZE, payload_len).unwrap();
         assert!(block_count > 1);
         let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
@@ -638,6 +663,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(blocks.len(), block_count);
+        assert_eq!(
+            block_count * STORAGE_SECTOR_SIZE,
+            blocks.iter().map(DirectBuf::capacity).sum()
+        );
+        let mut actual_payload = Vec::with_capacity(payload_len);
         for (idx, block) in blocks.iter().enumerate() {
             assert_eq!(block.capacity(), STORAGE_SECTOR_SIZE);
             let (_, header) = RedoBlockHeader::deser(block.as_bytes(), 0).unwrap();
@@ -662,6 +692,20 @@ mod tests {
                 assert_eq!(extension.min_redo_cts, cts);
                 assert_eq!(extension.max_redo_cts, cts);
             }
+            let payload_start = if idx == 0 {
+                RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE
+            } else {
+                RedoBlockHeader::SIZE
+            };
+            let payload_end = payload_start + header.payload_len_usize();
+            actual_payload.extend_from_slice(&block.as_bytes()[payload_start..payload_end]);
+            assert!(
+                block.as_bytes()[payload_end..]
+                    .iter()
+                    .all(|&byte| byte == 0),
+                "nonzero padding in block {idx}"
+            );
         }
+        assert_eq!(actual_payload, expected_payload);
     }
 }

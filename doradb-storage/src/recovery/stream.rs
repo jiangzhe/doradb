@@ -1207,8 +1207,8 @@ mod tests {
     use crate::io::{DirectBuf, IOBuf};
     use crate::log::block_group::LogBlockGroup;
     use crate::log::format::{
-        REDO_BLOCK_GROUP_START, REDO_SUPER_BLOCK_SLOT_SIZE, patch_redo_block_checksum,
-        redo_start_block_payload_capacity, serialize_redo_super_block,
+        REDO_BLOCK_GROUP_END, REDO_BLOCK_GROUP_START, REDO_SUPER_BLOCK_SLOT_SIZE,
+        patch_redo_block_checksum, redo_start_block_payload_capacity, serialize_redo_super_block,
     };
     use crate::log::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
@@ -1394,12 +1394,21 @@ mod tests {
     }
 
     fn block_group_with_range(log: TrxLog, min_cts: TrxID, max_cts: TrxID) -> DirectBuf {
+        block_group_with_range_and_size(STORAGE_SECTOR_SIZE, log, min_cts, max_cts)
+    }
+
+    fn block_group_with_range_and_size(
+        log_block_size: usize,
+        log: TrxLog,
+        min_cts: TrxID,
+        max_cts: TrxID,
+    ) -> DirectBuf {
         let payload_len = log.ser_len();
-        let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
+        let group = LogBlockGroup::new(log_block_size, log).unwrap();
         let mut blocks = group
             .finish_with(|count| {
                 (0..count)
-                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .map(|_| DirectBuf::zeroed(log_block_size))
                     .collect()
             })
             .unwrap();
@@ -1410,6 +1419,27 @@ mod tests {
             .ser(direct_buf.as_bytes_mut(), RedoBlockHeader::SIZE);
         patch_redo_block_checksum(direct_buf.as_bytes_mut()).unwrap();
         direct_buf
+    }
+
+    fn corrupt_padding_after_payload(block: &mut DirectBuf) {
+        let (_, header) = RedoBlockHeader::deser(block.as_bytes(), 0).unwrap();
+        let payload_start = if header.is_group_start() {
+            RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE
+        } else {
+            RedoBlockHeader::SIZE
+        };
+        let payload_end = payload_start + header.payload_len_usize();
+        assert!(payload_end < block.capacity());
+        block.as_bytes_mut()[payload_end] = 1;
+        patch_redo_block_checksum(block.as_bytes_mut()).unwrap();
+    }
+
+    fn bad_checksum_final_continuation() -> DirectBuf {
+        let mut block = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
+        let header = RedoBlockHeader::new(REDO_BLOCK_GROUP_END, 1, 1).unwrap();
+        header.ser(block.as_bytes_mut(), 0);
+        block.as_bytes_mut()[RedoBlockHeader::SIZE] = 1;
+        block
     }
 
     fn two_block_start_only() -> DirectBuf {
@@ -1455,6 +1485,24 @@ mod tests {
                 STORAGE_SECTOR_SIZE,
                 2,
                 &[block],
+                TestSegmentSeal::Open,
+            );
+
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_treats_bad_checksum_continuation_as_unsealed_incomplete_tail() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let blocks = [two_block_start_only(), bad_checksum_final_continuation()];
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                2,
+                &blocks,
                 TestSegmentSeal::Open,
             );
 
@@ -1586,6 +1634,26 @@ mod tests {
                 block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
             let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
             direct_buf.as_bytes_mut()[payload_start] ^= 0x80;
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Open,
+            );
+
+            assert_stream_corrupted(&mut stream).await;
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_rejects_nonzero_padding_after_payload() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut direct_buf =
+                block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
+            corrupt_padding_after_payload(&mut direct_buf);
             let mut stream = stream_for_test_file(
                 &file_path,
                 STORAGE_SECTOR_SIZE,
@@ -1872,6 +1940,55 @@ mod tests {
             assert!(log1.header.trx_kind == RedoTrxKind::System);
             let log2 = stream.try_next().await.unwrap().unwrap();
             assert!(log2.header.trx_kind == RedoTrxKind::User);
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_reads_segments_with_different_persisted_block_sizes() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let first_path = dir.path().join("first.log");
+            let second_path = dir.path().join("second.log");
+            let first = block_group_with_range_and_size(
+                STORAGE_SECTOR_SIZE,
+                simple_trx_log(TrxID::new(1)),
+                TrxID::new(1),
+                TrxID::new(1),
+            );
+            let second_block_size = STORAGE_SECTOR_SIZE * 2;
+            let second = block_group_with_range_and_size(
+                second_block_size,
+                simple_trx_log(TrxID::new(2)),
+                TrxID::new(2),
+                TrxID::new(2),
+            );
+            let first_descriptor = write_stream_log_file_with_seq(
+                &first_path,
+                0,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[first],
+                TestSegmentSeal::Open,
+            );
+            let second_descriptor = write_stream_log_file_with_seq(
+                &second_path,
+                1,
+                second_block_size,
+                1,
+                &[second],
+                TestSegmentSeal::Open,
+            );
+            let planner = RedoReplayPlanner::new(vec![first_descriptor, second_descriptor]);
+            let (skipped_max_recovered_cts, mut stream) =
+                planner.plan_stream(TrxID::new(0), 2).unwrap();
+            assert_eq!(skipped_max_recovered_cts, None);
+
+            let first = stream.try_next().await.unwrap().unwrap();
+            let second = stream.try_next().await.unwrap().unwrap();
+
+            assert_eq!(first.header.cts, TrxID::new(1));
+            assert_eq!(second.header.cts, TrxID::new(2));
             assert!(stream.try_next().await.unwrap().is_none());
         });
     }
