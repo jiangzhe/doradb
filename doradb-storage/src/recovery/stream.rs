@@ -14,7 +14,7 @@ use crate::log::{RedoLogFileDescriptor, next_redo_file_seq};
 use crate::serde::Deser;
 use crate::thread as doradb_thread;
 use error_stack::Report;
-use flume::{Receiver, Sender, TryRecvError, TrySendError};
+use flume::{Receiver, SendTimeoutError, Sender, TryRecvError};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind as IoErrorKind, Read, Result as IoResult};
@@ -22,6 +22,9 @@ use std::mem::take;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::thread::{JoinHandle, yield_now};
+use std::time::Duration;
+
+const REDO_READ_AHEAD_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Outcome of reading the next logical group from the redo stream.
 enum ReadGroup {
@@ -378,8 +381,7 @@ impl RedoLogStream {
 
         let first_block = self
             .recv_expected_block(state.file_seq, state.offset)
-            .await?
-            .ok_or_else(log_file_corrupted)?;
+            .await?;
         let group_start = match state.read_group_start(first_block.as_bytes()) {
             Ok(Some(group_start)) => group_start,
             Ok(None) => {
@@ -391,6 +393,19 @@ impl RedoLogStream {
                 return Err(err);
             }
         };
+
+        let Some(group_end_offset) = group_start
+            .block_count
+            .checked_mul(state.log_block_size)
+            .and_then(|group_len| state.offset.checked_add(group_len))
+        else {
+            self.recycle_buf(first_block);
+            return Err(log_file_corrupted());
+        };
+        if group_end_offset > state.scan_end_offset {
+            self.recycle_buf(first_block);
+            return Err(log_file_corrupted());
+        }
 
         let mut payload = Vec::with_capacity(group_start.payload_len);
         if !append_block_payload(
@@ -411,14 +426,14 @@ impl RedoLogStream {
                 .checked_mul(state.log_block_size)
                 .and_then(|delta| state.offset.checked_add(delta))
             else {
-                return state.incomplete_group_result();
+                return Err(log_file_corrupted());
             };
-            let Some(block) = self
+            if block_offset >= state.scan_end_offset {
+                return Err(log_file_corrupted());
+            }
+            let block = self
                 .recv_expected_block(state.file_seq, block_offset)
-                .await?
-            else {
-                return state.incomplete_group_result();
-            };
+                .await?;
             let append_res = state.append_continuation_payload(
                 block.as_bytes(),
                 &mut payload,
@@ -459,22 +474,20 @@ impl RedoLogStream {
         &mut self,
         expected_file_seq: u32,
         expected_offset: usize,
-    ) -> Result<Option<DirectBuf>> {
+    ) -> Result<DirectBuf> {
         match self.recv_item().await? {
             RedoReadItem::Block {
                 file_seq,
                 offset,
                 buf,
-            } if file_seq == expected_file_seq && offset == expected_offset => Ok(Some(buf)),
+            } if file_seq == expected_file_seq && offset == expected_offset => Ok(buf),
             RedoReadItem::Block { buf, .. } => {
                 self.recycle_buf(buf);
                 Err(log_file_corrupted())
             }
-            RedoReadItem::SegmentEnd { file_seq } if file_seq == expected_file_seq => Ok(None),
-            RedoReadItem::SegmentEnd { .. } | RedoReadItem::SegmentStart(_) => {
+            RedoReadItem::SegmentEnd { .. } | RedoReadItem::SegmentStart(_) | RedoReadItem::End => {
                 Err(log_file_corrupted())
             }
-            RedoReadItem::End => Ok(None),
             RedoReadItem::Error(err) => Err(err),
         }
     }
@@ -859,13 +872,12 @@ impl RedoReadAheadWorker {
             if self.stopped() {
                 return false;
             }
-            match self.items.try_send(item) {
+            match self.items.send_timeout(item, REDO_READ_AHEAD_SEND_TIMEOUT) {
                 Ok(()) => return true,
-                Err(TrySendError::Full(returned)) => {
+                Err(SendTimeoutError::Timeout(returned)) => {
                     item = returned;
-                    yield_now();
                 }
-                Err(TrySendError::Disconnected(_)) => return false,
+                Err(SendTimeoutError::Disconnected(_)) => return false,
             }
         }
     }
@@ -1044,15 +1056,6 @@ impl SegmentReadState {
     }
 
     #[inline]
-    fn incomplete_group_result(&self) -> Result<ReadGroup> {
-        if self.sealed.is_some() {
-            Err(log_file_corrupted())
-        } else {
-            Ok(ReadGroup::ReplayEof)
-        }
-    }
-
-    #[inline]
     fn incomplete_continuation_result(&self) -> Result<ContinuationRead> {
         if self.sealed.is_some() {
             Err(log_file_corrupted())
@@ -1211,9 +1214,10 @@ mod tests {
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };
     use crate::serde::Ser;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::io::Write;
     use std::path::Path;
+    use std::thread::spawn;
 
     const TEST_FILE_SEQ: u32 = 0;
 
@@ -1309,6 +1313,65 @@ mod tests {
         stream
     }
 
+    fn injected_segment(data_block_count: usize) -> RedoLogSegment {
+        let file_max_size = REDO_DEFAULT_DATA_START_OFFSET + data_block_count * STORAGE_SECTOR_SIZE;
+        RedoLogSegment {
+            path: PathBuf::from("injected.log"),
+            file_seq: TEST_FILE_SEQ,
+            super_block: RedoSuperBlock::initial(TEST_FILE_SEQ, STORAGE_SECTOR_SIZE, file_max_size),
+        }
+    }
+
+    fn injected_stream(items: Vec<RedoReadItem>) -> RedoLogStream {
+        let capacity = items.len().max(1);
+        let (items_tx, items_rx) = flume::bounded(capacity);
+        for item in items {
+            assert!(items_tx.send(item).is_ok());
+        }
+        drop(items_tx);
+        let (recycle_tx, _recycle_rx) = flume::bounded(capacity);
+        let (stop_tx, _stop_rx) = flume::bounded(1);
+        RedoLogStream {
+            reader: Some(RedoReadAheadHandle {
+                items: items_rx,
+                recycle: recycle_tx,
+                stop: stop_tx,
+                join: None,
+            }),
+            current_segment: None,
+            buffer: VecDeque::new(),
+            state: RedoLogStreamState::Active,
+        }
+    }
+
+    #[test]
+    fn test_read_ahead_send_item_stops_while_item_queue_full() {
+        let (items_tx, items_rx) = flume::bounded(1);
+        items_tx.send(RedoReadItem::End).unwrap();
+        let (_recycle_tx, recycle_rx) = flume::bounded(1);
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        let (started_tx, started_rx) = flume::bounded(1);
+        let join = spawn(move || {
+            let mut worker = RedoReadAheadWorker {
+                segments: Vec::new(),
+                read_depth: 1,
+                items: items_tx,
+                recycle: recycle_rx,
+                stop: stop_rx,
+                stop_requested: false,
+                free: Vec::new(),
+                free_block_size: None,
+            };
+            started_tx.send(()).unwrap();
+            worker.send_item(RedoReadItem::End)
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop_tx.send(()).unwrap();
+        assert!(!join.join().unwrap());
+        assert_eq!(items_rx.len(), 1);
+    }
+
     async fn assert_stream_corrupted(stream: &mut RedoLogStream) {
         let err = stream.try_next().await.unwrap_err();
         assert_eq!(
@@ -1364,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_stream_treats_incomplete_unsealed_group_as_eof() {
+    fn test_direct_stream_rejects_unsealed_group_crossing_segment_end() {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let file_path = dir.path().join("test.log");
@@ -1373,6 +1436,24 @@ mod tests {
                 &file_path,
                 STORAGE_SECTOR_SIZE,
                 1,
+                &[block],
+                TestSegmentSeal::Open,
+            );
+
+            assert_stream_corrupted(&mut stream).await;
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_treats_in_range_zero_continuation_as_incomplete_tail() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let block = two_block_start_only();
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                2,
                 &[block],
                 TestSegmentSeal::Open,
             );
@@ -1447,6 +1528,48 @@ mod tests {
             let (skipped_max_recovered_cts, mut stream) =
                 planner.plan_stream(TrxID::new(0), 1).unwrap();
             assert_eq!(skipped_max_recovered_cts, None);
+
+            assert_stream_corrupted(&mut stream).await;
+            let err = stream.try_next().await.unwrap_err();
+            assert_read_after_failed(err);
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_rejects_early_segment_end_while_waiting_for_continuation() {
+        smol::block_on(async {
+            let block = two_block_start_only();
+            let mut stream = injected_stream(vec![
+                RedoReadItem::SegmentStart(injected_segment(2)),
+                RedoReadItem::Block {
+                    file_seq: TEST_FILE_SEQ,
+                    offset: REDO_DEFAULT_DATA_START_OFFSET,
+                    buf: block,
+                },
+                RedoReadItem::SegmentEnd {
+                    file_seq: TEST_FILE_SEQ,
+                },
+            ]);
+
+            assert_stream_corrupted(&mut stream).await;
+            let err = stream.try_next().await.unwrap_err();
+            assert_read_after_failed(err);
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_rejects_early_end_while_waiting_for_continuation() {
+        smol::block_on(async {
+            let block = two_block_start_only();
+            let mut stream = injected_stream(vec![
+                RedoReadItem::SegmentStart(injected_segment(2)),
+                RedoReadItem::Block {
+                    file_seq: TEST_FILE_SEQ,
+                    offset: REDO_DEFAULT_DATA_START_OFFSET,
+                    buf: block,
+                },
+                RedoReadItem::End,
+            ]);
 
             assert_stream_corrupted(&mut stream).await;
             let err = stream.try_next().await.unwrap_err();

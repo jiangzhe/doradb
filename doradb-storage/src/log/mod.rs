@@ -4121,6 +4121,10 @@ mod tests {
                 log_recs += 1;
             }
             println!("total log records {}", log_recs);
+            assert!(
+                log_recs > 0,
+                "direct redo stream should produce at least one record"
+            );
 
             drop(engine);
         });
