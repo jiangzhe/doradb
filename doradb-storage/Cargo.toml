@@ -37,7 +37,6 @@ toml = { workspace = true }
 byte-unit = { workspace = true }
 ahash = { workspace = true }
 glob = { workspace = true }
-memmap2 = { workspace = true }
 futures = { workspace = true }
 scopeguard = { workspace = true }
 blake3 = { workspace = true }

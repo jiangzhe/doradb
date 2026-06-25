@@ -7,7 +7,7 @@ use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
-use crate::recovery::stream::RedoLogStream;
+use crate::recovery::stream::RedoReplayPlanner;
 use crate::trx::sys::TransactionSystem;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
@@ -56,6 +56,8 @@ pub(crate) struct CatalogCheckpointBatch {
 pub(crate) struct CatalogCheckpointScanConfig {
     /// Redo log file prefix used to discover scan inputs.
     pub(crate) file_prefix: String,
+    /// Maximum direct-IO read-ahead depth for redo scan input.
+    pub(crate) read_ahead_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -266,7 +268,7 @@ impl Catalog {
     )]
     pub(crate) async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
-        let batch = self.scan_checkpoint_batch(trx_sys)?;
+        let batch = self.scan_checkpoint_batch(trx_sys).await?;
         match self.apply_checkpoint_batch(batch).await {
             Ok(()) => {
                 trx_sys.request_dropped_table_purge();
@@ -287,7 +289,7 @@ impl Catalog {
     /// Scanned batches are intended for single-flight publish flow and must not
     /// be raced with other catalog checkpoint publishes against the same shared
     /// `CatalogStorage`/`MultiTableFile` writer.
-    pub(crate) fn scan_checkpoint_batch(
+    pub(crate) async fn scan_checkpoint_batch(
         &self,
         trx_sys: &TransactionSystem,
     ) -> Result<CatalogCheckpointBatch> {
@@ -298,10 +300,11 @@ impl Catalog {
             trx_sys.persisted_watermark_cts(),
             &scan_cfg,
         )
+        .await
     }
 
     /// Scan catalog redo logs with an explicit replay window and log prefix.
-    pub(crate) fn scan_checkpoint_batch_with_config(
+    pub(crate) async fn scan_checkpoint_batch_with_config(
         &self,
         replay_start_ts: TrxID,
         durable_upper_cts: TrxID,
@@ -327,10 +330,10 @@ impl Catalog {
         if logs.is_empty() {
             return Ok(batch);
         }
-        let mut stream = RedoLogStream::new(logs);
-        stream.plan_replay(replay_start_ts)?;
+        let planner = RedoReplayPlanner::new(logs);
+        let (_, mut stream) = planner.plan_stream(replay_start_ts, scan_cfg.read_ahead_depth)?;
 
-        while let Some(log) = stream.try_next()? {
+        while let Some(log) = stream.try_next().await? {
             let (header, redo) = log.into_inner();
             if header.cts < replay_start_ts {
                 // Older records are already represented by the current

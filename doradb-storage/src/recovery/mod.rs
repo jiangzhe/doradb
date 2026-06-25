@@ -26,6 +26,7 @@ use crate::catalog::{
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
+use crate::log::RedoLogInitializer;
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::map::{FastHashMap, FastHashSet};
@@ -33,7 +34,7 @@ use crate::row::RowPage;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::purge::DroppedTableFileDeleteItem;
-use stream::RedoLogStream;
+use stream::RedoReplayPlanner;
 
 use error_stack::Report;
 pub(crate) use resources::{RecoveryBuffers, RecoveryResources};
@@ -48,12 +49,16 @@ enum UserTableRedoAction {
     SkipCheckpointCoveredUnknownTable,
 }
 
-/// Recovery coordinator for checkpoint bootstrap, redo replay, and final repair.
+/// Recovery coordinator for checkpoint bootstrap, redo replay, final repair, and redo startup.
 pub(crate) struct RecoveryCoordinator<'a> {
     /// Catalog, table files, and buffer-pool resources used by recovery.
     resources: RecoveryResources<'a>,
-    /// Ordered single redo-log stream.
-    redo_stream: RedoLogStream,
+    /// Planner for the ordered redo-log stream.
+    redo_planner: RedoReplayPlanner,
+    /// Direct-IO read-ahead depth used by startup redo recovery.
+    redo_read_depth: usize,
+    /// Value-only initializer for the writable redo log created after recovery.
+    initializer: RedoLogInitializer,
     /// Replay cursors, per-table bounds, and recovered CTS watermark.
     timeline: RecoveryTimeline,
     /// Tables loaded from table-file metadata while catalog index DDL redo is pending.
@@ -66,12 +71,19 @@ pub(crate) struct RecoveryCoordinator<'a> {
 }
 
 impl<'a> RecoveryCoordinator<'a> {
-    /// Create a recovery coordinator from prepared resources and redo stream.
+    /// Create a recovery coordinator from prepared resources and redo startup state.
     #[inline]
-    pub(crate) fn new(resources: RecoveryResources<'a>, redo_stream: RedoLogStream) -> Self {
+    pub(crate) fn new(
+        resources: RecoveryResources<'a>,
+        redo_planner: RedoReplayPlanner,
+        redo_read_depth: usize,
+        initializer: RedoLogInitializer,
+    ) -> Self {
         RecoveryCoordinator {
             resources,
-            redo_stream,
+            redo_planner,
+            redo_read_depth,
+            initializer,
             timeline: RecoveryTimeline::new(MIN_SNAPSHOT_TS),
             pending_index_ddl_reconciliations: FastHashSet::default(),
             recovered_tables: FastHashMap::default(),
@@ -79,16 +91,21 @@ impl<'a> RecoveryCoordinator<'a> {
         }
     }
 
-    /// Replay redo, rebuild indexes, and return recovery outcomes.
+    /// Replay redo, rebuild indexes, and return recovery outcomes plus redo startup.
     #[inline]
-    pub(crate) async fn recover_all(mut self) -> Result<(TrxID, Vec<DroppedTableFileDeleteItem>)> {
+    pub(crate) async fn recover_all(
+        mut self,
+    ) -> Result<(TrxID, Vec<DroppedTableFileDeleteItem>, RedoLogInitializer)> {
         self.bootstrap_checkpointed_user_tables().await?;
-        if let Some(skipped_max_cts) = self.redo_stream.plan_replay(self.timeline.replay_floor)? {
+        let (skipped_max_recovered_cts, mut redo_stream) = self
+            .redo_planner
+            .plan_stream(self.timeline.replay_floor, self.redo_read_depth)?;
+        if let Some(skipped_max_cts) = skipped_max_recovered_cts {
             self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(skipped_max_cts);
         }
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
-        while let Some(log) = self.redo_stream.try_next()? {
+        while let Some(log) = redo_stream.try_next().await? {
             self.replay_log(log).await?;
         }
         // 2. Ensure catalog metadata caught up with table-file roots.
@@ -103,6 +120,7 @@ impl<'a> RecoveryCoordinator<'a> {
         Ok((
             self.timeline.max_recovered_cts,
             self.dropped_table_file_deletes,
+            self.initializer,
         ))
     }
 
@@ -924,7 +942,9 @@ mod tests {
             )
             .trx(
                 TrxSysConfig::default()
-                    .io_depth(1)
+                    .log_write_io_depth(1)
+                    .recovery_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
                     .log_file_stem(log_file_stem)
                     .purge_threads(1),
             )
@@ -941,7 +961,9 @@ mod tests {
     ) -> EngineConfig {
         lightweight_recovery_engine_config(main_dir, log_file_stem).trx(
             TrxSysConfig::default()
-                .io_depth(1)
+                .log_write_io_depth(1)
+                .recovery_io_depth(1)
+                .catalog_checkpoint_scan_io_depth(1)
                 .log_block_size(CORRUPTION_RECOVERY_LOG_BLOCK_SIZE)
                 .log_file_stem(log_file_stem)
                 .log_file_max_size(CORRUPTION_RECOVERY_LOG_FILE_MAX_SIZE)
@@ -1073,7 +1095,7 @@ mod tests {
         );
         let resources =
             RecoveryResources::new(buffers, engine.inner().table_fs.clone(), engine.catalog());
-        let (mut recovery, _initializer) = engine
+        let mut recovery = engine
             .inner()
             .trx_sys
             .config

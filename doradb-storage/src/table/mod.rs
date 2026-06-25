@@ -1718,7 +1718,9 @@ pub(crate) mod tests {
             )
             .trx(
                 TrxSysConfig::default()
-                    .io_depth(1)
+                    .log_write_io_depth(1)
+                    .recovery_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
                     .log_file_stem(log_file_stem)
                     .purge_threads(1),
             )

@@ -32,8 +32,8 @@ Main source files:
 - `recovery/`: startup recovery orchestration, checkpoint bootstrap, replay
   bounds, row-page recovery state, post-replay validation, and hot-state
   rebuild.
-- `recovery/redo_stream.rs`: replay planning, mmap reader, segment validation,
-  and redo record draining.
+- `recovery/stream.rs`: replay planning, direct-IO read-ahead transport,
+  segment validation, and redo record draining.
 - `catalog/checkpoint.rs`: catalog checkpoint scanning over durable redo.
 
 ## File Family
@@ -64,7 +64,9 @@ redo files are invalid. The configured defaults are:
 - `log_file_stem = "redo.log"`
 - `log_file_max_size = 1 GiB`
 - `log_block_size = 4096`
-- `io_depth = 32`
+- `log_write_io_depth = 32`
+- `recovery_io_depth = 32`
+- `catalog_checkpoint_scan_io_depth = 32`
 - `log_sync = fsync`
 
 Each log file is created as an `O_DIRECT` sparse file and truncated to the
@@ -337,34 +339,37 @@ replay-relevant records. The initializer derives the next writable file sequence
 from the newest discovered file before replay, so normal runtime opens a fresh
 file after recovery even if every planned segment was skipped.
 
-`MmapLogReader` maps one planned file, uses the selected valid redo super-block
-slot, and reads groups from the fixed `REDO_DEFAULT_DATA_START_OFFSET`.
-For each group:
+`RedoLogStream` starts one short-lived direct-IO read-ahead worker for the
+planned segment suffix. The worker opens each planned file with direct IO,
+submits fixed-size `log_block_size` reads through the backend-neutral
+submission driver, bounds in-flight reads by the stream's configured read-ahead
+depth, and emits completed blocks in logical segment/offset order.
+`RedoLogStream` owns the semantic parser: it consumes segment markers and
+ordered blocks, validates fixed-block headers/checksums/padding, assembles
+complete logical redo groups, validates sealed segment CTS ranges, and only
+then exposes strict `TrxLog` records.
+For each planned segment:
 
 - if an unsealed group offset reaches the header's `file_max_size`, the file is
   exhausted;
 - if a sealed group offset reaches `durable_end_offset`, the file is exhausted
   after the scanned group-header CTS range matches the sealed super-block
   range;
-- if the 28-byte group header is all zeros, replay treats an unsealed file as
-  ended and treats a sealed file as corrupted before `durable_end_offset`;
-- nonzero group headers are parsed and checked before transaction parsing;
-- `body_len == 0`, invalid CTS ranges, physical lengths that cross
-  the unsealed `file_max_size` or sealed `durable_end_offset`, missing mapped
-  bytes, checksum mismatches, and sealed range mismatches report
-  `LogFileCorrupted`;
-- checksum validation covers bytes `4..physical_len`, including zero padding;
-- only after checksum validation does the reader expose
-  `group_bytes[28..28 + body_len]` to transaction parsing;
-- if the group physical length fits within one header `log_block_size` block,
-  reader offset advances by `log_block_size`;
-- if the group physical length exceeds one page, reader offset advances by the
-  sector-aligned group length.
+- if an idle fixed block is all zeros, replay treats an unsealed file as ended
+  and treats a sealed file as corrupted before `durable_end_offset`;
+- block headers, block checksums, payload lengths, continuation order, group
+  start metadata, zero padding, and sealed range metadata are checked before
+  transaction parsing;
+- missing blocks, short direct reads, checksum mismatches, malformed fixed-block
+  metadata, invalid transaction frames, and sealed range mismatches report
+  `LogFileCorrupted` or an IO error according to the failure boundary;
+- an incomplete open group in an unsealed file is discarded as the crash tail,
+  while the same condition in a sealed file is corruption.
 
 Sealed empty files are skipped during replay planning because they contain no
 redo headers and make no timestamp contribution. Sealed non-empty files whose
-`max_redo_cts < replay_floor` are skipped without mmap/group parsing, and their
-`max_redo_cts` still contributes to recovery timestamp seeding. Because
+`max_redo_cts < replay_floor` are skipped without direct block scanning, and
+their `max_redo_cts` still contributes to recovery timestamp seeding. Because
 `replay_floor` is the minimum of the catalog and loaded-table replay
 boundaries, any low loaded-table heap or delete boundary keeps older sealed
 segments scan-relevant. A sealed file whose range reaches the replay floor,
@@ -415,14 +420,18 @@ The redo path is intentionally separate from table-file and buffer-pool IO.
 - Direct buffers and file offsets must be sector-aligned.
 - `Log-Thread` owns the redo submission driver; there is no nested redo IO
   worker thread.
-- The backend IO depth is bounded by `io_depth` for the single redo log stream.
+- The backend IO depth is bounded by `log_write_io_depth`.
 - Sync is done above the backend driver after an ordered write prefix finishes.
 - Shutdown closes group-commit admission, wakes and joins `Log-Thread`, then
   stops cleanup and purge in that order.
 
 Read IO is different:
 
-- recovery and catalog checkpoint scans use synchronous mmap-backed reads;
+- recovery and catalog checkpoint scans use a short-lived direct-IO read-ahead
+  worker with bounded ordered block delivery;
+- startup recovery read-ahead is bounded by `recovery_io_depth`;
+- catalog checkpoint redo scans are bounded by
+  `catalog_checkpoint_scan_io_depth`;
 - replay is logically sequential today; and
 - DML replay has a future dispatch boundary, but currently runs sequentially.
 
@@ -460,7 +469,8 @@ recent log writes.
 - Old log files are not physically truncated or deleted by the current redo
   path. Checkpoint metadata narrows replay logically, and recovery can skip
   validated sealed files whose CTS range is fully below the replay floor.
-- `MmapLogReader` can block the async runtime through page faults or file access.
+- Redo read-ahead is direct-IO based and bounded by the scan-specific configured
+  read-ahead depth; parsing and replay remain sequential.
 - A single large transaction can exceed `log_block_size` and is written as one
   large direct IO request.
 - `persisted_cts` is an ordered-completion watermark. It can advance across
@@ -506,9 +516,9 @@ separate large-record format would make memory and IO behavior easier to bound.
 
 ### Read and Recovery Path
 
-Replace mmap recovery reads with an async-friendly reader or a dedicated
-blocking reader thread. This is already tracked by
-`docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`.
+Parallel redo parsing or replay should build on the split between direct-IO
+read-ahead and `RedoLogStream` parsing. The current implementation keeps replay
+sequential.
 
 Add durable first-retained-sequence metadata before implementing physical redo
 file truncation. Without that metadata, missing prefix sequences remain

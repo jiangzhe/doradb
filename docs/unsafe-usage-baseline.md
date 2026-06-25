@@ -17,8 +17,8 @@
 | lwc | 2 | 0 | 0 | 0 | 0 | 0 |
 | file | 8 | 13 | 0 | 0 | 2 | 13 |
 | log | 6 | 0 | 0 | 0 | 0 | 0 |
-| recovery | 5 | 3 | 0 | 0 | 0 | 3 |
-| **total** | **77** | **150** | **0** | **0** | **6** | **130** |
+| recovery | 5 | 0 | 0 | 0 | 0 | 0 |
+| **total** | **77** | **147** | **0** | **0** | **6** | **127** |
 
 ## File Hotspots (top 40)
 
@@ -41,7 +41,6 @@
 | `doradb-storage/src/io/mod.rs` | io | 4 | 2 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 4 | 4 |
 | `doradb-storage/src/index/block_index_root.rs` | index | 3 | 3 |
-| `doradb-storage/src/recovery/stream.rs` | recovery | 3 | 3 |
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/frame.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/page.rs` | buffer | 2 | 1 |

@@ -33,3 +33,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000188-redo-direct-io-read-ahead-reader.md: redo recovery and catalog checkpoint scans now use the direct-IO RedoLogStream path, and MmapLogReader was removed.
+- Closed By: backlog close
+- Reference: docs/tasks/000188-redo-direct-io-read-ahead-reader.md; docs/rfcs/0021-redo-log-fixed-block-read-write-path.md Phase 3
+- Closed At: 2026-06-25

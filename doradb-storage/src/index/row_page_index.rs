@@ -1212,7 +1212,7 @@ mod tests {
     use crate::log::discover_redo_log_files;
     use crate::log::redo::DDLRedo;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
-    use crate::recovery::stream::ReadLog;
+    use crate::recovery::stream::RedoReplayPlanner;
     use crate::value::ValKind;
     use semistr::SemiStr;
     use std::future::Future;
@@ -2053,26 +2053,17 @@ mod tests {
             let file_prefix = temp_dir.path().join("redo_row_page_idx");
             let file_prefix = file_prefix.to_str().unwrap();
             let logs = discover_redo_log_files(file_prefix, false).unwrap();
-            for log in logs {
-                let mut reader = engine.inner().trx_sys.log_reader(&log.path).unwrap();
-                loop {
-                    match reader.read() {
-                        ReadLog::SizeLimit | ReadLog::DataCorrupted => panic!("invalid log data"),
-                        ReadLog::DataEnd => break,
-                        ReadLog::Iterator(mut iter) => {
-                            while let Some(log) = iter.try_next().unwrap() {
-                                if let Some(ddl) = log.payload.ddl.as_deref()
-                                    && matches!(
-                                        ddl,
-                                        DDLRedo::CreateRowPage { table_id, .. }
-                                            if *table_id == TableID::new(104)
-                                    )
-                                {
-                                    create_row_page_logs += 1;
-                                }
-                            }
-                        }
-                    }
+            let planner = RedoReplayPlanner::new(logs);
+            let (_, mut stream) = planner.plan_stream(TrxID::new(0), 1).unwrap();
+            while let Some(log) = stream.try_next().await.unwrap() {
+                if let Some(ddl) = log.payload.ddl.as_deref()
+                    && matches!(
+                        ddl,
+                        DDLRedo::CreateRowPage { table_id, .. }
+                            if *table_id == TableID::new(104)
+                    )
+                {
+                    create_row_page_logs += 1;
                 }
             }
             assert_eq!(create_row_page_logs, 1);

@@ -35,8 +35,12 @@ pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE: Byte =
 pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE: Byte =
     Byte::from_u64(1024 * 1024 * 1024);
 
-/// Default async IO depth allocated to the redo-log worker.
-pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
+/// Default async IO depth allocated to live redo-log writes.
+pub const DEFAULT_LOG_WRITE_IO_DEPTH: usize = 32;
+/// Default direct-IO read-ahead depth allocated to startup recovery.
+pub const DEFAULT_RECOVERY_IO_DEPTH: usize = 32;
+/// Default direct-IO read-ahead depth allocated to catalog checkpoint scans.
+pub const DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH: usize = 32;
 /// Default upper bound for one redo-log IO request payload.
 pub const DEFAULT_LOG_BLOCK_SIZE: Byte = Byte::from_u64(4096);
 /// Default relative directory where redo log files live.

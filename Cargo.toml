@@ -24,7 +24,6 @@ toml = "1.1"
 byte-unit = { version = "5", features = ["serde"] }
 ahash = "0.8"
 glob = "0.3"
-memmap2 = "0.9"
 futures = "0.3"
 scopeguard = "1.2"
 blake3 = "1.8"
