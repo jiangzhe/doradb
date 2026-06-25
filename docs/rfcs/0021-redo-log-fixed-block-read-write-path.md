@@ -356,43 +356,57 @@ pwrite_owned}`.
   - Scope: Define the new redo data-block format, add group-start metadata and
     continuation handling, serialize strict `TrxLog` frames across fixed-size
     blocks, allocate file space in block units, rotate before groups that do
-    not fit, and reject transactions that cannot fit in an empty file.
+    not fit, reject transactions that cannot fit in an empty file, and add the
+    minimal mmap fixed-block parser needed for restart/recovery before the
+    direct-IO reader lands.
   - Goals: Make every redo payload write exactly `log_block_size`, enforce IO
     depth in block units, preserve logical group atomicity, keep ordinary
     multi-transaction groups within one block, support oversized single
-    transactions through multi-block groups, and maintain sealed file metadata
-    from complete groups only.
+    transactions through multi-block groups, maintain sealed file metadata from
+    complete groups only, and expose complete fixed-block groups through the
+    existing recovery stream contract.
   - Non-goals: Cross-file logical groups, redo log truncation, legacy-format
-    migration support, and aggressive commit-group batching policy.
+    migration support, aggressive commit-group batching policy, and replacing
+    the mmap transport.
   - Prerequisites: Phase 1 prefix scheduler can aggregate multiple block writes
     into one logical group completion.
-  - Phase-local Choices: Exact common block header fields, exact group-start
-    extension fields, whether continuation blocks carry explicit group id and
-    block index or rely on strict offset-order parsing plus checksums, checksum
-    algorithm reuse, and whether serialization streams directly into blocks or
-    uses temporary framed transaction buffers.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: pending
-  - Implementation Summary: pending
+  - Phase-local Choices: Resolved with redo file format version `3`, an
+    11-byte common block header (`checksum`, `flags`, `payload_len`,
+    `group_block_idx`), a 28-byte group-start extension
+    (`group_payload_len`, `group_block_count`, `min_redo_cts`,
+    `max_redo_cts`), per-block CRC32 only, continuation blocks identified by
+    strict offset order plus `group_block_idx`, no group id, no persisted
+    header length, no block-local version field, and direct transaction-frame
+    serialization with scratch only for frames crossing block boundaries.
+  - Task Doc: `docs/tasks/000187-redo-fixed-block-format-and-writer.md`
+  - Task Issue: `#751`
+  - Phase Status: done
+  - Implementation Summary: Implemented fixed-block redo data format and writer
+    with block-level CRC32 validation, one logical group to one-or-more
+    `log_block_size` writes, non-fatal empty-file capacity rejection with
+    failed-precommit cleanup, buffer reuse through batched free-list operations,
+    and minimal mmap fixed-block group assembly for recovery. [Task Resolve
+    Sync: docs/tasks/000187-redo-fixed-block-format-and-writer.md @
+    2026-06-25]
 
-- **Phase 3: Direct-IO Async Reader and Group Assembler**
-  - Scope: Replace `MmapLogReader` with a direct-IO fixed-block reader,
-    implement bounded prefetch, ordered block consumption, logical group
-    reassembly, incomplete-tail handling, and strict sealed-file corruption
-    handling.
+- **Phase 3: Direct-IO Async Reader Transport**
+  - Scope: Replace the mmap transport with a direct-IO fixed-block reader,
+    implement bounded prefetch, ordered block consumption, incomplete-tail
+    handling, strict sealed-file corruption handling, and recovery/checkpoint
+    scan integration over the fixed-block parser/assembler introduced in Phase
+    2.
   - Goals: Remove mmap dependence from redo recovery/checkpoint scan paths,
-    preserve recovery ordering, validate blocks before group assembly, validate
-    complete groups before transaction parsing, and expose only complete
-    `TrxLog` records to recovery.
+    preserve recovery ordering, validate blocks before exposing assembled
+    payloads, and expose only complete `TrxLog` records to recovery.
   - Non-goals: Parallel redo replay policy beyond the current recovery
     pipeline, cross-file group reassembly, and log truncation.
-  - Prerequisites: Phase 2 fixed-block format exists and recovery callers can
-    accept the new stream API or a dedicated reader service.
+  - Prerequisites: Phase 2 fixed-block format and mmap parser/assembler exist;
+    recovery callers can accept either the existing stream shape backed by
+    direct IO or a dedicated reader service.
   - Phase-local Choices: Async stream API versus dedicated read service,
-    in-memory completion buffer representation, exact EOF/tail diagnostics, and
-    how catalog checkpoint scanning is adapted so read waits do not block async
-    executor threads.
+    in-memory completion buffer representation, completion ordering/backpressure
+    policy, and how catalog checkpoint scanning is adapted so read waits do not
+    block async executor threads.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: pending

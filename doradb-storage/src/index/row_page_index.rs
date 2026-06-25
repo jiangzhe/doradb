@@ -1212,7 +1212,7 @@ mod tests {
     use crate::log::discover_redo_log_files;
     use crate::log::redo::DDLRedo;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
-    use crate::recovery::redo_stream::ReadLog;
+    use crate::recovery::stream::ReadLog;
     use crate::value::ValKind;
     use semistr::SemiStr;
     use std::future::Future;
@@ -2059,8 +2059,8 @@ mod tests {
                     match reader.read() {
                         ReadLog::SizeLimit | ReadLog::DataCorrupted => panic!("invalid log data"),
                         ReadLog::DataEnd => break,
-                        ReadLog::Some(mut group) => {
-                            while let Some(log) = group.try_next().unwrap() {
+                        ReadLog::Iterator(mut iter) => {
+                            while let Some(log) = iter.try_next().unwrap() {
                                 if let Some(ddl) = log.payload.ddl.as_deref()
                                     && matches!(
                                         ddl,

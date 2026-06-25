@@ -331,7 +331,7 @@ pub(crate) mod tests {
         let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
         let mut driver = SubmissionDriver::new(ctx);
 
-        let mut buf = buf_free_list.pop(false);
+        let mut buf = buf_free_list.pop();
         buf.reset();
         let data = b"hello, world";
         buf.truncate(data.len());
@@ -350,7 +350,7 @@ pub(crate) mod tests {
         assert_eq!(completed.submission.kind, IOKind::Write);
         assert_eq!(completed.result.unwrap(), 4096);
 
-        let mut read_buf = buf_free_list.pop(false);
+        let mut read_buf = buf_free_list.pop();
         read_buf.reset();
         assert!(
             driver

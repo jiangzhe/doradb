@@ -1,4 +1,4 @@
-pub(crate) mod buf;
+pub(crate) mod block_group;
 pub(crate) mod format;
 mod prefix;
 pub(crate) mod redo;
@@ -18,13 +18,12 @@ use crate::io::{
     Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOBuf, IOSubmission, Operation,
     StorageBackend, SubmissionDriver,
 };
-use crate::log::buf::{LogBuf, TrxLog};
+use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoSuperBlock,
     serialize_redo_super_block,
 };
 use crate::map::FastHashMap;
-use crate::serde::Ser;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, GroupCommit, MutexGroupCommit,
@@ -87,7 +86,20 @@ impl AsRawFd for RedoLogFile {
     }
 }
 
-/// Allocation and real redo CTS range for one physical redo group write.
+/// Target file allocation for one queued redo group write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RedoGroupWriteAlloc {
+    /// Redo log file sequence receiving this group.
+    pub(crate) file_seq: u32,
+    /// File descriptor used for the physical write.
+    pub(crate) fd: RawFd,
+    /// Starting byte offset of the group write.
+    pub(crate) offset: usize,
+    /// Ending byte offset after the group write.
+    pub(crate) end_offset: usize,
+}
+
+/// Allocation and real redo CTS range for one durable redo group write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RedoGroupWriteMeta {
     /// Redo log file sequence receiving this group.
@@ -102,6 +114,16 @@ pub(crate) struct RedoGroupWriteMeta {
     pub(crate) min_redo_cts: TrxID,
     /// Maximum redo CTS serialized in the group.
     pub(crate) max_redo_cts: TrxID,
+}
+
+/// Non-queued precommit transaction returned from redo group admission.
+pub(crate) struct EnqueuePrecommitError {
+    /// Transaction whose commit handoff could not be queued.
+    pub(crate) trx: Box<PrecommitTrx>,
+    /// Reason reported to the rejected transaction.
+    pub(crate) reason: FailedPrecommitReason,
+    /// Whether group-commit admission must be closed after this rejection.
+    pub(crate) close_admission: bool,
 }
 
 /// Writer-assigned identity for one physical redo IO request.
@@ -270,12 +292,12 @@ pub(crate) struct LogWriteSubmission {
 }
 
 impl LogWriteSubmission {
-    /// Create a group write submission for the given file range and direct buffer.
+    /// Create one fixed-block group write submission.
     #[inline]
-    pub(crate) fn new(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
+    pub(crate) fn group(fd: RawFd, offset: usize, buf: DirectBuf, group_write_idx: usize) -> Self {
         LogWriteSubmission {
             owner: None,
-            kind: LogWriteKind::Group,
+            kind: LogWriteKind::Group { group_write_idx },
             operation: Operation::pwrite_owned(fd, offset, buf),
         }
     }
@@ -320,7 +342,7 @@ impl LogWriteSubmission {
     fn header_completion(&self) -> Option<Arc<Completion<()>>> {
         match &self.kind {
             LogWriteKind::Header { completion } => Some(Arc::clone(completion)),
-            LogWriteKind::Group | LogWriteKind::Seal { .. } => None,
+            LogWriteKind::Group { .. } | LogWriteKind::Seal { .. } => None,
         }
     }
 
@@ -349,7 +371,7 @@ impl IOSubmission for LogWriteSubmission {
 }
 
 enum LogWriteKind {
-    Group,
+    Group { group_write_idx: usize },
     Header { completion: Arc<Completion<()>> },
     Seal { log_file: Box<RedoLogFile> },
 }
@@ -446,7 +468,7 @@ pub(crate) struct RedoLog {
     log_write_backend: CachePadded<Mutex<Option<StorageBackend>>>,
     /// Backend-owned submit/wait statistics for redo writes.
     io_backend_stats: IOBackendStatsHandle,
-    /// Log block size of each group.
+    /// Fixed byte size of every redo data-block write.
     pub(crate) log_block_size: usize,
     /// Log file prefix for the single redo file family.
     pub(crate) file_prefix: String,
@@ -454,40 +476,15 @@ pub(crate) struct RedoLog {
     pub(crate) file_seq: AtomicU32,
     /// Maximum size of single log file.
     pub(crate) file_max_size: usize,
-    /// Free list of page buffer, which is used by commit group to concat
-    /// redo logs.
+    /// Free list of reusable fixed-block write buffers returned by completed I/O.
     pub(crate) buf_free_list: FreeList<DirectBuf>,
 }
 
 impl RedoLog {
-    /// Create a new log buffer to hold one transaction's redo log.
+    /// Create a logical fixed-block group for one transaction's redo log.
     #[inline]
-    fn new_buf(&self, data: TrxLog) -> LogBuf {
-        let ser_len = data.ser_len();
-        let buf_len = LogBuf::actual_len(ser_len);
-        if buf_len > self.log_block_size {
-            // Data is longer than a normal group, so allocate a large
-            // sector-aligned direct buffer for this single transaction.
-            let mut buf = LogBuf::new(buf_len);
-            buf.append_trx_log(&data);
-            return buf;
-        }
-        if let Some(mut buf) = self.try_buf_in_free_list(ser_len) {
-            buf.append_trx_log(&data);
-            return buf;
-        }
-        let mut buf = LogBuf::new(self.log_block_size);
-        buf.append_trx_log(&data);
-        buf
-    }
-
-    #[inline]
-    fn try_buf_in_free_list(&self, ser_len: usize) -> Option<LogBuf> {
-        if LogBuf::actual_len(ser_len) <= self.log_block_size {
-            // fit buffer size in free list.
-            return self.buf_free_list.try_pop(true).map(LogBuf::with_buffer);
-        }
-        None
+    fn new_log_group(&self, data: TrxLog) -> Result<LogBlockGroup> {
+        LogBlockGroup::new(self.log_block_size, data)
     }
 
     #[inline]
@@ -534,19 +531,28 @@ impl RedoLog {
         mut trx: PrecommitTrx,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
         wait_sync: bool,
-    ) -> StdResult<CommitJoin, Box<PrecommitTrx>> {
+    ) -> StdResult<CommitJoin, EnqueuePrecommitError> {
         let cts = trx.cts;
         let log = if let Some(redo_bin) = trx.take_log() {
-            // Serialize redo log to buffer.
-            let log_buf = self.new_buf(redo_bin);
-            let Some(log_file) = group_commit_g.log_file.as_ref() else {
-                return Err(Box::new(trx));
+            let log_group = match self.new_log_group(redo_bin) {
+                Ok(log_group) => log_group,
+                Err(_) => {
+                    return Err(EnqueuePrecommitError {
+                        trx: Box::new(trx),
+                        reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                        close_admission: true,
+                    });
+                }
             };
-            let (min_redo_cts, max_redo_cts) = log_buf
-                .redo_cts_range()
-                .expect("new redo-bearing group must track a CTS range");
-            // Allocate space of log file.
-            let (file_seq, fd, offset, end_offset) = match log_file.alloc(log_buf.capacity()) {
+            let Some(log_file) = group_commit_g.log_file.as_ref() else {
+                return Err(EnqueuePrecommitError {
+                    trx: Box::new(trx),
+                    reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                    close_admission: true,
+                });
+            };
+            let group_physical_len = log_group.physical_len();
+            let (file_seq, fd, offset, end_offset) = match log_file.alloc(group_physical_len) {
                 Ok((offset, end_offset)) => (
                     log_file.file_seq(),
                     log_file.as_raw_fd(),
@@ -558,34 +564,64 @@ impl RedoLog {
                 {
                     // Rotate log file and try again.
                     if self.rotate_log_file(group_commit_g).is_err() {
-                        return Err(Box::new(trx));
+                        return Err(EnqueuePrecommitError {
+                            trx: Box::new(trx),
+                            reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                            close_admission: true,
+                        });
                     }
 
                     let Some(new_log_file) = group_commit_g.log_file.as_ref() else {
-                        return Err(Box::new(trx));
+                        return Err(EnqueuePrecommitError {
+                            trx: Box::new(trx),
+                            reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                            close_admission: true,
+                        });
                     };
-                    let Ok((offset, end_offset)) = new_log_file.alloc(log_buf.capacity()) else {
-                        return Err(Box::new(trx));
-                    };
-                    (
-                        new_log_file.file_seq(),
-                        new_log_file.as_raw_fd(),
-                        offset,
-                        end_offset,
-                    )
+                    match new_log_file.alloc(group_physical_len) {
+                        Ok((offset, end_offset)) => (
+                            new_log_file.file_seq(),
+                            new_log_file.as_raw_fd(),
+                            offset,
+                            end_offset,
+                        ),
+                        Err(err)
+                            if err.resource_error()
+                                == Some(ResourceError::StorageFileCapacityExceeded) =>
+                        {
+                            return Err(EnqueuePrecommitError {
+                                trx: Box::new(trx),
+                                reason: FailedPrecommitReason::Resource(
+                                    ResourceError::StorageFileCapacityExceeded,
+                                ),
+                                close_admission: false,
+                            });
+                        }
+                        Err(_) => {
+                            return Err(EnqueuePrecommitError {
+                                trx: Box::new(trx),
+                                reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                                close_admission: true,
+                            });
+                        }
+                    }
                 }
-                Err(_) => return Err(Box::new(trx)),
+                Err(_) => {
+                    return Err(EnqueuePrecommitError {
+                        trx: Box::new(trx),
+                        reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                        close_admission: true,
+                    });
+                }
             };
             Some(CommitGroupLog {
-                write_meta: RedoGroupWriteMeta {
+                alloc: RedoGroupWriteAlloc {
                     file_seq,
                     fd,
                     offset,
                     end_offset,
-                    min_redo_cts,
-                    max_redo_cts,
                 },
-                log_buf,
+                group: log_group,
             })
         } else {
             None
@@ -663,8 +699,8 @@ pub(crate) struct SyncGroup {
     pub(crate) log_fd: Option<RawFd>,
     /// Physical write metadata recorded after the group becomes durable.
     pub(crate) write_meta: Option<RedoGroupWriteMeta>,
-    /// Pending write submission, if this group has redo bytes.
-    pub(crate) write: Option<LogWriteSubmission>,
+    /// Pending fixed-block write submissions for this logical group.
+    pub(crate) writes: VecDeque<LogWriteSubmission>,
     /// Buffers returned by completed redo write I/O.
     pub(crate) returned_bufs: Vec<DirectBuf>,
     /// Completion notified when commit or cleanup finishes.
@@ -680,13 +716,12 @@ pub(crate) struct SyncGroup {
 impl SyncGroup {
     #[inline]
     fn take_submission(&mut self) -> Option<LogWriteSubmission> {
-        self.write.take()
+        self.writes.pop_front()
     }
 
     #[inline]
     fn restore_submission(&mut self, submission: LogWriteSubmission) {
-        debug_assert!(self.write.is_none());
-        self.write = Some(submission);
+        self.writes.push_front(submission);
     }
 
     #[inline]
@@ -705,19 +740,18 @@ impl SyncGroup {
 
     #[inline]
     fn ready(&self) -> bool {
-        self.write.is_none() && self.outstanding_requests == 0
+        self.writes.is_empty() && self.outstanding_requests == 0
     }
 
     #[inline]
     fn drain_buffers(&mut self) -> Vec<DirectBuf> {
         let mut bufs = mem::take(&mut self.returned_bufs);
-        if let Some(buf) = self
-            .write
-            .as_mut()
-            .and_then(|submission| submission.operation.take_buf())
-        {
-            bufs.push(buf);
+        for submission in &mut self.writes {
+            if let Some(buf) = submission.operation.take_buf() {
+                bufs.push(buf);
+            }
         }
+        self.writes.clear();
         bufs
     }
 
@@ -845,19 +879,42 @@ impl<'a> RedoLogWriter<'a> {
     }
 
     #[inline]
-    fn recycle_buf(&self, mut buf: DirectBuf) {
-        if buf.capacity() == self.log_block_size {
+    fn take_reusable_bufs(&self, count: usize) -> Vec<DirectBuf> {
+        self.trx_sys.redo_log.buf_free_list.pop_batch(count)
+    }
+
+    #[inline]
+    fn recycle_bufs(&self, bufs: Vec<DirectBuf>) {
+        let mut reusable = Vec::with_capacity(bufs.len());
+        for mut buf in bufs {
+            if buf.capacity() != self.log_block_size {
+                continue;
+            }
             buf.reset();
-            self.trx_sys.redo_log.buf_free_list.push(buf);
+            reusable.push(buf);
         }
+        if !reusable.is_empty() {
+            self.trx_sys.redo_log.buf_free_list.push_batch(reusable);
+        }
+    }
+
+    #[inline]
+    fn fail_queued_group(&self, mut group: CommitGroup, reason: FailedPrecommitReason) {
+        if group.trx_list.is_empty() {
+            return;
+        }
+        let trx_list = mem::take(&mut group.trx_list);
+        let completion = Arc::clone(&group.completion);
+        self.trx_sys
+            .request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
+                trx_list, completion, reason,
+            ));
     }
 
     #[inline]
     fn fail_sync_group(&self, sync_group: &mut SyncGroup, reason: FailedPrecommitReason) {
         sync_group.fail_waiters(self.trx_sys, reason);
-        for buf in sync_group.drain_buffers() {
-            self.recycle_buf(buf);
-        }
+        self.recycle_bufs(sync_group.drain_buffers());
     }
 
     /// Fail all pending redo work after a fatal storage error.
@@ -888,8 +945,7 @@ impl<'a> RedoLogWriter<'a> {
             }
         }
         for group in queued {
-            let mut sync_group = group.into_sync_group();
-            self.fail_sync_group(&mut sync_group, reason);
+            self.fail_queued_group(group, reason);
         }
     }
 
@@ -915,12 +971,7 @@ impl<'a> RedoLogWriter<'a> {
                 }
                 LogPrefixKind::Group { group } => {
                     group.fail_waiters(self.trx_sys, reason);
-                    if group.write.is_some() {
-                        recycle.extend(group.drain_buffers());
-                        group.write = None;
-                    } else {
-                        recycle.extend(group.drain_buffers());
-                    }
+                    recycle.extend(group.drain_buffers());
                     group.failure_reason.get_or_insert(reason);
                 }
                 LogPrefixKind::SealDispatch { log_file } => {
@@ -928,9 +979,7 @@ impl<'a> RedoLogWriter<'a> {
                 }
             }
         }
-        for buf in recycle {
-            self.recycle_buf(buf);
-        }
+        self.recycle_bufs(recycle);
     }
 
     #[inline]
@@ -1034,7 +1083,8 @@ impl<'a> RedoLogWriter<'a> {
                         fetched = true;
                     }
                     Some(Commit::Group(cg)) => {
-                        self.prefix.push_group(cg.into_sync_group());
+                        let sync_group = cg.into_sync_group(|count| self.take_reusable_bufs(count));
+                        self.prefix.push_group(sync_group);
                         fetched = true;
                     }
                 }
@@ -1072,7 +1122,8 @@ impl<'a> RedoLogWriter<'a> {
                     self.prefix.push_header(header_write);
                 }
                 Some(Commit::Group(cg)) => {
-                    self.prefix.push_group(cg.into_sync_group());
+                    let sync_group = cg.into_sync_group(|count| self.take_reusable_bufs(count));
+                    self.prefix.push_group(sync_group);
                 }
             }
         }
@@ -1229,9 +1280,7 @@ impl<'a> RedoLogWriter<'a> {
 
         for mut sync_group in ready.written {
             debug_assert!(sync_group.failure_reason.is_none());
-            for buf in sync_group.drain_buffers() {
-                self.recycle_buf(buf);
-            }
+            self.recycle_bufs(sync_group.drain_buffers());
             // commit transactions to let waiting read operations to continue
             let mut committed_trx_list: FastHashMap<usize, Vec<CommittedTrx>> =
                 FastHashMap::default();
@@ -1344,10 +1393,26 @@ impl<'a> RedoLogWriter<'a> {
                 break;
             }
             self.mark_prefix_submission_driver_owned(idx, owner);
-            idx += 1;
+            if !self.prefix_entry_has_pending_submission(idx) {
+                idx += 1;
+            }
         }
         sealer.stage_ready(self.write_driver);
         self.write_driver.submit_ready();
+    }
+
+    #[inline]
+    fn prefix_entry_has_pending_submission(&self, idx: usize) -> bool {
+        let entry = self
+            .prefix
+            .entries
+            .get(idx)
+            .expect("redo prefix index must be in range");
+        match &entry.kind {
+            LogPrefixKind::Header { write, .. } => write.is_some(),
+            LogPrefixKind::Group { group } => !group.writes.is_empty(),
+            LogPrefixKind::SealDispatch { .. } => false,
+        }
     }
 
     #[inline]
@@ -1395,7 +1460,9 @@ impl<'a> RedoLogWriter<'a> {
         let request_id = self.next_request_id();
         let owner = match &submission.kind {
             LogWriteKind::Header { .. } => LogRequestOwner::header(request_id, entry_id),
-            LogWriteKind::Group => LogRequestOwner::group(request_id, entry_id, 0),
+            LogWriteKind::Group { group_write_idx } => {
+                LogRequestOwner::group(request_id, entry_id, *group_write_idx)
+            }
             LogWriteKind::Seal { .. } => {
                 unreachable!("side seal submissions receive owners in the sealer")
             }
@@ -1461,7 +1528,7 @@ impl<'a> RedoLogWriter<'a> {
                     self.fail_pending(sealer, err);
                 }
             }
-            LogWriteKind::Group => {
+            LogWriteKind::Group { .. } => {
                 let owner = owner.expect("redo group completion must carry request owner");
                 debug_assert_eq!(owner.kind, LogRequestKind::Group);
                 let entry_id = owner
@@ -1516,7 +1583,10 @@ impl<'a> RedoLogWriter<'a> {
         let LogPrefixKind::Group { group } = &mut entry.kind else {
             panic!("redo group completion matched non-group prefix entry");
         };
-        debug_assert_eq!(group_write_idx, Some(0));
+        debug_assert!(
+            group_write_idx.is_some(),
+            "redo group completion must carry a physical block index"
+        );
         group.finish_request(buf);
         if let Some(source) = poison {
             group
@@ -1787,18 +1857,20 @@ mod tests {
         REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, parse_redo_super_block,
         slot_offset,
     };
-    use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind};
-    use crate::recovery::redo_stream::{ReadLog, RedoLogSegment, RedoLogStream};
+    use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
+    use crate::recovery::stream::{ReadLog, RedoLogSegment, RedoLogStream};
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
     use crate::value::Val;
     use event_listener::Event;
     use futures::task::noop_waker;
     use smol::Timer;
+    use std::collections::BTreeMap;
     use std::fmt::Debug;
     use std::fs::{self, File, OpenOptions};
     use std::future::Future;
     use std::io::{Error as IoError, Seek, SeekFrom, Write};
+    use std::iter::repeat_n;
     use std::os::fd::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard, mpsc};
@@ -1821,6 +1893,28 @@ mod tests {
             Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    fn oversized_redo_log_for_test(cts: TrxID) -> TrxLog {
+        let mut rows = BTreeMap::new();
+        let text: String = repeat_n('a', 8000).collect();
+        rows.insert(
+            RowID::new(100),
+            RowRedo {
+                page_id: test_page_id(5),
+                row_id: RowID::new(100),
+                kind: RowRedoKind::Insert(vec![Val::from(1u32), Val::from(&text[..])]),
+            },
+        );
+        let mut dml = BTreeMap::new();
+        dml.insert(TableID::new(5), TableDML { rows });
+        TrxLog::new(
+            RedoHeader {
+                cts,
+                trx_kind: RedoTrxKind::User,
+            },
+            RedoLogs { ddl: None, dml },
+        )
     }
 
     fn create_log_file_for_test(
@@ -1920,7 +2014,7 @@ mod tests {
                 assert_eq!(poison, None);
                 completion.complete(Ok(()));
             }
-            LogWriteKind::Group => panic!("expected redo header write completion"),
+            LogWriteKind::Group { .. } => panic!("expected redo header write completion"),
             LogWriteKind::Seal { .. } => panic!("expected redo header write completion"),
         }
         assert!(header_completion.completed_result().unwrap().is_ok());
@@ -2686,7 +2780,7 @@ mod tests {
                     min_redo_cts: cts,
                     max_redo_cts: cts,
                 }),
-            write: None,
+            writes: VecDeque::new(),
             returned_bufs: Vec::new(),
             completion: Arc::new(Completion::new()),
             outstanding_requests: usize::from(!ready),
@@ -2868,15 +2962,19 @@ mod tests {
                 let log_file = group_commit_g.log_file.as_ref().unwrap();
                 let log_fd = log_file.as_raw_fd();
                 let file_seq = log_file.file_seq();
-                let mut log_buf = LogBuf::new(4096);
-                log_buf.append_trx_log(&TrxLog::new(
-                    RedoHeader {
-                        cts,
-                        trx_kind: RedoTrxKind::System,
-                    },
-                    RedoLogs::default(),
-                ));
-                let (offset, _) = log_file.alloc(log_buf.capacity()).unwrap();
+                let log_group = LogBlockGroup::new(
+                    4096,
+                    TrxLog::new(
+                        RedoHeader {
+                            cts,
+                            trx_kind: RedoTrxKind::System,
+                        },
+                        RedoLogs::default(),
+                    ),
+                )
+                .unwrap();
+                let physical_len = log_group.physical_len();
+                let (offset, _) = log_file.alloc(physical_len).unwrap();
                 group_commit_g.queue.push_back(Commit::Group(CommitGroup {
                     trx_list: vec![PrecommitTrx {
                         cts,
@@ -2888,15 +2986,13 @@ mod tests {
                     }],
                     max_cts: cts,
                     log: Some(CommitGroupLog {
-                        write_meta: RedoGroupWriteMeta {
+                        alloc: RedoGroupWriteAlloc {
                             file_seq,
                             fd: log_fd,
                             offset,
-                            end_offset: offset + log_buf.capacity(),
-                            min_redo_cts: cts,
-                            max_redo_cts: cts,
+                            end_offset: offset + physical_len,
                         },
-                        log_buf,
+                        group: log_group,
                     }),
                     completion: Arc::new(Completion::new()),
                 }));
@@ -2940,6 +3036,103 @@ mod tests {
                     .load(Ordering::SeqCst),
                 cts.as_u64()
             );
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_fetch_io_reqs_materializes_group_with_recycled_redo_buffers() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("fetch_reuses_redo_buffer", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_reuse_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let redo_log = &*harness.trx_sys.redo_log;
+            let cts = TrxID::new(58);
+
+            {
+                let mut group_commit_g = redo_log.group_commit.lock();
+                let log_file = group_commit_g.log_file.as_ref().unwrap();
+                let file_seq = log_file.file_seq();
+                let log_fd = log_file.as_raw_fd();
+                let log_group = LogBlockGroup::new(4096, oversized_redo_log_for_test(cts)).unwrap();
+                let physical_len = log_group.physical_len();
+                assert!(physical_len > 4096);
+                let (offset, _) = log_file.alloc(physical_len).unwrap();
+                group_commit_g.queue.push_back(Commit::Group(CommitGroup {
+                    trx_list: vec![PrecommitTrx {
+                        cts,
+                        redo_bin: None,
+                        payload: None,
+                        attachment: None,
+                        lock_manager: None,
+                        lock_state: None,
+                    }],
+                    max_cts: cts,
+                    log: Some(CommitGroupLog {
+                        alloc: RedoGroupWriteAlloc {
+                            file_seq,
+                            fd: log_fd,
+                            offset,
+                            end_offset: offset + physical_len,
+                        },
+                        group: log_group,
+                    }),
+                    completion: Arc::new(Completion::new()),
+                }));
+            }
+
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(2).unwrap());
+            let sealer = LogFileSealer::new(&harness.trx_sys.config);
+            {
+                let mut fp = RedoLogWriter::new(
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
+                    &mut write_driver,
+                );
+                let reusable1 = DirectBuf::zeroed(4096);
+                let reusable1_ptr = reusable1.as_bytes().as_ptr() as usize;
+                let reusable2 = DirectBuf::zeroed(4096);
+                let reusable2_ptr = reusable2.as_bytes().as_ptr() as usize;
+                fp.recycle_bufs(vec![reusable1, reusable2]);
+
+                fp.fetch_io_reqs(&sealer);
+
+                let group = fp
+                    .prefix
+                    .entries
+                    .iter()
+                    .find_map(|entry| match &entry.kind {
+                        LogPrefixKind::Group { group } => Some(group),
+                        _ => None,
+                    })
+                    .expect("queued redo group must enter prefix");
+                let buf_ptrs = group
+                    .writes
+                    .iter()
+                    .map(|submission| {
+                        let buf = submission
+                            .operation
+                            .buf()
+                            .expect("group write submission must own a buffer");
+                        buf.as_bytes().as_ptr() as usize
+                    })
+                    .collect::<Vec<_>>();
+                assert!(buf_ptrs.contains(&reusable1_ptr));
+                assert!(buf_ptrs.contains(&reusable2_ptr));
+            }
+
             drop(harness);
             engine.shutdown().unwrap();
         });
@@ -3725,27 +3918,40 @@ mod tests {
         let old_log_file =
             create_log_file_for_test(file_prefix, 0, old_file_max_size, old_log_block_size);
         let cts = TrxID::new(17);
-        let mut log_buf = LogBuf::new(old_log_block_size);
-        log_buf.append_trx_log(&TrxLog::new(
-            RedoHeader {
-                cts,
-                trx_kind: RedoTrxKind::System,
-            },
-            RedoLogs::default(),
-        ));
-        let direct_buf = log_buf.finish();
-        let (group_offset, _) = old_log_file.alloc(direct_buf.capacity()).unwrap();
+        let log_group = LogBlockGroup::new(
+            old_log_block_size,
+            TrxLog::new(
+                RedoHeader {
+                    cts,
+                    trx_kind: RedoTrxKind::System,
+                },
+                RedoLogs::default(),
+            ),
+        )
+        .unwrap();
+        let blocks = log_group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(old_log_block_size))
+                    .collect()
+            })
+            .unwrap();
+        let group_len = blocks.iter().map(DirectBuf::capacity).sum();
+        let (group_offset, _) = old_log_file.alloc(group_len).unwrap();
         assert_eq!(group_offset, REDO_DEFAULT_DATA_START_OFFSET);
         let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-        assert!(
-            write_driver
-                .push_write(LogWriteSubmission::new(
-                    old_log_file.as_raw_fd(),
-                    group_offset,
-                    direct_buf,
-                ))
-                .is_ok()
-        );
+        for (idx, direct_buf) in blocks.into_iter().enumerate() {
+            assert!(
+                write_driver
+                    .push_write(LogWriteSubmission::group(
+                        old_log_file.as_raw_fd(),
+                        group_offset + idx * old_log_block_size,
+                        direct_buf,
+                        idx,
+                    ))
+                    .is_ok()
+            );
+        }
         assert_eq!(write_driver.submit_ready(), 1);
         let LogWriteCompletion {
             owner,
@@ -3754,7 +3960,7 @@ mod tests {
             poison,
         } = write_driver.wait_one();
         match kind {
-            LogWriteKind::Group => {
+            LogWriteKind::Group { .. } => {
                 drop(buf);
                 assert!(owner.is_none());
                 assert_eq!(poison, None);
@@ -3910,8 +4116,8 @@ mod tests {
                         ReadLog::SizeLimit => unreachable!(),
                         ReadLog::DataCorrupted => unreachable!(),
                         ReadLog::DataEnd => break,
-                        ReadLog::Some(mut group) => {
-                            while let Some(pod) = group.try_next().unwrap() {
+                        ReadLog::Iterator(mut iter) => {
+                            while let Some(pod) = iter.try_next().unwrap() {
                                 println!(
                                     "log {}, header={:?}, payload={:?}",
                                     log_recs, pod.header, pod.payload

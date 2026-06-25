@@ -7,7 +7,7 @@ use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
-use crate::recovery::redo_stream::RedoLogStream;
+use crate::recovery::stream::RedoLogStream;
 use crate::trx::sys::TransactionSystem;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;

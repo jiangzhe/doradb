@@ -190,7 +190,7 @@ mod tests {
             log_bytes,
             log_fd: None,
             write_meta: None,
-            write: None,
+            writes: VecDeque::new(),
             returned_bufs: Vec::new(),
             completion: Arc::new(Completion::new()),
             outstanding_requests: usize::from(!ready),

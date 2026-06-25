@@ -1,9 +1,10 @@
 use crate::error::{DataIntegrityError, InternalError, Result};
 use crate::id::TrxID;
 use crate::io::STORAGE_SECTOR_SIZE;
-use crate::log::buf::TrxLog;
+use crate::log::block_group::{TrxLog, block_count_for_payload};
 use crate::log::format::{
-    REDO_DEFAULT_DATA_START_OFFSET, RedoGroupHeader, RedoSuperBlock, select_redo_super_block,
+    REDO_DEFAULT_DATA_START_OFFSET, RedoBlockHeader, RedoGroupStartExtension, RedoSuperBlock,
+    is_zero_redo_block, select_redo_super_block,
 };
 use crate::log::{RedoLogFileDescriptor, next_redo_file_seq};
 use crate::serde::Deser;
@@ -13,38 +14,42 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{ErrorKind as IoErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::result::Result as StdResult;
 
 /// Result of reading one redo group from a log file.
-pub(crate) enum ReadLog<'a> {
+pub(crate) enum ReadLog {
     /// The current group header is all zeroes, which marks logical EOF.
     DataEnd,
     /// The configured logical file size has been reached.
     SizeLimit,
     /// The current group or file header failed integrity validation.
     DataCorrupted,
-    /// A checksum-verified group body ready for transaction iteration.
-    Some(LogGroup<'a>),
+    /// A transaction log iterator assembled from CRC32-validated redo blocks.
+    Iterator(TrxLogIterator),
 }
 
 /// Iterator over transaction redo records inside one validated redo group.
 ///
-/// The group owns no bytes; it advances through the mmap-backed body slice and
-/// enforces the commit timestamp range advertised by the group header.
-pub(crate) struct LogGroup<'a> {
+/// The group owns an assembled logical payload and enforces the commit
+/// timestamp range advertised by the group-start block.
+pub(crate) struct TrxLogIterator {
     /// Unconsumed logical body bytes.
-    data: &'a [u8],
+    data: Vec<u8>,
+    /// Current offset into `data`.
+    offset: usize,
     /// Lowest commit timestamp accepted for body records.
     min_cts: TrxID,
     /// Highest commit timestamp accepted for body records.
     max_cts: TrxID,
 }
 
-impl<'a> LogGroup<'a> {
-    /// Create a group iterator from a checksum-verified body slice.
+impl TrxLogIterator {
+    /// Create a group iterator from an assembled payload whose source blocks were validated.
     #[inline]
-    fn new(data: &'a [u8], min_cts: TrxID, max_cts: TrxID) -> Self {
-        LogGroup {
+    fn new(data: Vec<u8>, min_cts: TrxID, max_cts: TrxID) -> Self {
+        TrxLogIterator {
             data,
+            offset: 0,
             min_cts,
             max_cts,
         }
@@ -53,13 +58,13 @@ impl<'a> LogGroup<'a> {
     /// Return the next transaction frame, or `None` once the body is exhausted.
     #[inline]
     pub(crate) fn try_next(&mut self) -> Result<Option<TrxLog>> {
-        if self.data.is_empty() {
+        if self.offset == self.data.len() {
             return Ok(None);
         }
-        let (offset, res) = TrxLog::deser(self.data, 0)?;
+        let (offset, res) = TrxLog::deser(&self.data[..], self.offset)?;
         // Defensive progress check: a zero-byte parser result would make replay
         // loop forever on corrupt input.
-        if offset == 0 {
+        if offset == self.offset {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach("block=redo-group, trx parser consumed zero bytes")
                 .into());
@@ -75,7 +80,7 @@ impl<'a> LogGroup<'a> {
                 ))
                 .into());
         }
-        self.data = &self.data[offset..];
+        self.offset = offset;
         Ok(Some(res))
     }
 }
@@ -321,8 +326,8 @@ impl RedoLogStream {
                     ReadLog::DataCorrupted => {
                         return Err(Report::new(DataIntegrityError::LogFileCorrupted).into());
                     }
-                    ReadLog::Some(mut log_group) => {
-                        while let Some(res) = log_group.try_next()? {
+                    ReadLog::Iterator(mut iter) => {
+                        while let Some(res) = iter.try_next()? {
                             self.buffer.push_back(res);
                         }
                         return Ok(());
@@ -376,14 +381,14 @@ impl SealedReplayState {
     }
 
     #[inline]
-    fn record_group(&mut self, header: RedoGroupHeader) {
+    fn record_group(&mut self, min_redo_cts: TrxID, max_redo_cts: TrxID) {
         self.actual_min_cts = Some(
             self.actual_min_cts
-                .map_or(header.min_cts, |current| current.min(header.min_cts)),
+                .map_or(min_redo_cts, |current| current.min(min_redo_cts)),
         );
         self.actual_max_cts = Some(
             self.actual_max_cts
-                .map_or(header.max_cts, |current| current.max(header.max_cts)),
+                .map_or(max_redo_cts, |current| current.max(max_redo_cts)),
         );
     }
 
@@ -396,6 +401,14 @@ impl SealedReplayState {
     fn validate(self) -> bool {
         self.actual_range() == self.expected_range
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedGroupStart {
+    header: RedoBlockHeader,
+    extension: RedoGroupStartExtension,
+    block_count: usize,
+    payload_len: usize,
 }
 
 /// Memory-mapped reader for checksum-protected redo groups in one file.
@@ -458,89 +471,245 @@ impl MmapLogReader {
         })
     }
 
-    /// Return the end offset for a bounded read from the current file offset.
-    #[inline]
-    fn bounded_read_end(&self, len: usize) -> Option<usize> {
-        let end = self.offset.checked_add(len)?;
-        (end <= self.scan_end_offset).then_some(end)
-    }
-
     #[inline]
     fn validate_sealed_end(&self) -> bool {
         self.sealed.is_none_or(SealedReplayState::validate)
     }
 
-    /// Read and validate one physical redo group.
+    /// Read and validate one logical fixed-block redo group.
     ///
-    /// The body is not exposed until the header fields and whole-group checksum
-    /// have both been validated, so transaction parsing never sees bytes from a
-    /// corrupt or partially written group.
+    /// The payload is not exposed until the group-start metadata, every block
+    /// header, each block-level CRC32 checksum, continuation order, end flags,
+    /// and assembled payload length have been validated.
     #[inline]
-    pub(crate) fn read(&mut self) -> ReadLog<'_> {
-        if self.offset >= self.scan_end_offset {
-            if !self.validate_sealed_end() {
-                return ReadLog::DataCorrupted;
-            }
-            if self.sealed.is_some() {
-                return ReadLog::DataEnd;
-            }
-            return ReadLog::SizeLimit; // file is exhausted.
+    pub(crate) fn read(&mut self) -> ReadLog {
+        if let Some(result) = self.read_exhausted_result() {
+            return result;
         }
-        // Redo groups always start at sector-aligned offsets.
+        let group_start = match self.read_group_start() {
+            Ok(group_start) => group_start,
+            Err(result) => return result,
+        };
+        let payload = match self.assemble_group_payload(&group_start) {
+            Ok(payload) => payload,
+            Err(result) => return result,
+        };
+        self.finish_group_read(group_start, payload)
+    }
+
+    #[inline]
+    fn read_exhausted_result(&self) -> Option<ReadLog> {
+        if self.offset < self.scan_end_offset {
+            return None;
+        }
+        if !self.validate_sealed_end() {
+            return Some(ReadLog::DataCorrupted);
+        }
+        if self.sealed.is_some() {
+            return Some(ReadLog::DataEnd);
+        }
+        Some(ReadLog::SizeLimit)
+    }
+
+    #[inline]
+    fn block_at(&self, offset: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(self.log_block_size)?;
+        if end > self.scan_end_offset {
+            return None;
+        }
+        self.m.get(offset..end)
+    }
+
+    #[inline]
+    fn read_group_start(&self) -> StdResult<ValidatedGroupStart, ReadLog> {
+        // Redo groups always start at fixed-block-aligned offsets.
         debug_assert!(self.offset.is_multiple_of(STORAGE_SECTOR_SIZE));
-        let Some(header_end) = self.bounded_read_end(RedoGroupHeader::SIZE) else {
-            return ReadLog::DataCorrupted;
+        let Some(block) = self.block_at(self.offset) else {
+            return Err(ReadLog::DataCorrupted);
         };
-        let Some(header_bytes) = self.m.get(self.offset..header_end) else {
-            return ReadLog::DataCorrupted;
-        };
-        let Ok((idx, header)) = RedoGroupHeader::deser(header_bytes, 0) else {
-            return ReadLog::DataCorrupted;
-        };
-        debug_assert_eq!(idx, RedoGroupHeader::SIZE);
-        if header.is_zero_eof() {
+        if is_zero_redo_block(block) {
             if self.sealed.is_some() {
-                return ReadLog::DataCorrupted;
+                return Err(ReadLog::DataCorrupted);
             }
-            return ReadLog::DataEnd;
+            return Err(ReadLog::DataEnd);
         }
-        if header.validate().is_err() {
-            return ReadLog::DataCorrupted;
+        let Ok((idx, header)) = RedoBlockHeader::deser(block, 0) else {
+            return Err(ReadLog::DataCorrupted);
+        };
+        debug_assert_eq!(idx, RedoBlockHeader::SIZE);
+        if header.verify_checksum(block).is_err()
+            || header.validate(self.log_block_size).is_err()
+            || !header.is_group_start()
+        {
+            return Err(ReadLog::DataCorrupted);
         }
-        // The header determines how many physical bytes must be present and
-        // covered by the checksum, including sector padding for large groups.
-        let Ok(physical_len) = header.physical_len(self.log_block_size) else {
-            return ReadLog::DataCorrupted;
+        let Ok((extension_end, extension)) = RedoGroupStartExtension::deser(block, idx) else {
+            return Err(ReadLog::DataCorrupted);
         };
-        let Some(read_end) = self.bounded_read_end(physical_len) else {
-            return ReadLog::DataCorrupted;
-        };
-        let Some(buf) = self.m.get(self.offset..read_end) else {
-            return ReadLog::DataCorrupted;
-        };
-        if header.verify_checksum(buf).is_err() {
-            return ReadLog::DataCorrupted;
+        debug_assert_eq!(
+            extension_end,
+            RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE
+        );
+        if extension.validate().is_err() {
+            return Err(ReadLog::DataCorrupted);
         }
-        // Only the logical body is handed to `LogGroup`; padding stays part of
-        // the checksum domain but is not parsed as transaction data.
-        let Ok(body_len) = header.body_len_usize() else {
-            return ReadLog::DataCorrupted;
+        let Ok(payload_len) = extension.group_payload_len_usize() else {
+            return Err(ReadLog::DataCorrupted);
         };
-        let Some(body_end) = RedoGroupHeader::SIZE.checked_add(body_len) else {
-            return ReadLog::DataCorrupted;
+        let Ok(expected_block_count) = block_count_for_payload(self.log_block_size, payload_len)
+        else {
+            return Err(ReadLog::DataCorrupted);
         };
-        let Some(body) = buf.get(RedoGroupHeader::SIZE..body_end) else {
-            return ReadLog::DataCorrupted;
+        let block_count = extension.group_block_count_usize();
+        if expected_block_count != block_count {
+            return Err(ReadLog::DataCorrupted);
+        }
+        if block_count == 1 && !header.is_group_end() {
+            return Err(ReadLog::DataCorrupted);
+        }
+        if block_count > 1 && header.is_group_end() {
+            return Err(ReadLog::DataCorrupted);
+        }
+        Ok(ValidatedGroupStart {
+            header,
+            extension,
+            block_count,
+            payload_len,
+        })
+    }
+
+    #[inline]
+    fn assemble_group_payload(
+        &self,
+        group_start: &ValidatedGroupStart,
+    ) -> StdResult<Vec<u8>, ReadLog> {
+        let Some(block) = self.block_at(self.offset) else {
+            return Err(ReadLog::DataCorrupted);
         };
+        let mut payload = Vec::with_capacity(group_start.payload_len);
+        if !append_block_payload(
+            block,
+            self.log_block_size,
+            group_start.header,
+            RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE,
+            group_start.block_count == 1,
+            &mut payload,
+        ) {
+            return Err(ReadLog::DataCorrupted);
+        }
+        for expected_idx in 1..group_start.block_count {
+            self.append_continuation_payload(&mut payload, expected_idx, group_start.block_count)?;
+        }
+        if payload.len() != group_start.payload_len {
+            return Err(ReadLog::DataCorrupted);
+        }
+        Ok(payload)
+    }
+
+    #[inline]
+    fn append_continuation_payload(
+        &self,
+        payload: &mut Vec<u8>,
+        expected_idx: usize,
+        block_count: usize,
+    ) -> StdResult<(), ReadLog> {
+        let Some(block_offset) = expected_idx
+            .checked_mul(self.log_block_size)
+            .and_then(|delta| self.offset.checked_add(delta))
+        else {
+            return Err(self.incomplete_group_result());
+        };
+        let Some(block) = self.block_at(block_offset) else {
+            return Err(self.incomplete_group_result());
+        };
+        if is_zero_redo_block(block) {
+            return Err(self.incomplete_group_result());
+        }
+        let Ok((idx, header)) = RedoBlockHeader::deser(block, 0) else {
+            return Err(self.incomplete_group_result());
+        };
+        debug_assert_eq!(idx, RedoBlockHeader::SIZE);
+        if header.verify_checksum(block).is_err() {
+            return Err(self.incomplete_group_result());
+        }
+        if header.validate(self.log_block_size).is_err()
+            || header.is_group_start()
+            || header.group_block_idx as usize != expected_idx
+        {
+            return Err(ReadLog::DataCorrupted);
+        }
+        let final_block = expected_idx + 1 == block_count;
+        if header.is_group_end() != final_block {
+            return Err(ReadLog::DataCorrupted);
+        }
+        if !append_block_payload(
+            block,
+            self.log_block_size,
+            header,
+            RedoBlockHeader::SIZE,
+            final_block,
+            payload,
+        ) {
+            return Err(ReadLog::DataCorrupted);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn finish_group_read(&mut self, group_start: ValidatedGroupStart, payload: Vec<u8>) -> ReadLog {
+        let extension = group_start.extension;
         if let Some(sealed) = self.sealed.as_mut() {
-            sealed.record_group(header);
+            sealed.record_group(extension.min_redo_cts, extension.max_redo_cts);
         }
-        self.offset += physical_len;
+        self.offset += group_start.block_count * self.log_block_size;
         if self.offset == self.scan_end_offset && !self.validate_sealed_end() {
             return ReadLog::DataCorrupted;
         }
-        ReadLog::Some(LogGroup::new(body, header.min_cts, header.max_cts))
+        ReadLog::Iterator(TrxLogIterator::new(
+            payload,
+            extension.min_redo_cts,
+            extension.max_redo_cts,
+        ))
     }
+
+    #[inline]
+    fn incomplete_group_result(&self) -> ReadLog {
+        if self.sealed.is_some() {
+            ReadLog::DataCorrupted
+        } else {
+            ReadLog::DataEnd
+        }
+    }
+}
+
+#[inline]
+fn append_block_payload(
+    block: &[u8],
+    log_block_size: usize,
+    header: RedoBlockHeader,
+    payload_start: usize,
+    final_block: bool,
+    out: &mut Vec<u8>,
+) -> bool {
+    let payload_len = header.payload_len_usize();
+    let payload_end = match payload_start.checked_add(payload_len) {
+        Some(payload_end) if payload_end <= log_block_size => payload_end,
+        _ => return false,
+    };
+    if !final_block {
+        let capacity = log_block_size - payload_start;
+        if payload_len != capacity {
+            return false;
+        }
+    }
+    if block[payload_end..log_block_size]
+        .iter()
+        .any(|&byte| byte != 0)
+    {
+        return false;
+    }
+    out.extend_from_slice(&block[payload_start..payload_end]);
+    true
 }
 
 #[cfg(test)]
@@ -549,11 +718,14 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::id::{RowID, TableID, TrxID};
     use crate::io::{DirectBuf, IOBuf};
-    use crate::log::buf::LogBuf;
+    use crate::log::block_group::LogBlockGroup;
+    use crate::log::format::{
+        REDO_BLOCK_GROUP_START, patch_redo_block_checksum, redo_start_block_payload_capacity,
+    };
     use crate::log::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };
-    use crate::serde::{Ser, Serde};
+    use crate::serde::Ser;
     use std::collections::BTreeMap;
     use std::io::Write;
 
@@ -612,15 +784,37 @@ mod tests {
         file.flush().unwrap();
     }
 
-    fn log_buf_with_header_range(log: &TrxLog, min_cts: TrxID, max_cts: TrxID) -> DirectBuf {
-        let body_len = log.ser_len();
-        let mut buf = LogBuf::new(STORAGE_SECTOR_SIZE);
-        buf.append_trx_log(log);
-        let mut direct_buf = buf.finish();
-        let header = RedoGroupHeader::new(body_len, min_cts, max_cts);
-        header.ser(direct_buf.as_bytes_mut(), 0);
-        RedoGroupHeader::patch_checksum(direct_buf.as_bytes_mut()).unwrap();
+    fn block_group_with_range(log: TrxLog, min_cts: TrxID, max_cts: TrxID) -> DirectBuf {
+        let payload_len = log.ser_len();
+        let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
+        let mut blocks = group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .collect()
+            })
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
+        let mut direct_buf = blocks.pop().unwrap();
+        RedoGroupStartExtension::new(payload_len, 1, min_cts, max_cts)
+            .unwrap()
+            .ser(direct_buf.as_bytes_mut(), RedoBlockHeader::SIZE);
+        patch_redo_block_checksum(direct_buf.as_bytes_mut()).unwrap();
         direct_buf
+    }
+
+    fn two_block_start_only() -> DirectBuf {
+        let start_capacity = redo_start_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
+        let mut block = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
+        let header = RedoBlockHeader::new(REDO_BLOCK_GROUP_START, start_capacity, 0).unwrap();
+        header.ser(block.as_bytes_mut(), 0);
+        RedoGroupStartExtension::new(start_capacity + 1, 2, TrxID::new(1), TrxID::new(1))
+            .unwrap()
+            .ser(block.as_bytes_mut(), RedoBlockHeader::SIZE);
+        let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
+        block.as_bytes_mut()[payload_start..payload_start + start_capacity].fill(1);
+        patch_redo_block_checksum(block.as_bytes_mut()).unwrap();
+        block
     }
 
     #[test]
@@ -632,22 +826,20 @@ mod tests {
         let mut reader =
             new_reader_at(file_path, STORAGE_SECTOR_SIZE * 2, STORAGE_SECTOR_SIZE, 0).unwrap();
 
-        assert!(matches!(reader.read(), ReadLog::DataEnd));
+        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
     }
 
     #[test]
     fn test_log_reader_stops_when_expanded_group_crosses_logical_file_size() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
-        let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE * 2];
-        let header = RedoGroupHeader::new(STORAGE_SECTOR_SIZE, TrxID::new(1), TrxID::new(1));
-        header.ser(&mut bytes[..], 0);
-        write_log_file(&file_path, &bytes);
+        let block = two_block_start_only();
+        write_log_file(&file_path, block.as_bytes());
 
         let mut reader =
             new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
 
-        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+        assert!(matches!(reader.read(), ReadLog::DataEnd));
     }
 
     #[test]
@@ -667,13 +859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
         let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE];
-        let header = RedoGroupHeader {
-            checksum: 1,
-            body_len: 0,
-            min_cts: TrxID::new(1),
-            max_cts: TrxID::new(1),
-        };
-        header.ser(&mut bytes[..], 0);
+        bytes[0] = 1;
         write_log_file(&file_path, &bytes);
 
         let mut reader =
@@ -686,18 +872,11 @@ mod tests {
     fn test_log_reader_rejects_bad_checksum_before_body_parsing() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
-        let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE];
-        let body_start = RedoGroupHeader::SIZE;
-        let mut idx = body_start;
-        idx = bytes[..].ser_u64(idx, 18);
-        idx = bytes[..].ser_u64(idx, 1);
-        idx = bytes[..].ser_u8(idx, RedoTrxKind::System as u8);
-        idx = bytes[..].ser_bool(idx, false);
-        idx = bytes[..].ser_u64(idx, u64::MAX);
-        let body_len = idx - body_start;
-        let header = RedoGroupHeader::new(body_len, TrxID::new(1), TrxID::new(1));
-        header.ser(&mut bytes[..], 0);
-        write_log_file(&file_path, &bytes);
+        let mut direct_buf =
+            block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
+        let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
+        direct_buf.as_bytes_mut()[payload_start] ^= 0x80;
+        write_log_file(&file_path, direct_buf.as_bytes());
 
         let mut reader =
             new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
@@ -706,20 +885,20 @@ mod tests {
     }
 
     #[test]
-    fn test_log_group_rejects_body_cts_below_header_range() {
+    fn test_trx_log_iterator_rejects_body_cts_below_header_range() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
         let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = log_buf_with_header_range(&log, TrxID::new(6), TrxID::new(8));
+        let direct_buf = block_group_with_range(log, TrxID::new(6), TrxID::new(8));
         write_log_file(&file_path, direct_buf.as_bytes());
 
         let mut reader =
             new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE * 2, 0).unwrap();
-        let ReadLog::Some(mut group) = reader.read() else {
+        let ReadLog::Iterator(mut iter) = reader.read() else {
             panic!("expected valid group");
         };
 
-        let err = group.try_next().unwrap_err();
+        let err = iter.try_next().unwrap_err();
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::InvalidPayload)
@@ -727,20 +906,20 @@ mod tests {
     }
 
     #[test]
-    fn test_log_group_rejects_body_cts_above_header_range() {
+    fn test_trx_log_iterator_rejects_body_cts_above_header_range() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
         let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = log_buf_with_header_range(&log, TrxID::new(1), TrxID::new(4));
+        let direct_buf = block_group_with_range(log, TrxID::new(1), TrxID::new(4));
         write_log_file(&file_path, direct_buf.as_bytes());
 
         let mut reader =
             new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE * 2, 0).unwrap();
-        let ReadLog::Some(mut group) = reader.read() else {
+        let ReadLog::Iterator(mut iter) = reader.read() else {
             panic!("expected valid group");
         };
 
-        let err = group.try_next().unwrap_err();
+        let err = iter.try_next().unwrap_err();
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::InvalidPayload)
@@ -748,21 +927,21 @@ mod tests {
     }
 
     #[test]
-    fn test_log_group_accepts_body_cts_within_loose_header_range() {
+    fn test_trx_log_iterator_accepts_body_cts_within_loose_header_range() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
         let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = log_buf_with_header_range(&log, TrxID::new(4), TrxID::new(6));
+        let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
         write_log_file(&file_path, direct_buf.as_bytes());
 
         let mut reader =
             new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE * 2, 0).unwrap();
-        let ReadLog::Some(mut group) = reader.read() else {
+        let ReadLog::Iterator(mut iter) = reader.read() else {
             panic!("expected valid group");
         };
 
-        assert!(group.try_next().unwrap().is_some());
-        assert!(group.try_next().unwrap().is_none());
+        assert!(iter.try_next().unwrap().is_some());
+        assert!(iter.try_next().unwrap().is_none());
     }
 
     #[test]
@@ -770,7 +949,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
         let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = log_buf_with_header_range(&log, TrxID::new(4), TrxID::new(6));
+        let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
         write_log_file(&file_path, direct_buf.as_bytes());
 
         let mut reader = new_sealed_reader_at(
@@ -782,11 +961,11 @@ mod tests {
         )
         .unwrap();
 
-        let ReadLog::Some(mut group) = reader.read() else {
+        let ReadLog::Iterator(mut iter) = reader.read() else {
             panic!("expected sealed group");
         };
-        assert!(group.try_next().unwrap().is_some());
-        assert!(group.try_next().unwrap().is_none());
+        assert!(iter.try_next().unwrap().is_some());
+        assert!(iter.try_next().unwrap().is_none());
         assert!(matches!(reader.read(), ReadLog::DataEnd));
     }
 
@@ -823,11 +1002,8 @@ mod tests {
     fn test_sealed_reader_rejects_group_crossing_durable_end() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
-        let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE * 2];
-        let header = RedoGroupHeader::new(STORAGE_SECTOR_SIZE, TrxID::new(1), TrxID::new(1));
-        header.ser(&mut bytes[..], 0);
-        RedoGroupHeader::patch_checksum(&mut bytes).unwrap();
-        write_log_file(&file_path, &bytes);
+        let block = two_block_start_only();
+        write_log_file(&file_path, block.as_bytes());
 
         let mut reader = new_sealed_reader_at(
             file_path,
@@ -846,7 +1022,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
         let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = log_buf_with_header_range(&log, TrxID::new(5), TrxID::new(5));
+        let direct_buf = block_group_with_range(log, TrxID::new(5), TrxID::new(5));
         write_log_file(&file_path, direct_buf.as_bytes());
 
         let mut reader = new_sealed_reader_at(
@@ -878,8 +1054,7 @@ mod tests {
                 dml: BTreeMap::new(),
             },
         );
-        let mut buf = LogBuf::new(STORAGE_SECTOR_SIZE);
-        buf.append_trx_log(&log1);
+        let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log1).unwrap();
 
         let mut rows = BTreeMap::new();
         rows.insert(
@@ -900,14 +1075,21 @@ mod tests {
             },
             RedoLogs { ddl: None, dml },
         );
-        buf.append_trx_log(&log2);
-
-        let direct_buf = buf.finish();
+        assert!(group.append_trx_log(log2).is_none());
+        let blocks = group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .collect()
+            })
+            .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
         let mut file = File::create(&file_path).unwrap();
-        file.write_all(direct_buf.as_bytes()).unwrap();
+        for block in &blocks {
+            file.write_all(block.as_bytes()).unwrap();
+        }
         file.flush().unwrap();
 
         let mut reader = new_reader_at(file_path, 4096, 1024 * 1024, 0).unwrap();
@@ -915,12 +1097,12 @@ mod tests {
             ReadLog::DataCorrupted | ReadLog::DataEnd | ReadLog::SizeLimit => {
                 panic!("invalid data")
             }
-            ReadLog::Some(mut group) => {
-                let log1 = group.try_next().unwrap().unwrap();
+            ReadLog::Iterator(mut iter) => {
+                let log1 = iter.try_next().unwrap().unwrap();
                 assert!(log1.header.trx_kind == RedoTrxKind::System);
-                let log2 = group.try_next().unwrap().unwrap();
+                let log2 = iter.try_next().unwrap().unwrap();
                 assert!(log2.header.trx_kind == RedoTrxKind::User);
-                assert!(group.try_next().unwrap().is_none());
+                assert!(iter.try_next().unwrap().is_none());
             }
         }
     }

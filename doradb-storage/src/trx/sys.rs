@@ -9,9 +9,11 @@ use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionID, TrxID};
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
-use crate::log::{LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter, parse_file_seq};
+use crate::log::{
+    EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter, parse_file_seq,
+};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
-use crate::recovery::redo_stream::MmapLogReader;
+use crate::recovery::stream::MmapLogReader;
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
@@ -26,6 +28,7 @@ use crate::trx::{
     TrxEntryState, TrxInner,
 };
 use crossbeam_utils::CachePadded;
+use either::Either::{Left, Right};
 use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
@@ -452,13 +455,26 @@ impl TransactionSystem {
         &self,
         redo_log: &RedoLog,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
-        trx: Box<PrecommitTrx>,
+        error: EnqueuePrecommitError,
     ) -> CommitRejection {
+        let EnqueuePrecommitError {
+            trx,
+            reason,
+            close_admission,
+        } = error;
         let cts = trx.cts;
-        let err = self.poison_storage(FatalError::RedoWrite);
-        let reason = FailedPrecommitReason::Fatal(*err.current_context());
-        group_commit_g.close(reason);
-        redo_log.group_commit.notify_one();
+        if close_admission {
+            let err = self.poison_storage(match reason {
+                FailedPrecommitReason::Fatal(reason) => reason,
+                FailedPrecommitReason::Resource(_) | FailedPrecommitReason::Shutdown => {
+                    FatalError::RedoWrite
+                }
+            });
+            let reason = FailedPrecommitReason::Fatal(*err.current_context());
+            group_commit_g.close(reason);
+            redo_log.group_commit.notify_one();
+            return CommitRejection { cts, trx, reason };
+        }
         CommitRejection { cts, trx, reason }
     }
 
@@ -475,7 +491,7 @@ impl TransactionSystem {
                 redo_log.group_commit.notify_one();
                 Ok(waiter)
             }
-            Err(trx) => Err(self.reject_group_creation_failure(redo_log, group_commit_g, trx)),
+            Err(error) => Err(self.reject_group_creation_failure(redo_log, group_commit_g, error)),
         }
     }
 
@@ -542,13 +558,14 @@ impl TransactionSystem {
                 return Ok(QueuedCommit { cts, waiter });
             }
         };
-        if last_group.can_join(&precommit_trx) {
-            let waiter = last_group.join(precommit_trx, wait_sync);
-            drop(group_commit_g);
-            return Ok(QueuedCommit { cts, waiter });
-        }
-        let waiter = match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync)
-        {
+        let trx = match last_group.try_join(precommit_trx, wait_sync) {
+            Left(waiter) => {
+                drop(group_commit_g);
+                return Ok(QueuedCommit { cts, waiter });
+            }
+            Right(rejected) => rejected,
+        };
+        let waiter = match self.try_enqueue_new_group(trx, &mut group_commit_g, wait_sync) {
             Ok(waiter) => waiter,
             Err(rejected) => {
                 drop(group_commit_g);
@@ -1231,12 +1248,13 @@ pub(crate) mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
     use crate::engine::Engine;
+    use crate::error::ResourceError;
     use crate::id::{PageID, RowID, TableID};
     use crate::log::LogSync;
     use crate::log::format::{REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE};
     use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::trx::SharedTrxStatus;
     use crate::value::Val;
-    use std::fmt::Debug;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, OnceLock};
     use std::thread::{sleep, spawn, yield_now};
@@ -1340,16 +1358,27 @@ pub(crate) mod tests {
         );
     }
 
-    fn assert_direct_fatal<T: Debug>(res: &Result<T>, expected: FatalError) {
-        let err = match res {
-            Ok(value) => panic!("expected fatal error, got {value:?}"),
-            Err(err) => err,
+    fn capture_transaction_cleanup_state(
+        trx: &Transaction,
+    ) -> (Arc<TrxEntry>, Arc<SharedTrxStatus>) {
+        let engine = trx.engine().expect("test transaction must have engine");
+        let (entry, _session) = engine
+            .session_registry
+            .resolve_trx(
+                trx.session_id,
+                trx.trx_id(),
+                "capture transaction cleanup state",
+            )
+            .expect("test transaction must resolve");
+        let status = {
+            let inner_slot = entry.inner.lock();
+            inner_slot
+                .as_ref()
+                .expect("test transaction must be checked in")
+                .ctx()
+                .status()
         };
-        assert_eq!(
-            err.downcast_ref::<FatalError>().copied(),
-            Some(expected),
-            "{err:?}"
-        );
+        (entry, status)
     }
 
     #[test]
@@ -1583,15 +1612,52 @@ pub(crate) mod tests {
             add_large_system_redo(&mut sys_trx, 1024);
             let res = engine.inner().trx_sys.commit_sys(sys_trx);
 
-            assert_direct_fatal(&res, FatalError::RedoWrite);
-            assert!(
-                engine
-                    .inner()
-                    .trx_sys
-                    .ensure_runtime_healthy()
-                    .as_ref()
-                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.resource_error(),
+                Some(ResourceError::StorageFileCapacityExceeded)
             );
+            engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_user_commit_new_log_allocation_failure_cleans_failed_precommit() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "user_new_log_alloc_failure",
+                64usize * 1024,
+            )
+            .await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let value = [7u8; 196];
+            trx.exec(async |stmt| {
+                for i in 0..384 {
+                    let insert = vec![Val::from(i), Val::from(&value[..])];
+                    stmt.table_insert_mvcc(table_id, insert).await?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let (entry, status) = capture_transaction_cleanup_state(&trx);
+
+            let err = trx.commit().await.unwrap_err();
+
+            assert_eq!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Resource(
+                    ResourceError::StorageFileCapacityExceeded
+                )),
+                "{err:?}"
+            );
+            assert_eq!(entry.inspect_state(), TrxEntryState::Terminal);
+            assert!(!session.in_trx().unwrap());
+            assert!(!status.preparing());
+            assert!(status.prepare_listener().is_none());
+            engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
         });
     }
 }
