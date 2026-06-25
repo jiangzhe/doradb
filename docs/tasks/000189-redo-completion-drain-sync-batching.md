@@ -1,7 +1,7 @@
 ---
 id: 000189
 title: Redo Completion Drain Sync Batching
-status: proposal
+status: implemented
 created: 2026-06-25
 github_issue: 755
 ---
@@ -36,7 +36,7 @@ RFC Phase:
 - Phase 4: Completion Drain and Sync Batching
 
 Source Backlogs:
-- docs/backlogs/000126-redo-commit-group-sync-batching-policy.md
+- docs/backlogs/closed/000126-redo-commit-group-sync-batching-policy.md
 
 Related Backlogs:
 - docs/backlogs/000080-evaluate-safe-async-file-sync-abstraction-beyond-file-syncer.md
@@ -205,6 +205,40 @@ RFC Phase 4 task/status/issue fields and implementation summary only.
 
 ## Implementation Notes
 
+- Added `SubmissionDriver::try_pop_completed()` so callers can consume
+  completions already buffered by a prior backend wait without re-entering the
+  blocking wait path. The blocking wait API was renamed to
+  `wait_at_least_one()` to make the contract explicit across the storage IO
+  driver and redo/recovery call sites.
+- Extended `LogWriteDriver` with `try_pop_buffered_completion()` and refactored
+  redo write completion conversion/poison detection into plain helper
+  functions. `LogWriteDriver` and `RedoLogWriter` are now backend-generic so
+  deterministic tests can exercise production completion routing without
+  production-only test hooks.
+- Replaced the redo writer's single-completion path with
+  `wait_and_drain_io_if_submitted()`: it waits for at least one submitted write,
+  routes that completion, drains already-buffered completions, and only then
+  finalizes the ready prefix. The finalization rules remain unchanged for
+  ordered commit publication, same-file sync batching, no-log groups, fatal
+  write/sync handling, seal side work, and clean shutdown drain.
+- Added focused tests for buffered completion popping in `SubmissionDriver` and
+  deterministic redo writer tests proving same-file buffered completions batch
+  into one sync while later ready groups behind an unfinished prefix are not
+  published early.
+- Review/style follow-ups were addressed during implementation: test-only
+  methods were avoided or kept inside test modules, extracted driver helpers
+  were moved into the private helper section, and the wait method names were
+  updated from `wait_one` to `wait_at_least_one`.
+- Validation passed:
+  - `tools/style_audit.rs --diff-base origin/main` passed with 5 branch-diff
+    Rust files checked.
+  - `cargo nextest run -p doradb-storage` passed with 1031 tests.
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+    passed with 1029 tests.
+- Source backlog
+  `docs/backlogs/closed/000126-redo-commit-group-sync-batching-policy.md` is
+  resolved by the opportunistic completion-drain batching implementation.
+  Related backlogs 000080 and 000131 remain intentionally open as future work.
 
 ## Impacts
 
@@ -236,9 +270,9 @@ RFC Phase 4 task/status/issue fields and implementation summary only.
 - `docs/rfcs/0021-redo-log-fixed-block-read-write-path.md`
   - Update Phase 4 fields during resolve after implementation.
 
-- `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
-  - This is the source backlog and should be closed during resolve if the task
-    implements the chosen opportunistic completion-drain batching design.
+- `docs/backlogs/closed/000126-redo-commit-group-sync-batching-policy.md`
+  - This source backlog was closed during resolve because the task implemented
+    the chosen opportunistic completion-drain batching design.
 
 - `docs/backlogs/000080-evaluate-safe-async-file-sync-abstraction-beyond-file-syncer.md`
   - Related future work only; do not close from this task.
