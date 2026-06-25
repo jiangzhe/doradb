@@ -15,8 +15,8 @@ use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
-    Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOBuf, IOSubmission, Operation,
-    StorageBackend, SubmissionDriver,
+    CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats, IOBackendStatsHandle,
+    IOBuf, IOSubmission, Operation, StorageBackend, SubmissionDriver,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -38,6 +38,7 @@ use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::io::Result as IoResult;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -384,13 +385,19 @@ struct LogWriteCompletion {
 }
 
 /// Driver wrapper for redo log write submissions.
-pub(crate) struct LogWriteDriver {
-    driver: SubmissionDriver<LogWriteSubmission>,
+pub(crate) struct LogWriteDriver<B = StorageBackend>
+where
+    B: IOBackend,
+{
+    driver: SubmissionDriver<LogWriteSubmission, B>,
 }
 
-impl LogWriteDriver {
+impl<B> LogWriteDriver<B>
+where
+    B: IOBackend,
+{
     #[inline]
-    fn new(backend: StorageBackend) -> Self {
+    fn new(backend: B) -> Self {
         LogWriteDriver {
             driver: SubmissionDriver::new(backend),
         }
@@ -427,25 +434,15 @@ impl LogWriteDriver {
     }
 
     #[inline]
-    fn wait_one(&mut self) -> LogWriteCompletion {
-        let completed = self.driver.wait_one();
-        let mut submission = completed.submission;
-        let expected_len = submission.operation.len();
-        let buf = submission
-            .operation
-            .take_buf()
-            .expect("redo write submission must still own its direct buffer");
-        let result = match completed.result {
-            Ok(len) if len == expected_len => None,
-            Ok(_len) => Some(FatalError::RedoWrite),
-            Err(_err) => Some(FatalError::RedoWrite),
-        };
-        LogWriteCompletion {
-            owner: submission.owner,
-            kind: submission.kind,
-            buf,
-            poison: result,
-        }
+    fn wait_at_least_one(&mut self) -> LogWriteCompletion {
+        log_write_completion_from_completed(self.driver.wait_at_least_one())
+    }
+
+    #[inline]
+    fn try_pop_buffered_completion(&mut self) -> Option<LogWriteCompletion> {
+        self.driver
+            .try_pop_completed()
+            .map(log_write_completion_from_completed)
     }
 }
 
@@ -839,9 +836,12 @@ impl FromStr for LogSync {
 }
 
 /// Processes redo write and sync work for commit groups.
-pub(crate) struct RedoLogWriter<'a> {
+pub(crate) struct RedoLogWriter<'a, B = StorageBackend>
+where
+    B: IOBackend,
+{
     trx_sys: &'a TransactionSystem,
-    write_driver: &'a mut LogWriteDriver,
+    write_driver: &'a mut LogWriteDriver<B>,
     log_block_size: usize,
     prefix: LogPrefixTracker,
     next_request_id: u64,
@@ -849,13 +849,16 @@ pub(crate) struct RedoLogWriter<'a> {
     shutdown: bool,
 }
 
-impl<'a> RedoLogWriter<'a> {
+impl<'a, B> RedoLogWriter<'a, B>
+where
+    B: IOBackend,
+{
     /// Create a redo log writer bound to a transaction system and write driver.
     #[inline]
     pub(crate) fn new(
         trx_sys: &'a TransactionSystem,
         config: &TrxSysConfig,
-        write_driver: &'a mut LogWriteDriver,
+        write_driver: &'a mut LogWriteDriver<B>,
     ) -> Self {
         RedoLogWriter {
             trx_sys,
@@ -1009,9 +1012,9 @@ impl<'a> RedoLogWriter<'a> {
             // maintenance for ended files: completion performs the configured
             // seal sync and reports fatal errors. Only active-file sealing during
             // clean shutdown is best-effort.
-            self.wait_one_io_if_submitted(sealer);
-            // The wait only marks a write finished; this publishes the durable
-            // ordered prefix made ready by that completion.
+            self.wait_and_drain_io_if_submitted(sealer);
+            // Completion handling only marks writes finished; this publishes
+            // the durable ordered prefix made ready by the observed completions.
             self.finalize_finished_prefix(sealer);
             self.shrink_prefix_if_sparse();
 
@@ -1029,7 +1032,7 @@ impl<'a> RedoLogWriter<'a> {
             self.finalize_finished_prefix(sealer);
             self.shrink_prefix_if_sparse();
             self.submit_io(sealer);
-            self.wait_one_io_if_submitted(sealer);
+            self.wait_and_drain_io_if_submitted(sealer);
             self.finalize_finished_prefix(sealer);
             self.shrink_prefix_if_sparse();
         }
@@ -1492,18 +1495,36 @@ impl<'a> RedoLogWriter<'a> {
         }
     }
 
-    /// Wait for one submitted redo write, if any, and mark its sync group finished.
+    /// Wait for one submitted redo write, then drain already-buffered completions.
     #[inline]
-    fn wait_one_io_if_submitted(&mut self, sealer: &mut LogFileSealer) {
+    fn wait_and_drain_io_if_submitted(&mut self, sealer: &mut LogFileSealer) {
         if self.write_driver.submitted_len() == 0 {
             return;
         }
+        let completion = self.write_driver.wait_at_least_one();
+        let entered_fatal = self.handle_write_completion(sealer, completion);
+        if entered_fatal {
+            return;
+        }
+        while let Some(completion) = self.write_driver.try_pop_buffered_completion() {
+            if self.handle_write_completion(sealer, completion) {
+                return;
+            }
+        }
+    }
+
+    #[inline]
+    fn handle_write_completion(
+        &mut self,
+        sealer: &mut LogFileSealer,
+        completion: LogWriteCompletion,
+    ) -> bool {
         let LogWriteCompletion {
             owner,
             kind,
             buf,
             poison,
-        } = self.write_driver.wait_one();
+        } = completion;
         match kind {
             LogWriteKind::Header { completion } => {
                 drop(buf);
@@ -1516,7 +1537,7 @@ impl<'a> RedoLogWriter<'a> {
                     } else {
                         completion.complete(Ok(()));
                     }
-                    return;
+                    return false;
                 };
                 debug_assert_eq!(owner.kind, LogRequestKind::Header);
                 let entry_id = owner
@@ -1526,6 +1547,7 @@ impl<'a> RedoLogWriter<'a> {
                 if let Some(source) = poison {
                     let err = self.trx_sys.poison_storage(source);
                     self.fail_pending(sealer, err);
+                    return true;
                 }
             }
             LogWriteKind::Group { .. } => {
@@ -1538,6 +1560,7 @@ impl<'a> RedoLogWriter<'a> {
                 if let Some(source) = poison {
                     let err = self.trx_sys.poison_storage(source);
                     self.fail_pending(sealer, err);
+                    return true;
                 }
             }
             LogWriteKind::Seal { log_file } => {
@@ -1548,9 +1571,11 @@ impl<'a> RedoLogWriter<'a> {
                     sealer.handle_completion(self.trx_sys, owner.request_id, log_file, poison)
                 {
                     self.fail_pending(sealer, err);
+                    return true;
                 }
             }
         }
+        false
     }
 
     #[inline]
@@ -1693,6 +1718,32 @@ pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
         )
     })?;
     Ok(file_seq)
+}
+
+#[inline]
+fn log_write_completion_from_completed(
+    completed: CompletedSubmission<LogWriteSubmission>,
+) -> LogWriteCompletion {
+    let mut submission = completed.submission;
+    let expected_len = submission.operation.len();
+    let buf = submission
+        .operation
+        .take_buf()
+        .expect("redo write submission must still own its direct buffer");
+    LogWriteCompletion {
+        owner: submission.owner,
+        kind: submission.kind,
+        buf,
+        poison: redo_write_poison(completed.result, expected_len),
+    }
+}
+
+#[inline]
+fn redo_write_poison(result: IoResult<usize>, expected_len: usize) -> Option<FatalError> {
+    match result {
+        Ok(len) if len == expected_len => None,
+        Ok(_) | Err(_) => Some(FatalError::RedoWrite),
+    }
 }
 
 #[inline]
@@ -1850,7 +1901,7 @@ mod tests {
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
-        IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
+        BackendToken, IOBackend, IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
     use crate::log::format::{
@@ -2005,7 +2056,7 @@ mod tests {
             kind,
             buf,
             poison,
-        } = write_driver.wait_one();
+        } = write_driver.wait_at_least_one();
         match kind {
             LogWriteKind::Header { completion } => {
                 drop(buf);
@@ -2789,6 +2840,119 @@ mod tests {
         }
     }
 
+    fn sync_group_with_pending_write_for_test(cts: TrxID, fd: RawFd, offset: usize) -> SyncGroup {
+        let mut group = sync_group_for_order_test_with_log_fd(cts, true, 4096, Some(fd));
+        group.write_meta = Some(RedoGroupWriteMeta {
+            file_seq: 0,
+            fd,
+            offset,
+            end_offset: offset + 4096,
+            min_redo_cts: cts,
+            max_redo_cts: cts,
+        });
+        group.writes.push_back(LogWriteSubmission::group(
+            fd,
+            offset,
+            DirectBuf::zeroed(4096),
+            0,
+        ));
+        group
+    }
+
+    #[derive(Clone, Copy)]
+    enum LogTestCompletionBatch {
+        AllFront,
+        OneBack,
+    }
+
+    struct LogTestBackend {
+        max_events: usize,
+        inflight: VecDeque<BackendToken>,
+        wait_batches: VecDeque<LogTestCompletionBatch>,
+    }
+
+    impl LogTestBackend {
+        fn complete_all(max_events: usize) -> Self {
+            Self {
+                max_events,
+                inflight: VecDeque::new(),
+                wait_batches: VecDeque::new(),
+            }
+        }
+
+        fn complete_one_back(max_events: usize) -> Self {
+            Self {
+                max_events,
+                inflight: VecDeque::new(),
+                wait_batches: VecDeque::from([LogTestCompletionBatch::OneBack]),
+            }
+        }
+    }
+
+    impl IOBackend for LogTestBackend {
+        type Prepared = BackendToken;
+        type SubmitBatch = VecDeque<BackendToken>;
+        type Events = ();
+
+        fn max_events(&self) -> usize {
+            self.max_events
+        }
+
+        fn new_submit_batch(&self) -> Self::SubmitBatch {
+            VecDeque::with_capacity(self.max_events)
+        }
+
+        fn new_events(&self) -> Self::Events {}
+
+        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
+            token
+        }
+
+        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
+            batch.push_back(*prepared);
+        }
+
+        fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
+            let submit_count = limit.min(batch.len());
+            for _ in 0..submit_count {
+                let token = batch
+                    .pop_front()
+                    .expect("submit batch length must match queued tokens");
+                self.inflight.push_back(token);
+            }
+            submit_count
+        }
+
+        fn wait_at_least(
+            &mut self,
+            _events: &mut Self::Events,
+            min_nr: usize,
+        ) -> Vec<(BackendToken, StdIoResult<usize>)> {
+            assert!(
+                self.inflight.len() >= min_nr,
+                "test backend requires enough inflight work to satisfy wait"
+            );
+            match self
+                .wait_batches
+                .pop_front()
+                .unwrap_or(LogTestCompletionBatch::AllFront)
+            {
+                LogTestCompletionBatch::AllFront => self
+                    .inflight
+                    .drain(..)
+                    .map(|token| (token, Ok(4096)))
+                    .collect(),
+                LogTestCompletionBatch::OneBack => {
+                    let token = self
+                        .inflight
+                        .pop_back()
+                        .expect("test backend must have one back completion");
+                    vec![(token, Ok(4096))]
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_prefix_tracker_preserves_order_with_no_log_groups() {
         smol::block_on(async {
@@ -2841,6 +3005,181 @@ mod tests {
             assert_eq!(ready.written[0].max_cts, TrxID::new(10));
             assert_eq!(ready.written[1].max_cts, TrxID::new(11));
             assert!(ready.failed.is_empty());
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_wait_and_drain_buffered_completions_batches_same_file_sync() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("buffered_completion_batch", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_buffered_batch_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let log_fd = redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .as_ref()
+                .unwrap()
+                .as_raw_fd();
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::Fsync);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let hook = RecordingFileSyncHook::new();
+            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let mut write_driver = LogWriteDriver::new(LogTestBackend::complete_all(2));
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+
+            {
+                let mut writer = RedoLogWriter::new(
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
+                    &mut write_driver,
+                );
+                writer
+                    .prefix
+                    .push_group(sync_group_with_pending_write_for_test(
+                        TrxID::new(90),
+                        log_fd,
+                        REDO_DEFAULT_DATA_START_OFFSET,
+                    ));
+                writer
+                    .prefix
+                    .push_group(sync_group_with_pending_write_for_test(
+                        TrxID::new(91),
+                        log_fd,
+                        REDO_DEFAULT_DATA_START_OFFSET + 4096,
+                    ));
+
+                writer.submit_io(&mut sealer);
+                writer.wait_and_drain_io_if_submitted(&mut sealer);
+                writer.finalize_finished_prefix(&mut sealer);
+
+                assert!(writer.prefix.is_empty());
+                assert_eq!(writer.write_driver.submitted_len(), 0);
+            }
+
+            let calls = hook.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].kind(), FileSyncKind::Fsync);
+            assert_eq!(calls[0].fd(), log_fd);
+            assert_eq!(
+                harness
+                    .trx_sys
+                    .redo_log
+                    .persisted_cts
+                    .load(Ordering::SeqCst),
+                91
+            );
+            assert_eq!(
+                harness
+                    .trx_sys
+                    .redo_log
+                    .stats
+                    .commit_count
+                    .load(Ordering::Relaxed),
+                2
+            );
+            assert_eq!(
+                harness
+                    .trx_sys
+                    .redo_log
+                    .stats
+                    .sync_count
+                    .load(Ordering::Relaxed),
+                1
+            );
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_wait_and_drain_keeps_later_ready_group_behind_unfinished_prefix() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("buffered_completion_order", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_buffered_order_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let log_fd = redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .as_ref()
+                .unwrap()
+                .as_raw_fd();
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::Fsync);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let hook = RecordingFileSyncHook::new();
+            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let mut write_driver = LogWriteDriver::new(LogTestBackend::complete_one_back(2));
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+
+            {
+                let mut writer = RedoLogWriter::new(
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
+                    &mut write_driver,
+                );
+                writer
+                    .prefix
+                    .push_group(sync_group_with_pending_write_for_test(
+                        TrxID::new(92),
+                        log_fd,
+                        REDO_DEFAULT_DATA_START_OFFSET,
+                    ));
+                writer
+                    .prefix
+                    .push_group(sync_group_with_pending_write_for_test(
+                        TrxID::new(93),
+                        log_fd,
+                        REDO_DEFAULT_DATA_START_OFFSET + 4096,
+                    ));
+
+                writer.submit_io(&mut sealer);
+                writer.wait_and_drain_io_if_submitted(&mut sealer);
+                writer.finalize_finished_prefix(&mut sealer);
+
+                assert_eq!(writer.prefix.len(), 2);
+                let LogPrefixKind::Group { group } = &writer.prefix.entries[0].kind else {
+                    panic!("expected first group")
+                };
+                assert!(!group.ready());
+                let LogPrefixKind::Group { group } = &writer.prefix.entries[1].kind else {
+                    panic!("expected second group")
+                };
+                assert!(group.ready());
+                assert_eq!(writer.write_driver.submitted_len(), 1);
+            }
+
+            assert!(hook.calls().is_empty());
+            assert_eq!(
+                harness
+                    .trx_sys
+                    .redo_log
+                    .persisted_cts
+                    .load(Ordering::SeqCst),
+                MIN_SNAPSHOT_TS.as_u64()
+            );
 
             drop(harness);
             engine.shutdown().unwrap();
@@ -3952,7 +4291,7 @@ mod tests {
                 kind,
                 buf,
                 poison,
-            } = write_driver.wait_one();
+            } = write_driver.wait_at_least_one();
             match kind {
                 LogWriteKind::Group { .. } => {
                     drop(buf);

@@ -523,16 +523,16 @@ where
         submit_count
     }
 
-    /// Waits for one accepted submission to complete.
+    /// Waits for at least one accepted submission to complete.
     ///
     /// If a previous backend wait returned several completions, this returns
     /// the next buffered completion without entering the backend wait path.
     #[inline]
-    pub(crate) fn wait_one(&mut self) -> CompletedSubmission<S> {
+    pub(crate) fn wait_at_least_one(&mut self) -> CompletedSubmission<S> {
         if self.completed.is_empty() {
             assert!(
                 self.submitted != 0,
-                "wait_one requires at least one backend-submitted operation"
+                "wait_at_least_one requires at least one backend-submitted operation"
             );
             let completions = self.backend.wait_at_least(&mut self.events, 1);
             let completed_count = completions.len();
@@ -566,6 +566,16 @@ where
         self.completed
             .pop_front()
             .expect("backend wait must return at least one completion")
+    }
+
+    /// Pops one backend completion that was already fetched by an earlier wait.
+    ///
+    /// This never enters the backend wait path. It is intended for callers that
+    /// want to observe already-available completions without delaying the first
+    /// ready item to chase more batching.
+    #[inline]
+    pub(crate) fn try_pop_completed(&mut self) -> Option<CompletedSubmission<S>> {
+        self.completed.pop_front()
     }
 }
 
@@ -852,6 +862,7 @@ mod tests {
         max_events: usize,
         submit_results: VecDeque<usize>,
         inflight: VecDeque<BackendToken>,
+        panic_on_wait: bool,
     }
 
     impl DriverBackend {
@@ -861,6 +872,7 @@ mod tests {
                 max_events,
                 submit_results: VecDeque::new(),
                 inflight: VecDeque::new(),
+                panic_on_wait: false,
             }
         }
 
@@ -873,6 +885,17 @@ mod tests {
                 max_events,
                 submit_results: submit_results.into(),
                 inflight: VecDeque::new(),
+                panic_on_wait: false,
+            }
+        }
+
+        #[inline]
+        fn wait_panics(max_events: usize) -> Self {
+            DriverBackend {
+                max_events,
+                submit_results: VecDeque::new(),
+                inflight: VecDeque::new(),
+                panic_on_wait: true,
             }
         }
     }
@@ -921,6 +944,7 @@ mod tests {
             _events: &mut Self::Events,
             min_nr: usize,
         ) -> Vec<(BackendToken, StdIoResult<usize>)> {
+            assert!(!self.panic_on_wait, "backend wait must not be called");
             assert!(
                 self.inflight.len() >= min_nr,
                 "immediate backend requires enough inflight work to satisfy wait"
@@ -1001,13 +1025,13 @@ mod tests {
         assert_eq!(driver.pending_len(), 2);
         assert_eq!(driver.submitted_len(), 2);
 
-        let first = driver.wait_one();
+        let first = driver.wait_at_least_one();
         assert_eq!(first.submission.op.id, 1);
         assert_eq!(first.result.unwrap(), STORAGE_SECTOR_SIZE);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 1);
 
-        let second = driver.wait_one();
+        let second = driver.wait_at_least_one();
         assert_eq!(second.submission.op.id, 2);
         assert_eq!(second.result.unwrap(), STORAGE_SECTOR_SIZE);
         assert_eq!(driver.pending_len(), 0);
@@ -1026,6 +1050,47 @@ mod tests {
             hook.completes.lock().unwrap().as_slice(),
             expected_ops.as_slice()
         );
+    }
+
+    #[test]
+    fn test_submission_driver_wait_at_least_one_exposes_buffered_completion_pop() {
+        let mut driver = SubmissionDriver::new(DriverBackend::new(2));
+
+        assert!(driver.push(DriverSubmission::new(1, 43, 0)).is_ok());
+        assert!(
+            driver
+                .push(DriverSubmission::new(2, 43, STORAGE_SECTOR_SIZE))
+                .is_ok()
+        );
+        assert_eq!(driver.submit_ready(), 2);
+
+        let first = driver.wait_at_least_one();
+        assert_eq!(first.submission.op.id, 1);
+        assert_eq!(first.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 1);
+
+        let second = driver
+            .try_pop_completed()
+            .expect("second completion should already be buffered");
+        assert_eq!(second.submission.op.id, 2);
+        assert_eq!(second.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
+    }
+
+    #[test]
+    fn test_submission_driver_try_pop_completed_does_not_wait() {
+        let mut driver = SubmissionDriver::new(DriverBackend::wait_panics(1));
+
+        assert!(driver.push(DriverSubmission::new(1, 44, 0)).is_ok());
+        assert_eq!(driver.submit_ready(), 1);
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 1);
+
+        assert!(driver.try_pop_completed().is_none());
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 1);
     }
 
     #[test]
@@ -1052,14 +1117,14 @@ mod tests {
         assert_eq!(driver.submitted_len(), 1);
         assert_eq!(driver.available_capacity(), 0);
 
-        let first = driver.wait_one();
+        let first = driver.wait_at_least_one();
         assert_eq!(first.submission.op.id, 1);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 1);
 
         assert_eq!(driver.submit_ready(), 1);
-        let second = driver.wait_one();
+        let second = driver.wait_at_least_one();
         assert_eq!(second.submission.op.id, 2);
         assert_eq!(driver.pending_len(), 0);
         assert_eq!(driver.submitted_len(), 0);

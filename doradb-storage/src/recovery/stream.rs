@@ -779,7 +779,7 @@ impl RedoReadAheadWorker {
                 yield_now();
                 continue;
             }
-            let completion = take_read_completion(driver.wait_one())?;
+            let completion = take_read_completion(driver.wait_at_least_one())?;
             let (completed_file_seq, completed_offset, buf) = match completion.validate() {
                 Ok(completed) => completed,
                 Err(err) => {
@@ -859,7 +859,7 @@ impl RedoReadAheadWorker {
                 yield_now();
                 continue;
             }
-            if let Ok(completion) = take_read_completion(driver.wait_one()) {
+            if let Ok(completion) = take_read_completion(driver.wait_at_least_one()) {
                 drop(completion.buf);
             }
         }

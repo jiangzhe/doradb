@@ -142,7 +142,7 @@ Issue Labels:
 
 - [B1] `docs/backlogs/closed/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
   - existing follow-up for replacing mmap redo recovery reads.
-- [B2] `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
+- [B2] `docs/backlogs/closed/000126-redo-commit-group-sync-batching-policy.md`
   - existing follow-up for commit-group construction and sync batching policy.
 - [B3] `docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md`
   - existing follow-up for replacing CTS-keyed redo IO sequencing with
@@ -436,12 +436,12 @@ pwrite_owned}`.
     completion aggregation provides group-ready state in prefix order.
   - Phase-local Choices: Nonblocking completion-drain API shape, batching
     metrics, and whether any small policy knob is needed after benchmarking.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: pending
-  - Implementation Summary: pending
+  - Task Doc: `docs/tasks/000189-redo-completion-drain-sync-batching.md`
+  - Task Issue: `#755`
+  - Phase Status: done
+  - Implementation Summary: Implemented nonblocking buffered completion draining in SubmissionDriver and LogWriteDriver, routed drained redo completions before prefix finalization, and validated default plus libaio test suites. [Task Resolve Sync: docs/tasks/000189-redo-completion-drain-sync-batching.md @ 2026-06-25]
   - Related Backlogs:
-    - `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
+    - `docs/backlogs/closed/000126-redo-commit-group-sync-batching-policy.md`
 
 - **Phase 5: Documentation, Tests, and Compatibility Cleanup**
   - Scope: Update redo docs, recovery docs, config comments, corruption tests,
@@ -542,5 +542,5 @@ pwrite_owned}`.
 - `docs/checkpoint-and-recovery.md`
 - `docs/transaction-system.md`
 - `docs/backlogs/closed/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
-- `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
+- `docs/backlogs/closed/000126-redo-commit-group-sync-batching-policy.md`
 - `docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md`
