@@ -24,7 +24,9 @@ writing log bytes; their CTS is not a recovery timestamp seed.
 Main source files:
 
 - `log/redo.rs`: redo record payload types and serialization.
-- `log/buf.rs`: log-group write buffer and transaction frame serialization.
+- `log/format.rs`: redo super-blocks and fixed-block data framing.
+- `log/block_group.rs`: logical group materialization and transaction frame
+  serialization.
 - `trx/group.rs`: commit-group construction.
 - `trx/sys.rs`: commit admission, CTS assignment, and GC bucket ownership.
 - `log/mod.rs`: log file discovery, writable-log initialization, allocation,
@@ -72,7 +74,7 @@ redo files are invalid. The configured defaults are:
 Each log file is created as an `O_DIRECT` sparse file and truncated to the
 effective `log_file_max_size`. The configured value is first rounded so the
 data region after the fixed super-block slots contains a whole number of
-`log_block_size` groups. The first two 4KB sectors are fixed A/B redo
+`log_block_size` data blocks. The first two 4KB sectors are fixed A/B redo
 super-block slots:
 
 - slot 0 at offset `0`
@@ -115,8 +117,8 @@ The segment metadata has three valid encodings:
   `0 < min_redo_cts <= max_redo_cts`.
 
 Every other combination is invalid. The sealed CTS range is derived only from
-redo-bearing physical group headers that reached the ordered durable prefix
-after the configured sync policy succeeded. Ordered no-log transactions,
+redo-bearing group-start metadata that reached the ordered durable prefix after
+the configured sync policy succeeded. Ordered no-log transactions,
 `CommitGroup.max_cts`, `SyncGroup.max_cts`, and the runtime
 `persisted_cts` watermark do not contribute to sealed file ranges.
 
@@ -164,38 +166,81 @@ Value encoding:
   payload.
 - `Val::VarByte`: code `11`, then `u16` byte length, then raw bytes.
 
-## Physical Group Format
+## Fixed-Block Data Format
 
-The log file is a sequence of log groups. One group maps to one direct write.
-A group can contain one or more transaction log records.
+Redo file format version `3` is the fixed-block data format. The selected redo
+super-block slot is the format-version authority; individual data blocks do not
+carry a version field. The data region is a sequence of fixed-size redo data
+blocks, and every physical redo payload read or write is exactly the persisted
+`log_block_size` for that file.
+
+One logical redo group is assembled from one or more consecutive fixed data
+blocks. Groups are strictly sequential, are never interleaved, and never cross
+redo file boundaries. A normal multi-transaction redo group fits in one block.
+A single oversized redo-bearing transaction may use a multi-block logical
+group, but no additional redo-bearing transaction joins that multi-block group.
+
+Every data block starts with an 11-byte common header:
 
 ```text
-LogGroup :=
-    RedoGroupHeader
-    TrxLog[body_len bytes]
-    zero padding to the direct-IO write length
-
-RedoGroupHeader := 28 bytes
+RedoBlockHeader :=
     u32 checksum
-    u64 body_len
-    u64 min_cts
-    u64 max_cts
+    u8  flags
+    u16 payload_len
+    u32 group_block_idx
 ```
 
-`body_len` is the length of serialized `TrxLog` body bytes only. It excludes
-the 28-byte group header and excludes zero padding. The checksum is CRC32 from
-`crc32fast` over every byte after the checksum field in the physical direct-IO
-write: header bytes `4..28`, transaction body bytes, and zero padding.
+The valid flags are:
 
-An all-zero 28-byte group header at the current group offset is the sparse-file
-logical EOF sentinel. A nonzero header with `body_len == 0` is invalid. There
-is no legacy group reader for the old `u64 group_data_len + body` format.
+- `GROUP_START`: this block starts a logical group.
+- `GROUP_END`: this block ends a logical group.
 
-Small groups are intended to use a fixed `log_block_size` buffer from the redo
-free-list. Large groups can exceed `log_block_size`; they are written as one
-sector-aligned direct buffer sized to the 28-byte header plus serialized group
-body. Small valid groups advance replay by `log_block_size`; large valid groups
-advance by the sector-aligned physical group length.
+The first block of every logical group has `GROUP_START` and
+`group_block_idx = 0`. Continuation blocks do not have `GROUP_START` and have
+strictly increasing `group_block_idx` values. A single-block group has both
+`GROUP_START` and `GROUP_END`; a multi-block group has `GROUP_START` only on
+block `0` and `GROUP_END` only on the final block.
+
+Group-start blocks carry a 28-byte extension immediately after the common
+header:
+
+```text
+RedoGroupStartExtension :=
+    u64 group_payload_len
+    u32 group_block_count
+    u64 min_redo_cts
+    u64 max_redo_cts
+```
+
+`group_payload_len` is the total serialized `TrxLog` payload bytes in the
+logical group, excluding all block headers and zero padding. `group_block_count`
+is the exact fixed-block count needed for that payload at this file's
+`log_block_size`. `min_redo_cts` and `max_redo_cts` are the inclusive CTS range
+for serialized redo records in the group. Continuation blocks do not repeat
+group-start metadata.
+
+The checksum is CRC32 from `crc32fast` over the complete fixed-size data block
+except the first four checksum bytes. That checksum domain includes common
+header bytes, any group-start extension, payload bytes, and all padding.
+Padding after `payload_len` must be zero and is still protected by the checksum.
+
+Payload capacity is derived from the flags:
+
+- start block capacity: `log_block_size - 11 - 28`;
+- continuation block capacity: `log_block_size - 11`.
+
+Non-final blocks must be full to their available payload capacity. Only the
+final block may have a short payload. A nonzero data block with invalid flags,
+`payload_len = 0`, impossible payload capacity, invalid group-start metadata,
+bad checksum, nonzero padding, unexpected block count, or unexpected block
+index is corrupt.
+
+An all-zero data block is logical EOF only when the parser is idle in an
+unsealed file. A zero block before a sealed file's `durable_end_offset`, or a
+zero block while a sealed group is open, is corruption. In an unsealed crash
+file, a zero, invalid, missing, or checksum-failed continuation while a
+multi-block group is open is treated as an incomplete tail; recovery discards
+that open group and stops scanning the file.
 
 ## Transaction Record Format
 
@@ -279,40 +324,48 @@ physical row page.
 
    - no-log transactions can join any group;
    - a redo-bearing transaction cannot join a no-log group;
-   - a redo-bearing transaction can join a redo group only if the group's
-     serialized buffer has enough capacity.
+   - a redo-bearing transaction can join a one-block redo group only if the
+     resulting serialized group still fits in the start-block payload capacity;
+   - a redo-bearing transaction cannot join a multi-block redo group.
 
-5. A new redo-bearing group serializes the first transaction into a `LogBuf`,
-   tracks the min/max CTS of serialized redo records, allocates append space
-   from the current sparse log file, and stores the raw file descriptor plus
-   offset. If allocation reaches `log_file_max_size`, the path rotates to a new
-   file and queues a log-file boundary before the group.
+5. A new redo-bearing group starts a `LogBlockGroup`, tracks the min/max CTS of
+   serialized redo records, computes the exact fixed-block count, and allocates
+   `block_count * log_block_size` bytes from the current sparse log file. If
+   the group does not fit in the remaining data region, the path rotates before
+   writing it and queues a log-file boundary. If the group cannot fit in an
+   empty file data region, precommit is rejected before the transaction becomes
+   durable or visible.
 
 6. `Log-Thread` drains commit queue entries. Log-file boundaries stage an async
    super-block write and stop queue fetching until pending IO plus that
-   super-block write drain. Redo-bearing groups drain into `SyncGroup`s and then one
-   `Operation::pwrite_owned(fd, offset, DirectBuf)` each. No-log groups are
-   inserted as already-finished ordered groups with no IO target. Before a
-   redo-bearing group is submitted, `LogBuf::finish` writes the 28-byte group
-   header with checksum zero, ensures padding bytes are zero, then patches the
-   CRC32 checksum over bytes `4..write_len`.
+   super-block write drain. Redo-bearing groups drain into `SyncGroup`s, and
+   `LogBlockGroup::finish_with` materializes one logical group into one or more
+   exact-`log_block_size` `DirectBuf`s with block headers, group-start
+   metadata, zero padding, and patched CRC32 checksums. No-log groups are
+   inserted as already-finished ordered groups with no IO target.
 
 7. `LogWriteDriver` wraps the backend-neutral `SubmissionDriver` and submits
-   direct writes through the compile-time storage backend (`io_uring` by
-   default, `libaio` with the alternate feature).
+   one `Operation::pwrite_owned(fd, offset, DirectBuf)` per physical redo data
+   block through the compile-time storage backend (`io_uring` by default,
+   `libaio` with the alternate feature). `log_write_io_depth` counts these
+   physical block writes, not logical groups.
 
 8. On write completion, the driver checks that the completed byte count equals
-   the submitted buffer length. Short writes and IO errors become
-   `FatalError::RedoWrite`.
+   the submitted fixed-block buffer length. Short writes and IO errors become
+   `FatalError::RedoWrite`. A logical `SyncGroup` becomes ready only after all
+   physical writes for that group have completed successfully.
 
-9. `RedoLogWriter::finalize_finished_prefix` commits only the contiguous
-   finished CTS prefix. When the prefix contains redo bytes, it performs the
-   configured sync policy (`fsync`, `fdatasync`, or `none`) on the file
-   descriptor that owns those writes. Only after that sync step succeeds does
-   `RedoFileSealer` record each redo-bearing group's
-   `durable_end_offset`, `min_cts`, and `max_cts`.
+9. After waiting for at least one write completion, the writer drains any
+   completions already buffered by the submission driver before finalizing the
+   prefix. `RedoLogWriter::finalize_finished_prefix` commits only the
+   contiguous finished prefix. When that prefix contains redo bytes, it syncs
+   the largest already-ready same-file prefix with the configured policy
+   (`fsync`, `fdatasync`, or `none`). Only after that sync step succeeds does
+   `RedoFileSealer` record each redo-bearing group's `durable_end_offset`,
+   `min_redo_cts`, and `max_redo_cts`.
 
-10. After sync succeeds, `persisted_cts` advances to the prefix max CTS, each
+10. After ordered prefix finalization succeeds, `persisted_cts` advances to the
+    prefix max CTS, each
     `PrecommitTrx` is finalized, committed payloads are handed to purge, waiters
     are completed, buffers are recycled, and stats are updated.
 
@@ -353,7 +406,7 @@ For each planned segment:
 - if an unsealed group offset reaches the header's `file_max_size`, the file is
   exhausted;
 - if a sealed group offset reaches `durable_end_offset`, the file is exhausted
-  after the scanned group-header CTS range matches the sealed super-block
+  after the scanned group-start CTS range matches the sealed super-block
   range;
 - if an idle fixed block is all zeros, replay treats an unsealed file as ended
   and treats a sealed file as corrupted before `durable_end_offset`;
@@ -374,8 +427,8 @@ their `max_redo_cts` still contributes to recovery timestamp seeding. Because
 boundaries, any low loaded-table heap or delete boundary keeps older sealed
 segments scan-relevant. A sealed file whose range reaches the replay floor,
 including `max_redo_cts == replay_floor`, is scanned normally. Each decoded
-`TrxLog` header CTS must fall within the inclusive group header
-`min_cts..=max_cts` range.
+`TrxLog` header CTS must fall within the inclusive group-start metadata
+`min_redo_cts..=max_redo_cts` range.
 
 Recovery first loads checkpointed catalog state and user table roots. It then
 computes replay floors:
@@ -416,12 +469,17 @@ stop the scan before an unsafe ordering point.
 The redo path is intentionally separate from table-file and buffer-pool IO.
 
 - Runtime writes are sequential append allocations to one active sparse file.
-- Every redo-bearing commit group is one direct `pwrite`.
+- Every physical redo data write is one direct `pwrite` of exactly
+  `log_block_size` bytes.
+- One logical redo group may produce one or more physical data-block writes.
 - Direct buffers and file offsets must be sector-aligned.
 - `Log-Thread` owns the redo submission driver; there is no nested redo IO
   worker thread.
-- The backend IO depth is bounded by `log_write_io_depth`.
-- Sync is done above the backend driver after an ordered write prefix finishes.
+- The backend write IO depth is bounded by `log_write_io_depth` in physical
+  data-block units.
+- Sync is done above the backend driver after an ordered write prefix finishes;
+  already-buffered write completions are drained first so one sync can cover
+  the current ready same-file prefix.
 - Shutdown closes group-commit admission, wakes and joins `Log-Thread`, then
   stops cleanup and purge in that order.
 
@@ -460,10 +518,11 @@ recent log writes.
 
 - Redo is a logical value log. It assumes committed checkpoint roots plus replay
   are sufficient; there is no undo phase.
-- Redo files are v2-only and require a valid fixed A/B super-block slot.
-- Physical redo groups are checksummed. Sealed files validate their durable end
-  offset and real redo CTS range during replay, but active crash files can
-  remain unsealed and are scanned sequentially.
+- Redo files use format version `3` fixed-block data framing and require a
+  valid fixed A/B super-block slot.
+- Physical redo data blocks are checksummed. Sealed files validate their
+  durable end offset and real redo CTS range during replay, but active crash
+  files can remain unsealed and are scanned sequentially.
 - Log discovery depends on file names and contiguous sequence numbers starting
   at `00000000`.
 - Old log files are not physically truncated or deleted by the current redo
@@ -471,8 +530,10 @@ recent log writes.
   validated sealed files whose CTS range is fully below the replay floor.
 - Redo read-ahead is direct-IO based and bounded by the scan-specific configured
   read-ahead depth; parsing and replay remain sequential.
-- A single large transaction can exceed `log_block_size` and is written as one
-  large direct IO request.
+- A single redo-bearing transaction may exceed one block payload and span a
+  multi-block logical group, but it must fit within an empty redo file data
+  region and no other redo-bearing transaction may join that group.
+- Logical redo groups never cross file boundaries.
 - `persisted_cts` is an ordered-completion watermark. It can advance across
   no-log groups, so recovery must continue to seed timestamps only from
   checkpoint metadata, table roots, skipped sealed non-empty segment ranges, and
@@ -487,32 +548,33 @@ floors prove that older segments are no longer needed. This likely needs the
 watermark expansion already tracked by
 `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`.
 
-Keep `log_block_size` config normalization and header validation in sync. The
-config path rounds values up to `STORAGE_SECTOR_SIZE` multiples before file
-creation, and redo header validation rejects persisted files whose
-`log_block_size` is not a sector-aligned size. `log_file_max_size` is normalized
-to `REDO_DEFAULT_DATA_START_OFFSET + N * log_block_size`; persisted super-blocks
-with a sector-aligned but log-block-misaligned data region are invalid.
+Keep `log_block_size` config normalization and block-header validation in sync.
+The config path rounds values up to `STORAGE_SECTOR_SIZE` multiples before file
+creation, and redo super-block validation rejects persisted files whose
+`log_block_size` is not a supported sector-aligned size. `log_file_max_size` is
+normalized to `REDO_DEFAULT_DATA_START_OFFSET + N * log_block_size`; persisted
+super-blocks with a sector-aligned but log-block-misaligned data region are
+invalid.
 
-Keep small-group buffer stride and reader advancement in sync. Small groups are
-read with a fixed `log_block_size` stride, so write-side fallback allocation
-must continue to use a full `log_block_size` direct buffer for normal groups.
+Keep write materialization and reader advancement in sync. The writer allocates
+logical groups in whole fixed blocks, and the reader advances strictly by
+`group_block_count * log_block_size` after validating a complete logical group.
 
 ### Write Path and Sync Policy
-
-Separate commit grouping from sync batching more explicitly. The current code
-can sync one observed contiguous finished prefix, but completions are marked one
-at a time. An opportunistic completion-drain API could reduce avoidable sync
-syscalls without delaying the first ready group. This matches
-`docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`.
 
 Add latency and shape telemetry: group size distribution, transactions per
 group, bytes per group, fsync/fdatasync latency percentiles, rotation count,
 queue depth, and no-log ordered group count.
 
-Consider an explicit policy for very large records. Today a large transaction
-becomes one large direct buffer and one large write. Chunking, size limits, or a
-separate large-record format would make memory and IO behavior easier to bound.
+Consider bounded-memory replay for very large transactions. Today one
+multi-block logical group is assembled before strict `TrxLog` parsing. Streaming
+parse/replay inside a large transaction is tracked separately in
+`docs/backlogs/000130-large-redo-transaction-streaming-replay.md`.
+
+Clarify rotation seal durability when needed by
+`docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md`. The
+current docs describe the implemented seal/read behavior without claiming that
+follow-up is resolved.
 
 ### Read and Recovery Path
 
@@ -529,5 +591,6 @@ ordering. The code already has `dispatch_dml` and `wait_for_dml_done` boundaries
 for this direction.
 
 Broaden corrupted-tail integration tests. Recovery should have explicit coverage
-for zero EOF, torn group header, torn payload, bad op code, bad collection
-length, checksum mismatch, and rotation-boundary crashes.
+for zero EOF, torn block header, torn payload, bad op code, bad collection
+length, checksum mismatch, nonzero padding, incomplete multi-block groups, and
+rotation-boundary crashes.
