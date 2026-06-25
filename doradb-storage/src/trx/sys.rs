@@ -1253,6 +1253,7 @@ pub(crate) mod tests {
     use crate::log::LogSync;
     use crate::log::format::{REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE};
     use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::trx::SharedTrxStatus;
     use crate::value::Val;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, OnceLock};
@@ -1355,6 +1356,29 @@ pub(crate) mod tests {
                 kind: RowRedoKind::Insert(values),
             },
         );
+    }
+
+    fn capture_transaction_cleanup_state(
+        trx: &Transaction,
+    ) -> (Arc<TrxEntry>, Arc<SharedTrxStatus>) {
+        let engine = trx.engine().expect("test transaction must have engine");
+        let (entry, _session) = engine
+            .session_registry
+            .resolve_trx(
+                trx.session_id,
+                trx.trx_id(),
+                "capture transaction cleanup state",
+            )
+            .expect("test transaction must resolve");
+        let status = {
+            let inner_slot = entry.inner.lock();
+            inner_slot
+                .as_ref()
+                .expect("test transaction must be checked in")
+                .ctx()
+                .status()
+        };
+        (entry, status)
     }
 
     #[test]
@@ -1593,6 +1617,46 @@ pub(crate) mod tests {
                 err.resource_error(),
                 Some(ResourceError::StorageFileCapacityExceeded)
             );
+            engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_user_commit_new_log_allocation_failure_cleans_failed_precommit() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "user_new_log_alloc_failure",
+                64usize * 1024,
+            )
+            .await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let value = [7u8; 196];
+            trx.exec(async |stmt| {
+                for i in 0..384 {
+                    let insert = vec![Val::from(i), Val::from(&value[..])];
+                    stmt.table_insert_mvcc(table_id, insert).await?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let (entry, status) = capture_transaction_cleanup_state(&trx);
+
+            let err = trx.commit().await.unwrap_err();
+
+            assert_eq!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Resource(
+                    ResourceError::StorageFileCapacityExceeded
+                )),
+                "{err:?}"
+            );
+            assert_eq!(entry.inspect_state(), TrxEntryState::Terminal);
+            assert!(!session.in_trx().unwrap());
+            assert!(!status.preparing());
+            assert!(status.prepare_listener().is_none());
             engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
         });
     }
