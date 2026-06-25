@@ -1,11 +1,11 @@
 use crate::id::TrxID;
-use crate::io::Completion;
+use crate::io::{Completion, DirectBuf};
 use crate::log::block_group::LogBlockGroup;
 use crate::log::{
     LogWriteSubmission, RedoGroupWriteAlloc, RedoGroupWriteMeta, RedoLogFile, SyncGroup,
 };
-use crate::serde::Ser;
 use crate::trx::{FailedPrecommitReason, PrecommitTrx};
+use either::Either;
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -123,49 +123,38 @@ pub(crate) struct CommitGroup {
 }
 
 impl CommitGroup {
-    /// Returns whether this group has redo bytes that require persistence.
+    /// Try to add a transaction to this group and return the requested waiter on success.
     #[inline]
-    pub(crate) fn require_durability(&self) -> bool {
-        self.log.is_some()
-    }
-
-    /// Returns whether the transaction can join this existing group.
-    #[inline]
-    pub(crate) fn can_join(&self, trx: &PrecommitTrx) -> bool {
-        if !trx.require_durability() {
-            return true;
-        }
-        if !self.require_durability() {
-            return false;
-        }
-        self.log.as_ref().is_some_and(|log| {
-            log.group
-                .capable_for(trx.redo_bin.as_ref().unwrap().ser_len())
-        })
-    }
-
-    /// Add a transaction to this group and return the waiter requested by the caller.
-    #[inline]
-    pub(crate) fn join(&mut self, mut trx: PrecommitTrx, wait_sync: bool) -> CommitJoin {
+    pub(crate) fn try_join(
+        &mut self,
+        mut trx: PrecommitTrx,
+        wait_sync: bool,
+    ) -> Either<CommitJoin, PrecommitTrx> {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.take_log() {
-            let log = self
-                .log
-                .as_mut()
-                .expect("durability transaction cannot join a no-log group");
-            log.group.append_trx_log(redo_bin);
+            let Some(log) = self.log.as_mut() else {
+                trx.redo_bin = Some(redo_bin);
+                return Either::Right(trx);
+            };
+            if let Some(rejected) = log.group.append_trx_log(redo_bin) {
+                trx.redo_bin = Some(rejected);
+                return Either::Right(trx);
+            }
         }
         self.max_cts = trx.cts;
         // Session completion ownership stays with the queued PrecommitTrx. The
         // waiter only observes ordered completion, so dropping the user commit
         // future after joining this group cannot strand the owning session.
         self.trx_list.push(trx);
-        wait_sync.then(|| Arc::clone(&self.completion))
+        Either::Left(wait_sync.then(|| Arc::clone(&self.completion)))
     }
 
     /// Convert this commit group into a sync group for redo publication.
     #[inline]
-    pub(crate) fn into_sync_group(self) -> SyncGroup {
+    pub(crate) fn into_sync_group<F>(self, take_blocks: F) -> SyncGroup
+    where
+        F: FnOnce(usize) -> Vec<DirectBuf>,
+    {
         let (log_bytes, log_fd, write_meta, writes) = match self.log {
             Some(log) => {
                 let alloc = log.alloc;
@@ -180,7 +169,7 @@ impl CommitGroup {
                 };
                 let blocks = log
                     .group
-                    .finish()
+                    .finish_with(take_blocks)
                     .expect("accepted redo group must materialize fixed blocks");
                 let mut writes = VecDeque::with_capacity(blocks.len());
                 let mut offset = alloc.offset;
@@ -225,6 +214,7 @@ mod tests {
     use crate::log::block_group::TrxLog;
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::value::Val;
+    use either::Either::{Left, Right};
     use std::collections::BTreeMap;
     use std::iter::repeat_n;
 
@@ -342,8 +332,10 @@ mod tests {
             LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(1))).unwrap();
         let mut group = log_group(TrxID::new(1), log_block_group);
 
-        let listener = group.join(precommit(TrxID::new(2)), false);
-        assert!(listener.is_none());
+        assert!(matches!(
+            group.try_join(precommit(TrxID::new(2)), false),
+            Left(None)
+        ));
         assert_eq!(group.trx_list.len(), 2);
         assert_eq!(group.max_cts, TrxID::new(2));
         for trx in &mut group.trx_list {
@@ -352,17 +344,24 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_group_can_join_respects_capacity() {
+    fn test_commit_group_try_join_respects_capacity() {
         let log_block_group =
             LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(100))).unwrap();
         let mut group = log_group(TrxID::new(1), log_block_group);
 
         let candidate1 = precommit_large(TrxID::new(2));
-        assert!(group.can_join(&candidate1));
-        let _ = group.join(candidate1, false);
-        let mut candidate2 = precommit_large(TrxID::new(3));
-        assert!(!group.can_join(&candidate2));
-        clear_redo(&mut candidate2);
+        assert!(matches!(group.try_join(candidate1, false), Left(None)));
+        let trx_count = group.trx_list.len();
+        let max_cts = group.max_cts;
+        let mut rejected = match group.try_join(precommit_large(TrxID::new(3)), false) {
+            Left(_) => panic!("oversized redo trx must be rejected"),
+            Right(rejected) => rejected,
+        };
+        assert_eq!(rejected.cts, TrxID::new(3));
+        assert!(rejected.redo_bin.is_some());
+        assert_eq!(group.trx_list.len(), trx_count);
+        assert_eq!(group.max_cts, max_cts);
+        clear_redo(&mut rejected);
         for trx in &mut group.trx_list {
             clear_redo(trx);
         }
@@ -371,17 +370,24 @@ mod tests {
     #[test]
     fn test_commit_group_no_log_join_rules() {
         let mut no_log_group = no_log_group(TrxID::new(1));
-        assert!(no_log_group.can_join(&precommit_no_log(TrxID::new(2))));
-        let mut durability_candidate = precommit(TrxID::new(3));
-        assert!(!no_log_group.can_join(&durability_candidate));
-        clear_redo(&mut durability_candidate);
-
-        let listener = no_log_group.join(precommit_no_log(TrxID::new(2)), true);
-        assert!(listener.is_some());
+        assert!(matches!(
+            no_log_group.try_join(precommit_no_log(TrxID::new(2)), true),
+            Left(Some(_))
+        ));
         assert_eq!(no_log_group.trx_list.len(), 2);
         assert_eq!(no_log_group.max_cts, TrxID::new(2));
+        let mut rejected = match no_log_group.try_join(precommit(TrxID::new(3)), false) {
+            Left(_) => panic!("redo trx must not join a no-log group"),
+            Right(rejected) => rejected,
+        };
+        assert_eq!(rejected.cts, TrxID::new(3));
+        assert!(rejected.redo_bin.is_some());
+        assert_eq!(no_log_group.trx_list.len(), 2);
+        assert_eq!(no_log_group.max_cts, TrxID::new(2));
+        clear_redo(&mut rejected);
 
-        let sync_group = no_log_group.into_sync_group();
+        let sync_group =
+            no_log_group.into_sync_group(|_| panic!("no-log group must not request redo buffers"));
         assert_eq!(sync_group.log_bytes, 0);
         assert!(sync_group.writes.is_empty());
         assert_eq!(sync_group.outstanding_requests, 0);
@@ -393,9 +399,11 @@ mod tests {
             LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(10))).unwrap();
         let mut group = log_group(TrxID::new(10), log_block_group);
 
-        assert!(group.require_durability());
-        assert!(group.can_join(&precommit_no_log(TrxID::new(11))));
-        let _ = group.join(precommit_no_log(TrxID::new(11)), false);
+        assert!(group.log.is_some());
+        assert!(matches!(
+            group.try_join(precommit_no_log(TrxID::new(11)), false),
+            Left(None)
+        ));
         assert_eq!(group.trx_list.len(), 2);
         assert_eq!(group.max_cts, TrxID::new(11));
 
@@ -411,13 +419,21 @@ mod tests {
         assert!(log_block_group.is_multi_block());
         let mut group = log_group(TrxID::new(20), log_block_group);
 
-        let mut redo_candidate = precommit(TrxID::new(21));
-        assert!(!group.can_join(&redo_candidate));
-        clear_redo(&mut redo_candidate);
-        assert!(group.can_join(&precommit_no_log(TrxID::new(22))));
-        let _ = group.join(precommit_no_log(TrxID::new(22)), false);
+        let mut rejected = match group.try_join(precommit(TrxID::new(21)), false) {
+            Left(_) => panic!("redo trx must not join a multi-block group"),
+            Right(rejected) => rejected,
+        };
+        clear_redo(&mut rejected);
+        assert!(matches!(
+            group.try_join(precommit_no_log(TrxID::new(22)), false),
+            Left(None)
+        ));
 
-        let sync_group = group.into_sync_group();
+        let sync_group = group.into_sync_group(|count| {
+            (0..count)
+                .map(|_| DirectBuf::zeroed(TEST_LOG_BLOCK_SIZE))
+                .collect()
+        });
         assert!(sync_group.writes.len() > 1);
         assert_eq!(
             sync_group.log_bytes,

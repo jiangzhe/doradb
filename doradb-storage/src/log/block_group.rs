@@ -87,9 +87,11 @@ impl LogBlockGroup {
 
     /// Append one transaction frame to a one-block logical group.
     #[inline]
-    pub(crate) fn append_trx_log(&mut self, trx_log: TrxLog) {
+    pub(crate) fn append_trx_log(&mut self, trx_log: TrxLog) -> Option<TrxLog> {
         let ser_len = trx_log.ser_len();
-        debug_assert!(self.capable_for(ser_len));
+        if !self.capable_for(ser_len) {
+            return Some(trx_log);
+        }
         let cts = trx_log.header.cts;
         self.payload_len += ser_len;
         self.cts_range = (self.cts_range.0.min(cts), self.cts_range.1.max(cts));
@@ -97,12 +99,17 @@ impl LogBlockGroup {
             .expect("existing redo group must have a valid block size");
         debug_assert_eq!(self.block_count, 1);
         self.trx_logs.push(trx_log);
+        None
     }
 
-    /// Materialize this logical group into fixed-size direct I/O write buffers.
+    /// Materialize this logical group using caller-supplied write buffers.
     #[inline]
-    pub(crate) fn finish(self) -> Result<Vec<DirectBuf>> {
-        LogBlockGroupWriter::new(&self).finish()
+    pub(crate) fn finish_with<F>(self, take_blocks: F) -> Result<Vec<DirectBuf>>
+    where
+        F: FnOnce(usize) -> Vec<DirectBuf>,
+    {
+        let blocks = take_blocks(self.block_count);
+        LogBlockGroupWriter::new(&self, blocks)?.finish()
     }
 
     #[inline]
@@ -135,18 +142,34 @@ struct LogBlockGroupWriter<'a> {
 
 impl<'a> LogBlockGroupWriter<'a> {
     #[inline]
-    fn new(group: &'a LogBlockGroup) -> Self {
-        let mut blocks = Vec::with_capacity(group.block_count);
-        for _ in 0..group.block_count {
-            blocks.push(DirectBuf::zeroed(group.log_block_size));
+    fn new(group: &'a LogBlockGroup, blocks: Vec<DirectBuf>) -> Result<Self> {
+        if blocks.len() != group.block_count {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "block=redo-data, expected_block_count={}, actual_block_count={}",
+                    group.block_count,
+                    blocks.len()
+                ))
+                .into());
         }
-        Self {
+        for (block_idx, block) in blocks.iter().enumerate() {
+            if block.capacity() != group.log_block_size {
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "block=redo-data, block_idx={block_idx}, expected_block_size={}, actual_block_size={}",
+                        group.log_block_size,
+                        block.capacity()
+                    ))
+                    .into());
+            }
+        }
+        Ok(Self {
             group,
             blocks,
             payload_lens: vec![0; group.block_count],
             block_idx: 0,
             scratch: Vec::new(),
-        }
+        })
     }
 
     #[inline]
@@ -494,8 +517,36 @@ mod tests {
             LogBlockGroup::new(STORAGE_SECTOR_SIZE, simple_trx_log(TrxID::new(7))).unwrap();
         assert_eq!(group.redo_cts_range(), (TrxID::new(7), TrxID::new(7)));
 
-        group.append_trx_log(simple_trx_log(TrxID::new(9)));
+        assert!(
+            group
+                .append_trx_log(simple_trx_log(TrxID::new(9)))
+                .is_none()
+        );
         assert_eq!(group.redo_cts_range(), (TrxID::new(7), TrxID::new(9)));
+    }
+
+    #[test]
+    fn test_log_block_group_append_rejects_over_capacity_without_mutation() {
+        let first_log = simple_trx_log(TrxID::new(7));
+        let initial_payload_len = first_log.ser_len();
+        let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, first_log).unwrap();
+        let initial_block_count = group.block_count;
+        let initial_cts_range = group.cts_range;
+        let initial_trx_count = group.trx_logs.len();
+        let second_log = large_trx_log(TrxID::new(9));
+        let second_len = second_log.ser_len();
+        assert!(!group.capable_for(second_len));
+
+        let rejected = group
+            .append_trx_log(second_log)
+            .expect("oversized second trx log must be rejected");
+
+        assert_eq!(rejected.ser_len(), second_len);
+        assert_eq!(rejected.header.cts, TrxID::new(9));
+        assert_eq!(group.payload_len, initial_payload_len);
+        assert_eq!(group.cts_range, initial_cts_range);
+        assert_eq!(group.block_count, initial_block_count);
+        assert_eq!(group.trx_logs.len(), initial_trx_count);
     }
 
     #[test]
@@ -504,7 +555,13 @@ mod tests {
         let payload_len = log.ser_len();
         let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
 
-        let blocks = group.finish().unwrap();
+        let blocks = group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .collect()
+            })
+            .unwrap();
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].capacity(), STORAGE_SECTOR_SIZE);
@@ -522,6 +579,48 @@ mod tests {
     }
 
     #[test]
+    fn test_log_block_group_finish_with_uses_supplied_block_batch() {
+        let cts = TrxID::new(13);
+        let log = large_trx_log(cts);
+        let payload_len = log.ser_len();
+        let block_count = block_count_for_payload(STORAGE_SECTOR_SIZE, payload_len).unwrap();
+        let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
+        let mut requested_count = 0usize;
+
+        let blocks = group
+            .finish_with(|count| {
+                requested_count = count;
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .collect()
+            })
+            .unwrap();
+
+        assert_eq!(requested_count, block_count);
+        assert_eq!(blocks.len(), block_count);
+        for block in blocks {
+            assert_eq!(block.capacity(), STORAGE_SECTOR_SIZE);
+        }
+    }
+
+    #[test]
+    fn test_log_block_group_finish_with_rejects_wrong_block_count() {
+        let cts = TrxID::new(13);
+        let log = simple_trx_log(cts);
+        let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
+
+        let err = match group.finish_with(|_| Vec::new()) {
+            Ok(_) => panic!("wrong block count must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
+    }
+
+    #[test]
     fn test_log_block_group_materializes_multi_block_group() {
         let cts = TrxID::new(11);
         let log = large_trx_log(cts);
@@ -530,7 +629,13 @@ mod tests {
         assert!(block_count > 1);
         let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
 
-        let blocks = group.finish().unwrap();
+        let blocks = group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .collect()
+            })
+            .unwrap();
 
         assert_eq!(blocks.len(), block_count);
         for (idx, block) in blocks.iter().enumerate() {

@@ -1892,12 +1892,6 @@ pub(crate) struct PrecommitTrx {
 }
 
 impl PrecommitTrx {
-    /// Returns whether this transaction needs a recovery-visible log record.
-    #[inline]
-    fn require_durability(&self) -> bool {
-        self.redo_bin.is_some()
-    }
-
     /// Takes the recovery-visible log record, if this transaction requires one.
     #[inline]
     pub(crate) fn take_log(&mut self) -> Option<TrxLog> {

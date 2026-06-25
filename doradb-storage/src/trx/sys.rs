@@ -28,6 +28,7 @@ use crate::trx::{
     TrxEntryState, TrxInner,
 };
 use crossbeam_utils::CachePadded;
+use either::Either::{Left, Right};
 use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
@@ -557,13 +558,14 @@ impl TransactionSystem {
                 return Ok(QueuedCommit { cts, waiter });
             }
         };
-        if last_group.can_join(&precommit_trx) {
-            let waiter = last_group.join(precommit_trx, wait_sync);
-            drop(group_commit_g);
-            return Ok(QueuedCommit { cts, waiter });
-        }
-        let waiter = match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync)
-        {
+        let trx = match last_group.try_join(precommit_trx, wait_sync) {
+            Left(waiter) => {
+                drop(group_commit_g);
+                return Ok(QueuedCommit { cts, waiter });
+            }
+            Right(rejected) => rejected,
+        };
+        let waiter = match self.try_enqueue_new_group(trx, &mut group_commit_g, wait_sync) {
             Ok(waiter) => waiter,
             Err(rejected) => {
                 drop(group_commit_g);

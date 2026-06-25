@@ -183,10 +183,7 @@ impl Operation {
 
     /// Returns a shared reference to the owned direct buffer, if present.
     #[inline]
-    #[cfg_attr(
-        any(not(test), feature = "iouring"),
-        expect(dead_code, reason = "reserved buf")
-    )]
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved buf"))]
     pub(crate) fn buf(&self) -> Option<&DirectBuf> {
         match &self.memory {
             IOMemory::Owned(buf) => Some(buf),

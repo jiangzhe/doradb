@@ -879,19 +879,42 @@ impl<'a> RedoLogWriter<'a> {
     }
 
     #[inline]
-    fn recycle_buf(&self, mut buf: DirectBuf) {
-        if buf.capacity() == self.log_block_size {
+    fn take_reusable_bufs(&self, count: usize) -> Vec<DirectBuf> {
+        self.trx_sys.redo_log.buf_free_list.pop_batch(count)
+    }
+
+    #[inline]
+    fn recycle_bufs(&self, bufs: Vec<DirectBuf>) {
+        let mut reusable = Vec::with_capacity(bufs.len());
+        for mut buf in bufs {
+            if buf.capacity() != self.log_block_size {
+                continue;
+            }
             buf.reset();
-            self.trx_sys.redo_log.buf_free_list.push(buf);
+            reusable.push(buf);
         }
+        if !reusable.is_empty() {
+            self.trx_sys.redo_log.buf_free_list.push_batch(reusable);
+        }
+    }
+
+    #[inline]
+    fn fail_queued_group(&self, mut group: CommitGroup, reason: FailedPrecommitReason) {
+        if group.trx_list.is_empty() {
+            return;
+        }
+        let trx_list = mem::take(&mut group.trx_list);
+        let completion = Arc::clone(&group.completion);
+        self.trx_sys
+            .request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
+                trx_list, completion, reason,
+            ));
     }
 
     #[inline]
     fn fail_sync_group(&self, sync_group: &mut SyncGroup, reason: FailedPrecommitReason) {
         sync_group.fail_waiters(self.trx_sys, reason);
-        for buf in sync_group.drain_buffers() {
-            self.recycle_buf(buf);
-        }
+        self.recycle_bufs(sync_group.drain_buffers());
     }
 
     /// Fail all pending redo work after a fatal storage error.
@@ -922,8 +945,7 @@ impl<'a> RedoLogWriter<'a> {
             }
         }
         for group in queued {
-            let mut sync_group = group.into_sync_group();
-            self.fail_sync_group(&mut sync_group, reason);
+            self.fail_queued_group(group, reason);
         }
     }
 
@@ -957,9 +979,7 @@ impl<'a> RedoLogWriter<'a> {
                 }
             }
         }
-        for buf in recycle {
-            self.recycle_buf(buf);
-        }
+        self.recycle_bufs(recycle);
     }
 
     #[inline]
@@ -1063,7 +1083,8 @@ impl<'a> RedoLogWriter<'a> {
                         fetched = true;
                     }
                     Some(Commit::Group(cg)) => {
-                        self.prefix.push_group(cg.into_sync_group());
+                        let sync_group = cg.into_sync_group(|count| self.take_reusable_bufs(count));
+                        self.prefix.push_group(sync_group);
                         fetched = true;
                     }
                 }
@@ -1101,7 +1122,8 @@ impl<'a> RedoLogWriter<'a> {
                     self.prefix.push_header(header_write);
                 }
                 Some(Commit::Group(cg)) => {
-                    self.prefix.push_group(cg.into_sync_group());
+                    let sync_group = cg.into_sync_group(|count| self.take_reusable_bufs(count));
+                    self.prefix.push_group(sync_group);
                 }
             }
         }
@@ -1258,9 +1280,7 @@ impl<'a> RedoLogWriter<'a> {
 
         for mut sync_group in ready.written {
             debug_assert!(sync_group.failure_reason.is_none());
-            for buf in sync_group.drain_buffers() {
-                self.recycle_buf(buf);
-            }
+            self.recycle_bufs(sync_group.drain_buffers());
             // commit transactions to let waiting read operations to continue
             let mut committed_trx_list: FastHashMap<usize, Vec<CommittedTrx>> =
                 FastHashMap::default();
@@ -1837,7 +1857,7 @@ mod tests {
         REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, parse_redo_super_block,
         slot_offset,
     };
-    use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind};
+    use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::recovery::stream::{ReadLog, RedoLogSegment, RedoLogStream};
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
@@ -1845,10 +1865,12 @@ mod tests {
     use event_listener::Event;
     use futures::task::noop_waker;
     use smol::Timer;
+    use std::collections::BTreeMap;
     use std::fmt::Debug;
     use std::fs::{self, File, OpenOptions};
     use std::future::Future;
     use std::io::{Error as IoError, Seek, SeekFrom, Write};
+    use std::iter::repeat_n;
     use std::os::fd::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard, mpsc};
@@ -1871,6 +1893,28 @@ mod tests {
             Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    fn oversized_redo_log_for_test(cts: TrxID) -> TrxLog {
+        let mut rows = BTreeMap::new();
+        let text: String = repeat_n('a', 8000).collect();
+        rows.insert(
+            RowID::new(100),
+            RowRedo {
+                page_id: test_page_id(5),
+                row_id: RowID::new(100),
+                kind: RowRedoKind::Insert(vec![Val::from(1u32), Val::from(&text[..])]),
+            },
+        );
+        let mut dml = BTreeMap::new();
+        dml.insert(TableID::new(5), TableDML { rows });
+        TrxLog::new(
+            RedoHeader {
+                cts,
+                trx_kind: RedoTrxKind::User,
+            },
+            RedoLogs { ddl: None, dml },
+        )
     }
 
     fn create_log_file_for_test(
@@ -2998,6 +3042,103 @@ mod tests {
     }
 
     #[test]
+    fn test_fetch_io_reqs_materializes_group_with_recycled_redo_buffers() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("fetch_reuses_redo_buffer", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_reuse_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let redo_log = &*harness.trx_sys.redo_log;
+            let cts = TrxID::new(58);
+
+            {
+                let mut group_commit_g = redo_log.group_commit.lock();
+                let log_file = group_commit_g.log_file.as_ref().unwrap();
+                let file_seq = log_file.file_seq();
+                let log_fd = log_file.as_raw_fd();
+                let log_group = LogBlockGroup::new(4096, oversized_redo_log_for_test(cts)).unwrap();
+                let physical_len = log_group.physical_len();
+                assert!(physical_len > 4096);
+                let (offset, _) = log_file.alloc(physical_len).unwrap();
+                group_commit_g.queue.push_back(Commit::Group(CommitGroup {
+                    trx_list: vec![PrecommitTrx {
+                        cts,
+                        redo_bin: None,
+                        payload: None,
+                        attachment: None,
+                        lock_manager: None,
+                        lock_state: None,
+                    }],
+                    max_cts: cts,
+                    log: Some(CommitGroupLog {
+                        alloc: RedoGroupWriteAlloc {
+                            file_seq,
+                            fd: log_fd,
+                            offset,
+                            end_offset: offset + physical_len,
+                        },
+                        group: log_group,
+                    }),
+                    completion: Arc::new(Completion::new()),
+                }));
+            }
+
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(2).unwrap());
+            let sealer = LogFileSealer::new(&harness.trx_sys.config);
+            {
+                let mut fp = RedoLogWriter::new(
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
+                    &mut write_driver,
+                );
+                let reusable1 = DirectBuf::zeroed(4096);
+                let reusable1_ptr = reusable1.as_bytes().as_ptr() as usize;
+                let reusable2 = DirectBuf::zeroed(4096);
+                let reusable2_ptr = reusable2.as_bytes().as_ptr() as usize;
+                fp.recycle_bufs(vec![reusable1, reusable2]);
+
+                fp.fetch_io_reqs(&sealer);
+
+                let group = fp
+                    .prefix
+                    .entries
+                    .iter()
+                    .find_map(|entry| match &entry.kind {
+                        LogPrefixKind::Group { group } => Some(group),
+                        _ => None,
+                    })
+                    .expect("queued redo group must enter prefix");
+                let buf_ptrs = group
+                    .writes
+                    .iter()
+                    .map(|submission| {
+                        let buf = submission
+                            .operation
+                            .buf()
+                            .expect("group write submission must own a buffer");
+                        buf.as_bytes().as_ptr() as usize
+                    })
+                    .collect::<Vec<_>>();
+                assert!(buf_ptrs.contains(&reusable1_ptr));
+                assert!(buf_ptrs.contains(&reusable2_ptr));
+            }
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
     fn test_finish_pending_io_and_header_write_syncs_boundary_ended_log_file() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
@@ -3788,7 +3929,13 @@ mod tests {
             ),
         )
         .unwrap();
-        let blocks = log_group.finish().unwrap();
+        let blocks = log_group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(old_log_block_size))
+                    .collect()
+            })
+            .unwrap();
         let group_len = blocks.iter().map(DirectBuf::capacity).sum();
         let (group_offset, _) = old_log_file.alloc(group_len).unwrap();
         assert_eq!(group_offset, REDO_DEFAULT_DATA_START_OFFSET);

@@ -4,7 +4,7 @@ use crate::component::Supplier;
 use crate::error::{ConfigError, ConfigResult, DataIntegrityError, Error, Result};
 use crate::file::fs::FileSystem;
 use crate::id::TrxID;
-use crate::io::{Completion, align_to_sector_size};
+use crate::io::{Completion, STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::{LogSync, RedoLogInitializer};
 use crate::quiescent::QuiescentGuard;
@@ -31,6 +31,8 @@ use super::consts::{
 use super::path::{path_to_utf8, validate_log_file_stem};
 
 use crate::log::discover_redo_log_files;
+
+const MAX_REDO_LOG_BLOCK_SIZE: usize = u16::MAX as usize + 1;
 
 /// Configuration for redo logging, recovery, and transaction-system workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,8 +168,9 @@ impl TrxSysConfig {
     ) -> Result<(RecoveryCoordinator<'a>, RedoLogInitializer)> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let file_prefix = self.file_prefix().map_err(Error::from)?;
-        let log_block_size = align_to_sector_size(self.log_block_size.as_u64() as usize);
-        validate_redo_log_block_size(log_block_size)?;
+        let configured_log_block_size = self.log_block_size.as_u64() as usize;
+        validate_redo_log_block_size(configured_log_block_size)?;
+        let log_block_size = align_to_sector_size(configured_log_block_size);
         let file_max_size =
             normalize_redo_file_max_size(self.log_file_max_size.as_u64() as usize, log_block_size)?;
 
@@ -186,8 +189,9 @@ impl TrxSysConfig {
 
     #[inline]
     fn normalize_redo_file_layout(mut self) -> Result<Self> {
-        let log_block_size = align_to_sector_size(self.log_block_size.as_u64() as usize);
-        validate_redo_log_block_size(log_block_size)?;
+        let configured_log_block_size = self.log_block_size.as_u64() as usize;
+        validate_redo_log_block_size(configured_log_block_size)?;
+        let log_block_size = align_to_sector_size(configured_log_block_size);
         let file_max_size =
             normalize_redo_file_max_size(self.log_file_max_size.as_u64() as usize, log_block_size)?;
         self.log_block_size = <Byte as From<usize>>::from(log_block_size);
@@ -321,13 +325,12 @@ fn normalize_redo_file_max_size(
 
 #[inline]
 fn validate_redo_log_block_size(log_block_size: usize) -> Result<()> {
-    const MAX_REDO_LOG_BLOCK_SIZE: usize = u16::MAX as usize + 1;
-    if log_block_size <= MAX_REDO_LOG_BLOCK_SIZE {
+    if (STORAGE_SECTOR_SIZE..=MAX_REDO_LOG_BLOCK_SIZE).contains(&log_block_size) {
         return Ok(());
     }
     Err(Report::new(ConfigError::InvalidLogBlockSize)
         .attach(format!(
-            "log_block_size={log_block_size}, max_supported={MAX_REDO_LOG_BLOCK_SIZE}"
+            "log_block_size={log_block_size}, min_supported={STORAGE_SECTOR_SIZE}, max_supported={MAX_REDO_LOG_BLOCK_SIZE}"
         ))
         .into())
 }
@@ -356,7 +359,14 @@ fn recovery_initial_trx_ts(max_recovered_cts: TrxID) -> Result<TrxID> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::STORAGE_SECTOR_SIZE;
+
+    fn assert_invalid_log_block_size(err: Error) {
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidLogBlockSize)
+        );
+    }
 
     #[test]
     fn log_block_size_rounds_below_sector_to_sector_size() {
@@ -380,6 +390,36 @@ mod tests {
             config.log_block_size.as_u64(),
             (STORAGE_SECTOR_SIZE * 2) as u64
         );
+    }
+
+    #[test]
+    fn normalize_redo_file_layout_rejects_direct_zero_log_block_size() {
+        let config = TrxSysConfig {
+            log_block_size: Byte::from(0usize),
+            ..TrxSysConfig::default()
+        };
+
+        let err = match config.normalize_redo_file_layout() {
+            Ok(_) => panic!("zero redo log block size must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_invalid_log_block_size(err);
+    }
+
+    #[test]
+    fn normalize_redo_file_layout_rejects_direct_too_large_log_block_size() {
+        let config = TrxSysConfig {
+            log_block_size: Byte::from(MAX_REDO_LOG_BLOCK_SIZE + STORAGE_SECTOR_SIZE),
+            ..TrxSysConfig::default()
+        };
+
+        let err = match config.normalize_redo_file_layout() {
+            Ok(_) => panic!("oversized redo log block size must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_invalid_log_block_size(err);
     }
 
     #[test]

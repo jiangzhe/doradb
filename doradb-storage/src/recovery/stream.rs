@@ -24,7 +24,7 @@ pub(crate) enum ReadLog {
     SizeLimit,
     /// The current group or file header failed integrity validation.
     DataCorrupted,
-    /// A checksum-verified transaction log iterator.
+    /// A transaction log iterator assembled from CRC32-validated redo blocks.
     Iterator(TrxLogIterator),
 }
 
@@ -44,7 +44,7 @@ pub(crate) struct TrxLogIterator {
 }
 
 impl TrxLogIterator {
-    /// Create a group iterator from a checksum-verified body slice.
+    /// Create a group iterator from an assembled payload whose source blocks were validated.
     #[inline]
     fn new(data: Vec<u8>, min_cts: TrxID, max_cts: TrxID) -> Self {
         TrxLogIterator {
@@ -478,9 +478,9 @@ impl MmapLogReader {
 
     /// Read and validate one logical fixed-block redo group.
     ///
-    /// The body is not exposed until the header fields and whole-group checksum
-    /// have both been validated, so transaction parsing never sees bytes from a
-    /// corrupt or partially written group.
+    /// The payload is not exposed until the group-start metadata, every block
+    /// header, each block-level CRC32 checksum, continuation order, end flags,
+    /// and assembled payload length have been validated.
     #[inline]
     pub(crate) fn read(&mut self) -> ReadLog {
         if let Some(result) = self.read_exhausted_result() {
@@ -787,7 +787,13 @@ mod tests {
     fn block_group_with_range(log: TrxLog, min_cts: TrxID, max_cts: TrxID) -> DirectBuf {
         let payload_len = log.ser_len();
         let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
-        let mut blocks = group.finish().unwrap();
+        let mut blocks = group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .collect()
+            })
+            .unwrap();
         assert_eq!(blocks.len(), 1);
         let mut direct_buf = blocks.pop().unwrap();
         RedoGroupStartExtension::new(payload_len, 1, min_cts, max_cts)
@@ -1069,8 +1075,14 @@ mod tests {
             },
             RedoLogs { ddl: None, dml },
         );
-        group.append_trx_log(log2);
-        let blocks = group.finish().unwrap();
+        assert!(group.append_trx_log(log2).is_none());
+        let blocks = group
+            .finish_with(|count| {
+                (0..count)
+                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                    .collect()
+            })
+            .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.log");
