@@ -1,7 +1,7 @@
 ---
 id: 000187
 title: Redo Fixed-Block Format and Writer
-status: proposal
+status: implemented
 created: 2026-06-22
 github_issue: 751
 ---
@@ -326,6 +326,83 @@ Planned RFC phase-plan update during `task resolve`:
 
 ## Implementation Notes
 
+Implemented RFC-0021 Phase 2 fixed-block redo format and writer.
+
+- Bumped redo file format version to `3` and replaced the v2 variable-size
+  redo group body with fixed-size redo data blocks. Each block has an 11-byte
+  common header (`checksum`, `flags`, `payload_len`, `group_block_idx`), and
+  group-start blocks carry a 28-byte extension (`group_payload_len`,
+  `group_block_count`, `min_redo_cts`, `max_redo_cts`).
+- Implemented per-block CRC32 validation and zero-tail checks. There is no
+  group-level checksum, no block-local format version, and no persisted header
+  length field; the selected redo super-block format version identifies the
+  data-block format.
+- Replaced `log/buf.rs` with `log/block_group.rs`. `LogBlockGroup` owns strict
+  `TrxLog` frames, keeps ordinary multi-transaction groups inside one block,
+  allows one oversized transaction to span multiple blocks, and materializes
+  exactly `log_block_size` `DirectBuf`s through `LogBlockGroupWriter`. Frames
+  are serialized directly into block payload space when they fit, and only
+  crossing frames use a reusable scratch buffer.
+- Updated commit-group admission around `CommitGroup::try_join()` so group
+  capacity is checked once while joining, no-log transactions retain ordered
+  completion behavior, and rejected redo-bearing transactions are handed back
+  without mutating the existing group.
+- Updated redo allocation and writer submission so one logical group maps to
+  one or more fixed-block write requests. The writer aggregates block
+  completions through the Phase 1 prefix scheduler, recycles completed block
+  buffers through batched `FreeList` operations, and records sealed metadata
+  only for complete durable logical groups.
+- Added non-fatal capacity rejection for groups that cannot fit in an empty
+  redo file data region. System commit reports `ResourceError`, user
+  `trx.commit().await` observes
+  `CompletionErrorKind::Resource(StorageFileCapacityExceeded)`, failed
+  precommit cleanup completes before waiters are woken, and group-commit
+  admission remains open.
+- Added the Phase 2 mmap fixed-block parser in `recovery/stream.rs`.
+  `MmapLogReader` validates every block header and per-block checksum before
+  exposing an owned `TrxLogIterator`; incomplete unsealed tails stop replay,
+  while incomplete or corrupt sealed data before `durable_end_offset` is
+  reported as corruption.
+- Renamed recovery reader code from `recovery/redo_stream.rs` to
+  `recovery/stream.rs`, renamed the logical group iterator to
+  `TrxLogIterator`, and renamed `ReadLog::Some` to `ReadLog::Iterator`.
+- Tightened related configuration and helper behavior discovered during review:
+  redo log block size now rejects values below `STORAGE_SECTOR_SIZE`, and
+  `FreeList` now exposes the synchronous batch operations used by redo buffer
+  recycling.
+
+Review follow-ups addressed during implementation:
+
+- Moved pure redo block/group capacity helpers out of impl blocks where they do
+  not require receiver state.
+- Simplified `MmapLogReader::read()` and `LogBlockGroup` materialization by
+  splitting validation/assembly helpers and removing the old mixed
+  `LogBlockGroup::finish()` shape.
+- Kept `LogBlockGroupWriter` responsible for full block materialization while
+  sourcing buffers from the redo free list instead of allocating fresh blocks
+  for every group.
+- Added regression coverage for redo block-size lower/upper validation,
+  checked append/join capacity rejection, per-block checksum wording, and
+  system plus user/session `StorageFileCapacityExceeded` cleanup paths.
+
+Validation completed:
+
+```bash
+tools/style_audit.rs --diff-base origin/main
+cargo fmt --all -- --check
+cargo check -p doradb-storage
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage trx::sys
+cargo nextest run -p doradb-storage
+cargo nextest run -p doradb-storage --no-default-features --features libaio
+```
+
+Validation results:
+
+- Branch-diff style audit passed for 19 Rust files changed against
+  `origin/main`.
+- Default nextest pass ran 1019 tests and all passed.
+- `libaio` nextest pass ran 1017 tests and all passed.
 
 ## Impacts
 
@@ -457,15 +534,6 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-- Exact new redo super-block format version number is left to implementation.
-- Exact non-fatal error surface for empty-file capacity rejection should fit
-  the existing `ErrorKind::Resource` / failed-precommit cleanup model. The
-  required behavior is fixed: no storage poison, no admission close, no durable
-  visibility, and mandatory cleanup for user transactions that already entered
-  precommit ownership.
-- During `task resolve`, synchronize RFC-0021 Phase 2 and Phase 3 wording with
-  the final implementation. The expected update is to record the no-version
-  block header, no group checksum, no persisted header length, continuation
-  block-index design, `u8` flags, `u16` payload length, no reserved
-  group-start field, reusable scratch serialization strategy, and Phase 2's
-  minimal fixed-block mmap parser.
+- None for this task. RFC-0021 Phase 3 remains responsible for replacing the
+  mmap transport with direct-IO async redo reads over the fixed-block parser
+  introduced here.
