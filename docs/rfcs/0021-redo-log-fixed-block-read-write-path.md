@@ -419,6 +419,9 @@ pwrite_owned}`.
     residual mmap reader/test dependency. [Task Resolve Sync: docs/tasks/000188-redo-direct-io-read-ahead-reader.md @ 2026-06-25]
   - Related Backlogs:
     - `docs/backlogs/closed/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
+    - `docs/backlogs/000130-large-redo-transaction-streaming-replay.md`
+    - `docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md`
+    - `docs/backlogs/000132-checkpoint-below-floor-group-skip-evaluation.md`
 
 - **Phase 4: Completion Drain and Sync Batching**
   - Scope: Use the prefix scheduler to drain already-available completions and

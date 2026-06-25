@@ -332,6 +332,10 @@ Planned RFC phase-plan update during `task resolve`:
   was removed instead of preserved.
 - Updated `docs/redo-log.md` and RFC-0021 Phase 3 notes to describe the
   direct-IO recovery/checkpoint reader path.
+- Created follow-up backlog items for larger deferred work:
+  - `docs/backlogs/000130-large-redo-transaction-streaming-replay.md`
+  - `docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md`
+  - `docs/backlogs/000132-checkpoint-below-floor-group-skip-evaluation.md`
 - Verified with:
   - `cargo fmt --check`
   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
@@ -434,3 +438,13 @@ default `io_uring` and alternate `libaio` validation paths are required.
 - Future parallel log parsing or replay should build on this task's separation
   between IO read-ahead and `RedoLogStream` parsing. It is out of scope for
   Phase 3.
+- Very large redo transactions can still require a full logical group payload
+  allocation before replay. Track bounded streaming replay follow-up in
+  `docs/backlogs/000130-large-redo-transaction-streaming-replay.md`.
+- Redo rotation seal persistence and repeated recovery repair need a separate
+  correctness task. Track durable-prefix seal semantics in
+  `docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md`.
+- Checkpoint scans may be able to skip groups whose group-start max CTS is
+  below the replay floor before payload deserialization, but that should be
+  evaluated with the future incremental checkpoint scan design. Track this in
+  `docs/backlogs/000132-checkpoint-below-floor-group-skip-evaluation.md`.
