@@ -198,10 +198,8 @@ pub(crate) struct RedoLogFileDescriptor {
     pub(crate) path: PathBuf,
 }
 
-/// Builder for the redo log runtime and its initial writable file.
+/// Value-only builder for the redo log runtime and its initial writable file.
 pub(crate) struct RedoLogInitializer {
-    /// Storage backend used by the redo log writer.
-    pub(crate) ctx: StorageBackend,
     /// Full file prefix for redo log file names.
     pub(crate) file_prefix: String,
     /// Maximum size of each redo log file.
@@ -209,34 +207,34 @@ pub(crate) struct RedoLogInitializer {
     /// Direct-I/O block size used for redo group writes.
     pub(crate) log_block_size: usize,
     /// Maximum in-flight I/O depth for redo writes.
-    pub(crate) io_depth: usize,
+    pub(crate) log_write_io_depth: usize,
     /// Sequence for the next writable redo file.
     pub(crate) next_file_seq: u32,
 }
 
 impl RedoLogInitializer {
-    /// Create a redo log initializer and its storage backend.
+    /// Create a value-only redo log initializer.
     #[inline]
     pub(crate) fn new(
         file_prefix: String,
-        io_depth: usize,
+        log_write_io_depth: usize,
         file_max_size: usize,
         log_block_size: usize,
         next_file_seq: u32,
-    ) -> Result<Self> {
-        Ok(Self {
-            ctx: StorageBackend::new(io_depth)?,
+    ) -> Self {
+        Self {
             file_prefix,
             file_max_size,
             log_block_size,
-            io_depth,
+            log_write_io_depth,
             next_file_seq,
-        })
+        }
     }
 
     /// Create the initial redo file and return the live redo log state.
     #[inline]
     pub(crate) fn finish(self, purge_tx: Sender<Purge>) -> Result<(RedoLog, Arc<Completion<()>>)> {
+        let ctx = StorageBackend::new(self.log_write_io_depth)?;
         let mut file_seq = self.next_file_seq;
         let (
             CreatedLogFile {
@@ -262,22 +260,24 @@ impl RedoLogInitializer {
             closed: None,
             log_file: Some(log_file),
         };
-        let io_backend_stats = self.ctx.stats_handle();
+        let io_backend_stats = ctx.stats_handle();
         Ok((
             RedoLog {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
                 stats: Arc::new(CachePadded::new(RedoLogStats::default())),
                 purge_tx,
-                log_write_backend: CachePadded::new(Mutex::new(Some(self.ctx))),
+                log_write_backend: CachePadded::new(Mutex::new(Some(ctx))),
                 io_backend_stats,
                 log_block_size: self.log_block_size,
                 file_prefix: self.file_prefix,
                 file_seq: AtomicU32::new(file_seq),
                 file_max_size: self.file_max_size,
-                buf_free_list: FreeList::new(self.io_depth, self.io_depth * 2, move || {
-                    DirectBuf::zeroed(self.log_block_size)
-                }),
+                buf_free_list: FreeList::new(
+                    self.log_write_io_depth,
+                    self.log_write_io_depth * 2,
+                    move || DirectBuf::zeroed(self.log_block_size),
+                ),
             },
             header_completion,
         ))
@@ -1858,7 +1858,7 @@ mod tests {
         slot_offset,
     };
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
-    use crate::recovery::stream::{ReadLog, RedoLogSegment, RedoLogStream};
+    use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner};
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
     use crate::value::Val;
@@ -1940,24 +1940,24 @@ mod tests {
         log_file
     }
 
-    fn redo_stream_and_initializer_for_test(
+    fn redo_planner_and_initializer_for_test(
         file_prefix: &str,
-        io_depth: usize,
+        recovery_io_depth: usize,
+        log_write_io_depth: usize,
         file_max_size: usize,
         log_block_size: usize,
         logs: Vec<RedoLogFileDescriptor>,
-    ) -> (RedoLogInitializer, RedoLogStream) {
-        let stream = RedoLogStream::new(logs);
-        let next_file_seq = stream.next_file_seq().unwrap().unwrap_or(0);
+    ) -> (RedoLogInitializer, RedoReplayPlanner, usize) {
+        let planner = RedoReplayPlanner::new(logs);
+        let next_file_seq = planner.next_file_seq().unwrap().unwrap_or(0);
         let initializer = RedoLogInitializer::new(
             file_prefix.to_owned(),
-            io_depth,
+            log_write_io_depth,
             file_max_size,
             log_block_size,
             next_file_seq,
-        )
-        .unwrap();
-        (initializer, stream)
+        );
+        (initializer, planner, recovery_io_depth)
     }
 
     fn create_sealed_log_file_for_test(
@@ -1985,11 +1985,10 @@ mod tests {
 
     fn finish_redo_log_for_test(
         file_prefix: String,
-        io_depth: usize,
+        log_write_io_depth: usize,
     ) -> (RedoLog, Arc<Completion<()>>) {
         let (purge_tx, _purge_rx) = flume::unbounded();
-        RedoLogInitializer::new(file_prefix, io_depth, 128 * 1024, 4096, 0)
-            .unwrap()
+        RedoLogInitializer::new(file_prefix, log_write_io_depth, 128 * 1024, 4096, 0)
             .finish(purge_tx)
             .unwrap()
     }
@@ -2342,7 +2341,9 @@ mod tests {
             .trx(
                 TrxSysConfig::default()
                     .log_file_stem(log_file_stem)
-                    .io_depth(1)
+                    .log_write_io_depth(1)
+                    .recovery_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
                     .log_sync(log_sync)
                     .log_file_max_size(log_file_max_size),
             )
@@ -3760,122 +3761,114 @@ mod tests {
 
     #[test]
     fn test_redo_replay_plan_stops_before_invalid_obsolete_prefix() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        let invalid_prefix = File::create(format!("{file_prefix}.00000000")).unwrap();
-        invalid_prefix.set_len(128 * 1024).unwrap();
-        drop(invalid_prefix);
-        create_sealed_log_file_for_test(
-            file_prefix,
-            1,
-            REDO_DEFAULT_DATA_START_OFFSET + 4096,
-            Some((TrxID::new(10), TrxID::new(20))),
-        );
-        create_sealed_log_file_for_test(file_prefix, 2, REDO_DEFAULT_DATA_START_OFFSET, None);
-        let descriptors = discover_redo_log_files(file_prefix, false).unwrap();
-        let mut stream = RedoLogStream::new(descriptors);
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir.path().join("redo.log");
+            let file_prefix = file_prefix.to_str().unwrap();
+            let invalid_prefix = File::create(format!("{file_prefix}.00000000")).unwrap();
+            invalid_prefix.set_len(128 * 1024).unwrap();
+            drop(invalid_prefix);
+            create_sealed_log_file_for_test(
+                file_prefix,
+                1,
+                REDO_DEFAULT_DATA_START_OFFSET + 4096,
+                Some((TrxID::new(10), TrxID::new(20))),
+            );
+            create_sealed_log_file_for_test(file_prefix, 2, REDO_DEFAULT_DATA_START_OFFSET, None);
+            let descriptors = discover_redo_log_files(file_prefix, false).unwrap();
+            let planner = RedoReplayPlanner::new(descriptors);
 
-        assert_eq!(stream.next_file_seq().unwrap(), Some(3));
-        let skipped = stream.plan_replay(TrxID::new(15)).unwrap();
-        assert_eq!(skipped, None);
-        assert_eq!(vec![1], stream.planned_file_seqs());
-    }
-
-    #[test]
-    fn test_redo_stream_rejects_read_before_explicit_plan() {
-        let mut stream = RedoLogStream::new(Vec::new());
-
-        let err = stream.try_next().unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::Generic)
-        );
-        assert!(
-            format!("{err:?}").contains("redo replay read before explicit plan"),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn test_redo_replay_plan_rejects_second_call() {
-        let mut stream = RedoLogStream::new(Vec::new());
-
-        assert_eq!(stream.plan_replay(TrxID::new(10)).unwrap(), None);
-        for requested_floor in [TrxID::new(10), TrxID::new(11)] {
-            let err = stream.plan_replay(requested_floor).unwrap_err();
+            assert_eq!(planner.next_file_seq().unwrap(), Some(3));
+            let (skipped_max_recovered_cts, mut stream) =
+                planner.plan_stream(TrxID::new(15), 1).unwrap();
+            assert_eq!(skipped_max_recovered_cts, None);
+            let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::Generic)
+                err.data_integrity_error(),
+                Some(DataIntegrityError::LogFileCorrupted)
             );
-            let report = format!("{err:?}");
-            assert!(report.contains("redo replay already planned"), "{report}");
-            assert!(report.contains("existing_floor=10"), "{report}");
-            assert!(
-                report.contains(&format!("requested_floor={requested_floor}")),
-                "{report}"
-            );
-        }
+        });
+    }
+
+    #[test]
+    fn test_redo_replay_planner_can_build_independent_empty_streams() {
+        smol::block_on(async {
+            let planner = RedoReplayPlanner::new(Vec::new());
+            let (_, mut stream1) = planner.plan_stream(TrxID::new(10), 1).unwrap();
+            let (_, mut stream2) = planner.plan_stream(TrxID::new(11), 1).unwrap();
+
+            assert!(stream1.try_next().await.unwrap().is_none());
+            assert!(stream2.try_next().await.unwrap().is_none());
+        });
     }
 
     #[test]
     fn test_redo_replay_plan_skips_obsolete_sealed_segment_and_seeds_cts() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        create_sealed_log_file_for_test(
-            file_prefix,
-            0,
-            REDO_DEFAULT_DATA_START_OFFSET + 4096,
-            Some((TrxID::new(10), TrxID::new(20))),
-        );
-        let logs = discover_redo_log_files(file_prefix, false).unwrap();
-        let (initializer, mut stream) =
-            redo_stream_and_initializer_for_test(file_prefix, 1, 128 * 1024, 4096, logs);
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir.path().join("redo.log");
+            let file_prefix = file_prefix.to_str().unwrap();
+            create_sealed_log_file_for_test(
+                file_prefix,
+                0,
+                REDO_DEFAULT_DATA_START_OFFSET + 4096,
+                Some((TrxID::new(10), TrxID::new(20))),
+            );
+            let logs = discover_redo_log_files(file_prefix, false).unwrap();
+            let (initializer, planner, read_depth) =
+                redo_planner_and_initializer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
 
-        let skipped = stream.plan_replay(TrxID::new(21)).unwrap();
-        assert_eq!(skipped, Some(TrxID::new(20)));
-        assert!(stream.try_next().unwrap().is_none());
-        assert_eq!(initializer.next_file_seq, 1);
+            let (skipped_max_recovered_cts, mut stream) =
+                planner.plan_stream(TrxID::new(21), read_depth).unwrap();
+            assert_eq!(skipped_max_recovered_cts, Some(TrxID::new(20)));
+            assert!(stream.try_next().await.unwrap().is_none());
+            assert_eq!(initializer.next_file_seq, 1);
+        });
     }
 
     #[test]
     fn test_redo_replay_plan_skips_sealed_empty_without_cts_seed() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        create_sealed_log_file_for_test(file_prefix, 0, REDO_DEFAULT_DATA_START_OFFSET, None);
-        let logs = discover_redo_log_files(file_prefix, false).unwrap();
-        let (initializer, mut stream) =
-            redo_stream_and_initializer_for_test(file_prefix, 1, 128 * 1024, 4096, logs);
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir.path().join("redo.log");
+            let file_prefix = file_prefix.to_str().unwrap();
+            create_sealed_log_file_for_test(file_prefix, 0, REDO_DEFAULT_DATA_START_OFFSET, None);
+            let logs = discover_redo_log_files(file_prefix, false).unwrap();
+            let (initializer, planner, read_depth) =
+                redo_planner_and_initializer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
 
-        let skipped = stream.plan_replay(TrxID::new(100)).unwrap();
-        assert_eq!(skipped, None);
-        assert!(stream.try_next().unwrap().is_none());
-        assert_eq!(initializer.next_file_seq, 1);
+            let (skipped_max_recovered_cts, mut stream) =
+                planner.plan_stream(TrxID::new(100), read_depth).unwrap();
+            assert_eq!(skipped_max_recovered_cts, None);
+            assert!(stream.try_next().await.unwrap().is_none());
+            assert_eq!(initializer.next_file_seq, 1);
+        });
     }
 
     #[test]
     fn test_redo_replay_plan_does_not_skip_boundary_equality() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        create_sealed_log_file_for_test(
-            file_prefix,
-            0,
-            REDO_DEFAULT_DATA_START_OFFSET + 4096,
-            Some((TrxID::new(10), TrxID::new(20))),
-        );
-        let logs = discover_redo_log_files(file_prefix, false).unwrap();
-        let mut stream = RedoLogStream::new(logs);
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir.path().join("redo.log");
+            let file_prefix = file_prefix.to_str().unwrap();
+            create_sealed_log_file_for_test(
+                file_prefix,
+                0,
+                REDO_DEFAULT_DATA_START_OFFSET + 4096,
+                Some((TrxID::new(10), TrxID::new(20))),
+            );
+            let logs = discover_redo_log_files(file_prefix, false).unwrap();
+            let planner = RedoReplayPlanner::new(logs);
 
-        let skipped = stream.plan_replay(TrxID::new(20)).unwrap();
-        assert_eq!(skipped, None);
-        let err = stream.try_next().unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::LogFileCorrupted)
-        );
+            let (skipped_max_recovered_cts, mut stream) =
+                planner.plan_stream(TrxID::new(20), 1).unwrap();
+            assert_eq!(skipped_max_recovered_cts, None);
+            let err = stream.try_next().await.unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::LogFileCorrupted)
+            );
+        });
     }
 
     #[test]
@@ -3907,118 +3900,127 @@ mod tests {
     #[test]
     fn test_restart_replays_old_log_with_persisted_config_and_creates_new_log_with_current_config()
     {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("mixed_config_redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        let old_log_block_size = 8192;
-        let old_file_max_size = REDO_DEFAULT_DATA_START_OFFSET + old_log_block_size * 2;
-        let new_log_block_size = 4096;
-        let new_file_max_size = REDO_DEFAULT_DATA_START_OFFSET + new_log_block_size * 3;
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir.path().join("mixed_config_redo.log");
+            let file_prefix = file_prefix.to_str().unwrap();
+            let old_log_block_size = 8192;
+            let old_file_max_size = REDO_DEFAULT_DATA_START_OFFSET + old_log_block_size * 2;
+            let new_log_block_size = 4096;
+            let new_file_max_size = REDO_DEFAULT_DATA_START_OFFSET + new_log_block_size * 3;
 
-        let old_log_file =
-            create_log_file_for_test(file_prefix, 0, old_file_max_size, old_log_block_size);
-        let cts = TrxID::new(17);
-        let log_group = LogBlockGroup::new(
-            old_log_block_size,
-            TrxLog::new(
-                RedoHeader {
-                    cts,
-                    trx_kind: RedoTrxKind::System,
-                },
-                RedoLogs::default(),
-            ),
-        )
-        .unwrap();
-        let blocks = log_group
-            .finish_with(|count| {
-                (0..count)
-                    .map(|_| DirectBuf::zeroed(old_log_block_size))
-                    .collect()
-            })
+            let old_log_file =
+                create_log_file_for_test(file_prefix, 0, old_file_max_size, old_log_block_size);
+            let cts = TrxID::new(17);
+            let log_group = LogBlockGroup::new(
+                old_log_block_size,
+                TrxLog::new(
+                    RedoHeader {
+                        cts,
+                        trx_kind: RedoTrxKind::System,
+                    },
+                    RedoLogs::default(),
+                ),
+            )
             .unwrap();
-        let group_len = blocks.iter().map(DirectBuf::capacity).sum();
-        let (group_offset, _) = old_log_file.alloc(group_len).unwrap();
-        assert_eq!(group_offset, REDO_DEFAULT_DATA_START_OFFSET);
-        let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-        for (idx, direct_buf) in blocks.into_iter().enumerate() {
-            assert!(
-                write_driver
-                    .push_write(LogWriteSubmission::group(
-                        old_log_file.as_raw_fd(),
-                        group_offset + idx * old_log_block_size,
-                        direct_buf,
-                        idx,
-                    ))
-                    .is_ok()
+            let blocks = log_group
+                .finish_with(|count| {
+                    (0..count)
+                        .map(|_| DirectBuf::zeroed(old_log_block_size))
+                        .collect()
+                })
+                .unwrap();
+            let group_len = blocks.iter().map(DirectBuf::capacity).sum();
+            let (group_offset, _) = old_log_file.alloc(group_len).unwrap();
+            assert_eq!(group_offset, REDO_DEFAULT_DATA_START_OFFSET);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            for (idx, direct_buf) in blocks.into_iter().enumerate() {
+                assert!(
+                    write_driver
+                        .push_write(LogWriteSubmission::group(
+                            old_log_file.as_raw_fd(),
+                            group_offset + idx * old_log_block_size,
+                            direct_buf,
+                            idx,
+                        ))
+                        .is_ok()
+                );
+            }
+            assert_eq!(write_driver.submit_ready(), 1);
+            let LogWriteCompletion {
+                owner,
+                kind,
+                buf,
+                poison,
+            } = write_driver.wait_one();
+            match kind {
+                LogWriteKind::Group { .. } => {
+                    drop(buf);
+                    assert!(owner.is_none());
+                    assert_eq!(poison, None);
+                }
+                LogWriteKind::Header { .. } => panic!("expected redo group write completion"),
+                LogWriteKind::Seal { .. } => panic!("expected redo group write completion"),
+            }
+            drop(old_log_file);
+
+            let config = TrxSysConfig::default()
+                .log_dir(temp_dir.path())
+                .log_file_stem("mixed_config_redo.log")
+                .log_write_io_depth(7)
+                .recovery_io_depth(5)
+                .catalog_checkpoint_scan_io_depth(3)
+                .log_block_size(new_log_block_size)
+                .log_file_max_size(new_file_max_size);
+            let file_prefix = config.file_prefix().unwrap();
+            let logs = discover_redo_log_files(&file_prefix, false).unwrap();
+            let (initializer, planner, read_depth) = redo_planner_and_initializer_for_test(
+                &file_prefix,
+                config.recovery_io_depth,
+                config.log_write_io_depth,
+                new_file_max_size,
+                new_log_block_size,
+                logs,
             );
-        }
-        assert_eq!(write_driver.submit_ready(), 1);
-        let LogWriteCompletion {
-            owner,
-            kind,
-            buf,
-            poison,
-        } = write_driver.wait_one();
-        match kind {
-            LogWriteKind::Group { .. } => {
-                drop(buf);
-                assert!(owner.is_none());
-                assert_eq!(poison, None);
-            }
-            LogWriteKind::Header { .. } => panic!("expected redo group write completion"),
-            LogWriteKind::Seal { .. } => panic!("expected redo group write completion"),
-        }
-        drop(old_log_file);
+            let (skipped_max_recovered_cts, mut stream) =
+                planner.plan_stream(MIN_SNAPSHOT_TS, read_depth).unwrap();
+            assert_eq!(skipped_max_recovered_cts, None);
+            let recovered = stream.try_next().await.unwrap().unwrap();
+            assert_eq!(recovered.header.cts, cts);
+            assert_eq!(recovered.header.trx_kind, RedoTrxKind::System);
+            assert!(stream.try_next().await.unwrap().is_none());
 
-        let config = TrxSysConfig::default()
-            .log_dir(temp_dir.path())
-            .log_file_stem("mixed_config_redo.log")
-            .log_block_size(new_log_block_size)
-            .log_file_max_size(new_file_max_size);
-        let file_prefix = config.file_prefix().unwrap();
-        let logs = discover_redo_log_files(&file_prefix, false).unwrap();
-        let (initializer, mut stream) = redo_stream_and_initializer_for_test(
-            &file_prefix,
-            config.io_depth,
-            new_file_max_size,
-            new_log_block_size,
-            logs,
-        );
-        assert_eq!(stream.plan_replay(MIN_SNAPSHOT_TS).unwrap(), None);
-        let recovered = stream.try_next().unwrap().unwrap();
-        assert_eq!(recovered.header.cts, cts);
-        assert_eq!(recovered.header.trx_kind, RedoTrxKind::System);
-        assert!(stream.try_next().unwrap().is_none());
+            assert_eq!(initializer.next_file_seq, 1);
+            assert_eq!(initializer.log_write_io_depth, 7);
+            assert_eq!(initializer.log_block_size, new_log_block_size);
+            assert_eq!(initializer.file_max_size, new_file_max_size);
 
-        assert_eq!(initializer.next_file_seq, 1);
-        assert_eq!(initializer.log_block_size, new_log_block_size);
-        assert_eq!(initializer.file_max_size, new_file_max_size);
-
-        let (purge_tx, _purge_rx) = flume::unbounded();
-        let (redo_log, initial_header_completion) = initializer.finish(purge_tx).unwrap();
-        let header_write = {
-            let mut group_commit_g = redo_log.group_commit.lock();
-            match group_commit_g.queue.pop_front().unwrap() {
-                Commit::LogFileBoundary {
-                    ended_log_file,
-                    header_write,
-                } => {
-                    assert!(ended_log_file.is_none());
-                    header_write
+            let (purge_tx, _purge_rx) = flume::unbounded();
+            let (redo_log, initial_header_completion) = initializer.finish(purge_tx).unwrap();
+            let header_write = {
+                let mut group_commit_g = redo_log.group_commit.lock();
+                match group_commit_g.queue.pop_front().unwrap() {
+                    Commit::LogFileBoundary {
+                        ended_log_file,
+                        header_write,
+                    } => {
+                        assert!(ended_log_file.is_none());
+                        header_write
+                    }
+                    Commit::Group(_) | Commit::Shutdown => {
+                        panic!("expected initial redo super-block write")
+                    }
                 }
-                Commit::Group(_) | Commit::Shutdown => {
-                    panic!("expected initial redo super-block write")
-                }
-            }
-        };
-        submit_header_write_for_test(header_write, &initial_header_completion);
-        drop(redo_log);
+            };
+            submit_header_write_for_test(header_write, &initial_header_completion);
+            drop(redo_log);
 
-        let new_bytes = fs::read(format!("{file_prefix}.00000001")).unwrap();
-        let new_slot0 =
-            parse_redo_super_block(&new_bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 1, 0).unwrap();
-        assert_eq!(new_slot0.log_block_size, new_log_block_size as u64);
-        assert_eq!(new_slot0.file_max_size, new_file_max_size as u64);
+            let new_bytes = fs::read(format!("{file_prefix}.00000001")).unwrap();
+            let new_slot0 =
+                parse_redo_super_block(&new_bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 1, 0).unwrap();
+            assert_eq!(new_slot0.log_block_size, new_log_block_size as u64);
+            assert_eq!(new_slot0.file_max_size, new_file_max_size as u64);
+        });
     }
 
     #[test]
@@ -4066,7 +4068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mmap_log_reader() {
+    fn test_direct_redo_log_stream_reader() {
         smol::block_on(async {
             const SIZE: i32 = 100;
 
@@ -4075,7 +4077,8 @@ mod tests {
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .trx(
-                    TrxSysConfig::default().log_file_stem(String::from("mmap_log_reader_redo.log")),
+                    TrxSysConfig::default()
+                        .log_file_stem(String::from("direct_redo_stream_reader.log")),
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -4108,27 +4111,20 @@ mod tests {
             let mut log_recs = 0usize;
             let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
             let logs = discover_redo_log_files(&file_prefix, false).unwrap();
-            for log in logs {
-                println!("log file {:?}", log.path.file_name());
-                let mut reader = engine.inner().trx_sys.log_reader(&log.path).unwrap();
-                loop {
-                    match reader.read() {
-                        ReadLog::SizeLimit => unreachable!(),
-                        ReadLog::DataCorrupted => unreachable!(),
-                        ReadLog::DataEnd => break,
-                        ReadLog::Iterator(mut iter) => {
-                            while let Some(pod) = iter.try_next().unwrap() {
-                                println!(
-                                    "log {}, header={:?}, payload={:?}",
-                                    log_recs, pod.header, pod.payload
-                                );
-                                log_recs += 1;
-                            }
-                        }
-                    }
-                }
+            let planner = RedoReplayPlanner::new(logs);
+            let (_, mut stream) = planner.plan_stream(TrxID::new(0), 1).unwrap();
+            while let Some(pod) = stream.try_next().await.unwrap() {
+                println!(
+                    "log {}, header={:?}, payload={:?}",
+                    log_recs, pod.header, pod.payload
+                );
+                log_recs += 1;
             }
             println!("total log records {}", log_recs);
+            assert!(
+                log_recs > 0,
+                "direct redo stream should produce at least one record"
+            );
 
             drop(engine);
         });

@@ -1505,6 +1505,7 @@ pub(crate) mod tests {
             let batch1 = engine
                 .catalog()
                 .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .await
                 .unwrap();
             assert_eq!(batch1.catalog_ddl_txn_count, 2);
             assert_eq!(
@@ -1523,6 +1524,7 @@ pub(crate) mod tests {
             let batch2 = engine
                 .catalog()
                 .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .await
                 .unwrap();
             assert_eq!(batch2.catalog_ddl_txn_count, 0);
             assert_eq!(batch2.safe_cts, safe_cts_1);

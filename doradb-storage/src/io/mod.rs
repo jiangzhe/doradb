@@ -72,10 +72,6 @@ pub(crate) struct Operation {
 impl Operation {
     /// Build one owned-buffer read operation.
     #[inline]
-    #[cfg_attr(
-        any(not(test), feature = "iouring"),
-        expect(dead_code, reason = "reserved pread_owned")
-    )]
     pub(crate) fn pread_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
         Operation {
             kind: IOKind::Read,

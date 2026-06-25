@@ -9,11 +9,8 @@ use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionID, TrxID};
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
-use crate::log::{
-    EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter, parse_file_seq,
-};
+use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
-use crate::recovery::stream::MmapLogReader;
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
@@ -33,7 +30,6 @@ use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
 use std::mem::{forget, take};
-use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1045,14 +1041,6 @@ impl TransactionSystem {
         }
     }
 
-    /// Open a memory-mapped redo log reader for the given file.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved log_reader"))]
-    pub(crate) fn log_reader(&self, log_file_path: impl AsRef<Path>) -> Result<MmapLogReader> {
-        let path = log_file_path.as_ref();
-        MmapLogReader::new(path, parse_file_seq(path)?)
-    }
-
     /// Returns the ordered-completion watermark `W` from the redo log.
     ///
     /// This is used as the upper bound for scanning durable redo. No-log
@@ -1069,6 +1057,7 @@ impl TransactionSystem {
     pub(crate) fn catalog_checkpoint_scan_config(&self) -> Result<CatalogCheckpointScanConfig> {
         Ok(CatalogCheckpointScanConfig {
             file_prefix: self.config.file_prefix()?,
+            read_ahead_depth: self.config.catalog_checkpoint_scan_io_depth,
         })
     }
 }
@@ -1330,7 +1319,9 @@ pub(crate) mod tests {
             .trx(
                 TrxSysConfig::default()
                     .log_file_stem(log_file_stem)
-                    .io_depth(1)
+                    .log_write_io_depth(1)
+                    .recovery_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
                     .log_sync(LogSync::None)
                     .log_file_max_size(log_file_max_size),
             )

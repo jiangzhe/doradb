@@ -1,6 +1,10 @@
-use crate::error::{DataIntegrityError, InternalError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, IoError, Result};
+use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::id::TrxID;
-use crate::io::STORAGE_SECTOR_SIZE;
+use crate::io::{
+    CompletedSubmission, DirectBuf, IOBuf, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
+    StorageBackend, SubmissionDriver,
+};
 use crate::log::block_group::{TrxLog, block_count_for_payload};
 use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, RedoBlockHeader, RedoGroupStartExtension, RedoSuperBlock,
@@ -8,24 +12,33 @@ use crate::log::format::{
 };
 use crate::log::{RedoLogFileDescriptor, next_redo_file_seq};
 use crate::serde::Deser;
+use crate::thread as doradb_thread;
 use error_stack::Report;
-use memmap2::Mmap;
-use std::collections::VecDeque;
+use flume::{Receiver, SendTimeoutError, Sender, TryRecvError};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::io::{ErrorKind as IoErrorKind, Read};
-use std::path::{Path, PathBuf};
-use std::result::Result as StdResult;
+use std::io::{ErrorKind as IoErrorKind, Read, Result as IoResult};
+use std::mem::take;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::PathBuf;
+use std::thread::{JoinHandle, yield_now};
+use std::time::Duration;
 
-/// Result of reading one redo group from a log file.
-pub(crate) enum ReadLog {
-    /// The current group header is all zeroes, which marks logical EOF.
-    DataEnd,
-    /// The configured logical file size has been reached.
-    SizeLimit,
-    /// The current group or file header failed integrity validation.
-    DataCorrupted,
+const REDO_READ_AHEAD_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Outcome of reading the next logical group from the redo stream.
+enum ReadGroup {
+    /// The current segment is exhausted; the next item should be another segment or stream end.
+    SegmentExhausted,
+    /// The replay stream reached logical EOF.
+    ReplayEof,
     /// A transaction log iterator assembled from CRC32-validated redo blocks.
-    Iterator(TrxLogIterator),
+    Group(TrxLogIterator),
+}
+
+enum ContinuationRead {
+    Appended,
+    IncompleteTail,
 }
 
 /// Iterator over transaction redo records inside one validated redo group.
@@ -163,27 +176,16 @@ impl RedoLogSegment {
 }
 
 /// Planner that selects which discovered redo segments require normal replay.
-pub(crate) struct ReplayPlanner {
+pub(crate) struct RedoReplayPlanner {
     /// Discovered file names in ascending sequence order.
     discovered: Vec<RedoLogFileDescriptor>,
-    /// Planned segments that still require normal mmap replay.
-    planned: VecDeque<RedoLogSegment>,
-    /// Replay floor used to build the planned queue.
-    replay_floor: Option<TrxID>,
-    /// Highest CTS contributed by skipped sealed segments.
-    skipped_max_recovered_cts: Option<TrxID>,
 }
 
-impl ReplayPlanner {
+impl RedoReplayPlanner {
     /// Create a replay planner from discovered redo files.
     #[inline]
     pub(crate) fn new(discovered: Vec<RedoLogFileDescriptor>) -> Self {
-        Self {
-            discovered,
-            planned: VecDeque::new(),
-            replay_floor: None,
-            skipped_max_recovered_cts: None,
-        }
+        Self { discovered }
     }
 
     /// Return the sequence for the next writable redo file after this family.
@@ -195,20 +197,13 @@ impl ReplayPlanner {
             .transpose()
     }
 
-    /// Plan which discovered redo segments must be replayed for a replay floor.
-    ///
-    /// This is a one-time transition: the floor controls which sealed segments
-    /// may be skipped, so a replan would make the already-built queue ambiguous.
+    /// Build an independently consumable redo stream for a replay floor.
     #[inline]
-    pub(crate) fn plan(&mut self, floor: TrxID) -> Result<Option<TrxID>> {
-        if let Some(existing_floor) = self.replay_floor {
-            return Err(Report::new(InternalError::Generic)
-                .attach(format!(
-                    "redo replay already planned: existing_floor={existing_floor}, requested_floor={floor}"
-                ))
-                .into());
-        }
-
+    pub(crate) fn plan_stream(
+        &self,
+        floor: TrxID,
+        read_depth: usize,
+    ) -> Result<(Option<TrxID>, RedoLogStream)> {
         let mut suffix = Vec::new();
         for descriptor in self.discovered.iter().rev() {
             let segment = RedoLogSegment::from_descriptor(descriptor.clone())?;
@@ -223,6 +218,7 @@ impl ReplayPlanner {
         suffix.reverse();
 
         let mut skipped_max = None::<TrxID>;
+        let mut segments = Vec::new();
         for segment in suffix {
             if segment.sealed_empty() {
                 continue;
@@ -234,131 +230,837 @@ impl ReplayPlanner {
                     Some(skipped_max.map_or(max_redo_cts, |current| current.max(max_redo_cts)));
                 continue;
             }
-            self.planned.push_back(segment);
+            segments.push(segment);
         }
 
-        self.replay_floor = Some(floor);
-        self.skipped_max_recovered_cts = skipped_max;
-        Ok(skipped_max)
+        Ok((
+            skipped_max,
+            RedoLogStream::from_planned_segments(segments, read_depth),
+        ))
     }
+}
 
-    /// Return the next mmap reader that must be scanned.
-    ///
-    /// Callers must plan replay first so the checkpoint-derived floor is known
-    /// before any segment is opened or skipped.
-    #[inline]
-    pub(crate) fn next_reader(&mut self) -> Result<Option<MmapLogReader>> {
-        if self.replay_floor.is_none() {
-            return Err(Report::new(InternalError::Generic)
-                .attach("redo replay read before explicit plan")
-                .into());
-        }
-        self.planned
-            .pop_front()
-            .map(MmapLogReader::from_segment)
-            .transpose()
-    }
-
-    /// Return the planned segment sequence list for tests.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn planned_file_seqs(&self) -> Vec<u32> {
-        self.planned
-            .iter()
-            .map(|segment| segment.file_seq)
-            .collect()
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedoLogStreamState {
+    Active,
+    Ended,
+    Failed,
 }
 
 /// Buffered stream of transaction redo records across a sequence of redo files.
 pub(crate) struct RedoLogStream {
-    /// Source of readers for successive redo files.
-    planner: ReplayPlanner,
-    /// Reader for the current redo file, if one is open.
-    reader: Option<MmapLogReader>,
+    /// Direct-IO read-ahead worker for the planned logical stream.
+    reader: Option<RedoReadAheadHandle>,
+    /// Parser state for the current redo segment.
+    current_segment: Option<SegmentReadState>,
     /// Decoded records ready for recovery to consume.
     buffer: VecDeque<TrxLog>,
+    /// Terminal state for the logical stream.
+    state: RedoLogStreamState,
 }
 
 impl RedoLogStream {
-    /// Create a redo stream from discovered redo files.
+    /// Create a stream over an already planned redo segment sequence.
     #[inline]
-    pub(crate) fn new(discovered: Vec<RedoLogFileDescriptor>) -> Self {
+    fn from_planned_segments(segments: Vec<RedoLogSegment>, read_depth: usize) -> Self {
+        let state = if segments.is_empty() {
+            RedoLogStreamState::Ended
+        } else {
+            RedoLogStreamState::Active
+        };
+        let reader = if state == RedoLogStreamState::Ended {
+            None
+        } else {
+            Some(RedoReadAheadWorker::spawn(segments, read_depth))
+        };
         Self {
-            planner: ReplayPlanner::new(discovered),
-            reader: None,
+            reader,
+            current_segment: None,
             buffer: VecDeque::new(),
+            state,
         }
     }
 
-    /// Return the sequence for the next writable redo file after this family.
+    /// Refill the in-memory queue from the direct-IO stream.
     #[inline]
-    pub(crate) fn next_file_seq(&self) -> Result<Option<u32>> {
-        self.planner.next_file_seq()
-    }
-
-    /// Plan replay using the checkpoint-derived floor and return skipped CTS seed.
-    ///
-    /// This must be called exactly once before `try_next`; repeated calls are
-    /// rejected even if they pass the same floor.
-    #[inline]
-    pub(crate) fn plan_replay(&mut self, floor: TrxID) -> Result<Option<TrxID>> {
-        self.planner.plan(floor)
-    }
-
-    /// Return the planned segment sequence list for tests.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn planned_file_seqs(&self) -> Vec<u32> {
-        self.planner.planned_file_seqs()
-    }
-
-    /// Refill the in-memory queue from the current reader or the next redo file.
-    ///
-    /// Requires prior `plan_replay` because opening the next reader may depend
-    /// on checkpoint-derived segment skipping decisions.
-    #[inline]
-    pub(crate) fn fill_buffer(&mut self) -> Result<()> {
-        loop {
-            // fill buffer by reading current log file.
-            if let Some(reader) = self.reader.as_mut() {
-                match reader.read() {
-                    ReadLog::DataCorrupted => {
-                        return Err(Report::new(DataIntegrityError::LogFileCorrupted).into());
-                    }
-                    ReadLog::Iterator(mut iter) => {
-                        while let Some(res) = iter.try_next()? {
-                            self.buffer.push_back(res);
-                        }
-                        return Ok(());
-                    }
-                    ReadLog::DataEnd | ReadLog::SizeLimit => {
-                        // current file exhausted.
-                        self.reader.take();
+    async fn fill_buffer(&mut self) -> Result<()> {
+        while self.state == RedoLogStreamState::Active {
+            if let Some(mut iter) = self.read_next_group().await? {
+                loop {
+                    match iter.try_next() {
+                        Ok(Some(res)) => self.buffer.push_back(res),
+                        Ok(None) => return Ok(()),
+                        Err(err) => return Err(self.fail_stream(err)),
                     }
                 }
             }
-            debug_assert!(self.reader.is_none());
-            let reader = self.planner.next_reader()?;
-            if reader.is_none() {
-                return Ok(());
-            }
-            self.reader = reader;
         }
+        Ok(())
     }
 
-    /// Try to read the next transaction redo record, reading more files on demand.
-    ///
-    /// The stream is deliberately not self-planning: callers must provide the
-    /// replay floor via `plan_replay` before consuming records.
+    /// Try to read the next transaction redo record, reading direct-IO blocks on demand.
     #[inline]
-    pub(crate) fn try_next(&mut self) -> Result<Option<TrxLog>> {
+    pub(crate) async fn try_next(&mut self) -> Result<Option<TrxLog>> {
+        if self.state == RedoLogStreamState::Failed {
+            return Err(Self::read_after_failed_error());
+        }
         match self.buffer.pop_front() {
             res @ Some(_) => Ok(res),
             None => {
-                self.fill_buffer()?;
+                self.fill_buffer().await?;
                 Ok(self.buffer.pop_front())
             }
+        }
+    }
+
+    #[inline]
+    async fn read_next_group(&mut self) -> Result<Option<TrxLogIterator>> {
+        loop {
+            match self.state {
+                RedoLogStreamState::Active => {}
+                RedoLogStreamState::Ended => return Ok(None),
+                RedoLogStreamState::Failed => return Err(Self::read_after_failed_error()),
+            }
+            let mut state = match self.current_segment.take() {
+                Some(state) => state,
+                None => match self.receive_next_segment().await {
+                    Ok(Some(state)) => state,
+                    Ok(None) => return Ok(None),
+                    Err(err) => return Err(self.fail_stream(err)),
+                },
+            };
+            let read = match self.read_group_from_segment(&mut state).await {
+                Ok(read) => read,
+                Err(err) => return Err(self.fail_stream(err)),
+            };
+            match read {
+                ReadGroup::Group(iter) => {
+                    self.current_segment = Some(state);
+                    return Ok(Some(iter));
+                }
+                ReadGroup::SegmentExhausted => {
+                    self.current_segment = None;
+                }
+                ReadGroup::ReplayEof => {
+                    self.end_stream();
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    async fn receive_next_segment(&mut self) -> Result<Option<SegmentReadState>> {
+        match self.recv_item().await? {
+            RedoReadItem::SegmentStart(segment) => {
+                Ok(Some(SegmentReadState::from_segment(segment)?))
+            }
+            RedoReadItem::End => {
+                self.end_stream();
+                Ok(None)
+            }
+            RedoReadItem::Error(err) => Err(err),
+            RedoReadItem::Block { buf, .. } => {
+                self.recycle_buf(buf);
+                Err(Report::new(InternalError::Generic)
+                    .attach("redo read-ahead emitted block before segment start")
+                    .into())
+            }
+            RedoReadItem::SegmentEnd { .. } => Err(Report::new(InternalError::Generic)
+                .attach("redo read-ahead emitted segment end before segment start")
+                .into()),
+        }
+    }
+
+    #[inline]
+    async fn read_group_from_segment(&mut self, state: &mut SegmentReadState) -> Result<ReadGroup> {
+        if let Some(result) = state.read_exhausted_result()? {
+            self.consume_segment_end(state).await?;
+            return Ok(result);
+        }
+
+        let first_block = self
+            .recv_expected_block(state.file_seq, state.offset)
+            .await?;
+        let group_start = match state.read_group_start(first_block.as_bytes()) {
+            Ok(Some(group_start)) => group_start,
+            Ok(None) => {
+                self.recycle_buf(first_block);
+                return Ok(ReadGroup::ReplayEof);
+            }
+            Err(err) => {
+                self.recycle_buf(first_block);
+                return Err(err);
+            }
+        };
+
+        let Some(group_end_offset) = group_start
+            .block_count
+            .checked_mul(state.log_block_size)
+            .and_then(|group_len| state.offset.checked_add(group_len))
+        else {
+            self.recycle_buf(first_block);
+            return Err(log_file_corrupted());
+        };
+        if group_end_offset > state.scan_end_offset {
+            self.recycle_buf(first_block);
+            return Err(log_file_corrupted());
+        }
+
+        let mut payload = Vec::with_capacity(group_start.payload_len);
+        if !append_block_payload(
+            first_block.as_bytes(),
+            state.log_block_size,
+            group_start.header,
+            RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE,
+            group_start.block_count == 1,
+            &mut payload,
+        ) {
+            self.recycle_buf(first_block);
+            return Err(log_file_corrupted());
+        }
+        self.recycle_buf(first_block);
+
+        for expected_idx in 1..group_start.block_count {
+            let Some(block_offset) = expected_idx
+                .checked_mul(state.log_block_size)
+                .and_then(|delta| state.offset.checked_add(delta))
+            else {
+                return Err(log_file_corrupted());
+            };
+            if block_offset >= state.scan_end_offset {
+                return Err(log_file_corrupted());
+            }
+            let block = self
+                .recv_expected_block(state.file_seq, block_offset)
+                .await?;
+            let append_res = state.append_continuation_payload(
+                block.as_bytes(),
+                &mut payload,
+                expected_idx,
+                group_start.block_count,
+            );
+            self.recycle_buf(block);
+            match append_res? {
+                ContinuationRead::Appended => {}
+                ContinuationRead::IncompleteTail => return Ok(ReadGroup::ReplayEof),
+            }
+        }
+
+        if payload.len() != group_start.payload_len {
+            return Err(log_file_corrupted());
+        }
+        state.finish_group_read(group_start, payload)
+    }
+
+    #[inline]
+    async fn consume_segment_end(&mut self, state: &SegmentReadState) -> Result<()> {
+        match self.recv_item().await? {
+            RedoReadItem::SegmentEnd { file_seq } if file_seq == state.file_seq => Ok(()),
+            RedoReadItem::SegmentEnd { .. } | RedoReadItem::SegmentStart(_) => {
+                Err(log_file_corrupted())
+            }
+            RedoReadItem::Block { buf, .. } => {
+                self.recycle_buf(buf);
+                Err(log_file_corrupted())
+            }
+            RedoReadItem::End => Err(log_file_corrupted()),
+            RedoReadItem::Error(err) => Err(err),
+        }
+    }
+
+    #[inline]
+    async fn recv_expected_block(
+        &mut self,
+        expected_file_seq: u32,
+        expected_offset: usize,
+    ) -> Result<DirectBuf> {
+        match self.recv_item().await? {
+            RedoReadItem::Block {
+                file_seq,
+                offset,
+                buf,
+            } if file_seq == expected_file_seq && offset == expected_offset => Ok(buf),
+            RedoReadItem::Block { buf, .. } => {
+                self.recycle_buf(buf);
+                Err(log_file_corrupted())
+            }
+            RedoReadItem::SegmentEnd { .. } | RedoReadItem::SegmentStart(_) | RedoReadItem::End => {
+                Err(log_file_corrupted())
+            }
+            RedoReadItem::Error(err) => Err(err),
+        }
+    }
+
+    #[inline]
+    async fn recv_item(&mut self) -> Result<RedoReadItem> {
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::Generic)
+                    .attach("redo read-ahead receive before worker start"),
+            )
+        })?;
+        reader.items.recv_async().await.map_err(|_| {
+            Error::from(
+                Report::new(InternalError::Generic).attach("redo read-ahead worker channel closed"),
+            )
+        })
+    }
+
+    #[inline]
+    fn recycle_buf(&self, buf: DirectBuf) {
+        if let Some(reader) = &self.reader {
+            let _ = reader.recycle.try_send(buf);
+        }
+    }
+
+    #[inline]
+    fn stop_reader(&mut self) {
+        if let Some(reader) = &self.reader {
+            reader.stop();
+        }
+        self.reader.take();
+    }
+
+    #[inline]
+    fn fail_stream(&mut self, err: Error) -> Error {
+        self.buffer.clear();
+        self.current_segment = None;
+        self.stop_reader();
+        self.state = RedoLogStreamState::Failed;
+        err
+    }
+
+    #[inline]
+    fn end_stream(&mut self) {
+        self.current_segment = None;
+        self.stop_reader();
+        self.state = RedoLogStreamState::Ended;
+    }
+
+    #[inline]
+    fn read_after_failed_error() -> Error {
+        Report::new(InternalError::Generic)
+            .attach("redo stream read after terminal error")
+            .into()
+    }
+}
+
+/// Ordered handoff from the read-ahead worker to `RedoLogStream`.
+///
+/// The worker publishes one segment at a time as:
+/// `SegmentStart`, zero or more contiguous `Block`s in ascending offset order,
+/// then `SegmentEnd`. After all planned segments it publishes `End`. If the
+/// worker hits an error, it publishes `Error` as the terminal item and exits;
+/// the stream turns any read, protocol, or parse error into a failed terminal
+/// state so later reads cannot advance to another segment or leak buffered
+/// records.
+enum RedoReadItem {
+    /// Starts a new segment; no block or segment-end item for this segment may precede it.
+    SegmentStart(RedoLogSegment),
+    /// A direct-IO block for the active segment.
+    ///
+    /// Blocks are emitted with the same `file_seq` as the active segment and
+    /// with contiguous offsets from `REDO_DEFAULT_DATA_START_OFFSET` up to the
+    /// segment scan end. Out-of-order, duplicate, cross-segment, or unexpected
+    /// blocks are protocol violations handled as stream errors by the consumer.
+    Block {
+        file_seq: u32,
+        offset: usize,
+        buf: DirectBuf,
+    },
+    /// Ends the active segment after its last emitted block.
+    SegmentEnd { file_seq: u32 },
+    /// Marks normal logical EOF after every planned segment has ended.
+    End,
+    /// Terminal worker failure; no later item is valid.
+    Error(Error),
+}
+
+struct RedoReadAheadHandle {
+    items: Receiver<RedoReadItem>,
+    recycle: Sender<DirectBuf>,
+    stop: Sender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl RedoReadAheadHandle {
+    #[inline]
+    fn stop(&self) {
+        let _ = self.stop.try_send(());
+    }
+}
+
+impl Drop for RedoReadAheadHandle {
+    #[inline]
+    fn drop(&mut self) {
+        let _ = self.stop.try_send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+struct RedoReadSubmission {
+    file_seq: u32,
+    offset: usize,
+    operation: Operation,
+}
+
+impl RedoReadSubmission {
+    #[inline]
+    fn new(file_seq: u32, offset: usize, fd: RawFd, buf: DirectBuf) -> Self {
+        Self {
+            file_seq,
+            offset,
+            operation: Operation::pread_owned(fd, offset, buf),
+        }
+    }
+}
+
+impl IOSubmission for RedoReadSubmission {
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        &mut self.operation
+    }
+}
+
+struct RedoReadCompletion {
+    file_seq: u32,
+    offset: usize,
+    expected_bytes: usize,
+    actual_bytes: IoResult<usize>,
+    buf: DirectBuf,
+}
+
+impl RedoReadCompletion {
+    #[inline]
+    fn validate(self) -> Result<(u32, usize, DirectBuf)> {
+        let actual_bytes = self.actual_bytes.map_err(|err| {
+            Error::from(IoError::report(err).attach(format!(
+                "redo direct read failed: file_seq={:08x}, offset={}",
+                self.file_seq, self.offset
+            )))
+        })?;
+        if actual_bytes != self.expected_bytes {
+            return Err(
+                IoError::report_unexpected_eof(actual_bytes, self.expected_bytes)
+                    .attach(format!(
+                        "redo direct read short read: file_seq={:08x}, offset={}",
+                        self.file_seq, self.offset
+                    ))
+                    .into(),
+            );
+        }
+        Ok((self.file_seq, self.offset, self.buf))
+    }
+}
+
+struct RedoReadAheadWorker {
+    segments: Vec<RedoLogSegment>,
+    read_depth: usize,
+    items: Sender<RedoReadItem>,
+    recycle: Receiver<DirectBuf>,
+    stop: Receiver<()>,
+    stop_requested: bool,
+    free: Vec<DirectBuf>,
+    free_block_size: Option<usize>,
+}
+
+impl RedoReadAheadWorker {
+    #[inline]
+    fn spawn(segments: Vec<RedoLogSegment>, read_depth: usize) -> RedoReadAheadHandle {
+        let capacity = read_depth.max(1).saturating_mul(2).max(1);
+        let (items_tx, items_rx) = flume::bounded(capacity);
+        let (recycle_tx, recycle_rx) = flume::bounded(capacity);
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        let join = doradb_thread::spawn_named("Redo-ReadAhead", move || {
+            let mut worker = RedoReadAheadWorker {
+                segments,
+                read_depth,
+                items: items_tx,
+                recycle: recycle_rx,
+                stop: stop_rx,
+                stop_requested: false,
+                free: Vec::with_capacity(capacity),
+                free_block_size: None,
+            };
+            match worker.run() {
+                Ok(true) => {
+                    let _ = worker.send_item(RedoReadItem::End);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    let _ = worker.send_item(RedoReadItem::Error(err));
+                }
+            }
+        });
+        RedoReadAheadHandle {
+            items: items_rx,
+            recycle: recycle_tx,
+            stop: stop_tx,
+            join: Some(join),
+        }
+    }
+
+    #[inline]
+    fn run(&mut self) -> Result<bool> {
+        let backend = StorageBackend::new(self.read_depth)?;
+        let mut driver = SubmissionDriver::new(backend);
+        for segment in take(&mut self.segments) {
+            if self.stopped() {
+                return Ok(false);
+            }
+            self.scan_segment(&mut driver, segment)?;
+        }
+        Ok(!self.stopped())
+    }
+
+    #[inline]
+    fn scan_segment(
+        &mut self,
+        driver: &mut SubmissionDriver<RedoReadSubmission>,
+        segment: RedoLogSegment,
+    ) -> Result<()> {
+        let file = open_direct_segment_file(&segment)?;
+        let file_seq = segment.file_seq;
+        let log_block_size = segment.super_block.log_block_size as usize;
+        let scan_end_offset = segment_scan_end_offset(&segment)?;
+        self.switch_block_size(log_block_size);
+        if !self.send_item(RedoReadItem::SegmentStart(segment)) {
+            return Ok(());
+        }
+
+        let mut next_submit_offset = REDO_DEFAULT_DATA_START_OFFSET;
+        let mut next_emit_offset = REDO_DEFAULT_DATA_START_OFFSET;
+        let mut completed = BTreeMap::<usize, DirectBuf>::new();
+        while next_emit_offset < scan_end_offset || driver.pending_len() != 0 {
+            self.drain_recycled();
+            while next_submit_offset < scan_end_offset
+                && !self.stopped()
+                && driver.available_capacity() != 0
+            {
+                let buf = self.take_buf(log_block_size);
+                let submission =
+                    RedoReadSubmission::new(file_seq, next_submit_offset, file.as_raw_fd(), buf);
+                if driver.push(submission).is_err() {
+                    return Err(Report::new(InternalError::Generic)
+                        .attach("redo read-ahead driver rejected submission despite capacity")
+                        .into());
+                }
+                next_submit_offset =
+                    next_submit_offset
+                        .checked_add(log_block_size)
+                        .ok_or_else(|| {
+                            Error::from(
+                                Report::new(DataIntegrityError::InvalidPayload)
+                                    .attach("redo read-ahead offset overflow"),
+                            )
+                        })?;
+            }
+            driver.submit_ready();
+            if !self.emit_ready(
+                file_seq,
+                &mut next_emit_offset,
+                log_block_size,
+                &mut completed,
+            ) {
+                self.drain_driver(driver);
+                return Ok(());
+            }
+            if self.stopped() {
+                self.drain_driver(driver);
+                return Ok(());
+            }
+            if driver.submitted_len() == 0 {
+                if driver.pending_len() == 0 {
+                    continue;
+                }
+                yield_now();
+                continue;
+            }
+            let completion = take_read_completion(driver.wait_one())?;
+            let (completed_file_seq, completed_offset, buf) = match completion.validate() {
+                Ok(completed) => completed,
+                Err(err) => {
+                    self.drain_driver(driver);
+                    return Err(err);
+                }
+            };
+            if completed_file_seq != file_seq || completed.insert(completed_offset, buf).is_some() {
+                self.drain_driver(driver);
+                return Err(Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "redo read-ahead duplicate or mismatched completion: file_seq={completed_file_seq:08x}, offset={completed_offset}"
+                    ))
+                    .into());
+            }
+        }
+        if self.send_item(RedoReadItem::SegmentEnd { file_seq }) {
+            self.drain_recycled();
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn emit_ready(
+        &mut self,
+        file_seq: u32,
+        next_emit_offset: &mut usize,
+        log_block_size: usize,
+        completed: &mut BTreeMap<usize, DirectBuf>,
+    ) -> bool {
+        while let Some(buf) = completed.remove(next_emit_offset) {
+            let offset = *next_emit_offset;
+            if !self.send_item(RedoReadItem::Block {
+                file_seq,
+                offset,
+                buf,
+            }) {
+                return false;
+            }
+            *next_emit_offset += log_block_size;
+        }
+        true
+    }
+
+    #[inline]
+    fn switch_block_size(&mut self, log_block_size: usize) {
+        if self.free_block_size == Some(log_block_size) {
+            return;
+        }
+        self.free.clear();
+        self.free_block_size = Some(log_block_size);
+        self.drain_recycled();
+    }
+
+    #[inline]
+    fn take_buf(&mut self, log_block_size: usize) -> DirectBuf {
+        self.drain_recycled();
+        self.free
+            .pop()
+            .unwrap_or_else(|| DirectBuf::zeroed(log_block_size))
+    }
+
+    #[inline]
+    fn drain_recycled(&mut self) {
+        while let Ok(buf) = self.recycle.try_recv() {
+            if Some(buf.capacity()) == self.free_block_size {
+                self.free.push(buf);
+            }
+        }
+    }
+
+    #[inline]
+    fn drain_driver(&mut self, driver: &mut SubmissionDriver<RedoReadSubmission>) {
+        while driver.pending_len() != 0 {
+            driver.submit_ready();
+            if driver.submitted_len() == 0 {
+                yield_now();
+                continue;
+            }
+            if let Ok(completion) = take_read_completion(driver.wait_one()) {
+                drop(completion.buf);
+            }
+        }
+        self.drain_recycled();
+    }
+
+    #[inline]
+    fn send_item(&mut self, mut item: RedoReadItem) -> bool {
+        loop {
+            if self.stopped() {
+                return false;
+            }
+            match self.items.send_timeout(item, REDO_READ_AHEAD_SEND_TIMEOUT) {
+                Ok(()) => return true,
+                Err(SendTimeoutError::Timeout(returned)) => {
+                    item = returned;
+                }
+                Err(SendTimeoutError::Disconnected(_)) => return false,
+            }
+        }
+    }
+
+    #[inline]
+    fn stopped(&mut self) -> bool {
+        if self.stop_requested {
+            return true;
+        }
+        match self.stop.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => {
+                self.stop_requested = true;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SegmentReadState {
+    file_seq: u32,
+    log_block_size: usize,
+    scan_end_offset: usize,
+    sealed: Option<SealedReplayState>,
+    offset: usize,
+}
+
+impl SegmentReadState {
+    #[inline]
+    fn from_segment(segment: RedoLogSegment) -> Result<Self> {
+        let scan_end_offset = segment_scan_end_offset(&segment)?;
+        let sealed = segment
+            .super_block
+            .is_sealed()
+            .then(|| SealedReplayState::new(segment.super_block.sealed_redo_range()));
+        Ok(Self {
+            file_seq: segment.file_seq,
+            log_block_size: segment.super_block.log_block_size as usize,
+            scan_end_offset,
+            sealed,
+            offset: REDO_DEFAULT_DATA_START_OFFSET,
+        })
+    }
+
+    #[inline]
+    fn validate_sealed_end(&self) -> bool {
+        self.sealed.is_none_or(SealedReplayState::validate)
+    }
+
+    #[inline]
+    fn read_exhausted_result(&self) -> Result<Option<ReadGroup>> {
+        if self.offset < self.scan_end_offset {
+            return Ok(None);
+        }
+        if !self.validate_sealed_end() {
+            return Err(log_file_corrupted());
+        }
+        Ok(Some(ReadGroup::SegmentExhausted))
+    }
+
+    #[inline]
+    fn read_group_start(&self, block: &[u8]) -> Result<Option<ValidatedGroupStart>> {
+        debug_assert!(self.offset.is_multiple_of(STORAGE_SECTOR_SIZE));
+        if is_zero_redo_block(block) {
+            if self.sealed.is_some() {
+                return Err(log_file_corrupted());
+            }
+            return Ok(None);
+        }
+        let Ok((idx, header)) = RedoBlockHeader::deser(block, 0) else {
+            return Err(log_file_corrupted());
+        };
+        debug_assert_eq!(idx, RedoBlockHeader::SIZE);
+        if header.verify_checksum(block).is_err()
+            || header.validate(self.log_block_size).is_err()
+            || !header.is_group_start()
+        {
+            return Err(log_file_corrupted());
+        }
+        let Ok((extension_end, extension)) = RedoGroupStartExtension::deser(block, idx) else {
+            return Err(log_file_corrupted());
+        };
+        debug_assert_eq!(
+            extension_end,
+            RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE
+        );
+        if extension.validate().is_err() {
+            return Err(log_file_corrupted());
+        }
+        let Ok(payload_len) = extension.group_payload_len_usize() else {
+            return Err(log_file_corrupted());
+        };
+        let Ok(expected_block_count) = block_count_for_payload(self.log_block_size, payload_len)
+        else {
+            return Err(log_file_corrupted());
+        };
+        let block_count = extension.group_block_count_usize();
+        if expected_block_count != block_count {
+            return Err(log_file_corrupted());
+        }
+        if block_count == 1 && !header.is_group_end() {
+            return Err(log_file_corrupted());
+        }
+        if block_count > 1 && header.is_group_end() {
+            return Err(log_file_corrupted());
+        }
+        Ok(Some(ValidatedGroupStart {
+            header,
+            extension,
+            block_count,
+            payload_len,
+        }))
+    }
+
+    #[inline]
+    fn append_continuation_payload(
+        &self,
+        block: &[u8],
+        payload: &mut Vec<u8>,
+        expected_idx: usize,
+        block_count: usize,
+    ) -> Result<ContinuationRead> {
+        if is_zero_redo_block(block) {
+            return self.incomplete_continuation_result();
+        }
+        let Ok((idx, header)) = RedoBlockHeader::deser(block, 0) else {
+            return self.incomplete_continuation_result();
+        };
+        debug_assert_eq!(idx, RedoBlockHeader::SIZE);
+        if header.verify_checksum(block).is_err() {
+            return self.incomplete_continuation_result();
+        }
+        if header.validate(self.log_block_size).is_err()
+            || header.is_group_start()
+            || header.group_block_idx as usize != expected_idx
+        {
+            return Err(log_file_corrupted());
+        }
+        let final_block = expected_idx + 1 == block_count;
+        if header.is_group_end() != final_block {
+            return Err(log_file_corrupted());
+        }
+        if !append_block_payload(
+            block,
+            self.log_block_size,
+            header,
+            RedoBlockHeader::SIZE,
+            final_block,
+            payload,
+        ) {
+            return Err(log_file_corrupted());
+        }
+        Ok(ContinuationRead::Appended)
+    }
+
+    #[inline]
+    fn finish_group_read(
+        &mut self,
+        group_start: ValidatedGroupStart,
+        payload: Vec<u8>,
+    ) -> Result<ReadGroup> {
+        let extension = group_start.extension;
+        if let Some(sealed) = self.sealed.as_mut() {
+            sealed.record_group(extension.min_redo_cts, extension.max_redo_cts);
+        }
+        self.offset += group_start.block_count * self.log_block_size;
+        if self.offset == self.scan_end_offset && !self.validate_sealed_end() {
+            return Err(log_file_corrupted());
+        }
+        Ok(ReadGroup::Group(TrxLogIterator::new(
+            payload,
+            extension.min_redo_cts,
+            extension.max_redo_cts,
+        )))
+    }
+
+    #[inline]
+    fn incomplete_continuation_result(&self) -> Result<ContinuationRead> {
+        if self.sealed.is_some() {
+            Err(log_file_corrupted())
+        } else {
+            Ok(ContinuationRead::IncompleteTail)
         }
     }
 }
@@ -411,275 +1113,60 @@ struct ValidatedGroupStart {
     payload_len: usize,
 }
 
-/// Memory-mapped reader for checksum-protected redo groups in one file.
-pub(crate) struct MmapLogReader {
-    /// Memory map of the redo file.
-    m: Mmap,
-    /// Normal physical stride for redo groups in this file.
-    log_block_size: usize,
-    /// End offset for the current scan; sealed files stop at durable end.
-    scan_end_offset: usize,
-    /// Sealed range validation state, when the selected super-block is sealed.
-    sealed: Option<SealedReplayState>,
-    /// Next group offset to read.
-    offset: usize,
+#[inline]
+fn log_file_corrupted() -> Error {
+    Report::new(DataIntegrityError::LogFileCorrupted).into()
 }
 
-impl MmapLogReader {
-    /// Open a redo file, select its newest valid super-block slot, and mmap it.
-    #[inline]
-    pub(crate) fn new(log_file_path: impl AsRef<Path>, expected_file_seq: u32) -> Result<Self> {
-        let segment =
-            RedoLogSegment::from_path(PathBuf::from(log_file_path.as_ref()), expected_file_seq)?;
-        Self::from_segment(segment)
-    }
+#[inline]
+fn open_direct_segment_file(segment: &RedoLogSegment) -> Result<SparseFile> {
+    let path = segment.path.to_str().ok_or_else(|| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "redo log path is not valid UTF-8: path={}",
+                segment.path.display()
+            )),
+        )
+    })?;
+    SparseFile::open(path, UNTRACKED_FILE_ID)
+}
 
-    /// Open and mmap a redo file using an already validated segment header.
-    #[inline]
-    pub(crate) fn from_segment(segment: RedoLogSegment) -> Result<Self> {
-        let RedoLogSegment {
-            path, super_block, ..
-        } = segment;
-        let file = File::open(&path)?;
-        // SAFETY: the file handle stays alive for the duration of mapping
-        // creation, and the returned `Mmap` owns the mapping afterward.
-        let m = unsafe { Mmap::map(&file)? };
-        if super_block.file_max_size as usize > m.len() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "redo super-block file_max_size exceeds mapped length: path={}, file_max_size={}, mapped_len={}",
-                    path.display(),
-                    super_block.file_max_size,
-                    m.len()
-                ))
-                .into());
-        }
-        let (scan_end_offset, sealed) = if super_block.is_sealed() {
-            (
-                super_block.durable_end_offset as usize,
-                Some(SealedReplayState::new(super_block.sealed_redo_range())),
-            )
-        } else {
-            (super_block.file_max_size as usize, None)
-        };
-        Ok(MmapLogReader {
-            m,
-            log_block_size: super_block.log_block_size as usize,
-            scan_end_offset,
-            sealed,
-            offset: REDO_DEFAULT_DATA_START_OFFSET,
-        })
-    }
+#[inline]
+fn segment_scan_end_offset(segment: &RedoLogSegment) -> Result<usize> {
+    let raw = if segment.super_block.is_sealed() {
+        segment.super_block.durable_end_offset
+    } else {
+        segment.super_block.file_max_size
+    };
+    usize::try_from(raw).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "redo scan end offset exceeds usize: file_seq={:08x}, offset={raw}",
+                segment.file_seq
+            )),
+        )
+    })
+}
 
-    #[inline]
-    fn validate_sealed_end(&self) -> bool {
-        self.sealed.is_none_or(SealedReplayState::validate)
-    }
-
-    /// Read and validate one logical fixed-block redo group.
-    ///
-    /// The payload is not exposed until the group-start metadata, every block
-    /// header, each block-level CRC32 checksum, continuation order, end flags,
-    /// and assembled payload length have been validated.
-    #[inline]
-    pub(crate) fn read(&mut self) -> ReadLog {
-        if let Some(result) = self.read_exhausted_result() {
-            return result;
-        }
-        let group_start = match self.read_group_start() {
-            Ok(group_start) => group_start,
-            Err(result) => return result,
-        };
-        let payload = match self.assemble_group_payload(&group_start) {
-            Ok(payload) => payload,
-            Err(result) => return result,
-        };
-        self.finish_group_read(group_start, payload)
-    }
-
-    #[inline]
-    fn read_exhausted_result(&self) -> Option<ReadLog> {
-        if self.offset < self.scan_end_offset {
-            return None;
-        }
-        if !self.validate_sealed_end() {
-            return Some(ReadLog::DataCorrupted);
-        }
-        if self.sealed.is_some() {
-            return Some(ReadLog::DataEnd);
-        }
-        Some(ReadLog::SizeLimit)
-    }
-
-    #[inline]
-    fn block_at(&self, offset: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(self.log_block_size)?;
-        if end > self.scan_end_offset {
-            return None;
-        }
-        self.m.get(offset..end)
-    }
-
-    #[inline]
-    fn read_group_start(&self) -> StdResult<ValidatedGroupStart, ReadLog> {
-        // Redo groups always start at fixed-block-aligned offsets.
-        debug_assert!(self.offset.is_multiple_of(STORAGE_SECTOR_SIZE));
-        let Some(block) = self.block_at(self.offset) else {
-            return Err(ReadLog::DataCorrupted);
-        };
-        if is_zero_redo_block(block) {
-            if self.sealed.is_some() {
-                return Err(ReadLog::DataCorrupted);
-            }
-            return Err(ReadLog::DataEnd);
-        }
-        let Ok((idx, header)) = RedoBlockHeader::deser(block, 0) else {
-            return Err(ReadLog::DataCorrupted);
-        };
-        debug_assert_eq!(idx, RedoBlockHeader::SIZE);
-        if header.verify_checksum(block).is_err()
-            || header.validate(self.log_block_size).is_err()
-            || !header.is_group_start()
-        {
-            return Err(ReadLog::DataCorrupted);
-        }
-        let Ok((extension_end, extension)) = RedoGroupStartExtension::deser(block, idx) else {
-            return Err(ReadLog::DataCorrupted);
-        };
-        debug_assert_eq!(
-            extension_end,
-            RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE
-        );
-        if extension.validate().is_err() {
-            return Err(ReadLog::DataCorrupted);
-        }
-        let Ok(payload_len) = extension.group_payload_len_usize() else {
-            return Err(ReadLog::DataCorrupted);
-        };
-        let Ok(expected_block_count) = block_count_for_payload(self.log_block_size, payload_len)
-        else {
-            return Err(ReadLog::DataCorrupted);
-        };
-        let block_count = extension.group_block_count_usize();
-        if expected_block_count != block_count {
-            return Err(ReadLog::DataCorrupted);
-        }
-        if block_count == 1 && !header.is_group_end() {
-            return Err(ReadLog::DataCorrupted);
-        }
-        if block_count > 1 && header.is_group_end() {
-            return Err(ReadLog::DataCorrupted);
-        }
-        Ok(ValidatedGroupStart {
-            header,
-            extension,
-            block_count,
-            payload_len,
-        })
-    }
-
-    #[inline]
-    fn assemble_group_payload(
-        &self,
-        group_start: &ValidatedGroupStart,
-    ) -> StdResult<Vec<u8>, ReadLog> {
-        let Some(block) = self.block_at(self.offset) else {
-            return Err(ReadLog::DataCorrupted);
-        };
-        let mut payload = Vec::with_capacity(group_start.payload_len);
-        if !append_block_payload(
-            block,
-            self.log_block_size,
-            group_start.header,
-            RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE,
-            group_start.block_count == 1,
-            &mut payload,
-        ) {
-            return Err(ReadLog::DataCorrupted);
-        }
-        for expected_idx in 1..group_start.block_count {
-            self.append_continuation_payload(&mut payload, expected_idx, group_start.block_count)?;
-        }
-        if payload.len() != group_start.payload_len {
-            return Err(ReadLog::DataCorrupted);
-        }
-        Ok(payload)
-    }
-
-    #[inline]
-    fn append_continuation_payload(
-        &self,
-        payload: &mut Vec<u8>,
-        expected_idx: usize,
-        block_count: usize,
-    ) -> StdResult<(), ReadLog> {
-        let Some(block_offset) = expected_idx
-            .checked_mul(self.log_block_size)
-            .and_then(|delta| self.offset.checked_add(delta))
-        else {
-            return Err(self.incomplete_group_result());
-        };
-        let Some(block) = self.block_at(block_offset) else {
-            return Err(self.incomplete_group_result());
-        };
-        if is_zero_redo_block(block) {
-            return Err(self.incomplete_group_result());
-        }
-        let Ok((idx, header)) = RedoBlockHeader::deser(block, 0) else {
-            return Err(self.incomplete_group_result());
-        };
-        debug_assert_eq!(idx, RedoBlockHeader::SIZE);
-        if header.verify_checksum(block).is_err() {
-            return Err(self.incomplete_group_result());
-        }
-        if header.validate(self.log_block_size).is_err()
-            || header.is_group_start()
-            || header.group_block_idx as usize != expected_idx
-        {
-            return Err(ReadLog::DataCorrupted);
-        }
-        let final_block = expected_idx + 1 == block_count;
-        if header.is_group_end() != final_block {
-            return Err(ReadLog::DataCorrupted);
-        }
-        if !append_block_payload(
-            block,
-            self.log_block_size,
-            header,
-            RedoBlockHeader::SIZE,
-            final_block,
-            payload,
-        ) {
-            return Err(ReadLog::DataCorrupted);
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn finish_group_read(&mut self, group_start: ValidatedGroupStart, payload: Vec<u8>) -> ReadLog {
-        let extension = group_start.extension;
-        if let Some(sealed) = self.sealed.as_mut() {
-            sealed.record_group(extension.min_redo_cts, extension.max_redo_cts);
-        }
-        self.offset += group_start.block_count * self.log_block_size;
-        if self.offset == self.scan_end_offset && !self.validate_sealed_end() {
-            return ReadLog::DataCorrupted;
-        }
-        ReadLog::Iterator(TrxLogIterator::new(
-            payload,
-            extension.min_redo_cts,
-            extension.max_redo_cts,
-        ))
-    }
-
-    #[inline]
-    fn incomplete_group_result(&self) -> ReadLog {
-        if self.sealed.is_some() {
-            ReadLog::DataCorrupted
-        } else {
-            ReadLog::DataEnd
-        }
-    }
+#[inline]
+fn take_read_completion(
+    completed: CompletedSubmission<RedoReadSubmission>,
+) -> Result<RedoReadCompletion> {
+    let mut submission = completed.submission;
+    let expected_bytes = submission.operation.len();
+    let buf = submission.operation.take_buf().ok_or_else(|| {
+        Error::from(
+            Report::new(InternalError::Generic)
+                .attach("redo direct read completion did not return owned buffer"),
+        )
+    })?;
+    Ok(RedoReadCompletion {
+        file_seq: submission.file_seq,
+        offset: submission.offset,
+        expected_bytes,
+        actual_bytes: completed.result,
+        buf,
+    })
 }
 
 #[inline]
@@ -720,52 +1207,27 @@ mod tests {
     use crate::io::{DirectBuf, IOBuf};
     use crate::log::block_group::LogBlockGroup;
     use crate::log::format::{
-        REDO_BLOCK_GROUP_START, patch_redo_block_checksum, redo_start_block_payload_capacity,
+        REDO_BLOCK_GROUP_START, REDO_SUPER_BLOCK_SLOT_SIZE, patch_redo_block_checksum,
+        redo_start_block_payload_capacity, serialize_redo_super_block,
     };
     use crate::log::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };
     use crate::serde::Ser;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::io::Write;
+    use std::path::Path;
+    use std::thread::spawn;
 
-    fn new_reader_at(
-        log_file_path: impl AsRef<Path>,
-        log_block_size: usize,
-        max_file_size: usize,
-        offset: usize,
-    ) -> Result<MmapLogReader> {
-        let file = File::open(log_file_path.as_ref())?;
-        // SAFETY: the file handle stays alive for the duration of mapping
-        // creation, and the returned `Mmap` owns the mapping afterward.
-        let m = unsafe { Mmap::map(&file)? };
-        Ok(MmapLogReader {
-            m,
-            log_block_size,
-            scan_end_offset: max_file_size,
-            sealed: None,
-            offset,
-        })
-    }
+    const TEST_FILE_SEQ: u32 = 0;
 
-    fn new_sealed_reader_at(
-        log_file_path: impl AsRef<Path>,
-        log_block_size: usize,
-        scan_end_offset: usize,
-        offset: usize,
-        expected_range: Option<(TrxID, TrxID)>,
-    ) -> Result<MmapLogReader> {
-        let file = File::open(log_file_path.as_ref())?;
-        // SAFETY: the file handle stays alive for the duration of mapping
-        // creation, and the returned `Mmap` owns the mapping afterward.
-        let m = unsafe { Mmap::map(&file)? };
-        Ok(MmapLogReader {
-            m,
-            log_block_size,
-            scan_end_offset,
-            sealed: Some(SealedReplayState::new(expected_range)),
-            offset,
-        })
+    #[derive(Clone, Copy)]
+    enum TestSegmentSeal {
+        Open,
+        Sealed {
+            durable_end_offset: usize,
+            redo_range: Option<(TrxID, TrxID)>,
+        },
     }
 
     fn simple_trx_log(cts: TrxID) -> TrxLog {
@@ -778,10 +1240,157 @@ mod tests {
         )
     }
 
-    fn write_log_file(path: impl AsRef<Path>, bytes: &[u8]) {
+    fn write_stream_log_file(
+        path: &Path,
+        log_block_size: usize,
+        data_block_count: usize,
+        blocks: &[DirectBuf],
+        seal: TestSegmentSeal,
+    ) -> RedoLogFileDescriptor {
+        write_stream_log_file_with_seq(
+            path,
+            TEST_FILE_SEQ,
+            log_block_size,
+            data_block_count,
+            blocks,
+            seal,
+        )
+    }
+
+    fn write_stream_log_file_with_seq(
+        path: &Path,
+        file_seq: u32,
+        log_block_size: usize,
+        data_block_count: usize,
+        blocks: &[DirectBuf],
+        seal: TestSegmentSeal,
+    ) -> RedoLogFileDescriptor {
+        assert!(data_block_count >= 1);
+        assert!(blocks.len() <= data_block_count);
+        let file_max_size = REDO_DEFAULT_DATA_START_OFFSET + data_block_count * log_block_size;
+        let open = RedoSuperBlock::initial(file_seq, log_block_size, file_max_size);
+        let mut bytes = vec![0; file_max_size];
+        let mut slot = vec![0; REDO_SUPER_BLOCK_SLOT_SIZE];
+        serialize_redo_super_block(&mut slot, &open).unwrap();
+        bytes[..REDO_SUPER_BLOCK_SLOT_SIZE].copy_from_slice(&slot);
+        if let TestSegmentSeal::Sealed {
+            durable_end_offset,
+            redo_range,
+        } = seal
+        {
+            let sealed =
+                RedoSuperBlock::sealed_from_open(&open, 1, durable_end_offset, redo_range).unwrap();
+            serialize_redo_super_block(&mut slot, &sealed).unwrap();
+            bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET]
+                .copy_from_slice(&slot);
+        }
+        for (idx, block) in blocks.iter().enumerate() {
+            assert_eq!(block.as_bytes().len(), log_block_size);
+            let offset = REDO_DEFAULT_DATA_START_OFFSET + idx * log_block_size;
+            bytes[offset..offset + log_block_size].copy_from_slice(block.as_bytes());
+        }
         let mut file = File::create(path).unwrap();
-        file.write_all(bytes).unwrap();
+        file.write_all(&bytes).unwrap();
         file.flush().unwrap();
+        RedoLogFileDescriptor {
+            file_seq,
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn stream_for_test_file(
+        path: &Path,
+        log_block_size: usize,
+        data_block_count: usize,
+        blocks: &[DirectBuf],
+        seal: TestSegmentSeal,
+    ) -> RedoLogStream {
+        let descriptor =
+            write_stream_log_file(path, log_block_size, data_block_count, blocks, seal);
+        let planner = RedoReplayPlanner::new(vec![descriptor]);
+        let (skipped_max_recovered_cts, stream) = planner.plan_stream(TrxID::new(0), 1).unwrap();
+        assert_eq!(skipped_max_recovered_cts, None);
+        stream
+    }
+
+    fn injected_segment(data_block_count: usize) -> RedoLogSegment {
+        let file_max_size = REDO_DEFAULT_DATA_START_OFFSET + data_block_count * STORAGE_SECTOR_SIZE;
+        RedoLogSegment {
+            path: PathBuf::from("injected.log"),
+            file_seq: TEST_FILE_SEQ,
+            super_block: RedoSuperBlock::initial(TEST_FILE_SEQ, STORAGE_SECTOR_SIZE, file_max_size),
+        }
+    }
+
+    fn injected_stream(items: Vec<RedoReadItem>) -> RedoLogStream {
+        let capacity = items.len().max(1);
+        let (items_tx, items_rx) = flume::bounded(capacity);
+        for item in items {
+            assert!(items_tx.send(item).is_ok());
+        }
+        drop(items_tx);
+        let (recycle_tx, _recycle_rx) = flume::bounded(capacity);
+        let (stop_tx, _stop_rx) = flume::bounded(1);
+        RedoLogStream {
+            reader: Some(RedoReadAheadHandle {
+                items: items_rx,
+                recycle: recycle_tx,
+                stop: stop_tx,
+                join: None,
+            }),
+            current_segment: None,
+            buffer: VecDeque::new(),
+            state: RedoLogStreamState::Active,
+        }
+    }
+
+    #[test]
+    fn test_read_ahead_send_item_stops_while_item_queue_full() {
+        let (items_tx, items_rx) = flume::bounded(1);
+        items_tx.send(RedoReadItem::End).unwrap();
+        let (_recycle_tx, recycle_rx) = flume::bounded(1);
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        let (started_tx, started_rx) = flume::bounded(1);
+        let join = spawn(move || {
+            let mut worker = RedoReadAheadWorker {
+                segments: Vec::new(),
+                read_depth: 1,
+                items: items_tx,
+                recycle: recycle_rx,
+                stop: stop_rx,
+                stop_requested: false,
+                free: Vec::new(),
+                free_block_size: None,
+            };
+            started_tx.send(()).unwrap();
+            worker.send_item(RedoReadItem::End)
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop_tx.send(()).unwrap();
+        assert!(!join.join().unwrap());
+        assert_eq!(items_rx.len(), 1);
+    }
+
+    async fn assert_stream_corrupted(stream: &mut RedoLogStream) {
+        let err = stream.try_next().await.unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::LogFileCorrupted),
+            "{err:?}"
+        );
+    }
+
+    fn assert_read_after_failed(err: Error) {
+        assert_eq!(
+            err.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::Generic),
+            "{err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("redo stream read after terminal error"),
+            "{err:?}"
+        );
     }
 
     fn block_group_with_range(log: TrxLog, min_cts: TrxID, max_cts: TrxID) -> DirectBuf {
@@ -818,292 +1427,452 @@ mod tests {
     }
 
     #[test]
-    fn test_log_reader_stops_when_initial_block_crosses_logical_file_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        write_log_file(&file_path, &vec![0u8; STORAGE_SECTOR_SIZE * 2]);
+    fn test_direct_stream_rejects_unsealed_group_crossing_segment_end() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let block = two_block_start_only();
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[block],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE * 2, STORAGE_SECTOR_SIZE, 0).unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+            assert_stream_corrupted(&mut stream).await;
+        });
     }
 
     #[test]
-    fn test_log_reader_stops_when_expanded_group_crosses_logical_file_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let block = two_block_start_only();
-        write_log_file(&file_path, block.as_bytes());
+    fn test_direct_stream_treats_in_range_zero_continuation_as_incomplete_tail() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let block = two_block_start_only();
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                2,
+                &[block],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataEnd));
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
     }
 
     #[test]
-    fn test_log_reader_treats_all_zero_group_header_as_eof() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        write_log_file(&file_path, &vec![0u8; STORAGE_SECTOR_SIZE]);
+    fn test_direct_stream_treats_all_zero_group_header_as_eof() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataEnd));
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
     }
 
     #[test]
-    fn test_log_reader_rejects_nonzero_empty_group_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE];
-        bytes[0] = 1;
-        write_log_file(&file_path, &bytes);
+    fn test_direct_stream_rejects_nonzero_empty_group_header() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut block = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
+            block.as_bytes_mut()[0] = 1;
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[block],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+            assert_stream_corrupted(&mut stream).await;
+        });
     }
 
     #[test]
-    fn test_log_reader_rejects_bad_checksum_before_body_parsing() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let mut direct_buf =
-            block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
-        let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
-        direct_buf.as_bytes_mut()[payload_start] ^= 0x80;
-        write_log_file(&file_path, direct_buf.as_bytes());
+    fn test_direct_stream_fails_closed_after_segment_error() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let corrupt_path = dir.path().join("corrupt.log");
+            let valid_path = dir.path().join("valid.log");
+            let mut corrupt_block = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
+            corrupt_block.as_bytes_mut()[0] = 1;
+            let corrupt = write_stream_log_file_with_seq(
+                &corrupt_path,
+                0,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[corrupt_block],
+                TestSegmentSeal::Open,
+            );
+            let valid_block =
+                block_group_with_range(simple_trx_log(TrxID::new(9)), TrxID::new(9), TrxID::new(9));
+            let valid = write_stream_log_file_with_seq(
+                &valid_path,
+                1,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[valid_block],
+                TestSegmentSeal::Open,
+            );
+            let planner = RedoReplayPlanner::new(vec![corrupt, valid]);
+            let (skipped_max_recovered_cts, mut stream) =
+                planner.plan_stream(TrxID::new(0), 1).unwrap();
+            assert_eq!(skipped_max_recovered_cts, None);
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+            assert_stream_corrupted(&mut stream).await;
+            let err = stream.try_next().await.unwrap_err();
+            assert_read_after_failed(err);
+        });
     }
 
     #[test]
-    fn test_trx_log_iterator_rejects_body_cts_below_header_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = block_group_with_range(log, TrxID::new(6), TrxID::new(8));
-        write_log_file(&file_path, direct_buf.as_bytes());
+    fn test_direct_stream_rejects_early_segment_end_while_waiting_for_continuation() {
+        smol::block_on(async {
+            let block = two_block_start_only();
+            let mut stream = injected_stream(vec![
+                RedoReadItem::SegmentStart(injected_segment(2)),
+                RedoReadItem::Block {
+                    file_seq: TEST_FILE_SEQ,
+                    offset: REDO_DEFAULT_DATA_START_OFFSET,
+                    buf: block,
+                },
+                RedoReadItem::SegmentEnd {
+                    file_seq: TEST_FILE_SEQ,
+                },
+            ]);
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE * 2, 0).unwrap();
-        let ReadLog::Iterator(mut iter) = reader.read() else {
-            panic!("expected valid group");
-        };
-
-        let err = iter.try_next().unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+            assert_stream_corrupted(&mut stream).await;
+            let err = stream.try_next().await.unwrap_err();
+            assert_read_after_failed(err);
+        });
     }
 
     #[test]
-    fn test_trx_log_iterator_rejects_body_cts_above_header_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = block_group_with_range(log, TrxID::new(1), TrxID::new(4));
-        write_log_file(&file_path, direct_buf.as_bytes());
+    fn test_direct_stream_rejects_early_end_while_waiting_for_continuation() {
+        smol::block_on(async {
+            let block = two_block_start_only();
+            let mut stream = injected_stream(vec![
+                RedoReadItem::SegmentStart(injected_segment(2)),
+                RedoReadItem::Block {
+                    file_seq: TEST_FILE_SEQ,
+                    offset: REDO_DEFAULT_DATA_START_OFFSET,
+                    buf: block,
+                },
+                RedoReadItem::End,
+            ]);
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE * 2, 0).unwrap();
-        let ReadLog::Iterator(mut iter) = reader.read() else {
-            panic!("expected valid group");
-        };
-
-        let err = iter.try_next().unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+            assert_stream_corrupted(&mut stream).await;
+            let err = stream.try_next().await.unwrap_err();
+            assert_read_after_failed(err);
+        });
     }
 
     #[test]
-    fn test_trx_log_iterator_accepts_body_cts_within_loose_header_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
-        write_log_file(&file_path, direct_buf.as_bytes());
+    fn test_direct_stream_rejects_bad_checksum_before_body_parsing() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut direct_buf =
+                block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
+            let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
+            direct_buf.as_bytes_mut()[payload_start] ^= 0x80;
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader =
-            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE * 2, 0).unwrap();
-        let ReadLog::Iterator(mut iter) = reader.read() else {
-            panic!("expected valid group");
-        };
-
-        assert!(iter.try_next().unwrap().is_some());
-        assert!(iter.try_next().unwrap().is_none());
+            assert_stream_corrupted(&mut stream).await;
+        });
     }
 
     #[test]
-    fn test_sealed_reader_accepts_matching_group_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
-        write_log_file(&file_path, direct_buf.as_bytes());
+    fn test_direct_stream_rejects_body_cts_below_header_range() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let log = simple_trx_log(TrxID::new(5));
+            let direct_buf = block_group_with_range(log, TrxID::new(6), TrxID::new(8));
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader = new_sealed_reader_at(
-            file_path,
-            STORAGE_SECTOR_SIZE,
-            STORAGE_SECTOR_SIZE,
-            0,
-            Some((TrxID::new(4), TrxID::new(6))),
-        )
-        .unwrap();
-
-        let ReadLog::Iterator(mut iter) = reader.read() else {
-            panic!("expected sealed group");
-        };
-        assert!(iter.try_next().unwrap().is_some());
-        assert!(iter.try_next().unwrap().is_none());
-        assert!(matches!(reader.read(), ReadLog::DataEnd));
+            let err = stream.try_next().await.unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+        });
     }
 
     #[test]
-    fn test_sealed_reader_accepts_empty_file_without_zero_eof() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        write_log_file(&file_path, &vec![0u8; STORAGE_SECTOR_SIZE]);
+    fn test_direct_stream_clears_partial_buffer_after_group_decode_error() {
+        smol::block_on(async {
+            let log1 = simple_trx_log(TrxID::new(1));
+            let log2 = simple_trx_log(TrxID::new(2));
+            let payload_len = log1.ser_len() + log2.ser_len();
+            let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log1).unwrap();
+            assert!(group.append_trx_log(log2).is_none());
+            let mut blocks = group
+                .finish_with(|count| {
+                    (0..count)
+                        .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                        .collect()
+                })
+                .unwrap();
+            RedoGroupStartExtension::new(payload_len, blocks.len(), TrxID::new(1), TrxID::new(1))
+                .unwrap()
+                .ser(blocks[0].as_bytes_mut(), RedoBlockHeader::SIZE);
+            patch_redo_block_checksum(blocks[0].as_bytes_mut()).unwrap();
 
-        let mut reader = new_sealed_reader_at(file_path, STORAGE_SECTOR_SIZE, 0, 0, None).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                blocks.len(),
+                &blocks,
+                TestSegmentSeal::Open,
+            );
 
-        assert!(matches!(reader.read(), ReadLog::DataEnd));
+            let err = stream.try_next().await.unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let err = stream.try_next().await.unwrap_err();
+            assert_read_after_failed(err);
+        });
     }
 
     #[test]
-    fn test_sealed_reader_rejects_zero_eof_before_durable_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        write_log_file(&file_path, &vec![0u8; STORAGE_SECTOR_SIZE]);
+    fn test_direct_stream_rejects_body_cts_above_header_range() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let log = simple_trx_log(TrxID::new(5));
+            let direct_buf = block_group_with_range(log, TrxID::new(1), TrxID::new(4));
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader = new_sealed_reader_at(
-            file_path,
-            STORAGE_SECTOR_SIZE,
-            STORAGE_SECTOR_SIZE,
-            0,
-            Some((TrxID::new(1), TrxID::new(1))),
-        )
-        .unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+            let err = stream.try_next().await.unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+        });
     }
 
     #[test]
-    fn test_sealed_reader_rejects_group_crossing_durable_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let block = two_block_start_only();
-        write_log_file(&file_path, block.as_bytes());
+    fn test_direct_stream_accepts_body_cts_within_loose_header_range() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let log = simple_trx_log(TrxID::new(5));
+            let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Open,
+            );
 
-        let mut reader = new_sealed_reader_at(
-            file_path,
-            STORAGE_SECTOR_SIZE,
-            STORAGE_SECTOR_SIZE,
-            0,
-            Some((TrxID::new(1), TrxID::new(1))),
-        )
-        .unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+            let recovered = stream.try_next().await.unwrap().unwrap();
+            assert_eq!(recovered.header.cts, TrxID::new(5));
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
     }
 
     #[test]
-    fn test_sealed_reader_rejects_mismatched_group_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let log = simple_trx_log(TrxID::new(5));
-        let direct_buf = block_group_with_range(log, TrxID::new(5), TrxID::new(5));
-        write_log_file(&file_path, direct_buf.as_bytes());
+    fn test_direct_stream_accepts_matching_sealed_group_range() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let log = simple_trx_log(TrxID::new(5));
+            let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(4), TrxID::new(6))),
+                },
+            );
 
-        let mut reader = new_sealed_reader_at(
-            file_path,
-            STORAGE_SECTOR_SIZE,
-            STORAGE_SECTOR_SIZE,
-            0,
-            Some((TrxID::new(4), TrxID::new(6))),
-        )
-        .unwrap();
-
-        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+            assert!(stream.try_next().await.unwrap().is_some());
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
     }
 
     #[test]
-    fn test_log_reader_read_multi_trx_log_in_one_group() {
-        let log1 = TrxLog::new(
-            RedoHeader {
-                cts: TrxID::new(1),
-                trx_kind: RedoTrxKind::System,
-            },
-            RedoLogs {
-                ddl: Some(Box::new(DDLRedo::CreateRowPage {
-                    table_id: TableID::new(6),
+    fn test_direct_stream_skips_empty_sealed_file_without_zero_eof() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[],
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET,
+                    redo_range: None,
+                },
+            );
+
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_rejects_zero_eof_before_sealed_durable_end() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[],
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
+                },
+            );
+
+            assert_stream_corrupted(&mut stream).await;
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_rejects_group_crossing_sealed_durable_end() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let block = two_block_start_only();
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[block],
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
+                },
+            );
+
+            assert_stream_corrupted(&mut stream).await;
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_rejects_mismatched_sealed_group_range() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let log = simple_trx_log(TrxID::new(5));
+            let direct_buf = block_group_with_range(log, TrxID::new(5), TrxID::new(5));
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(4), TrxID::new(6))),
+                },
+            );
+
+            assert_stream_corrupted(&mut stream).await;
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_reads_multi_trx_log_in_one_group() {
+        smol::block_on(async {
+            let log1 = TrxLog::new(
+                RedoHeader {
+                    cts: TrxID::new(1),
+                    trx_kind: RedoTrxKind::System,
+                },
+                RedoLogs {
+                    ddl: Some(Box::new(DDLRedo::CreateRowPage {
+                        table_id: TableID::new(6),
+                        page_id: test_page_id(5),
+                        start_row_id: RowID::new(0),
+                        end_row_id: RowID::new(574),
+                    })),
+                    dml: BTreeMap::new(),
+                },
+            );
+            let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log1).unwrap();
+
+            let mut rows = BTreeMap::new();
+            rows.insert(
+                RowID::new(100),
+                RowRedo {
                     page_id: test_page_id(5),
-                    start_row_id: RowID::new(0),
-                    end_row_id: RowID::new(574),
-                })),
-                dml: BTreeMap::new(),
-            },
-        );
-        let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log1).unwrap();
+                    row_id: RowID::new(100),
+                    kind: RowRedoKind::Delete,
+                },
+            );
+            let mut dml = BTreeMap::new();
+            dml.insert(TableID::new(6), TableDML { rows });
 
-        let mut rows = BTreeMap::new();
-        rows.insert(
-            RowID::new(100),
-            RowRedo {
-                page_id: test_page_id(5),
-                row_id: RowID::new(100),
-                kind: RowRedoKind::Delete,
-            },
-        );
-        let mut dml = BTreeMap::new();
-        dml.insert(TableID::new(6), TableDML { rows });
+            let log2 = TrxLog::new(
+                RedoHeader {
+                    cts: TrxID::new(2),
+                    trx_kind: RedoTrxKind::User,
+                },
+                RedoLogs { ddl: None, dml },
+            );
+            assert!(group.append_trx_log(log2).is_none());
+            let blocks = group
+                .finish_with(|count| {
+                    (0..count)
+                        .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                        .collect()
+                })
+                .unwrap();
 
-        let log2 = TrxLog::new(
-            RedoHeader {
-                cts: TrxID::new(2),
-                trx_kind: RedoTrxKind::User,
-            },
-            RedoLogs { ddl: None, dml },
-        );
-        assert!(group.append_trx_log(log2).is_none());
-        let blocks = group
-            .finish_with(|count| {
-                (0..count)
-                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
-                    .collect()
-            })
-            .unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let mut file = File::create(&file_path).unwrap();
-        for block in &blocks {
-            file.write_all(block.as_bytes()).unwrap();
-        }
-        file.flush().unwrap();
-
-        let mut reader = new_reader_at(file_path, 4096, 1024 * 1024, 0).unwrap();
-        match reader.read() {
-            ReadLog::DataCorrupted | ReadLog::DataEnd | ReadLog::SizeLimit => {
-                panic!("invalid data")
-            }
-            ReadLog::Iterator(mut iter) => {
-                let log1 = iter.try_next().unwrap().unwrap();
-                assert!(log1.header.trx_kind == RedoTrxKind::System);
-                let log2 = iter.try_next().unwrap().unwrap();
-                assert!(log2.header.trx_kind == RedoTrxKind::User);
-                assert!(iter.try_next().unwrap().is_none());
-            }
-        }
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                blocks.len(),
+                &blocks,
+                TestSegmentSeal::Open,
+            );
+            let log1 = stream.try_next().await.unwrap().unwrap();
+            assert!(log1.header.trx_kind == RedoTrxKind::System);
+            let log2 = stream.try_next().await.unwrap().unwrap();
+            assert!(log2.header.trx_kind == RedoTrxKind::User);
+            assert!(stream.try_next().await.unwrap().is_none());
+        });
     }
 }

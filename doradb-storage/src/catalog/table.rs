@@ -3602,6 +3602,7 @@ mod tests {
             let batch = engine
                 .catalog()
                 .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .await
                 .unwrap();
 
             assert_eq!(

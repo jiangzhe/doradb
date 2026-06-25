@@ -24,11 +24,12 @@ than one empty redo file are explicitly out of scope.
 
 RFC-0020 added redo v2 file headers, group checksums, strict transaction
 framing, and sealed segment ranges, but it intentionally preserved the existing
-one commit group to one physical write path. That leaves four related problems:
+one commit group to one physical write path. At RFC creation, that left four
+related problems:
 
 - A single large transaction can allocate a variable-sized direct IO buffer and
   submit one large write that exceeds `log_block_size`.
-- Recovery still uses a synchronous mmap-backed reader, which can block the
+- Recovery used a synchronous mmap-backed reader, which could block the
   caller through page faults and does not fit the async IO direction.
 - Configured IO depth counts operations, not fixed physical log blocks, so a
   large redo write can consume more device service than one queue slot implies.
@@ -55,8 +56,8 @@ Issue Labels:
   driven by checkpoint-published catalog/table boundaries.
 - [D4] `docs/table-file.md` - table roots and replay boundaries are published
   through CoW state, so redo segment metadata must not outpace recoverability.
-- [D5] `docs/redo-log.md` - current redo path maps one commit group to one
-  direct write, uses mmap recovery, and documents the fixed-block follow-up.
+- [D5] `docs/redo-log.md` - current redo path documents fixed-block direct
+  writes, direct-IO read-ahead recovery, and catalog checkpoint redo scans.
 - [D6] `docs/async-io.md` - storage IO should use the backend-neutral direct IO
   abstraction with bounded submission depth.
 - [D7] `docs/rfcs/0020-redo-log-format-and-integrity.md` - v2 redo integrity
@@ -93,28 +94,29 @@ Issue Labels:
   `doradb-storage/src/io/libaio_backend.rs` - both IO backends can return more
   than one completion per backend wait, even though redo currently consumes
   completions through a single-item API.
-- [C8] `doradb-storage/src/recovery/redo_stream.rs` - `MmapLogReader` scans v2
-  groups through mmap, treats sealed files as bounded by `durable_end_offset`,
-  and treats invalid data before a sealed end as corruption.
+- [C8] `doradb-storage/src/recovery/stream.rs` - `RedoLogStream` consumes
+  ordered direct-IO read-ahead blocks, treats sealed files as bounded by
+  `durable_end_offset`, and treats invalid data before a sealed end as
+  corruption.
 - [C9] `doradb-storage/src/conf/trx.rs` - `log_block_size`,
-  `log_file_max_size`, and `io_depth` are normalized at configuration time, but
-  comments still document that large single transactions are submitted as one
-  larger request.
+  `log_file_max_size`, and redo IO-depth knobs are normalized or validated at
+  configuration time, but comments still document that large single
+  transactions are submitted as one larger request.
 - [C10] `doradb-storage/src/trx/sys.rs` - commit precommit, log-thread
   processing, shutdown, and waiter completion rely on redo prefix durability.
 - [C11] `doradb-storage/src/recovery/mod.rs` - recovery consumes complete
   `TrxLog` records and uses DDL boundaries as replay pipeline breakers.
 - [C12] `doradb-storage/src/catalog/checkpoint.rs` - catalog checkpoint scanning
-  currently uses `RedoLogStream` from an async-facing workflow, so the reader
-  refactor must avoid moving synchronous mmap/page-fault work onto executor
-  threads.
+  uses `RedoLogStream` from an async-facing workflow and consumes direct-IO
+  read-ahead rather than mmap page faults.
 
 ### Conversation References
 
 - [U1] User requested an RFC to redesign redo read/write path because the
-  current path has no split between transaction group and single transaction,
-  supports only mmap reads, cannot enforce real IO depth with variable-size
-  groups, and still lacks sync-group batching plus request-id sequencing.
+  then-current path had no split between transaction group and single
+  transaction, supported only mmap reads, could not enforce real IO depth with
+  variable-size groups, and still lacked sync-group batching plus request-id
+  sequencing.
 - [U2] User proposed redesigning commit-group serialization/deserialization so
   groups can be split to fit `log_block_size`, then using that basis for a
   direct-IO async reader and IO-depth enforcement.
@@ -138,7 +140,7 @@ Issue Labels:
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
+- [B1] `docs/backlogs/closed/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
   - existing follow-up for replacing mmap redo recovery reads.
 - [B2] `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
   - existing follow-up for commit-group construction and sync batching policy.
@@ -214,9 +216,10 @@ CTS as the scheduler key. CTS remains transaction metadata used for persisted
 CTS updates and waiter completion, not the identity of an IO request. [C5],
 [C10], [B3], [U4]
 
-Enforce IO depth in fixed-block units. The redo writer submits at most `io_depth`
-fixed-block payload requests, plus separately tracked metadata requests if the
-implementation keeps header/seal submissions outside the data-block capacity.
+Enforce IO depth in fixed-block units. The redo writer submits at most
+`log_write_io_depth` fixed-block payload requests, plus separately tracked
+metadata requests if the implementation keeps header/seal submissions outside
+the data-block capacity.
 For group payloads, each block consumes one submission slot and completions may
 arrive out of order; group completion is reported only after every block in that
 group has completed successfully and the prefix/sync policy permits visibility.
@@ -400,19 +403,25 @@ pwrite_owned}`.
     payloads, and expose only complete `TrxLog` records to recovery.
   - Non-goals: Parallel redo replay policy beyond the current recovery
     pipeline, cross-file group reassembly, and log truncation.
-  - Prerequisites: Phase 2 fixed-block format and mmap parser/assembler exist;
-    recovery callers can accept either the existing stream shape backed by
-    direct IO or a dedicated reader service.
+  - Prerequisites: Phase 2 fixed-block format exists; recovery callers can use
+    the existing stream shape backed by direct IO.
   - Phase-local Choices: Async stream API versus dedicated read service,
     in-memory completion buffer representation, completion ordering/backpressure
     policy, and how catalog checkpoint scanning is adapted so read waits do not
     block async executor threads.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: pending
-  - Implementation Summary: pending
+  - Task Doc: `docs/tasks/000188-redo-direct-io-read-ahead-reader.md`
+  - Task Issue: `#753`
+  - Phase Status: done
+  - Implementation Summary: Implemented the direct-IO read-ahead worker and
+    async `RedoLogStream` integration for startup recovery and catalog
+    checkpoint scans, kept semantic parsing in `RedoLogStream`, split redo IO
+    depth configuration by write/recovery/checkpoint-scan path, and removed the
+    residual mmap reader/test dependency. [Task Resolve Sync: docs/tasks/000188-redo-direct-io-read-ahead-reader.md @ 2026-06-25]
   - Related Backlogs:
-    - `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
+    - `docs/backlogs/closed/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
+    - `docs/backlogs/000130-large-redo-transaction-streaming-replay.md`
+    - `docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md`
+    - `docs/backlogs/000132-checkpoint-below-floor-group-skip-evaluation.md`
 
 - **Phase 4: Completion Drain and Sync Batching**
   - Scope: Use the prefix scheduler to drain already-available completions and
@@ -532,6 +541,6 @@ pwrite_owned}`.
 - `docs/async-io.md`
 - `docs/checkpoint-and-recovery.md`
 - `docs/transaction-system.md`
-- `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
+- `docs/backlogs/closed/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
 - `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
 - `docs/backlogs/closed/000127-redo-io-request-id-prefix-sequencing.md`

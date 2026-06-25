@@ -8,7 +8,7 @@ use crate::io::{Completion, STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::{LogSync, RedoLogInitializer};
 use crate::quiescent::QuiescentGuard;
-use crate::recovery::stream::RedoLogStream;
+use crate::recovery::stream::RedoReplayPlanner;
 use crate::recovery::{RecoveryBuffers, RecoveryCoordinator, RecoveryResources};
 use crate::trx::MAX_SNAPSHOT_TS;
 use crate::trx::purge::Purge;
@@ -25,8 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::consts::{
-    DEFAULT_LOG_BLOCK_SIZE, DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM,
-    DEFAULT_LOG_IO_DEPTH, DEFAULT_LOG_SYNC, DEFAULT_PURGE_THREADS,
+    DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH, DEFAULT_LOG_BLOCK_SIZE, DEFAULT_LOG_DIR,
+    DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_SYNC, DEFAULT_LOG_WRITE_IO_DEPTH,
+    DEFAULT_PURGE_THREADS, DEFAULT_RECOVERY_IO_DEPTH,
 };
 use super::path::{path_to_utf8, validate_log_file_stem};
 
@@ -37,8 +38,12 @@ const MAX_REDO_LOG_BLOCK_SIZE: usize = u16::MAX as usize + 1;
 /// Configuration for redo logging, recovery, and transaction-system workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrxSysConfig {
-    /// Inflight IO request depth of the redo log stream.
-    pub io_depth: usize,
+    /// In-flight IO request depth of the live redo writer.
+    pub log_write_io_depth: usize,
+    /// Direct-IO read-ahead depth used during startup recovery.
+    pub recovery_io_depth: usize,
+    /// Direct-IO read-ahead depth used by catalog checkpoint redo scans.
+    pub catalog_checkpoint_scan_io_depth: usize,
     /// Sector-aligned physical write size for fixed-block redo data.
     ///
     /// Every redo payload write uses exactly this size. Ordinary grouped
@@ -67,7 +72,9 @@ impl Default for TrxSysConfig {
     #[inline]
     fn default() -> Self {
         TrxSysConfig {
-            io_depth: DEFAULT_LOG_IO_DEPTH,
+            log_write_io_depth: DEFAULT_LOG_WRITE_IO_DEPTH,
+            recovery_io_depth: DEFAULT_RECOVERY_IO_DEPTH,
+            catalog_checkpoint_scan_io_depth: DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH,
             log_block_size: DEFAULT_LOG_BLOCK_SIZE,
             log_dir: PathBuf::from(DEFAULT_LOG_DIR),
             log_file_stem: String::from(DEFAULT_LOG_FILE_STEM),
@@ -79,10 +86,24 @@ impl Default for TrxSysConfig {
 }
 
 impl TrxSysConfig {
-    /// Set the redo-log IO queue depth.
+    /// Set the live redo-writer IO queue depth.
     #[inline]
-    pub fn io_depth(mut self, io_depth: usize) -> Self {
-        self.io_depth = io_depth;
+    pub fn log_write_io_depth(mut self, io_depth: usize) -> Self {
+        self.log_write_io_depth = io_depth;
+        self
+    }
+
+    /// Set the startup recovery direct-IO read-ahead depth.
+    #[inline]
+    pub fn recovery_io_depth(mut self, io_depth: usize) -> Self {
+        self.recovery_io_depth = io_depth;
+        self
+    }
+
+    /// Set the catalog checkpoint redo-scan direct-IO read-ahead depth.
+    #[inline]
+    pub fn catalog_checkpoint_scan_io_depth(mut self, io_depth: usize) -> Self {
+        self.catalog_checkpoint_scan_io_depth = io_depth;
         self
     }
 
@@ -165,7 +186,7 @@ impl TrxSysConfig {
     pub(crate) fn prepare_recovery<'a>(
         &self,
         resources: RecoveryResources<'a>,
-    ) -> Result<(RecoveryCoordinator<'a>, RedoLogInitializer)> {
+    ) -> Result<RecoveryCoordinator<'a>> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let file_prefix = self.file_prefix().map_err(Error::from)?;
         let configured_log_block_size = self.log_block_size.as_u64() as usize;
@@ -175,20 +196,31 @@ impl TrxSysConfig {
             normalize_redo_file_max_size(self.log_file_max_size.as_u64() as usize, log_block_size)?;
 
         let logs = discover_redo_log_files(&file_prefix, false)?;
-        let stream = RedoLogStream::new(logs);
-        let next_file_seq = stream.next_file_seq()?.unwrap_or(0);
+        let planner = RedoReplayPlanner::new(logs);
+        let next_file_seq = planner.next_file_seq()?.unwrap_or(0);
         let initializer = RedoLogInitializer::new(
             file_prefix,
-            self.io_depth,
+            self.log_write_io_depth,
             file_max_size,
             log_block_size,
             next_file_seq,
-        )?;
-        Ok((RecoveryCoordinator::new(resources, stream), initializer))
+        );
+        Ok(RecoveryCoordinator::new(
+            resources,
+            planner,
+            self.recovery_io_depth,
+            initializer,
+        ))
     }
 
     #[inline]
     fn normalize_redo_file_layout(mut self) -> Result<Self> {
+        validate_redo_io_depth("log_write_io_depth", self.log_write_io_depth)?;
+        validate_redo_io_depth("recovery_io_depth", self.recovery_io_depth)?;
+        validate_redo_io_depth(
+            "catalog_checkpoint_scan_io_depth",
+            self.catalog_checkpoint_scan_io_depth,
+        )?;
         let configured_log_block_size = self.log_block_size.as_u64() as usize;
         validate_redo_log_block_size(configured_log_block_size)?;
         let log_block_size = align_to_sector_size(configured_log_block_size);
@@ -218,8 +250,9 @@ impl TrxSysConfig {
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
         let recovery_resources =
             RecoveryResources::new(recovery_buffers, table_fs.clone(), &catalog);
-        let (coordinator, initializer) = config.prepare_recovery(recovery_resources)?;
-        let (max_recovered_cts, initial_file_deletes) = coordinator.recover_all().await?;
+        let coordinator = config.prepare_recovery(recovery_resources)?;
+        let (max_recovered_cts, initial_file_deletes, initializer) =
+            coordinator.recover_all().await?;
         let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)?;
         let (redo_log, initial_redo_header) = initializer.finish(purge_tx.clone())?;
         let redo_log = CachePadded::new(redo_log);
@@ -324,6 +357,16 @@ fn normalize_redo_file_max_size(
 }
 
 #[inline]
+fn validate_redo_io_depth(field: &'static str, io_depth: usize) -> Result<()> {
+    if io_depth != 0 {
+        return Ok(());
+    }
+    Err(Report::new(ConfigError::InvalidIoDepth)
+        .attach(format!("{field}=0"))
+        .into())
+}
+
+#[inline]
 fn validate_redo_log_block_size(log_block_size: usize) -> Result<()> {
     if (STORAGE_SECTOR_SIZE..=MAX_REDO_LOG_BLOCK_SIZE).contains(&log_block_size) {
         return Ok(());
@@ -365,6 +408,58 @@ mod tests {
         assert_eq!(
             err.report().downcast_ref::<ConfigError>().copied(),
             Some(ConfigError::InvalidLogBlockSize)
+        );
+    }
+
+    fn assert_invalid_io_depth(err: Error) {
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidIoDepth)
+        );
+    }
+
+    fn assert_normalize_rejects_invalid_io_depth(config: TrxSysConfig) {
+        let err = match config.normalize_redo_file_layout() {
+            Ok(_) => panic!("zero redo IO depth must be rejected"),
+            Err(err) => err,
+        };
+        assert_invalid_io_depth(err);
+    }
+
+    #[test]
+    fn redo_io_depth_defaults_are_split_but_preserved() {
+        let config = TrxSysConfig::default();
+
+        assert_eq!(config.log_write_io_depth, DEFAULT_LOG_WRITE_IO_DEPTH);
+        assert_eq!(config.recovery_io_depth, DEFAULT_RECOVERY_IO_DEPTH);
+        assert_eq!(
+            config.catalog_checkpoint_scan_io_depth,
+            DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH
+        );
+        assert_eq!(config.log_write_io_depth, 32);
+        assert_eq!(config.recovery_io_depth, 32);
+        assert_eq!(config.catalog_checkpoint_scan_io_depth, 32);
+    }
+
+    #[test]
+    fn redo_io_depth_builders_are_independent() {
+        let config = TrxSysConfig::default()
+            .log_write_io_depth(2)
+            .recovery_io_depth(3)
+            .catalog_checkpoint_scan_io_depth(4);
+
+        assert_eq!(config.log_write_io_depth, 2);
+        assert_eq!(config.recovery_io_depth, 3);
+        assert_eq!(config.catalog_checkpoint_scan_io_depth, 4);
+    }
+
+    #[test]
+    fn normalize_redo_file_layout_rejects_zero_redo_io_depths() {
+        assert_normalize_rejects_invalid_io_depth(TrxSysConfig::default().log_write_io_depth(0));
+        assert_normalize_rejects_invalid_io_depth(TrxSysConfig::default().recovery_io_depth(0));
+        assert_normalize_rejects_invalid_io_depth(
+            TrxSysConfig::default().catalog_checkpoint_scan_io_depth(0),
         );
     }
 
