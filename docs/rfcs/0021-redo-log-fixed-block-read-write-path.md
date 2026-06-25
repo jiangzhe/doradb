@@ -455,10 +455,10 @@ pwrite_owned}`.
     behavior.
   - Phase-local Choices: Whether this is a separate task or folded into the
     preceding implementation tasks, depending on final patch size.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: pending
-  - Implementation Summary: pending
+  - Task Doc: `docs/tasks/000190-redo-fixed-block-documentation-tests-and-cleanup.md`
+  - Task Issue: `#757`
+  - Phase Status: done
+  - Implementation Summary: Audited and updated redo-log documentation for fixed-block v3 behavior, added focused format/block-group/recovery stream edge-case tests, removed obsolete active redo wording, and validated style/default/libaio suites. [Task Resolve Sync: docs/tasks/000190-redo-fixed-block-documentation-tests-and-cleanup.md @ 2026-06-25]
 
 ## Validation Strategy
 

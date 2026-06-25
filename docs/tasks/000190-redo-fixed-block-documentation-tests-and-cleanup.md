@@ -1,7 +1,7 @@
 ---
 id: 000190
 title: Redo Fixed-Block Documentation Tests and Cleanup
-status: proposal
+status: implemented
 created: 2026-06-25
 github_issue: 757
 ---
@@ -248,6 +248,52 @@ record it as backlog follow-up instead of widening this task.
      references.
 
 ## Implementation Notes
+
+- Rewrote `docs/redo-log.md` around the current format version 3 fixed-block
+  redo model. The document now describes the selected super-block as the data
+  format authority, the 11-byte common data-block header, the 28-byte
+  group-start extension, CRC32 coverage over header/payload/padding, zero
+  padding validation, all-zero block EOF rules, group boundary constraints,
+  empty-file capacity rejection, direct-IO read-ahead ownership, and
+  completion-drain sync batching.
+- Removed stale active redo documentation references to `LogBuf`,
+  `RedoGroupHeader`, v2-only physical group framing, production mmap redo
+  reads, one logical group to one direct write, and large variable-size direct
+  redo writes. Targeted searches over active redo docs and adjacent redo code
+  found no remaining matches for those obsolete active claims.
+- Hardened fixed-block format tests in
+  `doradb-storage/src/log/format.rs` with table-driven coverage for invalid
+  flags, zero payload lengths, start/continuation capacity overflow,
+  inconsistent `GROUP_START` and `group_block_idx`, zero group payload length,
+  zero group block count, and inverted group CTS ranges.
+- Hardened `LogBlockGroup` tests in
+  `doradb-storage/src/log/block_group.rs` with exact start/continuation
+  payload-boundary block-count checks and multi-block materialization
+  assertions that reconstruct the logical payload, verify physical byte count,
+  validate headers/checksums, and prove post-payload padding remains zero.
+- Hardened `RedoLogStream` tests in
+  `doradb-storage/src/recovery/stream.rs` for an unsealed malformed
+  continuation tail, nonzero padding after payload with a refreshed checksum,
+  and replay across planned segments with different persisted
+  `log_block_size` values.
+- Reviewed commit-group and configuration coverage and left it unchanged
+  because existing tests already cover no-log joins, one-block redo joins,
+  oversized single-transaction multi-block groups, redo IO-depth split
+  normalization, block-size rounding, and file-size normalization.
+- No persisted redo file format, block header layout, recovery semantics,
+  parser architecture, prefix scheduler, sync policy, or backlog-owned future
+  behavior was changed. Related backlogs 000130, 000131, and 000132 remain open
+  as intentional follow-ups; no new actionable follow-up was discovered during
+  this closure task.
+- Validation passed:
+  - `tools/style_audit.rs --diff-base origin/main` passed with 3 branch-diff
+    Rust files checked.
+  - `cargo fmt --all -- --check` passed.
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings` passed.
+  - Focused nextest run for the new/changed redo cases passed with 7 tests.
+  - `cargo nextest run -p doradb-storage` passed with 1036 tests.
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+    passed with 1034 tests.
 
 ## Impacts
 
