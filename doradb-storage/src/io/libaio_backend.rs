@@ -346,7 +346,7 @@ pub(crate) mod tests {
                 .is_ok()
         );
         assert_eq!(driver.submit_ready(), 1);
-        let completed = driver.wait_one();
+        let completed = driver.wait_at_least_one();
         assert_eq!(completed.submission.kind, IOKind::Write);
         assert_eq!(completed.result.unwrap(), 4096);
 
@@ -361,7 +361,7 @@ pub(crate) mod tests {
                 .is_ok()
         );
         assert_eq!(driver.submit_ready(), 1);
-        let completed = driver.wait_one();
+        let completed = driver.wait_at_least_one();
         assert_eq!(completed.submission.kind, IOKind::Read);
         assert_eq!(completed.result.unwrap(), 4096);
         let buf = completed.submission.operation.buf().unwrap();

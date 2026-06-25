@@ -6,7 +6,7 @@ use crate::conf::TrxSysConfig;
 use crate::error::{CompletionErrorKind, FatalError};
 use crate::file::FileSyncer;
 use crate::id::TrxID;
-use crate::io::{DirectBuf, IOBuf};
+use crate::io::{DirectBuf, IOBackend, IOBuf};
 use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoSuperBlock,
     serialize_redo_super_block, slot_offset,
@@ -160,7 +160,10 @@ impl LogFileSealer {
     }
 
     #[inline]
-    pub(super) fn stage_ready(&mut self, write_driver: &mut LogWriteDriver) {
+    pub(super) fn stage_ready<B>(&mut self, write_driver: &mut LogWriteDriver<B>)
+    where
+        B: IOBackend,
+    {
         while let Some(submission) = self.seal_writes.pop_front() {
             if write_driver.available_capacity() == 0 {
                 self.seal_writes.push_front(submission);
@@ -207,7 +210,7 @@ impl LogFileSealer {
     pub(crate) fn finish_pending(
         &mut self,
         trx_sys: &TransactionSystem,
-        write_driver: &mut LogWriteDriver,
+        write_driver: &mut LogWriteDriver<impl IOBackend>,
     ) -> Option<Report<FatalError>> {
         let mut first_err = None;
         while self.has_pending() {
@@ -225,7 +228,7 @@ impl LogFileSealer {
                 kind,
                 buf,
                 poison,
-            } = write_driver.wait_one();
+            } = write_driver.wait_at_least_one();
             match kind {
                 LogWriteKind::Seal { log_file } => {
                     drop(buf);
@@ -251,7 +254,7 @@ impl LogFileSealer {
     pub(crate) fn seal_active_file_best_effort(
         &mut self,
         trx_sys: &TransactionSystem,
-        write_driver: &mut LogWriteDriver,
+        write_driver: &mut LogWriteDriver<impl IOBackend>,
     ) {
         let target = {
             let group_commit_g = trx_sys.redo_log.group_commit.lock();
@@ -279,7 +282,7 @@ impl LogFileSealer {
     fn seal_file_target_best_effort(
         &self,
         target: LogFileSealTarget,
-        write_driver: &mut LogWriteDriver,
+        write_driver: &mut LogWriteDriver<impl IOBackend>,
     ) -> StdResult<(), FatalError> {
         debug_assert_eq!(write_driver.pending_len(), 0);
         debug_assert_eq!(write_driver.submitted_len(), 0);
@@ -297,7 +300,7 @@ impl LogFileSealer {
             kind,
             buf,
             poison,
-        } = write_driver.wait_one();
+        } = write_driver.wait_at_least_one();
         // This best-effort shutdown path starts from an empty driver and
         // submits exactly one header write above. Any other completion kind
         // means the caller violated that isolation invariant.
