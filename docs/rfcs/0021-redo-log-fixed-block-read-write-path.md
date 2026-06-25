@@ -1,7 +1,7 @@
 ---
 id: 0021
 title: Redo Log Fixed-Block Read Write Path
-status: draft
+status: implemented
 tags: [redo-log, recovery, storage, async-io]
 created: 2026-06-19
 github_issue: 729
@@ -345,9 +345,10 @@ pwrite_owned}`.
   - Non-goals: Changing the persisted redo data format, replacing the mmap
     reader, or changing commit-group admission policy.
   - Prerequisites: RFC-0020 sealed segment behavior is the starting point.
-  - Phase-local Choices: Exact internal data structure for prefix tracking,
-    whether metadata writes consume the same capacity as data writes, and how
-    much completion-drain API surface to add to `SubmissionDriver`.
+  - Phase-local Choices: Resolved with writer-generated `LogRequestId`,
+    `LogPrefixTracker` prefix entries, metadata writes routed through the
+    existing capacity path where they are actual IO submissions, and no
+    completion-drain API change in this scheduler-only phase.
   - Task Doc: `docs/tasks/000186-redo-request-id-prefix-scheduler.md`
   - Task Issue: `#749`
   - Phase Status: done
@@ -405,10 +406,10 @@ pwrite_owned}`.
     pipeline, cross-file group reassembly, and log truncation.
   - Prerequisites: Phase 2 fixed-block format exists; recovery callers can use
     the existing stream shape backed by direct IO.
-  - Phase-local Choices: Async stream API versus dedicated read service,
-    in-memory completion buffer representation, completion ordering/backpressure
-    policy, and how catalog checkpoint scanning is adapted so read waits do not
-    block async executor threads.
+  - Phase-local Choices: Resolved with an async `RedoLogStream` API backed by
+    one short-lived proactive `RedoReadAheadWorker`, a bounded ordered block
+    queue, parser-owned semantic validation, direct-buffer reuse by persisted
+    block size, and async startup recovery/catalog checkpoint scan integration.
   - Task Doc: `docs/tasks/000188-redo-direct-io-read-ahead-reader.md`
   - Task Issue: `#753`
   - Phase Status: done
@@ -419,9 +420,13 @@ pwrite_owned}`.
     residual mmap reader/test dependency. [Task Resolve Sync: docs/tasks/000188-redo-direct-io-read-ahead-reader.md @ 2026-06-25]
   - Related Backlogs:
     - `docs/backlogs/closed/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
+  - Deferred Follow-ups:
     - `docs/backlogs/000130-large-redo-transaction-streaming-replay.md`
+      remains open for bounded-memory replay of very large redo transactions.
     - `docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md`
+      remains open for rotation seal durable-prefix correctness semantics.
     - `docs/backlogs/000132-checkpoint-below-floor-group-skip-evaluation.md`
+      remains open for a future checkpoint-scan optimization decision.
 
 - **Phase 4: Completion Drain and Sync Batching**
   - Scope: Use the prefix scheduler to drain already-available completions and
@@ -434,8 +439,10 @@ pwrite_owned}`.
     changes to transaction admission.
   - Prerequisites: Phase 1 prefix scheduler exists; Phase 2 fixed-block
     completion aggregation provides group-ready state in prefix order.
-  - Phase-local Choices: Nonblocking completion-drain API shape, batching
-    metrics, and whether any small policy knob is needed after benchmarking.
+  - Phase-local Choices: Resolved with
+    `SubmissionDriver::try_pop_completed()` and
+    `LogWriteDriver::try_pop_buffered_completion()`, existing redo metrics, and
+    no new batching policy knob.
   - Task Doc: `docs/tasks/000189-redo-completion-drain-sync-batching.md`
   - Task Issue: `#755`
   - Phase Status: done
@@ -453,8 +460,9 @@ pwrite_owned}`.
   - Non-goals: Implementing truncation or cross-file logical groups.
   - Prerequisites: Phases 2 and 3 define the final persisted format and reader
     behavior.
-  - Phase-local Choices: Whether this is a separate task or folded into the
-    preceding implementation tasks, depending on final patch size.
+  - Phase-local Choices: Resolved as a separate closure task covering the final
+    documentation audit, focused fixed-block edge-case tests, stale wording
+    cleanup, and default plus `libaio` validation.
   - Task Doc: `docs/tasks/000190-redo-fixed-block-documentation-tests-and-cleanup.md`
   - Task Issue: `#757`
   - Phase Status: done
@@ -464,7 +472,7 @@ pwrite_owned}`.
 
 - Add format tests for single-block groups, multi-block single transactions,
   group-start extension parsing, continuation ordering, block checksum failure,
-  group checksum failure, and strict transaction-frame boundary enforcement.
+  block-count/index mismatch, and strict transaction-frame boundary enforcement.
 - Add writer tests for block-sized request submission, IO-depth limiting by
   block count, rotation before a group that does not fit in the active file,
   rejection of a group that does not fit in an empty file, fatal write failure
@@ -510,18 +518,24 @@ pwrite_owned}`.
 
 ## Open Questions
 
-- Exact block-header field layout, including whether continuation blocks need
-  explicit `group_id` and `group_block_idx`, is phase-local to the fixed-block
-  format task.
-- Exact checksum choices for per-block and per-group integrity are phase-local;
-  the format must support both block-local corruption detection and whole-group
-  validation.
-- The direct reader API shape is phase-local: async stream, dedicated recovery
-  read service, or another async-friendly wrapper over `crate::io` are all
-  acceptable if executor threads do not perform mmap/page-fault reads.
-- Compatibility with existing v2 redo files is not required by this RFC. A
-  transition reader may be added only if an implementation task finds a concrete
-  migration need.
+None for RFC resolve. Implementation settled the phase-local choices: redo data
+files use format version 3 with an 11-byte common block header, a 28-byte
+group-start extension, per-block CRC32 validation only, continuation identity
+through strict file order plus `group_block_idx`, async direct-IO
+`RedoLogStream` read-ahead, and no v2 compatibility reader.
+
+## Deferred Follow-up Backlogs
+
+The implementation intentionally deferred the following non-blocking work. These
+items remain open for future task/RFC planning and are not required to close RFC
+0021:
+
+- `docs/backlogs/000130-large-redo-transaction-streaming-replay.md` - bounded
+  replay memory for very large redo transactions.
+- `docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md` - durable
+  rotation-seal prefix semantics and repeated recovery repair.
+- `docs/backlogs/000132-checkpoint-below-floor-group-skip-evaluation.md` -
+  checkpoint-scan optimization using group-start CTS metadata.
 
 ## Future Work
 
