@@ -1175,7 +1175,7 @@ pub(crate) mod tests {
     use crate::catalog::tests::{table1, table2};
     use crate::conf::EngineConfig;
     use crate::error::{Error, ErrorKind, FatalError, LifecycleError, OperationError};
-    use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats};
+    use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use std::sync::mpsc;
     use std::thread;
@@ -1186,6 +1186,24 @@ pub(crate) mod tests {
     fn assert_lifecycle_shutdown(err: Error) {
         assert_eq!(err.kind(), ErrorKind::Lifecycle);
         assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+    }
+
+    #[inline]
+    fn assert_transaction_system_stats_monotonic(
+        before: TransactionSystemStats,
+        after: TransactionSystemStats,
+    ) {
+        assert!(after.commit_count >= before.commit_count);
+        assert!(after.trx_count >= before.trx_count);
+        assert!(after.log_bytes >= before.log_bytes);
+        assert!(after.sync_count >= before.sync_count);
+        assert!(after.sync_nanos >= before.sync_nanos);
+        assert!(after.seal_failure_count >= before.seal_failure_count);
+        assert!(after.io_submit_and_wait_count >= before.io_submit_and_wait_count);
+        assert!(after.io_submit_and_wait_nanos >= before.io_submit_and_wait_nanos);
+        assert!(after.purge_trx_count >= before.purge_trx_count);
+        assert!(after.purge_row_count >= before.purge_row_count);
+        assert!(after.purge_index_count >= before.purge_index_count);
     }
 
     #[inline]
@@ -1536,8 +1554,10 @@ pub(crate) mod tests {
             let trx1 = session.transaction_system_stats().unwrap();
             let storage1 = session.storage_io_stats().unwrap();
             let pools1 = session.buffer_pool_stats().unwrap();
-            assert!(trx1.commit_count > trx0.commit_count);
-            assert!(trx1.trx_count >= trx0.trx_count);
+            // Commit waiters can complete before the redo thread publishes
+            // aggregate stats, so this test verifies monotonic snapshots
+            // rather than immediate progress from the preceding operation.
+            assert_transaction_system_stats_monotonic(trx0, trx1);
             assert!(storage1.backend.submitted_ops >= storage0.backend.submitted_ops);
             assert!(storage1.table_read_requests >= storage0.table_read_requests);
             assert!(storage1.pool_read_requests >= storage0.pool_read_requests);
