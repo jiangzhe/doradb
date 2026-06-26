@@ -10,9 +10,7 @@ use self::fs::BackgroundWriteRequest;
 #[cfg(test)]
 pub(crate) use self::fs::tests::{build_test_fs, build_test_fs_in};
 #[cfg(test)]
-pub(crate) use self::tests::{
-    FileSyncOp, FileSyncTestHook, set_file_sync_test_hook, test_block_id, test_file_id,
-};
+pub(crate) use self::tests::{test_block_id, test_file_id};
 use crate::id::{BlockID, FileID};
 
 use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
@@ -514,24 +512,13 @@ impl FileSyncer {
 
     /// Flush file contents using `fdatasync`.
     #[inline]
+    #[expect(dead_code, reason = "reserved file sync mode")]
     pub(crate) fn fdatasync(&self) -> Result<()> {
         self.sync(FileSyncKind::Fdatasync)
     }
 
     #[inline]
     fn sync(&self, kind: FileSyncKind) -> Result<()> {
-        #[cfg(test)]
-        {
-            let op = FileSyncOp::new(self.0, kind);
-            if let Some(hook) = tests::current_file_sync_test_hook() {
-                let mut override_res = None;
-                hook.on_sync(op, &mut override_res);
-                if let Some(res) = override_res {
-                    return res;
-                }
-            }
-        }
-
         // SAFETY: `self.0` is a live borrowed file descriptor for this sync
         // call, and the libc sync calls do not retain borrowed memory beyond
         // the syscall.
@@ -680,8 +667,8 @@ mod tests {
     use crate::serde::{Deser, Ser};
     use crate::value::ValKind;
     use std::io::ErrorKind as IoErrorKind;
-    use std::mem::{self, replace};
-    use std::sync::{Arc, Mutex};
+    use std::mem;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[inline]
@@ -729,48 +716,6 @@ mod tests {
             DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
             None,
         )
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct FileSyncOp {
-        fd: RawFd,
-        kind: FileSyncKind,
-    }
-
-    impl FileSyncOp {
-        #[inline]
-        pub(super) fn new(fd: RawFd, kind: FileSyncKind) -> Self {
-            Self { fd, kind }
-        }
-
-        #[inline]
-        pub(crate) fn fd(&self) -> RawFd {
-            self.fd
-        }
-
-        #[inline]
-        pub(crate) fn kind(&self) -> FileSyncKind {
-            self.kind
-        }
-    }
-
-    pub(crate) trait FileSyncTestHook: Send + Sync {
-        fn on_sync(&self, _op: FileSyncOp, _override_res: &mut Option<Result<()>>) {}
-    }
-
-    type FileSyncHook = Arc<dyn FileSyncTestHook>;
-
-    static FILE_SYNC_TEST_HOOK: Mutex<Option<FileSyncHook>> = Mutex::new(None);
-
-    #[inline]
-    pub(super) fn current_file_sync_test_hook() -> Option<FileSyncHook> {
-        FILE_SYNC_TEST_HOOK.lock().unwrap().clone()
-    }
-
-    #[inline]
-    pub(crate) fn set_file_sync_test_hook(hook: Option<FileSyncHook>) -> Option<FileSyncHook> {
-        let mut guard = FILE_SYNC_TEST_HOOK.lock().unwrap();
-        replace(&mut *guard, hook)
     }
 
     #[test]

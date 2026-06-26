@@ -3,7 +3,8 @@ use super::{
 };
 use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
 use error_stack::Report;
-use io_uring::opcode::{Read, Write};
+use io_uring::opcode::{Fsync, Read, Write};
+use io_uring::types::FsyncFlags;
 use io_uring::{IoUring, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
@@ -122,12 +123,21 @@ impl IOBackend for IouringBackend {
     #[inline]
     fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
         let fd = types::Fd(operation.fd());
-        let ptr = operation.as_mut_ptr();
-        let len = operation.len() as _;
-        let offset = operation.offset() as u64;
         let entry = match operation.kind() {
-            IOKind::Read => Read::new(fd, ptr, len).offset(offset).build(),
-            IOKind::Write => Write::new(fd, ptr, len).offset(offset).build(),
+            IOKind::Read => {
+                let ptr = operation.as_mut_ptr();
+                let len = operation.len() as _;
+                let offset = operation.offset() as u64;
+                Read::new(fd, ptr, len).offset(offset).build()
+            }
+            IOKind::Write => {
+                let ptr = operation.as_mut_ptr();
+                let len = operation.len() as _;
+                let offset = operation.offset() as u64;
+                Write::new(fd, ptr, len).offset(offset).build()
+            }
+            IOKind::Fsync => Fsync::new(fd).build(),
+            IOKind::Fdatasync => Fsync::new(fd).flags(FsyncFlags::DATASYNC).build(),
         };
         entry.user_data(token.raw())
     }

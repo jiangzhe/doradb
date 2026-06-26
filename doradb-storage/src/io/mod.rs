@@ -46,10 +46,11 @@ const INVALID_SLOT: u32 = u32::MAX;
 ///
 /// Higher layers either transfer an owned direct buffer to the worker or
 /// provide a borrowed page-aligned pointer whose lifetime they keep valid until
-/// completion.
+/// completion. File sync operations do not bind memory.
 enum IOMemory {
     Owned(DirectBuf),
     Borrowed { ptr: *mut u8, len: usize },
+    None,
 }
 
 // SAFETY: borrowed pointers are only used for buffer/page memory that higher
@@ -59,8 +60,8 @@ unsafe impl Send for IOMemory {}
 
 /// Backend-agnostic description of one submitted kernel IO operation.
 ///
-/// This type is backend-agnostic: it describes one read/write operation and
-/// owns or borrows the memory that the backend will bind into its prepared
+/// This type is backend-agnostic: it describes one read/write/sync operation
+/// and owns or borrows the memory that data operations bind into their prepared
 /// submission shape.
 pub(crate) struct Operation {
     kind: IOKind,
@@ -132,7 +133,29 @@ impl Operation {
         }
     }
 
-    /// Returns whether this operation is a read or a write.
+    /// Build one file-integrity sync operation.
+    #[inline]
+    pub(crate) fn fsync(fd: RawFd) -> Self {
+        Operation {
+            kind: IOKind::Fsync,
+            fd,
+            offset: 0,
+            memory: IOMemory::None,
+        }
+    }
+
+    /// Build one data-only file sync operation.
+    #[inline]
+    pub(crate) fn fdatasync(fd: RawFd) -> Self {
+        Operation {
+            kind: IOKind::Fdatasync,
+            fd,
+            offset: 0,
+            memory: IOMemory::None,
+        }
+    }
+
+    /// Returns the logical operation kind.
     #[inline]
     pub(crate) fn kind(&self) -> IOKind {
         self.kind
@@ -144,7 +167,7 @@ impl Operation {
         self.fd
     }
 
-    /// Returns the byte offset used for this operation.
+    /// Returns the byte offset used for data operations.
     #[inline]
     pub(crate) fn offset(&self) -> usize {
         self.offset
@@ -156,19 +179,14 @@ impl Operation {
         match &self.memory {
             IOMemory::Owned(buf) => buf.capacity(),
             IOMemory::Borrowed { len, .. } => *len,
+            IOMemory::None => 0,
         }
     }
 
     /// Takes ownership of the direct buffer if this completion owns one.
     #[inline]
     pub(crate) fn take_buf(&mut self) -> Option<DirectBuf> {
-        match replace(
-            &mut self.memory,
-            IOMemory::Borrowed {
-                ptr: null_mut(),
-                len: 0,
-            },
-        ) {
+        match replace(&mut self.memory, IOMemory::None) {
             IOMemory::Owned(buf) => Some(buf),
             other => {
                 self.memory = other;
@@ -183,7 +201,7 @@ impl Operation {
     pub(crate) fn buf(&self) -> Option<&DirectBuf> {
         match &self.memory {
             IOMemory::Owned(buf) => Some(buf),
-            IOMemory::Borrowed { .. } => None,
+            IOMemory::Borrowed { .. } | IOMemory::None => None,
         }
     }
 
@@ -192,15 +210,24 @@ impl Operation {
         match &mut self.memory {
             IOMemory::Owned(buf) => buf.as_bytes_mut().as_mut_ptr(),
             IOMemory::Borrowed { ptr, .. } => *ptr,
+            IOMemory::None => {
+                debug_assert!(
+                    matches!(self.kind, IOKind::Fsync | IOKind::Fdatasync),
+                    "only sync operations may omit memory"
+                );
+                null_mut()
+            }
         }
     }
 }
 
-/// Direction of one backend IO operation.
+/// Kind of one backend IO operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IOKind {
     Read,
     Write,
+    Fsync,
+    Fdatasync,
 }
 
 /// Message delivered from IO clients to storage IO workers.
@@ -856,6 +883,25 @@ mod tests {
         let drained = queue.drain_to(5);
         assert_eq!(drained, vec![1, 2]);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_sync_operations_do_not_bind_buffers() {
+        let mut fsync = Operation::fsync(17);
+        assert_eq!(fsync.kind(), IOKind::Fsync);
+        assert_eq!(fsync.fd(), 17);
+        assert_eq!(fsync.offset(), 0);
+        assert_eq!(fsync.len(), 0);
+        assert!(fsync.buf().is_none());
+        assert!(fsync.take_buf().is_none());
+
+        let mut fdatasync = Operation::fdatasync(19);
+        assert_eq!(fdatasync.kind(), IOKind::Fdatasync);
+        assert_eq!(fdatasync.fd(), 19);
+        assert_eq!(fdatasync.offset(), 0);
+        assert_eq!(fdatasync.len(), 0);
+        assert!(fdatasync.buf().is_none());
+        assert!(fdatasync.take_buf().is_none());
     }
 
     struct DriverBackend {

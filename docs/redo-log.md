@@ -134,10 +134,11 @@ until all already-written groups from that file are durable, then prepares a
 prefix-owned seal barrier for the old file before the new-file header barrier.
 The barrier writes the inactive super-block slot with `generation + 1`, the
 durable end offset, and the real redo CTS range accumulated for that file, then
-runs the configured seal sync policy. The new-file header and later data writes
-may be submitted before the old seal finishes, but transaction publication for
-the new file cannot pass the old-file seal barrier. Seal write failure poisons
-storage as `RedoWrite`; seal sync failure poisons storage as `RedoSync`.
+submits the configured seal sync policy through the redo backend driver. The
+new-file header and later data writes may be submitted before the old seal
+finishes, but transaction publication for the new file cannot pass the old-file
+seal barrier. Seal write failure poisons storage as `RedoWrite`; seal sync
+failure poisons storage as `RedoSync`.
 
 ## Serialization Rules
 
@@ -345,26 +346,29 @@ physical row page.
    inserted as already-finished ordered groups with no IO target.
 
 7. `LogWriteDriver` wraps the backend-neutral `SubmissionDriver` and submits
-   one `Operation::pwrite_owned(fd, offset, DirectBuf)` per physical redo data
-   block through the compile-time storage backend (`io_uring` by default,
-   `libaio` with the alternate feature). `log_write_io_depth` counts these
-   physical block writes, not logical groups.
+   redo writes and syncs through the compile-time storage backend (`io_uring`
+   by default, `libaio` with the alternate feature). Each physical redo data
+   block is one `Operation::pwrite_owned(fd, offset, DirectBuf)`.
+   Durability-required prefixes later submit `Operation::fsync(fd)` or
+   `Operation::fdatasync(fd)`. `log_write_io_depth` bounds all in-flight redo
+   backend operations.
 
 8. On write completion, the driver checks that the completed byte count equals
    the submitted fixed-block buffer length. Short writes and IO errors become
    `FatalError::RedoWrite`. A logical `SyncGroup` becomes ready only after all
    physical writes for that group have completed successfully.
 
-9. After waiting for at least one write completion, the writer drains any
-   completions already buffered by the submission driver before finalizing the
-   prefix. `RedoLogWriter::finalize_finished_prefix` commits only the
-   contiguous finished prefix. When that prefix contains redo bytes, it syncs
-   the largest already-ready same-file prefix with the configured policy
-   (`fsync`, `fdatasync`, or `none`). Only after that sync step succeeds does
-   `LogFileSealer` record each redo-bearing group's `durable_end_offset`,
-   `min_redo_cts`, and `max_redo_cts`. A later file's transactions cannot be
-   published until the preceding rotated-file seal write and configured seal
-   sync have completed through the same ordered prefix.
+9. After waiting for at least one completion, the writer drains any completions
+   already buffered by the submission driver before finalizing the prefix.
+   `RedoLogWriter::finalize_finished_prefix` commits only the contiguous
+   finished prefix. When that prefix contains redo bytes and `log_sync` is not
+   `none`, the writer replaces the drained groups with a prefix-owned sync
+   barrier and submits the backend sync only after all covered writes have
+   completed. Only after that sync completion succeeds does `LogFileSealer`
+   record each redo-bearing group's `durable_end_offset`, `min_redo_cts`, and
+   `max_redo_cts`. A later file's transactions cannot be published until the
+   preceding rotated-file seal write and configured seal sync have completed
+   through the same ordered prefix.
 
 10. After ordered prefix finalization succeeds, `persisted_cts` advances to the
     prefix max CTS, each
@@ -373,9 +377,10 @@ physical row page.
 
 11. During clean shutdown, after pending redo work drains, the log thread
     best-effort seals the active file with the same segment metadata and sync
-    policy. A clean-shutdown seal failure increments a redo seal failure stat
-    but does not poison storage or fail shutdown by itself; recovery treats the
-    file as unsealed if the inactive slot was not durably published.
+    policy through the redo backend driver. A clean-shutdown seal failure
+    increments a redo seal failure stat but does not poison storage or fail
+    shutdown by itself; recovery treats the file as unsealed if the inactive
+    slot was not durably published.
 
 The handoff into group commit is irreversible for user transactions. After a
 `PrecommitTrx` is queued, the log thread owns the successful commit path and
@@ -500,11 +505,12 @@ The redo path is intentionally separate from table-file and buffer-pool IO.
 - Direct buffers and file offsets must be sector-aligned.
 - `Log-Thread` owns the redo submission driver; there is no nested redo IO
   worker thread.
-- The backend write IO depth is bounded by `log_write_io_depth` in physical
-  data-block units.
-- Sync is done above the backend driver after an ordered write prefix finishes;
-  already-buffered write completions are drained first so one sync can cover
-  the current ready same-file prefix.
+- The redo backend IO depth is bounded by `log_write_io_depth` across physical
+  data-block writes and native sync operations.
+- Sync is a first-class backend operation. Already-buffered completions are
+  drained first so one sync barrier can cover the current ready same-file
+  prefix, and the barrier is submitted only after the writes it covers have
+  completed.
 - Shutdown closes group-commit admission, wakes and joins `Log-Thread`, then
   stops cleanup and purge in that order.
 
@@ -524,8 +530,8 @@ Redo write and sync failures are fatal storage boundaries.
 
 - A short write or backend IO error poisons runtime admission with
   `FatalError::RedoWrite`.
-- `fsync` or `fdatasync` failure poisons runtime admission with
-  `FatalError::RedoSync`.
+- Backend `fsync` or `fdatasync` failure, or an unexpected nonzero successful
+  sync result, poisons runtime admission with `FatalError::RedoSync`.
 - The first failed group ends the durable prefix. That failed group and every
   later group become cleanup-only, even if some later write completed
   successfully.
@@ -535,9 +541,9 @@ Redo write and sync failures are fatal storage boundaries.
 - Successful committed payload handoff to purge happens before successful
   waiters are woken.
 
-`log_sync = none` skips the file sync syscall. Commit waiters still wait for
-write completion and ordered finalization, but an OS or device crash may lose
-recent log writes.
+`log_sync = none` skips the backend sync operation. Commit waiters still wait
+for write completion and ordered finalization, but an OS or device crash may
+lose recent log writes.
 
 ## Important Current Constraints
 

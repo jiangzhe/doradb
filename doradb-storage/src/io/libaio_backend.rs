@@ -171,11 +171,22 @@ impl IOBackend for LibaioBackend {
         iocb.aio_lio_opcode = match operation.kind() {
             IOKind::Read => io_iocb_cmd::IO_CMD_PREAD as u16,
             IOKind::Write => io_iocb_cmd::IO_CMD_PWRITE as u16,
+            IOKind::Fsync => io_iocb_cmd::IO_CMD_FSYNC as u16,
+            IOKind::Fdatasync => io_iocb_cmd::IO_CMD_FDSYNC as u16,
         };
         iocb.aio_reqprio = 0;
-        iocb.buf = operation.as_mut_ptr();
-        iocb.count = operation.len() as u64;
-        iocb.offset = operation.offset() as u64;
+        match operation.kind() {
+            IOKind::Read | IOKind::Write => {
+                iocb.buf = operation.as_mut_ptr();
+                iocb.count = operation.len() as u64;
+                iocb.offset = operation.offset() as u64;
+            }
+            IOKind::Fsync | IOKind::Fdatasync => {
+                iocb.buf = null_mut();
+                iocb.count = 0;
+                iocb.offset = 0;
+            }
+        }
         iocb.flags = 0;
         iocb.data = token.raw();
         iocb
@@ -392,6 +403,38 @@ pub(crate) mod tests {
                 .copied(),
             Some(crate::error::ConfigError::InvalidIoDepth)
         );
+    }
+
+    #[test]
+    fn test_libaio_prepare_sync_operations_use_native_opcodes() {
+        let mut backend = LibaioBackend::new(4).unwrap();
+
+        let mut fsync = Operation::fsync(17);
+        let fsync_iocb = <LibaioBackend as IOBackend>::prepare(
+            &mut backend,
+            BackendToken::new(1, 2),
+            &mut fsync,
+        );
+        assert_eq!(fsync_iocb.aio_lio_opcode, io_iocb_cmd::IO_CMD_FSYNC as u16);
+        assert_eq!(fsync_iocb.aio_fildes, 17);
+        assert_eq!(fsync_iocb.buf, null_mut());
+        assert_eq!(fsync_iocb.count, 0);
+        assert_eq!(fsync_iocb.offset, 0);
+
+        let mut fdatasync = Operation::fdatasync(19);
+        let fdatasync_iocb = <LibaioBackend as IOBackend>::prepare(
+            &mut backend,
+            BackendToken::new(1, 3),
+            &mut fdatasync,
+        );
+        assert_eq!(
+            fdatasync_iocb.aio_lio_opcode,
+            io_iocb_cmd::IO_CMD_FDSYNC as u16
+        );
+        assert_eq!(fdatasync_iocb.aio_fildes, 19);
+        assert_eq!(fdatasync_iocb.buf, null_mut());
+        assert_eq!(fdatasync_iocb.count, 0);
+        assert_eq!(fdatasync_iocb.offset, 0);
     }
 
     #[test]

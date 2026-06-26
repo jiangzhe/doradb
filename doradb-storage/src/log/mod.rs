@@ -11,12 +11,12 @@ use crate::error::{
     CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, InternalError,
     ResourceError, Result,
 };
-use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
+use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
     CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats, IOBackendStatsHandle,
-    IOBuf, IOSubmission, Operation, StorageBackend, SubmissionDriver,
+    IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -46,7 +46,7 @@ use std::result::Result as StdResult;
 use std::str::{FromStr, from_utf8};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Redo-local owner for a sparse log file and its selected super-block metadata.
 pub(crate) struct RedoLogFile {
@@ -164,10 +164,12 @@ impl LogRequestId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogRequestKind {
+pub(super) enum LogRequestKind {
     Group,
     Header,
-    Seal,
+    CommitSync,
+    SealWrite,
+    SealSync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,11 +202,31 @@ impl LogRequestOwner {
     }
 
     #[inline]
-    fn seal(request_id: LogRequestId, prefix_id: Option<LogPrefixId>) -> Self {
+    fn commit_sync(request_id: LogRequestId, prefix_id: LogPrefixId) -> Self {
         Self {
             request_id,
-            prefix_id,
-            kind: LogRequestKind::Seal,
+            prefix_id: Some(prefix_id),
+            kind: LogRequestKind::CommitSync,
+            group_write_idx: None,
+        }
+    }
+
+    #[inline]
+    fn seal_write(request_id: LogRequestId, prefix_id: LogPrefixId) -> Self {
+        Self {
+            request_id,
+            prefix_id: Some(prefix_id),
+            kind: LogRequestKind::SealWrite,
+            group_write_idx: None,
+        }
+    }
+
+    #[inline]
+    fn seal_sync(request_id: LogRequestId, prefix_id: LogPrefixId) -> Self {
+        Self {
+            request_id,
+            prefix_id: Some(prefix_id),
+            kind: LogRequestKind::SealSync,
             group_write_idx: None,
         }
     }
@@ -404,10 +426,43 @@ impl LogWriteSubmission {
         let fd = log_file.as_raw_fd();
         LogWriteSubmission {
             owner: None,
-            kind: LogWriteKind::Seal {
+            kind: LogWriteKind::SealWrite {
                 log_file: Box::new(log_file),
             },
             operation: Operation::pwrite_owned(fd, offset, buf),
+        }
+    }
+
+    #[inline]
+    fn commit_sync(fd: RawFd, log_sync: LogSync) -> Self {
+        LogWriteSubmission {
+            owner: None,
+            kind: LogWriteKind::CommitSync,
+            operation: sync_operation(fd, log_sync),
+        }
+    }
+
+    #[inline]
+    fn seal_sync(log_file: RedoLogFile, log_sync: LogSync) -> Self {
+        let fd = log_file.as_raw_fd();
+        LogWriteSubmission {
+            owner: None,
+            kind: LogWriteKind::SealSync {
+                log_file: Box::new(log_file),
+            },
+            operation: sync_operation(fd, log_sync),
+        }
+    }
+
+    #[inline]
+    fn standalone_sync(fd: RawFd, log_sync: LogSync) -> Option<Self> {
+        match log_sync {
+            LogSync::None => None,
+            LogSync::Fsync | LogSync::Fdatasync => Some(LogWriteSubmission {
+                owner: None,
+                kind: LogWriteKind::StandaloneSync,
+                operation: sync_operation(fd, log_sync),
+            }),
         }
     }
 
@@ -426,7 +481,11 @@ impl LogWriteSubmission {
     fn header_completion(&self) -> Option<Arc<Completion<()>>> {
         match &self.kind {
             LogWriteKind::Header { completion } => Some(Arc::clone(completion)),
-            LogWriteKind::Group { .. } | LogWriteKind::Seal { .. } => None,
+            LogWriteKind::Group { .. }
+            | LogWriteKind::CommitSync
+            | LogWriteKind::SealWrite { .. }
+            | LogWriteKind::SealSync { .. }
+            | LogWriteKind::StandaloneSync => None,
         }
     }
 
@@ -452,13 +511,16 @@ impl IOSubmission for LogWriteSubmission {
 enum LogWriteKind {
     Group { group_write_idx: usize },
     Header { completion: Arc<Completion<()>> },
-    Seal { log_file: Box<RedoLogFile> },
+    CommitSync,
+    SealWrite { log_file: Box<RedoLogFile> },
+    SealSync { log_file: Box<RedoLogFile> },
+    StandaloneSync,
 }
 
 struct LogWriteCompletion {
     owner: Option<LogRequestOwner>,
     kind: LogWriteKind,
-    buf: DirectBuf,
+    buf: Option<DirectBuf>,
     poison: Option<FatalError>,
 }
 
@@ -1054,9 +1116,25 @@ where
                     recycle.extend(group.drain_buffers());
                     group.failure_reason.get_or_insert(reason);
                 }
+                LogPrefixKind::Sync {
+                    ready_prefix,
+                    sync,
+                    ready,
+                    failure,
+                    ..
+                } => {
+                    if sync.take().is_some() {
+                        *ready = true;
+                    }
+                    fail_ready_prefix_waiters(self.trx_sys, ready_prefix, reason, &mut recycle);
+                    if !*ready || failure.is_none() {
+                        *failure = Some(fatal);
+                    }
+                }
                 LogPrefixKind::Seal {
                     log_file,
                     write,
+                    sync,
                     ready,
                     failure,
                 } => {
@@ -1065,6 +1143,9 @@ where
                     }
                     if let Some(mut submission) = write.take() {
                         let _ = submission.operation.take_buf();
+                        *ready = true;
+                    }
+                    if sync.take().is_some() {
                         *ready = true;
                     }
                     if !*ready || failure.is_none() {
@@ -1094,19 +1175,22 @@ where
             // but do not accept any new IO requests.
             if !self.shutdown {
                 self.fetch_io_reqs();
+                // Newly fetched prefix entries may already be publishable, or
+                // may need to prepare front seal/sync submissions before
+                // `submit_io` can make progress.
+                self.advance_ordered_prefix(sealer);
             }
-            self.finalize_finished_prefix(sealer);
-            self.shrink_prefix_if_sparse();
-            self.submit_io(sealer);
+            self.submit_io();
             // This may wait for rotated-file seal I/O even when no prefix
             // group/header write is submitted. Rotated-file sealing is required
             // maintenance for ended files: completion performs the configured
             // seal sync and reports fatal errors. Only active-file sealing during
             // clean shutdown is best-effort.
             self.wait_and_drain_io_if_submitted(sealer);
-            // Completion handling only marks writes finished; this publishes
-            // the durable ordered prefix made ready by the observed completions.
-            self.finalize_finished_prefix(sealer);
+            // Completion handling only marks prefix entries ready; advance the
+            // ordered prefix again to publish completed work or prepare the
+            // next barrier made reachable by completion.
+            self.advance_ordered_prefix(sealer);
             self.shrink_prefix_if_sparse();
 
             if self.shutdown && self.prefix.is_empty() {
@@ -1209,31 +1293,17 @@ where
         }
     }
 
-    #[inline]
-    fn sync_written_prefix(&self, log_fd: Option<RawFd>, log_bytes: usize) -> Result<()> {
-        if log_bytes == 0 {
-            return Ok(());
-        }
-        let log_fd = log_fd.expect("redo-bearing finished prefix must include a log file fd");
-        let syncer = FileSyncer::from_borrowed_fd(log_fd);
-        match self.log_sync {
-            LogSync::Fsync => syncer.fsync(),
-            LogSync::Fdatasync => syncer.fdatasync(),
-            LogSync::None => Ok(()),
-        }
-    }
-
-    /// Finalizes the ordered prefix whose redo writes are already finished.
+    /// Advance the ordered prefix until the front entry blocks.
     ///
-    /// This is a no-op when the first prefix entry is not ready. Otherwise it
-    /// removes ready header and seal barriers, and publishes the ready logical
-    /// group prefix.
+    /// This consumes ready barriers, publishes ready no-sync group prefixes,
+    /// prepares front seal work, or turns a ready redo-bearing group prefix into
+    /// a sync barrier. It returns when the front entry has no immediate progress.
     ///
     /// Redo durability is sequential: this stops at the first unfinished group,
     /// and a failed group makes every later group cleanup-only even if its
     /// individual write has completed.
     #[inline]
-    fn finalize_finished_prefix(&mut self, sealer: &mut LogFileSealer) {
+    fn advance_ordered_prefix(&mut self, sealer: &mut LogFileSealer) {
         loop {
             let Some(front) = self.prefix.entries.front() else {
                 return;
@@ -1249,7 +1319,7 @@ where
                         .prefix
                         .pop_front()
                         .expect("front redo header prefix entry must exist");
-                    Self::complete_header_prefix_entry(entry);
+                    finish_header_prefix_entry(entry);
                 }
                 LogPrefixKind::Seal { ready, .. } => {
                     if !ready {
@@ -1264,7 +1334,7 @@ where
                         .prefix
                         .pop_front()
                         .expect("front redo seal prefix entry must exist");
-                    Self::complete_seal_prefix_entry(entry);
+                    finish_seal_prefix_entry(entry);
                 }
                 LogPrefixKind::Group { group } => {
                     if !group.ready() {
@@ -1272,7 +1342,17 @@ where
                     }
                     // A ready group prefix is the only point where transaction
                     // waiters can be completed.
-                    self.finalize_ready_group_prefix(sealer);
+                    self.advance_ready_group_prefix(sealer);
+                }
+                LogPrefixKind::Sync { ready, .. } => {
+                    if !ready {
+                        return;
+                    }
+                    let entry = self
+                        .prefix
+                        .pop_front()
+                        .expect("front redo sync prefix entry must exist");
+                    self.advance_sync_prefix_entry(sealer, entry);
                 }
             }
         }
@@ -1280,7 +1360,7 @@ where
 
     /// Prepare the front rotated-file seal barrier for submission.
     ///
-    /// This is invoked from `finalize_finished_prefix` only when a seal entry is
+    /// This is invoked from `advance_ordered_prefix` only when a seal entry is
     /// the first prefix entry and is not ready yet. Preparing it at the front,
     /// instead of when it is enqueued, keeps seal metadata aligned with the
     /// already-durable group prefix and makes the seal an ordered publication
@@ -1293,13 +1373,14 @@ where
         let LogPrefixKind::Seal {
             log_file,
             write,
+            sync,
             ready,
             failure,
         } = &mut entry.kind
         else {
             unreachable!("front prefix entry must be a seal")
         };
-        if *ready || write.is_some() || failure.is_some() {
+        if *ready || write.is_some() || sync.is_some() || failure.is_some() {
             return;
         }
         // The log file is consumed exactly once: after the header write is
@@ -1322,47 +1403,8 @@ where
     }
 
     #[inline]
-    fn complete_header_prefix_entry(entry: LogPrefixEntry) {
-        let LogPrefixKind::Header {
-            completion,
-            failure,
-            ..
-        } = entry.kind
-        else {
-            unreachable!("header prefix completion requires a header entry")
-        };
-        let Some(completion) = completion else {
-            return;
-        };
-        if let Some(reason) = failure {
-            completion.complete(Err(CompletionErrorKind::report_fatal(
-                reason,
-                "redo header write failed",
-            )));
-        } else {
-            completion.complete(Ok(()));
-        }
-    }
-
-    #[inline]
-    fn complete_seal_prefix_entry(entry: LogPrefixEntry) {
-        let LogPrefixKind::Seal {
-            log_file,
-            write,
-            ready,
-            ..
-        } = entry.kind
-        else {
-            unreachable!("seal prefix completion requires a seal entry")
-        };
-        debug_assert!(log_file.is_none());
-        debug_assert!(write.is_none());
-        debug_assert!(ready);
-    }
-
-    #[inline]
-    fn finalize_ready_group_prefix(&mut self, sealer: &mut LogFileSealer) {
-        let mut ready = self.drain_ready_group_prefix();
+    fn advance_ready_group_prefix(&mut self, sealer: &mut LogFileSealer) {
+        let mut ready = self.prefix.drain_ready_group_prefix();
 
         if let Some(reason) = ready.failure_reason {
             // Redo is sequential: the first failed group turns every later
@@ -1383,22 +1425,49 @@ where
             return;
         }
 
-        let max_cts = ready.written.last().unwrap().max_cts;
-        let start = Instant::now();
-        // Sync one file-local prefix before publishing its transactions and
-        // advancing persisted CTS.
-        let sync_res = self.sync_written_prefix(ready.log_fd, ready.log_bytes);
-        let sync_dur = start.elapsed();
-        if sync_res.is_err() {
-            let err = self.trx_sys.poison_storage(FatalError::RedoSync);
-            let reason = FailedPrecommitReason::Fatal(*err.current_context());
-            for sync_group in &mut ready.written {
-                self.fail_sync_group(sync_group, reason);
-            }
-            self.fail_pending(sealer, err);
+        if ready.log_bytes == 0 || self.log_sync == LogSync::None {
+            self.publish_ready_group_prefix(sealer, ready, 0);
             return;
         }
 
+        let log_fd = ready
+            .log_fd
+            .expect("redo-bearing finished prefix must include a log file fd");
+        let sync = LogWriteSubmission::commit_sync(log_fd, self.log_sync);
+        self.prefix.push_front_sync(ready, sync);
+    }
+
+    #[inline]
+    fn advance_sync_prefix_entry(&mut self, sealer: &mut LogFileSealer, entry: LogPrefixEntry) {
+        let LogPrefixKind::Sync {
+            mut ready_prefix,
+            sync,
+            ready,
+            failure,
+            sync_nanos,
+            ..
+        } = entry.kind
+        else {
+            unreachable!("sync prefix completion requires a sync entry")
+        };
+        debug_assert!(sync.is_none());
+        debug_assert!(ready);
+        if let Some(reason) = failure {
+            let failed_reason = FailedPrecommitReason::Fatal(reason);
+            self.fail_ready_prefix_waiters(&mut ready_prefix, failed_reason);
+            return;
+        }
+        self.publish_ready_group_prefix(sealer, ready_prefix, sync_nanos);
+    }
+
+    #[inline]
+    fn publish_ready_group_prefix(
+        &self,
+        sealer: &mut LogFileSealer,
+        ready: ReadyGroupPrefix,
+        sync_nanos: usize,
+    ) {
+        let max_cts = ready.written.last().unwrap().max_cts;
         for sync_group in &ready.written {
             if let Some(write_meta) = sync_group.write_meta {
                 // Seal metadata is file-local, so only record groups after the
@@ -1406,7 +1475,6 @@ where
                 sealer.record_group(write_meta);
             }
         }
-
         self.trx_sys
             .redo_log
             .persisted_cts
@@ -1442,144 +1510,50 @@ where
             ready.trx_count,
             ready.commit_count,
             ready.log_bytes,
-            usize::from(ready.log_bytes > 0),
-            if ready.log_bytes > 0 {
-                sync_dur.as_nanos() as usize
-            } else {
-                0
-            },
+            usize::from(ready.log_bytes > 0 && self.log_sync != LogSync::None),
+            sync_nanos,
         );
     }
 
     #[inline]
-    fn drain_ready_group_prefix(&mut self) -> ReadyGroupPrefix {
-        let mut ready = ReadyGroupPrefix::default();
-
-        while let Some(front) = self.prefix.entries.front() {
-            let LogPrefixKind::Group { group } = &front.kind else {
-                break;
-            };
-            if !group.ready() {
-                break;
-            }
-            // Keep each durable publication batch on one physical redo file.
-            // Rotation normally inserts seal/header barriers, but this guard
-            // preserves the invariant even if adjacent ready groups differ.
-            if ready.failure_reason.is_none()
-                && group.failure_reason.is_none()
-                && group.log_bytes > 0
-            {
-                let group_fd = group
-                    .log_fd
-                    .expect("redo-bearing sync group must carry its log file fd");
-                if let Some(prefix_fd) = ready.log_fd {
-                    if prefix_fd != group_fd {
-                        break;
-                    }
-                } else {
-                    ready.log_fd = Some(group_fd);
-                }
-            }
-
-            let entry = self
-                .prefix
-                .pop_front()
-                .expect("front ready redo group entry must exist");
-            let LogPrefixKind::Group { group } = entry.kind else {
-                unreachable!("front group entry kind was checked")
-            };
-            if let Some(reason) = ready.failure_reason.or(group.failure_reason) {
-                ready.failure_reason = Some(reason);
-                // Failed groups and all later ready groups are removed from the
-                // prefix, but they are not counted as durable commits.
-                ready.failed.push(group);
-                continue;
-            }
-            ready.trx_count += group.trx_list.len();
-            ready.commit_count += 1;
-            ready.log_bytes += group.log_bytes;
-            ready.written.push(group);
-        }
-
-        ready
+    fn fail_ready_prefix_waiters(
+        &self,
+        ready: &mut ReadyGroupPrefix,
+        reason: FailedPrecommitReason,
+    ) {
+        let mut recycle = Vec::new();
+        fail_ready_prefix_waiters(self.trx_sys, ready, reason, &mut recycle);
+        self.recycle_bufs(recycle);
     }
 
     /// Submit queued redo writes.
     ///
     /// Header, group, and seal writes share the same async write driver
     /// capacity. Groups without redo bytes are ready as soon as they enter the
-    /// prefix and are published by `finalize_finished_prefix`.
+    /// prefix and are published by `advance_ordered_prefix`.
     #[inline]
-    fn submit_io(&mut self, _sealer: &mut LogFileSealer) {
+    fn submit_io(&mut self) {
         let mut idx = 0;
         while idx < self.prefix.entries.len() {
             if self.write_driver.available_capacity() == 0 {
                 break;
             }
-            let prefix_id = self.prefix.entries[idx].id;
-            let Some(mut submission) = self.take_prefix_submission(idx) else {
+            let prefix_id = self.prefix.entry_id(idx);
+            let Some(mut submission) = self.prefix.take_submission(idx) else {
                 idx += 1;
                 continue;
             };
             let owner = self.ensure_submission_owner(&mut submission, prefix_id);
             if let Err(submission) = self.write_driver.push_write(submission) {
-                self.restore_prefix_submission(idx, submission);
+                self.prefix.restore_submission(idx, submission);
                 break;
             }
-            self.mark_prefix_submission_driver_owned(idx, owner);
-            if !self.prefix_entry_has_pending_submission(idx) {
+            self.prefix.mark_submission_driver_owned(idx, owner.kind);
+            if !self.prefix.entry_has_pending_submission(idx) {
                 idx += 1;
             }
         }
         self.write_driver.submit_ready();
-    }
-
-    #[inline]
-    fn prefix_entry_has_pending_submission(&self, idx: usize) -> bool {
-        let entry = self
-            .prefix
-            .entries
-            .get(idx)
-            .expect("redo prefix index must be in range");
-        match &entry.kind {
-            LogPrefixKind::Header { write, .. } => write.is_some(),
-            LogPrefixKind::Group { group } => !group.writes.is_empty(),
-            LogPrefixKind::Seal { write, .. } => write.is_some(),
-        }
-    }
-
-    #[inline]
-    fn take_prefix_submission(&mut self, idx: usize) -> Option<LogWriteSubmission> {
-        let entry = self
-            .prefix
-            .entries
-            .get_mut(idx)
-            .expect("redo prefix index must be in range");
-        match &mut entry.kind {
-            LogPrefixKind::Header { write, .. } => write.take(),
-            LogPrefixKind::Group { group } => group.take_submission(),
-            LogPrefixKind::Seal { write, .. } => write.take(),
-        }
-    }
-
-    #[inline]
-    fn restore_prefix_submission(&mut self, idx: usize, submission: LogWriteSubmission) {
-        let entry = self
-            .prefix
-            .entries
-            .get_mut(idx)
-            .expect("redo prefix index must be in range");
-        match &mut entry.kind {
-            LogPrefixKind::Header { write, .. } => {
-                debug_assert!(write.is_none());
-                *write = Some(submission);
-            }
-            LogPrefixKind::Group { group } => group.restore_submission(submission),
-            LogPrefixKind::Seal { write, .. } => {
-                debug_assert!(write.is_none());
-                *write = Some(submission);
-            }
-        }
     }
 
     #[inline]
@@ -1597,31 +1571,15 @@ where
             LogWriteKind::Group { group_write_idx } => {
                 LogRequestOwner::group(request_id, prefix_id, *group_write_idx)
             }
-            LogWriteKind::Seal { .. } => LogRequestOwner::seal(request_id, Some(prefix_id)),
+            LogWriteKind::CommitSync => LogRequestOwner::commit_sync(request_id, prefix_id),
+            LogWriteKind::SealWrite { .. } => LogRequestOwner::seal_write(request_id, prefix_id),
+            LogWriteKind::SealSync { .. } => LogRequestOwner::seal_sync(request_id, prefix_id),
+            LogWriteKind::StandaloneSync => {
+                panic!("standalone sync submissions are not prefix-owned")
+            }
         };
         submission.attach_owner(owner);
         owner
-    }
-
-    #[inline]
-    fn mark_prefix_submission_driver_owned(&mut self, idx: usize, owner: LogRequestOwner) {
-        let entry = self
-            .prefix
-            .entries
-            .get_mut(idx)
-            .expect("redo prefix index must be in range");
-        match &mut entry.kind {
-            LogPrefixKind::Header { .. } => {
-                debug_assert_eq!(owner.kind, LogRequestKind::Header);
-            }
-            LogPrefixKind::Group { group } => {
-                debug_assert_eq!(owner.kind, LogRequestKind::Group);
-                group.mark_request_submitted();
-            }
-            LogPrefixKind::Seal { .. } => {
-                debug_assert_eq!(owner.kind, LogRequestKind::Seal);
-            }
-        }
     }
 
     /// Wait for one submitted redo write, then drain already-buffered completions.
@@ -1656,7 +1614,7 @@ where
         } = completion;
         match kind {
             LogWriteKind::Header { completion } => {
-                drop(buf);
+                drop(buf.expect("redo header write completion must return a buffer"));
                 let Some(owner) = owner else {
                     if let Some(source) = poison {
                         completion.complete(Err(CompletionErrorKind::report_fatal(
@@ -1685,28 +1643,61 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo group request must carry a prefix entry id");
-                self.complete_group_request(prefix_id, owner.group_write_idx, buf, poison);
+                self.complete_group_request(
+                    prefix_id,
+                    owner.group_write_idx,
+                    buf.expect("redo group write completion must return a buffer"),
+                    poison,
+                );
                 if let Some(source) = poison {
                     let err = self.trx_sys.poison_storage(source);
                     self.fail_pending(sealer, err);
                     return true;
                 }
             }
-            LogWriteKind::Seal { log_file } => {
-                drop(buf);
-                let owner = owner.expect("redo seal completion must carry request owner");
-                debug_assert_eq!(owner.kind, LogRequestKind::Seal);
-                if let Some(prefix_id) = owner.prefix_id {
-                    if let Some(reason) =
-                        self.complete_seal_request(prefix_id, sealer, log_file, poison)
-                    {
-                        let err = self.trx_sys.poison_storage(reason);
-                        self.fail_pending(sealer, err);
-                        return true;
-                    }
-                } else {
-                    panic!("prefix-owned redo seal completion must carry a prefix entry id");
+            LogWriteKind::CommitSync => {
+                debug_assert!(buf.is_none());
+                let owner = owner.expect("redo sync completion must carry request owner");
+                debug_assert_eq!(owner.kind, LogRequestKind::CommitSync);
+                let prefix_id = owner
+                    .prefix_id
+                    .expect("redo sync request must carry a prefix entry id");
+                self.complete_sync_request(prefix_id, poison);
+                if let Some(source) = poison {
+                    let err = self.trx_sys.poison_storage(source);
+                    self.fail_pending(sealer, err);
+                    return true;
                 }
+            }
+            LogWriteKind::SealWrite { log_file } => {
+                drop(buf.expect("redo seal write completion must return a buffer"));
+                let owner = owner.expect("redo seal write completion must carry request owner");
+                debug_assert_eq!(owner.kind, LogRequestKind::SealWrite);
+                let prefix_id = owner
+                    .prefix_id
+                    .expect("redo seal write request must carry a prefix entry id");
+                if let Some(reason) = self.complete_seal_write_request(prefix_id, log_file, poison)
+                {
+                    let err = self.trx_sys.poison_storage(reason);
+                    self.fail_pending(sealer, err);
+                    return true;
+                }
+            }
+            LogWriteKind::SealSync { log_file } => {
+                debug_assert!(buf.is_none());
+                let owner = owner.expect("redo seal sync completion must carry request owner");
+                debug_assert_eq!(owner.kind, LogRequestKind::SealSync);
+                let prefix_id = owner
+                    .prefix_id
+                    .expect("redo seal sync request must carry a prefix entry id");
+                if let Some(reason) = self.complete_seal_sync_request(prefix_id, log_file, poison) {
+                    let err = self.trx_sys.poison_storage(reason);
+                    self.fail_pending(sealer, err);
+                    return true;
+                }
+            }
+            LogWriteKind::StandaloneSync => {
+                panic!("standalone redo sync completion reached prefix writer")
             }
         }
         false
@@ -1755,27 +1746,85 @@ where
     }
 
     #[inline]
-    fn complete_seal_request(
+    fn complete_sync_request(&mut self, prefix_id: LogPrefixId, poison: Option<FatalError>) {
+        let entry = self
+            .prefix
+            .entry_mut(prefix_id)
+            .expect("redo sync completion must match one prefix entry");
+        let LogPrefixKind::Sync {
+            ready,
+            failure,
+            started_at,
+            sync_nanos,
+            ..
+        } = &mut entry.kind
+        else {
+            panic!("redo sync completion matched non-sync prefix entry");
+        };
+        if failure.is_none() {
+            *failure = poison;
+        }
+        *sync_nanos = started_at
+            .take()
+            .map_or(0, |started_at| started_at.elapsed().as_nanos() as usize);
+        *ready = true;
+    }
+
+    #[inline]
+    fn complete_seal_write_request(
         &mut self,
         prefix_id: LogPrefixId,
-        sealer: &LogFileSealer,
         log_file: Box<RedoLogFile>,
         poison: Option<FatalError>,
     ) -> Option<FatalError> {
-        let reason = sealer.finish_prefix_seal(&log_file, poison).err();
+        let reason = poison;
+        let entry = self
+            .prefix
+            .entry_mut(prefix_id)
+            .expect("redo seal write completion must match one prefix entry");
+        let LogPrefixKind::Seal {
+            sync: pending_sync,
+            ready,
+            failure,
+            ..
+        } = &mut entry.kind
+        else {
+            panic!("redo seal write completion matched non-seal prefix entry");
+        };
+        let already_failed = failure.is_some();
+        if !already_failed {
+            *failure = reason;
+        }
+        if !already_failed && reason.is_none() && self.log_sync != LogSync::None {
+            debug_assert!(pending_sync.is_none());
+            *pending_sync = Some(LogWriteSubmission::seal_sync(*log_file, self.log_sync));
+        } else {
+            drop(log_file);
+            *ready = true;
+        }
+        reason
+    }
+
+    #[inline]
+    fn complete_seal_sync_request(
+        &mut self,
+        prefix_id: LogPrefixId,
+        log_file: Box<RedoLogFile>,
+        poison: Option<FatalError>,
+    ) -> Option<FatalError> {
         drop(log_file);
         let entry = self
             .prefix
             .entry_mut(prefix_id)
-            .expect("redo seal completion must match one prefix entry");
+            .expect("redo seal sync completion must match one prefix entry");
         let LogPrefixKind::Seal { ready, failure, .. } = &mut entry.kind else {
-            panic!("redo seal completion matched non-seal prefix entry");
+            panic!("redo seal sync completion matched non-seal prefix entry");
         };
         if failure.is_none() {
-            *failure = reason;
+            *failure = poison;
         }
         *ready = true;
-        reason
+        poison
     }
 }
 
@@ -1879,28 +1928,113 @@ pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
 }
 
 #[inline]
-fn log_write_completion_from_completed(
-    completed: CompletedSubmission<LogWriteSubmission>,
-) -> LogWriteCompletion {
-    let mut submission = completed.submission;
-    let expected_len = submission.operation.len();
-    let buf = submission
-        .operation
-        .take_buf()
-        .expect("redo write submission must still own its direct buffer");
-    LogWriteCompletion {
-        owner: submission.owner,
-        kind: submission.kind,
-        buf,
-        poison: redo_write_poison(completed.result, expected_len),
+fn finish_header_prefix_entry(entry: LogPrefixEntry) {
+    let LogPrefixKind::Header {
+        completion,
+        failure,
+        ..
+    } = entry.kind
+    else {
+        unreachable!("header prefix completion requires a header entry")
+    };
+    let Some(completion) = completion else {
+        return;
+    };
+    if let Some(reason) = failure {
+        completion.complete(Err(CompletionErrorKind::report_fatal(
+            reason,
+            "redo header write failed",
+        )));
+    } else {
+        completion.complete(Ok(()));
     }
 }
 
 #[inline]
-fn redo_write_poison(result: IoResult<usize>, expected_len: usize) -> Option<FatalError> {
-    match result {
-        Ok(len) if len == expected_len => None,
-        Ok(_) | Err(_) => Some(FatalError::RedoWrite),
+fn finish_seal_prefix_entry(entry: LogPrefixEntry) {
+    let LogPrefixKind::Seal {
+        log_file,
+        write,
+        sync,
+        ready,
+        ..
+    } = entry.kind
+    else {
+        unreachable!("seal prefix completion requires a seal entry")
+    };
+    debug_assert!(log_file.is_none());
+    debug_assert!(write.is_none());
+    debug_assert!(sync.is_none());
+    debug_assert!(ready);
+}
+
+#[inline]
+fn sync_operation(fd: RawFd, log_sync: LogSync) -> Operation {
+    match log_sync {
+        LogSync::Fsync => Operation::fsync(fd),
+        LogSync::Fdatasync => Operation::fdatasync(fd),
+        LogSync::None => {
+            panic!("log_sync=none must not submit a backend sync operation")
+        }
+    }
+}
+
+#[inline]
+fn log_write_completion_from_completed(
+    completed: CompletedSubmission<LogWriteSubmission>,
+) -> LogWriteCompletion {
+    let mut submission = completed.submission;
+    let kind = submission.operation.kind();
+    let expected_len = submission.operation.len();
+    let buf = match kind {
+        IOKind::Read | IOKind::Write => Some(
+            submission
+                .operation
+                .take_buf()
+                .expect("redo write submission must still own its direct buffer"),
+        ),
+        IOKind::Fsync | IOKind::Fdatasync => None,
+    };
+    LogWriteCompletion {
+        owner: submission.owner,
+        kind: submission.kind,
+        buf,
+        poison: redo_io_poison(kind, completed.result, expected_len),
+    }
+}
+
+#[inline]
+fn redo_io_poison(
+    kind: IOKind,
+    result: IoResult<usize>,
+    expected_len: usize,
+) -> Option<FatalError> {
+    match kind {
+        IOKind::Read | IOKind::Write => match result {
+            Ok(len) if len == expected_len => None,
+            Ok(_) | Err(_) => Some(FatalError::RedoWrite),
+        },
+        IOKind::Fsync | IOKind::Fdatasync => match result {
+            Ok(0) => None,
+            Ok(_) | Err(_) => Some(FatalError::RedoSync),
+        },
+    }
+}
+
+#[inline]
+fn fail_ready_prefix_waiters(
+    trx_sys: &TransactionSystem,
+    ready: &mut ReadyGroupPrefix,
+    reason: FailedPrecommitReason,
+    recycle: &mut Vec<DirectBuf>,
+) {
+    for sync_group in &mut ready.written {
+        sync_group.fail_waiters(trx_sys, reason);
+        recycle.extend(sync_group.drain_buffers());
+    }
+    for sync_group in &mut ready.failed {
+        sync_group.fail_waiters(trx_sys, reason);
+        recycle.extend(sync_group.drain_buffers());
     }
 }
 
@@ -2094,7 +2228,6 @@ mod tests {
     use crate::error::{
         CompletionErrorKind, DataIntegrityError, FatalError, InternalError, LifecycleError,
     };
-    use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
         BackendToken, IOBackend, IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
@@ -2120,7 +2253,7 @@ mod tests {
     use std::iter::repeat_n;
     use std::os::fd::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, LazyLock, Mutex, MutexGuard, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::task::{Context, Poll};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -2260,38 +2393,18 @@ mod tests {
         } = write_driver.wait_at_least_one();
         match kind {
             LogWriteKind::Header { completion } => {
-                drop(buf);
+                drop(buf.expect("redo header write completion must return a buffer"));
                 assert!(owner.is_none());
                 assert_eq!(poison, None);
                 completion.complete(Ok(()));
             }
             LogWriteKind::Group { .. } => panic!("expected redo header write completion"),
-            LogWriteKind::Seal { .. } => panic!("expected redo header write completion"),
+            LogWriteKind::SealWrite { .. }
+            | LogWriteKind::SealSync { .. }
+            | LogWriteKind::CommitSync
+            | LogWriteKind::StandaloneSync => panic!("expected redo header write completion"),
         }
         assert!(header_completion.completed_result().unwrap().is_ok());
-    }
-
-    static FILE_SYNC_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct InstalledFileSyncTestHook {
-        previous: Option<Arc<dyn FileSyncTestHook>>,
-        guard: Option<MutexGuard<'static, ()>>,
-    }
-
-    impl Drop for InstalledFileSyncTestHook {
-        #[inline]
-        fn drop(&mut self) {
-            let _ = set_file_sync_test_hook(self.previous.take());
-            drop(self.guard.take());
-        }
-    }
-
-    fn install_file_sync_test_hook(hook: Arc<dyn FileSyncTestHook>) -> InstalledFileSyncTestHook {
-        let guard = FILE_SYNC_TEST_HOOK_LOCK.lock().unwrap();
-        InstalledFileSyncTestHook {
-            previous: set_file_sync_test_hook(Some(hook)),
-            guard: Some(guard),
-        }
     }
 
     #[derive(Clone, Default)]
@@ -2401,13 +2514,13 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct ControlledFileSyncHook {
-        inner: Arc<ControlledFileSyncHookInner>,
+    struct ControlledRedoSyncHook {
+        inner: Arc<ControlledRedoSyncHookInner>,
     }
 
-    struct ControlledFileSyncHookInner {
+    struct ControlledRedoSyncHookInner {
         fd: RawFd,
-        kind: FileSyncKind,
+        kind: IOKind,
         errno: i32,
         calls: AtomicUsize,
         started: Event,
@@ -2415,10 +2528,11 @@ mod tests {
         release: Event,
     }
 
-    impl ControlledFileSyncHook {
-        fn new(fd: RawFd, kind: FileSyncKind, errno: i32) -> Self {
+    impl ControlledRedoSyncHook {
+        fn new(fd: RawFd, kind: IOKind, errno: i32) -> Self {
+            debug_assert!(matches!(kind, IOKind::Fsync | IOKind::Fdatasync));
             Self {
-                inner: Arc::new(ControlledFileSyncHookInner {
+                inner: Arc::new(ControlledRedoSyncHookInner {
                     fd,
                     kind,
                     errno,
@@ -2430,7 +2544,7 @@ mod tests {
             }
         }
 
-        fn matches(&self, op: FileSyncOp) -> bool {
+        fn matches(&self, op: StorageBackendOp) -> bool {
             op.fd() == self.inner.fd && op.kind() == self.inner.kind
         }
 
@@ -2453,13 +2567,18 @@ mod tests {
         }
     }
 
-    impl FileSyncTestHook for ControlledFileSyncHook {
-        fn on_sync(&self, op: FileSyncOp, override_res: &mut Option<Result<()>>) {
+    impl StorageBackendTestHook for ControlledRedoSyncHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.inner.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.started.notify(usize::MAX);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if !self.matches(op) {
                 return;
             }
-            self.inner.calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.started.notify(usize::MAX);
             loop {
                 if self.inner.released.load(Ordering::SeqCst) {
                     break;
@@ -2470,31 +2589,32 @@ mod tests {
                 }
                 smol::block_on(listener);
             }
-            *override_res = Some(Err(IoError::from_raw_os_error(self.inner.errno).into()));
+            *res = Err(IoError::from_raw_os_error(self.inner.errno));
         }
     }
 
     #[derive(Clone)]
-    struct RecordingFileSyncHook {
-        calls: Arc<Mutex<Vec<FileSyncOp>>>,
+    struct RecordingRedoSyncHook {
+        calls: Arc<Mutex<Vec<StorageBackendOp>>>,
     }
 
-    impl RecordingFileSyncHook {
+    impl RecordingRedoSyncHook {
         fn new() -> Self {
             Self {
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn calls(&self) -> Vec<FileSyncOp> {
+        fn calls(&self) -> Vec<StorageBackendOp> {
             self.calls.lock().unwrap().clone()
         }
     }
 
-    impl FileSyncTestHook for RecordingFileSyncHook {
-        fn on_sync(&self, op: FileSyncOp, override_res: &mut Option<Result<()>>) {
-            self.calls.lock().unwrap().push(op);
-            *override_res = Some(Ok(()));
+    impl StorageBackendTestHook for RecordingRedoSyncHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if matches!(op.kind(), IOKind::Fsync | IOKind::Fdatasync) {
+                self.calls.lock().unwrap().push(op);
+            }
         }
     }
 
@@ -2539,6 +2659,24 @@ mod tests {
         let report = format!("{err:?}");
         assert!(report.contains("propagate from other threads"), "{report}");
         assert!(report.contains("wait for redo group commit"), "{report}");
+    }
+
+    #[test]
+    fn test_redo_sync_completion_accepts_only_zero_success_result() {
+        assert_eq!(redo_io_poison(IOKind::Fsync, Ok(0), 0), None);
+        assert_eq!(redo_io_poison(IOKind::Fdatasync, Ok(0), 0), None);
+        assert_eq!(
+            redo_io_poison(IOKind::Fsync, Ok(1), 0),
+            Some(FatalError::RedoSync)
+        );
+        assert_eq!(
+            redo_io_poison(
+                IOKind::Fdatasync,
+                Err(IoError::from_raw_os_error(libc::EIO)),
+                0
+            ),
+            Some(FatalError::RedoSync)
+        );
     }
 
     fn record_seal_group(
@@ -2595,11 +2733,11 @@ mod tests {
         B: IOBackend,
     {
         while !writer.prefix.is_empty() {
-            writer.finalize_finished_prefix(sealer);
+            writer.advance_ordered_prefix(sealer);
             writer.shrink_prefix_if_sparse();
-            writer.submit_io(sealer);
+            writer.submit_io();
             writer.wait_and_drain_io_if_submitted(sealer);
-            writer.finalize_finished_prefix(sealer);
+            writer.advance_ordered_prefix(sealer);
             writer.shrink_prefix_if_sparse();
         }
     }
@@ -2986,8 +3124,8 @@ mod tests {
                     .unwrap()
                     .as_raw_fd()
             };
-            let hook = ControlledFileSyncHook::new(redo_fd, FileSyncKind::Fsync, libc::EIO);
-            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let hook = ControlledRedoSyncHook::new(redo_fd, IOKind::Fsync, libc::EIO);
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
@@ -3099,7 +3237,7 @@ mod tests {
 
     struct LogTestBackend {
         max_events: usize,
-        inflight: VecDeque<BackendToken>,
+        inflight: VecDeque<(BackendToken, IOKind)>,
         wait_batches: VecDeque<LogTestCompletionBatch>,
     }
 
@@ -3122,8 +3260,8 @@ mod tests {
     }
 
     impl IOBackend for LogTestBackend {
-        type Prepared = BackendToken;
-        type SubmitBatch = VecDeque<BackendToken>;
+        type Prepared = (BackendToken, IOKind);
+        type SubmitBatch = VecDeque<(BackendToken, IOKind)>;
         type Events = ();
 
         fn max_events(&self) -> usize {
@@ -3136,8 +3274,8 @@ mod tests {
 
         fn new_events(&self) -> Self::Events {}
 
-        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            token
+        fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
+            (token, operation.kind())
         }
 
         fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
@@ -3172,75 +3310,24 @@ mod tests {
                 LogTestCompletionBatch::AllFront => self
                     .inflight
                     .drain(..)
-                    .map(|token| (token, Ok(4096)))
+                    .map(|(token, kind)| (token, Ok(log_test_completion_len(kind))))
                     .collect(),
                 LogTestCompletionBatch::OneBack => {
-                    let token = self
+                    let (token, kind) = self
                         .inflight
                         .pop_back()
                         .expect("test backend must have one back completion");
-                    vec![(token, Ok(4096))]
+                    vec![(token, Ok(log_test_completion_len(kind)))]
                 }
             }
         }
     }
 
-    #[test]
-    fn test_prefix_tracker_preserves_order_with_no_log_groups() {
-        smol::block_on(async {
-            let (_engine_temp_dir, engine) =
-                build_redo_test_engine("prefix_order_no_log", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_prefix_order_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
-            let config = TrxSysConfig::default()
-                .log_block_size(4096usize)
-                .log_sync(LogSync::None);
-            let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-            let mut writer =
-                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
-
-            writer
-                .prefix
-                .push_group(sync_group_for_order_test(TrxID::new(10), false, 4096));
-            writer
-                .prefix
-                .push_group(sync_group_for_order_test(TrxID::new(11), true, 0));
-            let ready = writer.drain_ready_group_prefix();
-            assert_eq!(ready.trx_count, 0);
-            assert_eq!(ready.commit_count, 0);
-            assert_eq!(ready.log_bytes, 0);
-            assert_eq!(ready.failure_reason, None);
-            assert!(ready.written.is_empty());
-            assert!(ready.failed.is_empty());
-            assert_eq!(writer.prefix.len(), 2);
-
-            let LogPrefixKind::Group { group } =
-                &mut writer.prefix.entries.front_mut().unwrap().kind
-            else {
-                panic!("expected front group")
-            };
-            group.outstanding_requests = 0;
-
-            let ready = writer.drain_ready_group_prefix();
-            assert_eq!(ready.trx_count, 2);
-            assert_eq!(ready.commit_count, 2);
-            assert_eq!(ready.log_bytes, 4096);
-            assert_eq!(ready.failure_reason, None);
-            assert_eq!(ready.written.len(), 2);
-            assert_eq!(ready.written[0].max_cts, TrxID::new(10));
-            assert_eq!(ready.written[1].max_cts, TrxID::new(11));
-            assert!(ready.failed.is_empty());
-
-            drop(harness);
-            engine.shutdown().unwrap();
-        });
+    fn log_test_completion_len(kind: IOKind) -> usize {
+        match kind {
+            IOKind::Read | IOKind::Write => 4096,
+            IOKind::Fsync | IOKind::Fdatasync => 0,
+        }
     }
 
     #[test]
@@ -3267,8 +3354,8 @@ mod tests {
                 .log_block_size(4096usize)
                 .log_sync(LogSync::Fsync);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let hook = RecordingFileSyncHook::new();
-            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let hook = RecordingRedoSyncHook::new();
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
             let mut write_driver = LogWriteDriver::new(LogTestBackend::complete_all(2));
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
 
@@ -3293,9 +3380,12 @@ mod tests {
                         REDO_DEFAULT_DATA_START_OFFSET + 4096,
                     ));
 
-                writer.submit_io(&mut sealer);
+                writer.submit_io();
                 writer.wait_and_drain_io_if_submitted(&mut sealer);
-                writer.finalize_finished_prefix(&mut sealer);
+                writer.advance_ordered_prefix(&mut sealer);
+                writer.submit_io();
+                writer.wait_and_drain_io_if_submitted(&mut sealer);
+                writer.advance_ordered_prefix(&mut sealer);
 
                 assert!(writer.prefix.is_empty());
                 assert_eq!(writer.write_driver.submitted_len(), 0);
@@ -3303,7 +3393,7 @@ mod tests {
 
             let calls = hook.calls();
             assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].kind(), FileSyncKind::Fsync);
+            assert_eq!(calls[0].kind(), IOKind::Fsync);
             assert_eq!(calls[0].fd(), log_fd);
             assert_eq!(
                 harness
@@ -3361,8 +3451,8 @@ mod tests {
                 .log_block_size(4096usize)
                 .log_sync(LogSync::Fsync);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let hook = RecordingFileSyncHook::new();
-            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let hook = RecordingRedoSyncHook::new();
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
             let mut write_driver = LogWriteDriver::new(LogTestBackend::complete_one_back(2));
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
 
@@ -3387,9 +3477,9 @@ mod tests {
                         REDO_DEFAULT_DATA_START_OFFSET + 4096,
                     ));
 
-                writer.submit_io(&mut sealer);
+                writer.submit_io();
                 writer.wait_and_drain_io_if_submitted(&mut sealer);
-                writer.finalize_finished_prefix(&mut sealer);
+                writer.advance_ordered_prefix(&mut sealer);
 
                 assert_eq!(writer.prefix.len(), 2);
                 let LogPrefixKind::Group { group } = &writer.prefix.entries[0].kind else {
@@ -3412,48 +3502,6 @@ mod tests {
                     .load(Ordering::SeqCst),
                 MIN_SNAPSHOT_TS.as_u64()
             );
-
-            drop(harness);
-            engine.shutdown().unwrap();
-        });
-    }
-
-    #[test]
-    fn test_prefix_tracker_releases_no_log_prefix_without_later_log() {
-        smol::block_on(async {
-            let (_engine_temp_dir, engine) =
-                build_redo_test_engine("prefix_no_log_before_unfinished", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_prefix_no_log_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
-            let config = TrxSysConfig::default()
-                .log_block_size(4096usize)
-                .log_sync(LogSync::None);
-            let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-            let mut writer =
-                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
-
-            writer
-                .prefix
-                .push_group(sync_group_for_order_test(TrxID::new(20), true, 0));
-            writer
-                .prefix
-                .push_group(sync_group_for_order_test(TrxID::new(21), false, 4096));
-            let ready = writer.drain_ready_group_prefix();
-            assert_eq!(ready.trx_count, 1);
-            assert_eq!(ready.commit_count, 1);
-            assert_eq!(ready.log_bytes, 0);
-            assert_eq!(ready.failure_reason, None);
-            assert_eq!(ready.written.len(), 1);
-            assert_eq!(ready.written[0].max_cts, TrxID::new(20));
-            assert!(ready.failed.is_empty());
-            assert_eq!(writer.prefix.len(), 1);
 
             drop(harness);
             engine.shutdown().unwrap();
@@ -3583,7 +3631,7 @@ mod tests {
                     &mut write_driver,
                 );
                 fp.fetch_io_reqs();
-                fp.submit_io(&mut sealer);
+                fp.submit_io();
 
                 assert_eq!(
                     hook.submits(),
@@ -3732,8 +3780,8 @@ mod tests {
             };
             assert_ne!(ended_fd, current_fd);
 
-            let hook = RecordingFileSyncHook::new();
-            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let hook = RecordingRedoSyncHook::new();
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
             let config = TrxSysConfig::default()
                 .log_block_size(4096usize)
                 .log_sync(LogSync::Fsync);
@@ -3774,7 +3822,7 @@ mod tests {
             let calls = hook.calls();
             assert_eq!(calls.len(), 2);
             for call in calls {
-                assert_eq!(call.kind(), FileSyncKind::Fsync);
+                assert_eq!(call.kind(), IOKind::Fsync);
                 assert_eq!(call.fd(), ended_fd);
                 assert_ne!(call.fd(), current_fd);
             }
@@ -3820,7 +3868,7 @@ mod tests {
 
     fn assert_rotated_file_seal_sync_policy(
         log_sync: LogSync,
-        expected_sync_kind: Option<FileSyncKind>,
+        expected_sync_kind: Option<IOKind>,
         log_file_stem: &str,
     ) {
         smol::block_on(async {
@@ -3841,8 +3889,8 @@ mod tests {
                 .to_owned();
             let ended_log_file = create_log_file_for_test(&file_prefix, 0, 128 * 1024, 4096);
             let ended_fd = ended_log_file.as_raw_fd();
-            let hook = RecordingFileSyncHook::new();
-            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let hook = RecordingRedoSyncHook::new();
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
             let (harness, mut write_driver) =
                 manual_redo_log_writer_for_seal(&engine, log_sync, harness_prefix);
             let end_offset = REDO_DEFAULT_DATA_START_OFFSET + 4096;
@@ -3889,7 +3937,7 @@ mod tests {
     fn test_rotated_file_seal_writes_inactive_slot_and_fsyncs_ended_fd() {
         assert_rotated_file_seal_sync_policy(
             LogSync::Fsync,
-            Some(FileSyncKind::Fsync),
+            Some(IOKind::Fsync),
             "rotated_seal_fsync",
         );
     }
@@ -3898,7 +3946,7 @@ mod tests {
     fn test_rotated_file_seal_fdatasyncs_ended_fd() {
         assert_rotated_file_seal_sync_policy(
             LogSync::Fdatasync,
-            Some(FileSyncKind::Fdatasync),
+            Some(IOKind::Fdatasync),
             "rotated_seal_fdatasync",
         );
     }
@@ -3968,13 +4016,10 @@ mod tests {
                 .unwrap()
                 .to_owned();
             let ended_log_file = create_log_file_for_test(&file_prefix, 0, 128 * 1024, 4096);
-            let hook = ControlledFileSyncHook::new(
-                ended_log_file.as_raw_fd(),
-                FileSyncKind::Fsync,
-                libc::EIO,
-            );
+            let hook =
+                ControlledRedoSyncHook::new(ended_log_file.as_raw_fd(), IOKind::Fsync, libc::EIO);
             hook.release();
-            let _install = install_file_sync_test_hook(Arc::new(hook));
+            let _install = install_storage_backend_test_hook(Arc::new(hook));
             let (harness, mut write_driver) =
                 manual_redo_log_writer_for_seal(&engine, LogSync::Fsync, harness_prefix);
 
@@ -4075,55 +4120,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_tracker_stops_at_failed_redo_boundary() {
-        smol::block_on(async {
-            let (_engine_temp_dir, engine) =
-                build_redo_test_engine("prefix_failed_boundary", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_prefix_failed_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
-            let config = TrxSysConfig::default()
-                .log_block_size(4096usize)
-                .log_sync(LogSync::None);
-            let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-            let mut writer =
-                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
-            let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
-            let mut failed = sync_group_for_order_test(TrxID::new(31), true, 2048);
-            failed.failure_reason = Some(reason);
-
-            writer
-                .prefix
-                .push_group(sync_group_for_order_test(TrxID::new(30), true, 1024));
-            writer.prefix.push_group(failed);
-            writer
-                .prefix
-                .push_group(sync_group_for_order_test(TrxID::new(32), true, 4096));
-
-            let ready = writer.drain_ready_group_prefix();
-            assert_eq!(ready.trx_count, 1);
-            assert_eq!(ready.commit_count, 1);
-            assert_eq!(ready.log_bytes, 1024);
-            assert_eq!(ready.failure_reason, Some(reason));
-            assert!(writer.prefix.is_empty());
-            assert_eq!(ready.written.len(), 1);
-            assert_eq!(ready.written[0].max_cts, TrxID::new(30));
-            assert_eq!(ready.failed.len(), 2);
-            assert_eq!(ready.failed[0].max_cts, TrxID::new(31));
-            assert_eq!(ready.failed[1].max_cts, TrxID::new(32));
-
-            drop(harness);
-            engine.shutdown().unwrap();
-        });
-    }
-
-    #[test]
     fn test_fail_prefix_entries_marks_unprepared_seal_ready() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
@@ -4160,54 +4156,10 @@ mod tests {
             writer.prefix.push_header(header_write);
             writer.prefix.push_seal(ended_log_file);
             writer.fail_prefix_entries(FatalError::RedoWrite);
-            writer.finalize_finished_prefix(&mut sealer);
+            writer.advance_ordered_prefix(&mut sealer);
 
             assert!(writer.prefix.is_empty());
             assert!(header_completion.completed_result().unwrap().is_err());
-
-            drop(harness);
-            engine.shutdown().unwrap();
-        });
-    }
-
-    #[test]
-    fn test_prefix_tracker_keeps_unfinished_groups_after_failed_boundary() {
-        smol::block_on(async {
-            let (_engine_temp_dir, engine) =
-                build_redo_test_engine("prefix_failed_keeps_unfinished", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_prefix_failed_unfinished_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
-            let config = TrxSysConfig::default()
-                .log_block_size(4096usize)
-                .log_sync(LogSync::None);
-            let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
-            let mut writer =
-                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
-            let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
-            let mut failed = sync_group_for_order_test(TrxID::new(40), true, 1024);
-            failed.failure_reason = Some(reason);
-
-            writer.prefix.push_group(failed);
-            writer
-                .prefix
-                .push_group(sync_group_for_order_test(TrxID::new(41), false, 2048));
-
-            let ready = writer.drain_ready_group_prefix();
-            assert_eq!(ready.trx_count, 0);
-            assert_eq!(ready.commit_count, 0);
-            assert_eq!(ready.log_bytes, 0);
-            assert_eq!(ready.failure_reason, Some(reason));
-            assert!(ready.written.is_empty());
-            assert_eq!(ready.failed.len(), 1);
-            assert_eq!(ready.failed[0].max_cts, TrxID::new(40));
-            assert_eq!(writer.prefix.len(), 1);
 
             drop(harness);
             engine.shutdown().unwrap();
@@ -4629,12 +4581,15 @@ mod tests {
             } = write_driver.wait_at_least_one();
             match kind {
                 LogWriteKind::Group { .. } => {
-                    drop(buf);
+                    drop(buf.expect("redo group write completion must return a buffer"));
                     assert!(owner.is_none());
                     assert_eq!(poison, None);
                 }
                 LogWriteKind::Header { .. } => panic!("expected redo group write completion"),
-                LogWriteKind::Seal { .. } => panic!("expected redo group write completion"),
+                LogWriteKind::SealWrite { .. }
+                | LogWriteKind::SealSync { .. }
+                | LogWriteKind::CommitSync
+                | LogWriteKind::StandaloneSync => panic!("expected redo group write completion"),
             }
             drop(old_log_file);
 
@@ -4859,7 +4814,7 @@ mod tests {
 
     async fn assert_redo_sync_failure_poison_runtime_and_fail_waiters(
         log_sync: LogSync,
-        sync_kind: FileSyncKind,
+        sync_kind: IOKind,
         log_file_stem: &str,
     ) {
         let (_temp_dir, engine) = build_redo_test_engine(log_file_stem, log_sync).await;
@@ -4875,8 +4830,8 @@ mod tests {
                 .unwrap()
                 .as_raw_fd()
         };
-        let hook = ControlledFileSyncHook::new(redo_fd, sync_kind, libc::EIO);
-        let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+        let hook = ControlledRedoSyncHook::new(redo_fd, sync_kind, libc::EIO);
+        let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
 
         let commit1 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 10);
         hook.wait_started(1).await;
@@ -4915,7 +4870,7 @@ mod tests {
         smol::block_on(async {
             assert_redo_sync_failure_poison_runtime_and_fail_waiters(
                 LogSync::Fsync,
-                FileSyncKind::Fsync,
+                IOKind::Fsync,
                 "redo_fsync_failure",
             )
             .await;
@@ -4927,7 +4882,7 @@ mod tests {
         smol::block_on(async {
             assert_redo_sync_failure_poison_runtime_and_fail_waiters(
                 LogSync::Fdatasync,
-                FileSyncKind::Fdatasync,
+                IOKind::Fdatasync,
                 "redo_fdatasync_failure",
             )
             .await;
