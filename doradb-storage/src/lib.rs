@@ -26,6 +26,7 @@ mod recovery;
 mod row;
 mod serde;
 mod session;
+pub mod stats;
 mod table;
 mod thread;
 mod trx;
@@ -43,6 +44,10 @@ pub use error::{Error, ErrorKind, Result};
 pub use lock::LockMode;
 pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 pub use session::Session;
+pub use stats::{
+    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats, StorageIoStats,
+    TransactionSystemStats,
+};
 pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness,
     SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats,

@@ -241,11 +241,9 @@ impl BufferPoolStatsHandle {
 /// Abstraction of buffer pool.
 pub(crate) trait BufferPool: Send + Sync {
     /// Returns the maximum number of pages that can be allocated.
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     fn capacity(&self) -> usize;
 
     /// Returns the number of allocated pages.
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     fn allocated(&self) -> usize;
 
     /// Returns a cloneable keepalive guard for this pool.

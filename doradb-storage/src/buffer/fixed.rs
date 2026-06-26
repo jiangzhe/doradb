@@ -60,7 +60,6 @@ impl FixedBufferPool {
 
     /// Returns one snapshot of fixed-pool access counters.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
     pub(crate) fn stats(&self) -> BufferPoolStats {
         self.stats.snapshot()
     }

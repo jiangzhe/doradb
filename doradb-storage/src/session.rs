@@ -11,6 +11,10 @@ use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::ChangeNotifier;
 use crate::quiescent::QuiescentGuard;
+use crate::stats::{
+    BufferPoolStats, StorageIoStats, TransactionSystemStats, buffer_pool_runtime_stats_snapshot,
+    storage_io_stats_snapshot, transaction_system_stats_snapshot,
+};
 use crate::table::{CheckpointOutcome, CheckpointReadiness, SecondaryMemIndexCleanupStats, Table};
 use crate::trx::{
     StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
@@ -95,17 +99,34 @@ impl Session {
         Ok(SessionPin { engine, state })
     }
 
+    #[inline]
+    fn query_engine(&self, operation: &'static str) -> Result<EngineRef> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed_session_error(self.id, operation));
+        }
+        let engine = self.engine.upgrade(operation)?;
+        engine.ensure_admission_open_for_query(operation)?;
+        Ok(engine)
+    }
+
     /// Returns whether the session currently owns an active transaction.
     #[inline]
     pub fn in_trx(&self) -> Result<bool> {
         const OPERATION: &str = "query session transaction state";
-        if self.closed.load(Ordering::Acquire) {
-            return Err(closed_session_error(self.id, OPERATION));
-        }
-        let engine = self.engine.upgrade(OPERATION)?;
-        engine.ensure_admission_open_for_query(OPERATION)?;
+        let engine = self.query_engine(OPERATION)?;
         let state = engine.session_registry.pin_running(self.id, OPERATION)?;
         state.in_trx(OPERATION)
+    }
+
+    /// Return sorted ids for currently loaded user-table runtimes.
+    ///
+    /// This read-only diagnostic remains observable after storage poison while
+    /// engine query admission is still open. It does not expose in-flight DDL
+    /// rows that have not installed a user-table runtime.
+    #[inline]
+    pub fn list_table_ids(&self) -> Result<Vec<TableID>> {
+        let engine = self.query_engine("list table ids")?;
+        Ok(engine.catalog().list_user_table_ids_now())
     }
 
     /// Begin a new transaction if the session is currently idle.
@@ -162,6 +183,84 @@ impl Session {
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
         let session = self.pin("session DDL")?;
         drop_table_for_session(session, table_id).await
+    }
+
+    /// Run one online catalog checkpoint.
+    ///
+    /// This mutating maintenance operation uses normal healthy-runtime
+    /// admission and requires the session to be idle.
+    #[inline]
+    pub async fn checkpoint_catalog(&mut self) -> Result<()> {
+        let session = self.pin("checkpoint catalog")?;
+        if session.in_trx("checkpoint catalog")? {
+            return Err(Report::new(OperationError::NotSupported)
+                .attach("catalog checkpoint requires an idle session")
+                .into());
+        }
+        session
+            .engine
+            .catalog()
+            .checkpoint_now(&session.engine.trx_sys)
+            .await
+    }
+
+    /// Return a monotonic transaction-system statistics snapshot.
+    ///
+    /// This read-only diagnostic remains observable after storage poison while
+    /// engine query admission is still open. Callers can compare snapshots to
+    /// compute deltas.
+    #[inline]
+    pub fn transaction_system_stats(&self) -> Result<TransactionSystemStats> {
+        let engine = self.query_engine("query transaction system stats")?;
+        Ok(transaction_system_stats_snapshot(
+            engine.trx_sys.trx_sys_stats(),
+        ))
+    }
+
+    /// Return a monotonic shared-storage IO statistics snapshot.
+    ///
+    /// This read-only diagnostic remains observable after storage poison while
+    /// engine query admission is still open. Callers can compare snapshots to
+    /// compute deltas.
+    #[inline]
+    pub fn storage_io_stats(&self) -> Result<StorageIoStats> {
+        let engine = self.query_engine("query storage io stats")?;
+        Ok(storage_io_stats_snapshot(
+            engine.table_fs.io_backend_stats(),
+            engine.table_fs.storage_service_stats(),
+        ))
+    }
+
+    /// Return point-in-time buffer-pool capacity, allocation, and counters.
+    ///
+    /// This read-only diagnostic remains observable after storage poison while
+    /// engine query admission is still open. Counters are monotonic snapshots
+    /// and callers can compare snapshots to compute deltas.
+    #[inline]
+    pub fn buffer_pool_stats(&self) -> Result<BufferPoolStats> {
+        let engine = self.query_engine("query buffer pool stats")?;
+        Ok(BufferPoolStats {
+            meta: buffer_pool_runtime_stats_snapshot(
+                engine.meta_pool.capacity(),
+                engine.meta_pool.allocated(),
+                engine.meta_pool.stats(),
+            ),
+            mem: buffer_pool_runtime_stats_snapshot(
+                engine.mem_pool.capacity(),
+                engine.mem_pool.allocated(),
+                engine.mem_pool.stats(),
+            ),
+            index: buffer_pool_runtime_stats_snapshot(
+                engine.index_pool.capacity(),
+                engine.index_pool.allocated(),
+                engine.index_pool.stats(),
+            ),
+            disk: buffer_pool_runtime_stats_snapshot(
+                engine.disk_pool.capacity(),
+                engine.disk_pool.allocated(),
+                engine.disk_pool.stats(),
+            ),
+        })
     }
 
     /// Freeze row pages for an existing user table and return approximate non-deleted rows visited.
@@ -1063,7 +1162,9 @@ fn stale_session_error(id: SessionID, operation: &'static str) -> Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::catalog::tests::{table1, table2};
     use crate::conf::EngineConfig;
+    use crate::error::{ErrorKind, FatalError, OperationError};
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use std::sync::mpsc;
     use std::thread;
@@ -1257,5 +1358,156 @@ pub(crate) mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("waiter should wake after a transaction change");
         waiter.join().expect("waiter thread should finish");
+    }
+
+    #[test]
+    fn test_session_list_table_ids_empty_and_sorted() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+
+            assert_eq!(session.list_table_ids().unwrap(), Vec::<TableID>::new());
+
+            let table_id1 = table2(&engine).await;
+            let table_id2 = table1(&engine).await;
+
+            assert_eq!(
+                session.list_table_ids().unwrap(),
+                vec![table_id1, table_id2]
+            );
+        });
+    }
+
+    #[test]
+    fn test_session_checkpoint_catalog_requires_idle_session() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
+
+            let err = session.checkpoint_catalog().await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_checkpoint_catalog_persists_catalog_state() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let main_dir = root.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(&main_dir)
+                .build()
+                .await
+                .unwrap();
+            let table_id = table1(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            session.checkpoint_catalog().await.unwrap();
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .storage_root(&main_dir)
+                .build()
+                .await
+                .unwrap();
+            assert!(engine.catalog().get_table(table_id).await.is_some());
+        });
+    }
+
+    #[test]
+    fn test_session_overlapping_checkpoint_catalog_calls_complete() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let _table_id = table1(&engine).await;
+            let mut session1 = engine.new_session().unwrap();
+            let mut session2 = engine.new_session().unwrap();
+
+            let (res1, res2) =
+                futures::join!(session1.checkpoint_catalog(), session2.checkpoint_catalog());
+
+            res1.unwrap();
+            res2.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_stats_snapshots_are_monotonic() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+
+            let trx0 = session.transaction_system_stats().unwrap();
+            let storage0 = session.storage_io_stats().unwrap();
+            let pools = session.buffer_pool_stats().unwrap();
+            assert_eq!(trx0.commit_count, 0);
+            assert_eq!(trx0.trx_count, 0);
+            assert_eq!(trx0.log_bytes, 0);
+            assert!(pools.meta.capacity > 0);
+            assert!(pools.mem.capacity > 0);
+            assert!(pools.index.capacity > 0);
+            assert!(pools.disk.capacity > 0);
+
+            let _table_id = table1(&engine).await;
+            let trx1 = session.transaction_system_stats().unwrap();
+            let storage1 = session.storage_io_stats().unwrap();
+            assert!(trx1.commit_count > trx0.commit_count);
+            assert!(trx1.trx_count >= trx0.trx_count);
+            assert!(storage1.backend.submitted_ops >= storage0.backend.submitted_ops);
+            assert!(storage1.table_read_requests >= storage0.table_read_requests);
+            assert!(storage1.pool_read_requests >= storage0.pool_read_requests);
+            assert!(storage1.background_write_requests >= storage0.background_write_requests);
+        });
+    }
+
+    #[test]
+    fn test_session_diagnostics_remain_visible_after_storage_poison() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let table_id = table1(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+
+            assert_eq!(session.list_table_ids().unwrap(), vec![table_id]);
+            assert!(session.transaction_system_stats().is_ok());
+            assert!(session.storage_io_stats().is_ok());
+            assert!(session.buffer_pool_stats().is_ok());
+
+            let err = session.checkpoint_catalog().await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Fatal);
+            assert_eq!(
+                err.downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoWrite)
+            );
+        });
     }
 }

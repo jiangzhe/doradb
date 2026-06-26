@@ -171,21 +171,18 @@ impl ReadonlyBufferPool {
 
     /// Returns total number of frame slots in this pool.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn capacity(&self) -> usize {
         self.size
     }
 
     /// Returns number of currently mapped cache entries.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn allocated(&self) -> usize {
         self.mappings.len()
     }
 
     /// Returns one snapshot of shared readonly-pool access and load counters.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
     pub(crate) fn stats(&self) -> BufferPoolStats {
         self.stats.snapshot()
     }

@@ -108,7 +108,6 @@ impl EvictableBufferPool {
 
     /// Returns one snapshot of evictable-pool access and IO lifecycle counters.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
     pub(crate) fn stats(&self) -> BufferPoolStats {
         self.stats.snapshot()
     }

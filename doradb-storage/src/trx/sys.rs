@@ -899,7 +899,6 @@ impl TransactionSystem {
 
     /// Returns statistics of group commit.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal trx sys stats"))]
     pub(crate) fn trx_sys_stats(&self) -> TrxSysStats {
         let mut stats = TrxSysStats::default();
         let redo_log = &*self.redo_log;

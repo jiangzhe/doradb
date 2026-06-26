@@ -384,6 +384,21 @@ impl Catalog {
             .map(|table| Arc::clone(table.value()))
     }
 
+    /// Return sorted ids for currently loaded user-table runtimes.
+    #[inline]
+    pub(crate) fn list_user_table_ids_now(&self) -> Vec<TableID> {
+        let mut table_ids = self
+            .user_tables
+            .iter()
+            .filter_map(|entry| {
+                let table_id = *entry.key();
+                is_user_obj_id(table_id).then_some(table_id)
+            })
+            .collect::<Vec<_>>();
+        table_ids.sort_by_key(|table_id| table_id.as_u64());
+        table_ids
+    }
+
     /// Acquires the catalog metadata-change gate for future index DDL.
     #[inline]
     pub(crate) async fn begin_metadata_change(&self) -> CatalogMetadataChangeLease<'_> {
