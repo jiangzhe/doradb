@@ -1,7 +1,7 @@
 ---
 id: 000193
 title: Session maintenance interface
-status: proposal
+status: implemented
 created: 2026-06-26
 github_issue: 764
 ---
@@ -62,7 +62,7 @@ impl Session {
 
     pub fn transaction_system_stats(&self) -> Result<TransactionSystemStats>;
     pub fn storage_io_stats(&self) -> Result<StorageIoStats>;
-    pub fn buffer_pool_stats(&self) -> Result<BufferPoolStatsSnapshot>;
+    pub fn buffer_pool_stats(&self) -> Result<BufferPoolStats>;
 }
 ```
 
@@ -121,7 +121,7 @@ pub struct IoBackendStats {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BufferPoolStatsSnapshot {
+pub struct BufferPoolStats {
     pub meta: BufferPoolRuntimeStats,
     pub mem: BufferPoolRuntimeStats,
     pub index: BufferPoolRuntimeStats,
@@ -179,21 +179,22 @@ Mutating maintenance keeps normal healthy-runtime admission:
 ## Plan
 
 1. Add a small public maintenance/stats type module.
-   - Prefer `doradb-storage/src/session/maintenance.rs` only if `session.rs`
-     is split; otherwise add the public types near `session.rs` and re-export
-     them from `lib.rs`.
+   - Add the public stats snapshots in `doradb-storage/src/stats.rs`.
+   - Export both module-path and root-path APIs with `pub mod stats` plus
+     root re-exports from `lib.rs`.
    - Keep the types plain snapshot structs with public fields and no reset or
      mutation API.
 
 2. Add query-admission helpers for poison-observable read-only methods.
    - Add a private helper on `Session`, for example
-     `query_engine(&self, operation: &'static str) -> Result<EngineRef>`, that
-     checks the public session is not closed, upgrades weak engine reachability,
-     and calls `EngineInner::ensure_admission_open_for_query`.
+     `query_session(&self, operation: &'static str) -> Result<SessionQueryPin>`,
+     that checks the public session is not closed, upgrades weak engine
+     reachability, calls `EngineInner::ensure_admission_open_for_query`, and
+     pins the session as still running in `SessionRegistry`.
    - Do not call `Session::pin` or `EngineInner::acquire_admission` from stats
      methods, because those reject storage poison.
-   - Keep these methods failing normally after session close or engine
-     shutdown.
+   - Keep these methods failing normally after session close, engine shutdown,
+     registry removal, or any other stale-session state.
 
 3. Implement `Session::list_table_ids`.
    - Add a crate-private `Catalog::list_user_table_ids_now() -> Vec<TableID>`
@@ -251,10 +252,43 @@ Mutating maintenance keeps normal healthy-runtime admission:
 
 ## Implementation Notes
 
+- Implemented the public `Session` maintenance surface for sorted table-id
+  listing, online catalog checkpoint, transaction-system stats, shared-storage
+  IO stats, and buffer-pool stats.
+- Added public runtime stats snapshots in `doradb-storage/src/stats.rs` and
+  exposed them through both `doradb_storage::stats::*` and root re-exports.
+  The final buffer-pool aggregate type is named `BufferPoolStats` for naming
+  consistency.
+- Added `Session::query_session` for poison-observable read-only diagnostics.
+  It verifies the public handle is not closed, engine query admission remains
+  open, and the session is still present/running in the session registry.
+  Mutating catalog checkpoint still uses normal healthy-runtime admission and
+  rejects active session transactions.
+- Changed catalog checkpoint gating so overlapping checkpoint callers wait for
+  the active checkpoint instead of panicking, and updated the `checkpoint_now`
+  rustdoc to match the serialized behavior.
+- Consolidated buffer-pool snapshot plumbing with the new public stats types,
+  removing the separate internal flat `BufferPoolStats` type while keeping the
+  internal atomic stats handles private.
+- Addressed review and CI findings during implementation: removed the
+  unnecessary public `Session::in_trx` API, documented poison/shutdown behavior
+  on public diagnostics, expanded buffer-pool snapshot test coverage, and made
+  the stats monotonicity test robust to redo-log stats publication occurring
+  after commit waiters are woken.
+- Validation completed:
+  - `cargo nextest run -p doradb-storage` passed with 1058 tests.
+  - `tools/style_audit.rs --diff-base origin/main` passed with 14 branch-diff
+    Rust files checked.
+  - The previously flaky
+    `session::tests::test_session_stats_snapshots_are_monotonic` passed 50
+    consecutive exact runs after the test fix.
+
 ## Impacts
 
 - `doradb-storage/src/session.rs`
   - Add new public methods and private query-admission helper.
+- `doradb-storage/src/stats.rs`
+  - Add public runtime statistics snapshot structs and conversion helpers.
 - `doradb-storage/src/catalog/mod.rs`
   - Add runtime user-table id listing helper.
 - `doradb-storage/src/catalog/checkpoint.rs`
@@ -266,7 +300,7 @@ Mutating maintenance keeps normal healthy-runtime admission:
   `doradb-storage/src/io/backend.rs`
   - Reuse existing stats snapshots through public conversion types.
 - `doradb-storage/src/lib.rs`
-  - Re-export new public stats types if they live outside `session.rs`.
+  - Expose the public `stats` module and re-export the new stats types.
 
 ## Test Cases
 
@@ -290,17 +324,20 @@ Add focused tests covering:
 6. Two overlapping `checkpoint_catalog` calls do not panic; the second waits or
    otherwise completes through the gate.
 7. `transaction_system_stats` returns zero-like counters on a fresh engine and
-   nonzero commit/redo/purge counters after simple committed work where
-   applicable.
+   monotonic snapshots after simple committed work, without requiring immediate
+   redo-log counter advancement from the preceding operation.
 8. `storage_io_stats` and `buffer_pool_stats` return snapshots on a fresh engine
-   and reflect additional read/write activity after basic table operations.
+   and remain monotonic after basic table operations.
 9. Stats/listing methods remain callable after injected storage poison while
    engine admission is still open.
 10. `checkpoint_catalog` fails after injected storage poison because it uses
     normal mutating-operation admission.
+11. Stats/listing methods fail after session close, engine shutdown, and
+    registry removal.
 
 ## Open Questions
 
 None for this task. Future work may add richer operator diagnostics, evictor
 stats, stats reset/delta helpers, or external CLI/admin surfaces, but those are
-intentionally outside this first public `Session` interface.
+intentionally outside this first public `Session` interface and are not tracked
+as actionable follow-ups from this resolve.
