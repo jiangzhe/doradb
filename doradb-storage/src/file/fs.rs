@@ -1573,7 +1573,6 @@ impl FileSystem {
 
     /// Returns one snapshot of shared-storage ingress and scheduler activity.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn storage_service_stats(&self) -> StorageServiceStats {
         self.storage_service_stats.snapshot()
     }

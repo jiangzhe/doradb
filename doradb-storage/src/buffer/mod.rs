@@ -50,6 +50,7 @@ use crate::id::{BlockID, PageID};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentBox;
+use crate::stats::BufferPoolCounters;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,56 +67,6 @@ pub(crate) type PageIOCompletion = Completion<PageID>;
 
 /// Validation callback for one persisted readonly-cache block image.
 pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> Result<()>;
-
-/// Snapshot of buffer-pool access and IO lifecycle counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct BufferPoolStats {
-    /// Number of resident-page accesses satisfied without a miss load.
-    pub(crate) cache_hits: usize,
-    /// Number of logical accesses that missed the resident set.
-    pub(crate) cache_misses: usize,
-    /// Number of miss accesses that joined an existing inflight load.
-    pub(crate) miss_joins: usize,
-    /// Number of read operations queued by the pool.
-    pub(crate) queued_reads: usize,
-    /// Number of read operations accepted into the backend running state.
-    pub(crate) running_reads: usize,
-    /// Number of read operations that reached a terminal state.
-    pub(crate) completed_reads: usize,
-    /// Number of read operations that completed with an error.
-    pub(crate) read_errors: usize,
-    /// Number of write operations queued by the pool.
-    pub(crate) queued_writes: usize,
-    /// Number of write operations accepted into the backend running state.
-    pub(crate) running_writes: usize,
-    /// Number of write operations that reached a terminal state.
-    pub(crate) completed_writes: usize,
-    /// Number of write operations that completed with an error.
-    pub(crate) write_errors: usize,
-}
-
-impl BufferPoolStats {
-    /// Returns the saturating delta from one earlier snapshot.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
-    pub(crate) fn delta_since(self, earlier: BufferPoolStats) -> BufferPoolStats {
-        BufferPoolStats {
-            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
-            cache_misses: self.cache_misses.saturating_sub(earlier.cache_misses),
-            miss_joins: self.miss_joins.saturating_sub(earlier.miss_joins),
-            queued_reads: self.queued_reads.saturating_sub(earlier.queued_reads),
-            running_reads: self.running_reads.saturating_sub(earlier.running_reads),
-            completed_reads: self.completed_reads.saturating_sub(earlier.completed_reads),
-            read_errors: self.read_errors.saturating_sub(earlier.read_errors),
-            queued_writes: self.queued_writes.saturating_sub(earlier.queued_writes),
-            running_writes: self.running_writes.saturating_sub(earlier.running_writes),
-            completed_writes: self
-                .completed_writes
-                .saturating_sub(earlier.completed_writes),
-            write_errors: self.write_errors.saturating_sub(earlier.write_errors),
-        }
-    }
-}
 
 #[derive(Default)]
 struct BufferPoolStatsCounters {
@@ -139,8 +90,8 @@ pub(crate) struct BufferPoolStatsHandle(Arc<BufferPoolStatsCounters>);
 impl BufferPoolStatsHandle {
     /// Returns one point-in-time snapshot of all counters.
     #[inline]
-    pub(crate) fn snapshot(&self) -> BufferPoolStats {
-        BufferPoolStats {
+    pub(crate) fn snapshot(&self) -> BufferPoolCounters {
+        BufferPoolCounters {
             cache_hits: self.0.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.0.cache_misses.load(Ordering::Relaxed),
             miss_joins: self.0.miss_joins.load(Ordering::Relaxed),
@@ -241,11 +192,9 @@ impl BufferPoolStatsHandle {
 /// Abstraction of buffer pool.
 pub(crate) trait BufferPool: Send + Sync {
     /// Returns the maximum number of pages that can be allocated.
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     fn capacity(&self) -> usize;
 
     /// Returns the number of allocated pages.
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     fn allocated(&self) -> usize;
 
     /// Returns a cloneable keepalive guard for this pool.

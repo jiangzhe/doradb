@@ -95,11 +95,9 @@ impl CatalogCheckpointGate {
         loop {
             {
                 let mut state = self.state.lock();
-                if state.metadata_change == CatalogMetadataChangePhase::Open {
-                    assert!(
-                        !state.checkpoint_active,
-                        "concurrent catalog checkpoint is not supported"
-                    );
+                if state.metadata_change == CatalogMetadataChangePhase::Open
+                    && !state.checkpoint_active
+                {
                     state.checkpoint_active = true;
                     return CatalogCheckpointLease { gate: self };
                 }
@@ -107,7 +105,9 @@ impl CatalogCheckpointGate {
             listener!(self.changed => listener);
             {
                 let state = self.state.lock();
-                if state.metadata_change == CatalogMetadataChangePhase::Open {
+                if state.metadata_change == CatalogMetadataChangePhase::Open
+                    && !state.checkpoint_active
+                {
                     continue;
                 }
             }
@@ -256,16 +256,12 @@ impl Catalog {
     ///
     /// # Panics
     ///
-    /// Panics if another checkpoint is already in progress on the same
-    /// shared `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint
-    /// publishes are not supported by design; the underlying
-    /// [`crate::file::cow_file::CowFile`] enforces a single mutable writer via
-    /// an atomic claim and will panic on violation.
+    /// Normal overlapping calls to this method do not panic; they wait for the
+    /// active catalog checkpoint to finish before publishing. A panic indicates
+    /// an internal invariant violation, such as bypassing the checkpoint gate
+    /// and reaching the shared `CatalogStorage`/`MultiTableFile` with multiple
+    /// mutable writers.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "missing catalog checkpoint invocation")
-    )]
     pub(crate) async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
         let batch = self.scan_checkpoint_batch(trx_sys).await?;
@@ -537,6 +533,52 @@ mod tests {
             let metadata_lease = gate.begin_metadata_change().await;
             let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
 
+            assert!(matches!(
+                futures::poll!(checkpoint_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(metadata_lease);
+            let _checkpoint_lease = checkpoint_fut.await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_waits_for_active_checkpoint() {
+        smol::block_on(async {
+            let gate = CatalogCheckpointGate::new();
+            let checkpoint_lease = gate.begin_checkpoint().await;
+            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+
+            assert!(matches!(
+                futures::poll!(checkpoint_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(checkpoint_lease);
+            let _checkpoint_lease = checkpoint_fut.await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_waits_behind_pending_metadata_change() {
+        smol::block_on(async {
+            let gate = CatalogCheckpointGate::new();
+            let checkpoint_lease = gate.begin_checkpoint().await;
+            let mut metadata_fut = Box::pin(gate.begin_metadata_change());
+            assert!(matches!(
+                futures::poll!(metadata_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+            assert!(matches!(
+                futures::poll!(checkpoint_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(checkpoint_lease);
+            let metadata_lease = metadata_fut.await;
             assert!(matches!(
                 futures::poll!(checkpoint_fut.as_mut()),
                 std::task::Poll::Pending

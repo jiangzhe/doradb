@@ -2242,6 +2242,7 @@ mod tests {
     };
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner};
+    use crate::session::tests::SessionTestExt;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
     use crate::value::Val;

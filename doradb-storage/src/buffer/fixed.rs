@@ -4,13 +4,13 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
 use crate::buffer::page::{BufferPage, Page, VersionedPageID, validate_frame_page_kind};
 use crate::buffer::{
-    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole,
-    RowPoolRole,
+    BufferPool, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole, RowPoolRole,
 };
 use crate::error::Validation::Valid;
 use crate::error::{Error, ResourceError, Result, Validation};
 use crate::id::PageID;
 use crate::latch::LatchFallbackMode;
+use crate::stats::BufferPoolCounters;
 use error_stack::Report;
 use std::mem;
 
@@ -60,8 +60,7 @@ impl FixedBufferPool {
 
     /// Returns one snapshot of fixed-pool access counters.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
-    pub(crate) fn stats(&self) -> BufferPoolStats {
+    pub(crate) fn stats(&self) -> BufferPoolCounters {
         self.stats.snapshot()
     }
 

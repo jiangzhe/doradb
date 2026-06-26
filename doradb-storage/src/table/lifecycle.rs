@@ -718,6 +718,7 @@ fn begin_drop_metadata_active_err(table_id: TableID) -> Error {
 mod tests {
     use super::*;
     use crate::id::TrxID;
+    use crate::session::tests::SessionTestExt;
     use crate::table::tests::*;
     use crate::table::{CheckpointOutcome, CheckpointReadiness};
     use crate::value::Val;
