@@ -1060,7 +1060,9 @@ where
                     ready,
                     failure,
                 } => {
-                    drop(log_file.take());
+                    if log_file.take().is_some() {
+                        *ready = true;
+                    }
                     if let Some(mut submission) = write.take() {
                         let _ = submission.operation.take_buf();
                         *ready = true;
@@ -4115,6 +4117,53 @@ mod tests {
             assert_eq!(ready.failed.len(), 2);
             assert_eq!(ready.failed[0].max_cts, TrxID::new(31));
             assert_eq!(ready.failed[1].max_cts, TrxID::new(32));
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_fail_prefix_entries_marks_unprepared_seal_ready() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("prefix_failed_unprepared_seal", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let ended_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_failed_seal_ended_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let active_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_failed_seal_active_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let ended_log_file = create_log_file_for_test(&ended_prefix, 0, 128 * 1024, 4096);
+            let (header_write, header_completion) = LogWriteSubmission::header(
+                ended_log_file.as_raw_fd(),
+                0,
+                DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE),
+            );
+            let (redo_log, _initial_header) = finish_redo_log_for_test(active_prefix, 1);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut writer =
+                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+
+            writer.prefix.push_header(header_write);
+            writer.prefix.push_seal(ended_log_file);
+            writer.fail_prefix_entries(FatalError::RedoWrite);
+            writer.finalize_finished_prefix(&mut sealer);
+
+            assert!(writer.prefix.is_empty());
+            assert!(header_completion.completed_result().unwrap().is_err());
 
             drop(harness);
             engine.shutdown().unwrap();
