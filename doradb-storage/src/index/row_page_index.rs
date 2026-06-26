@@ -2054,7 +2054,7 @@ mod tests {
             let file_prefix = file_prefix.to_str().unwrap();
             let logs = discover_redo_log_files(file_prefix, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
-            let (_, mut stream) = planner.plan_stream(TrxID::new(0), 1).unwrap();
+            let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
             while let Some(log) = stream.try_next().await.unwrap() {
                 if let Some(ddl) = log.payload.ddl.as_deref()
                     && matches!(

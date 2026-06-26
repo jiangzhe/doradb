@@ -88,12 +88,15 @@ impl LogPrefixTracker {
     }
 
     #[inline]
-    pub(super) fn push_seal_dispatch(&mut self, log_file: RedoLogFile) {
+    pub(super) fn push_seal(&mut self, log_file: RedoLogFile) {
         let id = self.alloc_id();
         self.entries.push_back(LogPrefixEntry {
             id,
-            kind: LogPrefixKind::SealDispatch {
+            kind: LogPrefixKind::Seal {
                 log_file: Some(log_file),
+                write: None,
+                ready: false,
+                failure: None,
             },
         });
     }
@@ -106,10 +109,10 @@ impl LogPrefixTracker {
     }
 
     #[inline]
-    pub(super) fn entry_mut(&mut self, entry_id: LogPrefixId) -> Option<&mut LogPrefixEntry> {
-        let idx = entry_id.raw().checked_sub(self.front_id.raw())? as usize;
+    pub(super) fn entry_mut(&mut self, prefix_id: LogPrefixId) -> Option<&mut LogPrefixEntry> {
+        let idx = prefix_id.raw().checked_sub(self.front_id.raw())? as usize;
         let entry = self.entries.get_mut(idx)?;
-        (entry.id == entry_id).then_some(entry)
+        (entry.id == prefix_id).then_some(entry)
     }
 
     #[inline]
@@ -134,7 +137,12 @@ impl LogPrefixTracker {
                     usize::from(write.is_none() && !ready)
                 }
                 LogPrefixKind::Group { group } => group.outstanding_requests,
-                LogPrefixKind::SealDispatch { .. } => 0,
+                LogPrefixKind::Seal {
+                    log_file,
+                    write,
+                    ready,
+                    ..
+                } => usize::from(log_file.is_none() && write.is_none() && !ready),
             })
             .sum()
     }
@@ -162,11 +170,23 @@ pub(super) enum LogPrefixKind {
     },
     /// Commit group waiting for its redo write and ordered publication.
     Group { group: SyncGroup },
-    /// Marker that dispatches asynchronous sealing for a rotated-out file.
+    /// Mandatory rotated-file seal barrier.
     ///
-    /// The seal itself does not block publication of the next file's header;
-    /// the marker only preserves prefix order for handing the old file to the sealer.
-    SealDispatch { log_file: Option<RedoLogFile> },
+    /// The seal write is prepared once this entry reaches the ordered prefix
+    /// front, after all older file-local groups have recorded seal metadata.
+    /// Later header/data writes may still be submitted while this entry is
+    /// waiting for its write and configured sync, but publication remains
+    /// blocked until `ready` is true.
+    Seal {
+        /// Rotated-out file waiting for seal metadata accumulation.
+        log_file: Option<RedoLogFile>,
+        /// Pending inactive-slot seal write before driver submission.
+        write: Option<LogWriteSubmission>,
+        /// Whether the seal write and configured sync have completed.
+        ready: bool,
+        /// Fatal write or sync failure reported when the barrier completes.
+        failure: Option<FatalError>,
+    },
 }
 
 #[cfg(test)]

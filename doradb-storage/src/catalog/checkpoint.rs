@@ -331,7 +331,9 @@ impl Catalog {
             return Ok(batch);
         }
         let planner = RedoReplayPlanner::new(logs);
-        let (_, mut stream) = planner.plan_stream(replay_start_ts, scan_cfg.read_ahead_depth)?;
+        let mut stream = planner
+            .plan_recovery(replay_start_ts, scan_cfg.read_ahead_depth)?
+            .stream;
 
         while let Some(log) = stream.try_next().await? {
             let (header, redo) = log.into_inner();

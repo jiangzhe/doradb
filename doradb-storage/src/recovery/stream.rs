@@ -31,7 +31,7 @@ enum ReadGroup {
     /// The current segment is exhausted; the next item should be another segment or stream end.
     SegmentExhausted,
     /// The replay stream reached logical EOF.
-    ReplayEof,
+    ReplayEof(Option<UnsealedSegmentTerminal>),
     /// A transaction log iterator assembled from CRC32-validated redo blocks.
     Group(TrxLogIterator),
 }
@@ -39,6 +39,41 @@ enum ReadGroup {
 enum ContinuationRead {
     Appended,
     IncompleteTail,
+}
+
+enum GroupStartRead {
+    Group(ValidatedGroupStart),
+    UnsealedTail(UnsealedSegmentTerminalReason),
+}
+
+/// Terminal condition accepted for an unsealed redo segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsealedSegmentTerminalReason {
+    /// An all-zero block was found while looking for the next group start.
+    ZeroTail,
+    /// A malformed group-start block ended the accepted prefix.
+    MalformedGroupStartTail,
+    /// A multi-block group had an incomplete unsealed continuation tail.
+    IncompleteContinuationTail,
+    /// The scan reached the open file's configured end.
+    ScanEndExhausted,
+}
+
+/// Accepted durable-prefix metadata for one unsealed segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnsealedSegmentTerminal {
+    /// Full path to the redo log file.
+    pub(crate) path: PathBuf,
+    /// Sequence number parsed from the file name.
+    pub(crate) file_seq: u32,
+    /// Selected open super-block used as the repair base.
+    pub(crate) super_block: RedoSuperBlock,
+    /// Accepted durable end offset before the terminal tail.
+    pub(crate) accepted_end_offset: usize,
+    /// Real redo CTS range from structurally complete accepted groups.
+    pub(crate) redo_range: Option<(TrxID, TrxID)>,
+    /// Tail condition that ended the accepted prefix.
+    pub(crate) terminal_reason: UnsealedSegmentTerminalReason,
 }
 
 /// Iterator over transaction redo records inside one validated redo group.
@@ -188,38 +223,26 @@ impl RedoReplayPlanner {
         Self { discovered }
     }
 
-    /// Return the sequence for the next writable redo file after this family.
+    /// Build a startup recovery stream and post-replay repair policy.
     #[inline]
-    pub(crate) fn next_file_seq(&self) -> Result<Option<u32>> {
-        self.discovered
-            .last()
-            .map(|descriptor| next_redo_file_seq(descriptor.file_seq))
-            .transpose()
-    }
-
-    /// Build an independently consumable redo stream for a replay floor.
-    #[inline]
-    pub(crate) fn plan_stream(
+    pub(crate) fn plan_recovery(
         &self,
         floor: TrxID,
         read_depth: usize,
-    ) -> Result<(Option<TrxID>, RedoLogStream)> {
-        let mut suffix = Vec::new();
-        for descriptor in self.discovered.iter().rev() {
-            let segment = RedoLogSegment::from_descriptor(descriptor.clone())?;
-            let stop = segment
-                .sealed_redo_range()
-                .is_some_and(|(min_redo_cts, _)| min_redo_cts < floor);
-            suffix.push(segment);
-            if stop {
-                break;
+    ) -> Result<PlannedRedoRecovery> {
+        let suffix = self.load_replay_suffix(floor)?;
+        let repair_policy = self.repair_policy_for_segments(&suffix)?;
+        let stream_segments = match repair_policy {
+            RedoRecoveryRepairPolicy::FinalTwoUnsealed { .. } => {
+                &suffix[..suffix.len().saturating_sub(1)]
             }
-        }
-        suffix.reverse();
+            RedoRecoveryRepairPolicy::CreateNext { .. }
+            | RedoRecoveryRepairPolicy::SingleFinalUnsealed { .. } => &suffix[..],
+        };
 
         let mut skipped_max = None::<TrxID>;
         let mut segments = Vec::new();
-        for segment in suffix {
+        for segment in stream_segments.iter().cloned() {
             if segment.sealed_empty() {
                 continue;
             }
@@ -233,11 +256,96 @@ impl RedoReplayPlanner {
             segments.push(segment);
         }
 
-        Ok((
-            skipped_max,
-            RedoLogStream::from_planned_segments(segments, read_depth),
-        ))
+        Ok(PlannedRedoRecovery {
+            skipped_max_recovered_cts: skipped_max,
+            stream: RedoLogStream::from_planned_segments(segments, read_depth),
+            repair_policy,
+        })
     }
+
+    #[inline]
+    fn load_replay_suffix(&self, floor: TrxID) -> Result<Vec<RedoLogSegment>> {
+        let mut suffix = Vec::new();
+        for descriptor in self.discovered.iter().rev() {
+            let segment = RedoLogSegment::from_descriptor(descriptor.clone())?;
+            let stop = segment
+                .sealed_redo_range()
+                .is_some_and(|(min_redo_cts, _)| min_redo_cts < floor);
+            suffix.push(segment);
+            if stop {
+                break;
+            }
+        }
+        suffix.reverse();
+        Ok(suffix)
+    }
+
+    #[inline]
+    fn repair_policy_for_segments(
+        &self,
+        segments: &[RedoLogSegment],
+    ) -> Result<RedoRecoveryRepairPolicy> {
+        let Some(last) = segments.last() else {
+            return Ok(RedoRecoveryRepairPolicy::CreateNext { file_seq: 0 });
+        };
+        let unsealed_positions = segments
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, segment)| (!segment.super_block.is_sealed()).then_some(idx))
+            .collect::<Vec<_>>();
+        // Unsealed redo files are accepted only as the crash tail of the
+        // selected replay suffix. A sealed file after an unsealed file proves
+        // the older open header was stale or incomplete, so that shape is
+        // corruption instead of a repair candidate.
+        match unsealed_positions.as_slice() {
+            [] => Ok(RedoRecoveryRepairPolicy::CreateNext {
+                file_seq: next_redo_file_seq(last.file_seq)?,
+            }),
+            // Normal crash tail: the final file is open, so replay its accepted
+            // prefix and then either seal it or recreate it after recovery.
+            [idx] if *idx + 1 == segments.len() => {
+                Ok(RedoRecoveryRepairPolicy::SingleFinalUnsealed {
+                    file_seq: last.file_seq,
+                })
+            }
+            // Rotation crash tail: the previous file may have durable redo that
+            // was not sealed yet, while the newest file is the untrusted active
+            // tail and must not be replayed.
+            [older_idx, newest_idx]
+                if *older_idx + 2 == segments.len() && *newest_idx + 1 == segments.len() =>
+            {
+                Ok(RedoRecoveryRepairPolicy::FinalTwoUnsealed {
+                    older_file_seq: segments[*older_idx].file_seq,
+                    newest_file_seq: segments[*newest_idx].file_seq,
+                })
+            }
+            _ => Err(log_file_corrupted()),
+        }
+    }
+}
+
+/// Complete redo startup plan: stream plus post-replay repair policy.
+pub(crate) struct PlannedRedoRecovery {
+    /// Highest CTS from sealed skipped segments below the replay floor.
+    pub(crate) skipped_max_recovered_cts: Option<TrxID>,
+    /// Stream over the planned durable redo prefix.
+    pub(crate) stream: RedoLogStream,
+    /// Repair and writable-file policy to apply after stream replay.
+    pub(crate) repair_policy: RedoRecoveryRepairPolicy,
+}
+
+/// Post-replay recovery repair and runtime active-file policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedoRecoveryRepairPolicy {
+    /// No unsealed tail participates in startup; create this next file.
+    CreateNext { file_seq: u32 },
+    /// Exactly one final unsealed file was scanned.
+    SingleFinalUnsealed { file_seq: u32 },
+    /// A crash rotation left previous and newest files unsealed.
+    FinalTwoUnsealed {
+        older_file_seq: u32,
+        newest_file_seq: u32,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -257,6 +365,8 @@ pub(crate) struct RedoLogStream {
     buffer: VecDeque<TrxLog>,
     /// Terminal state for the logical stream.
     state: RedoLogStreamState,
+    /// Accepted-prefix metadata for scanned unsealed segments.
+    unsealed_terminals: Vec<UnsealedSegmentTerminal>,
 }
 
 impl RedoLogStream {
@@ -278,6 +388,7 @@ impl RedoLogStream {
             current_segment: None,
             buffer: VecDeque::new(),
             state,
+            unsealed_terminals: Vec::new(),
         }
     }
 
@@ -341,7 +452,10 @@ impl RedoLogStream {
                 ReadGroup::SegmentExhausted => {
                     self.current_segment = None;
                 }
-                ReadGroup::ReplayEof => {
+                ReadGroup::ReplayEof(terminal) => {
+                    if let Some(terminal) = terminal {
+                        self.unsealed_terminals.push(terminal);
+                    }
                     self.end_stream();
                     return Ok(None);
                 }
@@ -383,10 +497,11 @@ impl RedoLogStream {
             .recv_expected_block(state.file_seq, state.offset)
             .await?;
         let group_start = match state.read_group_start(first_block.as_bytes()) {
-            Ok(Some(group_start)) => group_start,
-            Ok(None) => {
+            Ok(GroupStartRead::Group(group_start)) => group_start,
+            Ok(GroupStartRead::UnsealedTail(reason)) => {
+                let terminal = state.unsealed_terminal(reason);
                 self.recycle_buf(first_block);
-                return Ok(ReadGroup::ReplayEof);
+                return Ok(ReadGroup::ReplayEof(Some(terminal)));
             }
             Err(err) => {
                 self.recycle_buf(first_block);
@@ -404,7 +519,12 @@ impl RedoLogStream {
         };
         if group_end_offset > state.scan_end_offset {
             self.recycle_buf(first_block);
-            return Err(log_file_corrupted());
+            if state.sealed.is_some() {
+                return Err(log_file_corrupted());
+            }
+            return Ok(ReadGroup::ReplayEof(Some(state.unsealed_terminal(
+                UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+            ))));
         }
 
         let mut payload = Vec::with_capacity(group_start.payload_len);
@@ -443,7 +563,11 @@ impl RedoLogStream {
             self.recycle_buf(block);
             match append_res? {
                 ContinuationRead::Appended => {}
-                ContinuationRead::IncompleteTail => return Ok(ReadGroup::ReplayEof),
+                ContinuationRead::IncompleteTail => {
+                    return Ok(ReadGroup::ReplayEof(Some(state.unsealed_terminal(
+                        UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+                    ))));
+                }
             }
         }
 
@@ -543,6 +667,12 @@ impl RedoLogStream {
         Report::new(InternalError::Generic)
             .attach("redo stream read after terminal error")
             .into()
+    }
+
+    /// Take accepted-prefix metadata for unsealed segments observed by this stream.
+    #[inline]
+    pub(crate) fn take_unsealed_terminals(&mut self) -> Vec<UnsealedSegmentTerminal> {
+        take(&mut self.unsealed_terminals)
     }
 }
 
@@ -899,11 +1029,23 @@ impl RedoReadAheadWorker {
 
 #[derive(Debug)]
 struct SegmentReadState {
+    path: PathBuf,
     file_seq: u32,
+    super_block: RedoSuperBlock,
     log_block_size: usize,
     scan_end_offset: usize,
     sealed: Option<SealedReplayState>,
     offset: usize,
+    /// Lowest CTS from structurally complete groups accepted in this segment.
+    ///
+    /// For unsealed files this becomes repair metadata: recovery writes the
+    /// real accepted redo range into the sealed super-block after replay.
+    accepted_min_cts: Option<TrxID>,
+    /// Highest CTS from structurally complete groups accepted in this segment.
+    ///
+    /// Stays `None` with `accepted_min_cts` when the unsealed prefix contains
+    /// no complete redo group, allowing recovery to recreate the empty tail.
+    accepted_max_cts: Option<TrxID>,
 }
 
 impl SegmentReadState {
@@ -915,11 +1057,15 @@ impl SegmentReadState {
             .is_sealed()
             .then(|| SealedReplayState::new(segment.super_block.sealed_redo_range()));
         Ok(Self {
+            path: segment.path,
             file_seq: segment.file_seq,
+            super_block: segment.super_block.clone(),
             log_block_size: segment.super_block.log_block_size as usize,
             scan_end_offset,
             sealed,
             offset: REDO_DEFAULT_DATA_START_OFFSET,
+            accepted_min_cts: None,
+            accepted_max_cts: None,
         })
     }
 
@@ -936,61 +1082,83 @@ impl SegmentReadState {
         if !self.validate_sealed_end() {
             return Err(log_file_corrupted());
         }
+        if self.sealed.is_none() {
+            return Ok(Some(ReadGroup::ReplayEof(Some(self.unsealed_terminal(
+                UnsealedSegmentTerminalReason::ScanEndExhausted,
+            )))));
+        }
         Ok(Some(ReadGroup::SegmentExhausted))
     }
 
     #[inline]
-    fn read_group_start(&self, block: &[u8]) -> Result<Option<ValidatedGroupStart>> {
+    fn read_group_start(&self, block: &[u8]) -> Result<GroupStartRead> {
         debug_assert!(self.offset.is_multiple_of(STORAGE_SECTOR_SIZE));
         if is_zero_redo_block(block) {
-            if self.sealed.is_some() {
-                return Err(log_file_corrupted());
-            }
-            return Ok(None);
+            return self.group_start_tail(UnsealedSegmentTerminalReason::ZeroTail);
         }
         let Ok((idx, header)) = RedoBlockHeader::deser(block, 0) else {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         };
         debug_assert_eq!(idx, RedoBlockHeader::SIZE);
         if header.verify_checksum(block).is_err()
             || header.validate(self.log_block_size).is_err()
             || !header.is_group_start()
         {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         }
         let Ok((extension_end, extension)) = RedoGroupStartExtension::deser(block, idx) else {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         };
         debug_assert_eq!(
             extension_end,
             RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE
         );
         if extension.validate().is_err() {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         }
         let Ok(payload_len) = extension.group_payload_len_usize() else {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         };
         let Ok(expected_block_count) = block_count_for_payload(self.log_block_size, payload_len)
         else {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         };
         let block_count = extension.group_block_count_usize();
         if expected_block_count != block_count {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         }
         if block_count == 1 && !header.is_group_end() {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         }
         if block_count > 1 && header.is_group_end() {
-            return Err(log_file_corrupted());
+            return self.malformed_group_start_tail();
         }
-        Ok(Some(ValidatedGroupStart {
+        Ok(GroupStartRead::Group(ValidatedGroupStart {
             header,
             extension,
             block_count,
             payload_len,
         }))
+    }
+
+    #[inline]
+    fn malformed_group_start_tail(&self) -> Result<GroupStartRead> {
+        // Malformed group-start bytes can be the crash tail of an unsealed
+        // file. Only sealed files report corruption here because their durable
+        // end offset says another complete group start must exist.
+        self.group_start_tail(UnsealedSegmentTerminalReason::MalformedGroupStartTail)
+    }
+
+    #[inline]
+    fn group_start_tail(&self, reason: UnsealedSegmentTerminalReason) -> Result<GroupStartRead> {
+        // At group-start boundaries, zero or malformed blocks terminate only an
+        // unsealed file. Sealed files already published their durable byte
+        // range, so encountering such a tail inside that range is corruption.
+        if self.sealed.is_some() {
+            Err(log_file_corrupted())
+        } else {
+            Ok(GroupStartRead::UnsealedTail(reason))
+        }
     }
 
     #[inline]
@@ -1041,6 +1209,7 @@ impl SegmentReadState {
         payload: Vec<u8>,
     ) -> Result<ReadGroup> {
         let extension = group_start.extension;
+        self.record_accepted_group(extension.min_redo_cts, extension.max_redo_cts);
         if let Some(sealed) = self.sealed.as_mut() {
             sealed.record_group(extension.min_redo_cts, extension.max_redo_cts);
         }
@@ -1061,6 +1230,39 @@ impl SegmentReadState {
             Err(log_file_corrupted())
         } else {
             Ok(ContinuationRead::IncompleteTail)
+        }
+    }
+
+    #[inline]
+    fn record_accepted_group(&mut self, min_redo_cts: TrxID, max_redo_cts: TrxID) {
+        self.accepted_min_cts = Some(
+            self.accepted_min_cts
+                .map_or(min_redo_cts, |current| current.min(min_redo_cts)),
+        );
+        self.accepted_max_cts = Some(
+            self.accepted_max_cts
+                .map_or(max_redo_cts, |current| current.max(max_redo_cts)),
+        );
+    }
+
+    #[inline]
+    fn accepted_redo_range(&self) -> Option<(TrxID, TrxID)> {
+        self.accepted_min_cts.zip(self.accepted_max_cts)
+    }
+
+    #[inline]
+    fn unsealed_terminal(
+        &self,
+        terminal_reason: UnsealedSegmentTerminalReason,
+    ) -> UnsealedSegmentTerminal {
+        debug_assert!(self.sealed.is_none());
+        UnsealedSegmentTerminal {
+            path: self.path.clone(),
+            file_seq: self.file_seq,
+            super_block: self.super_block.clone(),
+            accepted_end_offset: self.offset,
+            redo_range: self.accepted_redo_range(),
+            terminal_reason,
         }
     }
 }
@@ -1308,9 +1510,9 @@ mod tests {
         let descriptor =
             write_stream_log_file(path, log_block_size, data_block_count, blocks, seal);
         let planner = RedoReplayPlanner::new(vec![descriptor]);
-        let (skipped_max_recovered_cts, stream) = planner.plan_stream(TrxID::new(0), 1).unwrap();
-        assert_eq!(skipped_max_recovered_cts, None);
-        stream
+        let planned = planner.plan_recovery(TrxID::new(0), 1).unwrap();
+        assert_eq!(planned.skipped_max_recovered_cts, None);
+        planned.stream
     }
 
     fn injected_segment(data_block_count: usize) -> RedoLogSegment {
@@ -1341,6 +1543,7 @@ mod tests {
             current_segment: None,
             buffer: VecDeque::new(),
             state: RedoLogStreamState::Active,
+            unsealed_terminals: Vec::new(),
         }
     }
 
@@ -1379,6 +1582,20 @@ mod tests {
             Some(DataIntegrityError::LogFileCorrupted),
             "{err:?}"
         );
+    }
+
+    async fn assert_unsealed_terminal(
+        stream: &mut RedoLogStream,
+        terminal_reason: UnsealedSegmentTerminalReason,
+        accepted_end_offset: usize,
+        redo_range: Option<(TrxID, TrxID)>,
+    ) {
+        assert!(stream.try_next().await.unwrap().is_none());
+        let terminals = stream.take_unsealed_terminals();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].terminal_reason, terminal_reason);
+        assert_eq!(terminals[0].accepted_end_offset, accepted_end_offset);
+        assert_eq!(terminals[0].redo_range, redo_range);
     }
 
     fn assert_read_after_failed(err: Error) {
@@ -1457,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_stream_rejects_unsealed_group_crossing_segment_end() {
+    fn test_direct_stream_treats_unsealed_group_crossing_segment_end_as_incomplete_tail() {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let file_path = dir.path().join("test.log");
@@ -1470,7 +1687,13 @@ mod tests {
                 TestSegmentSeal::Open,
             );
 
-            assert_stream_corrupted(&mut stream).await;
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+                REDO_DEFAULT_DATA_START_OFFSET,
+                None,
+            )
+            .await;
         });
     }
 
@@ -1488,7 +1711,13 @@ mod tests {
                 TestSegmentSeal::Open,
             );
 
-            assert!(stream.try_next().await.unwrap().is_none());
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+                REDO_DEFAULT_DATA_START_OFFSET,
+                None,
+            )
+            .await;
         });
     }
 
@@ -1506,7 +1735,13 @@ mod tests {
                 TestSegmentSeal::Open,
             );
 
-            assert!(stream.try_next().await.unwrap().is_none());
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+                REDO_DEFAULT_DATA_START_OFFSET,
+                None,
+            )
+            .await;
         });
     }
 
@@ -1523,12 +1758,18 @@ mod tests {
                 TestSegmentSeal::Open,
             );
 
-            assert!(stream.try_next().await.unwrap().is_none());
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::ZeroTail,
+                REDO_DEFAULT_DATA_START_OFFSET,
+                None,
+            )
+            .await;
         });
     }
 
     #[test]
-    fn test_direct_stream_rejects_nonzero_empty_group_header() {
+    fn test_direct_stream_treats_unsealed_nonzero_empty_group_header_as_tail() {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let file_path = dir.path().join("test.log");
@@ -1542,7 +1783,150 @@ mod tests {
                 TestSegmentSeal::Open,
             );
 
-            assert_stream_corrupted(&mut stream).await;
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::MalformedGroupStartTail,
+                REDO_DEFAULT_DATA_START_OFFSET,
+                None,
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_reports_unsealed_accepted_prefix_metadata() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let valid =
+                block_group_with_range(simple_trx_log(TrxID::new(5)), TrxID::new(4), TrxID::new(6));
+            let mut malformed_tail = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
+            malformed_tail.as_bytes_mut()[0] = 1;
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                2,
+                &[valid, malformed_tail],
+                TestSegmentSeal::Open,
+            );
+
+            let recovered = stream.try_next().await.unwrap().unwrap();
+            assert_eq!(recovered.header.cts, TrxID::new(5));
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::MalformedGroupStartTail,
+                REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                Some((TrxID::new(4), TrxID::new(6))),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_replay_planner_rejects_three_unsealed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptors = (0..3)
+            .map(|seq| {
+                write_stream_log_file_with_seq(
+                    &dir.path().join(format!("redo.{seq:08x}")),
+                    seq,
+                    STORAGE_SECTOR_SIZE,
+                    1,
+                    &[],
+                    TestSegmentSeal::Open,
+                )
+            })
+            .collect::<Vec<_>>();
+        let planner = RedoReplayPlanner::new(descriptors);
+
+        let err = match planner.plan_recovery(TrxID::new(0), 1) {
+            Ok(_) => panic!("three unsealed redo files must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::LogFileCorrupted)
+        );
+    }
+
+    #[test]
+    fn test_replay_planner_rejects_unsealed_before_sealed_newer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = write_stream_log_file_with_seq(
+            &dir.path().join("redo.00000000"),
+            0,
+            STORAGE_SECTOR_SIZE,
+            1,
+            &[],
+            TestSegmentSeal::Open,
+        );
+        let sealed = write_stream_log_file_with_seq(
+            &dir.path().join("redo.00000001"),
+            1,
+            STORAGE_SECTOR_SIZE,
+            1,
+            &[],
+            TestSegmentSeal::Sealed {
+                durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET,
+                redo_range: None,
+            },
+        );
+        let planner = RedoReplayPlanner::new(vec![open, sealed]);
+
+        let err = match planner.plan_recovery(TrxID::new(0), 1) {
+            Ok(_) => panic!("unsealed redo file before sealed newer file must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::LogFileCorrupted)
+        );
+    }
+
+    #[test]
+    fn test_replay_planner_final_two_unsealed_skips_newest_tail() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let older_block =
+                block_group_with_range(simple_trx_log(TrxID::new(5)), TrxID::new(5), TrxID::new(5));
+            let older = write_stream_log_file_with_seq(
+                &dir.path().join("redo.00000000"),
+                0,
+                STORAGE_SECTOR_SIZE,
+                2,
+                &[older_block],
+                TestSegmentSeal::Open,
+            );
+            let newest_block =
+                block_group_with_range(simple_trx_log(TrxID::new(9)), TrxID::new(9), TrxID::new(9));
+            let newest = write_stream_log_file_with_seq(
+                &dir.path().join("redo.00000001"),
+                1,
+                STORAGE_SECTOR_SIZE,
+                2,
+                &[newest_block],
+                TestSegmentSeal::Open,
+            );
+            let planner = RedoReplayPlanner::new(vec![older, newest]);
+            let planned = planner.plan_recovery(TrxID::new(0), 1).unwrap();
+            assert_eq!(
+                planned.repair_policy,
+                RedoRecoveryRepairPolicy::FinalTwoUnsealed {
+                    older_file_seq: 0,
+                    newest_file_seq: 1
+                }
+            );
+            let mut stream = planned.stream;
+
+            let recovered = stream.try_next().await.unwrap().unwrap();
+            assert_eq!(recovered.header.cts, TrxID::new(5));
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::ZeroTail,
+                REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                Some((TrxID::new(5), TrxID::new(5))),
+            )
+            .await;
         });
     }
 
@@ -1560,7 +1944,10 @@ mod tests {
                 STORAGE_SECTOR_SIZE,
                 1,
                 &[corrupt_block],
-                TestSegmentSeal::Open,
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
+                },
             );
             let valid_block =
                 block_group_with_range(simple_trx_log(TrxID::new(9)), TrxID::new(9), TrxID::new(9));
@@ -1570,12 +1957,15 @@ mod tests {
                 STORAGE_SECTOR_SIZE,
                 1,
                 &[valid_block],
-                TestSegmentSeal::Open,
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(9), TrxID::new(9))),
+                },
             );
             let planner = RedoReplayPlanner::new(vec![corrupt, valid]);
-            let (skipped_max_recovered_cts, mut stream) =
-                planner.plan_stream(TrxID::new(0), 1).unwrap();
-            assert_eq!(skipped_max_recovered_cts, None);
+            let planned = planner.plan_recovery(TrxID::new(0), 1).unwrap();
+            assert_eq!(planned.skipped_max_recovered_cts, None);
+            let mut stream = planned.stream;
 
             assert_stream_corrupted(&mut stream).await;
             let err = stream.try_next().await.unwrap_err();
@@ -1626,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_stream_rejects_bad_checksum_before_body_parsing() {
+    fn test_direct_stream_treats_unsealed_bad_group_start_checksum_as_tail() {
         smol::block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let file_path = dir.path().join("test.log");
@@ -1640,6 +2030,36 @@ mod tests {
                 1,
                 &[direct_buf],
                 TestSegmentSeal::Open,
+            );
+
+            assert_unsealed_terminal(
+                &mut stream,
+                UnsealedSegmentTerminalReason::MalformedGroupStartTail,
+                REDO_DEFAULT_DATA_START_OFFSET,
+                None,
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_direct_stream_rejects_sealed_bad_group_start_checksum() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("test.log");
+            let mut direct_buf =
+                block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
+            let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
+            direct_buf.as_bytes_mut()[payload_start] ^= 0x80;
+            let mut stream = stream_for_test_file(
+                &file_path,
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[direct_buf],
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
+                },
             );
 
             assert_stream_corrupted(&mut stream).await;
@@ -1969,7 +2389,10 @@ mod tests {
                 STORAGE_SECTOR_SIZE,
                 1,
                 &[first],
-                TestSegmentSeal::Open,
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
+                },
             );
             let second_descriptor = write_stream_log_file_with_seq(
                 &second_path,
@@ -1977,12 +2400,15 @@ mod tests {
                 second_block_size,
                 1,
                 &[second],
-                TestSegmentSeal::Open,
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + second_block_size,
+                    redo_range: Some((TrxID::new(2), TrxID::new(2))),
+                },
             );
             let planner = RedoReplayPlanner::new(vec![first_descriptor, second_descriptor]);
-            let (skipped_max_recovered_cts, mut stream) =
-                planner.plan_stream(TrxID::new(0), 2).unwrap();
-            assert_eq!(skipped_max_recovered_cts, None);
+            let planned = planner.plan_recovery(TrxID::new(0), 2).unwrap();
+            assert_eq!(planned.skipped_max_recovered_cts, None);
+            let mut stream = planned.stream;
 
             let first = stream.try_next().await.unwrap().unwrap();
             let second = stream.try_next().await.unwrap().unwrap();

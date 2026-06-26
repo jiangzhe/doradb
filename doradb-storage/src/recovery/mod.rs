@@ -26,15 +26,16 @@ use crate::catalog::{
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
-use crate::log::RedoLogInitializer;
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
+use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::{FastHashMap, FastHashSet};
+use crate::recovery::stream::PlannedRedoRecovery;
 use crate::row::RowPage;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::purge::DroppedTableFileDeleteItem;
-use stream::RedoReplayPlanner;
+use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
 use error_stack::Report;
 pub(crate) use resources::{RecoveryBuffers, RecoveryResources};
@@ -57,8 +58,8 @@ pub(crate) struct RecoveryCoordinator<'a> {
     redo_planner: RedoReplayPlanner,
     /// Direct-IO read-ahead depth used by startup redo recovery.
     redo_read_depth: usize,
-    /// Value-only initializer for the writable redo log created after recovery.
-    initializer: RedoLogInitializer,
+    /// Value-only finalizer for the writable redo log created after recovery.
+    finalizer: RedoLogFinalizer,
     /// Replay cursors, per-table bounds, and recovered CTS watermark.
     timeline: RecoveryTimeline,
     /// Tables loaded from table-file metadata while catalog index DDL redo is pending.
@@ -77,13 +78,13 @@ impl<'a> RecoveryCoordinator<'a> {
         resources: RecoveryResources<'a>,
         redo_planner: RedoReplayPlanner,
         redo_read_depth: usize,
-        initializer: RedoLogInitializer,
+        finalizer: RedoLogFinalizer,
     ) -> Self {
         RecoveryCoordinator {
             resources,
             redo_planner,
             redo_read_depth,
-            initializer,
+            finalizer,
             timeline: RecoveryTimeline::new(MIN_SNAPSHOT_TS),
             pending_index_ddl_reconciliations: FastHashSet::default(),
             recovered_tables: FastHashMap::default(),
@@ -95,19 +96,24 @@ impl<'a> RecoveryCoordinator<'a> {
     #[inline]
     pub(crate) async fn recover_all(
         mut self,
-    ) -> Result<(TrxID, Vec<DroppedTableFileDeleteItem>, RedoLogInitializer)> {
+    ) -> Result<(TrxID, Vec<DroppedTableFileDeleteItem>, RedoLogFinalizer)> {
         self.bootstrap_checkpointed_user_tables().await?;
-        let (skipped_max_recovered_cts, mut redo_stream) = self
+        let PlannedRedoRecovery {
+            skipped_max_recovered_cts,
+            mut stream,
+            repair_policy,
+        } = self
             .redo_planner
-            .plan_stream(self.timeline.replay_floor, self.redo_read_depth)?;
+            .plan_recovery(self.timeline.replay_floor, self.redo_read_depth)?;
         if let Some(skipped_max_cts) = skipped_max_recovered_cts {
             self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(skipped_max_cts);
         }
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
-        while let Some(log) = redo_stream.try_next().await? {
+        while let Some(log) = stream.try_next().await? {
             self.replay_log(log).await?;
         }
+        let unsealed_terminals = stream.take_unsealed_terminals();
         // 2. Ensure catalog metadata caught up with table-file roots.
         self.validate_loaded_table_metadata().await?;
         // 3. Remove create-table provisional files whose catalog redo never
@@ -116,12 +122,65 @@ impl<'a> RecoveryCoordinator<'a> {
         // 4. Rebuild hot secondary-index state from recovered RowStore pages
         //    and refresh pages to enable undo maps.
         self.recover_indexes_and_refresh_pages().await?;
+        // 5. Repair accepted unsealed redo prefixes and select the runtime
+        //    active file only after replay has succeeded.
+        self.repair_redo_and_prepare_startup(repair_policy, unsealed_terminals)?;
 
         Ok((
             self.timeline.max_recovered_cts,
             self.dropped_table_file_deletes,
-            self.initializer,
+            self.finalizer,
         ))
+    }
+
+    #[inline]
+    fn repair_redo_and_prepare_startup(
+        &mut self,
+        repair_policy: RedoRecoveryRepairPolicy,
+        unsealed_terminals: Vec<UnsealedSegmentTerminal>,
+    ) -> Result<()> {
+        match repair_policy {
+            RedoRecoveryRepairPolicy::CreateNext { file_seq } => {
+                if !unsealed_terminals.is_empty() {
+                    return Err(unexpected_unsealed_terminal_error());
+                }
+                self.finalizer
+                    .set_startup_file(file_seq, RedoLogCreateMode::CreateOrFail);
+            }
+            RedoRecoveryRepairPolicy::SingleFinalUnsealed { file_seq } => {
+                let terminal = take_unsealed_terminal(unsealed_terminals, file_seq)?;
+                if terminal.redo_range.is_some() {
+                    self.queue_recovered_seal(&terminal);
+                    self.finalizer.set_startup_file(
+                        next_redo_file_seq(file_seq)?,
+                        RedoLogCreateMode::CreateOrFail,
+                    );
+                } else {
+                    self.finalizer
+                        .set_startup_file(file_seq, RedoLogCreateMode::CreateOrTrunc);
+                }
+            }
+            RedoRecoveryRepairPolicy::FinalTwoUnsealed {
+                older_file_seq,
+                newest_file_seq,
+            } => {
+                let terminal = take_unsealed_terminal(unsealed_terminals, older_file_seq)?;
+                self.queue_recovered_seal(&terminal);
+                self.finalizer
+                    .set_startup_file(newest_file_seq, RedoLogCreateMode::CreateOrTrunc);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn queue_recovered_seal(&mut self, terminal: &UnsealedSegmentTerminal) {
+        self.finalizer.set_recovered_seal(
+            terminal.path.clone(),
+            terminal.super_block.clone(),
+            terminal.accepted_end_offset,
+            terminal.redo_range,
+        );
     }
 
     async fn bootstrap_checkpointed_user_tables(&mut self) -> Result<()> {
@@ -857,6 +916,28 @@ fn validate_create_table_reloaded_root_ts(
     Ok(())
 }
 
+#[inline]
+fn take_unsealed_terminal(
+    mut terminals: Vec<UnsealedSegmentTerminal>,
+    file_seq: u32,
+) -> Result<UnsealedSegmentTerminal> {
+    if terminals.len() != 1 {
+        return Err(unexpected_unsealed_terminal_error());
+    }
+    let terminal = terminals.pop().expect("terminal length was checked");
+    if terminal.file_seq != file_seq {
+        return Err(unexpected_unsealed_terminal_error());
+    }
+    Ok(terminal)
+}
+
+#[inline]
+fn unexpected_unsealed_terminal_error() -> Error {
+    Report::new(DataIntegrityError::LogFileCorrupted)
+        .attach("redo unsealed terminal metadata did not match recovery plan")
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RecoveryCoordinator, validate_create_table_reloaded_root_ts};
@@ -879,7 +960,7 @@ mod tests {
     use crate::log::format::{
         REDO_BLOCK_GROUP_END, REDO_BLOCK_GROUP_START, REDO_DEFAULT_DATA_START_OFFSET,
         REDO_SUPER_BLOCK_SLOT_SIZE, RedoBlockHeader, RedoGroupStartExtension, RedoSuperBlock,
-        serialize_redo_super_block, slot_offset,
+        parse_redo_super_block, serialize_redo_super_block, slot_offset,
     };
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::recovery::{RecoveryBuffers, RecoveryResources, RowRecoveryMap, TableReplayBounds};
@@ -1986,15 +2067,28 @@ mod tests {
     }
 
     #[test]
-    fn test_log_recover_fails_replay_relevant_group_checksum_mismatch() {
+    fn test_log_recover_discards_unsealed_group_start_checksum_tail() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path();
-            let log_file_stem = "recover-relevant-checksum-corrupt";
+            let log_file_stem = "recover-unsealed-checksum-tail";
             let replay_floor = prepare_checkpointed_recovery_floor(main_dir, log_file_stem).await;
             write_bad_checksum_redo_file(main_dir, log_file_stem, replay_floor, false);
 
-            expect_log_recovery_corruption(main_dir, log_file_stem).await;
+            let recovered = corruption_recovery_engine_config(main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            let bytes = fs::read(main_dir.join(format!("{log_file_stem}.00000000"))).unwrap();
+            let open = parse_redo_super_block(&bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 0, 0).unwrap();
+            assert!(!open.is_sealed());
+            let slot1 = &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET];
+            let err = parse_redo_super_block(slot1, 0, 1).unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidMagic)
+            );
+            drop(recovered);
         });
     }
 

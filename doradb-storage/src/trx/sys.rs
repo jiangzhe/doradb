@@ -956,7 +956,6 @@ impl TransactionSystem {
             debug_assert!(writer.shutdown());
             debug_assert!(!writer.has_pending_io());
         }
-        let _ = sealer.finish_pending(self, &mut write_driver);
         if self.storage_poison_error().is_none() {
             sealer.seal_active_file_best_effort(self, &mut write_driver);
         }
