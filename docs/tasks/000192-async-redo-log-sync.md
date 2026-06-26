@@ -26,6 +26,7 @@ Issue Labels:
 
 Related Backlogs:
 - docs/backlogs/000080-evaluate-safe-async-file-sync-abstraction-beyond-file-syncer.md
+- docs/backlogs/000133-return-io-backend-submit-wait-errors-instead-of-panicking.md
 
 Related Context:
 - docs/architecture.md
@@ -273,14 +274,38 @@ the redo commit path. Table/catalog CoW root publication still uses its existing
 - Updated redo tests from `FileSyncer` hooks to storage backend hooks that
   record or fail `IOKind::Fsync` / `IOKind::Fdatasync`; removed the obsolete
   `FileSyncer` test hook.
+- Refactored redo prefix advancement after review: `advance_ordered_prefix`
+  now makes the publish/prepare-for-sync role explicit, the two call sites in
+  `RedoLogWriter::process_until_shutdown` document why prefix advancement runs
+  after request fetch and after completion drain, and `submit_io` no longer
+  carries the sealer parameter.
+- Moved prefix-owned primitives and closely related tests into
+  `LogPrefixTracker`, while preserving direct id-to-index lookup for completion
+  routing. The front sync barrier now reuses the drained prefix id so live
+  `LogPrefixId` values remain contiguous and `entry_mut` stays O(1).
+- Moved receiver-free seal/header completion helpers out of the
+  `RedoLogWriter` impl block and kept seal orchestration tests in `log/mod.rs`
+  because they exercise writer/finalizer behavior rather than isolated
+  `log/seal.rs` primitives.
 - Updated `docs/async-io.md` and `docs/redo-log.md` for backend-driven redo
   sync barriers.
+- Documented that native libaio async redo `fsync` / `fdatasync` submissions
+  require Linux 4.18+ and do not provide a pre-4.18 fallback.
+- Created follow-up backlog
+  `docs/backlogs/000133-return-io-backend-submit-wait-errors-instead-of-panicking.md`
+  for the remaining backend-level submit/wait error handling gap: unexpected
+  `io_uring` and `libaio` syscall failures still panic instead of returning
+  typed errors and poisoning critical paths where appropriate.
 - Validation completed:
   - `cargo fmt`
+  - `cargo fmt --check`
   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings`
   - `cargo nextest run -p doradb-storage`
   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
-  - `cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings`
+  - focused prefix and redo writer completion test groups during review-driven
+    refactors
+  - `git diff --check`
   - `tools/style_audit.rs --diff-base origin/main`
 
 ## Impacts
@@ -374,3 +399,10 @@ Broader owner-aware file sync remains outside this task and stays tracked by
 That future work should decide how table files, multi-table files, catalog
 files, and any remaining `FileSyncer` call sites share a safe sync abstraction
 without weakening CoW root publication guarantees.
+
+Backend-level submit/wait syscall error propagation also remains outside this
+task and is tracked by
+`docs/backlogs/000133-return-io-backend-submit-wait-errors-instead-of-panicking.md`.
+Future work should replace unexpected `io_uring` and `libaio` panic paths with
+typed error propagation and engine poisoning for critical durability/progress
+failures where needed.
