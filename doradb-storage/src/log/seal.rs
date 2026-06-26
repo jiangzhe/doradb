@@ -4,7 +4,6 @@ use super::{
 };
 use crate::conf::TrxSysConfig;
 use crate::error::{CompletionErrorKind, FatalError};
-use crate::file::FileSyncer;
 use crate::id::TrxID;
 use crate::io::{DirectBuf, IOBackend, IOBuf};
 use crate::log::format::{
@@ -132,19 +131,6 @@ impl LogFileSealer {
         prepare_seal_submission(log_file, accumulator)
     }
 
-    /// Complete a prefix-owned rotated-file seal after the write finishes.
-    #[inline]
-    pub(super) fn finish_prefix_seal(
-        &self,
-        log_file: &RedoLogFile,
-        poison: Option<FatalError>,
-    ) -> StdResult<(), FatalError> {
-        if let Some(reason) = poison {
-            return Err(reason);
-        }
-        sync_sealed_header(self.log_sync, log_file.as_raw_fd())
-    }
-
     /// Best-effort seal of the active file during clean shutdown.
     #[inline]
     pub(crate) fn seal_active_file_best_effort(
@@ -203,7 +189,7 @@ impl LogFileSealer {
         let LogWriteKind::Header { completion } = kind else {
             unreachable!("active file seal submits exactly one header write");
         };
-        drop(buf);
+        drop(buf.expect("active file seal header write must return a buffer"));
         if let Some(reason) = poison {
             completion.complete(Err(CompletionErrorKind::report_fatal(
                 reason,
@@ -212,7 +198,35 @@ impl LogFileSealer {
             return Err(reason);
         }
         completion.complete(Ok(()));
-        sync_sealed_header(self.log_sync, fd)
+        self.sync_file_target_best_effort(fd, write_driver)
+    }
+
+    #[inline]
+    fn sync_file_target_best_effort(
+        &self,
+        fd: RawFd,
+        write_driver: &mut LogWriteDriver<impl IOBackend>,
+    ) -> StdResult<(), FatalError> {
+        let Some(submission) = LogWriteSubmission::standalone_sync(fd, self.log_sync) else {
+            return Ok(());
+        };
+        if write_driver.push_write(submission).is_err() {
+            return Err(FatalError::RedoSync);
+        }
+        if write_driver.submit_ready() == 0 && write_driver.submitted_len() == 0 {
+            return Err(FatalError::RedoSync);
+        }
+        let LogWriteCompletion {
+            owner: _,
+            kind,
+            buf,
+            poison,
+        } = write_driver.wait_at_least_one();
+        let LogWriteKind::StandaloneSync = kind else {
+            unreachable!("active file seal submits exactly one standalone sync");
+        };
+        debug_assert!(buf.is_none());
+        poison.map_or(Ok(()), Err)
     }
 }
 
@@ -246,16 +260,6 @@ fn build_sealed_header_write(
     let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
     serialize_redo_super_block(buf.as_bytes_mut(), &sealed).map_err(|_| FatalError::RedoWrite)?;
     Ok((target.fd, slot_offset(slot_no), buf))
-}
-
-#[inline]
-fn sync_sealed_header(log_sync: LogSync, fd: RawFd) -> StdResult<(), FatalError> {
-    let syncer = FileSyncer::from_borrowed_fd(fd);
-    match log_sync {
-        LogSync::Fsync => syncer.fsync().map_err(|_| FatalError::RedoSync),
-        LogSync::Fdatasync => syncer.fdatasync().map_err(|_| FatalError::RedoSync),
-        LogSync::None => Ok(()),
-    }
 }
 
 #[inline]

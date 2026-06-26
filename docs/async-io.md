@@ -35,13 +35,15 @@ The shared storage worker exposes three logical lanes:
 
 ## Ownership Model
 
-One `crate::io::Operation` describes a single read or write:
+One `crate::io::Operation` describes a single read, write, or file sync:
 
 - `Operation::pread_owned(...)` and `Operation::pwrite_owned(...)` transfer an
   owned `DirectBuf` into the worker until completion.
 - `Operation::pread_borrowed(...)` and `Operation::pwrite_borrowed(...)` bind a
   borrowed page-aligned pointer whose lifetime higher layers keep valid until
   completion is observed exactly once.
+- `Operation::fsync(fd)` and `Operation::fdatasync(fd)` bind no memory and
+  complete only after the backend reports the native file-sync operation.
 
 The completion core preserves two invariants:
 
@@ -77,6 +79,8 @@ Two compile-time backends are supported:
 - `libaio`
   - explicitly supported alternate backend for older Linux kernels that cannot
     use `io_uring`;
+  - requires Linux 4.18+ for native async redo `fsync` / `fdatasync`
+    submissions through `IO_CMD_FSYNC` / `IO_CMD_FDSYNC`;
   - selected with
     `cargo nextest run -p doradb-storage --no-default-features --features libaio`.
 
@@ -89,20 +93,23 @@ The current storage-engine integration points are:
 - table-file and catalog-file reads/writes in `src/file/`;
 - readonly-cache miss loads in `src/buffer/readonly.rs`;
 - evictable-pool page reads and writeback in `src/buffer/evict.rs`; and
-- redo-log writes in `src/trx/log.rs`.
+- redo-log writes and syncs in `src/log/`.
 
 Table-file and buffer-pool traffic share one storage service, while redo keeps
 its own scheduling and durability policy inside `Log-Thread`.
 
 ## Redo Path
 
-Redo-log writes use the backend-neutral submission driver inside `Log-Thread`:
+Redo-log writes and durability syncs use the backend-neutral submission driver
+inside `Log-Thread`:
 
 - the scheduler serializes one commit group into a `DirectBuf`;
 - the group becomes one `Operation::pwrite_owned(...)`;
-- the driver reports completion back to `RedoLogWriter`; and
-- durability is finalized above the driver with `fsync`, `fdatasync`, or no
-  sync depending on `TrxSysConfig::log_sync`.
+- after the contiguous write prefix completes, `RedoLogWriter` submits a native
+  `Operation::fsync(...)` or `Operation::fdatasync(...)` when
+  `TrxSysConfig::log_sync` requires it; and
+- ordered transaction publication happens only after the matching sync
+  completion succeeds. `log_sync = none` skips the backend sync operation.
 
 Fatal redo write or sync failures poison runtime admission through
 `FatalError::{RedoWrite, RedoSync}`.
@@ -124,6 +131,9 @@ shared-worker fairness from raw backend saturation.
 - Linux direct I/O still requires aligned buffers and offsets.
 - `libaio1` and `libaio-dev` remain required for environments that validate or
   build the alternate `libaio` backend.
+- The `libaio` backend does not provide a fallback for kernels before Linux
+  4.18, where native async file-sync opcodes may be rejected by `io_submit`
+  with `EINVAL`.
 - The initial phase-6 performance bar is manual: compare the default
   `io_uring` path against explicit `libaio` builds using the existing storage
   examples on the same machine.
