@@ -100,33 +100,29 @@ impl Session {
     }
 
     #[inline]
-    fn query_engine(&self, operation: &'static str) -> Result<EngineRef> {
+    fn query_session(&self, operation: &'static str) -> Result<SessionQueryPin> {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_session_error(self.id, operation));
         }
         let engine = self.engine.upgrade(operation)?;
         engine.ensure_admission_open_for_query(operation)?;
-        Ok(engine)
-    }
-
-    /// Returns whether the session currently owns an active transaction.
-    #[inline]
-    pub fn in_trx(&self) -> Result<bool> {
-        const OPERATION: &str = "query session transaction state";
-        let engine = self.query_engine(OPERATION)?;
-        let state = engine.session_registry.pin_running(self.id, OPERATION)?;
-        state.in_trx(OPERATION)
+        let state = engine.session_registry.pin_running(self.id, operation)?;
+        Ok(SessionQueryPin {
+            engine,
+            _state: state,
+        })
     }
 
     /// Return sorted ids for currently loaded user-table runtimes.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. It does not expose in-flight DDL
-    /// rows that have not installed a user-table runtime.
+    /// engine query admission is still open. It is not available after engine
+    /// shutdown, session close, or registry removal. It does not expose
+    /// in-flight DDL rows that have not installed a user-table runtime.
     #[inline]
     pub fn list_table_ids(&self) -> Result<Vec<TableID>> {
-        let engine = self.query_engine("list table ids")?;
-        Ok(engine.catalog().list_user_table_ids_now())
+        let session = self.query_session("list table ids")?;
+        Ok(session.engine.catalog().list_user_table_ids_now())
     }
 
     /// Begin a new transaction if the session is currently idle.
@@ -207,11 +203,13 @@ impl Session {
     /// Return a monotonic transaction-system statistics snapshot.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. Callers can compare snapshots to
-    /// compute deltas.
+    /// engine query admission is still open. It is not available after engine
+    /// shutdown, session close, or registry removal. Callers can compare
+    /// snapshots to compute deltas.
     #[inline]
     pub fn transaction_system_stats(&self) -> Result<TransactionSystemStats> {
-        let engine = self.query_engine("query transaction system stats")?;
+        let session = self.query_session("query transaction system stats")?;
+        let engine = &session.engine;
         Ok(transaction_system_stats_snapshot(
             engine.trx_sys.trx_sys_stats(),
         ))
@@ -220,11 +218,13 @@ impl Session {
     /// Return a monotonic shared-storage IO statistics snapshot.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. Callers can compare snapshots to
-    /// compute deltas.
+    /// engine query admission is still open. It is not available after engine
+    /// shutdown, session close, or registry removal. Callers can compare
+    /// snapshots to compute deltas.
     #[inline]
     pub fn storage_io_stats(&self) -> Result<StorageIoStats> {
-        let engine = self.query_engine("query storage io stats")?;
+        let session = self.query_session("query storage io stats")?;
+        let engine = &session.engine;
         Ok(storage_io_stats_snapshot(
             engine.table_fs.io_backend_stats(),
             engine.table_fs.storage_service_stats(),
@@ -234,11 +234,13 @@ impl Session {
     /// Return point-in-time buffer-pool capacity, allocation, and counters.
     ///
     /// This read-only diagnostic remains observable after storage poison while
-    /// engine query admission is still open. Counters are monotonic snapshots
-    /// and callers can compare snapshots to compute deltas.
+    /// engine query admission is still open. It is not available after engine
+    /// shutdown, session close, or registry removal. Counters are monotonic
+    /// snapshots and callers can compare snapshots to compute deltas.
     #[inline]
     pub fn buffer_pool_stats(&self) -> Result<BufferPoolStats> {
-        let engine = self.query_engine("query buffer pool stats")?;
+        let session = self.query_session("query buffer pool stats")?;
+        let engine = &session.engine;
         Ok(BufferPoolStats {
             meta: buffer_pool_runtime_stats_snapshot(
                 engine.meta_pool.capacity(),
@@ -344,6 +346,14 @@ impl Drop for Session {
             engine.session_registry.abandon(self.id);
         }
     }
+}
+
+/// Query-scoped strong pin for poison-observable public reads.
+struct SessionQueryPin {
+    /// Engine handle retained while the query reads shared runtime state.
+    engine: EngineRef,
+    /// Strong reference proving the session is still registered and running.
+    _state: Arc<SessionState>,
 }
 
 /// One operation-scoped strong pin of a registry-owned session.
@@ -1164,12 +1174,55 @@ pub(crate) mod tests {
     use super::*;
     use crate::catalog::tests::{table1, table2};
     use crate::conf::EngineConfig;
-    use crate::error::{ErrorKind, FatalError, OperationError};
+    use crate::error::{Error, ErrorKind, FatalError, LifecycleError, OperationError};
+    use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats};
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[inline]
+    fn assert_lifecycle_shutdown(err: Error) {
+        assert_eq!(err.kind(), ErrorKind::Lifecycle);
+        assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+    }
+
+    #[inline]
+    fn assert_buffer_pool_stats_monotonic(before: &BufferPoolStats, after: &BufferPoolStats) {
+        assert_buffer_pool_runtime_stats_monotonic(before.meta, after.meta);
+        assert_buffer_pool_runtime_stats_monotonic(before.mem, after.mem);
+        assert_buffer_pool_runtime_stats_monotonic(before.index, after.index);
+        assert_buffer_pool_runtime_stats_monotonic(before.disk, after.disk);
+    }
+
+    #[inline]
+    fn assert_buffer_pool_runtime_stats_monotonic(
+        before: BufferPoolRuntimeStats,
+        after: BufferPoolRuntimeStats,
+    ) {
+        assert_eq!(after.capacity, before.capacity);
+        assert!(after.allocated >= before.allocated);
+        assert_buffer_pool_counters_monotonic(before.counters, after.counters);
+    }
+
+    #[inline]
+    fn assert_buffer_pool_counters_monotonic(
+        before: BufferPoolCounters,
+        after: BufferPoolCounters,
+    ) {
+        assert!(after.cache_hits >= before.cache_hits);
+        assert!(after.cache_misses >= before.cache_misses);
+        assert!(after.miss_joins >= before.miss_joins);
+        assert!(after.queued_reads >= before.queued_reads);
+        assert!(after.running_reads >= before.running_reads);
+        assert!(after.completed_reads >= before.completed_reads);
+        assert!(after.read_errors >= before.read_errors);
+        assert!(after.queued_writes >= before.queued_writes);
+        assert!(after.running_writes >= before.running_writes);
+        assert!(after.completed_writes >= before.completed_writes);
+        assert!(after.write_errors >= before.write_errors);
+    }
 
     /// Returns the number of registry-owned sessions for tests.
     #[inline]
@@ -1202,6 +1255,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) trait SessionTestExt {
+        fn in_trx(&self) -> Result<bool>;
         fn pool_guards(&self) -> PoolGuards;
         fn engine(&self) -> EngineRef;
         fn last_cts(&self) -> TrxID;
@@ -1218,6 +1272,13 @@ pub(crate) mod tests {
     }
 
     impl SessionTestExt for Session {
+        #[inline]
+        fn in_trx(&self) -> Result<bool> {
+            const OPERATION: &str = "test query session transaction state";
+            let session = self.query_session(OPERATION)?;
+            session._state.in_trx(OPERATION)
+        }
+
         #[inline]
         fn pool_guards(&self) -> PoolGuards {
             self.pin("test session pool guards")
@@ -1462,24 +1523,70 @@ pub(crate) mod tests {
 
             let trx0 = session.transaction_system_stats().unwrap();
             let storage0 = session.storage_io_stats().unwrap();
-            let pools = session.buffer_pool_stats().unwrap();
+            let pools0 = session.buffer_pool_stats().unwrap();
             assert_eq!(trx0.commit_count, 0);
             assert_eq!(trx0.trx_count, 0);
             assert_eq!(trx0.log_bytes, 0);
-            assert!(pools.meta.capacity > 0);
-            assert!(pools.mem.capacity > 0);
-            assert!(pools.index.capacity > 0);
-            assert!(pools.disk.capacity > 0);
+            assert!(pools0.meta.capacity > 0);
+            assert!(pools0.mem.capacity > 0);
+            assert!(pools0.index.capacity > 0);
+            assert!(pools0.disk.capacity > 0);
 
             let _table_id = table1(&engine).await;
             let trx1 = session.transaction_system_stats().unwrap();
             let storage1 = session.storage_io_stats().unwrap();
+            let pools1 = session.buffer_pool_stats().unwrap();
             assert!(trx1.commit_count > trx0.commit_count);
             assert!(trx1.trx_count >= trx0.trx_count);
             assert!(storage1.backend.submitted_ops >= storage0.backend.submitted_ops);
             assert!(storage1.table_read_requests >= storage0.table_read_requests);
             assert!(storage1.pool_read_requests >= storage0.pool_read_requests);
             assert!(storage1.background_write_requests >= storage0.background_write_requests);
+            assert_buffer_pool_stats_monotonic(&pools0, &pools1);
+        });
+    }
+
+    #[test]
+    fn test_session_query_methods_require_registered_running_session() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+
+            engine
+                .inner()
+                .session_registry
+                .close_idle(session.id())
+                .unwrap();
+
+            assert_lifecycle_shutdown(session.list_table_ids().unwrap_err());
+            assert_lifecycle_shutdown(session.transaction_system_stats().unwrap_err());
+            assert_lifecycle_shutdown(session.storage_io_stats().unwrap_err());
+            assert_lifecycle_shutdown(session.buffer_pool_stats().unwrap_err());
+        });
+    }
+
+    #[test]
+    fn test_session_query_methods_fail_after_engine_shutdown() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+
+            engine.shutdown().unwrap();
+
+            assert_lifecycle_shutdown(session.list_table_ids().unwrap_err());
+            assert_lifecycle_shutdown(session.transaction_system_stats().unwrap_err());
+            assert_lifecycle_shutdown(session.storage_io_stats().unwrap_err());
+            assert_lifecycle_shutdown(session.buffer_pool_stats().unwrap_err());
         });
     }
 

@@ -12,7 +12,7 @@ use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{PAGE_SIZE, Page};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{
-    BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
+    BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
     ReadonlyBlockValidator,
 };
 use crate::error::{
@@ -26,6 +26,7 @@ use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
 use crate::latch::LatchFallbackMode;
 use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
+use crate::stats::BufferPoolCounters;
 use dashmap::mapref::entry::Entry;
 use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
@@ -183,7 +184,7 @@ impl ReadonlyBufferPool {
 
     /// Returns one snapshot of shared readonly-pool access and load counters.
     #[inline]
-    pub(crate) fn stats(&self) -> BufferPoolStats {
+    pub(crate) fn stats(&self) -> BufferPoolCounters {
         self.stats.snapshot()
     }
 
@@ -1503,7 +1504,7 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        pub(crate) fn global_stats(&self) -> BufferPoolStats {
+        pub(crate) fn global_stats(&self) -> BufferPoolCounters {
             self.global.stats()
         }
 

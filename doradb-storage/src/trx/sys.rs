@@ -1240,6 +1240,7 @@ pub(crate) mod tests {
     use crate::log::LogSync;
     use crate::log::format::{REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE};
     use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::session::tests::SessionTestExt;
     use crate::trx::SharedTrxStatus;
     use crate::value::Val;
     use std::sync::atomic::{AtomicBool, Ordering};

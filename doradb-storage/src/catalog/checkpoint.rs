@@ -256,11 +256,11 @@ impl Catalog {
     ///
     /// # Panics
     ///
-    /// Panics if another checkpoint is already in progress on the same
-    /// shared `CatalogStorage`/`MultiTableFile`. Concurrent checkpoint
-    /// publishes are not supported by design; the underlying
-    /// [`crate::file::cow_file::CowFile`] enforces a single mutable writer via
-    /// an atomic claim and will panic on violation.
+    /// Normal overlapping calls to this method do not panic; they wait for the
+    /// active catalog checkpoint to finish before publishing. A panic indicates
+    /// an internal invariant violation, such as bypassing the checkpoint gate
+    /// and reaching the shared `CatalogStorage`/`MultiTableFile` with multiple
+    /// mutable writers.
     #[inline]
     pub(crate) async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;

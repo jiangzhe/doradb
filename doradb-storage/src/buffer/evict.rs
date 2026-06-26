@@ -12,8 +12,8 @@ use crate::buffer::page::{
 };
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
-    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
-    PoolRole, RowPoolRole,
+    BufferPool, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
+    RowPoolRole,
 };
 use crate::component::Supplier;
 use crate::conf::EvictableBufferPoolConfig;
@@ -35,6 +35,7 @@ use crate::latch::{GuardState, LatchFallbackMode};
 use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
+use crate::stats::BufferPoolCounters;
 use crate::{IndexPool, MemPool};
 use error_stack::{Report, ensure};
 use event_listener::{Event, EventListener, listener};
@@ -108,7 +109,7 @@ impl EvictableBufferPool {
 
     /// Returns one snapshot of evictable-pool access and IO lifecycle counters.
     #[inline]
-    pub(crate) fn stats(&self) -> BufferPoolStats {
+    pub(crate) fn stats(&self) -> BufferPoolCounters {
         self.stats.snapshot()
     }
 

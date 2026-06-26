@@ -1,6 +1,5 @@
 //! Public storage-engine runtime statistics.
 
-use crate::buffer::BufferPoolStats as InternalBufferPoolStats;
 use crate::file::fs::StorageServiceStats as InternalStorageServiceStats;
 use crate::io::IOBackendStats as InternalIoBackendStats;
 use crate::trx::sys::TrxSysStats as InternalTrxSysStats;
@@ -115,6 +114,30 @@ pub struct BufferPoolCounters {
     pub write_errors: usize,
 }
 
+impl BufferPoolCounters {
+    /// Returns the saturating delta from one earlier snapshot.
+    #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
+    pub(crate) fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            cache_misses: self.cache_misses.saturating_sub(earlier.cache_misses),
+            miss_joins: self.miss_joins.saturating_sub(earlier.miss_joins),
+            queued_reads: self.queued_reads.saturating_sub(earlier.queued_reads),
+            running_reads: self.running_reads.saturating_sub(earlier.running_reads),
+            completed_reads: self.completed_reads.saturating_sub(earlier.completed_reads),
+            read_errors: self.read_errors.saturating_sub(earlier.read_errors),
+            queued_writes: self.queued_writes.saturating_sub(earlier.queued_writes),
+            running_writes: self.running_writes.saturating_sub(earlier.running_writes),
+            completed_writes: self
+                .completed_writes
+                .saturating_sub(earlier.completed_writes),
+            write_errors: self.write_errors.saturating_sub(earlier.write_errors),
+        }
+    }
+}
+
+/// Convert internal transaction-system counters into a public snapshot.
 #[inline]
 pub(crate) fn transaction_system_stats_snapshot(
     stats: InternalTrxSysStats,
@@ -134,6 +157,7 @@ pub(crate) fn transaction_system_stats_snapshot(
     }
 }
 
+/// Convert internal storage-service counters into a public snapshot.
 #[inline]
 pub(crate) fn storage_io_stats_snapshot(
     backend: InternalIoBackendStats,
@@ -150,16 +174,17 @@ pub(crate) fn storage_io_stats_snapshot(
     }
 }
 
+/// Convert internal buffer-pool counters into a public runtime snapshot.
 #[inline]
 pub(crate) fn buffer_pool_runtime_stats_snapshot(
     capacity: usize,
     allocated: usize,
-    counters: InternalBufferPoolStats,
+    counters: BufferPoolCounters,
 ) -> BufferPoolRuntimeStats {
     BufferPoolRuntimeStats {
         capacity,
         allocated,
-        counters: buffer_pool_counters_snapshot(counters),
+        counters,
     }
 }
 
@@ -170,22 +195,5 @@ fn io_backend_stats_snapshot(stats: InternalIoBackendStats) -> IoBackendStats {
         submitted_ops: stats.submitted_ops,
         submit_and_wait_nanos: stats.submit_and_wait_nanos,
         wait_completions: stats.wait_completions,
-    }
-}
-
-#[inline]
-fn buffer_pool_counters_snapshot(stats: InternalBufferPoolStats) -> BufferPoolCounters {
-    BufferPoolCounters {
-        cache_hits: stats.cache_hits,
-        cache_misses: stats.cache_misses,
-        miss_joins: stats.miss_joins,
-        queued_reads: stats.queued_reads,
-        running_reads: stats.running_reads,
-        completed_reads: stats.completed_reads,
-        read_errors: stats.read_errors,
-        queued_writes: stats.queued_writes,
-        running_writes: stats.running_writes,
-        completed_writes: stats.completed_writes,
-        write_errors: stats.write_errors,
     }
 }
