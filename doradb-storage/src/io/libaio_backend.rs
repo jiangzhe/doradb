@@ -171,6 +171,8 @@ impl IOBackend for LibaioBackend {
         iocb.aio_lio_opcode = match operation.kind() {
             IOKind::Read => io_iocb_cmd::IO_CMD_PREAD as u16,
             IOKind::Write => io_iocb_cmd::IO_CMD_PWRITE as u16,
+            // Native libaio file-sync opcodes require Linux 4.18+; older
+            // kernels may reject them from `io_submit` with EINVAL.
             IOKind::Fsync => io_iocb_cmd::IO_CMD_FSYNC as u16,
             IOKind::Fdatasync => io_iocb_cmd::IO_CMD_FDSYNC as u16,
         };

@@ -936,6 +936,9 @@ struct ReadyGroupPrefix {
     written: Vec<SyncGroup>,
     /// Ready groups after the first failed group; these are cleanup-only.
     failed: Vec<SyncGroup>,
+    /// Last prefix entry id drained into this batch. A front sync barrier
+    /// reuses this id to keep live prefix ids contiguous for O(1) lookup.
+    sync_barrier_id: Option<LogPrefixId>,
     trx_count: usize,
     commit_count: usize,
     log_bytes: usize,

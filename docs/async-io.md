@@ -79,6 +79,8 @@ Two compile-time backends are supported:
 - `libaio`
   - explicitly supported alternate backend for older Linux kernels that cannot
     use `io_uring`;
+  - requires Linux 4.18+ for native async redo `fsync` / `fdatasync`
+    submissions through `IO_CMD_FSYNC` / `IO_CMD_FDSYNC`;
   - selected with
     `cargo nextest run -p doradb-storage --no-default-features --features libaio`.
 
@@ -129,6 +131,9 @@ shared-worker fairness from raw backend saturation.
 - Linux direct I/O still requires aligned buffers and offsets.
 - `libaio1` and `libaio-dev` remain required for environments that validate or
   build the alternate `libaio` backend.
+- The `libaio` backend does not provide a fallback for kernels before Linux
+  4.18, where native async file-sync opcodes may be rejected by `io_submit`
+  with `EINVAL`.
 - The initial phase-6 performance bar is manual: compare the default
   `io_uring` path against explicit `libaio` builds using the existing storage
   examples on the same machine.

@@ -65,13 +65,6 @@ impl LogPrefixTracker {
     }
 
     #[inline]
-    fn alloc_front_id(&mut self) -> LogPrefixId {
-        let id = self.alloc_id();
-        self.front_id = id;
-        id
-    }
-
-    #[inline]
     pub(super) fn push_header(&mut self, write: LogWriteSubmission) {
         let completion = write
             .header_completion()
@@ -103,7 +96,19 @@ impl LogPrefixTracker {
         ready_prefix: ReadyGroupPrefix,
         sync: LogWriteSubmission,
     ) {
-        let id = self.alloc_front_id();
+        let id = ready_prefix
+            .sync_barrier_id
+            .expect("redo sync barrier must cover a drained prefix entry");
+        let next_raw = id
+            .raw()
+            .checked_add(1)
+            .expect("redo prefix entry id overflow");
+        if let Some(front) = self.entries.front() {
+            debug_assert_eq!(front.id.raw(), next_raw);
+        } else {
+            debug_assert_eq!(self.next_id.raw(), next_raw);
+        }
+        self.front_id = id;
         self.entries.push_front(LogPrefixEntry {
             id,
             kind: LogPrefixKind::Sync {
@@ -141,7 +146,9 @@ impl LogPrefixTracker {
 
     #[inline]
     pub(super) fn entry_mut(&mut self, prefix_id: LogPrefixId) -> Option<&mut LogPrefixEntry> {
-        self.entries.iter_mut().find(|entry| entry.id == prefix_id)
+        let idx = usize::try_from(prefix_id.raw().checked_sub(self.front_id.raw())?).ok()?;
+        let entry = self.entries.get_mut(idx)?;
+        (entry.id == prefix_id).then_some(entry)
     }
 
     #[inline]
@@ -215,6 +222,7 @@ impl LogPrefixTracker {
             let entry = self
                 .pop_front()
                 .expect("front ready redo group entry must exist");
+            ready.sync_barrier_id = Some(entry.id);
             let LogPrefixKind::Group { group } = entry.kind else {
                 unreachable!("front group entry kind was checked")
             };
@@ -392,6 +400,7 @@ mod tests {
     use super::*;
     use crate::id::TrxID;
     use crate::io::Completion;
+    use crate::log::LogSync;
     use crate::trx::FailedPrecommitReason;
     use crate::trx::PrecommitTrx;
     use std::os::fd::RawFd;
@@ -519,6 +528,33 @@ mod tests {
         assert_eq!(ready.failed.len(), 1);
         assert_eq!(ready.failed[0].max_cts, TrxID::new(40));
         assert_eq!(tracker.len(), 1);
+    }
+
+    #[test]
+    fn test_prefix_tracker_front_sync_preserves_o1_id_lookup() {
+        let mut tracker = LogPrefixTracker::new();
+        tracker.push_group(sync_group_for_order_test(TrxID::new(50), true, 4096));
+        tracker.push_group(sync_group_for_order_test(TrxID::new(51), false, 4096));
+        let sync_id = tracker.entries[0].id;
+        let later_id = tracker.entries[1].id;
+
+        let ready = tracker.drain_ready_group_prefix();
+        assert_eq!(ready.sync_barrier_id, Some(sync_id));
+        assert_eq!(tracker.front_id, later_id);
+
+        let sync = LogWriteSubmission::commit_sync(0, LogSync::Fsync);
+        tracker.push_front_sync(ready, sync);
+
+        assert_eq!(tracker.front_id, sync_id);
+        assert_eq!(tracker.entries[0].id, sync_id);
+        assert_eq!(tracker.entries[1].id, later_id);
+        let entry = tracker
+            .entry_mut(later_id)
+            .expect("later prefix id must resolve through direct id index");
+        let LogPrefixKind::Group { group } = &entry.kind else {
+            panic!("expected retained group entry")
+        };
+        assert_eq!(group.max_cts, TrxID::new(51));
     }
 
     #[test]
