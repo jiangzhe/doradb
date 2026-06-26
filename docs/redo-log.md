@@ -130,14 +130,14 @@ redo file is created with the latest normalized configuration.
 When a file runs out of append capacity, the commit path creates the next file
 and queues one log-file boundary containing the old file and the new file's
 initial super-block write. The log thread keeps the old file descriptor alive
-until all already-written groups from that file and the boundary super-block
-write are finished. It then hands the old file to `RedoFileSealer`, which queues
-an async seal write for the inactive super-block slot with `generation + 1`, the
-durable end offset, and the real redo CTS range accumulated for that file. The
-old file remains open until the seal write completes and the configured seal
-sync policy finishes, but processing can continue on the next file while that
-seal write is pending. Seal write failure poisons storage as `RedoWrite`; seal
-sync failure poisons storage as `RedoSync`.
+until all already-written groups from that file are durable, then prepares a
+prefix-owned seal barrier for the old file before the new-file header barrier.
+The barrier writes the inactive super-block slot with `generation + 1`, the
+durable end offset, and the real redo CTS range accumulated for that file, then
+runs the configured seal sync policy. The new-file header and later data writes
+may be submitted before the old seal finishes, but transaction publication for
+the new file cannot pass the old-file seal barrier. Seal write failure poisons
+storage as `RedoWrite`; seal sync failure poisons storage as `RedoSync`.
 
 ## Serialization Rules
 
@@ -336,9 +336,9 @@ physical row page.
    empty file data region, precommit is rejected before the transaction becomes
    durable or visible.
 
-6. `Log-Thread` drains commit queue entries. Log-file boundaries stage an async
-   super-block write and stop queue fetching until pending IO plus that
-   super-block write drain. Redo-bearing groups drain into `SyncGroup`s, and
+6. `Log-Thread` drains commit queue entries. Log-file boundaries insert a
+   rotated-file seal barrier followed by the new file's async initial
+   super-block write. Redo-bearing groups drain into `SyncGroup`s, and
    `LogBlockGroup::finish_with` materializes one logical group into one or more
    exact-`log_block_size` `DirectBuf`s with block headers, group-start
    metadata, zero padding, and patched CRC32 checksums. No-log groups are
@@ -361,8 +361,10 @@ physical row page.
    contiguous finished prefix. When that prefix contains redo bytes, it syncs
    the largest already-ready same-file prefix with the configured policy
    (`fsync`, `fdatasync`, or `none`). Only after that sync step succeeds does
-   `RedoFileSealer` record each redo-bearing group's `durable_end_offset`,
-   `min_redo_cts`, and `max_redo_cts`.
+   `LogFileSealer` record each redo-bearing group's `durable_end_offset`,
+   `min_redo_cts`, and `max_redo_cts`. A later file's transactions cannot be
+   published until the preceding rotated-file seal write and configured seal
+   sync have completed through the same ordered prefix.
 
 10. After ordered prefix finalization succeeds, `persisted_cts` advances to the
     prefix max CTS, each
@@ -384,13 +386,14 @@ observing the result; it does not roll the transaction back.
 
 Startup prepares recovery from discovered log files by building a
 recovery-owned `RedoLogStream` for existing files, a `RecoveryCoordinator` for
-checkpoint bootstrap and replay, and a log-owned `RedoLogInitializer` for the
+checkpoint bootstrap and replay, and a log-owned `RedoLogFinalizer` for the
 next writable file. After checkpoint bootstrap computes the `replay_floor`,
 recovery reads validated redo super-block metadata from the newest files
 backwards until it reaches the oldest suffix segment that may contain
-replay-relevant records. The initializer derives the next writable file sequence
-from the newest discovered file before replay, so normal runtime opens a fresh
-file after recovery even if every planned segment was skipped.
+replay-relevant records. Recovery repair then selects the runtime writable file:
+it either creates the next sequence after sealing an accepted unsealed prefix,
+or truncates/recreates the newest unsealed non-durable tail as the single active
+runtime file.
 
 `RedoLogStream` starts one short-lived direct-IO read-ahead worker for the
 planned segment suffix. The worker opens each planned file with direct IO,
@@ -410,6 +413,9 @@ For each planned segment:
   range;
 - if an idle fixed block is all zeros, replay treats an unsealed file as ended
   and treats a sealed file as corrupted before `durable_end_offset`;
+- if an unsealed group-start block is malformed, checksum-failed, or carries
+  impossible group-start metadata, replay accepts the prefix before that block
+  and stops scanning that file;
 - block headers, block checksums, payload lengths, continuation order, group
   start metadata, zero padding, and sealed range metadata are checked before
   transaction parsing;
@@ -442,6 +448,25 @@ The highest recovered timestamp is tracked separately from replay filtering.
 Recovery updates `max_recovered_cts` from checkpoint metadata, table roots,
 skipped sealed segment `max_redo_cts`, and every redo header, even when a record
 is skipped. The next runtime timestamp is `max_recovered_cts + 1`.
+
+Recovery accepts only these unsealed-file shapes:
+
+- no unsealed files;
+- one final unsealed file; or
+- two final unsealed files representing a crash during rotation, where the
+  older file may contain the accepted durable prefix and the newest file is a
+  non-durable active tail.
+
+More than two unsealed files, an unsealed file followed by a selected sealed
+newer file, or an unsealed file outside the selected final positions is
+corruption. In the final-two shape, recovery does not replay records from the
+newest unsealed file. After successful replay, recovery seals every accepted
+historical unsealed prefix with its accepted durable end offset and real redo
+CTS range. If a single final unsealed file contributes accepted redo, recovery
+seals it and starts runtime in the next sequence. If the newest unsealed file
+contributes no accepted redo, or is the non-durable tail in the final-two shape,
+runtime truncates/recreates that same sequence. After repair, repeated recovery
+observes sealed historical files plus exactly one active unsealed file.
 
 Replay rules:
 
@@ -570,11 +595,6 @@ Consider bounded-memory replay for very large transactions. Today one
 multi-block logical group is assembled before strict `TrxLog` parsing. Streaming
 parse/replay inside a large transaction is tracked separately in
 `docs/backlogs/000130-large-redo-transaction-streaming-replay.md`.
-
-Clarify rotation seal durability when needed by
-`docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md`. The
-current docs describe the implemented seal/read behavior without claiming that
-follow-up is resolved.
 
 ### Read and Recovery Path
 

@@ -52,13 +52,27 @@ use std::time::{Duration, Instant};
 pub(crate) struct RedoLogFile {
     file: SparseFile,
     super_block: RedoSuperBlock,
+    /// Recovered durable-prefix metadata for a file that must be sealed by the
+    /// normal prefix-owned seal path before startup publishes the next header.
+    seal_metadata: Option<Box<RedoLogSealMetadata>>,
 }
 
 impl RedoLogFile {
     /// Build a redo log file wrapper from an owned sparse file and open header.
     #[inline]
     fn new(file: SparseFile, super_block: RedoSuperBlock) -> Self {
-        RedoLogFile { file, super_block }
+        RedoLogFile {
+            file,
+            super_block,
+            seal_metadata: None,
+        }
+    }
+
+    /// Attach recovered durable-prefix metadata used by the normal seal path.
+    #[inline]
+    fn with_seal_metadata(mut self, seal_metadata: RedoLogSealMetadata) -> Self {
+        self.seal_metadata = Some(Box::new(seal_metadata));
+        self
     }
 
     /// Allocate an append range in this redo file.
@@ -117,6 +131,17 @@ pub(crate) struct RedoGroupWriteMeta {
     pub(crate) max_redo_cts: TrxID,
 }
 
+/// Durable prefix metadata used to seal a redo file without replaying groups in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RedoLogSealMetadata {
+    /// Redo log file sequence being sealed.
+    pub(crate) file_seq: u32,
+    /// Accepted durable end offset written into the sealed super-block.
+    pub(crate) durable_end_offset: usize,
+    /// Real redo CTS range from accepted complete groups, if any.
+    pub(crate) redo_range: Option<(TrxID, TrxID)>,
+}
+
 /// Non-queued precommit transaction returned from redo group admission.
 pub(crate) struct EnqueuePrecommitError {
     /// Transaction whose commit handoff could not be queued.
@@ -148,37 +173,37 @@ enum LogRequestKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LogRequestOwner {
     request_id: LogRequestId,
-    entry_id: Option<LogPrefixId>,
+    prefix_id: Option<LogPrefixId>,
     kind: LogRequestKind,
     group_write_idx: Option<usize>,
 }
 
 impl LogRequestOwner {
     #[inline]
-    fn header(request_id: LogRequestId, entry_id: LogPrefixId) -> Self {
+    fn header(request_id: LogRequestId, prefix_id: LogPrefixId) -> Self {
         Self {
             request_id,
-            entry_id: Some(entry_id),
+            prefix_id: Some(prefix_id),
             kind: LogRequestKind::Header,
             group_write_idx: None,
         }
     }
 
     #[inline]
-    fn group(request_id: LogRequestId, entry_id: LogPrefixId, group_write_idx: usize) -> Self {
+    fn group(request_id: LogRequestId, prefix_id: LogPrefixId, group_write_idx: usize) -> Self {
         Self {
             request_id,
-            entry_id: Some(entry_id),
+            prefix_id: Some(prefix_id),
             kind: LogRequestKind::Group,
             group_write_idx: Some(group_write_idx),
         }
     }
 
     #[inline]
-    fn seal(request_id: LogRequestId) -> Self {
+    fn seal(request_id: LogRequestId, prefix_id: Option<LogPrefixId>) -> Self {
         Self {
             request_id,
-            entry_id: None,
+            prefix_id,
             kind: LogRequestKind::Seal,
             group_write_idx: None,
         }
@@ -199,8 +224,23 @@ pub(crate) struct RedoLogFileDescriptor {
     pub(crate) path: PathBuf,
 }
 
-/// Value-only builder for the redo log runtime and its initial writable file.
-pub(crate) struct RedoLogInitializer {
+/// File creation mode for redo startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedoLogCreateMode {
+    /// Create a new file and fail if it already exists.
+    CreateOrFail,
+    /// Create or truncate an existing tail file.
+    CreateOrTrunc,
+}
+
+struct RecoveredRedoSeal {
+    path: PathBuf,
+    super_block: RedoSuperBlock,
+    metadata: RedoLogSealMetadata,
+}
+
+/// Value-only finalizer for redo startup repair and the initial writable file.
+pub(crate) struct RedoLogFinalizer {
     /// Full file prefix for redo log file names.
     pub(crate) file_prefix: String,
     /// Maximum size of each redo log file.
@@ -211,10 +251,14 @@ pub(crate) struct RedoLogInitializer {
     pub(crate) log_write_io_depth: usize,
     /// Sequence for the next writable redo file.
     pub(crate) next_file_seq: u32,
+    /// How the startup file should be opened.
+    create_mode: RedoLogCreateMode,
+    /// Optional recovered prefix to seal before the startup header is published.
+    recovered_seal: Option<RecoveredRedoSeal>,
 }
 
-impl RedoLogInitializer {
-    /// Create a value-only redo log initializer.
+impl RedoLogFinalizer {
+    /// Create a value-only redo log finalizer.
     #[inline]
     pub(crate) fn new(
         file_prefix: String,
@@ -229,12 +273,46 @@ impl RedoLogInitializer {
             log_block_size,
             log_write_io_depth,
             next_file_seq,
+            create_mode: RedoLogCreateMode::CreateOrFail,
+            recovered_seal: None,
         }
     }
 
-    /// Create the initial redo file and return the live redo log state.
+    /// Select the runtime active file sequence and creation mode.
     #[inline]
-    pub(crate) fn finish(self, purge_tx: Sender<Purge>) -> Result<(RedoLog, Arc<Completion<()>>)> {
+    pub(crate) fn set_startup_file(&mut self, file_seq: u32, create_mode: RedoLogCreateMode) {
+        self.next_file_seq = file_seq;
+        self.create_mode = create_mode;
+    }
+
+    /// Queue a recovered redo file for normal prefix-owned sealing during startup.
+    #[inline]
+    pub(crate) fn set_recovered_seal(
+        &mut self,
+        path: PathBuf,
+        super_block: RedoSuperBlock,
+        durable_end_offset: usize,
+        redo_range: Option<(TrxID, TrxID)>,
+    ) {
+        debug_assert!(self.recovered_seal.is_none());
+        let file_seq = super_block.file_seq;
+        self.recovered_seal = Some(RecoveredRedoSeal {
+            path,
+            super_block,
+            metadata: RedoLogSealMetadata {
+                file_seq,
+                durable_end_offset,
+                redo_range,
+            },
+        });
+    }
+
+    /// Finalize startup redo state and return the live redo log.
+    #[inline]
+    pub(crate) fn finalize(
+        self,
+        purge_tx: Sender<Purge>,
+    ) -> Result<(RedoLog, Arc<Completion<()>>)> {
         let ctx = StorageBackend::new(self.log_write_io_depth)?;
         let mut file_seq = self.next_file_seq;
         let (
@@ -243,17 +321,22 @@ impl RedoLogInitializer {
                 header_write,
             },
             header_completion,
-        ) = create_log_file_with_header_completion(
+        ) = create_log_file_with_header_completion_with_mode(
             &self.file_prefix,
             file_seq,
             self.file_max_size,
             self.log_block_size,
+            self.create_mode,
         )?;
         file_seq = next_redo_file_seq(file_seq)?;
 
+        let ended_log_file = self
+            .recovered_seal
+            .map(open_recovered_seal_file)
+            .transpose()?;
         let mut queue = VecDeque::new();
         queue.push_back(Commit::LogFileBoundary {
-            ended_log_file: None,
+            ended_log_file,
             header_write,
         });
         let group_commit = GroupCommit {
@@ -356,11 +439,6 @@ impl LogWriteSubmission {
                 "redo header write was not submitted",
             )));
         }
-    }
-
-    #[inline]
-    fn fail_unsubmitted_seal(mut self) {
-        let _ = self.operation.take_buf();
     }
 }
 
@@ -922,11 +1000,10 @@ where
 
     /// Fail all pending redo work after a fatal storage error.
     #[inline]
-    pub(crate) fn fail_pending(&mut self, sealer: &mut LogFileSealer, err: Report<FatalError>) {
+    pub(crate) fn fail_pending(&mut self, _sealer: &mut LogFileSealer, err: Report<FatalError>) {
         self.shutdown = true;
         let fatal = *err.current_context();
         let reason = FailedPrecommitReason::Fatal(fatal);
-        sealer.fail_unsubmitted();
         self.fail_prefix_entries(fatal);
 
         let mut queued = Vec::new();
@@ -977,8 +1054,22 @@ where
                     recycle.extend(group.drain_buffers());
                     group.failure_reason.get_or_insert(reason);
                 }
-                LogPrefixKind::SealDispatch { log_file } => {
-                    drop(log_file.take());
+                LogPrefixKind::Seal {
+                    log_file,
+                    write,
+                    ready,
+                    failure,
+                } => {
+                    if log_file.take().is_some() {
+                        *ready = true;
+                    }
+                    if let Some(mut submission) = write.take() {
+                        let _ = submission.operation.take_buf();
+                        *ready = true;
+                    }
+                    if !*ready || failure.is_none() {
+                        *failure = Some(fatal);
+                    }
                 }
             }
         }
@@ -995,14 +1086,14 @@ where
     pub(crate) fn process_until_shutdown(&mut self, sealer: &mut LogFileSealer) {
         loop {
             debug_assert!(
-                self.prefix.len() + self.prefix.driver_owned_len() + sealer.driver_owned_len()
+                self.prefix.len() + self.prefix.driver_owned_len()
                     >= self.write_driver.pending_len(),
                 "queued and inflight redo work should cover all driver-owned work"
             );
             // If shutdown flag is set, we still submit and finish all pending IOs,
             // but do not accept any new IO requests.
             if !self.shutdown {
-                self.fetch_io_reqs(sealer);
+                self.fetch_io_reqs();
             }
             self.finalize_finished_prefix(sealer);
             self.shrink_prefix_if_sparse();
@@ -1024,20 +1115,6 @@ where
         }
     }
 
-    /// Finish pending group IOs and any boundary header write already staged.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn finish_pending_io_and_header_write(&mut self, sealer: &mut LogFileSealer) {
-        while !self.prefix.is_empty() {
-            self.finalize_finished_prefix(sealer);
-            self.shrink_prefix_if_sparse();
-            self.submit_io(sealer);
-            self.wait_and_drain_io_if_submitted(sealer);
-            self.finalize_finished_prefix(sealer);
-            self.shrink_prefix_if_sparse();
-        }
-    }
-
     /// Return whether this writer still owns pending group or header I/O.
     #[inline]
     pub(crate) fn has_pending_io(&self) -> bool {
@@ -1052,8 +1129,8 @@ where
 
     /// Fetch queued commit work into the logical redo prefix.
     #[inline]
-    fn fetch_io_reqs(&mut self, sealer: &LogFileSealer) {
-        if self.write_driver.pending_len() == 0 && self.prefix.is_empty() && !sealer.has_pending() {
+    fn fetch_io_reqs(&mut self) {
+        if self.write_driver.pending_len() == 0 && self.prefix.is_empty() {
             // there is no processing IO, so we can block on waiting for next request.
             self.fetch_io_reqs_internal()
         } else {
@@ -1080,7 +1157,7 @@ where
                         header_write,
                     }) => {
                         if let Some(log_file) = ended_log_file {
-                            self.prefix.push_seal_dispatch(log_file);
+                            self.prefix.push_seal(log_file);
                         }
                         self.prefix.push_header(header_write);
                         fetched = true;
@@ -1120,7 +1197,7 @@ where
                     header_write,
                 }) => {
                     if let Some(log_file) = ended_log_file {
-                        self.prefix.push_seal_dispatch(log_file);
+                        self.prefix.push_seal(log_file);
                     }
                     self.prefix.push_header(header_write);
                 }
@@ -1149,8 +1226,8 @@ where
     /// Finalizes the ordered prefix whose redo writes are already finished.
     ///
     /// This is a no-op when the first prefix entry is not ready. Otherwise it
-    /// removes ready header barriers, dispatches old-file seal work, and
-    /// publishes the ready logical group prefix.
+    /// removes ready header and seal barriers, and publishes the ready logical
+    /// group prefix.
     ///
     /// Redo durability is sequential: this stops at the first unfinished group,
     /// and a failed group makes every later group cleanup-only even if its
@@ -1174,25 +1251,20 @@ where
                         .expect("front redo header prefix entry must exist");
                     Self::complete_header_prefix_entry(entry);
                 }
-                LogPrefixKind::SealDispatch { .. } => {
-                    // Rotation seal is side work for the old file. Dispatch it
-                    // in prefix order, then let the following header gate the
-                    // new file's groups.
+                LogPrefixKind::Seal { ready, .. } => {
+                    if !ready {
+                        // A rotated-file seal is prepared only after it reaches
+                        // the front of the ordered prefix. Until the old file's
+                        // seal write and configured sync complete, later header
+                        // and group entries must stay unpublished.
+                        self.prepare_front_seal_barrier(sealer);
+                        return;
+                    }
                     let entry = self
                         .prefix
                         .pop_front()
-                        .expect("front redo seal dispatch entry must exist");
-                    let LogPrefixKind::SealDispatch { log_file } = entry.kind else {
-                        unreachable!("front entry kind was checked")
-                    };
-                    if let Some(log_file) = log_file {
-                        let request_id = self.next_request_id();
-                        if let Err(reason) = sealer.enqueue_rotated_file(log_file, request_id) {
-                            let err = self.trx_sys.poison_storage(reason);
-                            self.fail_pending(sealer, err);
-                            return;
-                        }
-                    }
+                        .expect("front redo seal prefix entry must exist");
+                    Self::complete_seal_prefix_entry(entry);
                 }
                 LogPrefixKind::Group { group } => {
                     if !group.ready() {
@@ -1202,6 +1274,49 @@ where
                     // waiters can be completed.
                     self.finalize_ready_group_prefix(sealer);
                 }
+            }
+        }
+    }
+
+    /// Prepare the front rotated-file seal barrier for submission.
+    ///
+    /// This is invoked from `finalize_finished_prefix` only when a seal entry is
+    /// the first prefix entry and is not ready yet. Preparing it at the front,
+    /// instead of when it is enqueued, keeps seal metadata aligned with the
+    /// already-durable group prefix and makes the seal an ordered publication
+    /// barrier before the next file's header/groups can complete.
+    #[inline]
+    fn prepare_front_seal_barrier(&mut self, sealer: &mut LogFileSealer) {
+        let Some(entry) = self.prefix.entries.front_mut() else {
+            return;
+        };
+        let LogPrefixKind::Seal {
+            log_file,
+            write,
+            ready,
+            failure,
+        } = &mut entry.kind
+        else {
+            unreachable!("front prefix entry must be a seal")
+        };
+        if *ready || write.is_some() || failure.is_some() {
+            return;
+        }
+        // The log file is consumed exactly once: after the header write is
+        // built, the in-flight submission owns it until completion marks this
+        // prefix entry ready.
+        let Some(log_file) = log_file.take() else {
+            return;
+        };
+        match sealer.prepare_prefix_seal(log_file) {
+            Ok(submission) => {
+                *write = Some(submission);
+            }
+            Err(reason) => {
+                *failure = Some(reason);
+                *ready = true;
+                let err = self.trx_sys.poison_storage(reason);
+                self.fail_pending(sealer, err);
             }
         }
     }
@@ -1227,6 +1342,22 @@ where
         } else {
             completion.complete(Ok(()));
         }
+    }
+
+    #[inline]
+    fn complete_seal_prefix_entry(entry: LogPrefixEntry) {
+        let LogPrefixKind::Seal {
+            log_file,
+            write,
+            ready,
+            ..
+        } = entry.kind
+        else {
+            unreachable!("seal prefix completion requires a seal entry")
+        };
+        debug_assert!(log_file.is_none());
+        debug_assert!(write.is_none());
+        debug_assert!(ready);
     }
 
     #[inline]
@@ -1375,22 +1506,22 @@ where
 
     /// Submit queued redo writes.
     ///
-    /// Header, group, and side seal writes share the same async write driver
+    /// Header, group, and seal writes share the same async write driver
     /// capacity. Groups without redo bytes are ready as soon as they enter the
     /// prefix and are published by `finalize_finished_prefix`.
     #[inline]
-    fn submit_io(&mut self, sealer: &mut LogFileSealer) {
+    fn submit_io(&mut self, _sealer: &mut LogFileSealer) {
         let mut idx = 0;
         while idx < self.prefix.entries.len() {
             if self.write_driver.available_capacity() == 0 {
                 break;
             }
-            let entry_id = self.prefix.entries[idx].id;
+            let prefix_id = self.prefix.entries[idx].id;
             let Some(mut submission) = self.take_prefix_submission(idx) else {
                 idx += 1;
                 continue;
             };
-            let owner = self.ensure_submission_owner(&mut submission, entry_id);
+            let owner = self.ensure_submission_owner(&mut submission, prefix_id);
             if let Err(submission) = self.write_driver.push_write(submission) {
                 self.restore_prefix_submission(idx, submission);
                 break;
@@ -1400,7 +1531,6 @@ where
                 idx += 1;
             }
         }
-        sealer.stage_ready(self.write_driver);
         self.write_driver.submit_ready();
     }
 
@@ -1414,7 +1544,7 @@ where
         match &entry.kind {
             LogPrefixKind::Header { write, .. } => write.is_some(),
             LogPrefixKind::Group { group } => !group.writes.is_empty(),
-            LogPrefixKind::SealDispatch { .. } => false,
+            LogPrefixKind::Seal { write, .. } => write.is_some(),
         }
     }
 
@@ -1428,7 +1558,7 @@ where
         match &mut entry.kind {
             LogPrefixKind::Header { write, .. } => write.take(),
             LogPrefixKind::Group { group } => group.take_submission(),
-            LogPrefixKind::SealDispatch { .. } => None,
+            LogPrefixKind::Seal { write, .. } => write.take(),
         }
     }
 
@@ -1445,8 +1575,9 @@ where
                 *write = Some(submission);
             }
             LogPrefixKind::Group { group } => group.restore_submission(submission),
-            LogPrefixKind::SealDispatch { .. } => {
-                unreachable!("seal dispatch entries do not own direct submissions")
+            LogPrefixKind::Seal { write, .. } => {
+                debug_assert!(write.is_none());
+                *write = Some(submission);
             }
         }
     }
@@ -1455,20 +1586,18 @@ where
     fn ensure_submission_owner(
         &mut self,
         submission: &mut LogWriteSubmission,
-        entry_id: LogPrefixId,
+        prefix_id: LogPrefixId,
     ) -> LogRequestOwner {
         if let Some(owner) = submission.owner() {
             return owner;
         }
         let request_id = self.next_request_id();
         let owner = match &submission.kind {
-            LogWriteKind::Header { .. } => LogRequestOwner::header(request_id, entry_id),
+            LogWriteKind::Header { .. } => LogRequestOwner::header(request_id, prefix_id),
             LogWriteKind::Group { group_write_idx } => {
-                LogRequestOwner::group(request_id, entry_id, *group_write_idx)
+                LogRequestOwner::group(request_id, prefix_id, *group_write_idx)
             }
-            LogWriteKind::Seal { .. } => {
-                unreachable!("side seal submissions receive owners in the sealer")
-            }
+            LogWriteKind::Seal { .. } => LogRequestOwner::seal(request_id, Some(prefix_id)),
         };
         submission.attach_owner(owner);
         owner
@@ -1489,8 +1618,8 @@ where
                 debug_assert_eq!(owner.kind, LogRequestKind::Group);
                 group.mark_request_submitted();
             }
-            LogPrefixKind::SealDispatch { .. } => {
-                unreachable!("seal dispatch entries do not own direct submissions")
+            LogPrefixKind::Seal { .. } => {
+                debug_assert_eq!(owner.kind, LogRequestKind::Seal);
             }
         }
     }
@@ -1540,10 +1669,10 @@ where
                     return false;
                 };
                 debug_assert_eq!(owner.kind, LogRequestKind::Header);
-                let entry_id = owner
-                    .entry_id
+                let prefix_id = owner
+                    .prefix_id
                     .expect("redo header request must carry a prefix entry id");
-                self.complete_header_request(entry_id, poison);
+                self.complete_header_request(prefix_id, poison);
                 if let Some(source) = poison {
                     let err = self.trx_sys.poison_storage(source);
                     self.fail_pending(sealer, err);
@@ -1553,10 +1682,10 @@ where
             LogWriteKind::Group { .. } => {
                 let owner = owner.expect("redo group completion must carry request owner");
                 debug_assert_eq!(owner.kind, LogRequestKind::Group);
-                let entry_id = owner
-                    .entry_id
+                let prefix_id = owner
+                    .prefix_id
                     .expect("redo group request must carry a prefix entry id");
-                self.complete_group_request(entry_id, owner.group_write_idx, buf, poison);
+                self.complete_group_request(prefix_id, owner.group_write_idx, buf, poison);
                 if let Some(source) = poison {
                     let err = self.trx_sys.poison_storage(source);
                     self.fail_pending(sealer, err);
@@ -1567,11 +1696,16 @@ where
                 drop(buf);
                 let owner = owner.expect("redo seal completion must carry request owner");
                 debug_assert_eq!(owner.kind, LogRequestKind::Seal);
-                if let Some(err) =
-                    sealer.handle_completion(self.trx_sys, owner.request_id, log_file, poison)
-                {
-                    self.fail_pending(sealer, err);
-                    return true;
+                if let Some(prefix_id) = owner.prefix_id {
+                    if let Some(reason) =
+                        self.complete_seal_request(prefix_id, sealer, log_file, poison)
+                    {
+                        let err = self.trx_sys.poison_storage(reason);
+                        self.fail_pending(sealer, err);
+                        return true;
+                    }
+                } else {
+                    panic!("prefix-owned redo seal completion must carry a prefix entry id");
                 }
             }
         }
@@ -1579,10 +1713,10 @@ where
     }
 
     #[inline]
-    fn complete_header_request(&mut self, entry_id: LogPrefixId, poison: Option<FatalError>) {
+    fn complete_header_request(&mut self, prefix_id: LogPrefixId, poison: Option<FatalError>) {
         let entry = self
             .prefix
-            .entry_mut(entry_id)
+            .entry_mut(prefix_id)
             .expect("redo header completion must match one prefix entry");
         let LogPrefixKind::Header { ready, failure, .. } = &mut entry.kind else {
             panic!("redo header completion matched non-header prefix entry");
@@ -1596,14 +1730,14 @@ where
     #[inline]
     fn complete_group_request(
         &mut self,
-        entry_id: LogPrefixId,
+        prefix_id: LogPrefixId,
         group_write_idx: Option<usize>,
         buf: DirectBuf,
         poison: Option<FatalError>,
     ) {
         let entry = self
             .prefix
-            .entry_mut(entry_id)
+            .entry_mut(prefix_id)
             .expect("redo group completion must match one prefix entry");
         let LogPrefixKind::Group { group } = &mut entry.kind else {
             panic!("redo group completion matched non-group prefix entry");
@@ -1618,6 +1752,30 @@ where
                 .failure_reason
                 .get_or_insert(FailedPrecommitReason::Fatal(source));
         }
+    }
+
+    #[inline]
+    fn complete_seal_request(
+        &mut self,
+        prefix_id: LogPrefixId,
+        sealer: &LogFileSealer,
+        log_file: Box<RedoLogFile>,
+        poison: Option<FatalError>,
+    ) -> Option<FatalError> {
+        let reason = sealer.finish_prefix_seal(&log_file, poison).err();
+        drop(log_file);
+        let entry = self
+            .prefix
+            .entry_mut(prefix_id)
+            .expect("redo seal completion must match one prefix entry");
+        let LogPrefixKind::Seal { ready, failure, .. } = &mut entry.kind else {
+            panic!("redo seal completion matched non-seal prefix entry");
+        };
+        if failure.is_none() {
+            *failure = reason;
+        }
+        *ready = true;
+        reason
     }
 }
 
@@ -1775,8 +1933,32 @@ fn create_log_file_with_header_completion(
     file_max_size: usize,
     log_block_size: usize,
 ) -> Result<(CreatedLogFile, Arc<Completion<()>>)> {
+    create_log_file_with_header_completion_with_mode(
+        file_prefix,
+        file_seq,
+        file_max_size,
+        log_block_size,
+        RedoLogCreateMode::CreateOrFail,
+    )
+}
+
+#[inline]
+fn create_log_file_with_header_completion_with_mode(
+    file_prefix: &str,
+    file_seq: u32,
+    file_max_size: usize,
+    log_block_size: usize,
+    create_mode: RedoLogCreateMode,
+) -> Result<(CreatedLogFile, Arc<Completion<()>>)> {
     let file_name = log_file_name(file_prefix, file_seq);
-    let sparse_file = SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_FILE_ID)?;
+    let sparse_file = match create_mode {
+        RedoLogCreateMode::CreateOrFail => {
+            SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_FILE_ID)?
+        }
+        RedoLogCreateMode::CreateOrTrunc => {
+            SparseFile::create_or_trunc(&file_name, file_max_size, UNTRACKED_FILE_ID)?
+        }
+    };
     let super_block = RedoSuperBlock::initial(file_seq, log_block_size, file_max_size);
     let (header_write, header_completion) =
         prepare_initial_redo_super_block(&sparse_file, &super_block)?;
@@ -1799,6 +1981,20 @@ fn prepare_initial_redo_super_block(
     let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
     serialize_redo_super_block(buf.as_bytes_mut(), super_block)?;
     Ok(LogWriteSubmission::header(log_file.as_raw_fd(), 0, buf))
+}
+
+#[inline]
+fn open_recovered_seal_file(recovered: RecoveredRedoSeal) -> Result<RedoLogFile> {
+    let path = recovered.path.to_str().ok_or_else(|| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "redo log path is not valid UTF-8: path={}",
+                recovered.path.display()
+            )),
+        )
+    })?;
+    let sparse_file = SparseFile::open(path, UNTRACKED_FILE_ID)?;
+    Ok(RedoLogFile::new(sparse_file, recovered.super_block).with_seal_metadata(recovered.metadata))
 }
 
 #[inline]
@@ -1991,24 +2187,29 @@ mod tests {
         log_file
     }
 
-    fn redo_planner_and_initializer_for_test(
+    fn redo_planner_and_finalizer_for_test(
         file_prefix: &str,
         recovery_io_depth: usize,
         log_write_io_depth: usize,
         file_max_size: usize,
         log_block_size: usize,
         logs: Vec<RedoLogFileDescriptor>,
-    ) -> (RedoLogInitializer, RedoReplayPlanner, usize) {
+    ) -> (RedoLogFinalizer, RedoReplayPlanner, usize) {
+        let next_file_seq = logs
+            .last()
+            .map(|descriptor| next_redo_file_seq(descriptor.file_seq))
+            .transpose()
+            .unwrap()
+            .unwrap_or(0);
         let planner = RedoReplayPlanner::new(logs);
-        let next_file_seq = planner.next_file_seq().unwrap().unwrap_or(0);
-        let initializer = RedoLogInitializer::new(
+        let finalizer = RedoLogFinalizer::new(
             file_prefix.to_owned(),
             log_write_io_depth,
             file_max_size,
             log_block_size,
             next_file_seq,
         );
-        (initializer, planner, recovery_io_depth)
+        (finalizer, planner, recovery_io_depth)
     }
 
     fn create_sealed_log_file_for_test(
@@ -2039,8 +2240,8 @@ mod tests {
         log_write_io_depth: usize,
     ) -> (RedoLog, Arc<Completion<()>>) {
         let (purge_tx, _purge_rx) = flume::unbounded();
-        RedoLogInitializer::new(file_prefix, log_write_io_depth, 128 * 1024, 4096, 0)
-            .finish(purge_tx)
+        RedoLogFinalizer::new(file_prefix, log_write_io_depth, 128 * 1024, 4096, 0)
+            .finalize(purge_tx)
             .unwrap()
     }
 
@@ -2370,6 +2571,37 @@ mod tests {
             manual_log_processor_harness(engine, config, redo_log),
             LogWriteDriver::new(StorageBackend::new(1).unwrap()),
         )
+    }
+
+    fn finish_prefix_seal_for_test(
+        harness: &ManualLogProcessorHarness,
+        write_driver: &mut LogWriteDriver,
+        sealer: &mut LogFileSealer,
+        log_file: RedoLogFile,
+    ) {
+        let mut writer =
+            RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, write_driver);
+        writer.prefix.push_seal(log_file);
+        drain_pending_prefix_for_test(&mut writer, sealer);
+        assert!(!writer.has_pending_io());
+        assert_eq!(writer.write_driver.pending_len(), 0);
+        assert_eq!(writer.write_driver.submitted_len(), 0);
+    }
+
+    fn drain_pending_prefix_for_test<B>(
+        writer: &mut RedoLogWriter<'_, B>,
+        sealer: &mut LogFileSealer,
+    ) where
+        B: IOBackend,
+    {
+        while !writer.prefix.is_empty() {
+            writer.finalize_finished_prefix(sealer);
+            writer.shrink_prefix_if_sparse();
+            writer.submit_io(sealer);
+            writer.wait_and_drain_io_if_submitted(sealer);
+            writer.finalize_finished_prefix(sealer);
+            writer.shrink_prefix_if_sparse();
+        }
     }
 
     async fn build_redo_test_engine(log_file_stem: &str, log_sync: LogSync) -> (TempDir, Engine) {
@@ -3229,7 +3461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_pending_io_and_header_write_finalizes_finished_prefix_without_submitted_write() {
+    fn test_drain_pending_prefix_finalizes_finished_prefix_without_submitted_write() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("finish_pending_no_submitted_write", LogSync::None).await;
@@ -3258,7 +3490,7 @@ mod tests {
                 fp.prefix
                     .push_group(sync_group_for_order_test(cts, true, 0));
 
-                fp.finish_pending_io_and_header_write(&mut sealer);
+                drain_pending_prefix_for_test(&mut fp, &mut sealer);
 
                 assert!(fp.prefix.is_empty());
                 assert_eq!(fp.write_driver.pending_len(), 0);
@@ -3350,7 +3582,7 @@ mod tests {
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
-                fp.fetch_io_reqs(&sealer);
+                fp.fetch_io_reqs();
                 fp.submit_io(&mut sealer);
 
                 assert_eq!(
@@ -3363,7 +3595,7 @@ mod tests {
                 assert_eq!(fp.next_request_id, 2);
                 assert_eq!(fp.prefix.driver_owned_len(), 2);
 
-                fp.finish_pending_io_and_header_write(&mut sealer);
+                drain_pending_prefix_for_test(&mut fp, &mut sealer);
                 assert!(fp.prefix.is_empty());
                 assert_eq!(fp.write_driver.pending_len(), 0);
             }
@@ -3434,7 +3666,6 @@ mod tests {
             }
 
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(2).unwrap());
-            let sealer = LogFileSealer::new(&harness.trx_sys.config);
             {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
@@ -3447,7 +3678,7 @@ mod tests {
                 let reusable2_ptr = reusable2.as_bytes().as_ptr() as usize;
                 fp.recycle_bufs(vec![reusable1, reusable2]);
 
-                fp.fetch_io_reqs(&sealer);
+                fp.fetch_io_reqs();
 
                 let group = fp
                     .prefix
@@ -3479,7 +3710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_pending_io_and_header_write_syncs_boundary_ended_log_file() {
+    fn test_drain_pending_prefix_syncs_boundary_ended_log_file() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("finish_pending_switch_syncer", LogSync::None).await;
@@ -3523,9 +3754,9 @@ mod tests {
                     4096,
                     Some(ended_fd),
                 ));
-                fp.fetch_io_reqs(&sealer);
+                fp.fetch_io_reqs();
 
-                fp.finish_pending_io_and_header_write(&mut sealer);
+                drain_pending_prefix_for_test(&mut fp, &mut sealer);
 
                 assert!(fp.prefix.is_empty());
                 assert_eq!(fp.write_driver.pending_len(), 0);
@@ -3541,10 +3772,12 @@ mod tests {
                 cts.as_u64()
             );
             let calls = hook.calls();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].kind(), FileSyncKind::Fsync);
-            assert_eq!(calls[0].fd(), ended_fd);
-            assert_ne!(calls[0].fd(), current_fd);
+            assert_eq!(calls.len(), 2);
+            for call in calls {
+                assert_eq!(call.kind(), FileSyncKind::Fsync);
+                assert_eq!(call.fd(), ended_fd);
+                assert_ne!(call.fd(), current_fd);
+            }
 
             drop(harness);
             engine.shutdown().unwrap();
@@ -3552,14 +3785,14 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_pending_io_and_header_write_does_not_wait_for_pending_seal() {
+    fn test_drain_pending_prefix_drains_prefix_owned_seal() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
-                build_redo_test_engine("finish_pending_with_async_seal", LogSync::None).await;
+                build_redo_test_engine("finish_pending_with_prefix_seal", LogSync::None).await;
             let temp_dir = TempDir::new().unwrap();
             let ended_prefix = temp_dir
                 .path()
-                .join("standalone_pending_seal_redo.log")
+                .join("standalone_prefix_seal_redo.log")
                 .to_str()
                 .unwrap()
                 .to_owned();
@@ -3578,31 +3811,7 @@ mod tests {
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
 
-            sealer
-                .enqueue_rotated_file(ended_log_file, LogRequestId::new(100))
-                .unwrap();
-            assert!(sealer.has_pending());
-
-            {
-                let mut writer = RedoLogWriter::new(
-                    &harness.trx_sys,
-                    &harness.trx_sys.config,
-                    &mut write_driver,
-                );
-                writer.fetch_io_reqs(&sealer);
-                writer.finish_pending_io_and_header_write(&mut sealer);
-
-                assert!(!writer.has_pending_io());
-                assert_eq!(writer.write_driver.pending_len(), 0);
-            }
-
-            assert!(sealer.has_pending());
-            assert!(
-                sealer
-                    .finish_pending(&harness.trx_sys, &mut write_driver)
-                    .is_none()
-            );
-            assert!(!sealer.has_pending());
+            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
 
             drop(harness);
             engine.shutdown().unwrap();
@@ -3646,16 +3855,7 @@ mod tests {
                 TrxID::new(72),
                 end_offset,
             );
-            sealer
-                .enqueue_rotated_file(ended_log_file, LogRequestId::new(101))
-                .unwrap();
-            assert!(sealer.has_pending());
-            assert!(
-                sealer
-                    .finish_pending(&harness.trx_sys, &mut write_driver)
-                    .is_none()
-            );
-            assert!(!sealer.has_pending());
+            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
 
             let bytes = fs::read(format!("{file_prefix}.00000000")).unwrap();
             let slot1 = parse_redo_super_block(
@@ -3734,14 +3934,7 @@ mod tests {
                 manual_redo_log_writer_for_seal(&engine, LogSync::None, harness_prefix);
 
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
-            sealer
-                .enqueue_rotated_file(ended_log_file, LogRequestId::new(102))
-                .unwrap();
-            assert!(
-                sealer
-                    .finish_pending(&harness.trx_sys, &mut write_driver)
-                    .is_some()
-            );
+            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
 
             assert!(
                 harness
@@ -3786,14 +3979,7 @@ mod tests {
                 manual_redo_log_writer_for_seal(&engine, LogSync::Fsync, harness_prefix);
 
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
-            sealer
-                .enqueue_rotated_file(ended_log_file, LogRequestId::new(103))
-                .unwrap();
-            assert!(
-                sealer
-                    .finish_pending(&harness.trx_sys, &mut write_driver)
-                    .is_some()
-            );
+            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
 
             assert!(
                 harness
@@ -3931,6 +4117,53 @@ mod tests {
             assert_eq!(ready.failed.len(), 2);
             assert_eq!(ready.failed[0].max_cts, TrxID::new(31));
             assert_eq!(ready.failed[1].max_cts, TrxID::new(32));
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_fail_prefix_entries_marks_unprepared_seal_ready() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("prefix_failed_unprepared_seal", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let ended_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_failed_seal_ended_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let active_prefix = temp_dir
+                .path()
+                .join("standalone_prefix_failed_seal_active_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let ended_log_file = create_log_file_for_test(&ended_prefix, 0, 128 * 1024, 4096);
+            let (header_write, header_completion) = LogWriteSubmission::header(
+                ended_log_file.as_raw_fd(),
+                0,
+                DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE),
+            );
+            let (redo_log, _initial_header) = finish_redo_log_for_test(active_prefix, 1);
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut writer =
+                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+
+            writer.prefix.push_header(header_write);
+            writer.prefix.push_seal(ended_log_file);
+            writer.fail_prefix_entries(FatalError::RedoWrite);
+            writer.finalize_finished_prefix(&mut sealer);
+
+            assert!(writer.prefix.is_empty());
+            assert!(header_completion.completed_result().unwrap().is_err());
 
             drop(harness);
             engine.shutdown().unwrap();
@@ -4117,10 +4350,9 @@ mod tests {
             let descriptors = discover_redo_log_files(file_prefix, false).unwrap();
             let planner = RedoReplayPlanner::new(descriptors);
 
-            assert_eq!(planner.next_file_seq().unwrap(), Some(3));
-            let (skipped_max_recovered_cts, mut stream) =
-                planner.plan_stream(TrxID::new(15), 1).unwrap();
-            assert_eq!(skipped_max_recovered_cts, None);
+            let planned = planner.plan_recovery(TrxID::new(15), 1).unwrap();
+            assert_eq!(planned.skipped_max_recovered_cts, None);
+            let mut stream = planned.stream;
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
                 err.data_integrity_error(),
@@ -4133,8 +4365,8 @@ mod tests {
     fn test_redo_replay_planner_can_build_independent_empty_streams() {
         smol::block_on(async {
             let planner = RedoReplayPlanner::new(Vec::new());
-            let (_, mut stream1) = planner.plan_stream(TrxID::new(10), 1).unwrap();
-            let (_, mut stream2) = planner.plan_stream(TrxID::new(11), 1).unwrap();
+            let mut stream1 = planner.plan_recovery(TrxID::new(10), 1).unwrap().stream;
+            let mut stream2 = planner.plan_recovery(TrxID::new(11), 1).unwrap().stream;
 
             assert!(stream1.try_next().await.unwrap().is_none());
             assert!(stream2.try_next().await.unwrap().is_none());
@@ -4154,14 +4386,14 @@ mod tests {
                 Some((TrxID::new(10), TrxID::new(20))),
             );
             let logs = discover_redo_log_files(file_prefix, false).unwrap();
-            let (initializer, planner, read_depth) =
-                redo_planner_and_initializer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
+            let (finalizer, planner, read_depth) =
+                redo_planner_and_finalizer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
 
-            let (skipped_max_recovered_cts, mut stream) =
-                planner.plan_stream(TrxID::new(21), read_depth).unwrap();
-            assert_eq!(skipped_max_recovered_cts, Some(TrxID::new(20)));
+            let planned = planner.plan_recovery(TrxID::new(21), read_depth).unwrap();
+            assert_eq!(planned.skipped_max_recovered_cts, Some(TrxID::new(20)));
+            let mut stream = planned.stream;
             assert!(stream.try_next().await.unwrap().is_none());
-            assert_eq!(initializer.next_file_seq, 1);
+            assert_eq!(finalizer.next_file_seq, 1);
         });
     }
 
@@ -4173,14 +4405,14 @@ mod tests {
             let file_prefix = file_prefix.to_str().unwrap();
             create_sealed_log_file_for_test(file_prefix, 0, REDO_DEFAULT_DATA_START_OFFSET, None);
             let logs = discover_redo_log_files(file_prefix, false).unwrap();
-            let (initializer, planner, read_depth) =
-                redo_planner_and_initializer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
+            let (finalizer, planner, read_depth) =
+                redo_planner_and_finalizer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
 
-            let (skipped_max_recovered_cts, mut stream) =
-                planner.plan_stream(TrxID::new(100), read_depth).unwrap();
-            assert_eq!(skipped_max_recovered_cts, None);
+            let planned = planner.plan_recovery(TrxID::new(100), read_depth).unwrap();
+            assert_eq!(planned.skipped_max_recovered_cts, None);
+            let mut stream = planned.stream;
             assert!(stream.try_next().await.unwrap().is_none());
-            assert_eq!(initializer.next_file_seq, 1);
+            assert_eq!(finalizer.next_file_seq, 1);
         });
     }
 
@@ -4199,9 +4431,9 @@ mod tests {
             let logs = discover_redo_log_files(file_prefix, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
 
-            let (skipped_max_recovered_cts, mut stream) =
-                planner.plan_stream(TrxID::new(20), 1).unwrap();
-            assert_eq!(skipped_max_recovered_cts, None);
+            let planned = planner.plan_recovery(TrxID::new(20), 1).unwrap();
+            assert_eq!(planned.skipped_max_recovered_cts, None);
+            let mut stream = planned.stream;
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
                 err.data_integrity_error(),
@@ -4230,6 +4462,109 @@ mod tests {
 
         let slot1 = &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET];
         let err = parse_redo_super_block(slot1, 3, 1).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidMagic)
+        );
+    }
+
+    #[test]
+    fn test_recovery_finalizer_seals_recovered_redo_file_in_normal_prefix() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("recovered_seal_prefix", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir.path().join("redo.log");
+            let file_prefix = file_prefix.to_str().unwrap();
+            let log_file = create_log_file_for_test(file_prefix, 0, 128 * 1024, 4096);
+            let open = log_file.super_block();
+            drop(log_file);
+            let path = PathBuf::from(log_file_name(file_prefix, 0));
+            let durable_end_offset = REDO_DEFAULT_DATA_START_OFFSET + 4096;
+            let (purge_tx, _purge_rx) = flume::unbounded();
+            let mut finalizer =
+                RedoLogFinalizer::new(file_prefix.to_owned(), 1, 128 * 1024, 4096, 1);
+
+            finalizer.set_recovered_seal(
+                path.clone(),
+                open,
+                durable_end_offset,
+                Some((TrxID::new(70), TrxID::new(72))),
+            );
+            let (redo_log, header_completion) = finalizer.finalize(purge_tx).unwrap();
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+            let mut writer =
+                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
+
+            writer.fetch_io_reqs();
+            drain_pending_prefix_for_test(&mut writer, &mut sealer);
+
+            assert!(!writer.has_pending_io());
+            assert_eq!(writer.write_driver.pending_len(), 0);
+            assert_eq!(writer.write_driver.submitted_len(), 0);
+            assert!(header_completion.completed_result().unwrap().is_ok());
+
+            let bytes = fs::read(path).unwrap();
+            let sealed = parse_redo_super_block(
+                &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..][..REDO_SUPER_BLOCK_SLOT_SIZE],
+                0,
+                1,
+            )
+            .unwrap();
+            assert!(sealed.is_sealed());
+            assert_eq!(sealed.generation, 1);
+            assert_eq!(sealed.durable_end_offset, durable_end_offset as u64);
+            assert_eq!(sealed.min_redo_cts, 70);
+            assert_eq!(sealed.max_redo_cts, 72);
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_redo_finalizer_recreates_existing_tail_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        create_sealed_log_file_for_test(
+            file_prefix,
+            0,
+            REDO_DEFAULT_DATA_START_OFFSET + 4096,
+            Some((TrxID::new(1), TrxID::new(1))),
+        );
+        let (purge_tx, _purge_rx) = flume::unbounded();
+        let mut finalizer = RedoLogFinalizer::new(file_prefix.to_owned(), 1, 128 * 1024, 4096, 0);
+        finalizer.set_startup_file(0, RedoLogCreateMode::CreateOrTrunc);
+        let (redo_log, header_completion) = finalizer.finalize(purge_tx).unwrap();
+        let header_write = {
+            let mut group_commit_g = redo_log.group_commit.lock();
+            match group_commit_g.queue.pop_front().unwrap() {
+                Commit::LogFileBoundary {
+                    ended_log_file,
+                    header_write,
+                } => {
+                    assert!(ended_log_file.is_none());
+                    header_write
+                }
+                Commit::Group(_) | Commit::Shutdown => {
+                    panic!("expected initial redo super-block write")
+                }
+            }
+        };
+        submit_header_write_for_test(header_write, &header_completion);
+        drop(redo_log);
+
+        let bytes = fs::read(format!("{file_prefix}.00000000")).unwrap();
+        let open = parse_redo_super_block(&bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 0, 0).unwrap();
+        assert!(!open.is_sealed());
+        let slot1 = &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET];
+        let err = parse_redo_super_block(slot1, 0, 1).unwrap_err();
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::InvalidMagic)
@@ -4313,7 +4648,7 @@ mod tests {
                 .log_file_max_size(new_file_max_size);
             let file_prefix = config.file_prefix().unwrap();
             let logs = discover_redo_log_files(&file_prefix, false).unwrap();
-            let (initializer, planner, read_depth) = redo_planner_and_initializer_for_test(
+            let (finalizer, planner, read_depth) = redo_planner_and_finalizer_for_test(
                 &file_prefix,
                 config.recovery_io_depth,
                 config.log_write_io_depth,
@@ -4321,21 +4656,21 @@ mod tests {
                 new_log_block_size,
                 logs,
             );
-            let (skipped_max_recovered_cts, mut stream) =
-                planner.plan_stream(MIN_SNAPSHOT_TS, read_depth).unwrap();
-            assert_eq!(skipped_max_recovered_cts, None);
+            let planned = planner.plan_recovery(MIN_SNAPSHOT_TS, read_depth).unwrap();
+            assert_eq!(planned.skipped_max_recovered_cts, None);
+            let mut stream = planned.stream;
             let recovered = stream.try_next().await.unwrap().unwrap();
             assert_eq!(recovered.header.cts, cts);
             assert_eq!(recovered.header.trx_kind, RedoTrxKind::System);
             assert!(stream.try_next().await.unwrap().is_none());
 
-            assert_eq!(initializer.next_file_seq, 1);
-            assert_eq!(initializer.log_write_io_depth, 7);
-            assert_eq!(initializer.log_block_size, new_log_block_size);
-            assert_eq!(initializer.file_max_size, new_file_max_size);
+            assert_eq!(finalizer.next_file_seq, 1);
+            assert_eq!(finalizer.log_write_io_depth, 7);
+            assert_eq!(finalizer.log_block_size, new_log_block_size);
+            assert_eq!(finalizer.file_max_size, new_file_max_size);
 
             let (purge_tx, _purge_rx) = flume::unbounded();
-            let (redo_log, initial_header_completion) = initializer.finish(purge_tx).unwrap();
+            let (redo_log, initial_header_completion) = finalizer.finalize(purge_tx).unwrap();
             let header_write = {
                 let mut group_commit_g = redo_log.group_commit.lock();
                 match group_commit_g.queue.pop_front().unwrap() {
@@ -4451,7 +4786,7 @@ mod tests {
             let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
             let logs = discover_redo_log_files(&file_prefix, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
-            let (_, mut stream) = planner.plan_stream(TrxID::new(0), 1).unwrap();
+            let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
             while let Some(pod) = stream.try_next().await.unwrap() {
                 println!(
                     "log {}, header={:?}, payload={:?}",

@@ -1,6 +1,6 @@
 use super::{
-    LogRequestId, LogRequestKind, LogRequestOwner, LogSync, LogWriteCompletion, LogWriteDriver,
-    LogWriteKind, LogWriteSubmission, RedoGroupWriteMeta, RedoLogFile,
+    LogSync, LogWriteCompletion, LogWriteDriver, LogWriteKind, LogWriteSubmission,
+    RedoGroupWriteMeta, RedoLogFile, RedoLogSealMetadata,
 };
 use crate::conf::TrxSysConfig;
 use crate::error::{CompletionErrorKind, FatalError};
@@ -12,8 +12,6 @@ use crate::log::format::{
     serialize_redo_super_block, slot_offset,
 };
 use crate::trx::sys::TransactionSystem;
-use error_stack::Report;
-use std::collections::VecDeque;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::result::Result as StdResult;
@@ -56,6 +54,20 @@ impl LogFileSealAccumulator {
     }
 
     #[inline]
+    fn from_metadata(metadata: RedoLogSealMetadata) -> Self {
+        let (min_redo_cts, max_redo_cts) = match metadata.redo_range {
+            Some((min_redo_cts, max_redo_cts)) => (Some(min_redo_cts), Some(max_redo_cts)),
+            None => (None, None),
+        };
+        Self {
+            file_seq: Some(metadata.file_seq),
+            durable_end_offset: metadata.durable_end_offset,
+            min_redo_cts,
+            max_redo_cts,
+        }
+    }
+
+    #[inline]
     fn record_group(&mut self, write_meta: RedoGroupWriteMeta) {
         if let Some(file_seq) = self.file_seq {
             debug_assert_eq!(file_seq, write_meta.file_seq);
@@ -83,15 +95,9 @@ impl LogFileSealAccumulator {
     }
 }
 
-struct PendingSeal {
-    request_id: LogRequestId,
-}
-
-/// Tracks sealed redo metadata and pending seal writes for rotated files.
+/// Tracks sealed redo metadata and builds seal writes for rotated files.
 pub(crate) struct LogFileSealer {
     accumulator: LogFileSealAccumulator,
-    seal_writes: VecDeque<LogWriteSubmission>,
-    inflight_seals: Vec<PendingSeal>,
     log_sync: LogSync,
 }
 
@@ -101,8 +107,6 @@ impl LogFileSealer {
     pub(crate) fn new(config: &TrxSysConfig) -> Self {
         LogFileSealer {
             accumulator: LogFileSealAccumulator::new(),
-            seal_writes: VecDeque::new(),
-            inflight_seals: Vec::new(),
             log_sync: config.log_sync,
         }
     }
@@ -113,140 +117,32 @@ impl LogFileSealer {
         self.accumulator.record_group(write_meta);
     }
 
+    /// Prepare a prefix-owned rotated-file seal write.
     #[inline]
-    pub(super) fn has_pending(&self) -> bool {
-        !self.seal_writes.is_empty() || !self.inflight_seals.is_empty()
-    }
-
-    #[inline]
-    pub(super) fn driver_owned_len(&self) -> usize {
-        self.inflight_seals.len()
-    }
-
-    #[inline]
-    pub(super) fn fail_unsubmitted(&mut self) {
-        let drained: Vec<_> = self.seal_writes.drain(..).collect();
-        for submission in drained {
-            submission.fail_unsubmitted_seal();
-        }
-    }
-
-    /// Queue a rotated log file for inactive-slot sealing.
-    #[inline]
-    pub(crate) fn enqueue_rotated_file(
+    pub(super) fn prepare_prefix_seal(
         &mut self,
-        log_file: RedoLogFile,
-        request_id: LogRequestId,
-    ) -> StdResult<(), FatalError> {
-        let accumulator = mem::replace(&mut self.accumulator, LogFileSealAccumulator::new());
-        let mut submission = Self::prepare_seal_submission(log_file, accumulator)?;
-        submission.attach_owner(LogRequestOwner::seal(request_id));
-        self.seal_writes.push_back(submission);
-        Ok(())
-    }
-
-    #[inline]
-    fn prepare_seal_submission(
-        log_file: RedoLogFile,
-        accumulator: LogFileSealAccumulator,
+        mut log_file: RedoLogFile,
     ) -> StdResult<LogWriteSubmission, FatalError> {
-        if let Some(file_seq) = accumulator.file_seq {
-            debug_assert_eq!(file_seq, log_file.file_seq());
-        }
-        let target = log_file.seal_target();
-        let (fd, offset, buf) = build_sealed_header_write(target, accumulator)?;
-        debug_assert_eq!(fd, log_file.as_raw_fd());
-        Ok(LogWriteSubmission::seal(log_file, offset, buf))
+        let accumulator = match log_file.seal_metadata.take() {
+            // Recovery attaches accepted-prefix metadata to the file so startup
+            // sealing uses the same ordered prefix barrier as normal rotation.
+            Some(metadata) => LogFileSealAccumulator::from_metadata(*metadata),
+            None => mem::replace(&mut self.accumulator, LogFileSealAccumulator::new()),
+        };
+        prepare_seal_submission(log_file, accumulator)
     }
 
+    /// Complete a prefix-owned rotated-file seal after the write finishes.
     #[inline]
-    pub(super) fn stage_ready<B>(&mut self, write_driver: &mut LogWriteDriver<B>)
-    where
-        B: IOBackend,
-    {
-        while let Some(submission) = self.seal_writes.pop_front() {
-            if write_driver.available_capacity() == 0 {
-                self.seal_writes.push_front(submission);
-                break;
-            }
-            let request_id = submission
-                .owner()
-                .expect("redo seal submission must carry a request owner")
-                .request_id;
-            if let Err(submission) = write_driver.push_write(submission) {
-                self.seal_writes.push_front(submission);
-                break;
-            }
-            self.inflight_seals.push(PendingSeal { request_id });
-        }
-    }
-
-    #[inline]
-    pub(super) fn handle_completion(
-        &mut self,
-        trx_sys: &TransactionSystem,
-        request_id: LogRequestId,
-        log_file: Box<RedoLogFile>,
+    pub(super) fn finish_prefix_seal(
+        &self,
+        log_file: &RedoLogFile,
         poison: Option<FatalError>,
-    ) -> Option<Report<FatalError>> {
-        let pos = self
-            .inflight_seals
-            .iter()
-            .position(|seal| seal.request_id == request_id)
-            .expect("redo seal completion must match inflight seal request id");
-        self.inflight_seals.swap_remove(pos);
+    ) -> StdResult<(), FatalError> {
         if let Some(reason) = poison {
-            return Some(trx_sys.poison_storage(reason));
+            return Err(reason);
         }
-        if let Err(reason) = sync_sealed_header(self.log_sync, log_file.as_raw_fd()) {
-            return Some(trx_sys.poison_storage(reason));
-        }
-        drop(log_file);
-        None
-    }
-
-    /// Drain all pending seal writes and return the first fatal seal error.
-    #[inline]
-    pub(crate) fn finish_pending(
-        &mut self,
-        trx_sys: &TransactionSystem,
-        write_driver: &mut LogWriteDriver<impl IOBackend>,
-    ) -> Option<Report<FatalError>> {
-        let mut first_err = None;
-        while self.has_pending() {
-            self.stage_ready(write_driver);
-            write_driver.submit_ready();
-            if write_driver.submitted_len() == 0 {
-                if first_err.is_none() {
-                    first_err = Some(trx_sys.poison_storage(FatalError::RedoWrite));
-                }
-                self.fail_unsubmitted();
-                break;
-            }
-            let LogWriteCompletion {
-                owner,
-                kind,
-                buf,
-                poison,
-            } = write_driver.wait_at_least_one();
-            match kind {
-                LogWriteKind::Seal { log_file } => {
-                    drop(buf);
-                    let owner = owner.expect("redo seal completion must carry request owner");
-                    debug_assert_eq!(owner.kind, LogRequestKind::Seal);
-                    if let Some(err) =
-                        self.handle_completion(trx_sys, owner.request_id, log_file, poison)
-                        && first_err.is_none()
-                    {
-                        first_err = Some(err);
-                    }
-                }
-                LogWriteKind::Header { .. } | LogWriteKind::Group { .. } => {
-                    unreachable!("redo file sealer must only drain seal completions");
-                }
-            }
-        }
-        first_err
+        sync_sealed_header(self.log_sync, log_file.as_raw_fd())
     }
 
     /// Best-effort seal of the active file during clean shutdown.
@@ -318,6 +214,20 @@ impl LogFileSealer {
         completion.complete(Ok(()));
         sync_sealed_header(self.log_sync, fd)
     }
+}
+
+#[inline]
+fn prepare_seal_submission(
+    log_file: RedoLogFile,
+    accumulator: LogFileSealAccumulator,
+) -> StdResult<LogWriteSubmission, FatalError> {
+    if let Some(file_seq) = accumulator.file_seq {
+        debug_assert_eq!(file_seq, log_file.file_seq());
+    }
+    let target = log_file.seal_target();
+    let (fd, offset, buf) = build_sealed_header_write(target, accumulator)?;
+    debug_assert_eq!(fd, log_file.as_raw_fd());
+    Ok(LogWriteSubmission::seal(log_file, offset, buf))
 }
 
 #[inline]

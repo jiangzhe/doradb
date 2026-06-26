@@ -6,7 +6,7 @@ use crate::file::fs::FileSystem;
 use crate::id::TrxID;
 use crate::io::{Completion, STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
-use crate::log::{LogSync, RedoLogInitializer};
+use crate::log::{LogSync, RedoLogFinalizer};
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::RedoReplayPlanner;
 use crate::recovery::{RecoveryBuffers, RecoveryCoordinator, RecoveryResources};
@@ -197,19 +197,18 @@ impl TrxSysConfig {
 
         let logs = discover_redo_log_files(&file_prefix, false)?;
         let planner = RedoReplayPlanner::new(logs);
-        let next_file_seq = planner.next_file_seq()?.unwrap_or(0);
-        let initializer = RedoLogInitializer::new(
+        let finalizer = RedoLogFinalizer::new(
             file_prefix,
             self.log_write_io_depth,
             file_max_size,
             log_block_size,
-            next_file_seq,
+            0,
         );
         Ok(RecoveryCoordinator::new(
             resources,
             planner,
             self.recovery_io_depth,
-            initializer,
+            finalizer,
         ))
     }
 
@@ -251,10 +250,10 @@ impl TrxSysConfig {
         let recovery_resources =
             RecoveryResources::new(recovery_buffers, table_fs.clone(), &catalog);
         let coordinator = config.prepare_recovery(recovery_resources)?;
-        let (max_recovered_cts, initial_file_deletes, initializer) =
+        let (max_recovered_cts, initial_file_deletes, finalizer) =
             coordinator.recover_all().await?;
         let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)?;
-        let (redo_log, initial_redo_header) = initializer.finish(purge_tx.clone())?;
+        let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone())?;
         let redo_log = CachePadded::new(redo_log);
 
         let trx_sys = TransactionSystem::new(
