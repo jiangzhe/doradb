@@ -4,6 +4,7 @@ title: Catalog-Backed Redo Log Truncation
 status: draft
 tags: [redo, recovery, catalog, checkpoint]
 created: 2026-06-26
+github_issue: 767
 ---
 
 # RFC-0022: Catalog-Backed Redo Log Truncation
