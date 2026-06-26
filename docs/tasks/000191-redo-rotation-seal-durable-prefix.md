@@ -1,7 +1,7 @@
 ---
 id: 000191
 title: Redo Rotation Seal Durable Prefix
-status: proposal
+status: implemented
 created: 2026-06-25
 github_issue: 760
 ---
@@ -34,7 +34,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000131-redo-rotation-seal-durable-prefix-barrier.md
+- docs/backlogs/closed/000131-redo-rotation-seal-durable-prefix-barrier.md
 
 Related design context:
 - docs/rfcs/0021-redo-log-fixed-block-read-write-path.md
@@ -257,6 +257,41 @@ Resolved policy choice:
 
 ## Implementation Notes
 
+- Implemented prefix-owned rotated-file seal barriers. Log-file boundaries now
+  enqueue the ended file as an ordered seal prefix entry before the next file's
+  header barrier, and seal completion/sync failure flows through the normal
+  redo prefix failure path.
+- Moved rotated-file seal write construction into the prefix-owned sealer path
+  while preserving best-effort clean-shutdown active-file sealing.
+- Added durable-prefix seal metadata tracking per file. Redo-bearing groups
+  contribute accepted end offsets and real redo CTS ranges only after their
+  file-local prefix is durable; no-log groups remain excluded.
+- Made recovery planning enforce the supported unsealed-file shapes: no
+  unsealed files, one final unsealed file, or the final-two crash-rotation
+  shape. Unsupported unsealed chains are reported as corruption.
+- Made unsealed group-start tail handling consistent with continuation-tail
+  handling while preserving strict sealed-file corruption behavior and strict
+  complete-group parsing.
+- Reworked recovery startup around `RedoLogFinalizer`, including startup file
+  create/truncate policy and recovered seal metadata attached to `RedoLogFile`
+  so recovered historical seals use the same ordered prefix seal path as normal
+  rotation.
+- Updated redo documentation to describe seal-as-prefix-barrier semantics,
+  supported recovery repair shapes, and repeated recovery guarantees.
+- Addressed review findings during implementation:
+  - removed obsolete planner and writer helper APIs;
+  - kept `LogPrefixEntry.id` stable while renaming local prefix ids;
+  - added comments for accepted CTS tracking, unseal-position checks,
+    malformed group-start tail handling, recovered seal metadata, and
+    front-seal barrier invocation;
+  - fixed fatal prefix failure so a failed, unprepared seal entry becomes
+    terminal-ready and cannot stall drain.
+- Validation completed:
+  - `tools/style_audit.rs --diff-base origin/main` passed for 9 branch-diff
+    Rust files;
+  - `cargo nextest run -p doradb-storage` passed: 1044 tests;
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+    passed: 1042 tests.
 
 ## Impacts
 
