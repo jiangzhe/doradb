@@ -76,6 +76,24 @@ pub(crate) struct UnsealedSegmentTerminal {
     pub(crate) terminal_reason: UnsealedSegmentTerminalReason,
 }
 
+/// Real CTS range advertised by one sealed redo segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RedoSegmentCtsRange {
+    /// Lowest commit timestamp contained in the segment.
+    pub(crate) min_cts: TrxID,
+    /// Highest commit timestamp contained in the segment.
+    pub(crate) max_cts: TrxID,
+}
+
+/// Catalog-checkpoint observation for one sealed redo segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogSafeRedoSegment {
+    /// Redo file sequence number.
+    pub(crate) file_seq: u32,
+    /// Real redo CTS range, or `None` for a sealed empty file.
+    pub(crate) redo_range: Option<RedoSegmentCtsRange>,
+}
+
 /// Iterator over transaction redo records inside one validated redo group.
 ///
 /// The group owns an assembled logical payload and enforces the commit
@@ -231,36 +249,45 @@ impl RedoReplayPlanner {
         read_depth: usize,
     ) -> Result<PlannedRedoRecovery> {
         let suffix = self.load_replay_suffix(floor)?;
-        let repair_policy = self.repair_policy_for_segments(&suffix)?;
-        let stream_segments = match repair_policy {
-            RedoRecoveryRepairPolicy::FinalTwoUnsealed { .. } => {
-                &suffix[..suffix.len().saturating_sub(1)]
-            }
-            RedoRecoveryRepairPolicy::CreateNext { .. }
-            | RedoRecoveryRepairPolicy::SingleFinalUnsealed { .. } => &suffix[..],
-        };
-
-        let mut skipped_max = None::<TrxID>;
-        let mut segments = Vec::new();
-        for segment in stream_segments.iter().cloned() {
-            if segment.sealed_empty() {
-                continue;
-            }
-            if let Some((_, max_redo_cts)) = segment.sealed_redo_range()
-                && max_redo_cts < floor
-            {
-                skipped_max =
-                    Some(skipped_max.map_or(max_redo_cts, |current| current.max(max_redo_cts)));
-                continue;
-            }
-            segments.push(segment);
-        }
+        let planned = self.plan_replay_segments(&suffix, floor)?;
 
         Ok(PlannedRedoRecovery {
-            skipped_max_recovered_cts: skipped_max,
-            stream: RedoLogStream::from_planned_segments(segments, read_depth),
-            repair_policy,
+            skipped_max_recovered_cts: planned.skipped_max_recovered_cts,
+            stream: RedoLogStream::from_planned_segments(planned.stream_segments, read_depth),
+            repair_policy: planned.repair_policy,
         })
+    }
+
+    /// Build a catalog checkpoint scan stream and sealed-segment observations.
+    #[inline]
+    pub(crate) fn plan_catalog_scan(
+        &self,
+        floor: TrxID,
+        read_depth: usize,
+    ) -> Result<PlannedCatalogRedoScan> {
+        let segments = self.load_all_segments()?;
+        let suffix_start = replay_suffix_start(&segments, floor);
+        let suffix = &segments[suffix_start..];
+        let planned = self.plan_replay_segments(suffix, floor)?;
+
+        let sealed_segments = segments
+            .iter()
+            .filter_map(sealed_catalog_segment_summary)
+            .collect();
+
+        Ok(PlannedCatalogRedoScan {
+            stream: RedoLogStream::from_planned_segments(planned.stream_segments, read_depth),
+            sealed_segments,
+        })
+    }
+
+    #[inline]
+    fn load_all_segments(&self) -> Result<Vec<RedoLogSegment>> {
+        self.discovered
+            .iter()
+            .cloned()
+            .map(RedoLogSegment::from_descriptor)
+            .collect()
     }
 
     #[inline]
@@ -278,6 +305,46 @@ impl RedoReplayPlanner {
         }
         suffix.reverse();
         Ok(suffix)
+    }
+
+    #[inline]
+    fn plan_replay_segments(
+        &self,
+        suffix: &[RedoLogSegment],
+        floor: TrxID,
+    ) -> Result<PlannedReplaySegments> {
+        let repair_policy = self.repair_policy_for_segments(suffix)?;
+        let replayable_segments = match repair_policy {
+            RedoRecoveryRepairPolicy::FinalTwoUnsealed { .. } => {
+                &suffix[..suffix.len().saturating_sub(1)]
+            }
+            RedoRecoveryRepairPolicy::CreateNext { .. }
+            | RedoRecoveryRepairPolicy::SingleFinalUnsealed { .. } => suffix,
+        };
+
+        let mut skipped_max_recovered_cts = None::<TrxID>;
+        let mut stream_segments = Vec::new();
+        for segment in replayable_segments.iter().cloned() {
+            if segment.sealed_empty() {
+                continue;
+            }
+            if let Some((_, max_redo_cts)) = segment.sealed_redo_range()
+                && max_redo_cts < floor
+            {
+                skipped_max_recovered_cts = Some(
+                    skipped_max_recovered_cts
+                        .map_or(max_redo_cts, |current| current.max(max_redo_cts)),
+                );
+                continue;
+            }
+            stream_segments.push(segment);
+        }
+
+        Ok(PlannedReplaySegments {
+            repair_policy,
+            stream_segments,
+            skipped_max_recovered_cts,
+        })
     }
 
     #[inline]
@@ -324,6 +391,12 @@ impl RedoReplayPlanner {
     }
 }
 
+struct PlannedReplaySegments {
+    repair_policy: RedoRecoveryRepairPolicy,
+    stream_segments: Vec<RedoLogSegment>,
+    skipped_max_recovered_cts: Option<TrxID>,
+}
+
 /// Complete redo startup plan: stream plus post-replay repair policy.
 pub(crate) struct PlannedRedoRecovery {
     /// Highest CTS from sealed skipped segments below the replay floor.
@@ -332,6 +405,14 @@ pub(crate) struct PlannedRedoRecovery {
     pub(crate) stream: RedoLogStream,
     /// Repair and writable-file policy to apply after stream replay.
     pub(crate) repair_policy: RedoRecoveryRepairPolicy,
+}
+
+/// Catalog checkpoint scan plan with sealed redo segment summaries.
+pub(crate) struct PlannedCatalogRedoScan {
+    /// Stream over the durable redo suffix needed by catalog scan.
+    pub(crate) stream: RedoLogStream,
+    /// Sealed retained redo segments observed from super-block metadata.
+    pub(crate) sealed_segments: Vec<CatalogSafeRedoSegment>,
 }
 
 /// Post-replay recovery repair and runtime active-file policy.
@@ -1316,6 +1397,37 @@ struct ValidatedGroupStart {
 }
 
 #[inline]
+fn replay_suffix_start(segments: &[RedoLogSegment], floor: TrxID) -> usize {
+    let mut suffix_start = segments.len();
+    for (idx, segment) in segments.iter().enumerate().rev() {
+        suffix_start = idx;
+        if segment
+            .sealed_redo_range()
+            .is_some_and(|(min_redo_cts, _)| min_redo_cts < floor)
+        {
+            break;
+        }
+    }
+    suffix_start
+}
+
+#[inline]
+fn sealed_catalog_segment_summary(segment: &RedoLogSegment) -> Option<CatalogSafeRedoSegment> {
+    if segment.sealed_empty() {
+        return Some(CatalogSafeRedoSegment {
+            file_seq: segment.file_seq,
+            redo_range: None,
+        });
+    }
+    segment
+        .sealed_redo_range()
+        .map(|(min_cts, max_cts)| CatalogSafeRedoSegment {
+            file_seq: segment.file_seq,
+            redo_range: Some(RedoSegmentCtsRange { min_cts, max_cts }),
+        })
+}
+
+#[inline]
 fn log_file_corrupted() -> Error {
     Report::new(DataIntegrityError::LogFileCorrupted).into()
 }
@@ -1880,6 +1992,61 @@ mod tests {
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::LogFileCorrupted)
+        );
+    }
+
+    #[test]
+    fn test_catalog_scan_planner_reports_sealed_segment_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed_empty = write_stream_log_file_with_seq(
+            &dir.path().join("redo.00000000"),
+            0,
+            STORAGE_SECTOR_SIZE,
+            1,
+            &[],
+            TestSegmentSeal::Sealed {
+                durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET,
+                redo_range: None,
+            },
+        );
+        let sealed_non_empty = write_stream_log_file_with_seq(
+            &dir.path().join("redo.00000001"),
+            1,
+            STORAGE_SECTOR_SIZE,
+            1,
+            &[],
+            TestSegmentSeal::Sealed {
+                durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                redo_range: Some((TrxID::new(2), TrxID::new(4))),
+            },
+        );
+        let open = write_stream_log_file_with_seq(
+            &dir.path().join("redo.00000002"),
+            2,
+            STORAGE_SECTOR_SIZE,
+            1,
+            &[],
+            TestSegmentSeal::Open,
+        );
+        let planner = RedoReplayPlanner::new(vec![sealed_empty, sealed_non_empty, open]);
+
+        let planned = planner.plan_catalog_scan(TrxID::new(5), 1).unwrap();
+
+        assert_eq!(
+            planned.sealed_segments,
+            vec![
+                CatalogSafeRedoSegment {
+                    file_seq: 0,
+                    redo_range: None,
+                },
+                CatalogSafeRedoSegment {
+                    file_seq: 1,
+                    redo_range: Some(RedoSegmentCtsRange {
+                        min_cts: TrxID::new(2),
+                        max_cts: TrxID::new(4),
+                    }),
+                },
+            ]
         );
     }
 

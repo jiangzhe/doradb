@@ -184,7 +184,9 @@ impl Session {
     /// Run one online catalog checkpoint.
     ///
     /// This mutating maintenance operation uses normal healthy-runtime
-    /// admission and requires the session to be idle.
+    /// admission and requires the session to be idle. A successful publish also
+    /// refreshes internal catalog-safe redo retention progress for future
+    /// truncation planning.
     #[inline]
     pub async fn checkpoint_catalog(&mut self) -> Result<()> {
         let session = self.pin("checkpoint catalog")?;
@@ -1494,7 +1496,20 @@ pub(crate) mod tests {
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
 
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .catalog_redo_retention_progress()
+                    .is_none()
+            );
             session.checkpoint_catalog().await.unwrap();
+            let progress = engine
+                .inner()
+                .trx_sys
+                .catalog_redo_retention_progress()
+                .expect("catalog checkpoint publish should refresh retention progress");
+            assert!(progress.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             drop(session);
             drop(engine);
 
@@ -1504,6 +1519,13 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_some());
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .catalog_redo_retention_progress()
+                    .is_none()
+            );
         });
     }
 

@@ -7,8 +7,8 @@ use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
-use crate::recovery::stream::RedoReplayPlanner;
-use crate::trx::sys::TransactionSystem;
+use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
+use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -43,12 +43,65 @@ pub(crate) struct CatalogCheckpointBatch {
     pub(crate) replay_start_ts: TrxID,
     /// Highest commit timestamp safely covered by the batch.
     pub(crate) safe_cts: TrxID,
+    /// First redo file sequence retained in the catalog marker for this scan.
+    pub(crate) first_retained_file_seq: u32,
+    /// Sealed redo segment summaries observed while planning the scan.
+    pub(crate) sealed_redo_segments: Vec<CatalogSafeRedoSegment>,
     /// Catalog table row redo operations folded into the checkpoint.
     pub(crate) catalog_ops: Vec<CatalogRedoEntry>,
     /// Number of catalog DDL transactions included in the batch.
     pub(crate) catalog_ddl_txn_count: usize,
     /// Reason the scan stopped.
     pub(crate) stop_reason: CatalogCheckpointScanStopReason,
+}
+
+impl CatalogCheckpointBatch {
+    #[inline]
+    fn redo_retention_progress(
+        &self,
+        catalog_replay_start_ts: TrxID,
+    ) -> Option<CatalogRedoRetentionProgress> {
+        // A scan that did not cover any durable record cannot prove a new
+        // catalog replay boundary, so it must not refresh retention progress.
+        if self.safe_cts < self.replay_start_ts {
+            return None;
+        }
+        let segments = self
+            .sealed_redo_segments
+            .iter()
+            .filter(|segment| match segment.redo_range {
+                // Sealed empty files contain no catalog redo records, so they
+                // are catalog-safe once the checkpoint publish succeeds.
+                None => true,
+                // Non-empty sealed files are catalog-safe only when their
+                // entire redo CTS range is strictly below the published catalog
+                // replay boundary. The file that contains the boundary remains
+                // replay-relevant for catalog recovery.
+                Some(range) => range.max_cts < catalog_replay_start_ts,
+            })
+            .cloned()
+            .collect();
+        Some(CatalogRedoRetentionProgress {
+            // Keep the durable first-retained marker with the in-memory
+            // summaries so later planning can verify the cache belongs to the
+            // retained redo suffix it is reasoning about.
+            first_retained_file_seq: self.first_retained_file_seq,
+            catalog_replay_start_ts,
+            segments,
+        })
+    }
+}
+
+/// Internal result of applying one catalog checkpoint batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogCheckpointApplyOutcome {
+    /// Catalog checkpoint metadata was durably published at this replay boundary.
+    Published {
+        /// New catalog replay start timestamp.
+        catalog_replay_start_ts: TrxID,
+    },
+    /// The batch had no publishable work or was already superseded.
+    Noop,
 }
 
 /// Configuration for scanning catalog checkpoint redo logs.
@@ -267,11 +320,20 @@ impl Catalog {
     pub(crate) async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
         let batch = self.scan_checkpoint_batch(trx_sys).await?;
+        let publishable_progress = batch
+            .redo_retention_progress(batch.safe_cts.saturating_add(1).max(batch.replay_start_ts));
         match self.apply_checkpoint_batch(batch).await {
-            Ok(()) => {
+            Ok(CatalogCheckpointApplyOutcome::Published {
+                catalog_replay_start_ts,
+            }) => {
+                if let Some(progress) = publishable_progress {
+                    debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
+                    trx_sys.record_catalog_redo_retention_progress(progress);
+                }
                 trx_sys.request_dropped_table_purge();
                 Ok(())
             }
+            Ok(CatalogCheckpointApplyOutcome::Noop) => Ok(()),
             Err(err) if err.kind() == ErrorKind::Io => {
                 Err(trx_sys.poison_storage(FatalError::CheckpointWrite).into())
             }
@@ -315,6 +377,8 @@ impl Catalog {
         let mut batch = CatalogCheckpointBatch {
             replay_start_ts,
             safe_cts: replay_start_ts.saturating_sub(1),
+            first_retained_file_seq: scan_cfg.first_retained_file_seq,
+            sealed_redo_segments: vec![],
             catalog_ops: vec![],
             catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
@@ -334,9 +398,9 @@ impl Catalog {
             return Ok(batch);
         }
         let planner = RedoReplayPlanner::new(logs);
-        let mut stream = planner
-            .plan_recovery(replay_start_ts, scan_cfg.read_ahead_depth)?
-            .stream;
+        let planned = planner.plan_catalog_scan(replay_start_ts, scan_cfg.read_ahead_depth)?;
+        batch.sealed_redo_segments = planned.sealed_segments;
+        let mut stream = planned.stream;
 
         while let Some(log) = stream.try_next().await? {
             let (header, redo) = log.into_inner();
@@ -504,6 +568,7 @@ fn drop_table_has_catalog_table_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recovery::stream::RedoSegmentCtsRange;
     use smol::Timer;
     use smol::future::or;
     use std::time::Duration;
@@ -612,6 +677,85 @@ mod tests {
             drop(checkpoint_lease);
             let _checkpoint_lease = gate.begin_checkpoint().await;
         });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_batch_builds_catalog_safe_progress() {
+        let replay_start_ts = TrxID::new(10);
+        let published_catalog_replay_start_ts = TrxID::new(20);
+        let batch = CatalogCheckpointBatch {
+            replay_start_ts,
+            safe_cts: TrxID::new(19),
+            first_retained_file_seq: 7,
+            sealed_redo_segments: vec![
+                CatalogSafeRedoSegment {
+                    file_seq: 7,
+                    redo_range: None,
+                },
+                CatalogSafeRedoSegment {
+                    file_seq: 8,
+                    redo_range: Some(RedoSegmentCtsRange {
+                        min_cts: TrxID::new(11),
+                        max_cts: TrxID::new(19),
+                    }),
+                },
+                CatalogSafeRedoSegment {
+                    file_seq: 9,
+                    redo_range: Some(RedoSegmentCtsRange {
+                        min_cts: TrxID::new(20),
+                        max_cts: TrxID::new(24),
+                    }),
+                },
+            ],
+            catalog_ops: Vec::new(),
+            catalog_ddl_txn_count: 0,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+        };
+
+        let progress = batch
+            .redo_retention_progress(published_catalog_replay_start_ts)
+            .unwrap();
+
+        assert_eq!(progress.first_retained_file_seq, 7);
+        assert_eq!(
+            progress.catalog_replay_start_ts,
+            published_catalog_replay_start_ts
+        );
+        assert_eq!(
+            progress.segments,
+            vec![
+                CatalogSafeRedoSegment {
+                    file_seq: 7,
+                    redo_range: None,
+                },
+                CatalogSafeRedoSegment {
+                    file_seq: 8,
+                    redo_range: Some(RedoSegmentCtsRange {
+                        min_cts: TrxID::new(11),
+                        max_cts: TrxID::new(19),
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_batch_without_durable_work_has_no_progress() {
+        let replay_start_ts = TrxID::new(10);
+        let batch = CatalogCheckpointBatch {
+            replay_start_ts,
+            safe_cts: TrxID::new(9),
+            first_retained_file_seq: 7,
+            sealed_redo_segments: vec![CatalogSafeRedoSegment {
+                file_seq: 7,
+                redo_range: None,
+            }],
+            catalog_ops: Vec::new(),
+            catalog_ddl_txn_count: 0,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+        };
+
+        assert!(batch.redo_retention_progress(replay_start_ts).is_none());
     }
 
     #[test]

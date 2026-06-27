@@ -174,7 +174,10 @@ impl Catalog {
     /// are responsible for ensuring mutual exclusion at a higher level (e.g.,
     /// a single background checkpoint task).
     #[inline]
-    pub(crate) async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
+    pub(crate) async fn apply_checkpoint_batch(
+        &self,
+        batch: CatalogCheckpointBatch,
+    ) -> Result<CatalogCheckpointApplyOutcome> {
         self.storage
             .apply_checkpoint_batch(batch, self.curr_next_table_id())
             .await
