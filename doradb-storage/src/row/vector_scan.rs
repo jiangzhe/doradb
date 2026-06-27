@@ -13,7 +13,7 @@ use crate::id::TrxID;
 use crate::row::{RowPage, RowPageNullBitmap};
 use crate::trx::trx_is_committed;
 use crate::trx::undo::RowUndoKind;
-use crate::value::{PageVar, ValBuffer, ValType};
+use crate::value::{PageVar, Val, ValBuffer, ValType};
 use error_stack::Report;
 use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
@@ -179,6 +179,53 @@ impl ScanBuffer {
             }
         }
         self.len = new_len;
+        Ok(())
+    }
+
+    /// Append one decoded row into the scan buffer.
+    ///
+    /// Null values still append a type-specific placeholder so column value
+    /// buffers stay row-aligned with the null bitmap, matching row-page scans.
+    pub(crate) fn append_row_values(
+        &mut self,
+        col_layout: &TableColumnLayout,
+        vals: &[Val],
+    ) -> Result<()> {
+        if vals.len() != col_layout.col_count() {
+            return Err(column_scan_shape_mismatch());
+        }
+        for buf in &self.cols {
+            let Some(val) = vals.get(buf.col_idx) else {
+                return Err(column_scan_shape_mismatch());
+            };
+            let col_type = col_layout.col_type(buf.col_idx);
+            if val.is_null() {
+                if !col_type.nullable {
+                    return Err(column_scan_shape_mismatch());
+                }
+            } else if !val.matches_kind(col_type.kind) {
+                return Err(column_scan_shape_mismatch());
+            }
+        }
+
+        let row_idx = self.len;
+        let new_len = row_idx + 1;
+        self.len = new_len;
+        for buf in &mut self.cols {
+            let val = &vals[buf.col_idx];
+            if let Some(null_bitmap) = buf.null_bitmap.as_mut() {
+                let new_units = new_len.div_ceil(64);
+                if new_units > null_bitmap.len() {
+                    null_bitmap.resize(new_units, 0);
+                }
+                if val.is_null() {
+                    null_bitmap.bitmap_set(row_idx);
+                } else {
+                    null_bitmap.bitmap_unset(row_idx);
+                }
+            }
+            append_scan_value(&mut buf.vals, val)?;
+        }
         Ok(())
     }
 
@@ -427,6 +474,43 @@ pub(crate) enum ValArrayRef<'a> {
 #[inline]
 fn column_scan_shape_mismatch() -> Error {
     Report::new(InternalError::ColumnScanShapeMismatch).into()
+}
+
+fn append_scan_value(buf: &mut ValBuffer, val: &Val) -> Result<()> {
+    match (buf, val) {
+        (ValBuffer::I8(vals), Val::I8(value)) => vals.push(*value),
+        (ValBuffer::U8(vals), Val::U8(value)) => vals.push(*value),
+        (ValBuffer::I16(vals), Val::I16(value)) => vals.push(*value),
+        (ValBuffer::U16(vals), Val::U16(value)) => vals.push(*value),
+        (ValBuffer::I32(vals), Val::I32(value)) => vals.push(*value),
+        (ValBuffer::U32(vals), Val::U32(value)) => vals.push(*value),
+        (ValBuffer::F32(vals), Val::F32(value)) => vals.push(value.0),
+        (ValBuffer::I64(vals), Val::I64(value)) => vals.push(*value),
+        (ValBuffer::U64(vals), Val::U64(value)) => vals.push(*value),
+        (ValBuffer::F64(vals), Val::F64(value)) => vals.push(value.0),
+        (ValBuffer::VarByte { offsets, data }, Val::VarByte(value)) => {
+            let offset = data.len();
+            let bytes = value.as_bytes();
+            offsets.push((offset, offset + bytes.len()));
+            data.extend(bytes);
+        }
+        (ValBuffer::I8(vals), Val::Null) => vals.push(0),
+        (ValBuffer::U8(vals), Val::Null) => vals.push(0),
+        (ValBuffer::I16(vals), Val::Null) => vals.push(0),
+        (ValBuffer::U16(vals), Val::Null) => vals.push(0),
+        (ValBuffer::I32(vals), Val::Null) => vals.push(0),
+        (ValBuffer::U32(vals), Val::Null) => vals.push(0),
+        (ValBuffer::F32(vals), Val::Null) => vals.push(0.0),
+        (ValBuffer::I64(vals), Val::Null) => vals.push(0),
+        (ValBuffer::U64(vals), Val::Null) => vals.push(0),
+        (ValBuffer::F64(vals), Val::Null) => vals.push(0.0),
+        (ValBuffer::VarByte { offsets, data }, Val::Null) => {
+            let offset = data.len();
+            offsets.push((offset, offset));
+        }
+        _ => return Err(column_scan_shape_mismatch()),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

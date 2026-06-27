@@ -311,6 +311,7 @@ impl RowPage {
 
     /// Insert a new row in page.
     #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved row-page insert"))]
     pub(crate) fn insert(&self, col_layout: &TableColumnLayout, user_cols: &[Val]) -> InsertRow {
         debug_assert!(col_layout.col_count() == self.header.col_count as usize);
         // insert row does not include RowID, as RowID is auto-generated.

@@ -11,6 +11,7 @@ use crate::io::Completion;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
+use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
@@ -29,6 +30,7 @@ use either::Either::{Left, Right};
 use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
+use std::collections::BTreeMap;
 use std::mem::{forget, take};
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -37,6 +39,39 @@ use std::thread::JoinHandle;
 
 /// Number of transaction GC buckets used to shard active/committed tracking.
 pub(crate) const GC_BUCKETS: usize = 64;
+
+/// In-memory catalog-safe redo segment progress from a published catalog checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogRedoRetentionProgress {
+    /// First retained redo file sequence from the durable catalog marker.
+    pub(crate) first_retained_file_seq: u32,
+    /// Catalog replay boundary published by the checkpoint.
+    pub(crate) catalog_replay_start_ts: TrxID,
+    /// Sealed retained segments proven safe for catalog recovery below the boundary.
+    pub(crate) segments: Vec<CatalogSafeRedoSegment>,
+}
+
+impl CatalogRedoRetentionProgress {
+    #[inline]
+    fn merge_equal_boundary(&mut self, progress: Self) {
+        debug_assert_eq!(
+            self.catalog_replay_start_ts,
+            progress.catalog_replay_start_ts
+        );
+        self.first_retained_file_seq = self
+            .first_retained_file_seq
+            .max(progress.first_retained_file_seq);
+        let mut segments = BTreeMap::new();
+        for segment in take(&mut self.segments)
+            .into_iter()
+            .chain(progress.segments)
+            .filter(|segment| segment.file_seq >= self.first_retained_file_seq)
+        {
+            segments.insert(segment.file_seq, segment);
+        }
+        self.segments = segments.into_values().collect();
+    }
+}
 
 struct QueuedCommit {
     cts: TrxID,
@@ -320,6 +355,8 @@ pub(crate) struct TransactionSystem {
     /// Fatal rollback failures move those payloads here so reachable
     /// `RowUndoRef`s remain valid until component teardown drops the engine.
     fatal_rollback_retention: CachePadded<Mutex<Vec<FatalRollbackRetention>>>,
+    /// Latest in-memory catalog-safe redo segment progress.
+    catalog_redo_retention: CachePadded<Mutex<Option<CatalogRedoRetentionProgress>>>,
 }
 
 impl TransactionSystem {
@@ -354,6 +391,7 @@ impl TransactionSystem {
             storage_poisoned: CachePadded::new(AtomicBool::new(false)),
             storage_poison_err: CachePadded::new(Mutex::new(None)),
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
+            catalog_redo_retention: CachePadded::new(Mutex::new(None)),
         }
     }
 
@@ -374,6 +412,35 @@ impl TransactionSystem {
             "storage poison flag published before poison error was recorded"
         );
         guard.as_ref().copied().map(Report::new)
+    }
+
+    /// Record catalog-safe redo retention progress after a catalog checkpoint publish.
+    #[inline]
+    pub(crate) fn record_catalog_redo_retention_progress(
+        &self,
+        progress: CatalogRedoRetentionProgress,
+    ) {
+        let mut current = self.catalog_redo_retention.lock();
+        match current.as_mut() {
+            Some(stored) if progress.catalog_replay_start_ts < stored.catalog_replay_start_ts => {}
+            Some(stored) if progress.catalog_replay_start_ts == stored.catalog_replay_start_ts => {
+                stored.merge_equal_boundary(progress);
+            }
+            _ => *current = Some(progress),
+        }
+    }
+
+    /// Return the latest in-memory catalog-safe redo retention progress.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "phase 3 redo truncation planning will consume cached catalog progress"
+        )
+    )]
+    #[inline]
+    pub(crate) fn catalog_redo_retention_progress(&self) -> Option<CatalogRedoRetentionProgress> {
+        self.catalog_redo_retention.lock().clone()
     }
 
     /// Returns `Err` once a fatal storage failure poisoned runtime admission.
@@ -1241,6 +1308,7 @@ pub(crate) mod tests {
     use crate::log::LogSync;
     use crate::log::format::{REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE};
     use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::recovery::stream::RedoSegmentCtsRange;
     use crate::session::tests::SessionTestExt;
     use crate::trx::SharedTrxStatus;
     use crate::value::Val;
@@ -1349,6 +1417,17 @@ pub(crate) mod tests {
         );
     }
 
+    fn catalog_safe_segment(
+        file_seq: u32,
+        redo_range: Option<(TrxID, TrxID)>,
+    ) -> CatalogSafeRedoSegment {
+        CatalogSafeRedoSegment {
+            file_seq,
+            redo_range: redo_range
+                .map(|(min_cts, max_cts)| RedoSegmentCtsRange { min_cts, max_cts }),
+        }
+    }
+
     fn capture_transaction_cleanup_state(
         trx: &Transaction,
     ) -> (Arc<TrxEntry>, Arc<SharedTrxStatus>) {
@@ -1370,6 +1449,61 @@ pub(crate) mod tests {
                 .status()
         };
         (entry, status)
+    }
+
+    #[test]
+    fn test_catalog_redo_retention_progress_records_monotonic_merge() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .trx(TrxSysConfig::default().log_file_stem("redo_catalog_retention"))
+                .build()
+                .await
+                .unwrap();
+            let trx_sys = &engine.inner().trx_sys;
+
+            assert_eq!(trx_sys.catalog_redo_retention_progress(), None);
+
+            trx_sys.record_catalog_redo_retention_progress(CatalogRedoRetentionProgress {
+                first_retained_file_seq: 0,
+                catalog_replay_start_ts: TrxID::new(10),
+                segments: vec![catalog_safe_segment(
+                    1,
+                    Some((TrxID::new(2), TrxID::new(4))),
+                )],
+            });
+            trx_sys.record_catalog_redo_retention_progress(CatalogRedoRetentionProgress {
+                first_retained_file_seq: 0,
+                catalog_replay_start_ts: TrxID::new(9),
+                segments: vec![catalog_safe_segment(0, None)],
+            });
+            assert_eq!(
+                trx_sys.catalog_redo_retention_progress().unwrap().segments,
+                vec![catalog_safe_segment(
+                    1,
+                    Some((TrxID::new(2), TrxID::new(4)))
+                )]
+            );
+
+            trx_sys.record_catalog_redo_retention_progress(CatalogRedoRetentionProgress {
+                first_retained_file_seq: 0,
+                catalog_replay_start_ts: TrxID::new(10),
+                segments: vec![catalog_safe_segment(0, None), catalog_safe_segment(2, None)],
+            });
+            assert_eq!(
+                trx_sys.catalog_redo_retention_progress(),
+                Some(CatalogRedoRetentionProgress {
+                    first_retained_file_seq: 0,
+                    catalog_replay_start_ts: TrxID::new(10),
+                    segments: vec![
+                        catalog_safe_segment(0, None),
+                        catalog_safe_segment(1, Some((TrxID::new(2), TrxID::new(4)))),
+                        catalog_safe_segment(2, None),
+                    ],
+                })
+            );
+        });
     }
 
     #[test]
