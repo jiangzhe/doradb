@@ -1,7 +1,7 @@
 ---
 id: 000196
 title: Global Truncation Floor Planning
-status: proposal
+status: implemented
 created: 2026-06-27
 github_issue: 773
 ---
@@ -345,6 +345,50 @@ impl TransactionSystem {
 
 ## Implementation Notes
 
+- Implemented a crate-private redo truncation planner in
+  `doradb-storage/src/trx/retention.rs`, consumed through
+  `TransactionSystem::plan_redo_truncation()`. The planner computes
+  `RedoTruncationPlan` from catalog replay start, live table floors, pending
+  dropped-table floors, retained redo segment metadata, and cached or fallback
+  catalog-safe segment evidence.
+- Added metadata-only redo retention segment planning in
+  `RedoReplayPlanner::plan_retention_segments()` so the planner validates redo
+  super-blocks and classifies sealed empty, sealed non-empty, and unsealed
+  retained files without replaying redo payloads.
+- Added table replay-floor snapshots through `Table::redo_replay_floor_snapshot`
+  and `Catalog::snapshot_live_table_redo_floors`. Review cleanup split the
+  timestamp-only `TableRedoReplayFloor` from `LiveTableRedoReplayFloor` so the
+  table id is carried only where the live catalog snapshot needs it.
+- Extended dropped-table cleanup state so foreground `DROP TABLE`, recovery
+  `DropTable` replay, runtime purge, and file-delete retry preserve copied
+  table replay floors until the catalog absence becomes durable.
+- Updated redo-log documentation to record that Phase 3 can compute an internal
+  dry-run truncation plan but still does not advance the durable marker or
+  physically delete redo files.
+- Review follow-ups completed during implementation:
+  - simplified `Catalog::snapshot_live_table_redo_floors()` because
+    `user_tables` already contains user table ids;
+  - split `RecoveryCoordinator::replay_ddl()` branch bodies into focused helper
+    methods without changing recovery behavior;
+  - strengthened the cached catalog progress test so it proves cached progress
+    is consulted instead of passing through the fallback path.
+- Deferred follow-ups created:
+  - `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md` for
+    reducing write amplification from heartbeat-only table checkpoints by
+    centralizing durable watermark overrides in catalog storage.
+  - `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+    for a cleaner future dropped-table ownership model that keeps dropped
+    runtimes visible to redo floor planning until catalog absence is
+    checkpoint-durable. This captures the accepted/deferred concurrent
+    `DROP TABLE` handoff race found during review.
+- Verified with:
+  - `cargo fmt`
+  - `cargo nextest run -p doradb-storage retention dropped_table_file_delete_snapshot`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `git diff --check`
+  - `tools/style_audit.rs --diff-base origin/main`
+
 ## Impacts
 
 - `doradb-storage/src/trx/retention.rs`
@@ -434,6 +478,10 @@ Validation commands:
 
 ## Open Questions
 
-None for Phase 3 design. Phase 4 remains responsible for public
-`Session::truncate_redo_log`, marker advancement, file unlink, unlink retry
-behavior, and public outcome/reporting shape.
+Phase 4 remains responsible for public `Session::truncate_redo_log`, marker
+advancement, file unlink, unlink retry behavior, exact retention-gate
+placement, and public outcome/reporting shape.
+
+Follow-up backlog items from implementation review:
+- `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md`
+- `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
