@@ -852,6 +852,7 @@ mod tests {
                 .trx_sys
                 .catalog_checkpoint_scan_config()
                 .unwrap();
+            assert_eq!(scan_cfg.first_retained_file_seq, 0);
             assert_eq!(scan_cfg.read_ahead_depth, 4);
         });
     }

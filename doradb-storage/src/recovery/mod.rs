@@ -942,6 +942,7 @@ fn unexpected_unsealed_terminal_error() -> Error {
 mod tests {
     use super::{RecoveryCoordinator, validate_create_table_reloaded_root_ts};
     use crate::buffer::PoolRole;
+    use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
         IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
@@ -1053,6 +1054,65 @@ mod tests {
         )
     }
 
+    fn retention_marker_recovery_engine_config(
+        main_dir: impl Into<PathBuf>,
+        log_file_stem: &str,
+    ) -> EngineConfig {
+        lightweight_recovery_engine_config(main_dir, log_file_stem).trx(
+            TrxSysConfig::default()
+                .log_write_io_depth(1)
+                .recovery_io_depth(1)
+                .catalog_checkpoint_scan_io_depth(1)
+                .log_block_size(CORRUPTION_RECOVERY_LOG_BLOCK_SIZE)
+                .log_file_stem(log_file_stem)
+                .log_file_max_size(
+                    REDO_DEFAULT_DATA_START_OFFSET + CORRUPTION_RECOVERY_LOG_BLOCK_SIZE,
+                )
+                .log_sync(LogSync::None)
+                .purge_threads(1),
+        )
+    }
+
+    async fn prepare_engine_with_retained_redo_suffix(
+        main_dir: &Path,
+        log_file_stem: &str,
+    ) -> (Engine, TableID) {
+        let engine = retention_marker_recovery_engine_config(main_dir, log_file_stem)
+            .build()
+            .await
+            .unwrap();
+        let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+        let mut session = engine.new_session().unwrap();
+        for value in 0..32 {
+            let mut trx = session.begin_trx().unwrap();
+            trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(value), Val::from(value)])
+                .await
+                .unwrap();
+            trx.commit().await.unwrap();
+            if redo_file_path(main_dir, log_file_stem, 1).exists() {
+                break;
+            }
+        }
+        assert!(
+            redo_file_path(main_dir, log_file_stem, 1).exists(),
+            "test setup should create retained redo suffix"
+        );
+
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        checkpoint_published(&table, &mut session).await;
+        drop(table);
+        drop(session);
+        engine
+            .catalog()
+            .checkpoint_now(&engine.inner().trx_sys)
+            .await
+            .unwrap();
+        publish_first_redo_log_seq_for_test(&engine.catalog().storage, 1)
+            .await
+            .unwrap();
+        (engine, table_id)
+    }
+
     async fn prepare_checkpointed_recovery_floor(main_dir: &Path, log_file_stem: &str) -> TrxID {
         let engine = corruption_recovery_engine_config(main_dir, log_file_stem)
             .build()
@@ -1077,6 +1137,14 @@ mod tests {
         drop(engine);
         remove_redo_family(main_dir, log_file_stem);
         replay_floor
+    }
+
+    fn redo_file_path(main_dir: &Path, log_file_stem: &str, file_seq: u32) -> PathBuf {
+        main_dir.join(format!("{log_file_stem}.{file_seq:08x}"))
+    }
+
+    fn remove_redo_file(main_dir: &Path, log_file_stem: &str, file_seq: u32) {
+        fs::remove_file(redo_file_path(main_dir, log_file_stem, file_seq)).unwrap();
     }
 
     fn remove_redo_family(main_dir: &Path, log_file_stem: &str) {
@@ -2089,6 +2157,89 @@ mod tests {
                 Some(DataIntegrityError::InvalidMagic)
             );
             drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_log_recover_accepts_missing_prefix_below_first_retained_redo() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path();
+            let log_file_stem = "recover-retained-prefix";
+            let (engine, _) =
+                prepare_engine_with_retained_redo_suffix(main_dir, log_file_stem).await;
+            drop(engine);
+            remove_redo_file(main_dir, log_file_stem, 0);
+
+            let recovered = retention_marker_recovery_engine_config(main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_log_recover_rejects_missing_first_retained_redo_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path();
+            let log_file_stem = "recover-missing-retained";
+            let (engine, _) =
+                prepare_engine_with_retained_redo_suffix(main_dir, log_file_stem).await;
+            drop(engine);
+            remove_redo_file(main_dir, log_file_stem, 0);
+            remove_redo_file(main_dir, log_file_stem, 1);
+
+            let err = match retention_marker_recovery_engine_config(main_dir, log_file_stem)
+                .build()
+                .await
+            {
+                Ok(engine) => {
+                    drop(engine);
+                    panic!("engine startup should reject missing first retained redo file");
+                }
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::RedoLogSequenceGap)
+            );
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_scan_accepts_missing_prefix_below_first_retained_redo() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path();
+            let log_file_stem = "scan-retained-prefix";
+            let (engine, table_id) =
+                prepare_engine_with_retained_redo_suffix(main_dir, log_file_stem).await;
+            remove_redo_file(main_dir, log_file_stem, 0);
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            trx_insert_row_by_id(
+                &mut trx,
+                table_id,
+                vec![Val::from(10_000), Val::from(10_000)],
+            )
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+            drop(session);
+
+            let batch = engine
+                .catalog()
+                .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+            assert_eq!(
+                batch.stop_reason,
+                crate::catalog::CatalogCheckpointScanStopReason::ReachedDurableUpper
+            );
+            drop(engine);
         });
     }
 

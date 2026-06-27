@@ -53,14 +53,19 @@ Example with defaults:
 ./redo.log.00000001
 ```
 
-Discovery uses `discover_redo_log_files` and requires contiguous sequence
-numbers starting at `00000000`; until durable truncation metadata exists, a
-non-empty family missing that prefix is corruption. Startup first discovers
-file names and sequence continuity. Valid redo super-block metadata is selected
-later during replay planning or reader construction before a file can
-participate in startup recovery or checkpoint scanning. Legacy partitioned
-names like `<prefix>.<partition>.<seq>` are rejected, and legacy zero-header
-redo files are invalid. The configured defaults are:
+Discovery uses `discover_redo_log_files` with the durable
+`catalog.mtb` `first_redo_log_seq` marker. Files below that marker are obsolete
+prefix files: they may be present or absent, and discovery excludes them from
+startup recovery and checkpoint scan planning. The retained suffix at and above
+`first_redo_log_seq` remains strict: the first retained file must exist when the
+marker is nonzero, and retained sequence numbers must be contiguous. The zero
+marker is the default for new and existing databases, so a non-empty family with
+marker `0` still requires `00000000`. Startup first discovers file names and
+sequence continuity. Valid redo super-block metadata is selected later during
+replay planning or reader construction before a file can participate in startup
+recovery or checkpoint scanning. Legacy partitioned names like
+`<prefix>.<partition>.<seq>` are rejected, and legacy zero-header redo files are
+invalid. The configured defaults are:
 
 - `log_dir = "."`
 - `log_file_stem = "redo.log"`
@@ -554,8 +559,9 @@ lose recent log writes.
 - Physical redo data blocks are checksummed. Sealed files validate their
   durable end offset and real redo CTS range during replay, but active crash
   files can remain unsealed and are scanned sequentially.
-- Log discovery depends on file names and contiguous sequence numbers starting
-  at `00000000`.
+- Log discovery depends on file names and the durable `first_redo_log_seq`
+  marker in `catalog.mtb`. Files below the marker are ignored as obsolete
+  prefix files, while the retained suffix remains contiguous.
 - Old log files are not physically truncated or deleted by the current redo
   path. Checkpoint metadata narrows replay logically, and recovery can skip
   validated sealed files whose CTS range is fully below the replay floor.
@@ -608,9 +614,10 @@ Parallel redo parsing or replay should build on the split between direct-IO
 read-ahead and `RedoLogStream` parsing. The current implementation keeps replay
 sequential.
 
-Add durable first-retained-sequence metadata before implementing physical redo
-file truncation. Without that metadata, missing prefix sequences remain
-corruption.
+Implement physical unlink of prefix redo files after catalog and table replay
+floors prove the files are no longer needed and after `first_redo_log_seq` is
+advanced durably. The marker-aware discovery contract exists, but this redo path
+still does not delete old files.
 
 Parallelize DML replay after preserving DDL pipeline barriers and per-table/page
 ordering. The code already has `dispatch_dml` and `wait_for_dml_done` boundaries

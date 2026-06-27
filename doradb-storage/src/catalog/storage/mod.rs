@@ -19,6 +19,9 @@ use crate::index::BlockIndex;
 use crate::quiescent::QuiescentGuard;
 use std::sync::Arc;
 
+#[cfg(test)]
+pub(crate) use tests::publish_first_redo_log_seq_for_test;
+
 /// Runtime storage container for all catalog logical tables.
 pub(crate) struct CatalogStorage {
     pub(super) meta_pool: QuiescentGuard<FixedBufferPool>,
@@ -132,4 +135,23 @@ impl CatalogStorage {
 pub(crate) struct CatalogDefinition {
     pub(crate) table_id: TableID,
     pub(crate) metadata: TableMetadata,
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
+
+    /// Publish a metadata-only catalog root with a test-controlled redo retention marker.
+    pub(crate) async fn publish_first_redo_log_seq_for_test(
+        storage: &CatalogStorage,
+        first_redo_log_seq: u32,
+    ) -> Result<()> {
+        publish_mtb_first_redo_log_seq_for_test(
+            &storage.mtb,
+            storage.table_fs.background_writes(),
+            first_redo_log_seq,
+        )
+        .await
+    }
 }
