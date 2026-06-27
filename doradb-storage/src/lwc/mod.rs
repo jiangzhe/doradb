@@ -869,9 +869,26 @@ impl<'a> LwcBuilder<'a> {
     }
 
     /// Appends all non-deleted rows from `page` if the block still fits.
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved row-page LWC build"))]
     pub(crate) fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
         let view = page.vector_view(self.col_layout);
         self.append_view(page, view)
+    }
+
+    /// Appends one decoded row if the block still fits.
+    pub(crate) fn append_row_values(&mut self, row_id: RowID, vals: &[Val]) -> Result<bool> {
+        let snapshot = self.snapshot_state();
+        match self.append_row_values_inner(row_id, vals) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.rollback(snapshot);
+                Ok(false)
+            }
+            Err(err) => {
+                self.rollback(snapshot);
+                Err(err)
+            }
+        }
     }
 
     /// Appends rows described by `view` if the block still fits.
@@ -904,6 +921,16 @@ impl<'a> LwcBuilder<'a> {
         self.scan_page_stats(&view, &new_row_ids)?;
         self.buffer.scan(view)?;
         self.row_ids.extend(new_row_ids);
+        if self.estimate_size()? > LWC_BLOCK_PAYLOAD_SIZE {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn append_row_values_inner(&mut self, row_id: RowID, vals: &[Val]) -> Result<bool> {
+        self.scan_row_value_stats(vals)?;
+        self.buffer.append_row_values(self.col_layout, vals)?;
+        self.row_ids.push(row_id);
         if self.estimate_size()? > LWC_BLOCK_PAYLOAD_SIZE {
             return Ok(false);
         }
@@ -1123,6 +1150,32 @@ impl<'a> LwcBuilder<'a> {
                     );
                 }
                 ValArrayRef::F32(_) | ValArrayRef::F64(_) | ValArrayRef::VarByte(_, _) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_row_value_stats(&mut self, vals: &[Val]) -> Result<()> {
+        if vals.len() != self.col_layout.col_count() {
+            return Err(column_scan_shape_mismatch());
+        }
+        for (col_idx, val) in vals.iter().enumerate() {
+            if val.is_null() {
+                continue;
+            }
+            match (self.col_layout.val_kind(col_idx), val) {
+                (ValKind::I8, Val::I8(value)) => self.stats[col_idx].update_i64(*value as i64),
+                (ValKind::U8, Val::U8(value)) => self.stats[col_idx].update_u64(*value as u64),
+                (ValKind::I16, Val::I16(value)) => self.stats[col_idx].update_i64(*value as i64),
+                (ValKind::U16, Val::U16(value)) => self.stats[col_idx].update_u64(*value as u64),
+                (ValKind::I32, Val::I32(value)) => self.stats[col_idx].update_i64(*value as i64),
+                (ValKind::U32, Val::U32(value)) => self.stats[col_idx].update_u64(*value as u64),
+                (ValKind::I64, Val::I64(value)) => self.stats[col_idx].update_i64(*value),
+                (ValKind::U64, Val::U64(value)) => self.stats[col_idx].update_u64(*value),
+                (ValKind::F32, Val::F32(_))
+                | (ValKind::F64, Val::F64(_))
+                | (ValKind::VarByte, Val::VarByte(_)) => {}
+                _ => return Err(column_scan_shape_mismatch()),
             }
         }
         Ok(())
@@ -2344,6 +2397,65 @@ mod tests {
                 assert!(column1.is_null(idx));
             }
         }
+    }
+
+    #[test]
+    fn test_lwc_builder_append_row_values_matches_row_page() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                ColumnSpec::new("c_i16", ValKind::I16, ColumnAttributes::NULLABLE),
+                ColumnSpec::new("c_u64", ValKind::U64, ColumnAttributes::empty()),
+                ColumnSpec::new("c_bytes", ValKind::VarByte, ColumnAttributes::NULLABLE),
+                ColumnSpec::new("c_f32", ValKind::F32, ColumnAttributes::empty()),
+            ],
+            vec![],
+        )
+        .expect("valid table metadata");
+        let rows = vec![
+            vec![
+                Val::Null,
+                Val::U64(10),
+                Val::from(Vec::from(&b"alpha"[..])),
+                Val::F32(OrderedFloat(1.25)),
+            ],
+            vec![
+                Val::I16(-5),
+                Val::U64(11),
+                Val::Null,
+                Val::F32(OrderedFloat(2.5)),
+            ],
+            vec![
+                Val::I16(9),
+                Val::U64(12),
+                Val::from(Vec::from(&b"beta"[..])),
+                Val::F32(OrderedFloat(3.75)),
+            ],
+        ];
+        let mut page = RowPage::new_test_page();
+        page.init(RowID::new(10), rows.len(), metadata.col.as_ref());
+        for vals in &rows {
+            assert!(matches!(
+                page.insert(metadata.col.as_ref(), vals),
+                InsertRow::Ok(_)
+            ));
+        }
+
+        let mut page_builder = LwcBuilder::new(metadata.col.as_ref());
+        assert!(page_builder.append_row_page(&page).unwrap());
+        let mut direct_builder = LwcBuilder::new(metadata.col.as_ref());
+        for (offset, vals) in rows.iter().enumerate() {
+            assert!(
+                direct_builder
+                    .append_row_values(RowID::new(10 + offset as u64), vals)
+                    .unwrap()
+            );
+        }
+
+        assert_eq!(direct_builder.row_ids(), page_builder.row_ids());
+        let fingerprint = row_shape_fingerprint_for(direct_builder.row_ids(), 10, 13);
+        let page_buf = page_builder.build(fingerprint).unwrap();
+        let direct_buf = direct_builder.build(fingerprint).unwrap();
+        assert_eq!(direct_buf.as_bytes(), page_buf.as_bytes());
     }
 
     #[test]
