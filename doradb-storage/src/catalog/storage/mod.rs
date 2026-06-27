@@ -148,6 +148,12 @@ impl CatalogStorage {
     }
 
     /// Publish a durable first-retained redo marker without changing catalog table roots.
+    ///
+    /// The marker is stored in the `catalog.mtb` root instead of a catalog row
+    /// because startup must read it before redo discovery and catalog redo
+    /// replay. It tells recovery that missing prefix files below the marker
+    /// were intentionally truncated; ordinary catalog-table state cannot prove
+    /// that until after redo has already been selected for replay.
     pub(crate) async fn publish_first_redo_log_seq(&self, first_redo_log_seq: u32) -> Result<u32> {
         let snapshot = self.mtb.load_snapshot()?;
         if first_redo_log_seq <= snapshot.meta.first_redo_log_seq {

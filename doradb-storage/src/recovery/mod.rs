@@ -1370,15 +1370,23 @@ mod tests {
     }
 
     async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
-        match session.checkpoint_table(table.table_id()).await.unwrap() {
-            CheckpointOutcome::Published { checkpoint_ts } => checkpoint_ts,
-            CheckpointOutcome::Delayed { reason } => {
-                panic!("checkpoint should publish, delayed by {reason:?}")
-            }
-            CheckpointOutcome::Cancelled { reason } => {
-                panic!("checkpoint should publish, cancelled by {reason:?}")
+        let mut last_delay = None;
+        for _ in 0..50 {
+            match session.checkpoint_table(table.table_id()).await.unwrap() {
+                CheckpointOutcome::Published { checkpoint_ts } => return checkpoint_ts,
+                CheckpointOutcome::Delayed { reason } => {
+                    last_delay = Some(reason);
+                    Timer::after(Duration::from_millis(20)).await;
+                }
+                CheckpointOutcome::Cancelled { reason } => {
+                    panic!("checkpoint should publish, cancelled by {reason:?}")
+                }
             }
         }
+        panic!(
+            "checkpoint should publish, delayed after retries by {:?}",
+            last_delay.unwrap()
+        )
     }
 
     async fn trx_insert_row(trx: &mut Transaction, table: &Table, cols: Vec<Val>) -> Result<RowID> {

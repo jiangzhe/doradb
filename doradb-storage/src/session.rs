@@ -1249,16 +1249,21 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{Error, ErrorKind, FatalError, LifecycleError, OperationError};
+    use crate::io::install_storage_backend_test_hook;
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
     use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
+    use crate::table::tests::FailingFirstWriteHook;
     use crate::trx::retention::tests::install_redo_cleanup_before_unlink_hook;
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use crate::value::Val;
+    use futures::task::noop_waker;
     use smol::Timer;
     use std::fs;
+    use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+    use std::task::{Context, Poll};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1722,6 +1727,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_truncate_redo_log_waits_for_catalog_metadata_change() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let metadata_lease = engine.catalog().begin_metadata_change().await;
+            let mut session = engine.new_session().unwrap();
+            let mut truncate_fut = Box::pin(session.truncate_redo_log());
+
+            assert!(matches!(
+                futures::poll!(truncate_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(metadata_lease);
+            let outcome = truncate_fut.await.unwrap();
+            assert_eq!(outcome.previous_first_retained_file_seq, 0);
+            assert_eq!(outcome.new_first_retained_file_seq, 0);
+            assert_eq!(
+                outcome.blockers,
+                vec![RedoTruncationBlockerInfo::UnsealedFile { file_seq: 0 }]
+            );
+        });
+    }
+
+    #[test]
     fn test_session_truncate_redo_log_removes_prefix_and_restart_keeps_retained_suffix_strict() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1788,6 +1822,179 @@ pub(crate) mod tests {
                 Err(err) => err,
             };
             assert_eq!(err.kind(), ErrorKind::DataIntegrity, "{err:?}");
+        });
+    }
+
+    #[test]
+    fn test_session_truncate_redo_log_marker_publish_failure_does_not_unlink() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let main_dir = root.path().to_path_buf();
+            let log_file_stem = "redo_truncate_marker_fail";
+            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
+            let mut session = engine.new_session().unwrap();
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_table_published(&mut session, table_id).await;
+            session.checkpoint_catalog().await.unwrap();
+
+            let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
+            assert_eq!(plan.first_retained_file_seq, 0);
+            assert!(!plan.candidates.is_empty(), "{plan:?}");
+            let candidate_paths = plan
+                .candidates
+                .iter()
+                .map(|candidate| redo_file_path(&main_dir, log_file_stem, candidate.file_seq))
+                .collect::<Vec<_>>();
+            for path in &candidate_paths {
+                assert!(
+                    path.exists(),
+                    "test setup candidate redo file should exist before marker failure: {}",
+                    path.display()
+                );
+            }
+
+            let catalog_path = engine.inner().table_fs.catalog_mtb_file_path();
+            let publish_hook = Arc::new(FailingFirstWriteHook::new(catalog_path));
+            let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
+            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(Arc::new(
+                |file_seq, path| {
+                    panic!(
+                        "redo cleanup must not run after marker publication failure: file_seq={file_seq}, path={}",
+                        path.display()
+                    );
+                },
+            ));
+
+            let err = session.truncate_redo_log().await.unwrap_err();
+
+            assert_eq!(err.kind(), ErrorKind::Fatal);
+            assert_eq!(
+                err.downcast_ref::<FatalError>().copied(),
+                Some(FatalError::CheckpointWrite)
+            );
+            assert!(publish_hook.call_count() > 0);
+            assert_eq!(
+                engine
+                    .catalog()
+                    .storage
+                    .checkpoint_snapshot()
+                    .unwrap()
+                    .meta
+                    .first_redo_log_seq,
+                0
+            );
+            for path in &candidate_paths {
+                assert!(
+                    path.exists(),
+                    "candidate redo file should remain after marker failure: {}",
+                    path.display()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_session_truncate_redo_log_releases_catalog_gate_before_cleanup() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let main_dir = root.path().to_path_buf();
+            let log_file_stem = "redo_truncate_cleanup_gate";
+            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
+            engine
+                .catalog()
+                .storage
+                .publish_first_redo_log_seq(1)
+                .await
+                .unwrap();
+            let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
+            assert!(obsolete_path.exists());
+
+            let hook_called = Arc::new(AtomicBool::new(false));
+            let hook_flag = Arc::clone(&hook_called);
+            let hook_engine = engine.new_ref().unwrap();
+            let hook_guard =
+                install_redo_cleanup_before_unlink_hook(Arc::new(move |file_seq, _path| {
+                    if file_seq != 0 {
+                        return;
+                    }
+                    hook_flag.store(true, Ordering::SeqCst);
+                    let catalog = hook_engine.catalog();
+                    let mut metadata_fut = Box::pin(catalog.begin_metadata_change());
+                    let waker = noop_waker();
+                    let mut cx = Context::from_waker(&waker);
+                    let metadata_lease = match metadata_fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(lease) => lease,
+                        Poll::Pending => {
+                            panic!("catalog gate should be released before redo cleanup")
+                        }
+                    };
+                    drop(metadata_lease);
+                }));
+
+            let mut session = engine.new_session().unwrap();
+            let outcome = session.truncate_redo_log().await.unwrap();
+
+            assert!(hook_called.load(Ordering::SeqCst));
+            assert_eq!(outcome.previous_first_retained_file_seq, 1);
+            assert_eq!(outcome.new_first_retained_file_seq, 1);
+            assert_eq!(outcome.advanced_files, 0);
+            assert_eq!(outcome.removed_files, 1);
+            assert_eq!(outcome.failed_unlink_files, 0);
+            assert!(!obsolete_path.exists());
+            drop(hook_guard);
+        });
+    }
+
+    #[test]
+    fn test_session_truncate_redo_log_rechecks_poison_after_gate_wait() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let main_dir = root.path().to_path_buf();
+            let log_file_stem = "redo_truncate_poison_wait";
+            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
+            engine
+                .catalog()
+                .storage
+                .publish_first_redo_log_seq(1)
+                .await
+                .unwrap();
+            let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
+            assert!(obsolete_path.exists());
+
+            let redo_retention_lease = engine.inner().trx_sys.begin_redo_retention().await;
+            let mut session = engine.new_session().unwrap();
+            let mut truncate_fut = Box::pin(session.truncate_redo_log());
+
+            assert!(matches!(
+                futures::poll!(truncate_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            drop(redo_retention_lease);
+
+            let err = truncate_fut.await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Fatal);
+            assert_eq!(
+                err.downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoWrite)
+            );
+            assert!(
+                obsolete_path.exists(),
+                "obsolete redo file should not be removed after poison"
+            );
         });
     }
 

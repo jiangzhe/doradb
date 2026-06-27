@@ -140,8 +140,21 @@ impl TransactionSystem {
     }
 
     /// Advance the durable redo retention marker and unlink obsolete redo files.
+    ///
+    /// Lock ordering matches catalog checkpoint: acquire the catalog checkpoint
+    /// lease before the redo-retention lease. The catalog lease protects the
+    /// `catalog.mtb` root fork used to publish `first_redo_log_seq`, while the
+    /// redo-retention lease protects the retained redo suffix, catalog-safe
+    /// progress cache, and cleanup below the marker. They are separate because
+    /// the marker is catalog bootstrap metadata, but unlink races are about the
+    /// redo file family rather than catalog metadata shape.
     pub(crate) async fn truncate_redo_log(&self) -> Result<RedoTruncationOutcome> {
+        let catalog_checkpoint_lease = self.catalog.begin_checkpoint().await;
         let _redo_retention_lease = self.begin_redo_retention().await;
+        // Session admission happens before the async gate waits above. Recheck
+        // here so poison published while truncation was queued prevents marker
+        // publication and physical redo cleanup.
+        self.ensure_runtime_healthy()?;
         let plan = self.plan_redo_truncation()?;
         let previous_first_retained_file_seq = plan.first_retained_file_seq;
         let target_marker = match plan.candidates.last() {
@@ -166,6 +179,7 @@ impl TransactionSystem {
             previous_first_retained_file_seq
         };
 
+        drop(catalog_checkpoint_lease);
         let file_prefix = self.config.file_prefix()?;
         let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)?;
 
@@ -451,9 +465,11 @@ pub(crate) mod tests {
     };
     use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
     use crate::trx::sys::CatalogRedoRetentionProgress;
-    use parking_lot::Mutex;
+    use parking_lot::{Mutex, MutexGuard};
     use std::path::Path;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, OnceLock, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     type BeforeUnlinkHook = Arc<dyn Fn(u32, &Path) + Send + Sync + 'static>;
 
@@ -462,9 +478,18 @@ pub(crate) mod tests {
         HOOK.get_or_init(|| Mutex::new(None))
     }
 
+    fn before_unlink_hook_install_lock() -> &'static Mutex<()> {
+        static INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        INSTALL_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     /// Guard that restores the previous redo cleanup before-unlink hook on drop.
+    ///
+    /// The process-wide install lock is held for the guard lifetime so parallel
+    /// tests cannot overwrite each other's global hook state.
     pub(crate) struct RedoCleanupBeforeUnlinkHookGuard {
         previous: Option<BeforeUnlinkHook>,
+        _install_guard: MutexGuard<'static, ()>,
     }
 
     impl Drop for RedoCleanupBeforeUnlinkHookGuard {
@@ -479,9 +504,13 @@ pub(crate) mod tests {
     pub(crate) fn install_redo_cleanup_before_unlink_hook(
         hook: BeforeUnlinkHook,
     ) -> RedoCleanupBeforeUnlinkHookGuard {
+        let install_guard = before_unlink_hook_install_lock().lock();
         let mut slot = before_unlink_hook_slot().lock();
         let previous = slot.replace(hook);
-        RedoCleanupBeforeUnlinkHookGuard { previous }
+        RedoCleanupBeforeUnlinkHookGuard {
+            previous,
+            _install_guard: install_guard,
+        }
     }
 
     #[inline]
@@ -572,6 +601,31 @@ pub(crate) mod tests {
             safe,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn redo_cleanup_before_unlink_hook_installation_is_exclusive() {
+        let first = install_redo_cleanup_before_unlink_hook(Arc::new(|_, _| {}));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (installed_tx, installed_rx) = mpsc::channel();
+
+        let installer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second = install_redo_cleanup_before_unlink_hook(Arc::new(|_, _| {}));
+            installed_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            installed_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "second hook installer should wait for the first guard"
+        );
+
+        drop(first);
+        installed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        installer.join().unwrap();
     }
 
     #[test]

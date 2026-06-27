@@ -129,13 +129,20 @@ struct CatalogCheckpointGateState {
     metadata_change: CatalogMetadataChangePhase,
 }
 
-/// Catalog-local checkpoint and metadata-DDL exclusion gate.
+/// Catalog-local checkpoint, marker-publish, and metadata-DDL exclusion gate.
 ///
 /// A catalog checkpoint scans redo and publishes catalog table roots that must
 /// match a stable catalog metadata shape. Index DDL temporarily moves catalog
 /// rows, user-table roots, and runtime layouts through different intermediate
 /// states, so checkpoint scan/apply sections and catalog metadata-change
 /// sections must not overlap.
+///
+/// Redo truncation also uses the checkpoint side of this gate while it plans
+/// from the catalog snapshot and publishes the durable `first_redo_log_seq`
+/// marker. The marker is bootstrap metadata in the `catalog.mtb` root, not an
+/// ordinary catalog row: startup must read it before redo discovery so missing
+/// prefix files below the marker can be accepted without replaying catalog redo
+/// first.
 ///
 /// Pending metadata changes reserve the next turn once an active checkpoint
 /// drains. This prevents later checkpoints from repeatedly entering ahead of a
@@ -155,13 +162,13 @@ impl CatalogCheckpointGate {
         }
     }
 
-    /// Acquire a catalog checkpoint lease.
+    /// Acquire a catalog checkpoint/marker-publish lease.
     ///
     /// The lease waits until no catalog metadata change is active or pending,
-    /// and also serializes overlapping catalog checkpoints. It does not protect
-    /// redo-retention marker state; callers that scan retained redo for
-    /// checkpoint progress must also hold the transaction-system redo-retention
-    /// lease.
+    /// and also serializes overlapping catalog checkpoints or redo marker
+    /// publishes. It does not protect the retained redo suffix itself; callers
+    /// that scan retained redo, publish a marker, or unlink obsolete files must
+    /// also hold the transaction-system redo-retention lease.
     pub(crate) async fn begin_checkpoint(&self) -> CatalogCheckpointLease<'_> {
         loop {
             {

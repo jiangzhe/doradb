@@ -86,6 +86,11 @@ struct RedoRetentionGateState {
 /// in-memory catalog-safe segment progress cache. The gate serializes those
 /// sections so a checkpoint cannot scan one marker/suffix while truncation
 /// publishes another marker or unlinks files below it.
+///
+/// This intentionally remains separate from `CatalogCheckpointGate`. The
+/// catalog gate excludes `catalog.mtb` root writers and metadata DDL, but it is
+/// released before redo truncation performs filesystem cleanup; this gate stays
+/// held through cleanup so retained-redo scans never race disappearing files.
 struct RedoRetentionGate {
     state: Mutex<RedoRetentionGateState>,
     changed: Event,

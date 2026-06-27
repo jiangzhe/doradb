@@ -417,6 +417,12 @@ impl Catalog {
         floors
     }
 
+    /// Acquires the catalog checkpoint side of the catalog metadata gate.
+    #[inline]
+    pub(crate) async fn begin_checkpoint(&self) -> CatalogCheckpointLease<'_> {
+        self.checkpoint_gate.begin_checkpoint().await
+    }
+
     /// Acquires the catalog metadata-change gate for future index DDL.
     #[inline]
     pub(crate) async fn begin_metadata_change(&self) -> CatalogMetadataChangeLease<'_> {
