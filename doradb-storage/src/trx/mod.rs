@@ -17,6 +17,7 @@
 //!    d) If less than current STS, return current version.
 pub(crate) mod group;
 pub(crate) mod purge;
+pub(crate) mod retention;
 pub(crate) mod row;
 pub(crate) mod stmt;
 pub(crate) mod sys;

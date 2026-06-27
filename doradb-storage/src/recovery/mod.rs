@@ -509,116 +509,18 @@ impl<'a> RecoveryCoordinator<'a> {
         dml: BTreeMap<TableID, TableDML>,
         cts: TrxID,
     ) -> Result<()> {
-        match &*ddl {
+        match *ddl {
             DDLRedo::CreateTable(table_id) => {
-                if !self.should_replay_catalog(cts) {
-                    return Ok(());
-                }
-                self.replay_catalog_modifications(dml).await?;
-                // The table file stores only the latest active root, so create-table
-                // redo may load metadata from later durable index DDL. Recovery
-                // tracks that temporary gap until index-DDL redo reconciles catalog rows.
-                let metadata_matched = self
-                    .resources
-                    .catalog
-                    .reload_create_table(
-                        self.resources.buffers.mem_pool.clone(),
-                        self.resources.buffers.index_pool.clone(),
-                        &self.resources.table_fs,
-                        self.resources.buffers.disk_pool.clone(),
-                        *table_id,
-                    )
-                    .await?;
-                let state = self.track_loaded_table(*table_id).await?;
-                self.timeline
-                    .seed_recovered_cts(state.max_recovered_cts_seed());
-                let pending_index_ddl_reconciliation = !metadata_matched;
-                // Validate the root/create CTS relation before marking the table
-                // as pending, so impossible metadata divergence fails at the
-                // source instead of surfacing only in final equality validation.
-                validate_create_table_reloaded_root_ts(
-                    *table_id,
-                    cts,
-                    state,
-                    pending_index_ddl_reconciliation,
-                )?;
-                if pending_index_ddl_reconciliation {
-                    self.pending_index_ddl_reconciliations.insert(*table_id);
-                }
+                self.replay_create_table_ddl(table_id, dml, cts).await?
             }
-            DDLRedo::DropTable(table_id) => {
-                if !self.should_replay_catalog(cts) {
-                    return Ok(());
-                }
-                self.replay_catalog_modifications(dml).await?;
-                let removed = self
-                    .resources
-                    .catalog
-                    .remove_user_table(*table_id)
-                    .ok_or_else(|| {
-                        Error::from(
-                            Report::new(OperationError::TableNotFound)
-                                .attach(format!("replay drop table: table_id={table_id}")),
-                        )
-                    })?;
-                let table = Arc::try_unwrap(removed).map_err(|table| {
-                    Error::from(Report::new(OperationError::TableNotFound).attach(format!(
-                        "replay drop table found stale runtime handle: table_id={table_id}, strong_count={}",
-                        Arc::strong_count(&table)
-                    )))
-                })?;
-                table
-                    .destroy_dropped_runtime(&self.resources.buffers.pool_guards)
-                    .await?;
-                self.dropped_table_file_deletes
-                    .push(DroppedTableFileDeleteItem::new(*table_id, cts));
-                self.timeline.table_bounds.remove(table_id);
-                self.recovered_tables.remove(table_id);
-                self.pending_index_ddl_reconciliations.remove(table_id);
-            }
+            DDLRedo::DropTable(table_id) => self.replay_drop_table_ddl(table_id, dml, cts).await?,
             DDLRedo::CreateIndex { table_id, index_no } => {
-                if !self.should_replay_catalog(cts) {
-                    return Ok(());
-                }
-                if self.classify_user_table_redo(*table_id, cts, "replay create index")?
-                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
-                {
-                    return Ok(());
-                }
-                let proof =
-                    self.classify_index_ddl_root(IndexDdlKind::Create, *table_id, *index_no, cts)?;
-                match proof {
-                    IndexDdlRootProof::DurableFinalCreate
-                    | IndexDdlRootProof::DurableAllocationOnly => {
-                        self.replay_catalog_modifications(dml).await?;
-                    }
-                    IndexDdlRootProof::Provisional => {}
-                    IndexDdlRootProof::DurableFinalDrop => unreachable!(
-                        "create-index root proof cannot classify as durable final drop"
-                    ),
-                }
+                self.replay_create_index_ddl(table_id, index_no, dml, cts)
+                    .await?
             }
             DDLRedo::DropIndex { table_id, index_no } => {
-                if !self.should_replay_catalog(cts) {
-                    return Ok(());
-                }
-                if self.classify_user_table_redo(*table_id, cts, "replay drop index")?
-                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
-                {
-                    return Ok(());
-                }
-                let proof =
-                    self.classify_index_ddl_root(IndexDdlKind::Drop, *table_id, *index_no, cts)?;
-                match proof {
-                    IndexDdlRootProof::DurableFinalDrop => {
-                        self.replay_catalog_modifications(dml).await?;
-                    }
-                    IndexDdlRootProof::Provisional => {}
-                    IndexDdlRootProof::DurableFinalCreate
-                    | IndexDdlRootProof::DurableAllocationOnly => {
-                        unreachable!("drop-index root proof cannot classify as create proof")
-                    }
-                }
+                self.replay_drop_index_ddl(table_id, index_no, dml, cts)
+                    .await?
             }
             DDLRedo::CreateRowPage {
                 table_id,
@@ -626,79 +528,242 @@ impl<'a> RecoveryCoordinator<'a> {
                 start_row_id,
                 end_row_id,
             } => {
-                debug_assert!(dml.is_empty());
-                if self.classify_user_table_redo(*table_id, cts, "replay create row page")?
-                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
-                {
-                    return Ok(());
-                }
-                if cts < self.table_heap_redo_start_ts(*table_id)? {
-                    return Ok(());
-                }
-                // Row page creation is guaranteed to be ordered in the redo log,
-                // so its safe to recreate it and the row id range must be identical.
-                let table = self
-                    .resources
-                    .catalog
-                    .get_table(*table_id)
-                    .await
-                    .ok_or_else(|| {
-                        Error::from(
-                            Report::new(OperationError::TableNotFound)
-                                .attach(format!("replay create row page: table_id={table_id}")),
-                        )
-                    })?;
-                let count = *end_row_id - *start_row_id;
-                let mut page_guard = table
-                    .mem
-                    .allocate_row_page_at(
-                        &self.resources.buffers.pool_guards,
-                        count as usize,
-                        *page_id,
-                    )
-                    .await?;
-                // Here we switch row page to recover mode.
-                page_guard.bf_mut().init_recover_map(cts);
-
-                // Record recovered pages so we can recover indexes and refresh undo map at end.
-                // Note: we do not need to recover catalog tables because they are specially handled.
-                if self.resources.catalog.is_user_table(*table_id) {
-                    self.recovered_tables
-                        .entry(*table_id)
-                        .or_default()
-                        .insert(*page_id);
-                }
-
-                debug_assert!({
-                    let page = page_guard.page();
-                    page.header.start_row_id == *start_row_id
-                        && page.header.start_row_id + page.header.max_row_count as u64
-                            == *end_row_id
-                });
+                self.replay_create_row_page_ddl(
+                    table_id,
+                    page_id,
+                    start_row_id,
+                    end_row_id,
+                    dml,
+                    cts,
+                )
+                .await?
             }
             DDLRedo::DataCheckpoint { table_id, .. } => {
-                debug_assert!(dml.is_empty());
-                if self.classify_user_table_redo(*table_id, cts, "replay data checkpoint")?
-                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
-                {
-                    return Ok(());
-                }
-                if cts < self.table_heap_redo_start_ts(*table_id)? {
-                    return Ok(());
-                }
-                let _ = self
-                    .resources
-                    .catalog
-                    .get_table(*table_id)
-                    .await
-                    .ok_or_else(|| {
-                        Error::from(
-                            Report::new(OperationError::TableNotFound)
-                                .attach(format!("replay data checkpoint: table_id={table_id}")),
-                        )
-                    })?;
+                self.replay_data_checkpoint_ddl(table_id, dml, cts).await?
             }
         }
+        Ok(())
+    }
+
+    async fn replay_create_table_ddl(
+        &mut self,
+        table_id: TableID,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<()> {
+        if !self.should_replay_catalog(cts) {
+            return Ok(());
+        }
+        self.replay_catalog_modifications(dml).await?;
+        // The table file stores only the latest active root, so create-table
+        // redo may load metadata from later durable index DDL. Recovery
+        // tracks that temporary gap until index-DDL redo reconciles catalog rows.
+        let metadata_matched = self
+            .resources
+            .catalog
+            .reload_create_table(
+                self.resources.buffers.mem_pool.clone(),
+                self.resources.buffers.index_pool.clone(),
+                &self.resources.table_fs,
+                self.resources.buffers.disk_pool.clone(),
+                table_id,
+            )
+            .await?;
+        let state = self.track_loaded_table(table_id).await?;
+        self.timeline
+            .seed_recovered_cts(state.max_recovered_cts_seed());
+        let pending_index_ddl_reconciliation = !metadata_matched;
+        // Validate the root/create CTS relation before marking the table
+        // as pending, so impossible metadata divergence fails at the
+        // source instead of surfacing only in final equality validation.
+        validate_create_table_reloaded_root_ts(
+            table_id,
+            cts,
+            state,
+            pending_index_ddl_reconciliation,
+        )?;
+        if pending_index_ddl_reconciliation {
+            self.pending_index_ddl_reconciliations.insert(table_id);
+        }
+        Ok(())
+    }
+
+    async fn replay_drop_table_ddl(
+        &mut self,
+        table_id: TableID,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<()> {
+        if !self.should_replay_catalog(cts) {
+            return Ok(());
+        }
+        self.replay_catalog_modifications(dml).await?;
+        let removed = self
+            .resources
+            .catalog
+            .remove_user_table(table_id)
+            .ok_or_else(|| {
+                Error::from(
+                    Report::new(OperationError::TableNotFound)
+                        .attach(format!("replay drop table: table_id={table_id}")),
+                )
+            })?;
+        let replay_floor = removed.redo_replay_floor_snapshot();
+        let table = Arc::try_unwrap(removed).map_err(|table| {
+            Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                "replay drop table found stale runtime handle: table_id={table_id}, strong_count={}",
+                Arc::strong_count(&table)
+            )))
+        })?;
+        table
+            .destroy_dropped_runtime(&self.resources.buffers.pool_guards)
+            .await?;
+        self.dropped_table_file_deletes
+            .push(DroppedTableFileDeleteItem::new(table_id, cts, replay_floor));
+        self.timeline.table_bounds.remove(&table_id);
+        self.recovered_tables.remove(&table_id);
+        self.pending_index_ddl_reconciliations.remove(&table_id);
+        Ok(())
+    }
+
+    async fn replay_create_index_ddl(
+        &mut self,
+        table_id: TableID,
+        index_no: u16,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<()> {
+        if !self.should_replay_catalog(cts) {
+            return Ok(());
+        }
+        if self.classify_user_table_redo(table_id, cts, "replay create index")?
+            == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+        {
+            return Ok(());
+        }
+        let proof = self.classify_index_ddl_root(IndexDdlKind::Create, table_id, index_no, cts)?;
+        match proof {
+            IndexDdlRootProof::DurableFinalCreate | IndexDdlRootProof::DurableAllocationOnly => {
+                self.replay_catalog_modifications(dml).await?;
+            }
+            IndexDdlRootProof::Provisional => {}
+            IndexDdlRootProof::DurableFinalDrop => {
+                unreachable!("create-index root proof cannot classify as durable final drop")
+            }
+        }
+        Ok(())
+    }
+
+    async fn replay_drop_index_ddl(
+        &mut self,
+        table_id: TableID,
+        index_no: u16,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<()> {
+        if !self.should_replay_catalog(cts) {
+            return Ok(());
+        }
+        if self.classify_user_table_redo(table_id, cts, "replay drop index")?
+            == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+        {
+            return Ok(());
+        }
+        let proof = self.classify_index_ddl_root(IndexDdlKind::Drop, table_id, index_no, cts)?;
+        match proof {
+            IndexDdlRootProof::DurableFinalDrop => {
+                self.replay_catalog_modifications(dml).await?;
+            }
+            IndexDdlRootProof::Provisional => {}
+            IndexDdlRootProof::DurableFinalCreate | IndexDdlRootProof::DurableAllocationOnly => {
+                unreachable!("drop-index root proof cannot classify as create proof")
+            }
+        }
+        Ok(())
+    }
+
+    async fn replay_create_row_page_ddl(
+        &mut self,
+        table_id: TableID,
+        page_id: PageID,
+        start_row_id: RowID,
+        end_row_id: RowID,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<()> {
+        debug_assert!(dml.is_empty());
+        if self.classify_user_table_redo(table_id, cts, "replay create row page")?
+            == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+        {
+            return Ok(());
+        }
+        if cts < self.table_heap_redo_start_ts(table_id)? {
+            return Ok(());
+        }
+        // Row page creation is guaranteed to be ordered in the redo log,
+        // so its safe to recreate it and the row id range must be identical.
+        let table = self
+            .resources
+            .catalog
+            .get_table(table_id)
+            .await
+            .ok_or_else(|| {
+                Error::from(
+                    Report::new(OperationError::TableNotFound)
+                        .attach(format!("replay create row page: table_id={table_id}")),
+                )
+            })?;
+        let count = end_row_id - start_row_id;
+        let mut page_guard = table
+            .mem
+            .allocate_row_page_at(&self.resources.buffers.pool_guards, count as usize, page_id)
+            .await?;
+        // Here we switch row page to recover mode.
+        page_guard.bf_mut().init_recover_map(cts);
+
+        // Record recovered pages so we can recover indexes and refresh undo map at end.
+        // Note: we do not need to recover catalog tables because they are specially handled.
+        if self.resources.catalog.is_user_table(table_id) {
+            self.recovered_tables
+                .entry(table_id)
+                .or_default()
+                .insert(page_id);
+        }
+
+        debug_assert!({
+            let page = page_guard.page();
+            page.header.start_row_id == start_row_id
+                && page.header.start_row_id + page.header.max_row_count as u64 == end_row_id
+        });
+        Ok(())
+    }
+
+    async fn replay_data_checkpoint_ddl(
+        &mut self,
+        table_id: TableID,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<()> {
+        debug_assert!(dml.is_empty());
+        if self.classify_user_table_redo(table_id, cts, "replay data checkpoint")?
+            == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+        {
+            return Ok(());
+        }
+        if cts < self.table_heap_redo_start_ts(table_id)? {
+            return Ok(());
+        }
+        let _ = self
+            .resources
+            .catalog
+            .get_table(table_id)
+            .await
+            .ok_or_else(|| {
+                Error::from(
+                    Report::new(OperationError::TableNotFound)
+                        .attach(format!("replay data checkpoint: table_id={table_id}")),
+                )
+            })?;
         Ok(())
     }
 

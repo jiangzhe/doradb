@@ -27,7 +27,7 @@ use crate::index::BlockIndex;
 use crate::map::{FastDashMap, FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
-use crate::table::{MemTable, Table, TableRuntimeLayout};
+use crate::table::{LiveTableRedoReplayFloor, MemTable, Table, TableRuntimeLayout};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::undo::IndexUndo;
 use dashmap::mapref::entry::Entry::{Occupied, Vacant};
@@ -400,6 +400,21 @@ impl Catalog {
             .collect::<Vec<_>>();
         table_ids.sort_by_key(|table_id| table_id.as_u64());
         table_ids
+    }
+
+    /// Copy replay-floor fields from currently resident live user-table runtimes.
+    #[inline]
+    pub(crate) fn snapshot_live_table_redo_floors(&self) -> Vec<LiveTableRedoReplayFloor> {
+        let mut floors = self
+            .user_tables
+            .iter()
+            .map(|entry| LiveTableRedoReplayFloor {
+                table_id: *entry.key(),
+                floor: entry.value().redo_replay_floor_snapshot(),
+            })
+            .collect::<Vec<_>>();
+        floors.sort_by_key(|floor| floor.table_id.as_u64());
+        floors
     }
 
     /// Acquires the catalog metadata-change gate for future index DDL.

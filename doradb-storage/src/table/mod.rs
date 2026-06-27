@@ -57,6 +57,32 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Copied replay floor fields from one user-table active root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableRedoReplayFloor {
+    /// Lower bound for replaying heap row-page redo.
+    pub(crate) heap_redo_start_ts: TrxID,
+    /// Lower bound for replaying persisted cold-delete metadata.
+    pub(crate) deletion_cutoff_ts: TrxID,
+}
+
+impl TableRedoReplayFloor {
+    /// Earliest table redo timestamp that may still affect recovered state.
+    #[inline]
+    pub(crate) fn replay_start_ts(self) -> TrxID {
+        self.heap_redo_start_ts.min(self.deletion_cutoff_ts)
+    }
+}
+
+/// Replay floor snapshot for one resident live user table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveTableRedoReplayFloor {
+    /// User table id.
+    pub(crate) table_id: TableID,
+    /// Replay floor copied from the table active root.
+    pub(crate) floor: TableRedoReplayFloor,
+}
+
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub(crate) struct Table {
     /// Hot row-store and in-memory index runtime.
@@ -250,6 +276,18 @@ impl Table {
     #[inline]
     pub(crate) fn metadata(&self) -> Arc<TableMetadata> {
         Arc::clone(self.layout_snapshot().metadata_arc())
+    }
+
+    /// Copy replay-bound fields from one active-root observation.
+    #[inline]
+    pub(crate) fn redo_replay_floor_snapshot(&self) -> TableRedoReplayFloor {
+        // Redo retention planning is a maintenance dry run. It copies only
+        // durable replay-bound fields and does not expose the active root.
+        let active_root = self.storage.file().active_root_unchecked();
+        TableRedoReplayFloor {
+            heap_redo_start_ts: active_root.heap_redo_start_ts,
+            deletion_cutoff_ts: active_root.deletion_cutoff_ts,
+        }
     }
 
     /// Bind one active root observation under a transaction read proof.

@@ -76,6 +76,14 @@ invalid. The configured defaults are:
 - `catalog_checkpoint_scan_io_depth = 32`
 - `log_sync = fsync`
 
+The transaction system can also build an internal dry-run truncation plan from
+the same retained suffix. Planning validates retained redo super-block metadata,
+combines the catalog replay boundary with resident user-table replay floors and
+pending dropped-table replay floors, and reports eligible sealed prefix files
+plus blockers. The plan is side-effect-free: it does not advance
+`first_redo_log_seq`, unlink redo files, or run checkpoint work. Physical redo
+file removal remains future `Session::truncate_redo_log` work.
+
 Each log file is created as an `O_DIRECT` sparse file and truncated to the
 effective `log_file_max_size`. The configured value is first rounded so the
 data region after the fixed super-block slots contains a whole number of

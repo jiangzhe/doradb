@@ -346,10 +346,10 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
   - Phase-local Choices: Public vs test-only exposure of a dry-run plan; exact
     blocker taxonomy; whether live-table root snapshots are collected through a
     new catalog iterator or transaction-system helper.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000196-global-truncation-floor-planning.md`
+  - Task Issue: `#773`
+  - Phase Status: done
+  - Implementation Summary: Implemented internal dry-run redo truncation planning from catalog-safe progress, live table floors, pending dropped-table floors, and retained segment metadata, with dropped-table floor retention and explicit candidate/blocker reporting. [Task Resolve Sync: docs/tasks/000196-global-truncation-floor-planning.md @ 2026-06-27]
   - Related Backlogs:
     - `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
 
