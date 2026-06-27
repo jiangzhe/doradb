@@ -53,7 +53,12 @@ Escalate to RFC instead of task when any condition is true:
 When escalating, explain why and direct the user to `docs/rfcs/0000-template.md`.
 Do not draft a task file after a failed gate.
 
-A `Long-Term Evolution Proposal` may legitimately surface RFC-scale scope during comparison even when the original request still has a narrower task-shaped variant. If that long-term direction becomes the recommended best-overall path, treat the complexity gate as failed: recommend RFC escalation, explain why task scope is insufficient, and include one limited prerequisite task suggestion that can de-risk or enable the RFC.
+A `Long-Term Evolution Proposal` may describe an RFC-scale long-term
+destination during comparison, but the proposal itself should explain the
+intent and rationale of that long-term plan while focusing the task on a
+prerequisite or first-step change. Do not fail the complexity gate merely
+because the long-term destination would need an RFC; fail the gate only when
+the current task deliverable itself cannot be narrow and testable.
 
 ## Step 3: Run Round 1 (Initial Design)
 
@@ -62,7 +67,7 @@ Produce an initial design package with:
 2. Relevant current-state analysis from docs and code.
 3. At least 3 implementation proposals with these explicit labeled lenses:
    - `First-Principles Proposal`: derived from project goals and fundamentals, even when it conflicts with the developer's requested direction.
-   - `Long-Term Evolution Proposal`: optimized for the project's long-term architecture and evolution, even when it broadens scope.
+   - `Long-Term Evolution Proposal`: explain the intent and rationale of the project's long-term architecture/evolution direction, then focus on a prerequisite or first-step task that enables it.
    - `Original-Requirement-Fit Proposal`: best fit for the developer's requested scope/intention.
    - Additional proposals are welcome when they add real strategic value.
 4. Clear scope, rationale, tradeoffs/drawbacks, and alignment/conflict with the original request for each proposal.
@@ -80,7 +85,10 @@ Every proposal and the recommendation must cite at least one relevant reference 
 Do not satisfy this gate with low-value citation padding; references must be materially used in current-state analysis, tradeoffs, or recommendation rationale.
 Recommendation defaults to the best overall direction for correctness and project evolution; do not default to the original request just because it was requested.
 If the recommended direction conflicts with the original request, explicitly describe the reasoning and findings that make the original direction weaker.
-If the `Long-Term Evolution Proposal` broadens to RFC scope, state that scope change explicitly and, when recommending it, include one limited prerequisite task suggestion for the RFC.
+If the `Long-Term Evolution Proposal` points toward RFC-scale long-term work,
+state that long-term destination explicitly while keeping the proposal and
+recommendation anchored on a limited prerequisite or first-step task unless the
+current task deliverable itself fails the complexity gate.
 Proposal sets that differ only by effort level (for example `easy / medium / hard`) are weak by default. They are acceptable only when each option represents a materially different strategic direction, and that difference is stated explicitly.
 
 For RFC-linked tasks, each proposal and the recommendation must state how it
@@ -192,7 +200,8 @@ tools/style_audit.rs --diff-base origin/main
    - Report the audit failure and leave fix strategy to the developer; do not auto-format, run fixes, or change implementation code as part of resolve.
 2. Confirm known implementation/review issues are fixed or explicitly accepted/deferred.
 3. Synchronize the task doc implementation outcome by editing the task doc directly.
-4. Fill `Implementation Notes` with concrete implementation/test/review outcomes.
+4. Fill `Implementation Notes` with material implementation/test/review outcomes and plan deviations.
+   - Omit small changes and internal bug fixes unless they changed the original plan, user-visible behavior, acceptance criteria, RFC/backlog synchronization, or follow-up decisions.
 5. Append unresolved future improvements to `Open Questions` when needed.
 6. Create/link follow-up backlog todos in `docs/backlogs/` for actionable deferred work (use `$backlog create` when creating new backlog docs manually).
    - When the backlog captures work intentionally deferred to avoid disrupting current execution, include:

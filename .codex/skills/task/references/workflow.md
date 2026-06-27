@@ -37,7 +37,7 @@ Complete all items:
 7. For RFC-linked tasks, each proposal and the recommendation must state how the
    target phase prerequisites are satisfied, which phase-local choices are
    resolved, and whether following-phase prerequisites or assumptions change.
-8. If the `Long-Term Evolution Proposal` broadens to RFC scope and becomes the recommended best-overall direction, fail the task gate, recommend RFC escalation, and include one limited prerequisite task suggestion.
+8. If the `Long-Term Evolution Proposal` points toward RFC-scale long-term work, explain that destination's intent and rationale while keeping the proposal focused on a limited prerequisite or first-step task unless the current task deliverable itself fails the complexity gate.
 9. Include a `Source References` block with at least:
    - 2 concrete repo references total,
    - 1 docs/backlog/process reference (`[D#]` or `[B#]`),
@@ -84,7 +84,12 @@ If escalated:
 2. Point to `docs/rfcs/0000-template.md`.
 3. Stop task document generation.
 
-A `Long-Term Evolution Proposal` may surface this gate during comparison even when the original request still has a narrower task-shaped option. If that long-term direction is recommended as best overall, stop task generation and convert the recommendation into RFC escalation plus a limited prerequisite task suggestion.
+A `Long-Term Evolution Proposal` may describe an RFC-scale long-term
+destination during comparison, but it should explain the intent and rationale
+of that long-term plan while focusing the task on a prerequisite or first-step
+change. Do not stop task generation merely because the long-term destination
+would need an RFC; escalate only when the current task deliverable itself
+cannot be narrow and testable.
 
 ## Task Document Structure
 
@@ -163,7 +168,8 @@ tools/style_audit.rs --diff-base origin/main
    - Report the failure and leave fix strategy to the developer; do not auto-format, run fixes, or edit implementation code during resolve.
 3. Confirm known implementation/review issues are fixed or explicitly accepted/deferred.
 4. Edit the task doc directly and keep section structure consistent with `docs/tasks/000000-template.md`.
-5. Fill `Implementation Notes` with concrete implementation/test/review results.
+5. Fill `Implementation Notes` with material implementation/test/review results and plan deviations.
+   - Omit small changes and internal bug fixes unless they changed the original plan, user-visible behavior, acceptance criteria, RFC/backlog synchronization, or follow-up decisions.
 6. Append unresolved future improvements to `Open Questions` if they remain out of scope.
 7. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
 8. When a follow-up backlog item is intentionally deferred from current task/RFC execution, require backlog creation to include:
