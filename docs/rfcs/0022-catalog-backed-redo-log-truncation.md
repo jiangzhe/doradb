@@ -320,14 +320,15 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
     marker advancement, file unlink.
   - Prerequisites: Phase 1 marker/discovery contract exists, even though this
     phase does not advance the marker.
-  - Phase-local Choices: Exact `RedoLogStream` observation API shape; catalog
-    checkpoint outcome struct shape; whether the in-memory retention record
-    stores first-needed sequence, last-catalog-safe sequence, or segment
-    summaries.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Catalog scan uses a catalog-specific redo planner path
+    that emits sealed segment summaries. No public catalog checkpoint outcome
+    was added; the apply outcome remains crate-private. The in-memory retention
+    record is owned by `TransactionSystem` and stores `first_retained_file_seq`,
+    `catalog_replay_start_ts`, and per-segment summaries.
+  - Task Doc: `docs/tasks/000195-catalog-scan-segment-progress.md`
+  - Task Issue: `#771`
+  - Phase Status: done
+  - Implementation Summary: Implemented catalog-specific sealed segment summaries and TransactionSystem-owned in-memory catalog redo retention progress while keeping checkpoint_catalog returning Result. [Task Resolve Sync: docs/tasks/000195-catalog-scan-segment-progress.md @ 2026-06-27]
 
 - **Phase 3: Global Truncation Floor Planning**
   - Scope: Add deterministic truncation planning that combines catalog-safe

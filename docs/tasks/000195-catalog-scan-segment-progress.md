@@ -1,7 +1,7 @@
 ---
 id: 000195
 title: Catalog Scan Segment Progress
-status: proposal
+status: implemented
 created: 2026-06-27
 github_issue: 771
 ---
@@ -260,6 +260,45 @@ pub(crate) fn catalog_redo_retention_progress(
      `TransactionSystem`.
 
 ## Implementation Notes
+
+- Added catalog-scan-specific redo planning that reports sealed redo segment
+  summaries without changing startup recovery replay behavior. Startup recovery
+  and catalog scan now use separate planner requirements, preserving recovery
+  repair policy while letting catalog scan collect sealed empty and sealed
+  non-empty retained segment metadata.
+- Extended `CatalogCheckpointBatch` with retained marker and sealed segment
+  progress, and wired catalog checkpoint publish to record
+  `CatalogRedoRetentionProgress` only after a successful published checkpoint
+  boundary. No progress is recorded for metadata-only/no-progress batches.
+- Added `TransactionSystem`-owned in-memory catalog redo retention progress with
+  monotonic record/snapshot helpers. The cache stores the retained redo marker,
+  catalog replay boundary, and catalog-safe sealed segment summaries; it remains
+  restart-discardable and starts as `None`.
+- Kept `Session::checkpoint_catalog(&mut self) -> Result<()>` as the public API.
+  The checkpoint apply outcome is crate-private, and no retention progress type
+  is exported from `lib.rs`.
+- Merged the catalog checkpoint storage helper module into
+  `catalog/storage/mod.rs` and added comments explaining checkpoint apply and
+  redo-retention progress logic.
+- Addressed review hardening found during implementation:
+  - validate empty catalog roots against their table-id slot before accepting
+    metadata-only roots;
+  - reject out-of-range catalog redo table ids instead of silently skipping
+    redo entries;
+  - refresh tail-merge append bounds after partial LWC tail replacement;
+  - replace per-row temporary `RowPage` LWC staging with direct
+    `LwcBuilder::append_row_values`;
+  - reject malformed `DeleteByUniqueKey` payloads instead of treating invalid
+    index numbers, key arity mismatches, or missing row columns as non-matches.
+- Verified with:
+  - `cargo fmt`
+  - focused `cargo nextest run -p doradb-storage` invocations for new catalog
+    checkpoint, redo planner, transaction progress, LWC direct-build, and
+    delete-key validation tests
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `git diff --check`
+  - `tools/style_audit.rs --diff-base origin/main`
 
 ## Impacts
 
