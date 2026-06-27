@@ -36,6 +36,9 @@ use std::sync::Arc;
 
 pub(crate) use crate::file::CATALOG_MTB_FILE_ID;
 
+#[cfg(test)]
+pub(crate) use tests::publish_first_redo_log_seq_for_test;
+
 /// On-disk format version of `catalog.mtb`.
 pub(crate) const CATALOG_MTB_VERSION: u64 = 3;
 /// Reserved number of catalog logical-table root descriptors.
@@ -79,6 +82,8 @@ impl CatalogTableRootDesc {
 pub(crate) struct MultiTableMetaBlock {
     /// Global next table-id allocator watermark.
     pub(crate) next_table_id: TableID,
+    /// First redo log file sequence retained for recovery.
+    pub(crate) first_redo_log_seq: u32,
     /// Reserved root descriptors for catalog logical tables.
     pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
 }
@@ -93,6 +98,7 @@ impl MultiTableMetaBlock {
         }
         MultiTableMetaBlock {
             next_table_id: next_table_id.max(USER_OBJ_ID_START),
+            first_redo_log_seq: 0,
             table_roots,
         }
     }
@@ -530,6 +536,7 @@ fn parse_multi_table_meta_block(
     Ok(ParsedMeta {
         meta: MultiTableMetaBlock {
             next_table_id: meta_block.next_table_id,
+            first_redo_log_seq: meta_block.first_redo_log_seq,
             table_roots: meta_block.table_roots,
         },
         alloc_map: meta_block.alloc_map,
@@ -658,6 +665,25 @@ mod tests {
         drop(old_root);
     }
 
+    pub(crate) async fn publish_first_redo_log_seq_for_test(
+        mtb: &Arc<MultiTableFile>,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        first_redo_log_seq: u32,
+    ) -> Result<()> {
+        let snapshot = mtb.load_snapshot()?;
+        let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
+        mutable.apply_checkpoint_metadata(
+            snapshot.catalog_replay_start_ts,
+            snapshot.meta.next_table_id,
+            snapshot.meta.table_roots,
+        )?;
+        mutable.new_root.root.first_redo_log_seq = first_redo_log_seq;
+        mutable.reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)?;
+        let (_, old_root) = mutable.commit_prepared().await?;
+        drop(old_root);
+        Ok(())
+    }
+
     #[test]
     fn test_multi_table_file_open_publish_and_reload() {
         smol::block_on(async {
@@ -673,6 +699,7 @@ mod tests {
             let s0 = mtb.load_snapshot().unwrap();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_table_id, USER_OBJ_ID_START);
+            assert_eq!(s0.meta.first_redo_log_seq, 0);
             let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
             assert!(meta_block_id_0 > test_block_id(0));
 
@@ -701,11 +728,58 @@ mod tests {
             let s1 = mtb2.load_snapshot().unwrap();
             assert_eq!(s1.catalog_replay_start_ts, TrxID::new(7));
             assert_eq!(s1.meta.next_table_id, USER_OBJ_ID_START + 16);
+            assert_eq!(s1.meta.first_redo_log_seq, 0);
             assert_eq!(s1.meta.table_roots, roots);
 
             drop(mtb2);
             drop(fs);
             let _ = remove_file(path);
+        });
+    }
+
+    #[test]
+    fn test_multi_table_file_metadata_checkpoint_preserves_first_redo_log_seq() {
+        smol::block_on(async {
+            let (dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let mtb = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
+
+            publish_first_redo_log_seq_for_test(&mtb, background_writes, 3)
+                .await
+                .unwrap();
+            let marker_snapshot = mtb.load_snapshot().unwrap();
+            assert_eq!(marker_snapshot.meta.first_redo_log_seq, 3);
+
+            let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
+            for (idx, root) in roots.iter_mut().enumerate() {
+                root.table_id = TableID::new(idx as u64);
+            }
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                TrxID::new(8),
+                USER_OBJ_ID_START + 5,
+                roots,
+            )
+            .await;
+            let updated_snapshot = mtb.load_snapshot().unwrap();
+            assert_eq!(updated_snapshot.catalog_replay_start_ts, TrxID::new(8));
+            assert_eq!(updated_snapshot.meta.first_redo_log_seq, 3);
+            drop(mtb);
+            drop(fs);
+
+            let fs = build_test_fs_in(dir.path());
+            let mtb = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
+            let reloaded = mtb.load_snapshot().unwrap();
+            assert_eq!(reloaded.catalog_replay_start_ts, TrxID::new(8));
+            assert_eq!(reloaded.meta.first_redo_log_seq, 3);
         });
     }
 

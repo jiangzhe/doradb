@@ -1847,6 +1847,7 @@ pub(crate) fn next_redo_file_seq(file_seq: u32) -> Result<u32> {
 #[inline]
 pub(crate) fn discover_redo_log_files(
     file_prefix: &str,
+    first_retained_file_seq: u32,
     desc: bool,
 ) -> Result<Vec<RedoLogFileDescriptor>> {
     let pattern = format!("{}.*", Pattern::escape(file_prefix));
@@ -1877,7 +1878,11 @@ pub(crate) fn discover_redo_log_files(
             .into());
     }
     files.sort_by_key(|(seq, _)| *seq);
-    validate_redo_log_file_sequences(file_prefix, &files)?;
+    let files = files
+        .into_iter()
+        .filter(|(seq, _)| *seq >= first_retained_file_seq)
+        .collect::<Vec<_>>();
+    validate_redo_log_file_sequences(file_prefix, first_retained_file_seq, &files)?;
     let mut res = files
         .into_iter()
         .map(|(file_seq, path)| RedoLogFileDescriptor { file_seq, path })
@@ -2135,19 +2140,34 @@ fn open_recovered_seal_file(recovered: RecoveredRedoSeal) -> Result<RedoLogFile>
 }
 
 #[inline]
-fn validate_redo_log_file_sequences(file_prefix: &str, files: &[(u32, PathBuf)]) -> Result<()> {
+fn validate_redo_log_file_sequences(
+    file_prefix: &str,
+    first_retained_file_seq: u32,
+    files: &[(u32, PathBuf)],
+) -> Result<()> {
+    if files.is_empty() {
+        if first_retained_file_seq > 0 {
+            return Err(Report::new(DataIntegrityError::RedoLogSequenceGap)
+                .attach(format!(
+                    "no redo log files at or above first retained sequence {first_retained_file_seq:08x} in family {file_prefix}"
+                ))
+                .into());
+        }
+        return Ok(());
+    }
     if let Some((first, _)) = files.first()
-        && *first != 0
+        && *first != first_retained_file_seq
     {
-        let missing_end = first - 1;
-        let missing = if missing_end == 0 {
-            String::from("00000000")
+        let missing_end = first.saturating_sub(1);
+        let missing = format_redo_sequence_range(first_retained_file_seq, missing_end);
+        let missing_kind = if first_retained_file_seq == 0 {
+            "redo log file prefix"
         } else {
-            format!("00000000..={missing_end:08x}")
+            "first retained redo log file"
         };
         return Err(Report::new(DataIntegrityError::RedoLogSequenceGap)
             .attach(format!(
-                "missing redo log file prefix sequence(s) {missing} in family {file_prefix}"
+                "missing {missing_kind} sequence(s) {missing} in family {file_prefix}"
             ))
             .into());
     }
@@ -2183,6 +2203,15 @@ fn validate_redo_log_file_sequences(file_prefix: &str, files: &[(u32, PathBuf)])
         }
     }
     Ok(())
+}
+
+#[inline]
+fn format_redo_sequence_range(first: u32, last: u32) -> String {
+    if first == last {
+        format!("{first:08x}")
+    } else {
+        format!("{first:08x}..={last:08x}")
+    }
 }
 
 #[inline]
@@ -4193,7 +4222,7 @@ mod tests {
         }
         File::create(log_dir.join("redo.logx.00000000")).unwrap();
 
-        let asc = discover_redo_log_files(file_prefix, false).unwrap();
+        let asc = discover_redo_log_files(file_prefix, 0, false).unwrap();
         assert_eq!(
             expected.to_vec(),
             asc.iter()
@@ -4207,7 +4236,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let desc = discover_redo_log_files(file_prefix, true).unwrap();
+        let desc = discover_redo_log_files(file_prefix, 0, true).unwrap();
         assert_eq!(
             expected.iter().rev().cloned().collect::<Vec<_>>(),
             desc.iter()
@@ -4229,7 +4258,7 @@ mod tests {
         let file_prefix = file_prefix.to_str().unwrap();
         drop(create_log_file_for_test(file_prefix, 1, 128 * 1024, 4096));
 
-        let err = discover_redo_log_files(file_prefix, false).unwrap_err();
+        let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::RedoLogSequenceGap)
@@ -4248,7 +4277,7 @@ mod tests {
         drop(create_log_file_for_test(file_prefix, 0, 128 * 1024, 4096));
         drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
 
-        let err = discover_redo_log_files(file_prefix, false).unwrap_err();
+        let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::RedoLogSequenceGap)
@@ -4259,13 +4288,110 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_redo_log_files_accepts_retained_suffix_without_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
+        drop(create_log_file_for_test(file_prefix, 3, 128 * 1024, 4096));
+
+        let descriptors = discover_redo_log_files(file_prefix, 2, false).unwrap();
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.file_seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn test_discover_redo_log_files_excludes_obsolete_prefix_below_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        for file_seq in 0..4 {
+            drop(create_log_file_for_test(
+                file_prefix,
+                file_seq,
+                128 * 1024,
+                4096,
+            ));
+        }
+
+        let descriptors = discover_redo_log_files(file_prefix, 2, true).unwrap();
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.file_seq)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
+
+    #[test]
+    fn test_discover_redo_log_files_rejects_empty_retained_suffix() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        drop(create_log_file_for_test(file_prefix, 0, 128 * 1024, 4096));
+        drop(create_log_file_for_test(file_prefix, 1, 128 * 1024, 4096));
+
+        let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::RedoLogSequenceGap)
+        );
+        let report = format!("{err:?}");
+        assert!(
+            report.contains("first retained sequence 00000002"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn test_discover_redo_log_files_rejects_missing_marker_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        drop(create_log_file_for_test(file_prefix, 3, 128 * 1024, 4096));
+
+        let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::RedoLogSequenceGap)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("00000002"), "{report}");
+        assert!(report.contains(file_prefix), "{report}");
+    }
+
+    #[test]
+    fn test_discover_redo_log_files_rejects_gap_above_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
+        drop(create_log_file_for_test(file_prefix, 4, 128 * 1024, 4096));
+
+        let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::RedoLogSequenceGap)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("00000003"), "{report}");
+        assert!(report.contains(file_prefix), "{report}");
+    }
+
+    #[test]
     fn test_discover_redo_log_files_rejects_legacy_partitioned_files() {
         let temp_dir = TempDir::new().unwrap();
         let file_prefix = temp_dir.path().join("redo.log");
         let file_prefix = file_prefix.to_str().unwrap();
         File::create(format!("{file_prefix}.0.00000000")).unwrap();
 
-        let err = discover_redo_log_files(file_prefix, false).unwrap_err();
+        let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
         let report = format!("{err:?}");
         assert!(report.contains("unsupported legacy partitioned redo log file"));
     }
@@ -4278,7 +4404,7 @@ mod tests {
         let expected_path =
             create_sealed_log_file_for_test(file_prefix, 0, REDO_DEFAULT_DATA_START_OFFSET, None);
 
-        let descriptors = discover_redo_log_files(file_prefix, false).unwrap();
+        let descriptors = discover_redo_log_files(file_prefix, 0, false).unwrap();
         assert_eq!(descriptors.len(), 1);
         let segment = RedoLogSegment::from_descriptor(descriptors[0].clone()).unwrap();
         assert_eq!(segment.path, expected_path);
@@ -4303,7 +4429,7 @@ mod tests {
                 Some((TrxID::new(10), TrxID::new(20))),
             );
             create_sealed_log_file_for_test(file_prefix, 2, REDO_DEFAULT_DATA_START_OFFSET, None);
-            let descriptors = discover_redo_log_files(file_prefix, false).unwrap();
+            let descriptors = discover_redo_log_files(file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(descriptors);
 
             let planned = planner.plan_recovery(TrxID::new(15), 1).unwrap();
@@ -4341,7 +4467,7 @@ mod tests {
                 REDO_DEFAULT_DATA_START_OFFSET + 4096,
                 Some((TrxID::new(10), TrxID::new(20))),
             );
-            let logs = discover_redo_log_files(file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
             let (finalizer, planner, read_depth) =
                 redo_planner_and_finalizer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
 
@@ -4360,7 +4486,7 @@ mod tests {
             let file_prefix = temp_dir.path().join("redo.log");
             let file_prefix = file_prefix.to_str().unwrap();
             create_sealed_log_file_for_test(file_prefix, 0, REDO_DEFAULT_DATA_START_OFFSET, None);
-            let logs = discover_redo_log_files(file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
             let (finalizer, planner, read_depth) =
                 redo_planner_and_finalizer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
 
@@ -4384,7 +4510,7 @@ mod tests {
                 REDO_DEFAULT_DATA_START_OFFSET + 4096,
                 Some((TrxID::new(10), TrxID::new(20))),
             );
-            let logs = discover_redo_log_files(file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
 
             let planned = planner.plan_recovery(TrxID::new(20), 1).unwrap();
@@ -4606,7 +4732,7 @@ mod tests {
                 .log_block_size(new_log_block_size)
                 .log_file_max_size(new_file_max_size);
             let file_prefix = config.file_prefix().unwrap();
-            let logs = discover_redo_log_files(&file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(&file_prefix, 0, false).unwrap();
             let (finalizer, planner, read_depth) = redo_planner_and_finalizer_for_test(
                 &file_prefix,
                 config.recovery_io_depth,
@@ -4743,7 +4869,7 @@ mod tests {
 
             let mut log_recs = 0usize;
             let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
-            let logs = discover_redo_log_files(&file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(&file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
             let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
             while let Some(pod) = stream.try_next().await.unwrap() {

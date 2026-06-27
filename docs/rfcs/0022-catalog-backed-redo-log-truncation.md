@@ -126,7 +126,7 @@ global truncation floor derived from catalog and all retained table replay
 boundaries. [D2], [D3], [C2], [C3], [C5], [U2]
 
 Persist a durable first-retained redo file sequence in `catalog.mtb` overlay
-metadata, tentatively named `redo_first_retained_file_seq`. Redo discovery and
+metadata, tentatively named `first_redo_log_seq`. Redo discovery and
 recovery must accept missing prefix files only when their sequence is strictly
 below this durable marker; any missing file at or above the marker remains a
 data-integrity error. This marker is advanced durably before old files are
@@ -289,7 +289,7 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
 ## Implementation Phases
 
 - **Phase 1: Durable Retention Marker And Discovery**
-  - Scope: Add `redo_first_retained_file_seq` to catalog metadata persisted in
+  - Scope: Add `first_redo_log_seq` to catalog metadata persisted in
     `catalog.mtb`; load it during transaction-system recovery setup; change redo
     discovery to accept missing prefix files below the marker and reject gaps at
     or above it.
@@ -303,10 +303,10 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
   - Phase-local Choices: Exact marker field name and encoding in
     `MultiTableMetaBlock`; whether marker advancement is exposed through a
     narrow catalog-storage helper or a transaction-system helper.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000194-durable-retention-marker-for-redo-log.md`
+  - Task Issue: `#769`
+  - Phase Status: done
+  - Implementation Summary: Implemented durable first-retained redo marker in catalog metadata and marker-aware retained-suffix discovery for startup recovery and catalog checkpoint scan. [Task Resolve Sync: docs/tasks/000194-durable-retention-marker-for-redo-log.md @ 2026-06-27]
 
 - **Phase 2: Catalog Scan Segment Progress**
   - Scope: Extend redo stream/planner outputs so catalog checkpoint scan can

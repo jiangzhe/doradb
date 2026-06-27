@@ -178,6 +178,8 @@ impl<'a> Ser<'a> for MetaBlockSerView<'a> {
 pub(crate) struct MultiTableMetaBlockData {
     /// Global next table-id allocator watermark.
     pub(crate) next_table_id: TableID,
+    /// First redo log file sequence retained for recovery.
+    pub(crate) first_redo_log_seq: u32,
     /// Reserved root descriptors of catalog logical tables.
     pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
@@ -202,7 +204,7 @@ impl Deser for MultiTableMetaBlockData {
             )));
         }
         let (idx, table_count) = input.deser_u32(idx)?;
-        let (mut idx, _) = input.deser_u32(idx)?; // reserved
+        let (mut idx, first_redo_log_seq) = input.deser_u32(idx)?;
         if table_count as usize != CATALOG_TABLE_ROOT_DESC_COUNT {
             return Err(invalid_payload(format!(
                 "catalog table root count {table_count} does not match expected {CATALOG_TABLE_ROOT_DESC_COUNT}"
@@ -237,6 +239,7 @@ impl Deser for MultiTableMetaBlockData {
             idx,
             MultiTableMetaBlockData {
                 next_table_id,
+                first_redo_log_seq,
                 table_roots,
                 alloc_map,
             },
@@ -251,6 +254,8 @@ impl Deser for MultiTableMetaBlockData {
 pub(crate) struct MultiTableMetaBlockSerView<'a> {
     /// Global next table-id allocator watermark.
     next_table_id: TableID,
+    /// First redo log file sequence retained for recovery.
+    first_redo_log_seq: u32,
     /// Reserved root descriptors of catalog logical tables.
     table_roots: &'a [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
@@ -264,6 +269,7 @@ impl<'a> MultiTableMetaBlockSerView<'a> {
     pub(crate) fn new(meta: &'a MultiTableMetaBlock, alloc_map: &'a AllocMap) -> Self {
         MultiTableMetaBlockSerView {
             next_table_id: meta.next_table_id,
+            first_redo_log_seq: meta.first_redo_log_seq,
             table_roots: &meta.table_roots,
             alloc_map,
         }
@@ -286,7 +292,7 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
         let mut idx = start_idx;
         idx = out.ser_u64(idx, self.next_table_id.as_u64());
         idx = out.ser_u32(idx, CATALOG_TABLE_ROOT_DESC_COUNT as u32);
-        idx = out.ser_u32(idx, 0); // reserved
+        idx = out.ser_u32(idx, self.first_redo_log_seq);
         for root in self.table_roots {
             idx = out.ser_u64(idx, root.table_id.as_u64());
             idx = out.ser_u64(
@@ -639,6 +645,7 @@ mod tests {
     #[test]
     fn test_multi_table_meta_block_serde_none_root_block_id() {
         let mut meta = MultiTableMetaBlock::new(USER_OBJ_ID_START + 9);
+        meta.first_redo_log_seq = 7;
         meta.table_roots[0].root_block_id = None;
         meta.table_roots[0].pivot_row_id = RowID::new(0);
         meta.table_roots[1].root_block_id = NonZeroU64::new(42);
@@ -654,6 +661,7 @@ mod tests {
 
         let (_, decoded) = MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
         assert_eq!(decoded.next_table_id, meta.next_table_id);
+        assert_eq!(decoded.first_redo_log_seq, 7);
         assert_eq!(decoded.table_roots[0].table_id, TableID::new(0));
         assert_eq!(decoded.table_roots[0].root_block_id, None);
         assert_eq!(decoded.table_roots[0].pivot_row_id, RowID::new(0));

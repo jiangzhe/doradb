@@ -56,6 +56,8 @@ pub(crate) struct CatalogCheckpointBatch {
 pub(crate) struct CatalogCheckpointScanConfig {
     /// Redo log file prefix used to discover scan inputs.
     pub(crate) file_prefix: String,
+    /// First redo log file sequence retained for recovery.
+    pub(crate) first_retained_file_seq: u32,
     /// Maximum direct-IO read-ahead depth for redo scan input.
     pub(crate) read_ahead_depth: usize,
 }
@@ -290,7 +292,8 @@ impl Catalog {
         trx_sys: &TransactionSystem,
     ) -> Result<CatalogCheckpointBatch> {
         let snapshot = self.storage.checkpoint_snapshot()?;
-        let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
+        let mut scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
+        scan_cfg.first_retained_file_seq = snapshot.meta.first_redo_log_seq;
         self.scan_checkpoint_batch_with_config(
             snapshot.catalog_replay_start_ts,
             trx_sys.persisted_watermark_cts(),
@@ -322,7 +325,11 @@ impl Catalog {
             return Ok(batch);
         }
 
-        let logs = discover_redo_log_files(&scan_cfg.file_prefix, false)?;
+        let logs = discover_redo_log_files(
+            &scan_cfg.file_prefix,
+            scan_cfg.first_retained_file_seq,
+            false,
+        )?;
         if logs.is_empty() {
             return Ok(batch);
         }

@@ -2052,7 +2052,7 @@ mod tests {
             let mut create_row_page_logs = 0usize;
             let file_prefix = temp_dir.path().join("redo_row_page_idx");
             let file_prefix = file_prefix.to_str().unwrap();
-            let logs = discover_redo_log_files(file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
             let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
             while let Some(log) = stream.try_next().await.unwrap() {

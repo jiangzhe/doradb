@@ -195,7 +195,13 @@ impl TrxSysConfig {
         let file_max_size =
             normalize_redo_file_max_size(self.log_file_max_size.as_u64() as usize, log_block_size)?;
 
-        let logs = discover_redo_log_files(&file_prefix, false)?;
+        let first_retained_file_seq = resources
+            .catalog
+            .storage
+            .checkpoint_snapshot()?
+            .meta
+            .first_redo_log_seq;
+        let logs = discover_redo_log_files(&file_prefix, first_retained_file_seq, false)?;
         let planner = RedoReplayPlanner::new(logs);
         let finalizer = RedoLogFinalizer::new(
             file_prefix,
