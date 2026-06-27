@@ -13,8 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio, exit, id};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio, exit};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
@@ -32,6 +31,7 @@ const CLIPPY_COMMAND: &[&str] = &[
     "-D",
     "warnings",
 ];
+const DEFAULT_DIFF_BASE: &str = "origin/main";
 
 #[derive(Debug, Clone)]
 struct Violation {
@@ -56,16 +56,6 @@ enum ItemGroup {
     PublicFunction = 4,
     PrivateFunction = 5,
     Tests = 6,
-}
-
-struct TempSnapshot {
-    path: PathBuf,
-}
-
-impl Drop for TempSnapshot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,7 +156,7 @@ impl<'ast> Visit<'ast> for QualifiedPathVisitor<'_> {
 }
 
 fn usage() -> &'static str {
-    "Usage: tools/style_audit.rs [--diff-base <rev> | --force-path <file-or-dir> ...]"
+    "Usage: tools/style_audit.rs [--diff-base <rev> | --force-path <file-or-dir> ...]\nDefault: audit Rust files changed against origin/main."
 }
 
 fn main() {
@@ -236,43 +226,11 @@ fn parse_args() -> Result<Args, String> {
 fn run_audit(args: &Args) -> Result<i32, String> {
     let repo_root = repo_root()?;
     match (args.force_paths.is_empty(), args.diff_base.as_deref()) {
-        (true, None) => run_staged_audit(&repo_root),
+        (true, None) => run_branch_diff_audit(&repo_root, DEFAULT_DIFF_BASE),
         (true, Some(diff_base)) => run_branch_diff_audit(&repo_root, diff_base),
         (false, None) => run_forced_audit(&repo_root, &args.force_paths),
         (false, Some(_)) => unreachable!("validated by parse_args"),
     }
-}
-
-fn run_staged_audit(repo_root: &Path) -> Result<i32, String> {
-    let staged_rs = staged_rust_files(repo_root)?;
-    if staged_rs.is_empty() {
-        println!("style-audit: no staged Rust files");
-        return Ok(0);
-    }
-
-    let snapshot = export_index_snapshot(repo_root)?;
-
-    if let Some(result) = run_cargo_gate(&snapshot.path, FMT_COMMAND)? {
-        print_gate_failure("cargo fmt --all -- --check", &result);
-        return Ok(1);
-    }
-
-    if let Some(result) = run_cargo_gate(&snapshot.path, CLIPPY_COMMAND)? {
-        print_gate_failure(
-            "cargo clippy -p doradb-storage --all-targets -- -D warnings",
-            &result,
-        );
-        return Ok(1);
-    }
-
-    let files = staged_rs
-        .iter()
-        .map(|path| AuditFile {
-            display_path: normalize_path(path),
-            full_path: snapshot.path.join(path),
-        })
-        .collect::<Vec<_>>();
-    audit_files("staged", &files)
 }
 
 fn run_branch_diff_audit(repo_root: &Path, diff_base: &str) -> Result<i32, String> {
@@ -319,7 +277,7 @@ fn run_forced_audit(repo_root: &Path, force_paths: &[PathBuf]) -> Result<i32, St
         return Ok(1);
     }
 
-    audit_files("forced", &files)
+    audit_files("forced-path", &files)
 }
 
 fn audit_files(label: &str, files: &[AuditFile]) -> Result<i32, String> {
@@ -348,38 +306,6 @@ fn repo_root() -> Result<PathBuf, String> {
         ));
     }
     Ok(PathBuf::from(result.stdout.trim()))
-}
-
-fn staged_rust_files(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
-    let result = run_command(
-        repo_root,
-        "git",
-        &[
-            "diff",
-            "--cached",
-            "--name-only",
-            "--diff-filter=ACMR",
-            "-z",
-            "--",
-            "*.rs",
-        ],
-    )?;
-    if result.code != Some(0) {
-        return Err(format!(
-            "failed to collect staged Rust files\n{}{}",
-            result.stdout, result.stderr
-        ));
-    }
-
-    let mut paths = result
-        .stdout
-        .split('\0')
-        .filter(|path| !path.is_empty() && path.ends_with(".rs"))
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
 }
 
 fn branch_diff_rust_files(repo_root: &Path, diff_base: &str) -> Result<Vec<AuditFile>, String> {
@@ -486,31 +412,6 @@ fn display_path(repo_root: &Path, path: &Path) -> String {
     path.strip_prefix(repo_root)
         .map(normalize_path)
         .unwrap_or_else(|_| normalize_path(path))
-}
-
-fn export_index_snapshot(repo_root: &Path) -> Result<TempSnapshot, String> {
-    let mut dir = env::temp_dir();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system clock before unix epoch: {e}"))?
-        .as_nanos();
-    dir.push(format!("doradb-style-audit-{}-{nanos}", id()));
-    fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
-
-    let prefix = format!("{}/", normalize_path(&dir));
-    let result = run_command(
-        repo_root,
-        "git",
-        &["checkout-index", "--all", "--force", "--prefix", &prefix],
-    )?;
-    if result.code != Some(0) {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(format!(
-            "failed to export staged index snapshot\n{}{}",
-            result.stdout, result.stderr
-        ));
-    }
-    Ok(TempSnapshot { path: dir })
 }
 
 fn run_cargo_gate(cwd: &Path, args: &[&str]) -> Result<Option<CommandResult>, String> {

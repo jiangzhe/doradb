@@ -27,24 +27,29 @@ cargo fmt
 cargo clippy -p doradb-storage --all-targets -- -D warnings
 ```
 
-3. Audit staged Rust style when Rust files are staged:
+3. Audit branch Rust style:
 
 ```bash
 tools/style_audit.rs
 ```
 
-This command checks only staged `.rs` files, reads the staged index rather than
-unstaged working-tree edits, and reports formatting, clippy, and repository
-style violations. For explicit unstaged checks, pass
-`--force-path <file-or-dir>`; directory targets check only direct `.rs`
-children and do not recurse.
+This command checks working-tree `.rs` files changed against
+`merge-base(origin/main, HEAD)` and reports formatting, clippy, and repository
+style violations.
 
-During `task resolve`, audit task-branch Rust changes against `origin/main` so
-already committed implementation changes are included:
+To audit against a different branch base, pass an explicit diff base:
 
 ```bash
-tools/style_audit.rs --diff-base origin/main
+tools/style_audit.rs --diff-base <rev>
 ```
+
+For explicit file or directory checks, pass:
+
+```bash
+tools/style_audit.rs --force-path <file-or-dir>
+```
+
+Directory targets check only direct `.rs` children and do not recurse.
 
 4. Run tests:
 

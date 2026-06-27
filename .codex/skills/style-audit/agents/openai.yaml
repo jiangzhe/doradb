@@ -1,4 +1,4 @@
 interface:
   display_name: "Style Audit"
-  short_description: "Audit staged or branch-diff Rust coding style"
-  default_prompt: "Use $style-audit to audit staged Rust files by default, or branch-diff Rust files with `tools/style_audit.rs --diff-base origin/main` during task resolve, and report style violations."
+  short_description: "Audit branch-diff Rust coding style"
+  default_prompt: "Use $style-audit to audit branch-diff Rust files with the default `tools/style_audit.rs` origin/main base, or explicit file/directory targets with `--force-path`, and report style violations."
