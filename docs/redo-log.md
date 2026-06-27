@@ -81,8 +81,15 @@ the same retained suffix. Planning validates retained redo super-block metadata,
 combines the catalog replay boundary with resident user-table replay floors and
 pending dropped-table replay floors, and reports eligible sealed prefix files
 plus blockers. The plan is side-effect-free: it does not advance
-`first_redo_log_seq`, unlink redo files, or run checkpoint work. Physical redo
-file removal remains future `Session::truncate_redo_log` work.
+`first_redo_log_seq`, unlink redo files, or run checkpoint work.
+
+`Session::truncate_redo_log` is the public maintenance API that consumes a fresh
+plan. It publishes `first_redo_log_seq = last_candidate_seq + 1` durably before
+unlinking any planned candidate, then removes present redo sequence files below
+the final marker. The call also retries cleanup for leftovers already below the
+marker, returns aggregate counts for marker advancement, removed files,
+already-missing files, retryable unlink failures, and current blockers, and does
+not run catalog or table checkpoints implicitly.
 
 Each log file is created as an `O_DIRECT` sparse file and truncated to the
 effective `log_file_max_size`. The configured value is first rounded so the
@@ -570,9 +577,12 @@ lose recent log writes.
 - Log discovery depends on file names and the durable `first_redo_log_seq`
   marker in `catalog.mtb`. Files below the marker are ignored as obsolete
   prefix files, while the retained suffix remains contiguous.
-- Old log files are not physically truncated or deleted by the current redo
-  path. Checkpoint metadata narrows replay logically, and recovery can skip
-  validated sealed files whose CTS range is fully below the replay floor.
+- `Session::truncate_redo_log` can physically unlink whole obsolete prefix files
+  after checkpoint metadata proves the sealed files are below all catalog,
+  live-table, and pending dropped-table replay floors. A marker publication
+  failure stops before unlink and is treated like a fatal checkpoint-write
+  failure. Non-`NotFound` unlink failures are reported as retryable cleanup
+  failures and do not poison storage.
 - Redo read-ahead is direct-IO based and bounded by the scan-specific configured
   read-ahead depth; parsing and replay remain sequential.
 - A single redo-bearing transaction may exceed one block payload and span a
@@ -588,10 +598,9 @@ lose recent log writes.
 
 ### File Layout and Retention
 
-Implement physical redo truncation or deletion after catalog and table replay
-floors prove that older segments are no longer needed. This likely needs the
-watermark expansion already tracked by
-`docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`.
+Add background scheduling and richer telemetry for physical redo cleanup. The
+current API is explicit and session-driven; future work can decide when to run
+checkpoint hints and truncation automatically.
 
 Keep `log_block_size` config normalization and block-header validation in sync.
 The config path rounds values up to `STORAGE_SECTOR_SIZE` multiples before file
@@ -622,10 +631,9 @@ Parallel redo parsing or replay should build on the split between direct-IO
 read-ahead and `RedoLogStream` parsing. The current implementation keeps replay
 sequential.
 
-Implement physical unlink of prefix redo files after catalog and table replay
-floors prove the files are no longer needed and after `first_redo_log_seq` is
-advanced durably. The marker-aware discovery contract exists, but this redo path
-still does not delete old files.
+Expose more detailed retention diagnostics if aggregate blocker and unlink
+counts are not enough for operators. Per-file public unlink details remain
+outside the current API.
 
 Parallelize DML replay after preserving DDL pipeline barriers and per-table/page
 ordering. The code already has `dispatch_dml` and `wait_for_dml_done` boundaries

@@ -1,13 +1,18 @@
-use crate::error::{DataIntegrityError, Result};
+use crate::error::{DataIntegrityError, ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
-use crate::log::discover_redo_log_files;
+use crate::log::{
+    discover_redo_log_files, next_redo_file_seq, obsolete_redo_log_files_below_marker,
+};
 use crate::recovery::stream::{
     RedoReplayPlanner, RedoRetentionSegment, RedoRetentionSegmentState, RedoSegmentCtsRange,
 };
+use crate::session::{RedoTruncationBlockerInfo, RedoTruncationOutcome};
 use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use error_stack::Report;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::ErrorKind as IoErrorKind;
 
 /// Dry-run redo truncation plan for the currently retained redo suffix.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,10 +107,6 @@ impl PendingDroppedTableRedoFloor {
 
 impl TransactionSystem {
     /// Compute a side-effect-free redo truncation plan.
-    #[expect(
-        dead_code,
-        reason = "phase 4 truncate API will consume the phase 3 dry-run planner"
-    )]
     #[inline]
     pub(crate) fn plan_redo_truncation(&self) -> Result<RedoTruncationPlan> {
         let snapshot = self.catalog.storage.checkpoint_snapshot()?;
@@ -136,6 +137,114 @@ impl TransactionSystem {
             segments,
             catalog_safe_segments,
         )
+    }
+
+    /// Advance the durable redo retention marker and unlink obsolete redo files.
+    pub(crate) async fn truncate_redo_log(&self) -> Result<RedoTruncationOutcome> {
+        let _redo_retention_lease = self.begin_redo_retention().await;
+        let plan = self.plan_redo_truncation()?;
+        let previous_first_retained_file_seq = plan.first_retained_file_seq;
+        let target_marker = match plan.candidates.last() {
+            Some(candidate) => next_redo_file_seq(candidate.file_seq)?,
+            None => previous_first_retained_file_seq,
+        };
+        let advanced_files = plan.candidates.len();
+        let new_first_retained_file_seq = if target_marker > previous_first_retained_file_seq {
+            match self
+                .catalog
+                .storage
+                .publish_first_redo_log_seq(target_marker)
+                .await
+            {
+                Ok(marker) => marker,
+                Err(err) if err.kind() == ErrorKind::Io => {
+                    return Err(self.poison_storage(FatalError::CheckpointWrite).into());
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            previous_first_retained_file_seq
+        };
+
+        let file_prefix = self.config.file_prefix()?;
+        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)?;
+
+        Ok(RedoTruncationOutcome {
+            previous_first_retained_file_seq,
+            new_first_retained_file_seq,
+            advanced_files,
+            removed_files: cleanup.removed_files,
+            already_missing_files: cleanup.already_missing_files,
+            failed_unlink_files: cleanup.failed_unlink_files,
+            blockers: plan
+                .blockers
+                .into_iter()
+                .map(public_redo_truncation_blocker)
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RedoCleanupCounts {
+    removed_files: usize,
+    already_missing_files: usize,
+    failed_unlink_files: usize,
+}
+
+fn cleanup_obsolete_redo_files(
+    file_prefix: &str,
+    first_retained_file_seq: u32,
+) -> Result<RedoCleanupCounts> {
+    let mut counts = RedoCleanupCounts::default();
+    for descriptor in obsolete_redo_log_files_below_marker(file_prefix, first_retained_file_seq)? {
+        debug_assert!(descriptor.file_seq < first_retained_file_seq);
+        #[cfg(test)]
+        tests::run_redo_cleanup_before_unlink_hook(descriptor.file_seq, &descriptor.path);
+        match fs::remove_file(&descriptor.path) {
+            Ok(()) => counts.removed_files = counts.removed_files.saturating_add(1),
+            Err(err) if err.kind() == IoErrorKind::NotFound => {
+                counts.already_missing_files = counts.already_missing_files.saturating_add(1);
+            }
+            Err(_) => {
+                counts.failed_unlink_files = counts.failed_unlink_files.saturating_add(1);
+            }
+        }
+    }
+    Ok(counts)
+}
+
+#[inline]
+fn public_redo_truncation_blocker(blocker: RedoTruncationBlocker) -> RedoTruncationBlockerInfo {
+    match blocker {
+        RedoTruncationBlocker::CatalogFloor {
+            catalog_replay_start_ts,
+        } => RedoTruncationBlockerInfo::CatalogFloor {
+            catalog_replay_start_ts,
+        },
+        RedoTruncationBlocker::LiveTableFloor {
+            table_id,
+            heap_redo_start_ts,
+            deletion_cutoff_ts,
+        } => RedoTruncationBlockerInfo::LiveTableFloor {
+            table_id,
+            heap_redo_start_ts,
+            deletion_cutoff_ts,
+        },
+        RedoTruncationBlocker::PendingDroppedTableFloor {
+            table_id,
+            drop_cts,
+            heap_redo_start_ts,
+            deletion_cutoff_ts,
+        } => RedoTruncationBlockerInfo::PendingDroppedTableFloor {
+            table_id,
+            drop_cts,
+            heap_redo_start_ts,
+            deletion_cutoff_ts,
+        },
+        RedoTruncationBlocker::UnsealedFile { file_seq } => {
+            RedoTruncationBlockerInfo::UnsealedFile { file_seq }
+        }
     }
 }
 
@@ -330,7 +439,7 @@ fn push_floor_blockers(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         PendingDroppedTableRedoFloor, RedoTruncationBlocker, RedoTruncationCandidate,
         build_redo_truncation_plan, catalog_safe_segments_for_plan,
@@ -342,6 +451,46 @@ mod tests {
     };
     use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
     use crate::trx::sys::CatalogRedoRetentionProgress;
+    use parking_lot::Mutex;
+    use std::path::Path;
+    use std::sync::{Arc, OnceLock};
+
+    type BeforeUnlinkHook = Arc<dyn Fn(u32, &Path) + Send + Sync + 'static>;
+
+    fn before_unlink_hook_slot() -> &'static Mutex<Option<BeforeUnlinkHook>> {
+        static HOOK: OnceLock<Mutex<Option<BeforeUnlinkHook>>> = OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Guard that restores the previous redo cleanup before-unlink hook on drop.
+    pub(crate) struct RedoCleanupBeforeUnlinkHookGuard {
+        previous: Option<BeforeUnlinkHook>,
+    }
+
+    impl Drop for RedoCleanupBeforeUnlinkHookGuard {
+        #[inline]
+        fn drop(&mut self) {
+            *before_unlink_hook_slot().lock() = self.previous.take();
+        }
+    }
+
+    /// Install a hook invoked after obsolete redo discovery and before unlink.
+    #[inline]
+    pub(crate) fn install_redo_cleanup_before_unlink_hook(
+        hook: BeforeUnlinkHook,
+    ) -> RedoCleanupBeforeUnlinkHookGuard {
+        let mut slot = before_unlink_hook_slot().lock();
+        let previous = slot.replace(hook);
+        RedoCleanupBeforeUnlinkHookGuard { previous }
+    }
+
+    #[inline]
+    pub(crate) fn run_redo_cleanup_before_unlink_hook(file_seq: u32, path: &Path) {
+        let hook = before_unlink_hook_slot().lock().clone();
+        if let Some(hook) = hook {
+            hook(file_seq, path);
+        }
+    }
 
     #[inline]
     fn catalog_safe_segment(

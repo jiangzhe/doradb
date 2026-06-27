@@ -28,6 +28,7 @@ use crate::trx::{
 use crossbeam_utils::CachePadded;
 use either::Either::{Left, Right};
 use error_stack::Report;
+use event_listener::{Event, listener};
 use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeMap;
@@ -70,6 +71,79 @@ impl CatalogRedoRetentionProgress {
             segments.insert(segment.file_seq, segment);
         }
         self.segments = segments.into_values().collect();
+    }
+}
+
+#[derive(Debug, Default)]
+struct RedoRetentionGateState {
+    active: bool,
+}
+
+/// Transaction-system-wide gate for marker-based redo retention work.
+///
+/// Catalog checkpoint and redo truncation both reason about the durable
+/// first-retained redo marker, the retained redo suffix on disk, and the
+/// in-memory catalog-safe segment progress cache. The gate serializes those
+/// sections so a checkpoint cannot scan one marker/suffix while truncation
+/// publishes another marker or unlinks files below it.
+struct RedoRetentionGate {
+    state: Mutex<RedoRetentionGateState>,
+    changed: Event,
+}
+
+impl RedoRetentionGate {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RedoRetentionGateState::default()),
+            changed: Event::new(),
+        }
+    }
+
+    /// Acquire exclusive access to redo-retention planning or publication.
+    async fn acquire(&self) -> RedoRetentionLease<'_> {
+        loop {
+            {
+                let mut state = self.state.lock();
+                if !state.active {
+                    state.active = true;
+                    return RedoRetentionLease { gate: self };
+                }
+            }
+            listener!(self.changed => listener);
+            {
+                let state = self.state.lock();
+                if !state.active {
+                    continue;
+                }
+            }
+            listener.await;
+        }
+    }
+
+    #[inline]
+    fn release(&self) {
+        let mut state = self.state.lock();
+        debug_assert!(state.active);
+        state.active = false;
+        drop(state);
+        self.changed.notify(usize::MAX);
+    }
+}
+
+/// RAII lease for a redo-retention planning/publication/cleanup section.
+///
+/// While held, catalog checkpoint retained-redo scans, catalog-safe progress
+/// publication, redo truncation planning, marker publication, and obsolete-file
+/// cleanup run as one serialized retention observation.
+pub(crate) struct RedoRetentionLease<'a> {
+    gate: &'a RedoRetentionGate,
+}
+
+impl Drop for RedoRetentionLease<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.gate.release();
     }
 }
 
@@ -357,6 +431,11 @@ pub(crate) struct TransactionSystem {
     fatal_rollback_retention: CachePadded<Mutex<Vec<FatalRollbackRetention>>>,
     /// Latest in-memory catalog-safe redo segment progress.
     catalog_redo_retention: CachePadded<Mutex<Option<CatalogRedoRetentionProgress>>>,
+    /// Exclusive async gate for marker-based redo retention observations.
+    ///
+    /// This is separate from the catalog checkpoint gate: it protects redo
+    /// marker/suffix/progress consistency, not catalog metadata DDL ordering.
+    redo_retention_gate: CachePadded<RedoRetentionGate>,
 }
 
 impl TransactionSystem {
@@ -392,6 +471,7 @@ impl TransactionSystem {
             storage_poison_err: CachePadded::new(Mutex::new(None)),
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
             catalog_redo_retention: CachePadded::new(Mutex::new(None)),
+            redo_retention_gate: CachePadded::new(RedoRetentionGate::new()),
         }
     }
 
@@ -434,6 +514,16 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn catalog_redo_retention_progress(&self) -> Option<CatalogRedoRetentionProgress> {
         self.catalog_redo_retention.lock().clone()
+    }
+
+    /// Acquire the exclusive redo-retention gate.
+    ///
+    /// Use this around code that observes or changes the durable first-retained
+    /// redo marker together with retained redo files or catalog-safe segment
+    /// progress.
+    #[inline]
+    pub(crate) async fn begin_redo_retention(&self) -> RedoRetentionLease<'_> {
+        self.redo_retention_gate.acquire().await
     }
 
     /// Returns `Err` once a fatal storage failure poisoned runtime admission.
@@ -1496,6 +1586,23 @@ pub(crate) mod tests {
                     ],
                 })
             );
+        });
+    }
+
+    #[test]
+    fn test_redo_retention_gate_serializes_leases() {
+        smol::block_on(async {
+            let gate = RedoRetentionGate::new();
+            let lease = gate.acquire().await;
+            let mut waiter = Box::pin(gate.acquire());
+
+            assert!(matches!(
+                futures::poll!(waiter.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(lease);
+            let _next_lease = waiter.await;
         });
     }
 

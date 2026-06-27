@@ -147,6 +147,29 @@ impl CatalogStorage {
         self.mtb.load_snapshot()
     }
 
+    /// Publish a durable first-retained redo marker without changing catalog table roots.
+    pub(crate) async fn publish_first_redo_log_seq(&self, first_redo_log_seq: u32) -> Result<u32> {
+        let snapshot = self.mtb.load_snapshot()?;
+        if first_redo_log_seq <= snapshot.meta.first_redo_log_seq {
+            return Ok(snapshot.meta.first_redo_log_seq);
+        }
+
+        let background_writes = self.table_fs.background_writes();
+        let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
+        let (current_first_redo_log_seq, displaced_meta_block_id) = {
+            let root = mutable.root();
+            (root.first_redo_log_seq, root.meta_block_id)
+        };
+        if first_redo_log_seq <= current_first_redo_log_seq {
+            return Ok(current_first_redo_log_seq);
+        }
+        mutable.apply_first_redo_log_seq(first_redo_log_seq)?;
+        mutable.reserve_publish_meta_block_reclaiming_displaced_meta(displaced_meta_block_id)?;
+        let (_, old_root) = mutable.commit_prepared().await?;
+        drop(old_root);
+        Ok(first_redo_log_seq)
+    }
+
     /// Bootstrap in-memory catalog rows from the latest catalog checkpoint snapshot.
     pub(crate) async fn bootstrap_from_checkpoint(
         &self,
@@ -1529,6 +1552,44 @@ pub(crate) mod tests {
                 let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
                 assert_eq!(snap.catalog_replay_start_ts, expected_replay_start_ts);
                 assert_eq!(snap.meta.next_table_id, USER_OBJ_ID_START);
+            });
+        }
+
+        #[test]
+        fn test_catalog_publish_first_redo_log_seq_preserves_checkpoint_metadata() {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let main_dir = temp_dir.path().to_path_buf();
+                let engine =
+                    open_catalog_test_engine(main_dir, Some("catalog-redo-marker-preserve")).await;
+
+                let _ = table1(&engine).await;
+                engine
+                    .catalog()
+                    .checkpoint_now(&engine.inner().trx_sys)
+                    .await
+                    .unwrap();
+
+                let storage = &engine.catalog().storage;
+                let before = storage.checkpoint_snapshot().unwrap();
+
+                let marker = storage.publish_first_redo_log_seq(3).await.unwrap();
+
+                assert_eq!(marker, 3);
+                let after = storage.checkpoint_snapshot().unwrap();
+                assert_ne!(after.meta_block_id, before.meta_block_id);
+                assert_eq!(
+                    after.catalog_replay_start_ts,
+                    before.catalog_replay_start_ts
+                );
+                assert_eq!(after.meta.next_table_id, before.meta.next_table_id);
+                assert_eq!(after.meta.table_roots, before.meta.table_roots);
+                assert_eq!(after.meta.first_redo_log_seq, 3);
+
+                let marker = storage.publish_first_redo_log_seq(2).await.unwrap();
+
+                assert_eq!(marker, 3);
+                assert_eq!(storage.checkpoint_snapshot().unwrap(), after);
             });
         }
 
