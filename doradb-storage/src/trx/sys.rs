@@ -431,13 +431,6 @@ impl TransactionSystem {
     }
 
     /// Return the latest in-memory catalog-safe redo retention progress.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "phase 3 redo truncation planning will consume cached catalog progress"
-        )
-    )]
     #[inline]
     pub(crate) fn catalog_redo_retention_progress(&self) -> Option<CatalogRedoRetentionProgress> {
         self.catalog_redo_retention.lock().clone()

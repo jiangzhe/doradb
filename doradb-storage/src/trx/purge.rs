@@ -8,8 +8,9 @@ use crate::latch::LatchFallbackMode;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
-use crate::table::Table;
+use crate::table::{Table, TableRedoReplayFloor};
 use crate::thread;
+use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
@@ -34,6 +35,8 @@ pub(crate) struct DroppedTableGcItem {
     pub(crate) table_id: TableID,
     /// Commit timestamp of the logical DROP TABLE.
     pub(crate) drop_cts: TrxID,
+    /// Replay floor copied before the table can be destroyed.
+    pub(crate) replay_floor: TableRedoReplayFloor,
     /// Runtime table handle retained until purge can destroy it.
     pub(crate) table: Arc<Table>,
 }
@@ -49,13 +52,23 @@ pub(crate) struct DroppedTableFileDeleteItem {
     pub(crate) table_id: TableID,
     /// Commit timestamp of the logical DROP TABLE.
     pub(crate) drop_cts: TrxID,
+    /// Replay floor copied before the table runtime was destroyed.
+    pub(crate) replay_floor: TableRedoReplayFloor,
 }
 
 impl DroppedTableFileDeleteItem {
     /// Create a queued dropped-table file deletion item.
     #[inline]
-    pub(crate) fn new(table_id: TableID, drop_cts: TrxID) -> Self {
-        Self { table_id, drop_cts }
+    pub(crate) fn new(
+        table_id: TableID,
+        drop_cts: TrxID,
+        replay_floor: TableRedoReplayFloor,
+    ) -> Self {
+        Self {
+            table_id,
+            drop_cts,
+            replay_floor,
+        }
     }
 }
 
@@ -122,6 +135,41 @@ impl DroppedTableQueue {
     fn push_runtime(&mut self, item: DroppedTableGcItem) {
         self.runtime.push_back(item);
     }
+
+    /// Snapshot dropped-table floors that still constrain redo truncation planning.
+    #[inline]
+    pub(crate) fn snapshot_pending_redo_floors(
+        &self,
+        catalog_replay_start_ts: TrxID,
+    ) -> Vec<PendingDroppedTableRedoFloor> {
+        let mut floors = Vec::new();
+        floors.extend(
+            self.runtime
+                .iter()
+                .filter(|item| catalog_replay_start_ts <= item.drop_cts)
+                .map(|item| {
+                    PendingDroppedTableRedoFloor::new(
+                        item.table_id,
+                        item.drop_cts,
+                        item.replay_floor,
+                    )
+                }),
+        );
+        floors.extend(
+            self.files
+                .iter()
+                .filter(|item| catalog_replay_start_ts <= item.drop_cts)
+                .map(|item| {
+                    PendingDroppedTableRedoFloor::new(
+                        item.table_id,
+                        item.drop_cts,
+                        item.replay_floor,
+                    )
+                }),
+        );
+        floors.sort_by_key(|floor| (floor.drop_cts.as_u64(), floor.table_id.as_u64()));
+        floors
+    }
 }
 
 impl TransactionSystem {
@@ -138,11 +186,13 @@ impl TransactionSystem {
         &self,
         table_id: TableID,
         drop_cts: TrxID,
+        replay_floor: TableRedoReplayFloor,
         table: Arc<Table>,
     ) {
         self.dropped_tables.lock().push_runtime(DroppedTableGcItem {
             table_id,
             drop_cts,
+            replay_floor,
             table,
         });
         self.request_dropped_table_purge();
@@ -447,6 +497,7 @@ impl TransactionSystem {
         for DroppedTableGcItem {
             table_id,
             drop_cts,
+            replay_floor,
             table,
         } in eligible
         {
@@ -456,7 +507,11 @@ impl TransactionSystem {
                     // runtime. Any destroy error is fatal to the storage runtime
                     // and is converted to poison by the caller.
                     table.destroy_dropped_runtime(guards).await?;
-                    file_deletes.push(DroppedTableFileDeleteItem::new(table_id, drop_cts));
+                    file_deletes.push(DroppedTableFileDeleteItem::new(
+                        table_id,
+                        drop_cts,
+                        replay_floor,
+                    ));
                 }
                 Err(table) => {
                     // Stale external table handles are not fatal. Keep retrying
@@ -464,6 +519,7 @@ impl TransactionSystem {
                     stale_handles.push(DroppedTableGcItem {
                         table_id,
                         drop_cts,
+                        replay_floor,
                         table,
                     })
                 }
@@ -1301,6 +1357,32 @@ mod tests {
         let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| true);
 
         assert_eq!(work, PurgeWork::full());
+    }
+
+    #[test]
+    fn test_dropped_table_file_delete_snapshot_retains_replay_floor_until_catalog_absence() {
+        let replay_floor = TableRedoReplayFloor {
+            heap_redo_start_ts: TrxID::new(7),
+            deletion_cutoff_ts: TrxID::new(11),
+        };
+        let queue = DroppedTableQueue::from_file_deletes(vec![DroppedTableFileDeleteItem::new(
+            TableID::new(100),
+            TrxID::new(30),
+            replay_floor,
+        )]);
+
+        let pending = queue.snapshot_pending_redo_floors(TrxID::new(30));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].table_id, TableID::new(100));
+        assert_eq!(pending[0].drop_cts, TrxID::new(30));
+        assert_eq!(pending[0].heap_redo_start_ts, TrxID::new(7));
+        assert_eq!(pending[0].deletion_cutoff_ts, TrxID::new(11));
+
+        assert!(
+            queue
+                .snapshot_pending_redo_floors(TrxID::new(31))
+                .is_empty()
+        );
     }
 
     #[test]

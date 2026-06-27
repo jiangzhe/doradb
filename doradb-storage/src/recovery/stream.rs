@@ -94,6 +94,26 @@ pub(crate) struct CatalogSafeRedoSegment {
     pub(crate) redo_range: Option<RedoSegmentCtsRange>,
 }
 
+/// Metadata-only retained redo segment summary for truncation planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedoRetentionSegment {
+    /// Redo file sequence number.
+    pub(crate) file_seq: u32,
+    /// Seal state and optional real redo CTS range.
+    pub(crate) state: RedoRetentionSegmentState,
+}
+
+/// Metadata-only retained redo segment state for truncation planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedoRetentionSegmentState {
+    /// File is sealed and contains no durable redo groups.
+    SealedEmpty,
+    /// File is sealed and contains durable redo groups in the advertised range.
+    SealedNonEmpty(RedoSegmentCtsRange),
+    /// File is not sealed and cannot be truncated.
+    Unsealed,
+}
+
 /// Iterator over transaction redo records inside one validated redo group.
 ///
 /// The group owns an assembled logical payload and enforces the commit
@@ -288,6 +308,17 @@ impl RedoReplayPlanner {
             .cloned()
             .map(RedoLogSegment::from_descriptor)
             .collect()
+    }
+
+    /// Build retained-segment summaries by validating only redo super-block metadata.
+    #[inline]
+    pub(crate) fn plan_retention_segments(&self) -> Result<Vec<RedoRetentionSegment>> {
+        self.load_all_segments().map(|segments| {
+            segments
+                .iter()
+                .map(retention_segment_summary)
+                .collect::<Vec<_>>()
+        })
     }
 
     #[inline]
@@ -1425,6 +1456,21 @@ fn sealed_catalog_segment_summary(segment: &RedoLogSegment) -> Option<CatalogSaf
             file_seq: segment.file_seq,
             redo_range: Some(RedoSegmentCtsRange { min_cts, max_cts }),
         })
+}
+
+#[inline]
+fn retention_segment_summary(segment: &RedoLogSegment) -> RedoRetentionSegment {
+    let state = if segment.sealed_empty() {
+        RedoRetentionSegmentState::SealedEmpty
+    } else if let Some((min_cts, max_cts)) = segment.sealed_redo_range() {
+        RedoRetentionSegmentState::SealedNonEmpty(RedoSegmentCtsRange { min_cts, max_cts })
+    } else {
+        RedoRetentionSegmentState::Unsealed
+    };
+    RedoRetentionSegment {
+        file_seq: segment.file_seq,
+        state,
+    }
 }
 
 #[inline]

@@ -1154,6 +1154,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         }
     };
 
+    let replay_floor = table.redo_replay_floor_snapshot();
     let removed = finish_drop_table_runtime_removal(&engine, table_id, &table)?;
     table_locks.fail_waiters_on_release(OperationError::TableNotFound);
     drop(table);
@@ -1163,7 +1164,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     // blocking this DDL call on best-effort cleanup work.
     engine
         .trx_sys
-        .enqueue_dropped_table(table_id, drop_cts, removed);
+        .enqueue_dropped_table(table_id, drop_cts, replay_floor, removed);
     Ok(())
 }
 
