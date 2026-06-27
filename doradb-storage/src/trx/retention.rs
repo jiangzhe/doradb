@@ -546,13 +546,22 @@ mod tests {
             &segments,
         );
 
-        let plan =
-            build_redo_truncation_plan(0, TrxID::new(10), vec![], vec![], segments, safe).unwrap();
+        let plan = build_redo_truncation_plan(
+            0,
+            TrxID::new(10),
+            vec![table_floor(100, 9, 20)],
+            vec![],
+            segments,
+            safe,
+        )
+        .unwrap();
 
         assert_eq!(
             plan.blockers,
-            vec![RedoTruncationBlocker::CatalogFloor {
-                catalog_replay_start_ts: TrxID::new(10)
+            vec![RedoTruncationBlocker::LiveTableFloor {
+                table_id: TableID::new(100),
+                heap_redo_start_ts: TrxID::new(9),
+                deletion_cutoff_ts: TrxID::new(20)
             }]
         );
     }
