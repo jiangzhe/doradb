@@ -133,7 +133,9 @@ impl CatalogStorage {
 
 /// Static definition used to bootstrap one catalog logical table.
 pub(crate) struct CatalogDefinition {
+    /// Reserved catalog table id.
     pub(crate) table_id: TableID,
+    /// Static metadata for the catalog table.
     pub(crate) metadata: TableMetadata,
 }
 

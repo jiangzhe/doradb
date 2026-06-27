@@ -1,7 +1,7 @@
 ---
 id: 000194
 title: Durable Retention Marker For Redo Log
-status: proposal
+status: implemented
 created: 2026-06-26
 github_issue: 769
 ---
@@ -166,6 +166,36 @@ Current behavior:
    - Do not document any public truncation API in this task.
 
 ## Implementation Notes
+
+- Persisted `first_redo_log_seq: u32` in the existing `catalog.mtb`
+  multi-table meta-block reserved slot without changing `CATALOG_MTB_VERSION`.
+  New catalogs default the marker to `0`, and metadata-only catalog checkpoint
+  publishes preserve the marker across reload.
+- Made redo-family discovery marker-aware. Files below the marker are filtered
+  as obsolete prefix files, while the retained suffix must start exactly at the
+  marker and remain contiguous. Marker `0` preserves the previous
+  sequence-from-zero behavior.
+- Threaded the catalog snapshot marker into startup recovery and catalog
+  checkpoint scan discovery so both paths share the same retained-suffix
+  validation contract.
+- Kept marker advancement out of production APIs. Nonzero marker setup for
+  tests is handled through narrow `#[cfg(test)]` helpers, with the direct
+  multi-table root mutation kept inside the owning `multi_table_file` test
+  module and re-exported only as a higher-level publish helper for catalog and
+  recovery tests.
+- Updated `docs/redo-log.md` to document durable marker-aware redo discovery.
+- Review/style cleanup completed: removed the lower-level
+  `set_first_redo_log_seq_for_test()` helper, kept test-only helpers out of the
+  production `CatalogStorage` API, and added missing docs for visible
+  `CatalogDefinition` fields.
+- Verified with:
+  - `cargo fmt`
+  - `cargo nextest run -p doradb-storage first_redo_log_seq`
+  - `cargo nextest run -p doradb-storage first_retained_redo`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `git diff --check`
+  - `tools/style_audit.rs --diff-base origin/main`
 
 ## Impacts
 

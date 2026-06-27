@@ -305,8 +305,8 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
     narrow catalog-storage helper or a transaction-system helper.
   - Task Doc: `docs/tasks/000194-durable-retention-marker-for-redo-log.md`
   - Task Issue: `#769`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented durable first-retained redo marker in catalog metadata and marker-aware retained-suffix discovery for startup recovery and catalog checkpoint scan. [Task Resolve Sync: docs/tasks/000194-durable-retention-marker-for-redo-log.md @ 2026-06-27]
 
 - **Phase 2: Catalog Scan Segment Progress**
   - Scope: Extend redo stream/planner outputs so catalog checkpoint scan can
