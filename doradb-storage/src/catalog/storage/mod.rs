@@ -12,8 +12,8 @@ use crate::catalog::storage::table_replay_silent_watermarks::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{
-    CatalogCheckpointApplyOutcome, CatalogCheckpointBatch, CatalogRedoEntry, CatalogTable,
-    IndexSpec, USER_OBJ_ID_START,
+    CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable, IndexSpec,
+    USER_OBJ_ID_START,
 };
 use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
@@ -252,16 +252,16 @@ impl CatalogStorage {
                 snapshot.meta.table_roots[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()],
             )
             .await?;
-        self.install_checkpointed_silent_watermarks(watermarks);
+        self.install_checkpointed_silent_watermarks(Arc::new(watermarks));
         Ok(())
     }
 
-    /// Apply one scanned catalog checkpoint batch into catalog storage.
-    pub(crate) async fn apply_checkpoint_batch(
+    /// Prepare one scanned catalog checkpoint batch for catalog root publication.
+    pub(crate) async fn prepare_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
         next_table_id: TableID,
-    ) -> Result<CatalogCheckpointApplyOutcome> {
+    ) -> Result<PreparedCatalogCheckpoint> {
         let CatalogCheckpointBatch {
             replay_start_ts,
             safe_cts,
@@ -278,7 +278,10 @@ impl CatalogStorage {
         // would skip or duplicate catalog redo.
         if current_catalog_replay_start_ts != replay_start_ts {
             if current_catalog_replay_start_ts >= next_catalog_replay_start_ts {
-                return Ok(CatalogCheckpointApplyOutcome::Noop);
+                return Ok(PreparedCatalogCheckpoint::Noop {
+                    catalog_replay_start_ts: current_catalog_replay_start_ts,
+                    checkpointed_silent_watermarks: self.checkpointed_silent_watermarks(),
+                });
             }
             return Err(invalid_catalog_payload(format!(
                 "catalog replay start mismatch: current={current_catalog_replay_start_ts}, expected={replay_start_ts}, next={next_catalog_replay_start_ts}"
@@ -289,7 +292,10 @@ impl CatalogStorage {
         // catalog replay cursor. In that case there is no new checkpoint
         // boundary to publish.
         if safe_cts < replay_start_ts {
-            return Ok(CatalogCheckpointApplyOutcome::Noop);
+            return Ok(PreparedCatalogCheckpoint::Noop {
+                catalog_replay_start_ts: current_catalog_replay_start_ts,
+                checkpointed_silent_watermarks: self.checkpointed_silent_watermarks(),
+            });
         }
         let background_writes = self.table_fs.background_writes();
 
@@ -353,26 +359,44 @@ impl CatalogStorage {
             mutable.reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)?;
         }
         let disk_pool_guard = self.disk_pool.pool_guard();
+        // Load the silent replay watermark overlay from `new_roots`, not from
+        // the currently durable cache. The prepared checkpoint has already
+        // materialized catalog-table changes into blocks, but its metadata root
+        // is not committed yet. Combined catalog checkpoint plus redo
+        // truncation uses this projected overlay to plan against the same table
+        // replay floors that will become checkpoint-durable if the prepared
+        // root is committed.
         let checkpointed_silent_watermarks = self
             .load_checkpointed_table_replay_silent_watermark_map(
                 &disk_pool_guard,
                 new_roots[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()],
             )
             .await?;
-        let (_, old_root) = mutable.commit_prepared().await?;
-        drop(old_root);
-        self.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
-        Ok(CatalogCheckpointApplyOutcome::Published {
-            catalog_replay_start_ts: next_catalog_replay_start_ts,
-        })
+        Ok(PreparedCatalogCheckpoint::Published(Box::new(
+            PreparedCatalogPublish {
+                mutable,
+                catalog_replay_start_ts: next_catalog_replay_start_ts,
+                checkpointed_silent_watermarks: Arc::new(checkpointed_silent_watermarks),
+            },
+        )))
+    }
+
+    /// Apply one scanned catalog checkpoint batch into catalog storage.
+    pub(crate) async fn apply_checkpoint_batch(
+        &self,
+        batch: CatalogCheckpointBatch,
+        next_table_id: TableID,
+    ) -> Result<CatalogCheckpointOutcome> {
+        let prepared = self.prepare_checkpoint_batch(batch, next_table_id).await?;
+        prepared.commit(self).await
     }
 
     #[inline]
     fn install_checkpointed_silent_watermarks(
         &self,
-        watermarks: FastHashMap<TableID, TableRedoReplayFloor>,
+        watermarks: Arc<FastHashMap<TableID, TableRedoReplayFloor>>,
     ) {
-        *self.checkpointed_silent_watermarks.lock() = Arc::new(watermarks);
+        *self.checkpointed_silent_watermarks.lock() = watermarks;
     }
 
     async fn load_checkpointed_table_replay_silent_watermark_map(
@@ -1096,6 +1120,93 @@ struct PendingInsertRow {
     row_id: RowID,
     vals: Vec<Val>,
     deleted: bool,
+}
+
+/// Prepared result of planning a catalog checkpoint root publication.
+pub(crate) enum PreparedCatalogCheckpoint {
+    /// A new catalog root is prepared and can still accept marker metadata.
+    Published(Box<PreparedCatalogPublish>),
+    /// No catalog checkpoint metadata needs publication.
+    Noop {
+        /// Current durable catalog replay boundary.
+        catalog_replay_start_ts: TrxID,
+        /// Current checkpoint-durable silent watermark overlay.
+        checkpointed_silent_watermarks: Arc<FastHashMap<TableID, TableRedoReplayFloor>>,
+    },
+}
+
+impl PreparedCatalogCheckpoint {
+    /// Returns whether committing this prepared result will publish a catalog root.
+    #[inline]
+    pub(crate) fn will_publish(&self) -> bool {
+        matches!(self, PreparedCatalogCheckpoint::Published(_))
+    }
+
+    /// Catalog replay boundary projected after this prepared result commits.
+    #[inline]
+    pub(crate) fn catalog_replay_start_ts(&self) -> TrxID {
+        match self {
+            PreparedCatalogCheckpoint::Published(publish) => publish.catalog_replay_start_ts,
+            PreparedCatalogCheckpoint::Noop {
+                catalog_replay_start_ts,
+                ..
+            } => *catalog_replay_start_ts,
+        }
+    }
+
+    /// Checkpoint-durable silent watermark overlay projected after commit.
+    #[inline]
+    pub(crate) fn checkpointed_silent_watermarks(
+        &self,
+    ) -> Arc<FastHashMap<TableID, TableRedoReplayFloor>> {
+        match self {
+            PreparedCatalogCheckpoint::Published(publish) => {
+                Arc::clone(&publish.checkpointed_silent_watermarks)
+            }
+            PreparedCatalogCheckpoint::Noop {
+                checkpointed_silent_watermarks,
+                ..
+            } => Arc::clone(checkpointed_silent_watermarks),
+        }
+    }
+
+    /// Add a monotonic first-retained redo marker to the prepared catalog root.
+    #[inline]
+    pub(crate) fn apply_first_redo_log_seq(&mut self, first_redo_log_seq: u32) -> Result<bool> {
+        match self {
+            PreparedCatalogCheckpoint::Published(publish) => {
+                publish.mutable.apply_first_redo_log_seq(first_redo_log_seq)
+            }
+            PreparedCatalogCheckpoint::Noop { .. } => Ok(false),
+        }
+    }
+
+    /// Commit the prepared catalog root, installing projected caches after success.
+    pub(crate) async fn commit(self, storage: &CatalogStorage) -> Result<CatalogCheckpointOutcome> {
+        match self {
+            PreparedCatalogCheckpoint::Published(publish) => {
+                let PreparedCatalogPublish {
+                    mutable,
+                    catalog_replay_start_ts,
+                    checkpointed_silent_watermarks,
+                } = *publish;
+                let (_, old_root) = mutable.commit_prepared().await?;
+                drop(old_root);
+                storage.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
+                Ok(CatalogCheckpointOutcome::Published {
+                    catalog_replay_start_ts,
+                })
+            }
+            PreparedCatalogCheckpoint::Noop { .. } => Ok(CatalogCheckpointOutcome::Noop),
+        }
+    }
+}
+
+/// Mutable catalog root prepared for a checkpoint publication.
+pub(crate) struct PreparedCatalogPublish {
+    mutable: MutableMultiTableFile,
+    catalog_replay_start_ts: TrxID,
+    checkpointed_silent_watermarks: Arc<FastHashMap<TableID, TableRedoReplayFloor>>,
 }
 
 #[inline]
