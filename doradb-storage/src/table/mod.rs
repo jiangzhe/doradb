@@ -606,14 +606,17 @@ impl Table {
         Ok(())
     }
 
-    async fn build_lwc_blocks(
+    async fn build_lwc_blocks<C>(
         &self,
         metadata: &TableMetadata,
         guards: &PoolGuards,
         cutoff_ts: TrxID,
         frozen_pages: &[FrozenPage],
-        mut collect_visible_row: Option<VisibleRowCollector<'_>>,
-    ) -> Result<Vec<LwcBlockPersist>> {
+        mut collect_visible_row: Option<C>,
+    ) -> Result<Vec<LwcBlockPersist>>
+    where
+        C: FnMut(&RowPage, usize, RowID) -> Result<()>,
+    {
         #[cfg(test)]
         {
             if test_hooks::test_force_lwc_build_error_enabled() {
@@ -1143,8 +1146,6 @@ struct FrozenPage {
     start_row_id: RowID,
     end_row_id: RowID,
 }
-
-type VisibleRowCollector<'a> = &'a mut dyn FnMut(&RowPage, usize, RowID) -> Result<()>;
 
 /// Stages newly built dual-tree secondary indexes until the caller publishes them.
 struct SecondaryIndexScopedBuilder {
@@ -2420,7 +2421,7 @@ pub(crate) mod tests {
         let mut last_delay = None;
         for _ in 0..50 {
             match session.checkpoint_table(table_id).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts } => {
+                CheckpointOutcome::Published { checkpoint_ts, .. } => {
                     return checkpoint_ts;
                 }
                 CheckpointOutcome::Delayed { reason } => {

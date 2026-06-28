@@ -175,8 +175,23 @@ persistent delete metadata and the companion secondary-index `DiskTree`
 deletes. Storage compaction, vacuum, or page reclamation must not make those
 row values undecodable before that publication.
 
-If no delete bitmap changes are selected, checkpoint can still publish a
-metadata-only root to advance `deletion_cutoff_ts` to the checkpoint cutoff.
+If no table-file state changes are selected, a heartbeat checkpoint does not
+publish a metadata-only user-table root only to advance replay bounds. Instead,
+it writes a row in `catalog.table_replay_silent_watermarks` through normal
+catalog DML plus `DDLRedo::TableReplaySilentWatermark`. That row becomes
+recovery and truncation proof only after a catalog checkpoint folds it into
+`catalog.mtb`. Effective table replay bounds are computed fieldwise:
+
+```text
+effective_heap_redo_start_ts =
+    max(table_root.heap_redo_start_ts, checkpointed_silent.heap_redo_start_ts)
+effective_deletion_cutoff_ts =
+    max(table_root.deletion_cutoff_ts, checkpointed_silent.deletion_cutoff_ts)
+```
+
+When no checkpointed silent row exists, the table-root bounds are used
+unchanged. If a checkpoint also publishes real table-file state, the replay
+bounds remain part of the user-table root publication.
 
 Before any user-table checkpoint publication, the active table-file root's
 runtime effective timestamp must be older than the GC horizon:
@@ -223,9 +238,10 @@ index prefix without extra machinery.
 
 ### 5.1 Coarse Replay Floor
 
-Recovery computes a coarse replay floor from:
+Recovery computes a coarse replay floor from checkpointed catalog state,
+including any checkpointed silent watermark overlays:
 
-$$ W = \min \left( \text{catalog\_replay\_start\_ts}, \min_{\forall T \in \text{Loaded User Tables}}(T.\text{heap\_redo\_start\_ts}), \min_{\forall T \in \text{Loaded User Tables}}(T.\text{deletion\_cutoff\_ts}) \right) $$
+$$ W = \min \left( \text{catalog\_replay\_start\_ts}, \min_{\forall T \in \text{Loaded User Tables}}(T.\text{effective\_heap\_redo\_start\_ts}), \min_{\forall T \in \text{Loaded User Tables}}(T.\text{effective\_deletion\_cutoff\_ts}) \right) $$
 
 This only skips redo that is definitely older than every loaded replay
 boundary. Finer replay rules are still applied afterward.
@@ -235,9 +251,11 @@ boundary. Finer replay rules are still applied afterward.
 On restart:
 
 1. load checkpointed catalog state from `catalog.mtb`
-2. reload checkpointed user tables
-3. load each table's persistent LWC/block-index state
-4. load each table's persistent secondary-index `DiskTree` roots from the same
+2. rebuild the checkpoint-durable silent watermark overlay cache from
+   `catalog.table_replay_silent_watermarks`
+3. reload checkpointed user tables
+4. load each table's persistent LWC/block-index state
+5. load each table's persistent secondary-index `DiskTree` roots from the same
    table checkpoint root
 
 At this point the engine has all checkpointed cold data, cold delete state, and
@@ -271,13 +289,13 @@ For each redo record after the coarse replay floor:
   - replay if `CTS >= catalog_replay_start_ts`
 - Heap / hot RowStore:
   - replay if the row belongs to hot RowStore and
-    `CTS >= Heap_Redo_Start_TS`
+    `CTS >= effective Heap_Redo_Start_TS`
   - row replay reconstructs hot RowStore pages only; after log replay,
     `recover_indexes_and_refresh_pages` scans those pages to rebuild hot
     secondary-index `MemIndex` state
 - Cold-row deletions:
   - replay if `row_id < pivot_row_id` and
-    `cts >= deletion_cutoff_ts`
+    `cts >= effective deletion_cutoff_ts`
   - insert those deletes into the in-memory deletion buffer
 
 There is no extra per-index replay predicate.
@@ -367,8 +385,10 @@ delete item queued for retry.
 
 The checkpoint/recovery design is built around three ideas:
 
-1. `heap_redo_start_ts` remains the hot-heap recovery boundary.
-2. `deletion_cutoff_ts` remains the cold-delete recovery boundary.
+1. `heap_redo_start_ts` remains the hot-heap recovery boundary, with
+   checkpointed catalog silent-watermark rows acting as fieldwise overlays.
+2. `deletion_cutoff_ts` remains the cold-delete recovery boundary, with the
+   same checkpointed overlay rule.
 3. Secondary-index `DiskTree` state is published only as a companion of table
    data/deletion checkpoint, so there is no `index_rec_cts`.
 

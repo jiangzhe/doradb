@@ -2154,6 +2154,7 @@ fn is_catalog_metadata_ddl(ddl: Option<&DDLRedo>) -> bool {
                 | DDLRedo::DropTable(_)
                 | DDLRedo::CreateIndex { .. }
                 | DDLRedo::DropIndex { .. }
+                | DDLRedo::TableReplaySilentWatermark { .. }
         )
     )
 }

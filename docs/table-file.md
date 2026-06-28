@@ -175,9 +175,9 @@ publication.
 
 ## 7. Checkpoint Publication
 
-There is one atomic publication mechanism. A `checkpoint()` run may publish
-new data, cold-delete state, metadata-only replay-boundary advancement, or a
-combination of those changes:
+There is one atomic publication mechanism for table-file state. A
+`checkpoint()` run may publish new data, cold-delete state, secondary-index
+state, or a combination of those changes:
 
 1. data checkpoint work
 2. deletion checkpoint work
@@ -209,9 +209,14 @@ available until this publication succeeds. The delete metadata and companion
 observes a checkpoint root where the durable delete bitmap has advanced without
 the matching secondary-index delete publication.
 
-If no cold-delete payload changes are selected, checkpoint can still publish a
-metadata-only root that advances `deletion_cutoff_ts` to the checkpoint
-`cutoff_ts`.
+If no table-file state changes are selected and only `heap_redo_start_ts` or
+`deletion_cutoff_ts` would advance, checkpoint does not publish a user-table
+root. It writes a row in `catalog.table_replay_silent_watermarks` instead. That
+row is a replay-bound overlay only after catalog checkpoint persists it in
+`catalog.mtb`; until then, recovery and redo truncation continue to use the
+table-root bounds. When real data, delete payload, secondary-index, metadata,
+or allocation-reachability state changes, the replay bounds remain part of the
+normal table-root publication.
 
 ### 7.3 Checkpoint Readiness And Reclamation
 
@@ -278,8 +283,8 @@ On restart, the table file supplies:
 
 Redo recovery then rebuilds only the missing hot state:
 
-- hot RowStore pages from `heap_redo_start_ts`
-- post-checkpoint cold deletes from `deletion_cutoff_ts`
+- hot RowStore pages from effective `heap_redo_start_ts`
+- post-checkpoint cold deletes from effective `deletion_cutoff_ts`
 - hot secondary-index `MemTree` state from normal row redo
 
 ## 9. Summary

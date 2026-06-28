@@ -54,3 +54,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000199-catalog-silent-table-replay-watermarks.md
+- Closed By: backlog close
+- Reference: docs/tasks/000199-catalog-silent-table-replay-watermarks.md
+- Closed At: 2026-06-28

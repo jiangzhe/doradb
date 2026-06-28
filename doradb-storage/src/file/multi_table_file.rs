@@ -40,9 +40,9 @@ pub(crate) use crate::file::CATALOG_MTB_FILE_ID;
 pub(crate) use tests::publish_first_redo_log_seq_for_test;
 
 /// On-disk format version of `catalog.mtb`.
-pub(crate) const CATALOG_MTB_VERSION: u64 = 3;
+pub(crate) const CATALOG_MTB_VERSION: u64 = 4;
 /// Reserved number of catalog logical-table root descriptors.
-pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 4;
+pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 5;
 /// Initial sparse-file size for `catalog.mtb`.
 pub(crate) const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 

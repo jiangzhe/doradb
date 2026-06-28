@@ -32,7 +32,7 @@ use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::recovery::stream::PlannedRedoRecovery;
 use crate::row::RowPage;
-use crate::table::Table;
+use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::MIN_SNAPSHOT_TS;
 use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
@@ -269,13 +269,28 @@ impl<'a> RecoveryCoordinator<'a> {
                         .attach(format!("track loaded table runtime: table_id={table_id}")),
                 )
             })?;
-        // `recovery_bootstrap_unchecked`: recovery records replay floors from
-        // the table root loaded during restart, before normal transactions run.
+        // Recovery seeds per-table replay bounds before normal transactions
+        // run. The loaded table root supplies the physical root timestamp and
+        // the root-local replay floors, but checkpointed silent watermark rows
+        // may prove a stronger durable replay floor without a newer table root.
+        // Use the catalog helper so the timeline records the fieldwise maximum
+        // of root floors and checkpointed silent overlays; uncheckpointed
+        // watermark rows replayed later must not affect these bounds.
         let active_root = table.file().active_root_unchecked();
+        let effective_floor = self
+            .resources
+            .catalog
+            .effective_user_table_redo_replay_floor(
+                table_id,
+                TableRedoReplayFloor {
+                    heap_redo_start_ts: active_root.heap_redo_start_ts,
+                    deletion_cutoff_ts: active_root.deletion_cutoff_ts,
+                },
+            );
         let state = TableReplayBounds {
             root_ts: active_root.root_ts,
-            heap_redo_start_ts: active_root.heap_redo_start_ts,
-            deletion_cutoff_ts: active_root.deletion_cutoff_ts,
+            heap_redo_start_ts: effective_floor.heap_redo_start_ts,
+            deletion_cutoff_ts: effective_floor.deletion_cutoff_ts,
         };
         let old = self.timeline.table_bounds.insert(table_id, state);
         if old.is_some() {
@@ -532,6 +547,10 @@ impl<'a> RecoveryCoordinator<'a> {
             DDLRedo::DataCheckpoint { table_id, .. } => {
                 self.replay_data_checkpoint_ddl(table_id, dml, cts).await?
             }
+            DDLRedo::TableReplaySilentWatermark { table_id } => {
+                self.replay_table_replay_silent_watermark_ddl(table_id, dml, cts)
+                    .await?
+            }
         }
         Ok(())
     }
@@ -603,7 +622,10 @@ impl<'a> RecoveryCoordinator<'a> {
                         .attach(format!("replay drop table: table_id={table_id}")),
                 )
             })?;
-        let replay_floor = removed.redo_replay_floor_snapshot();
+        let replay_floor = self
+            .resources
+            .catalog
+            .effective_user_table_redo_replay_floor(table_id, removed.redo_replay_floor_snapshot());
         let table = Arc::try_unwrap(removed).map_err(|table| {
             Error::from(Report::new(OperationError::TableNotFound).attach(format!(
                 "replay drop table found stale runtime handle: table_id={table_id}, strong_count={}",
@@ -769,6 +791,23 @@ impl<'a> RecoveryCoordinator<'a> {
                 )
             })?;
         Ok(())
+    }
+
+    async fn replay_table_replay_silent_watermark_ddl(
+        &mut self,
+        table_id: TableID,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<()> {
+        if !self.should_replay_catalog(cts) {
+            return Ok(());
+        }
+        if self.classify_user_table_redo(table_id, cts, "replay silent table watermark")?
+            == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+        {
+            return Ok(());
+        }
+        self.replay_catalog_modifications(dml).await
     }
 
     fn classify_index_ddl_root(
@@ -1038,7 +1077,7 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::serde::Ser;
     use crate::session::{Session, tests::SessionTestExt};
-    use crate::table::{CheckpointOutcome, DeleteMarker, Table};
+    use crate::table::{CheckpointOutcome, DeleteMarker, Table, TableRedoReplayFloor};
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use crate::value::ValKind;
@@ -1377,7 +1416,7 @@ mod tests {
         let mut last_delay = None;
         for _ in 0..50 {
             match session.checkpoint_table(table.table_id()).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts } => return checkpoint_ts,
+                CheckpointOutcome::Published { checkpoint_ts, .. } => return checkpoint_ts,
                 CheckpointOutcome::Delayed { reason } => {
                     last_delay = Some(reason);
                     Timer::after(Duration::from_millis(20)).await;
@@ -2581,6 +2620,120 @@ mod tests {
 
             assert!(engine.catalog().get_table(table_id).await.is_some());
             drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_recovery_uses_silent_watermark_only_after_catalog_checkpoint() {
+        async fn prepare_silent_watermark(
+            main_dir: PathBuf,
+            log_file_stem: &'static str,
+            checkpoint_catalog: bool,
+        ) -> (TableID, TableRedoReplayFloor, TableRedoReplayFloor) {
+            let engine = lightweight_recovery_engine_config(main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let root_floor = table.redo_replay_floor_snapshot();
+            let mut session = engine.new_session().unwrap();
+            checkpoint_published(&table, &mut session).await;
+            let watermark = engine
+                .catalog()
+                .storage
+                .table_replay_silent_watermarks()
+                .find_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                .await
+                .unwrap()
+                .expect("silent checkpoint should write catalog row");
+            let watermark_floor = TableRedoReplayFloor {
+                heap_redo_start_ts: watermark.heap_redo_start_ts,
+                deletion_cutoff_ts: watermark.deletion_cutoff_ts,
+            };
+            assert!(watermark_floor.heap_redo_start_ts > root_floor.heap_redo_start_ts);
+            assert!(watermark_floor.deletion_cutoff_ts > root_floor.deletion_cutoff_ts);
+            if checkpoint_catalog {
+                session.checkpoint_catalog().await.unwrap();
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .checkpointed_silent_watermarks()
+                        .get(&table_id)
+                        .copied(),
+                    Some(watermark_floor)
+                );
+            }
+            drop(table);
+            drop(session);
+            drop(engine);
+            (table_id, root_floor, watermark_floor)
+        }
+
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let unchecked_dir = temp_dir.path().join("unchecked");
+            fs::create_dir_all(&unchecked_dir).unwrap();
+            let checked_dir = temp_dir.path().join("checked");
+            fs::create_dir_all(&checked_dir).unwrap();
+
+            let (table_id, root_floor, watermark_floor) =
+                prepare_silent_watermark(unchecked_dir.clone(), "recover-silent-unchecked", false)
+                    .await;
+            let recovered =
+                lightweight_recovery_engine_config(unchecked_dir, "recover-silent-unchecked")
+                    .build()
+                    .await
+                    .unwrap();
+            let snapshot = recovered.catalog().storage.checkpoint_snapshot().unwrap();
+            let (live_before_catalog_checkpoint, _) = recovered
+                .catalog()
+                .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
+            assert_eq!(live_before_catalog_checkpoint.len(), 1);
+            assert_eq!(live_before_catalog_checkpoint[0].floor, root_floor);
+            assert!(
+                recovered
+                    .catalog()
+                    .storage
+                    .checkpointed_silent_watermarks()
+                    .get(&table_id)
+                    .is_none()
+            );
+            let session = recovered.new_session().unwrap();
+            let replayed_watermark = recovered
+                .catalog()
+                .storage
+                .table_replay_silent_watermarks()
+                .find_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                .await
+                .unwrap()
+                .expect("recovery should replay uncheckpointed watermark row");
+            assert_eq!(
+                replayed_watermark.heap_redo_start_ts,
+                watermark_floor.heap_redo_start_ts
+            );
+            assert_eq!(
+                replayed_watermark.deletion_cutoff_ts,
+                watermark_floor.deletion_cutoff_ts
+            );
+            drop(session);
+            drop(recovered);
+
+            let (_table_id, _, expected_floor) =
+                prepare_silent_watermark(checked_dir.clone(), "recover-silent-checked", true).await;
+            let recovered =
+                lightweight_recovery_engine_config(checked_dir, "recover-silent-checked")
+                    .build()
+                    .await
+                    .unwrap();
+            let snapshot = recovered.catalog().storage.checkpoint_snapshot().unwrap();
+            let (live_after_catalog_checkpoint, _) = recovered
+                .catalog()
+                .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
+            assert_eq!(live_after_catalog_checkpoint.len(), 1);
+            assert_eq!(live_after_catalog_checkpoint[0].floor, expected_floor);
+            drop(recovered);
         })
     }
 
