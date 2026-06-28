@@ -53,7 +53,7 @@ Each slot stores:
 Commit protocol:
 
 1. write the inactive slot with the new `MetaBlock` pointer
-2. fsync the page
+2. submit `fsync` through the shared storage backend and wait for completion
 3. once durable, that slot is the active root
 
 ## 4. MetaBlock

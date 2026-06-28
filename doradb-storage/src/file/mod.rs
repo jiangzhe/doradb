@@ -25,10 +25,7 @@ use crate::io::{
     StdIoResult, align_to_sector_size,
 };
 use error_stack::Report;
-use libc::{
-    O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
-    stat,
-};
+use libc::{O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fstat, ftruncate, open, stat};
 use parking_lot::RawMutex;
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use scopeguard::defer;
@@ -233,12 +230,6 @@ impl SparseFile {
         }
     }
 
-    /// Returns the file syncer.
-    #[inline]
-    pub(crate) fn syncer(&self) -> FileSyncer {
-        FileSyncer::from_borrowed_fd(self.fd)
-    }
-
     /// Grow the file to given size.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
@@ -368,9 +359,57 @@ impl IOSubmission for PreparedWriteSubmission {
     }
 }
 
+/// Worker-owned table-file sync request before the backend queue admits it.
+///
+/// The request keeps the file owner alive while it is deferred or queued on the
+/// shared background-write lane. `TableFsStateMachine` materializes the backend
+/// `Operation::fsync` only when this request is admitted to the IO queue.
+pub(crate) struct SyncSubmission {
+    file: Arc<SparseFile>,
+    completion: Arc<Completion<()>>,
+}
+
+impl SyncSubmission {
+    #[inline]
+    fn prepare_fsync(file: Arc<SparseFile>) -> (Self, Arc<Completion<()>>) {
+        let completion = Arc::new(Completion::new());
+        let fio = SyncSubmission {
+            file,
+            completion: Arc::clone(&completion),
+        };
+        (fio, completion)
+    }
+
+    #[inline]
+    fn into_prepared(self) -> PreparedSyncSubmission {
+        let SyncSubmission { file, completion } = self;
+        let operation = Operation::fsync(file.as_raw_fd());
+        PreparedSyncSubmission {
+            _file: file,
+            operation,
+            completion,
+        }
+    }
+}
+
+/// Backend-prepared sync submission retained until completion.
+pub(crate) struct PreparedSyncSubmission {
+    _file: Arc<SparseFile>,
+    operation: Operation,
+    completion: Arc<Completion<()>>,
+}
+
+impl IOSubmission for PreparedSyncSubmission {
+    #[inline]
+    fn operation(&mut self) -> &mut Operation {
+        &mut self.operation
+    }
+}
+
 /// Submission variants handled by the shared table-file IO worker.
 pub(crate) enum TableFsSubmission {
     Write(PreparedWriteSubmission),
+    Sync(PreparedSyncSubmission),
     Read(ReadSubmission),
 }
 
@@ -379,6 +418,7 @@ impl IOSubmission for TableFsSubmission {
     fn operation(&mut self) -> &mut Operation {
         match self {
             TableFsSubmission::Write(sub) => sub.operation(),
+            TableFsSubmission::Sync(sub) => sub.operation(),
             TableFsSubmission::Read(sub) => sub.operation(),
         }
     }
@@ -424,6 +464,21 @@ impl TableFsStateMachine {
         None
     }
 
+    /// Queue or defer one table-sync request depending on available backend capacity.
+    #[inline]
+    pub(crate) fn prepare_sync_request(
+        &mut self,
+        req: SyncSubmission,
+        max_new: usize,
+        queue: &mut IOQueue<TableFsSubmission>,
+    ) -> Option<SyncSubmission> {
+        if max_new == 0 {
+            return Some(req);
+        }
+        queue.push(TableFsSubmission::Sync(req.into_prepared()));
+        None
+    }
+
     /// Records side effects when one table-file submission is accepted by the backend.
     #[inline]
     pub(crate) fn on_submit(&mut self, sub: &TableFsSubmission) {
@@ -431,6 +486,7 @@ impl TableFsStateMachine {
             TableFsSubmission::Write(sub) => {
                 let _ = sub.key;
             }
+            TableFsSubmission::Sync(_) => {}
             TableFsSubmission::Read(sub) => sub.record_running(),
         }
     }
@@ -476,63 +532,26 @@ impl TableFsStateMachine {
                 }
                 IOKind::Write
             }
+            TableFsSubmission::Sync(sub) => {
+                match res {
+                    Ok(0) => sub.completion.complete(Ok(())),
+                    Ok(result) => {
+                        sub.completion
+                            .complete(Err(CompletionErrorKind::report_unexpected_result(
+                                result,
+                                0,
+                                "complete table file fsync",
+                            )))
+                    }
+                    Err(err) => sub.completion.complete(Err(CompletionErrorKind::report_io(
+                        err,
+                        "complete table file fsync",
+                    ))),
+                }
+                IOKind::Fsync
+            }
             TableFsSubmission::Read(sub) => sub.complete(res),
         }
-    }
-}
-
-/// Sync operation performed through a borrowed file descriptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileSyncKind {
-    Fsync,
-    Fdatasync,
-}
-
-/// Borrowed file descriptor wrapper for fsync() and fdatasync().
-///
-/// `FileSyncer` does not own or close the descriptor. The caller must keep the
-/// underlying file descriptor open until the sync operation returns.
-pub(crate) struct FileSyncer(RawFd);
-
-impl FileSyncer {
-    /// Builds a syncer for a borrowed file descriptor.
-    ///
-    /// The returned value does not take ownership of `fd`; it is only valid
-    /// while the caller keeps that descriptor open.
-    #[inline]
-    pub(crate) fn from_borrowed_fd(fd: RawFd) -> Self {
-        Self(fd)
-    }
-
-    /// Flush file contents and metadata using `fsync`.
-    #[inline]
-    pub(crate) fn fsync(&self) -> Result<()> {
-        self.sync(FileSyncKind::Fsync)
-    }
-
-    /// Flush file contents using `fdatasync`.
-    #[inline]
-    #[expect(dead_code, reason = "reserved file sync mode")]
-    pub(crate) fn fdatasync(&self) -> Result<()> {
-        self.sync(FileSyncKind::Fdatasync)
-    }
-
-    #[inline]
-    fn sync(&self, kind: FileSyncKind) -> Result<()> {
-        // SAFETY: `self.0` is a live borrowed file descriptor for this sync
-        // call, and the libc sync calls do not retain borrowed memory beyond
-        // the syscall.
-        let ret = unsafe {
-            match kind {
-                FileSyncKind::Fsync => fsync(self.0),
-                FileSyncKind::Fdatasync => fdatasync(self.0),
-            }
-        };
-        if ret == 0 {
-            return Ok(());
-        }
-        debug_assert!(ret == -1);
-        Err(IoError::report(StdIoError::last_os_error()).into())
     }
 }
 
@@ -644,6 +663,31 @@ pub(crate) async fn write_direct_with_lease(
     })
 }
 
+/// Flush one sparse file with a backend-submitted fsync request.
+#[inline]
+pub(crate) async fn fsync_direct(
+    file: Arc<SparseFile>,
+    background_writes: &IOClient<BackgroundWriteRequest>,
+) -> Result<()> {
+    let file_id = file.file_id();
+    let (submission, completion) = SyncSubmission::prepare_fsync(file);
+    if let Err(err) = background_writes
+        .send_async(BackgroundWriteRequest::TableSync(submission))
+        .await
+    {
+        let BackgroundWriteRequest::TableSync(_submission) = err.into_inner() else {
+            unreachable!("fsync_direct received unexpected background-write send error");
+        };
+        return Err(IoError::report_send("send background table fsync request").into());
+    }
+    completion.wait_result().await.map_err(|report| {
+        Error::from_completion_report(
+            report,
+            format!("wait for table file background fsync: file_id={file_id}"),
+        )
+    })
+}
+
 #[inline]
 fn c_string_from_path(file_path: &str) -> Result<CString> {
     CString::new(file_path).map_err(|_| {
@@ -716,6 +760,12 @@ mod tests {
             DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
             None,
         )
+    }
+
+    fn prepare_table_sync_submission(
+        table_file: &Arc<TableFile>,
+    ) -> (SyncSubmission, Arc<Completion<()>>) {
+        SyncSubmission::prepare_fsync(Arc::clone(table_file.sparse_file()))
     }
 
     #[test]
@@ -1030,6 +1080,119 @@ mod tests {
                     && format!("{err:?}").contains("propagate from other threads")
                     && format!("{err:?}").contains("wait for table file background write")
             }));
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_table_fs_sync_submission_prepares_fsync_and_retains_file() {
+        smol::block_on(async {
+            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+            let sparse_file = Arc::clone(table_file.sparse_file());
+            let fd = sparse_file.as_raw_fd();
+            let initial_count = Arc::strong_count(&sparse_file);
+            let mut state_machine = TableFsStateMachine::new();
+            let (submission, waiter) = prepare_table_sync_submission(&table_file);
+            let mut queue = IOQueue::with_capacity(1);
+            assert!(
+                state_machine
+                    .prepare_sync_request(submission, 1, &mut queue)
+                    .is_none()
+            );
+            assert_eq!(Arc::strong_count(&sparse_file), initial_count + 1);
+
+            let Some(TableFsSubmission::Sync(mut submission)) = queue.pop_front() else {
+                panic!("expected one prepared table fsync submission");
+            };
+            assert_eq!(submission.operation.kind(), IOKind::Fsync);
+            assert_eq!(submission.operation.fd(), fd);
+            assert_eq!(submission.operation.offset(), 0);
+            assert_eq!(submission.operation.len(), 0);
+            assert!(submission.operation.buf().is_none());
+            assert!(submission.operation.take_buf().is_none());
+            assert_eq!(submission._file.as_raw_fd(), fd);
+
+            let kind = state_machine.on_complete(TableFsSubmission::Sync(submission), Ok(0));
+
+            assert_eq!(kind, IOKind::Fsync);
+            assert!(waiter.wait_result().await.is_ok());
+            assert_eq!(Arc::strong_count(&sparse_file), initial_count);
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_table_fs_sync_completion_rejects_nonzero_success() {
+        smol::block_on(async {
+            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+            let mut state_machine = TableFsStateMachine::new();
+            let (submission, waiter) = prepare_table_sync_submission(&table_file);
+            let mut queue = IOQueue::with_capacity(1);
+            assert!(
+                state_machine
+                    .prepare_sync_request(submission, 1, &mut queue)
+                    .is_none()
+            );
+
+            let Some(TableFsSubmission::Sync(submission)) = queue.pop_front() else {
+                panic!("expected one prepared table fsync submission");
+            };
+            let kind = state_machine.on_complete(TableFsSubmission::Sync(submission), Ok(1));
+
+            assert_eq!(kind, IOKind::Fsync);
+            let wait_result = waiter.wait_result().await.map_err(|report| {
+                Error::from_completion_report(report, "wait for table file background fsync")
+            });
+            let err = wait_result.expect_err("nonzero fsync completion should fail");
+            assert_eq!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Io(IoErrorKind::Other))
+            );
+            assert!(
+                format!("{err:?}").contains("wait for table file background fsync"),
+                "unexpected error: {err:?}"
+            );
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_table_fs_sync_completion_reports_io_failure() {
+        smol::block_on(async {
+            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+            let mut state_machine = TableFsStateMachine::new();
+            let (submission, waiter) = prepare_table_sync_submission(&table_file);
+            let mut queue = IOQueue::with_capacity(1);
+            assert!(
+                state_machine
+                    .prepare_sync_request(submission, 1, &mut queue)
+                    .is_none()
+            );
+
+            let Some(TableFsSubmission::Sync(submission)) = queue.pop_front() else {
+                panic!("expected one prepared table fsync submission");
+            };
+            let kind = state_machine.on_complete(
+                TableFsSubmission::Sync(submission),
+                Err(StdIoError::from_raw_os_error(libc::EIO)),
+            );
+
+            assert_eq!(kind, IOKind::Fsync);
+            let wait_result = waiter.wait_result().await.map_err(|report| {
+                Error::from_completion_report(report, "wait for table file background fsync")
+            });
+            let err = wait_result.expect_err("backend fsync completion should fail");
+            assert!(
+                matches!(err.completion_error(), Some(CompletionErrorKind::Io(_))),
+                "unexpected error: {err:?}"
+            );
+            assert!(
+                format!("{err:?}").contains("wait for table file background fsync"),
+                "unexpected error: {err:?}"
+            );
             drop(table_file);
             drop(fs);
         });

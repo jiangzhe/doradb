@@ -23,9 +23,10 @@ storage-adjacent worker plus one redo driver owned by the transaction log
 thread:
 
 - one shared `StorageIOWorker` for table-file reads/writes, readonly-cache miss
-  loads, and `mem_pool` / `index_pool` page IO; and
+  loads, table/catalog CoW root fsyncs, and `mem_pool` / `index_pool` page IO;
+  and
 - one scheduler-owned redo backend driver running inside `Log-Thread` for
-  transaction-log writes.
+  transaction-log writes and redo durability syncs.
 
 The shared storage worker exposes three logical lanes:
 
@@ -90,13 +91,29 @@ Exactly one backend feature must be enabled at compile time.
 
 The current storage-engine integration points are:
 
-- table-file and catalog-file reads/writes in `src/file/`;
+- table-file and catalog-file reads/writes plus CoW root fsyncs in `src/file/`;
 - readonly-cache miss loads in `src/buffer/readonly.rs`;
 - evictable-pool page reads and writeback in `src/buffer/evict.rs`; and
 - redo-log writes and syncs in `src/log/`.
 
-Table-file and buffer-pool traffic share one storage service, while redo keeps
-its own scheduling and durability policy inside `Log-Thread`.
+Table-file, catalog-file, and buffer-pool traffic share one storage service.
+Redo keeps its own scheduling and durability policy inside `Log-Thread`.
+
+## Table And Catalog Root Publication
+
+Table files and `catalog.mtb` publish CoW roots through the shared storage
+worker:
+
+- the new meta block is written on the background-write lane;
+- the inactive super-block slot is written on the same lane;
+- an owner-retaining `Operation::fsync(...)` is submitted through the shared
+  backend; and
+- the in-memory active root is swapped only after that fsync completion
+  succeeds.
+
+The sync request retains the owning `SparseFile` until the backend completion
+is observed, so the raw fd used by the backend operation cannot outlive its
+file owner.
 
 ## Redo Path
 

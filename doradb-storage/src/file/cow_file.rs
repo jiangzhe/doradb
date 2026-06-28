@@ -4,7 +4,7 @@ use crate::buffer::{ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier}
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
-use crate::file::{BlockKey, SparseFile, write_direct, write_direct_with_lease};
+use crate::file::{BlockKey, SparseFile, fsync_direct, write_direct, write_direct_with_lease};
 use crate::id::{BlockID, FileID, TrxID};
 use crate::io::{DirectBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
@@ -667,7 +667,7 @@ impl<M> CowFile<M> {
         self.write_at_offset(background_writes, offset, super_buf)
             .await?;
 
-        self.fsync()?;
+        fsync_direct(Arc::clone(&self.file), background_writes).await?;
         Ok(self.swap_active_root(new_root.root))
     }
 
@@ -688,12 +688,6 @@ impl<M> CowFile<M> {
                 .into());
         }
         Ok(())
-    }
-
-    /// Force all pending writes to disk.
-    #[inline]
-    pub(crate) fn fsync(&self) -> Result<()> {
-        self.file.syncer().fsync()
     }
 
     /// Delete underlying file by fd path.
