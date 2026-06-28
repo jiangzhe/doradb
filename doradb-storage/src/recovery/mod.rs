@@ -21,7 +21,7 @@ use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{
     CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout, classify_index_ddl_root,
-    is_catalog_obj_id, is_user_obj_id,
+    is_catalog_table, is_user_table,
 };
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
@@ -34,7 +34,6 @@ use crate::recovery::stream::PlannedRedoRecovery;
 use crate::row::RowPage;
 use crate::table::Table;
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::trx::purge::DroppedTableFileDeleteItem;
 use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
 use error_stack::Report;
@@ -67,8 +66,6 @@ pub(crate) struct RecoveryCoordinator<'a> {
     /// Hot row pages touched by redo replay, grouped by table for post-replay
     /// index rebuild and undo-map refresh.
     recovered_tables: FastHashMap<TableID, BTreeSet<PageID>>,
-    /// Dropped user-table files whose runtime state was destroyed during replay.
-    dropped_table_file_deletes: Vec<DroppedTableFileDeleteItem>,
 }
 
 impl<'a> RecoveryCoordinator<'a> {
@@ -88,15 +85,12 @@ impl<'a> RecoveryCoordinator<'a> {
             timeline: RecoveryTimeline::new(MIN_SNAPSHOT_TS),
             pending_index_ddl_reconciliations: FastHashSet::default(),
             recovered_tables: FastHashMap::default(),
-            dropped_table_file_deletes: Vec::new(),
         }
     }
 
     /// Replay redo, rebuild indexes, and return recovery outcomes plus redo startup.
     #[inline]
-    pub(crate) async fn recover_all(
-        mut self,
-    ) -> Result<(TrxID, Vec<DroppedTableFileDeleteItem>, RedoLogFinalizer)> {
+    pub(crate) async fn recover_all(mut self) -> Result<(TrxID, RedoLogFinalizer)> {
         self.bootstrap_checkpointed_user_tables().await?;
         let PlannedRedoRecovery {
             skipped_max_recovered_cts,
@@ -126,11 +120,7 @@ impl<'a> RecoveryCoordinator<'a> {
         //    active file only after replay has succeeded.
         self.repair_redo_and_prepare_startup(repair_policy, unsealed_terminals)?;
 
-        Ok((
-            self.timeline.max_recovered_cts,
-            self.dropped_table_file_deletes,
-            self.finalizer,
-        ))
+        Ok((self.timeline.max_recovered_cts, self.finalizer))
     }
 
     #[inline]
@@ -197,7 +187,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .await?;
         let checkpointed_user_table_ids = checkpointed_tables
             .iter()
-            .filter(|table| is_user_obj_id(table.table_id))
+            .filter(|table| is_user_table(table.table_id))
             .map(|table| table.table_id)
             .collect::<FastHashSet<_>>();
         self.resources
@@ -208,7 +198,7 @@ impl<'a> RecoveryCoordinator<'a> {
             )?;
 
         for table in checkpointed_tables {
-            if !is_user_obj_id(table.table_id) {
+            if !is_user_table(table.table_id) {
                 continue;
             }
             // Checkpoint bootstrap can see table-file metadata that already includes
@@ -457,9 +447,10 @@ impl<'a> RecoveryCoordinator<'a> {
             .copied()
             .collect::<FastHashSet<_>>();
         let deferred_drop_table_ids = self
-            .dropped_table_file_deletes
-            .iter()
-            .map(|item| item.table_id)
+            .resources
+            .catalog
+            .retained_dropped_table_ids_now()
+            .into_iter()
             .collect::<FastHashSet<_>>();
         self.resources
             .table_fs
@@ -598,10 +589,14 @@ impl<'a> RecoveryCoordinator<'a> {
             return Ok(());
         }
         self.replay_catalog_modifications(dml).await?;
+        // The catalog DROP rows have been replayed, but the table runtime was
+        // loaded before DDL replay so row/index redo could reach it. Remove the
+        // live catalog entry now so later recovery phases stop treating this
+        // table as an existing user table.
         let removed = self
             .resources
             .catalog
-            .remove_user_table(table_id)
+            .remove_live_user_table(table_id)
             .ok_or_else(|| {
                 Error::from(
                     Report::new(OperationError::TableNotFound)
@@ -615,11 +610,20 @@ impl<'a> RecoveryCoordinator<'a> {
                 Arc::strong_count(&table)
             )))
         })?;
+        // Recovery runs before normal runtime admission, so a committed DROP
+        // should have the only remaining table runtime handle here. Destroy the
+        // row/index runtime state immediately after logical removal.
         table
             .destroy_dropped_runtime(&self.resources.buffers.pool_guards)
             .await?;
-        self.dropped_table_file_deletes
-            .push(DroppedTableFileDeleteItem::new(table_id, cts, replay_floor));
+        if self.timeline.catalog_replay_start_ts <= cts {
+            // The catalog checkpoint has not yet made this table absence
+            // durable. Keep only the dropped replay floor so redo retention
+            // protects the log range needed to recover the DROP again.
+            self.resources
+                .catalog
+                .insert_dropped_table_floor(table_id, cts, replay_floor)?;
+        }
         self.timeline.table_bounds.remove(&table_id);
         self.recovered_tables.remove(&table_id);
         self.pending_index_ddl_reconciliations.remove(&table_id);
@@ -800,7 +804,7 @@ impl<'a> RecoveryCoordinator<'a> {
     /// rebuilt after log replay from recovered RowStore pages.
     async fn replay_dml(&mut self, dml: BTreeMap<TableID, TableDML>, cts: TrxID) -> Result<()> {
         for (table_id, table_dml) in dml {
-            if is_catalog_obj_id(table_id) {
+            if is_catalog_table(table_id) {
                 if !self.should_replay_catalog(cts) {
                     continue;
                 }

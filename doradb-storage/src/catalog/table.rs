@@ -1,10 +1,10 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableObject, is_user_obj_id};
+use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableObject, is_user_table};
 use crate::engine::EngineRef;
 use crate::error::{ConfigError, Error, FatalError, InternalError, OperationError, Result};
 use crate::file::table_file::{MutableTableFile, TableFile};
-use crate::id::TableID;
+use crate::id::{TableID, TrxID};
 use crate::index::BlockIndex;
 use crate::log::redo::DDLRedo;
 use crate::map::FastHashSet;
@@ -12,7 +12,7 @@ use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{SessionDdlContext, SessionPin};
-use crate::table::Table;
+use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::Transaction;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
@@ -1108,8 +1108,8 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     let ctx = SessionDdlContext::new(&session)?;
     let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
-    // Keep this guard alive until runtime removal is complete so table
-    // identity removal remains namespace-serialized.
+    // Keep this guard alive until the catalog entry is transitioned to dropped
+    // state so table identity changes remain namespace-serialized.
     let _namespace_lock = lock_manager
         .acquire_catalog_namespace_lock(ctx.owner, ctx.owner_group)
         .await?;
@@ -1155,23 +1155,19 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     };
 
     let replay_floor = table.redo_replay_floor_snapshot();
-    let removed = finish_drop_table_runtime_removal(&engine, table_id, &table)?;
+    finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)?;
     table_locks.fail_waiters_on_release(OperationError::TableNotFound);
-    drop(table);
-    // Foreground DROP TABLE stops at logical/runtime removal. Physical runtime
-    // destruction and file unlink are purge-owned so stale handles, active
-    // snapshots, and catalog checkpoint durability can be honored without
-    // blocking this DDL call on best-effort cleanup work.
-    engine
-        .trx_sys
-        .enqueue_dropped_table(table_id, drop_cts, replay_floor, removed);
+    // Foreground DROP TABLE stops at logical removal. The catalog map retains
+    // the dropped runtime and replay floor until purge and catalog checkpoint
+    // finish the physical cleanup obligations.
+    engine.trx_sys.request_dropped_table_purge();
     Ok(())
 }
 
 /// Reject table ids outside user-managed catalog space.
 #[inline]
 pub(crate) fn reject_non_user_table_id(table_id: TableID, operation: &'static str) -> Result<()> {
-    if is_user_obj_id(table_id) {
+    if is_user_table(table_id) {
         return Ok(());
     }
     Err(Report::new(OperationError::TableNotFound)
@@ -1411,20 +1407,23 @@ fn validate_drop_catalog_delete_counts(
 }
 
 #[inline]
-fn finish_drop_table_runtime_removal(
+fn finish_drop_table_runtime_retention(
     engine: &EngineRef,
     table_id: TableID,
-    table: &Arc<Table>,
-) -> Result<Arc<Table>> {
+    table: Arc<Table>,
+    drop_cts: TrxID,
+    replay_floor: TableRedoReplayFloor,
+) -> Result<()> {
     if let Err(_err) = table.mark_dropped_lifecycle() {
         return Err(poison_drop_table_after_gate(engine, table_id, "mark dropped").into());
     }
-    match engine.catalog().remove_user_table(table_id) {
-        Some(removed) if Arc::ptr_eq(&removed, table) => Ok(removed),
-        Some(_) | None => {
-            Err(poison_drop_table_after_gate(engine, table_id, "runtime removal").into())
-        }
+    if engine
+        .catalog()
+        .mark_user_table_dropped_runtime(table_id, table, drop_cts, replay_floor)
+    {
+        return Ok(());
     }
+    Err(poison_drop_table_after_gate(engine, table_id, "runtime retention").into())
 }
 
 #[inline]
@@ -3260,6 +3259,10 @@ mod tests {
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
             session.drop_table(table_id).await.unwrap();
+            assert_eq!(
+                engine.catalog().retained_dropped_table_ids_now(),
+                vec![table_id]
+            );
             engine.inner().trx_sys.request_dropped_table_purge();
             engine
                 .catalog()
@@ -3267,6 +3270,7 @@ mod tests {
                 .await
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;
+            assert!(engine.catalog().retained_dropped_table_ids_now().is_empty());
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx

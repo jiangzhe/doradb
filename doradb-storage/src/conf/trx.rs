@@ -256,8 +256,7 @@ impl TrxSysConfig {
         let recovery_resources =
             RecoveryResources::new(recovery_buffers, table_fs.clone(), &catalog);
         let coordinator = config.prepare_recovery(recovery_resources)?;
-        let (max_recovered_cts, initial_file_deletes, finalizer) =
-            coordinator.recover_all().await?;
+        let (max_recovered_cts, finalizer) = coordinator.recover_all().await?;
         let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)?;
         let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone())?;
         let redo_log = CachePadded::new(redo_log);
@@ -272,7 +271,6 @@ impl TrxSysConfig {
                 purge_tx: purge_tx.clone(),
                 cleanup_tx: cleanup_tx.clone(),
             },
-            initial_file_deletes,
         );
         Ok((
             trx_sys,

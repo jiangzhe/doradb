@@ -1,7 +1,7 @@
 use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
-use crate::catalog::{CatalogTable, TableCache, is_catalog_obj_id};
+use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
 use crate::error::{Error, FatalError, OperationError, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
@@ -315,7 +315,7 @@ impl<'stmt> Statement<'stmt> {
         table_id: TableID,
         operation: &'static str,
     ) -> Result<Arc<Table>> {
-        if is_catalog_obj_id(table_id) {
+        if is_catalog_table(table_id) {
             return Err(Self::table_not_found(table_id, operation));
         }
         if let Some(table) = self.inner.cached_user_table(table_id) {

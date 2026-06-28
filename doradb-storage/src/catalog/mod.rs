@@ -27,8 +27,11 @@ use crate::index::BlockIndex;
 use crate::map::{FastDashMap, FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
-use crate::table::{LiveTableRedoReplayFloor, MemTable, Table, TableRuntimeLayout};
+use crate::table::{
+    LiveTableRedoReplayFloor, MemTable, Table, TableRedoReplayFloor, TableRuntimeLayout,
+};
 use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::undo::IndexUndo;
 use dashmap::mapref::entry::Entry::{Occupied, Vacant};
 use error_stack::Report;
@@ -85,44 +88,10 @@ impl Deref for CatalogTable {
 /// Catalog contains metadata of user tables.
 pub(crate) struct Catalog {
     next_table_id: AtomicU64,
-    user_tables: FastDashMap<TableID, Arc<Table>>,
+    user_tables: FastDashMap<TableID, UserTableEntry>,
     /// Persistent storage for built-in catalog tables.
     pub(crate) storage: CatalogStorage,
     checkpoint_gate: CatalogCheckpointGate,
-}
-
-impl Component for Catalog {
-    type Config = ();
-    type Owned = Self;
-    type Access = QuiescentGuard<Self>;
-
-    const NAME: &'static str = "catalog";
-
-    #[inline]
-    async fn build(
-        _config: Self::Config,
-        registry: &mut ComponentRegistry,
-        _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        let meta_pool = registry.dependency::<MetaPool>()?;
-        let table_fs = registry.dependency::<FileSystem>()?;
-        let disk_pool = registry.dependency::<DiskPool>()?;
-        let storage = CatalogStorage::new(
-            meta_pool.clone_inner(),
-            table_fs.clone(),
-            disk_pool.clone_inner(),
-        )
-        .await?;
-        registry.register::<Self>(Catalog::new(storage).await?)
-    }
-
-    #[inline]
-    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
-        owner.guard()
-    }
-
-    #[inline]
-    fn shutdown(_component: &Self::Owned) {}
 }
 
 impl Catalog {
@@ -186,7 +155,7 @@ impl Catalog {
     /// Returns whether a table is user table.
     #[inline]
     pub(crate) fn is_user_table(&self, table_id: TableID) -> bool {
-        is_user_obj_id(table_id)
+        crate::catalog::is_user_table(table_id)
     }
 
     /// Reload one user table runtime from catalog metadata and table file.
@@ -267,7 +236,9 @@ impl Catalog {
             )
             .await?,
         );
-        let old = self.user_tables.insert(table_id, table);
+        let old = self
+            .user_tables
+            .insert(table_id, UserTableEntry::Live { table });
         if old.is_some() {
             return Err(Report::new(OperationError::TableAlreadyExists)
                 .attach(format!("insert reloaded user table: table_id={table_id}"))
@@ -379,12 +350,12 @@ impl Catalog {
     /// Get a user-table runtime handle synchronously by table id.
     #[inline]
     pub(crate) fn get_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
-        if is_catalog_obj_id(table_id) {
+        if is_catalog_table(table_id) {
             return None;
         }
         self.user_tables
             .get(&table_id)
-            .map(|table| Arc::clone(table.value()))
+            .and_then(|entry| entry.value().live_table().map(Arc::clone))
     }
 
     /// Return sorted ids for currently loaded user-table runtimes.
@@ -395,26 +366,48 @@ impl Catalog {
             .iter()
             .filter_map(|entry| {
                 let table_id = *entry.key();
-                is_user_obj_id(table_id).then_some(table_id)
+                entry.value().live_table().is_some().then_some(table_id)
             })
             .collect::<Vec<_>>();
         table_ids.sort_by_key(|table_id| table_id.as_u64());
         table_ids
     }
 
-    /// Copy replay-floor fields from currently resident live user-table runtimes.
+    /// Copy replay floors from live and dropped user-table catalog entries.
     #[inline]
-    pub(crate) fn snapshot_live_table_redo_floors(&self) -> Vec<LiveTableRedoReplayFloor> {
-        let mut floors = self
-            .user_tables
-            .iter()
-            .map(|entry| LiveTableRedoReplayFloor {
-                table_id: *entry.key(),
-                floor: entry.value().redo_replay_floor_snapshot(),
-            })
-            .collect::<Vec<_>>();
-        floors.sort_by_key(|floor| floor.table_id.as_u64());
-        floors
+    pub(crate) fn snapshot_user_table_redo_floors(
+        &self,
+        catalog_replay_start_ts: TrxID,
+    ) -> (
+        Vec<LiveTableRedoReplayFloor>,
+        Vec<PendingDroppedTableRedoFloor>,
+    ) {
+        let mut live = Vec::new();
+        let mut dropped = Vec::new();
+        for entry in &self.user_tables {
+            let table_id = *entry.key();
+            match entry.value() {
+                UserTableEntry::Live { table } => live.push(LiveTableRedoReplayFloor {
+                    table_id,
+                    floor: table.redo_replay_floor_snapshot(),
+                }),
+                UserTableEntry::DroppedRuntime {
+                    drop_cts,
+                    replay_floor,
+                    ..
+                }
+                | UserTableEntry::DroppedFloor {
+                    drop_cts,
+                    replay_floor,
+                } if catalog_replay_start_ts <= *drop_cts => dropped.push(
+                    PendingDroppedTableRedoFloor::new(table_id, *drop_cts, *replay_floor),
+                ),
+                UserTableEntry::DroppedRuntime { .. } | UserTableEntry::DroppedFloor { .. } => {}
+            }
+        }
+        live.sort_by_key(|floor| floor.table_id.as_u64());
+        dropped.sort_by_key(|floor| (floor.drop_cts.as_u64(), floor.table_id.as_u64()));
+        (live, dropped)
     }
 
     /// Acquires the catalog checkpoint side of the catalog metadata gate.
@@ -457,7 +450,7 @@ impl Catalog {
         let table_id = table.table_id();
         match self.user_tables.entry(table_id) {
             Vacant(entry) => {
-                entry.insert(table);
+                entry.insert(UserTableEntry::Live { table });
                 Ok(())
             }
             Occupied(_) => Err(Report::new(OperationError::TableAlreadyExists)
@@ -466,10 +459,305 @@ impl Catalog {
         }
     }
 
-    /// Remove a user table runtime from the in-memory cache.
+    /// Remove a live user table runtime from the in-memory cache.
     #[inline]
-    pub(crate) fn remove_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
-        self.user_tables.remove(&table_id).map(|(_, table)| table)
+    pub(crate) fn remove_live_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
+        match self.user_tables.entry(table_id) {
+            Occupied(entry) if entry.get().live_table().is_some() => {
+                let UserTableEntry::Live { table } = entry.remove() else {
+                    unreachable!("entry checked as live")
+                };
+                Some(table)
+            }
+            Occupied(_) | Vacant(_) => None,
+        }
+    }
+
+    /// Transition one live user-table entry into retained dropped-runtime state.
+    #[inline]
+    pub(crate) fn mark_user_table_dropped_runtime(
+        &self,
+        table_id: TableID,
+        table: Arc<Table>,
+        drop_cts: TrxID,
+        replay_floor: TableRedoReplayFloor,
+    ) -> bool {
+        match self.user_tables.entry(table_id) {
+            Occupied(mut entry) => match entry.get() {
+                UserTableEntry::Live { table: current } if Arc::ptr_eq(current, &table) => {
+                    entry.insert(UserTableEntry::DroppedRuntime {
+                        table,
+                        drop_cts,
+                        replay_floor,
+                    });
+                    true
+                }
+                UserTableEntry::Live { .. }
+                | UserTableEntry::DroppedRuntime { .. }
+                | UserTableEntry::DroppedFloor { .. } => false,
+            },
+            Vacant(_) => false,
+        }
+    }
+
+    /// Insert a lightweight retained dropped-table replay floor.
+    #[inline]
+    pub(crate) fn insert_dropped_table_floor(
+        &self,
+        table_id: TableID,
+        drop_cts: TrxID,
+        replay_floor: TableRedoReplayFloor,
+    ) -> Result<()> {
+        match self.user_tables.entry(table_id) {
+            Vacant(entry) => {
+                entry.insert(UserTableEntry::DroppedFloor {
+                    drop_cts,
+                    replay_floor,
+                });
+                Ok(())
+            }
+            Occupied(_) => Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!(
+                    "insert dropped user table floor: table_id={table_id}"
+                ))
+                .into()),
+        }
+    }
+
+    /// Detach purge-horizon dropped runtimes while leaving replay floors visible.
+    #[inline]
+    pub(crate) fn take_dropped_runtime_candidates(
+        &self,
+        min_active_sts: TrxID,
+    ) -> Vec<DroppedTableRuntime> {
+        let mut table_ids = self
+            .user_tables
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                UserTableEntry::DroppedRuntime { drop_cts, .. } if *drop_cts < min_active_sts => {
+                    Some(*entry.key())
+                }
+                UserTableEntry::Live { .. }
+                | UserTableEntry::DroppedRuntime { .. }
+                | UserTableEntry::DroppedFloor { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        table_ids.sort_by_key(|table_id| table_id.as_u64());
+
+        let mut candidates = Vec::with_capacity(table_ids.len());
+        for table_id in table_ids {
+            if let Occupied(mut entry) = self.user_tables.entry(table_id) {
+                let UserTableEntry::DroppedRuntime {
+                    table,
+                    drop_cts,
+                    replay_floor,
+                } = entry.get()
+                else {
+                    continue;
+                };
+                if *drop_cts >= min_active_sts {
+                    continue;
+                }
+                let table = Arc::clone(table);
+                let drop_cts = *drop_cts;
+                let replay_floor = *replay_floor;
+                entry.insert(UserTableEntry::DroppedFloor {
+                    drop_cts,
+                    replay_floor,
+                });
+                candidates.push(DroppedTableRuntime {
+                    table_id,
+                    drop_cts,
+                    replay_floor,
+                    table,
+                });
+            }
+        }
+        candidates
+    }
+
+    /// Restore a detached dropped runtime after purge observes stale handles.
+    #[inline]
+    pub(crate) fn restore_dropped_runtime(&self, item: DroppedTableRuntime) -> bool {
+        match self.user_tables.entry(item.table_id) {
+            Occupied(mut entry) => match entry.get() {
+                UserTableEntry::DroppedFloor {
+                    drop_cts,
+                    replay_floor,
+                } if *drop_cts == item.drop_cts && *replay_floor == item.replay_floor => {
+                    entry.insert(UserTableEntry::DroppedRuntime {
+                        table: item.table,
+                        drop_cts: item.drop_cts,
+                        replay_floor: item.replay_floor,
+                    });
+                    true
+                }
+                UserTableEntry::Live { .. }
+                | UserTableEntry::DroppedRuntime { .. }
+                | UserTableEntry::DroppedFloor { .. } => false,
+            },
+            Vacant(_) => false,
+        }
+    }
+
+    /// Snapshot retained dropped floors for purge file-cleanup queue seeding.
+    ///
+    /// This is the intended catalog-map scan for file cleanup: recovery and
+    /// startup rebuild the lightweight purge queue from these authoritative
+    /// floor entries, then normal purge wakeups work from that queue.
+    #[inline]
+    pub(crate) fn snapshot_dropped_table_file_cleanups(&self) -> Vec<DroppedTableFileCleanup> {
+        let mut candidates = self
+            .user_tables
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                UserTableEntry::DroppedFloor {
+                    drop_cts,
+                    replay_floor,
+                } => Some(DroppedTableFileCleanup::new(
+                    *entry.key(),
+                    *drop_cts,
+                    *replay_floor,
+                )),
+                UserTableEntry::Live { .. } | UserTableEntry::DroppedRuntime { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|item| (item.drop_cts.as_u64(), item.table_id.as_u64()));
+        candidates
+    }
+
+    /// Remove a dropped-floor entry after its table-file cleanup succeeds.
+    #[inline]
+    pub(crate) fn remove_dropped_floor(&self, item: DroppedTableFileCleanup) -> bool {
+        match self.user_tables.entry(item.table_id) {
+            Occupied(entry) => match entry.get() {
+                UserTableEntry::DroppedFloor {
+                    drop_cts,
+                    replay_floor,
+                } if *drop_cts == item.drop_cts && *replay_floor == item.replay_floor => {
+                    let _ = entry.remove();
+                    true
+                }
+                UserTableEntry::Live { .. }
+                | UserTableEntry::DroppedRuntime { .. }
+                | UserTableEntry::DroppedFloor { .. } => false,
+            },
+            Vacant(_) => false,
+        }
+    }
+
+    /// Return retained dropped table ids that should protect files from startup cleanup.
+    #[inline]
+    pub(crate) fn retained_dropped_table_ids_now(&self) -> Vec<TableID> {
+        let mut table_ids = self
+            .user_tables
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                UserTableEntry::DroppedRuntime { .. } | UserTableEntry::DroppedFloor { .. } => {
+                    Some(*entry.key())
+                }
+                UserTableEntry::Live { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        table_ids.sort_by_key(|table_id| table_id.as_u64());
+        table_ids
+    }
+}
+
+impl Component for Catalog {
+    type Config = ();
+    type Owned = Self;
+    type Access = QuiescentGuard<Self>;
+
+    const NAME: &'static str = "catalog";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        _shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let meta_pool = registry.dependency::<MetaPool>()?;
+        let table_fs = registry.dependency::<FileSystem>()?;
+        let disk_pool = registry.dependency::<DiskPool>()?;
+        let storage = CatalogStorage::new(
+            meta_pool.clone_inner(),
+            table_fs.clone(),
+            disk_pool.clone_inner(),
+        )
+        .await?;
+        registry.register::<Self>(Catalog::new(storage).await?)
+    }
+
+    #[inline]
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
+        owner.guard()
+    }
+
+    #[inline]
+    fn shutdown(_component: &Self::Owned) {}
+}
+
+enum UserTableEntry {
+    Live {
+        table: Arc<Table>,
+    },
+    DroppedRuntime {
+        table: Arc<Table>,
+        drop_cts: TrxID,
+        replay_floor: TableRedoReplayFloor,
+    },
+    DroppedFloor {
+        drop_cts: TrxID,
+        replay_floor: TableRedoReplayFloor,
+    },
+}
+
+impl UserTableEntry {
+    #[inline]
+    fn live_table(&self) -> Option<&Arc<Table>> {
+        match self {
+            UserTableEntry::Live { table } => Some(table),
+            UserTableEntry::DroppedRuntime { .. } | UserTableEntry::DroppedFloor { .. } => None,
+        }
+    }
+}
+
+/// Dropped table runtime detached from the catalog map for purge destruction.
+pub(crate) struct DroppedTableRuntime {
+    /// Dropped user table id.
+    pub(crate) table_id: TableID,
+    /// Commit timestamp of the logical DROP TABLE.
+    pub(crate) drop_cts: TrxID,
+    /// Replay floor copied before the table can be destroyed.
+    pub(crate) replay_floor: TableRedoReplayFloor,
+    /// Runtime table handle retained until purge can destroy it.
+    pub(crate) table: Arc<Table>,
+}
+
+/// Dropped table floor whose file can be deleted after catalog absence is durable.
+#[derive(Clone, Copy)]
+pub(crate) struct DroppedTableFileCleanup {
+    /// Dropped user table id.
+    pub(crate) table_id: TableID,
+    /// Commit timestamp of the logical DROP TABLE.
+    pub(crate) drop_cts: TrxID,
+    replay_floor: TableRedoReplayFloor,
+}
+
+impl DroppedTableFileCleanup {
+    /// Create a dropped-table file cleanup item.
+    #[inline]
+    pub(crate) fn new(
+        table_id: TableID,
+        drop_cts: TrxID,
+        replay_floor: TableRedoReplayFloor,
+    ) -> Self {
+        Self {
+            table_id,
+            drop_cts,
+            replay_floor,
+        }
     }
 }
 
@@ -577,7 +865,7 @@ impl<'a> TableCache<'a> {
     /// positive/negative lookup result.
     #[inline]
     pub(crate) fn get_catalog_table(&mut self, table_id: TableID) -> Option<&CatalogTable> {
-        if !is_catalog_obj_id(table_id) {
+        if !is_catalog_table(table_id) {
             return None;
         }
         match self.catalog_tables.entry(table_id) {
@@ -606,7 +894,7 @@ impl<'a> TableCache<'a> {
         &mut self,
         table_id: TableID,
     ) -> Option<&mut UserTableCacheEntry> {
-        if is_catalog_obj_id(table_id) {
+        if is_catalog_table(table_id) {
             return None;
         }
         match self.user_tables.entry(table_id) {
@@ -672,16 +960,16 @@ impl<'a> TableCache<'a> {
     }
 }
 
-/// Return whether an object id belongs to user-managed catalog space.
+/// Return whether a table id belongs to user-managed catalog space.
 #[inline]
-pub(crate) const fn is_user_obj_id(obj_id: TableID) -> bool {
-    obj_id.as_u64() >= USER_OBJ_ID_START.as_u64()
+pub(crate) const fn is_user_table(table_id: TableID) -> bool {
+    table_id.as_u64() >= USER_OBJ_ID_START.as_u64()
 }
 
-/// Return whether an object id belongs to built-in catalog table space.
+/// Return whether a table id belongs to built-in catalog table space.
 #[inline]
-pub(crate) const fn is_catalog_obj_id(obj_id: TableID) -> bool {
-    !is_user_obj_id(obj_id)
+pub(crate) const fn is_catalog_table(table_id: TableID) -> bool {
+    !is_user_table(table_id)
 }
 
 #[inline]
@@ -985,12 +1273,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_catalog_user_obj_id_boundary_predicates() {
+    fn test_catalog_table_id_boundary_predicates() {
         let before_user = TableID::new(USER_OBJ_ID_START.as_u64() - 1);
-        assert!(is_catalog_obj_id(before_user));
-        assert!(!is_catalog_obj_id(USER_OBJ_ID_START));
-        assert!(!is_user_obj_id(before_user));
-        assert!(is_user_obj_id(USER_OBJ_ID_START));
+        assert!(is_catalog_table(before_user));
+        assert!(!is_catalog_table(USER_OBJ_ID_START));
+        assert!(!is_user_table(before_user));
+        assert!(is_user_table(USER_OBJ_ID_START));
     }
 
     #[test]

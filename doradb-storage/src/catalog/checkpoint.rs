@@ -1,7 +1,7 @@
 use crate::catalog::storage::tables::TABLE_ID_TABLES;
 use crate::catalog::{
-    Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_obj_id,
-    is_user_obj_id,
+    Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_table,
+    is_user_table,
 };
 use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
@@ -473,7 +473,7 @@ impl Catalog {
                     // checkpoint; user-table row data remains owned by table
                     // files and is not part of catalog storage state.
                     for (table_id, table_dml) in redo.dml {
-                        if !is_catalog_obj_id(table_id) {
+                        if !is_catalog_table(table_id) {
                             continue;
                         }
                         for row_redo in table_dml.rows.into_values() {
@@ -507,7 +507,7 @@ impl Catalog {
         match ddl {
             DDLRedo::CreateTable(_) => Ok(CatalogCheckpointTxnAction::Include),
             DDLRedo::DropTable(table_id)
-                if is_user_obj_id(*table_id)
+                if is_user_table(*table_id)
                     && !drop_table_has_catalog_table_delete(*table_id, dml) =>
             {
                 // A user-table drop without the matching catalog-table delete

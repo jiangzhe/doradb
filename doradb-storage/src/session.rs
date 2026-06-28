@@ -1254,7 +1254,9 @@ pub(crate) mod tests {
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
     use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
     use crate::table::tests::FailingFirstWriteHook;
-    use crate::trx::retention::tests::install_redo_cleanup_before_unlink_hook;
+    use crate::trx::retention::{
+        RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
+    };
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use crate::value::Val;
     use futures::task::noop_waker;
@@ -1722,6 +1724,45 @@ pub(crate) mod tests {
             assert_eq!(
                 outcome.blockers,
                 vec![RedoTruncationBlockerInfo::UnsealedFile { file_seq: 0 }]
+            );
+        });
+    }
+
+    #[test]
+    fn test_session_truncate_redo_log_reports_catalog_retained_dropped_floor() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let main_dir = root.path().to_path_buf();
+            let log_file_stem = "redo_truncate_dropped_floor";
+            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
+            let mut session = engine.new_session().unwrap();
+            session.checkpoint_catalog().await.unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let expected_floor = table.redo_replay_floor_snapshot();
+            drop(table);
+
+            session.drop_table(table_id).await.unwrap();
+
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_eq!(session.list_table_ids().unwrap(), Vec::<TableID>::new());
+            let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
+            assert!(
+                plan.blockers.iter().any(|blocker| matches!(
+                    blocker,
+                    RedoTruncationBlocker::PendingDroppedTableFloor {
+                        table_id: blocked_table_id,
+                        heap_redo_start_ts,
+                        deletion_cutoff_ts,
+                        ..
+                    } if *blocked_table_id == table_id
+                        && *heap_redo_start_ts == expected_floor.heap_redo_start_ts
+                        && *deletion_cutoff_ts == expected_floor.deletion_cutoff_ts
+                )),
+                "{plan:?}"
             );
         });
     }

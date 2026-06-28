@@ -113,11 +113,9 @@ impl TransactionSystem {
         let first_retained_file_seq = snapshot.meta.first_redo_log_seq;
         let catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
 
-        let live_table_floors = self.catalog.snapshot_live_table_redo_floors();
-        let pending_dropped_table_floors = self
-            .dropped_tables
-            .lock()
-            .snapshot_pending_redo_floors(catalog_replay_start_ts);
+        let (live_table_floors, pending_dropped_table_floors) = self
+            .catalog
+            .snapshot_user_table_redo_floors(catalog_replay_start_ts);
 
         let file_prefix = self.config.file_prefix()?;
         let discovered = discover_redo_log_files(&file_prefix, first_retained_file_seq, false)?;

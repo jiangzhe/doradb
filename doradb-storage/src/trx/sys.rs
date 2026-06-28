@@ -15,9 +15,7 @@ use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
-use crate::trx::purge::{
-    DroppedTableFileDeleteItem, DroppedTableQueue, GCBucket, Purge, TableRootQueue,
-};
+use crate::trx::purge::{DroppedTableFileCleanupQueue, GCBucket, Purge, TableRootQueue};
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
     FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
@@ -421,8 +419,11 @@ pub(crate) struct TransactionSystem {
     cleanup_tx: CachePadded<Sender<TrxCleanupMessage>>,
     /// Swapped table roots retained until post-publish readers drain.
     pub(super) table_roots: CachePadded<Mutex<TableRootQueue>>,
-    /// Dropped table runtime and file cleanup queues.
-    pub(super) dropped_tables: CachePadded<Mutex<DroppedTableQueue>>,
+    /// Advisory queue for dropped table files waiting on catalog checkpoint safety.
+    ///
+    /// The catalog's retained dropped-floor entries remain authoritative; this
+    /// queue only avoids full catalog-map scans during purge wakeups.
+    pub(super) dropped_table_files: CachePadded<Mutex<DroppedTableFileCleanupQueue>>,
     /// Storage-runtime poison flag for fatal storage background or durability failures.
     storage_poisoned: CachePadded<AtomicBool>,
     /// First fatal storage reason that poisoned runtime admission.
@@ -444,7 +445,7 @@ pub(crate) struct TransactionSystem {
 }
 
 impl TransactionSystem {
-    /// Create a transaction system with redo, catalog, queues, and retained startup cleanup.
+    /// Create a transaction system with redo, catalog, and background queues.
     #[inline]
     pub(crate) fn new(
         config: TrxSysConfig,
@@ -453,10 +454,15 @@ impl TransactionSystem {
         redo_log: CachePadded<RedoLog>,
         initial_ts: TrxID,
         queues: TransactionSystemQueues,
-        initial_file_deletes: Vec<DroppedTableFileDeleteItem>,
     ) -> Self {
         debug_assert!((MIN_SNAPSHOT_TS..MAX_SNAPSHOT_TS).contains(&initial_ts));
         let gc_buckets: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
+        // Recovery can insert dropped-floor entries before purge queues exist.
+        // Seed the advisory queue once so checkpoint-gated file cleanup resumes
+        // without scanning the catalog map on every later purge wake.
+        let dropped_table_files = DroppedTableFileCleanupQueue::from_items(
+            catalog.snapshot_dropped_table_file_cleanups(),
+        );
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
@@ -469,9 +475,7 @@ impl TransactionSystem {
             purge_tx: CachePadded::new(queues.purge_tx),
             cleanup_tx: CachePadded::new(queues.cleanup_tx),
             table_roots: CachePadded::new(Mutex::new(TableRootQueue::default())),
-            dropped_tables: CachePadded::new(Mutex::new(DroppedTableQueue::from_file_deletes(
-                initial_file_deletes,
-            ))),
+            dropped_table_files: CachePadded::new(Mutex::new(dropped_table_files)),
             storage_poisoned: CachePadded::new(AtomicBool::new(false)),
             storage_poison_err: CachePadded::new(Mutex::new(None)),
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
