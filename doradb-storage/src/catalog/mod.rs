@@ -155,7 +155,7 @@ impl Catalog {
     /// Returns whether a table is user table.
     #[inline]
     pub(crate) fn is_user_table(&self, table_id: TableID) -> bool {
-        crate::catalog::is_user_table(table_id)
+        is_user_table(table_id)
     }
 
     /// Reload one user table runtime from catalog metadata and table file.

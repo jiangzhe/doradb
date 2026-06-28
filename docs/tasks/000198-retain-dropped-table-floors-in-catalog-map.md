@@ -1,7 +1,7 @@
 ---
 id: 000198
 title: Retain Dropped Table Floors In Catalog Map
-status: proposal
+status: implemented
 created: 2026-06-28
 github_issue: 780
 ---
@@ -30,7 +30,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+- `docs/backlogs/closed/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
 
 Related design documents:
 - `docs/checkpoint-and-recovery.md`
@@ -235,6 +235,35 @@ DroppedFloor {
      `docs/checkpoint-and-recovery.md` or `docs/table-file.md`.
 
 ## Implementation Notes
+
+- Implemented the catalog-owned dropped-table model with private live,
+  dropped-runtime, and dropped-floor entries. Public catalog/session lookup and
+  listing paths now expose only live user tables, while redo truncation planning
+  snapshots live and retained dropped replay floors from the catalog map.
+- Foreground `DROP TABLE` now transitions the committed table into
+  `DroppedRuntime` instead of removing it from the catalog map. Purge later
+  destroys the heavy runtime after the active-snapshot horizon, restores stale
+  runtime candidates when extra `Arc<Table>` handles remain, and transitions
+  successful cleanup to `DroppedFloor`.
+- File cleanup kept a lightweight ordered queue to avoid scanning the whole
+  catalog map on every purge wake. The queue is seeded from catalog dropped-floor
+  snapshots, drains only the catalog-checkpoint-ready prefix, and prepends
+  failed deletes for ordered retry.
+- Recovery replay destroys dropped runtimes immediately when safe for startup,
+  seeds dropped-floor catalog entries while catalog absence is not durable, and
+  documents the live-versus-dropped replay handling.
+- Review follow-ups resolved readability and diagnostics issues in purge
+  cleanup: common deallocate/poison handling moved onto `TransactionSystem`,
+  file-delete result handling is explicit at the call site, stale-handle restore
+  errors include the affected table id and floor context, and successful file
+  deletes debug-assert dropped-floor removal invariants.
+- Closed source backlog
+  `docs/backlogs/closed/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+  as implemented. RFC 0022 deferred-follow-up text was updated to show that this
+  follow-up is no longer open.
+- Validation completed with `tools/style_audit.rs --diff-base origin/main`,
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings`,
+  `cargo nextest run -p doradb-storage`, and `git diff --check`.
 
 ## Impacts
 
