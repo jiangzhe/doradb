@@ -306,7 +306,12 @@ impl TransactionSystem {
         // `catalog.mtb` root; otherwise use the marker-only publication path.
         let checkpoint_outcome = if checkpoint_will_publish {
             if target_marker > previous_first_retained_file_seq {
-                prepared.apply_first_redo_log_seq(target_marker)?;
+                let applied = prepared.apply_first_redo_log_seq(target_marker)?;
+                debug_assert!(
+                    applied,
+                    "marker must monotonically advance when target_marker ({target_marker}) \
+                     exceeds the durable marker ({previous_first_retained_file_seq})"
+                );
                 new_first_retained_file_seq = target_marker;
             }
             match prepared.commit(&self.catalog.storage).await {
@@ -600,6 +605,11 @@ fn catalog_safe_segments_for_plan(
         && progress.first_retained_file_seq == first_retained_file_seq
         && progress.catalog_replay_start_ts == catalog_replay_start_ts
     {
+        // Seed from current sealed segment CTS ranges before overlaying cached
+        // checkpoint-scan proof. Sealed non-empty ranges are immutable, so a
+        // file whose max CTS is already below `catalog_replay_start_ts` is
+        // catalog-safe even if the last checkpoint scan did not record it.
+        // Cached proof still wins for matching file sequences below.
         let mut safe = fallback_catalog_safe_segments(catalog_replay_start_ts, segments);
         safe.extend(
             progress
