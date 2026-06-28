@@ -736,7 +736,7 @@ pub(crate) struct DroppedTableRuntime {
 }
 
 /// Dropped table floor whose file can be deleted after catalog absence is durable.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct DroppedTableFileCleanup {
     /// Dropped user table id.
     pub(crate) table_id: TableID,

@@ -474,10 +474,18 @@ impl TransactionSystem {
             }
         }
 
-        for item in stale_handles {
+        let stale_handle_count = stale_handles.len();
+        for (idx, item) in stale_handles.into_iter().enumerate() {
+            let table_id = item.table_id;
+            let drop_cts = item.drop_cts;
+            let replay_floor = item.replay_floor;
+            let strong_count = Arc::strong_count(&item.table);
+            let remaining_stale_handles = stale_handle_count - idx - 1;
             if !self.catalog.restore_dropped_runtime(item) {
                 return Err(Report::new(InternalError::Generic)
-                    .attach("restore dropped table runtime after stale handle")
+                    .attach(format!(
+                        "restore dropped table runtime after stale handle: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, strong_count={strong_count}, remaining_stale_handles={remaining_stale_handles}"
+                    ))
                     .into());
             }
         }
@@ -531,9 +539,15 @@ impl TransactionSystem {
                 continue;
             }
             // Successful unlink is followed by a catalog-validated floor
-            // removal. If the queued item is stale, the catalog rejects it and
-            // remains the source of truth.
-            let _ = self.catalog.remove_dropped_floor(item);
+            // removal. A mismatch is self-healing in release builds because
+            // startup can rediscover the retained floor and retry the
+            // idempotent file delete, but debug builds should surface the
+            // invariant violation immediately.
+            let removed = self.catalog.remove_dropped_floor(item);
+            debug_assert!(
+                removed,
+                "remove dropped floor after file delete: item={item:?}"
+            );
         }
         if !failed.is_empty() {
             self.dropped_table_files.lock().prepend_failed_ready(failed);
