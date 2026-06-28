@@ -1,76 +1,30 @@
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
-use crate::catalog::{Catalog, TableCache, is_catalog_obj_id};
-use crate::error::{FatalError, Result};
+use crate::catalog::{
+    Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, is_catalog_table,
+};
+use crate::error::{FatalError, InternalError, Result};
 use crate::file::table_file::OldRoot;
-use crate::id::{PageID, TableID, TrxID};
+use crate::id::{PageID, TrxID};
 use crate::latch::LatchFallbackMode;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
-use crate::table::{Table, TableRedoReplayFloor};
+use crate::table::Table;
 use crate::thread;
-use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS};
 use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
+use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
-
-/// Runtime table handle waiting for purge-horizon destruction after DROP TABLE.
-///
-/// The catalog no longer exposes this table once foreground DROP TABLE commits,
-/// but crate-private operation, session, transaction, or cleanup pins may still
-/// retain the runtime. Purge owns the final runtime destroy step so it can wait
-/// until the drop commit is older than every active snapshot.
-pub(crate) struct DroppedTableGcItem {
-    /// Dropped user table id.
-    pub(crate) table_id: TableID,
-    /// Commit timestamp of the logical DROP TABLE.
-    pub(crate) drop_cts: TrxID,
-    /// Replay floor copied before the table can be destroyed.
-    pub(crate) replay_floor: TableRedoReplayFloor,
-    /// Runtime table handle retained until purge can destroy it.
-    pub(crate) table: Arc<Table>,
-}
-
-/// User table file waiting for checkpoint-safe deletion after runtime destroy.
-///
-/// Physical file unlink must lag runtime destroy until a catalog checkpoint has
-/// made the table absence durable. Before that point recovery may still need the
-/// file to replay the committed drop.
-#[derive(Clone, Copy)]
-pub(crate) struct DroppedTableFileDeleteItem {
-    /// Dropped user table id.
-    pub(crate) table_id: TableID,
-    /// Commit timestamp of the logical DROP TABLE.
-    pub(crate) drop_cts: TrxID,
-    /// Replay floor copied before the table runtime was destroyed.
-    pub(crate) replay_floor: TableRedoReplayFloor,
-}
-
-impl DroppedTableFileDeleteItem {
-    /// Create a queued dropped-table file deletion item.
-    #[inline]
-    pub(crate) fn new(
-        table_id: TableID,
-        drop_cts: TrxID,
-        replay_floor: TableRedoReplayFloor,
-    ) -> Self {
-        Self {
-            table_id,
-            drop_cts,
-            replay_floor,
-        }
-    }
-}
 
 /// Swapped user-table active root retained until post-publish readers drain.
 struct RetainedTableRoot {
@@ -108,96 +62,82 @@ impl TableRootQueue {
     }
 }
 
-/// Purge-owned queues for GC-managed dropped-table cleanup.
+/// Purge-owned worklist for dropped table files waiting on catalog checkpoint safety.
 ///
-/// `runtime` entries wait for both the purge horizon and exclusive ownership of
-/// the table `Arc`; `files` entries wait for the catalog checkpoint replay
-/// floor. These queues are deliberately purge-owned so foreground DROP TABLE can
-/// finish after logical removal without synchronously reclaiming memory or
-/// unlinking files.
+/// This queue is only an optimization to avoid scanning the whole catalog map on
+/// every dropped-table purge wake. The catalog's `DroppedFloor` entry remains
+/// authoritative for redo retention and for validating that a queued file
+/// cleanup item is still current.
 #[derive(Default)]
-pub(crate) struct DroppedTableQueue {
-    runtime: VecDeque<DroppedTableGcItem>,
-    files: VecDeque<DroppedTableFileDeleteItem>,
+pub(crate) struct DroppedTableFileCleanupQueue {
+    files: VecDeque<DroppedTableFileCleanup>,
 }
 
-impl DroppedTableQueue {
-    /// Build dropped-table queues seeded with checkpoint-gated file deletes.
+impl DroppedTableFileCleanupQueue {
+    /// Seed the queue from catalog-retained dropped floors after recovery.
+    ///
+    /// This restores pending file cleanup work that may have been waiting on a
+    /// future catalog checkpoint when the previous engine instance stopped.
     #[inline]
-    pub(crate) fn from_file_deletes(file_deletes: Vec<DroppedTableFileDeleteItem>) -> Self {
+    pub(crate) fn from_items(mut items: Vec<DroppedTableFileCleanup>) -> Self {
+        items.sort_by_key(Self::cleanup_key);
         Self {
-            runtime: VecDeque::new(),
-            files: VecDeque::from(file_deletes),
+            files: VecDeque::from(items),
         }
     }
 
     #[inline]
-    fn push_runtime(&mut self, item: DroppedTableGcItem) {
-        self.runtime.push_back(item);
+    fn push_ordered(&mut self, item: DroppedTableFileCleanup) {
+        let key = Self::cleanup_key(&item);
+        let idx = self
+            .files
+            .iter()
+            .position(|existing| Self::cleanup_key(existing) > key)
+            .unwrap_or(self.files.len());
+        self.files.insert(idx, item);
     }
 
-    /// Snapshot dropped-table floors that still constrain redo truncation planning.
     #[inline]
-    pub(crate) fn snapshot_pending_redo_floors(
-        &self,
-        catalog_replay_start_ts: TrxID,
-    ) -> Vec<PendingDroppedTableRedoFloor> {
-        let mut floors = Vec::new();
-        floors.extend(
-            self.runtime
-                .iter()
-                .filter(|item| catalog_replay_start_ts <= item.drop_cts)
-                .map(|item| {
-                    PendingDroppedTableRedoFloor::new(
-                        item.table_id,
-                        item.drop_cts,
-                        item.replay_floor,
-                    )
-                }),
-        );
-        floors.extend(
-            self.files
-                .iter()
-                .filter(|item| catalog_replay_start_ts <= item.drop_cts)
-                .map(|item| {
-                    PendingDroppedTableRedoFloor::new(
-                        item.table_id,
-                        item.drop_cts,
-                        item.replay_floor,
-                    )
-                }),
-        );
-        floors.sort_by_key(|floor| (floor.drop_cts.as_u64(), floor.table_id.as_u64()));
-        floors
+    fn drain_ready(&mut self, catalog_replay_start_ts: TrxID) -> Vec<DroppedTableFileCleanup> {
+        let mut ready = Vec::new();
+        while self
+            .files
+            .front()
+            .is_some_and(|item| item.drop_cts < catalog_replay_start_ts)
+        {
+            let Some(item) = self.files.pop_front() else {
+                break;
+            };
+            ready.push(item);
+        }
+        ready
+    }
+
+    #[inline]
+    fn prepend_failed_ready(&mut self, items: Vec<DroppedTableFileCleanup>) {
+        debug_assert!(Self::cleanups_ordered(&items));
+        if let (Some(last_item), Some(front_item)) = (items.last(), self.files.front()) {
+            debug_assert!(Self::cleanup_key(last_item) <= Self::cleanup_key(front_item));
+        }
+        for item in items.into_iter().rev() {
+            self.files.push_front(item);
+        }
+    }
+
+    #[inline]
+    fn cleanup_key(item: &DroppedTableFileCleanup) -> (u64, u64) {
+        (item.drop_cts.as_u64(), item.table_id.as_u64())
+    }
+
+    #[inline]
+    fn cleanups_ordered(items: &[DroppedTableFileCleanup]) -> bool {
+        items
+            .windows(2)
+            .all(|window| Self::cleanup_key(&window[0]) <= Self::cleanup_key(&window[1]))
     }
 }
 
 impl TransactionSystem {
-    /// Enqueue a logically dropped table runtime for purge-horizon destruction.
-    ///
-    /// The wake requests only dropped-table cleanup, so foreground DROP TABLE
-    /// does not trigger a full undo/index/page GC cycle.
-    ///
-    /// A send failure is harmless during shutdown: the engine owner will join the
-    /// purge worker, and any remaining queue entries become irrelevant once the
-    /// owner tears down the whole runtime.
-    #[inline]
-    pub(crate) fn enqueue_dropped_table(
-        &self,
-        table_id: TableID,
-        drop_cts: TrxID,
-        replay_floor: TableRedoReplayFloor,
-        table: Arc<Table>,
-    ) {
-        self.dropped_tables.lock().push_runtime(DroppedTableGcItem {
-            table_id,
-            drop_cts,
-            replay_floor,
-            table,
-        });
-        self.request_dropped_table_purge();
-    }
-
     /// Wake the purge coordinator for table-root retention cleanup only.
     ///
     /// This is best-effort. Dropping the purge receiver is the normal shutdown
@@ -349,7 +289,7 @@ impl TransactionSystem {
                 if let Some(row_undo) = trx.row_undo() {
                     purge_row_count += row_undo.len();
                     for undo in &**row_undo {
-                        if is_catalog_obj_id(undo.table_id) {
+                        if is_catalog_table(undo.table_id) {
                             let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
                                 continue;
                             };
@@ -389,7 +329,7 @@ impl TransactionSystem {
             for trx in &trx_list {
                 if let Some(index_gc) = trx.index_gc() {
                     for ip in index_gc {
-                        if is_catalog_obj_id(ip.table_id) {
+                        if is_catalog_table(ip.table_id) {
                             let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
                                 continue;
                             };
@@ -463,6 +403,28 @@ impl TransactionSystem {
         Ok(())
     }
 
+    /// Deallocate retired row pages, poisoning storage on failure.
+    ///
+    /// Returns `false` only after publishing `FatalError::PurgeDeallocate`.
+    #[inline]
+    async fn deallocate_gc_row_pages_or_poison(
+        &self,
+        mem_pool: &EvictableBufferPool,
+        guards: &PoolGuards,
+        gc_row_pages: FastHashSet<PageID>,
+    ) -> bool {
+        match self
+            .deallocate_gc_row_pages(mem_pool, guards, gc_row_pages)
+            .await
+        {
+            Ok(()) => true,
+            Err(_) => {
+                let _ = self.poison_storage(FatalError::PurgeDeallocate);
+                false
+            }
+        }
+    }
+
     #[inline]
     fn process_retained_table_roots(&self, min_active_sts: TrxID) {
         self.table_roots.lock().release_ready(min_active_sts);
@@ -474,32 +436,13 @@ impl TransactionSystem {
         guards: &PoolGuards,
         min_active_sts: TrxID,
     ) -> Result<()> {
-        // First detach eligible runtime entries under the queue lock, then do
-        // async destruction without holding the lock. Entries that are not past
-        // the purge horizon stay queued for a later wake.
-        let eligible = {
-            let mut queues = self.dropped_tables.lock();
-            let mut eligible = Vec::new();
-            let mut retained = VecDeque::new();
-            while let Some(item) = queues.runtime.pop_front() {
-                if item.drop_cts < min_active_sts {
-                    eligible.push(item);
-                } else {
-                    retained.push_back(item);
-                }
-            }
-            queues.runtime = retained;
-            eligible
-        };
-
         let mut stale_handles = Vec::new();
-        let mut file_deletes = Vec::new();
-        for DroppedTableGcItem {
+        for DroppedTableRuntime {
             table_id,
             drop_cts,
             replay_floor,
             table,
-        } in eligible
+        } in self.catalog.take_dropped_runtime_candidates(min_active_sts)
         {
             match Arc::try_unwrap(table) {
                 Ok(table) => {
@@ -507,16 +450,21 @@ impl TransactionSystem {
                     // runtime. Any destroy error is fatal to the storage runtime
                     // and is converted to poison by the caller.
                     table.destroy_dropped_runtime(guards).await?;
-                    file_deletes.push(DroppedTableFileDeleteItem::new(
-                        table_id,
-                        drop_cts,
-                        replay_floor,
-                    ));
+                    // Runtime destruction leaves only the catalog `DroppedFloor`.
+                    // The queued item schedules checkpoint-gated file unlink;
+                    // redo retention still reads the catalog floor as truth.
+                    self.dropped_table_files
+                        .lock()
+                        .push_ordered(DroppedTableFileCleanup::new(
+                            table_id,
+                            drop_cts,
+                            replay_floor,
+                        ));
                 }
                 Err(table) => {
                     // Stale external table handles are not fatal. Keep retrying
                     // on future purge wakes until the last handle is released.
-                    stale_handles.push(DroppedTableGcItem {
+                    stale_handles.push(DroppedTableRuntime {
                         table_id,
                         drop_cts,
                         replay_floor,
@@ -526,45 +474,83 @@ impl TransactionSystem {
             }
         }
 
-        {
-            let mut queues = self.dropped_tables.lock();
-            queues.runtime.extend(stale_handles);
-            queues.files.extend(file_deletes);
+        let stale_handle_count = stale_handles.len();
+        for (idx, item) in stale_handles.into_iter().enumerate() {
+            let table_id = item.table_id;
+            let drop_cts = item.drop_cts;
+            let replay_floor = item.replay_floor;
+            let strong_count = Arc::strong_count(&item.table);
+            let remaining_stale_handles = stale_handle_count - idx - 1;
+            if !self.catalog.restore_dropped_runtime(item) {
+                return Err(Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "restore dropped table runtime after stale handle: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, strong_count={strong_count}, remaining_stale_handles={remaining_stale_handles}"
+                    ))
+                    .into());
+            }
         }
 
         self.process_dropped_table_file_deletes();
         Ok(())
     }
 
+    /// Destroy purge-ready dropped table runtimes, poisoning storage on failure.
+    ///
+    /// Returns `false` only after publishing `FatalError::PurgeDeallocate`.
+    #[inline]
+    async fn process_dropped_table_gc_or_poison(
+        &self,
+        guards: &PoolGuards,
+        min_active_sts: TrxID,
+    ) -> bool {
+        match self.process_dropped_table_gc(guards, min_active_sts).await {
+            Ok(()) => true,
+            Err(_) => {
+                let _ = self.poison_storage(FatalError::PurgeDeallocate);
+                false
+            }
+        }
+    }
+
     #[inline]
     fn process_dropped_table_file_deletes(&self) {
         // File deletion is a checkpoint-gated housekeeping step. Unlike runtime
         // destroy, unlink failure is retryable and does not poison the engine:
-        // retain the item and let a later purge wake try again.
+        // retain the catalog floor entry and requeue failed ready items so a
+        // later purge wake can retry without scanning every catalog table.
         let catalog_replay_start_ts = match self.catalog.storage.checkpoint_snapshot() {
             Ok(snapshot) => snapshot.catalog_replay_start_ts,
             Err(_) => return,
         };
-        let file_deletes = {
-            let mut queues = self.dropped_tables.lock();
-            queues.files.drain(..).collect::<Vec<_>>()
-        };
+        // Drain only the checkpoint-ready prefix. Newer entries stay queued,
+        // preserving order without a full drain-and-requeue pass.
+        let file_deletes = self
+            .dropped_table_files
+            .lock()
+            .drain_ready(catalog_replay_start_ts);
         if file_deletes.is_empty() {
             return;
         }
 
-        let mut retained = Vec::new();
+        let mut failed = Vec::new();
         for item in file_deletes {
-            if catalog_replay_start_ts <= item.drop_cts {
-                retained.push(item);
+            if self.table_fs.delete_user_table_file(item.table_id).is_err() {
+                failed.push(item);
                 continue;
             }
-            if self.table_fs.delete_user_table_file(item.table_id).is_err() {
-                retained.push(item);
-            }
+            // Successful unlink is followed by a catalog-validated floor
+            // removal. A mismatch is self-healing in release builds because
+            // startup can rediscover the retained floor and retry the
+            // idempotent file delete, but debug builds should surface the
+            // invariant violation immediately.
+            let removed = self.catalog.remove_dropped_floor(item);
+            debug_assert!(
+                removed,
+                "remove dropped floor after file delete: item={item:?}"
+            );
         }
-        if !retained.is_empty() {
-            self.dropped_tables.lock().files.extend(retained);
+        if !failed.is_empty() {
+            self.dropped_table_files.lock().prepend_failed_ready(failed);
         }
     }
 }
@@ -878,31 +864,27 @@ impl PurgeLoop for PurgeSingleThreaded {
                     Err(_) => return,
                 };
                 gc_row_pages.extend(bucket_gc_pages);
-                if !handle_gc_row_page_deallocation_result(
-                    trx_sys,
-                    trx_sys
-                        .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                        .await,
-                ) {
-                    // The helper already poisoned runtime admission. Exiting the
-                    // loop leaves shutdown to join this already-finished worker.
+                let deallocated = trx_sys
+                    .deallocate_gc_row_pages_or_poison(mem_pool, &pool_guards, gc_row_pages)
+                    .await;
+                if !deallocated {
+                    // Runtime admission is already poisoned. Exiting the loop
+                    // leaves shutdown to join this already-finished worker.
                     return;
                 }
             }
             if work.table_root_retention {
                 trx_sys.process_retained_table_roots(curr_sts);
             }
-            if work.dropped_table
-                && !handle_gc_row_page_deallocation_result(
-                    trx_sys,
-                    trx_sys
-                        .process_dropped_table_gc(&pool_guards, curr_sts)
-                        .await,
-                )
-            {
-                // Dropped-table runtime destruction failed after purge took
-                // ownership. Do not retry in-place against a poisoned runtime.
-                return;
+            if work.dropped_table {
+                let dropped_tables_processed = trx_sys
+                    .process_dropped_table_gc_or_poison(&pool_guards, curr_sts)
+                    .await;
+                if !dropped_tables_processed {
+                    // Dropped-table runtime destruction failed after purge took
+                    // ownership. Do not retry in-place against a poisoned runtime.
+                    return;
+                }
             }
             if work.full_gc {
                 // Once GC is finished, update global_visible_sts so other threads can use it to
@@ -968,12 +950,10 @@ impl PurgeLoop for PurgeDispatcher {
                     let mut g = gc_row_pages.lock();
                     g.drain(..).collect::<FastHashSet<PageID>>()
                 };
-                if !handle_gc_row_page_deallocation_result(
-                    trx_sys,
-                    trx_sys
-                        .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                        .await,
-                ) {
+                let deallocated = trx_sys
+                    .deallocate_gc_row_pages_or_poison(mem_pool, &pool_guards, gc_row_pages)
+                    .await;
+                if !deallocated {
                     // Poison is the durable-consistency boundary here. The
                     // dispatcher exits; once the worker closure drops the
                     // dispatcher value, executor task channels close and
@@ -984,17 +964,15 @@ impl PurgeLoop for PurgeDispatcher {
             if work.table_root_retention {
                 trx_sys.process_retained_table_roots(curr_sts);
             }
-            if work.dropped_table
-                && !handle_gc_row_page_deallocation_result(
-                    trx_sys,
-                    trx_sys
-                        .process_dropped_table_gc(&pool_guards, curr_sts)
-                        .await,
-                )
-            {
-                // Dropped-table destroy failure is fatal; exiting also closes
-                // the executor task channels when this dispatcher is dropped.
-                return;
+            if work.dropped_table {
+                let dropped_tables_processed = trx_sys
+                    .process_dropped_table_gc_or_poison(&pool_guards, curr_sts)
+                    .await;
+                if !dropped_tables_processed {
+                    // Dropped-table destroy failure is fatal; exiting also closes
+                    // the executor task channels when this dispatcher is dropped.
+                    return;
+                }
             }
             if work.full_gc && curr_sts > min_sts {
                 // Once GC is finished, update global_visible_sts so other threads can use it to
@@ -1101,37 +1079,22 @@ fn purge_undo_chain_from_page(
     access.purge_undo_chain(min_active_sts);
 }
 
-#[inline]
-fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Result<()>) -> bool {
-    match res {
-        Ok(()) => true,
-        Err(_) => {
-            // Runtime resource destruction is not replayable once purge has
-            // started mutating in-memory ownership. Treat any error here as a
-            // fatal storage failure: reject new work, let explicit shutdown join
-            // the worker later, and stop this purge cycle immediately.
-            let _ = trx_sys.poison_storage(FatalError::PurgeDeallocate);
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::guard::PageSharedGuard;
-    use crate::buffer::page::VersionedPageID;
+    use crate::buffer::page::{Page, VersionedPageID};
     use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, Result};
-    use crate::id::{BlockID, RowID};
+    use crate::id::{BlockID, RowID, TableID};
     use crate::index::{IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::{DeleteMvcc, SelectKey};
-    use crate::table::{DeleteMarker, Table};
+    use crate::table::{DeleteMarker, Table, TableRedoReplayFloor};
     use crate::trx::row::RowReadAccess;
     use crate::trx::stmt::Statement;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
@@ -1272,6 +1235,93 @@ mod tests {
         stmt.table_delete_unique_mvcc(table_id, key, false).await
     }
 
+    #[inline]
+    fn dropped_file_cleanup(table_id: u64, drop_cts: u64) -> DroppedTableFileCleanup {
+        DroppedTableFileCleanup::new(
+            TableID::new(table_id),
+            TrxID::new(drop_cts),
+            TableRedoReplayFloor {
+                heap_redo_start_ts: TrxID::new(1),
+                deletion_cutoff_ts: TrxID::new(1),
+            },
+        )
+    }
+
+    #[inline]
+    fn cleanup_pairs(items: &[DroppedTableFileCleanup]) -> Vec<(u64, u64)> {
+        items
+            .iter()
+            .map(|item| (item.drop_cts.as_u64(), item.table_id.as_u64()))
+            .collect()
+    }
+
+    #[inline]
+    fn queued_cleanup_pairs(queue: &DroppedTableFileCleanupQueue) -> Vec<(u64, u64)> {
+        queue
+            .files
+            .iter()
+            .map(|item| (item.drop_cts.as_u64(), item.table_id.as_u64()))
+            .collect()
+    }
+
+    #[test]
+    fn test_dropped_table_file_cleanup_queue_sorts_seed_and_insert() {
+        let mut queue = DroppedTableFileCleanupQueue::from_items(vec![
+            dropped_file_cleanup(104, 20),
+            dropped_file_cleanup(103, 10),
+            dropped_file_cleanup(102, 10),
+        ]);
+        assert_eq!(
+            queued_cleanup_pairs(&queue),
+            vec![(10, 102), (10, 103), (20, 104)]
+        );
+
+        queue.push_ordered(dropped_file_cleanup(101, 15));
+        queue.push_ordered(dropped_file_cleanup(105, 10));
+        assert_eq!(
+            queued_cleanup_pairs(&queue),
+            vec![(10, 102), (10, 103), (10, 105), (15, 101), (20, 104)]
+        );
+    }
+
+    #[test]
+    fn test_dropped_table_file_cleanup_queue_drains_ready_prefix_only() {
+        let mut queue = DroppedTableFileCleanupQueue::from_items(vec![
+            dropped_file_cleanup(101, 10),
+            dropped_file_cleanup(102, 20),
+            dropped_file_cleanup(103, 30),
+        ]);
+
+        let ready = queue.drain_ready(TrxID::new(20));
+        assert_eq!(cleanup_pairs(&ready), vec![(10, 101)]);
+        assert_eq!(queued_cleanup_pairs(&queue), vec![(20, 102), (30, 103)]);
+
+        let ready = queue.drain_ready(TrxID::new(31));
+        assert_eq!(cleanup_pairs(&ready), vec![(20, 102), (30, 103)]);
+        assert!(queue.files.is_empty());
+    }
+
+    #[test]
+    fn test_dropped_table_file_cleanup_queue_prepends_failed_ready_items() {
+        let mut queue = DroppedTableFileCleanupQueue::from_items(vec![
+            dropped_file_cleanup(101, 10),
+            dropped_file_cleanup(102, 20),
+            dropped_file_cleanup(103, 30),
+            dropped_file_cleanup(104, 40),
+        ]);
+        let ready = queue.drain_ready(TrxID::new(35));
+        let failed = ready
+            .into_iter()
+            .filter(|item| item.drop_cts >= TrxID::new(20))
+            .collect::<Vec<_>>();
+
+        queue.prepend_failed_ready(failed);
+        assert_eq!(
+            queued_cleanup_pairs(&queue),
+            vec![(20, 102), (30, 103), (40, 104)]
+        );
+    }
+
     #[test]
     fn test_coalesce_purge_work_preserves_strongest_request() {
         let (_tx, rx) = flume::unbounded();
@@ -1360,32 +1410,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dropped_table_file_delete_snapshot_retains_replay_floor_until_catalog_absence() {
-        let replay_floor = TableRedoReplayFloor {
-            heap_redo_start_ts: TrxID::new(7),
-            deletion_cutoff_ts: TrxID::new(11),
-        };
-        let queue = DroppedTableQueue::from_file_deletes(vec![DroppedTableFileDeleteItem::new(
-            TableID::new(100),
-            TrxID::new(30),
-            replay_floor,
-        )]);
-
-        let pending = queue.snapshot_pending_redo_floors(TrxID::new(30));
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].table_id, TableID::new(100));
-        assert_eq!(pending[0].drop_cts, TrxID::new(30));
-        assert_eq!(pending[0].heap_redo_start_ts, TrxID::new(7));
-        assert_eq!(pending[0].deletion_cutoff_ts, TrxID::new(11));
-
-        assert!(
-            queue
-                .snapshot_pending_redo_floors(TrxID::new(31))
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn test_active_sts_list() {
         let mut active_sts_list = ActiveStsList::default();
         for (val, expected, delete) in vec![
@@ -1413,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_gc_row_page_deallocation_result_poisons_runtime() {
+    fn test_deallocate_gc_row_pages_or_poison_poisons_runtime() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1434,16 +1458,39 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(handle_gc_row_page_deallocation_result(
-                &engine.inner().trx_sys,
-                Ok(())
-            ));
+            let guards = full_pool_guards(&engine);
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .deallocate_gc_row_pages_or_poison(
+                        &engine.inner().mem_pool,
+                        &guards,
+                        FastHashSet::default(),
+                    )
+                    .await
+            );
             assert!(engine.inner().trx_sys.storage_poison_error().is_none());
 
-            assert!(!handle_gc_row_page_deallocation_result(
-                &engine.inner().trx_sys,
-                Err(std::io::Error::from_raw_os_error(libc::EIO).into())
-            ));
+            let raw_page = engine
+                .inner()
+                .mem_pool
+                .allocate_page::<Page>(guards.mem_guard())
+                .await
+                .unwrap();
+            let raw_page_id = raw_page.page_id();
+            drop(raw_page);
+            assert!(
+                !engine
+                    .inner()
+                    .trx_sys
+                    .deallocate_gc_row_pages_or_poison(
+                        &engine.inner().mem_pool,
+                        &guards,
+                        FastHashSet::from_iter([raw_page_id]),
+                    )
+                    .await
+            );
             assert!(
                 engine
                     .inner()

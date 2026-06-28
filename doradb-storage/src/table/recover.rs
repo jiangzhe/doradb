@@ -406,6 +406,10 @@ mod tests {
                 .await
                 .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_eq!(
+                engine.catalog().retained_dropped_table_ids_now(),
+                vec![table_id]
+            );
             assert!(std::path::Path::new(&table_file_path).exists());
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
@@ -416,6 +420,7 @@ mod tests {
                 .await
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;
+            assert!(engine.catalog().retained_dropped_table_ids_now().is_empty());
         });
     }
 

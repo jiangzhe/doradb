@@ -27,7 +27,7 @@ pub(crate) mod ver_map;
 
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableCache, is_catalog_obj_id};
+use crate::catalog::{TableCache, is_catalog_table};
 use crate::engine::{EngineRef, WeakEngineRef};
 use crate::error::{
     CompletionErrorKind, Error, FatalError, InternalError, LifecycleError, OperationError,
@@ -658,7 +658,7 @@ impl TrxEffects {
                 .redo
                 .dml
                 .keys()
-                .any(|table_id| is_catalog_obj_id(*table_id))
+                .any(|table_id| is_catalog_table(*table_id))
                 || is_catalog_metadata_ddl(self.redo.ddl.as_deref()),
             "catalog table DML must be logged by a catalog metadata DDL transaction"
         );

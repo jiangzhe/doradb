@@ -1,5 +1,5 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::{TableCache, is_catalog_obj_id};
+use crate::catalog::{TableCache, is_catalog_table};
 use crate::error::Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::SelectKey;
@@ -48,7 +48,7 @@ impl IndexUndoLogs {
         ts: TrxID,
     ) -> Result<()> {
         while let Some(entry) = self.0.pop() {
-            if is_catalog_obj_id(entry.table_id) {
+            if is_catalog_table(entry.table_id) {
                 let table = table_cache.must_get_catalog_table(entry.table_id);
                 table.rollback_index_entry(entry, guards, ts).await?;
             } else {

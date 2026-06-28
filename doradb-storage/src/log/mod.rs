@@ -2835,7 +2835,6 @@ mod tests {
                 purge_tx,
                 cleanup_tx,
             },
-            Vec::new(),
         );
         ManualLogProcessorHarness {
             trx_sys,
