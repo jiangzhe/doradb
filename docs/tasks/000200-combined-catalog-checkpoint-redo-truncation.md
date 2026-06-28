@@ -1,7 +1,7 @@
 ---
 id: 000200
 title: Combined Catalog Checkpoint And Redo Truncation
-status: proposal
+status: implemented
 created: 2026-06-28
 github_issue: 785
 ---
@@ -238,6 +238,38 @@ pub enum CatalogCheckpointOutcome {
 
 ## Implementation Notes
 
+- Implemented `Session::checkpoint_catalog_and_truncate_redo_log()` and public
+  `CatalogRedoMaintenanceOutcome`, with crate-root exports for the composite
+  maintenance outcome and `CatalogCheckpointOutcome`.
+- Split catalog checkpoint publication into a prepared-root path so a combined
+  call can fold checkpoint metadata, projected checkpointed silent watermark
+  cache state, and an advanced `first_redo_log_seq` marker into one
+  `catalog.mtb` root before redo prefix unlink.
+- Added projected truncation planning that uses the post-checkpoint catalog
+  replay boundary, projected silent watermark overlay, live/pending dropped table
+  floors, and merged catalog-safe segment proof from the current scan plus valid
+  cached progress.
+- Preserved standalone `checkpoint_catalog` and `truncate_redo_log` behavior,
+  including marker-before-unlink crash safety, retryable obsolete-prefix cleanup,
+  and releasing the catalog checkpoint gate before filesystem cleanup.
+- Added review-driven comments and invariants for projected catalog replay
+  progress, projected silent watermark overlays, dropped-table floor filtering,
+  fallback CTS-derived catalog-safe segments, and prepared marker application.
+- Added focused combined-API regression tests for checkpoint+marker publish,
+  marker-only publish, projected silent watermarks, active-session rejection,
+  publish-failure no-unlink behavior, poison recheck after gate waits, and
+  catalog-gate release before cleanup. Existing standalone truncation safety
+  tests remain covered.
+- Updated `docs/redo-log.md` for the combined maintenance command. No
+  `docs/checkpoint-and-recovery.md` update was needed because the implementation
+  batches existing durable checkpoint/marker contracts without changing recovery
+  rules.
+- Validation completed:
+  - `tools/style_audit.rs --diff-base origin/main`
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo nextest run -p doradb-storage combined truncate_redo_log`
+  - `cargo nextest run -p doradb-storage`
 
 ## Impacts
 
