@@ -394,6 +394,21 @@ impl CompletionErrorKind {
             .attach(message.into())
     }
 
+    /// Builds a completion report for an unexpected successful IO result.
+    #[inline]
+    pub(crate) fn report_unexpected_result(
+        actual_result: usize,
+        expected_result: usize,
+        message: impl Into<String>,
+    ) -> Report<Self> {
+        Report::new(IoError::from(IoErrorKind::Other))
+            .change_context(Self::Io(IoErrorKind::Other))
+            .attach(format!(
+                "unexpected io completion result: actual_result={actual_result}, expected_result={expected_result}"
+            ))
+            .attach(message.into())
+    }
+
     /// Builds a completion report for a send failure.
     #[inline]
     pub(crate) fn report_send(message: impl Into<String>) -> Report<Self> {

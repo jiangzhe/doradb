@@ -16,7 +16,9 @@ use crate::file::multi_table_file::{
 };
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
-use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
+use crate::file::{
+    SparseFile, SyncSubmission, TableFsStateMachine, TableFsSubmission, WriteSubmission,
+};
 use crate::id::{TableID, TrxID};
 use crate::io::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
@@ -184,6 +186,7 @@ impl PoolBatchWriteRequest {
 /// write-heavy traffic throttled independently from read traffic.
 pub(crate) enum BackgroundWriteRequest {
     Table(WriteSubmission),
+    TableSync(SyncSubmission),
     MemPool(PoolBatchWriteRequest),
     IndexPool(PoolBatchWriteRequest),
 }
@@ -334,6 +337,17 @@ impl StorageStateMachine {
                     .table_fs
                     .prepare_write_request(req, max_new, &mut table_queue)
                     .map(BackgroundWriteRequest::Table);
+                for sub in table_queue.drain_to(table_queue.len()) {
+                    queue.push(StorageSubmission::table(sub));
+                }
+                remainder
+            }
+            BackgroundWriteRequest::TableSync(req) => {
+                let mut table_queue = IOQueue::with_capacity(max_new);
+                let remainder = self
+                    .table_fs
+                    .prepare_sync_request(req, max_new, &mut table_queue)
+                    .map(BackgroundWriteRequest::TableSync);
                 for sub in table_queue.drain_to(table_queue.len()) {
                     queue.push(StorageSubmission::table(sub));
                 }
@@ -1421,6 +1435,9 @@ impl FileSystem {
                     BackgroundWriteRequest::Table(_) => {
                         unreachable!("shared pool write lane returned a table write request");
                     }
+                    BackgroundWriteRequest::TableSync(_) => {
+                        unreachable!("shared pool write lane returned a table fsync request");
+                    }
                 };
                 (req.page_guards, req.done_ev)
             })
@@ -2078,6 +2095,71 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingStorageOpHook {
+        inner: Arc<RecordingStorageOpHookInner>,
+    }
+
+    struct RecordingStorageOpHookInner {
+        recorded_file: StorageBackendFileIdentity,
+        submits: Mutex<Vec<StorageBackendOp>>,
+    }
+
+    impl RecordingStorageOpHook {
+        fn new(recorded_file: StorageBackendFileIdentity) -> Self {
+            Self {
+                inner: Arc::new(RecordingStorageOpHookInner {
+                    recorded_file,
+                    submits: Mutex::new(Vec::new()),
+                }),
+            }
+        }
+
+        fn submits(&self) -> Vec<StorageBackendOp> {
+            self.inner.submits.lock().clone()
+        }
+    }
+
+    impl StorageBackendTestHook for RecordingStorageOpHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if op.matches_file_identity(self.inner.recorded_file) {
+                self.inner.submits.lock().push(op);
+            }
+        }
+    }
+
+    struct FailingStorageOpHook {
+        failed_kind: IOKind,
+        failed_file: StorageBackendFileIdentity,
+        failed: AtomicBool,
+    }
+
+    impl FailingStorageOpHook {
+        fn new(failed_kind: IOKind, failed_file: StorageBackendFileIdentity) -> Self {
+            Self {
+                failed_kind,
+                failed_file,
+                failed: AtomicBool::new(false),
+            }
+        }
+
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == self.failed_kind && op.matches_file_identity(self.failed_file)
+        }
+    }
+
+    impl StorageBackendTestHook for FailingStorageOpHook {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if self.matches(op) && !self.failed.swap(true, Ordering::SeqCst) {
+                *res = Err(StdIoError::from_raw_os_error(libc::EIO));
+            }
+        }
+    }
+
+    fn op_kinds(ops: &[StorageBackendOp]) -> Vec<IOKind> {
+        ops.iter().map(StorageBackendOp::kind).collect()
+    }
+
     async fn wait_until(mut predicate: impl FnMut() -> bool) {
         for _ in 0..TEST_WAIT_RETRIES {
             if predicate() {
@@ -2127,6 +2209,107 @@ pub(crate) mod tests {
             assert_eq!(snapshot.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(snapshot.meta.next_table_id, USER_OBJ_ID_START);
             assert!(mtb.active_root_unchecked().meta_block_id > BlockID::new(0));
+        });
+    }
+
+    #[test]
+    fn test_user_table_commit_submits_backend_fsync_after_root_writes() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = USER_OBJ_ID_START + 201;
+            let mutable = fs
+                .create_table_file(table_id, make_metadata(), false)
+                .unwrap();
+            let table_file_identity =
+                StorageBackendFileIdentity::from_path(fs.user_table_file_path(table_id)).unwrap();
+            let hook = Arc::new(RecordingStorageOpHook::new(table_file_identity));
+            let _hook = install_storage_backend_test_hook(hook.clone());
+
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+
+            let submits = hook.submits();
+            assert_eq!(
+                op_kinds(&submits),
+                vec![IOKind::Write, IOKind::Write, IOKind::Fsync]
+            );
+            assert_eq!(submits[2].fd(), table_file.sparse_file().as_raw_fd());
+            assert_eq!(submits[2].offset(), 0);
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_user_table_commit_fsync_failure_keeps_active_root() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = USER_OBJ_ID_START + 202;
+            let mutable = fs
+                .create_table_file(table_id, make_metadata(), false)
+                .unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            let before_root = table_file.active_root_unchecked().clone();
+            let table_file_identity =
+                StorageBackendFileIdentity::from_path(fs.user_table_file_path(table_id)).unwrap();
+            let _hook = install_storage_backend_test_hook(Arc::new(FailingStorageOpHook::new(
+                IOKind::Fsync,
+                table_file_identity,
+            )));
+
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(2), &table_file);
+            let mutable = MutableTableFile::fork(
+                &table_file,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
+            let err = match mutable.commit(TrxID::new(2), false).await {
+                Ok(_) => panic!("expected table commit fsync failure"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), ErrorKind::Io, "unexpected error: {err:?}");
+            let active_root = table_file.active_root_unchecked();
+            assert_eq!(active_root.slot_no, before_root.slot_no);
+            assert_eq!(active_root.root_ts, before_root.root_ts);
+            assert_eq!(active_root.meta_block_id, before_root.meta_block_id);
+            assert_eq!(active_root.effective_ts(), before_root.effective_ts());
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_catalog_commit_submits_backend_fsync_after_root_writes() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let path = fs.catalog_mtb_file_path();
+            let mtb = match MultiTableFile::open_or_create(&path).await.unwrap() {
+                MultiTableFileOpenOutcome::Created(mtb) => mtb,
+                MultiTableFileOpenOutcome::Opened(_) => {
+                    panic!("fresh catalog path should create a multi-table file")
+                }
+            };
+            let catalog_file_identity = StorageBackendFileIdentity::from_path(&path).unwrap();
+            let hook = Arc::new(RecordingStorageOpHook::new(catalog_file_identity));
+            let _hook = install_storage_backend_test_hook(hook.clone());
+            let mutable = MutableMultiTableFile::new(
+                Arc::clone(&mtb),
+                MultiTableActiveRoot::new(),
+                fs.background_writes(),
+            );
+
+            let (_mtb, old_root) = mutable.commit().await.unwrap();
+            drop(old_root);
+
+            assert_eq!(
+                op_kinds(&hook.submits()),
+                vec![IOKind::Write, IOKind::Write, IOKind::Fsync]
+            );
+            drop(mtb);
+            drop(fs);
         });
     }
 
