@@ -1,5 +1,5 @@
 use super::lifecycle::TableLifecycleState;
-use crate::catalog::{IndexSpec, SilentWatermarkObject, TableMetadata};
+use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
     Result,
@@ -222,6 +222,7 @@ impl SecondaryIndexSidecar {
 
 struct ActiveSecondaryIndexSidecar {
     index_no: usize,
+    key_cols: Box<[usize]>,
     sidecar: SecondaryIndexSidecar,
 }
 
@@ -237,6 +238,11 @@ impl SecondaryCheckpointSidecar {
             .map(|(index_no, index_spec)| {
                 Ok(ActiveSecondaryIndexSidecar {
                     index_no,
+                    key_cols: index_spec
+                        .cols
+                        .iter()
+                        .map(|index_key| index_key.col_no as usize)
+                        .collect(),
                     sidecar: SecondaryIndexSidecar::new(metadata, index_spec)?,
                 })
             })
@@ -251,7 +257,7 @@ impl SecondaryCheckpointSidecar {
 
     fn add_data_row(
         &mut self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         page: &RowPage,
         row_idx: usize,
         row_id: RowID,
@@ -259,14 +265,10 @@ impl SecondaryCheckpointSidecar {
         // Data checkpoint feeds committed-visible transition rows here, once
         // per row selected for persistence.
         for active in &mut self.indexes {
-            let index_no = active.index_no;
-            let index_spec = metadata.idx.require_index_spec(index_no)?;
-            let key = index_spec
-                .cols
+            let key = active
+                .key_cols
                 .iter()
-                .map(|index_key| {
-                    page.val(metadata.col.as_ref(), row_idx, index_key.col_no as usize)
-                })
+                .map(|col_idx| page.val(col_layout, row_idx, *col_idx))
                 .collect();
             active.sidecar.add_data(key, row_id);
         }
@@ -843,21 +845,6 @@ impl Table {
                 .into());
         }
 
-        let index_read_sets = secondary_sidecar
-            .indexes
-            .iter()
-            .enumerate()
-            .map(|(sidecar_pos, active)| {
-                let index_no = active.index_no;
-                let index_spec = metadata.idx.require_index_spec(index_no)?;
-                let read_set = index_spec
-                    .cols
-                    .iter()
-                    .map(|index_key| index_key.col_no as usize)
-                    .collect::<Vec<_>>();
-                Ok((sidecar_pos, index_no, read_set))
-            })
-            .collect::<Result<Vec<_>>>()?;
         let mut sparse_row_idx = 0usize;
         for delta in delete_deltas {
             let row_id = entry
@@ -902,9 +889,17 @@ impl Table {
                     ))
                     .into());
             }
-            for (sidecar_pos, index_no, read_set) in &index_read_sets {
-                let key = block.decode_row_values(metadata.col.as_ref(), row_idx, read_set)?;
-                secondary_sidecar.add_deleted_key_at(*sidecar_pos, *index_no, row_id, key)?;
+            for sidecar_pos in 0..secondary_sidecar.indexes.len() {
+                let (index_no, key) = {
+                    let active = &secondary_sidecar.indexes[sidecar_pos];
+                    let key = block.decode_row_values(
+                        metadata.col.as_ref(),
+                        row_idx,
+                        active.key_cols.as_ref(),
+                    )?;
+                    (active.index_no, key)
+                };
+                secondary_sidecar.add_deleted_key_at(sidecar_pos, index_no, row_id, key)?;
             }
         }
         Ok(())
@@ -1022,12 +1017,14 @@ impl Table {
             .last()
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
-        let mut collect_secondary_row = |page: &RowPage, row_idx, row_id| {
-            secondary_sidecar.add_data_row(metadata, page, row_idx, row_id)
+        let collect_visible_row = if secondary_sidecar.indexes.is_empty() {
+            None
+        } else {
+            let col_layout = metadata.col.as_ref();
+            Some(|page: &RowPage, row_idx: usize, row_id: RowID| {
+                secondary_sidecar.add_data_row(col_layout, page, row_idx, row_id)
+            })
         };
-        let collect_visible_row = (!metadata.idx.index_specs().is_empty()).then_some(
-            &mut collect_secondary_row as &mut dyn FnMut(&RowPage, usize, RowID) -> Result<()>,
-        );
         let (mut lwc_blocks, heap_redo_start_ts) = match self
             .build_lwc_blocks(
                 metadata,
@@ -1223,6 +1220,17 @@ fn silent_watermark_floor(
     active_root: &ActiveRoot,
     mutable_root: &ActiveRoot,
 ) -> Option<TableRedoReplayFloor> {
+    // Any checkpointed table-file data/state change must update one of these
+    // logical root fields before this decision:
+    // - pivot_row_id for persisted row coverage,
+    // - column_block_index_root for LWC inserts or cold-delete rewrites,
+    // - secondary_index_roots for secondary DiskTree checkpoint work,
+    // - metadata for table/index shape changes,
+    // - alloc_map for CoW reachability/allocation changes.
+    // Replay bounds are intentionally excluded because those are the catalog
+    // watermark payload. `meta_block_id` is also excluded because the normal
+    // table checkpoint path reserves the publish meta block only after this
+    // silent-vs-root-publication decision.
     let table_file_work = active_root.pivot_row_id != mutable_root.pivot_row_id
         || active_root.column_block_index_root != mutable_root.column_block_index_root
         || active_root.secondary_index_roots != mutable_root.secondary_index_roots

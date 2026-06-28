@@ -1,7 +1,7 @@
 ---
 id: 000199
 title: Catalog Silent Table Replay Watermarks
-status: proposal
+status: implemented
 created: 2026-06-28
 github_issue: 782
 ---
@@ -31,7 +31,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md
+- docs/backlogs/closed/000134-centralize-silent-table-checkpoint-watermarks.md
 
 Related design context:
 - docs/tasks/000196-global-truncation-floor-planning.md
@@ -266,6 +266,42 @@ DDLRedo::TableReplaySilentWatermark { table_id: TableID }
 
 ## Implementation Notes
 
+- Implemented `catalog.table_replay_silent_watermarks` as the fifth catalog
+  logical table, with `SilentWatermarkObject`, fieldwise-max row upsert,
+  checkpoint-root loading, and the `DDLRedo::TableReplaySilentWatermark`
+  metadata marker so catalog checkpoints materialize silent watermark DML.
+- Added the checkpoint-durable `CatalogStorage::checkpointed_silent_watermarks`
+  overlay cache. Recovery, redo truncation planning, and dropped-table retained
+  floor capture now compute effective table replay floors as the fieldwise max
+  of user-table root floors and checkpointed silent watermark rows.
+- Updated `Table::checkpoint` so replay-bound-only checkpoints abandon the
+  table-file fork, upsert the catalog watermark, and return
+  `CheckpointOutcome::Published { silent: true, .. }`. Root-publishing
+  checkpoints return `silent: false`. Comments document why heartbeat
+  checkpoints still advance replay floors through checkpoint transaction STS.
+- Preserved the durable-proof boundary: committed but uncheckpointed watermark
+  rows are visible catalog state, but recovery and truncation use only the
+  checkpointed overlay cache until catalog checkpoint folds those rows into
+  `catalog.mtb`.
+- Updated checkpoint/recovery, redo-log, and table-file documentation for
+  catalog-backed silent watermark overlays and root-plus-overlay replay floor
+  semantics.
+- Review follow-ups completed during implementation: corrected the
+  `SilentWatermarkObject` and `checkpointed_silent_watermarks` spelling,
+  simplified checkpoint root-change detection to `Option<TableRedoReplayFloor>`,
+  added the `silent` diagnostic field to `CheckpointOutcome::Published`, and
+  clarified recovery/table replay floor comments.
+- Deferred a generic unique-key MVCC upsert table-access API to
+  `docs/backlogs/000138-unique-key-mvcc-upsert-table-access-api.md` instead of
+  broadening this task beyond the catalog watermark implementation.
+- Closed source backlog
+  `docs/backlogs/closed/000134-centralize-silent-table-checkpoint-watermarks.md`
+  as implemented and synced RFC 0022 follow-up references for this completed
+  optimization.
+- Validation completed with `cargo nextest run -p doradb-storage`,
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings`,
+  focused silent watermark/checkpoint/recovery test reruns, `git diff --check`,
+  and `tools/style_audit.rs --diff-base origin/main`.
 
 ## Impacts
 
@@ -387,6 +423,8 @@ Regression and validation:
 
 No open questions for the approved scope.
 
-If implementation discovers that adding the fifth catalog table requires
-production compatibility migration for existing `catalog.mtb` files, stop and
-escalate the migration design to an RFC before continuing.
+Future improvement:
+- `docs/backlogs/000138-unique-key-mvcc-upsert-table-access-api.md` tracks the
+  broader storage/table-access API follow-up for replacing bespoke
+  find/delete/insert upsert sequences with a reusable unique-key MVCC upsert
+  interface.

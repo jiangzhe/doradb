@@ -355,12 +355,14 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
   - Implementation Summary: Implemented internal dry-run redo truncation planning from catalog-safe progress, live table floors, pending dropped-table floors, and retained segment metadata, with dropped-table floor retention and explicit candidate/blocker reporting. [Task Resolve Sync: docs/tasks/000196-global-truncation-floor-planning.md @ 2026-06-27]
   - Related Backlogs:
     - `docs/backlogs/closed/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
+    - `docs/backlogs/closed/000134-centralize-silent-table-checkpoint-watermarks.md`
+      implemented the catalog-backed heartbeat watermark optimization through
+      task 000199.
+    - `docs/backlogs/closed/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+      implemented the dropped-table retained-floor ownership follow-up through
+      task 000198.
   - Deferred Follow-ups:
-    - `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md`
-      remains open for catalog-backed heartbeat watermark optimization.
-    - `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
-      remains open for a cleaner dropped-table ownership model that removes the
-      foreground drop handoff gap.
+    - None.
 
 - **Phase 4: Session Truncate API**
   - Scope: Add `Session::truncate_redo_log`, publish marker advancement before
@@ -426,10 +428,6 @@ The implementation intentionally deferred the following non-blocking work. These
 items remain open for future task/RFC planning and are not required to close RFC
 0022:
 
-- `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md` -
-  catalog-backed heartbeat watermark overrides for static tables.
-- `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
-  - retained dropped-table runtime ownership until catalog absence is durable.
 - `docs/backlogs/000136-combine-catalog-checkpoint-redo-truncation.md` -
   combined catalog checkpoint plus redo truncation command and single
   `catalog.mtb` publication.
@@ -455,7 +453,7 @@ items remain open for future task/RFC planning and are not required to close RFC
 - `docs/redo-log.md`
 - `docs/checkpoint-and-recovery.md`
 - `docs/backlogs/closed/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
-- `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md`
-- `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+- `docs/backlogs/closed/000134-centralize-silent-table-checkpoint-watermarks.md`
+- `docs/backlogs/closed/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
 - `docs/backlogs/000136-combine-catalog-checkpoint-redo-truncation.md`
 - `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md`

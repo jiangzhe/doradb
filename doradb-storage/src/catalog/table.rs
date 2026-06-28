@@ -310,12 +310,6 @@ impl IndexSpecs {
         self.slots.len()
     }
 
-    /// Returns whether there are no active secondary indexes.
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.active_count == 0
-    }
-
     /// Returns the number of active secondary indexes.
     #[inline]
     pub(crate) fn active_count(&self) -> usize {
