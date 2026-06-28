@@ -27,6 +27,86 @@ const COL_NO_COLUMNS_COLUMN_ATTRIBUTES: usize = 4;
 const COL_NAME_COLUMNS_COLUMN_ATTRIBUTES: &str = "column_attributes";
 const PK_NO_COLUMNS: usize = 0;
 
+/// Runtime accessor for `catalog.columns`.
+pub(crate) struct Columns<'a> {
+    pub(super) table: &'a CatalogTable,
+}
+
+impl Columns<'_> {
+    /// Insert a column.
+    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &ColumnObject) -> bool {
+        let cols = vec![
+            Val::from(obj.table_id),
+            Val::from(obj.column_no),
+            Val::from(obj.column_name.as_str()),
+            Val::from(obj.column_type as u32),
+            Val::from(obj.column_attributes.bits()),
+        ];
+        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
+    }
+
+    /// List all columns of one table from uncommitted-visible catalog rows.
+    pub(crate) async fn list_uncommitted_by_table_id(
+        &self,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) -> Result<Vec<ColumnObject>> {
+        let mut res = vec![];
+        self.table
+            .table_scan_uncommitted(guards, |col_layout, row| {
+                if row.is_deleted() {
+                    return true;
+                }
+                // filter by table id before deserializing the whole object.
+                let table_id_in_row = row
+                    .val(col_layout, COL_NO_COLUMNS_TABLE_ID)
+                    .as_u64()
+                    .unwrap();
+                if table_id_in_row == table_id.as_u64() {
+                    let obj = row_to_column_object(col_layout, row);
+                    res.push(obj);
+                }
+                true
+            })
+            .await?;
+        Ok(res)
+    }
+
+    /// Delete a column by (table_id, column_no).
+    pub(crate) async fn delete_by_id(
+        &self,
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+        column_no: u16,
+    ) -> bool {
+        let key = SelectKey::new(
+            PK_NO_COLUMNS,
+            vec![Val::from(table_id), Val::from(column_no)],
+        );
+        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
+            .await
+            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
+    }
+
+    /// Delete all columns for one table and return the number of deleted rows.
+    pub(crate) async fn delete_by_table_id(
+        &self,
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+    ) -> Result<usize> {
+        let columns = self
+            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .await?;
+        let mut deleted = 0;
+        for column in columns {
+            if self.delete_by_id(stmt, table_id, column.column_no).await {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+}
+
 /// Return static table definition of `catalog.columns`.
 pub(super) fn catalog_definition_of_columns() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
@@ -105,86 +185,6 @@ fn row_to_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> ColumnO
         column_name: SemiStr::new(column_name),
         column_type: ValKind::try_from(column_type as u8).unwrap(),
         column_attributes: ColumnAttributes::from_bits_truncate(column_attributes),
-    }
-}
-
-/// Runtime accessor for `catalog.columns`.
-pub(crate) struct Columns<'a> {
-    pub(super) table: &'a CatalogTable,
-}
-
-impl Columns<'_> {
-    /// Insert a column.
-    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &ColumnObject) -> bool {
-        let cols = vec![
-            Val::from(obj.table_id),
-            Val::from(obj.column_no),
-            Val::from(obj.column_name.as_str()),
-            Val::from(obj.column_type as u32),
-            Val::from(obj.column_attributes.bits()),
-        ];
-        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
-    }
-
-    /// List all columns of one table from uncommitted-visible catalog rows.
-    pub(crate) async fn list_uncommitted_by_table_id(
-        &self,
-        guards: &PoolGuards,
-        table_id: TableID,
-    ) -> Result<Vec<ColumnObject>> {
-        let mut res = vec![];
-        self.table
-            .table_scan_uncommitted(guards, |col_layout, row| {
-                if row.is_deleted() {
-                    return true;
-                }
-                // filter by table id before deserializing the whole object.
-                let table_id_in_row = row
-                    .val(col_layout, COL_NO_COLUMNS_TABLE_ID)
-                    .as_u64()
-                    .unwrap();
-                if table_id_in_row == table_id.as_u64() {
-                    let obj = row_to_column_object(col_layout, row);
-                    res.push(obj);
-                }
-                true
-            })
-            .await?;
-        Ok(res)
-    }
-
-    /// Delete a column by (table_id, column_no).
-    pub(crate) async fn delete_by_id(
-        &self,
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-        column_no: u16,
-    ) -> bool {
-        let key = SelectKey::new(
-            PK_NO_COLUMNS,
-            vec![Val::from(table_id), Val::from(column_no)],
-        );
-        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
-            .await
-            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
-    }
-
-    /// Delete all columns for one table and return the number of deleted rows.
-    pub(crate) async fn delete_by_table_id(
-        &self,
-        stmt: &mut Statement<'_>,
-        table_id: TableID,
-    ) -> Result<usize> {
-        let columns = self
-            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
-            .await?;
-        let mut deleted = 0;
-        for column in columns {
-            if self.delete_by_id(stmt, table_id, column.column_no).await {
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
     }
 }
 

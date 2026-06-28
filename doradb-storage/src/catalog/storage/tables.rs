@@ -14,12 +14,62 @@ use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
+/// Catalog table id for `catalog.tables`.
 pub(crate) const TABLE_ID_TABLES: TableID = TableID::new(0);
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
 const COL_NO_TABLES_NEXT_INDEX_NO: usize = 1;
 const COL_NAME_TABLES_NEXT_INDEX_NO: &str = "next_index_no";
 const PK_NO_TABLES: usize = 0;
+
+/// Runtime accessor for `catalog.tables`.
+pub(crate) struct Tables<'a> {
+    pub(super) table: &'a CatalogTable,
+}
+
+impl Tables<'_> {
+    /// List all table rows from uncommitted-visible catalog state.
+    pub(crate) async fn list_uncommitted(&self, guards: &PoolGuards) -> Result<Vec<TableObject>> {
+        let mut res = vec![];
+        self.table
+            .table_scan_uncommitted(guards, |col_layout, row| {
+                if row.is_deleted() {
+                    return true;
+                }
+                res.push(row_to_table_object(col_layout, row));
+                true
+            })
+            .await?;
+        Ok(res)
+    }
+
+    /// Find a table by id.
+    #[inline]
+    pub(crate) async fn find_uncommitted_by_id(
+        &self,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) -> Result<Option<TableObject>> {
+        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
+        self.table
+            .index_lookup_unique_uncommitted(guards, &key, row_to_table_object)
+            .await
+    }
+
+    /// Insert a table.
+    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &TableObject) -> bool {
+        let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
+        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
+    }
+
+    /// Delete a table by id.
+    pub(crate) async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
+        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
+        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
+            .await
+            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
+    }
+}
 
 /// Return static table definition of `catalog.tables`.
 pub(crate) fn catalog_definition_of_tables() -> &'static CatalogDefinition {
@@ -66,55 +116,6 @@ fn row_to_table_object(col_layout: &TableColumnLayout, row: Row<'_>) -> TableObj
     TableObject {
         table_id,
         next_index_no,
-    }
-}
-
-/// Runtime accessor for `catalog.tables`.
-pub(crate) struct Tables<'a> {
-    pub(super) table: &'a CatalogTable,
-}
-
-impl Tables<'_> {
-    /// List all table rows from uncommitted-visible catalog state.
-    pub(crate) async fn list_uncommitted(&self, guards: &PoolGuards) -> Result<Vec<TableObject>> {
-        let mut res = vec![];
-        self.table
-            .table_scan_uncommitted(guards, |col_layout, row| {
-                if row.is_deleted() {
-                    return true;
-                }
-                res.push(row_to_table_object(col_layout, row));
-                true
-            })
-            .await?;
-        Ok(res)
-    }
-
-    /// Find a table by id.
-    #[inline]
-    pub(crate) async fn find_uncommitted_by_id(
-        &self,
-        guards: &PoolGuards,
-        table_id: TableID,
-    ) -> crate::error::Result<Option<TableObject>> {
-        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
-        self.table
-            .index_lookup_unique_uncommitted(guards, &key, row_to_table_object)
-            .await
-    }
-
-    /// Insert a table.
-    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &TableObject) -> bool {
-        let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
-        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
-    }
-
-    /// Delete a table by id.
-    pub(crate) async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
-        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
-        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
-            .await
-            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
 }
 
