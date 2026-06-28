@@ -384,12 +384,16 @@ impl Catalog {
     ) {
         let mut live = Vec::new();
         let mut dropped = Vec::new();
+        let checkpointed_slient_watermarks = self.storage.checkpointed_slient_watermarks();
         for entry in &self.user_tables {
             let table_id = *entry.key();
             match entry.value() {
                 UserTableEntry::Live { table } => live.push(LiveTableRedoReplayFloor {
                     table_id,
-                    floor: table.redo_replay_floor_snapshot(),
+                    floor: effective_table_redo_replay_floor(
+                        table.redo_replay_floor_snapshot(),
+                        checkpointed_slient_watermarks.get(&table_id).copied(),
+                    ),
                 }),
                 UserTableEntry::DroppedRuntime {
                     drop_cts,
@@ -408,6 +412,20 @@ impl Catalog {
         live.sort_by_key(|floor| floor.table_id.as_u64());
         dropped.sort_by_key(|floor| (floor.drop_cts.as_u64(), floor.table_id.as_u64()));
         (live, dropped)
+    }
+
+    /// Compute the checkpoint-durable root-plus-overlay replay floor for one table.
+    #[inline]
+    pub(crate) fn effective_user_table_redo_replay_floor(
+        &self,
+        table_id: TableID,
+        root_floor: TableRedoReplayFloor,
+    ) -> TableRedoReplayFloor {
+        let checkpointed_slient_watermarks = self.storage.checkpointed_slient_watermarks();
+        effective_table_redo_replay_floor(
+            root_floor,
+            checkpointed_slient_watermarks.get(&table_id).copied(),
+        )
     }
 
     /// Acquires the catalog checkpoint side of the catalog metadata gate.
@@ -970,6 +988,18 @@ pub(crate) const fn is_user_table(table_id: TableID) -> bool {
 #[inline]
 pub(crate) const fn is_catalog_table(table_id: TableID) -> bool {
     !is_user_table(table_id)
+}
+
+/// Combine table-root replay bounds with a checkpoint-durable silent overlay.
+#[inline]
+pub(crate) fn effective_table_redo_replay_floor(
+    root_floor: TableRedoReplayFloor,
+    checkpointed_silent: Option<TableRedoReplayFloor>,
+) -> TableRedoReplayFloor {
+    checkpointed_silent.map_or(root_floor, |silent| TableRedoReplayFloor {
+        heap_redo_start_ts: root_floor.heap_redo_start_ts.max(silent.heap_redo_start_ts),
+        deletion_cutoff_ts: root_floor.deletion_cutoff_ts.max(silent.deletion_cutoff_ts),
+    })
 }
 
 #[inline]

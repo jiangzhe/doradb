@@ -1,12 +1,14 @@
 mod columns;
 mod indexes;
 mod object;
+mod table_replay_silent_watermarks;
 pub(crate) mod tables;
 
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
 pub(crate) use crate::catalog::storage::object::*;
+use crate::catalog::storage::table_replay_silent_watermarks::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{
@@ -28,10 +30,13 @@ use crate::index::{
 use crate::io::DirectBuf;
 use crate::log::redo::RowRedoKind;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
+use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::SelectKey;
+use crate::table::TableRedoReplayFloor;
 use crate::value::Val;
 use error_stack::Report;
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -47,6 +52,16 @@ pub(crate) struct CatalogStorage {
     next_table_id: TableID,
     pub(super) mtb: Arc<MultiTableFile>,
     pub(super) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    /// Checkpoint-durable table replay watermark overlays.
+    ///
+    /// This cache is rebuilt only from checkpointed
+    /// `catalog.table_replay_silent_watermarks` roots. A committed silent
+    /// watermark transaction can make current catalog rows newer than this
+    /// cache, but recovery and redo truncation must not treat those rows as
+    /// durable proof until a catalog checkpoint folds them into `catalog.mtb`.
+    /// Callers combine these overlays with user-table root floors by fieldwise
+    /// maximum.
+    checkpointed_slient_watermarks: Mutex<Arc<FastHashMap<TableID, TableRedoReplayFloor>>>,
 }
 
 impl CatalogStorage {
@@ -69,6 +84,7 @@ impl CatalogStorage {
             catalog_definition_of_columns(),
             catalog_definition_of_indexes(),
             catalog_definition_of_index_columns(),
+            catalog_definition_of_table_replay_silent_watermarks(),
         ] {
             // make sure table id matches.
             assert_eq!(cat.len(), table_id.as_usize());
@@ -94,6 +110,7 @@ impl CatalogStorage {
             next_table_id: mtb_snapshot.meta.next_table_id,
             mtb,
             disk_pool,
+            checkpointed_slient_watermarks: Mutex::new(Arc::new(FastHashMap::default())),
         })
     }
 
@@ -127,6 +144,27 @@ impl CatalogStorage {
         IndexColumns {
             table: &self.tables[TABLE_ID_INDEX_COLUMNS.as_usize()],
         }
+    }
+
+    /// Accessor of `catalog.table_replay_silent_watermarks`.
+    #[inline]
+    pub(crate) fn table_replay_silent_watermarks(&self) -> TableReplaySilentWatermarks<'_> {
+        TableReplaySilentWatermarks {
+            table: &self.tables[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()],
+        }
+    }
+
+    /// Clone the checkpoint-durable silent watermark overlay snapshot.
+    ///
+    /// The snapshot is loaded from checkpointed catalog roots only. It does not
+    /// include silent watermark transactions committed after the latest catalog
+    /// checkpoint, even though those rows are visible through
+    /// `table_replay_silent_watermarks()`.
+    #[inline]
+    pub(crate) fn checkpointed_slient_watermarks(
+        &self,
+    ) -> Arc<FastHashMap<TableID, TableRedoReplayFloor>> {
+        Arc::clone(&self.checkpointed_slient_watermarks.lock())
     }
 
     /// Return one catalog table runtime by table id.
@@ -208,6 +246,13 @@ impl CatalogStorage {
                 self.tables[idx].insert_no_trx(guards, &row.vals).await?;
             }
         }
+        let watermarks = self
+            .load_checkpointed_table_replay_silent_watermark_map(
+                guards.disk_guard(),
+                snapshot.meta.table_roots[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()],
+            )
+            .await?;
+        self.install_checkpointed_slient_watermarks(watermarks);
         Ok(())
     }
 
@@ -307,11 +352,53 @@ impl CatalogStorage {
             // avoid reading catalog indexes just to rebuild the same map.
             mutable.reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)?;
         }
+        let disk_pool_guard = self.disk_pool.pool_guard();
+        let checkpointed_slient_watermarks = self
+            .load_checkpointed_table_replay_silent_watermark_map(
+                &disk_pool_guard,
+                new_roots[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()],
+            )
+            .await?;
         let (_, old_root) = mutable.commit_prepared().await?;
         drop(old_root);
+        self.install_checkpointed_slient_watermarks(checkpointed_slient_watermarks);
         Ok(CatalogCheckpointApplyOutcome::Published {
             catalog_replay_start_ts: next_catalog_replay_start_ts,
         })
+    }
+
+    #[inline]
+    fn install_checkpointed_slient_watermarks(
+        &self,
+        watermarks: FastHashMap<TableID, TableRedoReplayFloor>,
+    ) {
+        *self.checkpointed_slient_watermarks.lock() = Arc::new(watermarks);
+    }
+
+    async fn load_checkpointed_table_replay_silent_watermark_map(
+        &self,
+        disk_pool_guard: &PoolGuard,
+        root: CatalogTableRootDesc,
+    ) -> Result<FastHashMap<TableID, TableRedoReplayFloor>> {
+        let rows = self
+            .load_visible_rows_from_root(
+                self.tables[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()].metadata(),
+                disk_pool_guard,
+                root,
+            )
+            .await?;
+        let mut watermarks = FastHashMap::default();
+        for row in rows {
+            let obj = table_replay_silent_watermark_object_from_vals(&row.vals)?;
+            watermarks.insert(
+                obj.table_id,
+                TableRedoReplayFloor {
+                    heap_redo_start_ts: obj.heap_redo_start_ts,
+                    deletion_cutoff_ts: obj.deletion_cutoff_ts,
+                },
+            );
+        }
+        Ok(watermarks)
     }
 
     async fn rebuild_catalog_alloc_map(
@@ -679,6 +766,24 @@ impl CatalogStorage {
         index.collect_leaf_entries().await
     }
 
+    /// Load checkpoint-visible rows from one catalog table root.
+    ///
+    /// This is a disk-root reader, not a runtime catalog-table scan. The `root`
+    /// must come from a checkpointed `catalog.mtb` root descriptor or from a
+    /// newly prepared descriptor that is about to be published. Rows committed
+    /// after that descriptor was produced are intentionally invisible here.
+    ///
+    /// `visible` means present in persisted LWC blocks and not tombstoned by the
+    /// column block's persisted delete deltas. This helper does not apply MVCC
+    /// visibility rules, does not read in-memory catalog rows, and does not
+    /// validate that the descriptor's `table_id` matches the supplied metadata;
+    /// callers that iterate descriptor slots must enforce that outer invariant.
+    ///
+    /// Empty roots are represented by `root_block_id == None` and
+    /// `pivot_row_id == 0`. Any other empty-root shape is treated as catalog
+    /// payload corruption. Returned rows are decoded with `metadata`; malformed
+    /// row ids, delete deltas, or LWC payloads are surfaced as catalog payload
+    /// errors.
     async fn load_visible_rows_from_root(
         &self,
         metadata: &TableMetadata,

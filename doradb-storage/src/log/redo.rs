@@ -174,6 +174,7 @@ pub(crate) enum DDLRedoCode {
     DropIndex = 132,
     CreateRowPage = 133,
     DataCheckpoint = 134,
+    TableReplaySilentWatermark = 135,
 }
 
 impl TryFrom<u8> for DDLRedoCode {
@@ -188,6 +189,7 @@ impl TryFrom<u8> for DDLRedoCode {
             132 => Ok(DDLRedoCode::DropIndex),
             133 => Ok(DDLRedoCode::CreateRowPage),
             134 => Ok(DDLRedoCode::DataCheckpoint),
+            135 => Ok(DDLRedoCode::TableReplaySilentWatermark),
             _ => Err(()),
         }
     }
@@ -219,6 +221,9 @@ pub(crate) enum DDLRedo {
         pivor_row_id: RowID,
         sts: TrxID,
     },
+    TableReplaySilentWatermark {
+        table_id: TableID,
+    },
 }
 
 impl DDLRedo {
@@ -232,6 +237,7 @@ impl DDLRedo {
             DDLRedo::DropIndex { .. } => DDLRedoCode::DropIndex,
             DDLRedo::CreateRowPage { .. } => DDLRedoCode::CreateRowPage,
             DDLRedo::DataCheckpoint { .. } => DDLRedoCode::DataCheckpoint,
+            DDLRedo::TableReplaySilentWatermark { .. } => DDLRedoCode::TableReplaySilentWatermark,
         }
     }
 }
@@ -254,6 +260,7 @@ impl Ser<'_> for DDLRedo {
                 DDLRedo::DataCheckpoint { .. } => {
                     mem::size_of::<TableID>() + mem::size_of::<RowID>() + mem::size_of::<TrxID>()
                 }
+                DDLRedo::TableReplaySilentWatermark { .. } => mem::size_of::<TableID>(),
             }
     }
 
@@ -295,6 +302,9 @@ impl Ser<'_> for DDLRedo {
                 idx = out.ser_u64(idx, table_id.as_u64());
                 idx = out.ser_u64(idx, pivor_row_id.as_u64());
                 idx = out.ser_u64(idx, sts.as_u64());
+            }
+            DDLRedo::TableReplaySilentWatermark { table_id } => {
+                idx = out.ser_u64(idx, table_id.as_u64());
             }
         }
         idx
@@ -360,6 +370,10 @@ impl Deser for DDLRedo {
                         sts,
                     },
                 ))
+            }
+            DDLRedoCode::TableReplaySilentWatermark => {
+                let (idx, table_id) = TableID::deser(input, idx)?;
+                Ok((idx, DDLRedo::TableReplaySilentWatermark { table_id }))
             }
         }
     }
@@ -1018,6 +1032,22 @@ mod tests {
                 assert_eq!(sts, TrxID::new(42));
             }
             _ => panic!("Expected DataCheckpoint"),
+        }
+
+        // 测试用例7：TableReplaySilentWatermark
+        let watermark = DDLRedo::TableReplaySilentWatermark {
+            table_id: TableID::new(10),
+        };
+        let mut buf = vec![0; watermark.ser_len()];
+        watermark.ser(&mut buf[..], 0);
+        assert_eq!(buf[0], DDLRedoCode::TableReplaySilentWatermark as u8);
+
+        let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
+        match deserialized {
+            DDLRedo::TableReplaySilentWatermark { table_id } => {
+                assert_eq!(table_id, TableID::new(10));
+            }
+            _ => panic!("Expected TableReplaySilentWatermark"),
         }
     }
 

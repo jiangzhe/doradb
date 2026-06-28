@@ -1382,7 +1382,7 @@ pub(crate) mod tests {
         let mut last_delay = None;
         for _ in 0..50 {
             match session.checkpoint_table(table_id).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts } => return checkpoint_ts,
+                CheckpointOutcome::Published { checkpoint_ts, .. } => return checkpoint_ts,
                 CheckpointOutcome::Delayed { reason } => {
                     last_delay = Some(reason);
                     Timer::after(Duration::from_millis(20)).await;

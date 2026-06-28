@@ -524,6 +524,7 @@ impl Catalog {
             DDLRedo::CreateRowPage { .. } | DDLRedo::DataCheckpoint { .. } => {
                 Ok(CatalogCheckpointTxnAction::Skip)
             }
+            DDLRedo::TableReplaySilentWatermark { .. } => Ok(CatalogCheckpointTxnAction::Include),
             DDLRedo::CreateIndex { table_id, index_no } => self
                 .catalog_checkpoint_index_ddl_action(
                     IndexDdlKind::Create,

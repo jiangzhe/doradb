@@ -1154,7 +1154,9 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         }
     };
 
-    let replay_floor = table.redo_replay_floor_snapshot();
+    let replay_floor = engine
+        .catalog()
+        .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
     finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)?;
     table_locks.fail_waiters_on_release(OperationError::TableNotFound);
     // Foreground DROP TABLE stops at logical removal. The catalog map retains
@@ -1360,6 +1362,12 @@ async fn execute_drop_table_catalog_cascade(
                 .attach(format!("drop table catalog row: table_id={table_id}"))
                 .into());
         }
+        engine
+            .catalog()
+            .storage
+            .table_replay_silent_watermarks()
+            .delete_by_table_id(stmt, table_id)
+            .await?;
 
         validate_drop_catalog_delete_counts(
             table_id,

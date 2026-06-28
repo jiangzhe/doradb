@@ -320,6 +320,7 @@ RowRedo :=
 - `132 DropIndex`: `TableID + u16 index_no`.
 - `133 CreateRowPage`: `TableID + PageID + start RowID + end RowID`.
 - `134 DataCheckpoint`: `TableID + pivot RowID + STS`.
+- `135 TableReplaySilentWatermark`: `TableID`.
 
 The DML map is keyed by table and row. `RowRedo` still repeats `row_id`, and
 also carries `page_id`, because replay of user-table heap records needs the
@@ -461,12 +462,14 @@ including `max_redo_cts == replay_floor`, is scanned normally. Each decoded
 `TrxLog` header CTS must fall within the inclusive group-start metadata
 `min_redo_cts..=max_redo_cts` range.
 
-Recovery first loads checkpointed catalog state and user table roots. It then
-computes replay floors:
+Recovery first loads checkpointed catalog state and user table roots. It also
+loads checkpointed `catalog.table_replay_silent_watermarks` rows as durable
+overlays. It then computes replay floors:
 
 - `catalog_replay_start_ts` from the catalog checkpoint;
-- per-table `heap_redo_start_ts`;
-- per-table `deletion_cutoff_ts`; and
+- per-table effective `heap_redo_start_ts`, computed as the fieldwise max of
+  the user-table root and checkpointed silent watermark row;
+- per-table effective `deletion_cutoff_ts`, computed the same way; and
 - `replay_floor = min(catalog replay start, loaded table heap/delete starts)`.
 
 The highest recovered timestamp is tracked separately from replay filtering.
@@ -496,8 +499,10 @@ observes sealed historical files plus exactly one active unsealed file.
 Replay rules:
 
 - catalog redo before `catalog_replay_start_ts` is skipped;
-- user-table heap redo before that table's `heap_redo_start_ts` is skipped;
-- cold-delete redo before that table's `deletion_cutoff_ts` is skipped;
+- user-table heap redo before that table's effective `heap_redo_start_ts` is
+  skipped;
+- cold-delete redo before that table's effective `deletion_cutoff_ts` is
+  skipped;
 - DDL records are pipeline breakers before metadata mutations;
 - `CreateTable` reloads the table file root;
 - `DropTable` removes runtime state and queues dropped-file cleanup;
@@ -511,8 +516,11 @@ from `DiskTree` roots in table-file checkpoints.
 
 Catalog checkpoint also scans redo. It reads the same single stream from
 `catalog_replay_start_ts` through `TransactionSystem::persisted_watermark_cts()`
-and folds safe catalog metadata changes into `catalog.mtb`. Some table DDL can
-stop the scan before an unsafe ordering point.
+and folds safe catalog metadata changes into `catalog.mtb`.
+`DDLRedo::TableReplaySilentWatermark` is a catalog metadata marker: its catalog
+row DML is folded into `catalog.mtb`, but committed rows newer than the last
+catalog checkpoint are not used for recovery replay skipping or redo
+truncation. Some table DDL can stop the scan before an unsafe ordering point.
 
 ## IO Pattern
 

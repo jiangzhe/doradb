@@ -1,5 +1,5 @@
 use super::lifecycle::TableLifecycleState;
-use crate::catalog::{IndexSpec, TableMetadata};
+use crate::catalog::{IndexSpec, SlientWatermarkObject, TableMetadata};
 use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
     Result,
@@ -16,7 +16,7 @@ use crate::log::redo::DDLRedo;
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowPage;
 use crate::session::SessionPin;
-use crate::table::{CheckpointCancelReason, Table, TableRuntimeLayout};
+use crate::table::{CheckpointCancelReason, Table, TableRedoReplayFloor, TableRuntimeLayout};
 #[cfg(test)]
 use crate::trx::tests::discard_transaction_after_fatal_rollback;
 use crate::value::{Val, ValKind, ValType};
@@ -64,10 +64,15 @@ impl CheckpointReadiness {
 /// User-table checkpoint execution result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointOutcome {
-    /// A new checkpoint root was durably published.
+    /// A checkpoint transaction was durably published.
     Published {
         /// Commit timestamp of the publishing checkpoint transaction.
         checkpoint_ts: TrxID,
+        /// Whether publication used only a catalog silent replay watermark.
+        ///
+        /// `true` means no user-table root was published. `false` means the
+        /// checkpoint published a user-table root.
+        silent: bool,
     },
     /// No checkpoint work was published because the active root is still live.
     Delayed {
@@ -1117,11 +1122,51 @@ impl Table {
             return Err(err);
         }
 
+        if let Some(requested_floor) =
+            silent_watermark_floor(table_file.active_root_unchecked(), mutable_file.root())
+        {
+            drop(mutable_file);
+            let old = trx.set_ddl_redo(DDLRedo::TableReplaySilentWatermark {
+                table_id: self.table_id(),
+            })?;
+            debug_assert!(matches!(
+                old.as_deref(),
+                Some(DDLRedo::DataCheckpoint { .. })
+            ));
+            let watermark = SlientWatermarkObject {
+                table_id: self.table_id(),
+                heap_redo_start_ts: requested_floor.heap_redo_start_ts,
+                deletion_cutoff_ts: requested_floor.deletion_cutoff_ts,
+            };
+            if let Err(err) = trx
+                .exec(async |stmt| {
+                    session
+                        .engine
+                        .catalog()
+                        .storage
+                        .table_replay_silent_watermarks()
+                        .upsert(stmt, &watermark)
+                        .await?;
+                    Ok(())
+                })
+                .await
+            {
+                trx.rollback().await?;
+                return Err(err);
+            }
+            let checkpoint_ts = trx.commit().await?;
+            drop(root_mutation_lease);
+            return Ok(CheckpointOutcome::Published {
+                checkpoint_ts,
+                silent: true,
+            });
+        }
+
         // Step 10: enter the no-cancel publication section, publish a new
         // table-file root, and then commit the checkpoint transaction. This
-        // intentionally happens even when no row data, deletion payload, or
-        // secondary index root changed: the root timestamp acts as a checkpoint
-        // heartbeat for future redo-log truncation.
+        // happens only when table-file state beyond replay-bound fields
+        // changed. Replay-bound-only checkpoints are published as catalog
+        // silent watermark rows above.
         let publish_lease = match self.try_begin_checkpoint_publish() {
             Ok(lease) => lease,
             Err(reason) => {
@@ -1164,8 +1209,30 @@ impl Table {
         }
         drop(publish_lease);
         drop(root_mutation_lease);
-        Ok(CheckpointOutcome::Published { checkpoint_ts })
+        Ok(CheckpointOutcome::Published {
+            checkpoint_ts,
+            silent: false,
+        })
     }
+}
+
+#[inline]
+fn silent_watermark_floor(
+    active_root: &ActiveRoot,
+    mutable_root: &ActiveRoot,
+) -> Option<TableRedoReplayFloor> {
+    let table_file_work = active_root.pivot_row_id != mutable_root.pivot_row_id
+        || active_root.column_block_index_root != mutable_root.column_block_index_root
+        || active_root.secondary_index_roots != mutable_root.secondary_index_roots
+        || active_root.metadata != mutable_root.metadata
+        || active_root.alloc_map != mutable_root.alloc_map;
+    if table_file_work {
+        return None;
+    }
+    Some(TableRedoReplayFloor {
+        heap_redo_start_ts: mutable_root.heap_redo_start_ts,
+        deletion_cutoff_ts: mutable_root.deletion_cutoff_ts,
+    })
 }
 
 #[cfg(test)]
@@ -1994,9 +2061,26 @@ mod tests {
             wait_gc_cutoff_after(&session, root_before.deletion_cutoff_ts).await;
 
             checkpoint_published(table_id, &mut session).await;
+            let root_after = table.file().active_root_unchecked().clone();
+            if root_after.deletion_cutoff_ts <= root_before.deletion_cutoff_ts {
+                let watermark = engine
+                    .catalog()
+                    .storage
+                    .table_replay_silent_watermarks()
+                    .find_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                    .await
+                    .unwrap()
+                    .expect("silent checkpoint should write a watermark");
+                assert!(watermark.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+                session.checkpoint_catalog().await.unwrap();
+            }
+            let effective = engine.catalog().effective_user_table_redo_replay_floor(
+                table_id,
+                table.redo_replay_floor_snapshot(),
+            );
             assert!(
-                table.file().active_root_unchecked().deletion_cutoff_ts
-                    > root_before.deletion_cutoff_ts
+                effective.deletion_cutoff_ts > root_before.deletion_cutoff_ts,
+                "{effective:?}"
             );
         });
     }
@@ -2216,7 +2300,11 @@ mod tests {
                 .unwrap();
             assert!(!frozen_pages.is_empty());
 
-            checkpoint_published(table_id, &mut session).await;
+            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            assert!(
+                matches!(outcome, CheckpointOutcome::Published { silent: false, .. }),
+                "{outcome:?}"
+            );
 
             let new_root = table.file().active_root_unchecked().clone();
             assert!(new_root.pivot_row_id > old_root.pivot_row_id);
@@ -2232,6 +2320,9 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "publish-write-fail").await;
+            delete_key_range_and_wait_gc_cutoff(table_id, &mut session, 0, 4).await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
             wait_checkpoint_ready(table_id, &session).await;
@@ -2257,6 +2348,8 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "post-publish-fail").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
             wait_checkpoint_ready(table_id, &session).await;
@@ -2669,6 +2762,11 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut checkpoint_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut checkpoint_session, 0, 4, "readiness-recheck").await;
+            checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap();
             let root_before = table_for_internal_assertion(&engine, table_id)
                 .file()
                 .active_root_unchecked()
@@ -2911,19 +3009,81 @@ mod tests {
                 .file()
                 .active_root_unchecked()
                 .clone();
-            checkpoint_published(table_id, &mut session).await;
+            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            assert!(
+                matches!(outcome, CheckpointOutcome::Published { silent: true, .. }),
+                "{outcome:?}"
+            );
             let root_after = table_for_internal_assertion(&engine, table_id)
                 .file()
                 .active_root_unchecked()
                 .clone();
 
             assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
-            assert!(root_after.heap_redo_start_ts > root_before.heap_redo_start_ts);
-            assert!(root_after.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+            assert_eq!(
+                root_after.heap_redo_start_ts,
+                root_before.heap_redo_start_ts
+            );
+            assert_eq!(
+                root_after.deletion_cutoff_ts,
+                root_before.deletion_cutoff_ts
+            );
             assert_eq!(
                 root_after.column_block_index_root,
                 root_before.column_block_index_root
             );
+
+            let guards = session.pool_guards();
+            let watermark = engine
+                .catalog()
+                .storage
+                .table_replay_silent_watermarks()
+                .find_uncommitted_by_table_id(&guards, table_id)
+                .await
+                .unwrap()
+                .expect("silent checkpoint should write a catalog row");
+            assert!(watermark.heap_redo_start_ts > root_before.heap_redo_start_ts);
+            assert!(watermark.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .checkpointed_slient_watermarks()
+                    .get(&table_id)
+                    .is_none(),
+                "uncheckpointed watermark rows must not update durable cache"
+            );
+
+            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let (live_before_catalog_checkpoint, _) = engine
+                .catalog()
+                .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
+            assert_eq!(live_before_catalog_checkpoint.len(), 1);
+            assert_eq!(
+                live_before_catalog_checkpoint[0].floor,
+                table_for_internal_assertion(&engine, table_id).redo_replay_floor_snapshot()
+            );
+
+            session.checkpoint_catalog().await.unwrap();
+            let checkpointed = engine.catalog().storage.checkpointed_slient_watermarks();
+            let checkpointed_floor = checkpointed
+                .get(&table_id)
+                .copied()
+                .expect("catalog checkpoint should rebuild durable watermark cache");
+            assert_eq!(
+                checkpointed_floor.heap_redo_start_ts,
+                watermark.heap_redo_start_ts
+            );
+            assert_eq!(
+                checkpointed_floor.deletion_cutoff_ts,
+                watermark.deletion_cutoff_ts
+            );
+            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let (live_after_catalog_checkpoint, _) = engine
+                .catalog()
+                .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
+            assert_eq!(live_after_catalog_checkpoint.len(), 1);
+            assert_eq!(live_after_catalog_checkpoint[0].floor, checkpointed_floor);
         });
     }
 
