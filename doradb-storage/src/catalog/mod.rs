@@ -4,6 +4,7 @@ pub(crate) mod spec;
 pub(crate) mod storage;
 pub(crate) mod table;
 
+pub use checkpoint::CatalogCheckpointOutcome;
 pub(crate) use checkpoint::*;
 pub(crate) use index::*;
 pub(crate) use spec::ActiveIndexSpec;
@@ -146,9 +147,20 @@ impl Catalog {
     pub(crate) async fn apply_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
-    ) -> Result<CatalogCheckpointApplyOutcome> {
+    ) -> Result<CatalogCheckpointOutcome> {
         self.storage
             .apply_checkpoint_batch(batch, self.curr_next_table_id())
+            .await
+    }
+
+    /// Prepare one scanned catalog checkpoint batch for a later root commit.
+    #[inline]
+    pub(crate) async fn prepare_checkpoint_batch(
+        &self,
+        batch: CatalogCheckpointBatch,
+    ) -> Result<PreparedCatalogCheckpoint> {
+        self.storage
+            .prepare_checkpoint_batch(batch, self.curr_next_table_id())
             .await
     }
 
@@ -382,9 +394,25 @@ impl Catalog {
         Vec<LiveTableRedoReplayFloor>,
         Vec<PendingDroppedTableRedoFloor>,
     ) {
+        let checkpointed_silent_watermarks = self.storage.checkpointed_silent_watermarks();
+        self.snapshot_user_table_redo_floors_with_silent_watermarks(
+            catalog_replay_start_ts,
+            &checkpointed_silent_watermarks,
+        )
+    }
+
+    /// Copy replay floors using an explicit checkpoint-durable silent overlay.
+    #[inline]
+    pub(crate) fn snapshot_user_table_redo_floors_with_silent_watermarks(
+        &self,
+        catalog_replay_start_ts: TrxID,
+        checkpointed_silent_watermarks: &FastHashMap<TableID, TableRedoReplayFloor>,
+    ) -> (
+        Vec<LiveTableRedoReplayFloor>,
+        Vec<PendingDroppedTableRedoFloor>,
+    ) {
         let mut live = Vec::new();
         let mut dropped = Vec::new();
-        let checkpointed_silent_watermarks = self.storage.checkpointed_silent_watermarks();
         for entry in &self.user_tables {
             let table_id = *entry.key();
             match entry.value() {

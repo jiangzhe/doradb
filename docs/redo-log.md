@@ -91,6 +91,22 @@ marker, returns aggregate counts for marker advancement, removed files,
 already-missing files, retryable unlink failures, and current blockers, and does
 not run catalog or table checkpoints implicitly.
 
+`Session::checkpoint_catalog_and_truncate_redo_log` is the combined maintenance
+API for callers that want the explicit catalog-checkpoint dependency and redo
+cleanup in one operation. It runs one catalog checkpoint scan, plans truncation
+from the projected post-checkpoint catalog replay boundary and projected
+checkpointed silent watermark overlay, and publishes catalog checkpoint metadata
+plus any advanced `first_redo_log_seq` marker in one `catalog.mtb` root when
+both advance. The command still publishes the marker before unlink and releases
+the catalog checkpoint gate before physical redo cleanup. Its composite outcome
+contains the catalog checkpoint outcome and the redo truncation outcome.
+
+For silent table checkpoints, the combined command can fold committed
+`catalog.table_replay_silent_watermarks` rows into `catalog.mtb` and use those
+newly checkpointed overlays for truncation planning in the same call. Standalone
+`Session::truncate_redo_log` continues to use only already checkpoint-durable
+silent watermark overlays.
+
 Each log file is created as an `O_DIRECT` sparse file and truncated to the
 effective `log_file_max_size`. The configured value is first rounded so the
 data region after the fixed super-block slots contains a whole number of
@@ -591,6 +607,9 @@ lose recent log writes.
   failure stops before unlink and is treated like a fatal checkpoint-write
   failure. Non-`NotFound` unlink failures are reported as retryable cleanup
   failures and do not poison storage.
+- `Session::checkpoint_catalog_and_truncate_redo_log` batches explicit catalog
+  checkpoint and truncation work, including a single `catalog.mtb` root publish
+  when checkpoint metadata and `first_redo_log_seq` both advance.
 - Redo read-ahead is direct-IO based and bounded by the scan-specific configured
   read-ahead depth; parsing and replay remain sequential.
 - A single redo-bearing transaction may exceed one block payload and span a

@@ -56,16 +56,21 @@ pub(crate) struct CatalogCheckpointBatch {
 }
 
 impl CatalogCheckpointBatch {
+    /// Catalog replay boundary that would be published for this batch.
     #[inline]
-    fn redo_retention_progress(
-        &self,
-        catalog_replay_start_ts: TrxID,
-    ) -> Option<CatalogRedoRetentionProgress> {
+    fn catalog_replay_start_ts_after_publish(&self) -> TrxID {
+        self.safe_cts.saturating_add(1).max(self.replay_start_ts)
+    }
+
+    /// Build catalog-safe redo retention progress represented by this batch.
+    #[inline]
+    pub(crate) fn redo_retention_progress(&self) -> Option<CatalogRedoRetentionProgress> {
         // A scan that did not cover any durable record cannot prove a new
         // catalog replay boundary, so it must not refresh retention progress.
         if self.safe_cts < self.replay_start_ts {
             return None;
         }
+        let catalog_replay_start_ts = self.catalog_replay_start_ts_after_publish();
         let segments = self
             .sealed_redo_segments
             .iter()
@@ -92,9 +97,9 @@ impl CatalogCheckpointBatch {
     }
 }
 
-/// Internal result of applying one catalog checkpoint batch.
+/// Result of a catalog checkpoint maintenance operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CatalogCheckpointApplyOutcome {
+pub enum CatalogCheckpointOutcome {
     /// Catalog checkpoint metadata was durably published at this replay boundary.
     Published {
         /// New catalog replay start timestamp.
@@ -352,14 +357,16 @@ impl Catalog {
     /// required gates and reaching the shared `CatalogStorage`/`MultiTableFile`
     /// with multiple mutable writers.
     #[inline]
-    pub(crate) async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
+    pub(crate) async fn checkpoint_now(
+        &self,
+        trx_sys: &TransactionSystem,
+    ) -> Result<CatalogCheckpointOutcome> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
         let _redo_retention_lease = trx_sys.begin_redo_retention().await;
         let batch = self.scan_checkpoint_batch(trx_sys).await?;
-        let publishable_progress = batch
-            .redo_retention_progress(batch.safe_cts.saturating_add(1).max(batch.replay_start_ts));
+        let publishable_progress = batch.redo_retention_progress();
         match self.apply_checkpoint_batch(batch).await {
-            Ok(CatalogCheckpointApplyOutcome::Published {
+            Ok(CatalogCheckpointOutcome::Published {
                 catalog_replay_start_ts,
             }) => {
                 if let Some(progress) = publishable_progress {
@@ -367,9 +374,11 @@ impl Catalog {
                     trx_sys.record_catalog_redo_retention_progress(progress);
                 }
                 trx_sys.request_dropped_table_purge();
-                Ok(())
+                Ok(CatalogCheckpointOutcome::Published {
+                    catalog_replay_start_ts,
+                })
             }
-            Ok(CatalogCheckpointApplyOutcome::Noop) => Ok(()),
+            Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
             Err(err) if err.kind() == ErrorKind::Io => {
                 Err(trx_sys.poison_storage(FatalError::CheckpointWrite).into())
             }
@@ -749,9 +758,7 @@ mod tests {
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
 
-        let progress = batch
-            .redo_retention_progress(published_catalog_replay_start_ts)
-            .unwrap();
+        let progress = batch.redo_retention_progress().unwrap();
 
         assert_eq!(progress.first_retained_file_seq, 7);
         assert_eq!(
@@ -792,7 +799,7 @@ mod tests {
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
 
-        assert!(batch.redo_retention_progress(replay_start_ts).is_none());
+        assert!(batch.redo_retention_progress().is_none());
     }
 
     #[test]

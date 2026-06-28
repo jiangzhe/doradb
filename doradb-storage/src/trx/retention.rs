@@ -1,3 +1,4 @@
+use crate::catalog::CatalogCheckpointOutcome;
 use crate::error::{DataIntegrityError, ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::{
@@ -6,7 +7,9 @@ use crate::log::{
 use crate::recovery::stream::{
     RedoReplayPlanner, RedoRetentionSegment, RedoRetentionSegmentState, RedoSegmentCtsRange,
 };
-use crate::session::{RedoTruncationBlockerInfo, RedoTruncationOutcome};
+use crate::session::{
+    CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome,
+};
 use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use error_stack::Report;
@@ -117,11 +120,28 @@ impl TransactionSystem {
             .catalog
             .snapshot_user_table_redo_floors(catalog_replay_start_ts);
 
+        self.plan_redo_truncation_with_floors(
+            first_retained_file_seq,
+            catalog_replay_start_ts,
+            live_table_floors,
+            pending_dropped_table_floors,
+            self.catalog_redo_retention_progress(),
+        )
+    }
+
+    fn plan_redo_truncation_with_floors(
+        &self,
+        first_retained_file_seq: u32,
+        catalog_replay_start_ts: TrxID,
+        live_table_floors: Vec<LiveTableRedoReplayFloor>,
+        pending_dropped_table_floors: Vec<PendingDroppedTableRedoFloor>,
+        catalog_redo_retention_progress: Option<CatalogRedoRetentionProgress>,
+    ) -> Result<RedoTruncationPlan> {
         let file_prefix = self.config.file_prefix()?;
         let discovered = discover_redo_log_files(&file_prefix, first_retained_file_seq, false)?;
         let segments = RedoReplayPlanner::new(discovered).plan_retention_segments()?;
         let catalog_safe_segments = catalog_safe_segments_for_plan(
-            self.catalog_redo_retention_progress(),
+            catalog_redo_retention_progress,
             first_retained_file_seq,
             catalog_replay_start_ts,
             &segments,
@@ -195,6 +215,175 @@ impl TransactionSystem {
                 .collect(),
         })
     }
+
+    /// Run catalog checkpoint and redo truncation from one gated retention observation.
+    pub(crate) async fn checkpoint_catalog_and_truncate_redo_log(
+        &self,
+    ) -> Result<CatalogRedoMaintenanceOutcome> {
+        // 1. Acquire gates in the same order as standalone truncation. The
+        // catalog gate protects the `catalog.mtb` root writer, while the redo
+        // retention gate stays held until obsolete-file cleanup is finished.
+        let catalog_checkpoint_lease = self.catalog.begin_checkpoint().await;
+        let _redo_retention_lease = self.begin_redo_retention().await;
+        // Session admission happened before these async waits. Recheck after
+        // the gates so queued storage poison cannot publish metadata or unlink
+        // redo files.
+        self.ensure_runtime_healthy()?;
+
+        // 2. Scan exactly one catalog checkpoint batch and prepare, but do not
+        // commit, the projected catalog root. Keeping the root mutable lets the
+        // same publication also carry an advanced first-retained redo marker.
+        let batch = self.catalog.scan_checkpoint_batch(self).await?;
+        let checkpoint_progress = batch.redo_retention_progress();
+        let mut prepared = self.catalog.prepare_checkpoint_batch(batch).await?;
+        let checkpoint_will_publish = prepared.will_publish();
+
+        // 3. Build truncation inputs from the projected post-checkpoint state.
+        // This is the combined command's main difference from standalone
+        // truncation: newly checkpointed silent watermark rows may participate
+        // in planning before the root has been committed.
+        //
+        // Dropped-table floors are filtered by the same projected catalog
+        // replay boundary. If this checkpoint would make a table's catalog
+        // absence durable (`projected_catalog_replay_start_ts > drop_cts`),
+        // that table no longer protects old redo for this combined plan even
+        // though purge may remove the retained dropped-floor entry later. If
+        // the projected boundary is still at or before `drop_cts`, the dropped
+        // table remains in `pending_dropped_table_floors` and can conservatively
+        // block marker advancement.
+        let projected_catalog_replay_start_ts = prepared.catalog_replay_start_ts();
+        debug_assert!(
+            checkpoint_progress.as_ref().is_none_or(|progress| {
+                progress.catalog_replay_start_ts == projected_catalog_replay_start_ts
+            }),
+            "catalog checkpoint progress must match projected catalog replay boundary"
+        );
+        // Use the silent watermark overlay projected by the prepared catalog
+        // checkpoint. For a publishable checkpoint this is loaded from the
+        // not-yet-committed catalog roots; for a no-op it is the current
+        // checkpoint-durable cache. Planning with this overlay makes the redo
+        // truncation decision match the table replay floors that will be true
+        // after this combined maintenance command commits.
+        let projected_silent_watermarks = prepared.checkpointed_silent_watermarks();
+        let (live_table_floors, pending_dropped_table_floors) = self
+            .catalog
+            .snapshot_user_table_redo_floors_with_silent_watermarks(
+                projected_catalog_replay_start_ts,
+                &projected_silent_watermarks,
+            );
+        let first_retained_file_seq = self
+            .catalog
+            .storage
+            .checkpoint_snapshot()?
+            .meta
+            .first_redo_log_seq;
+        let projected_catalog_progress = projected_catalog_redo_retention_progress(
+            checkpoint_progress.clone(),
+            self.catalog_redo_retention_progress(),
+            first_retained_file_seq,
+            projected_catalog_replay_start_ts,
+        );
+        // 4. Plan truncation against the projected catalog boundary, projected
+        // live-table floors, pending dropped-table floors, and the best
+        // catalog-safe segment proof available from this scan plus cache.
+        let plan = self.plan_redo_truncation_with_floors(
+            first_retained_file_seq,
+            projected_catalog_replay_start_ts,
+            live_table_floors,
+            pending_dropped_table_floors,
+            projected_catalog_progress,
+        )?;
+        let previous_first_retained_file_seq = plan.first_retained_file_seq;
+        let target_marker = match plan.candidates.last() {
+            Some(candidate) => next_redo_file_seq(candidate.file_seq)?,
+            None => previous_first_retained_file_seq,
+        };
+        let advanced_files = plan.candidates.len();
+
+        let mut new_first_retained_file_seq = previous_first_retained_file_seq;
+        // 5. Publish the durable metadata before unlink. If checkpoint metadata
+        // is already prepared, fold marker advancement into that same
+        // `catalog.mtb` root; otherwise use the marker-only publication path.
+        let checkpoint_outcome = if checkpoint_will_publish {
+            if target_marker > previous_first_retained_file_seq {
+                let applied = prepared.apply_first_redo_log_seq(target_marker)?;
+                debug_assert!(
+                    applied,
+                    "marker must monotonically advance when target_marker ({target_marker}) \
+                     exceeds the durable marker ({previous_first_retained_file_seq})"
+                );
+                new_first_retained_file_seq = target_marker;
+            }
+            match prepared.commit(&self.catalog.storage).await {
+                Ok(outcome) => outcome,
+                Err(err) if err.kind() == ErrorKind::Io => {
+                    return Err(self.poison_storage(FatalError::CheckpointWrite).into());
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            if target_marker > previous_first_retained_file_seq {
+                new_first_retained_file_seq = match self
+                    .catalog
+                    .storage
+                    .publish_first_redo_log_seq(target_marker)
+                    .await
+                {
+                    Ok(marker) => marker,
+                    Err(err) if err.kind() == ErrorKind::Io => {
+                        return Err(self.poison_storage(FatalError::CheckpointWrite).into());
+                    }
+                    Err(err) => return Err(err),
+                };
+            }
+            CatalogCheckpointOutcome::Noop
+        };
+
+        // 6. After a successful checkpoint publish, refresh in-memory
+        // catalog-safe segment progress using the final marker. This prevents
+        // later truncation planning from reusing segment proof below the new
+        // retained suffix.
+        if let CatalogCheckpointOutcome::Published {
+            catalog_replay_start_ts,
+        } = checkpoint_outcome
+        {
+            if let Some(progress) = catalog_progress_for_final_marker(
+                checkpoint_progress,
+                new_first_retained_file_seq,
+                catalog_replay_start_ts,
+            ) {
+                self.record_catalog_redo_retention_progress(progress);
+            }
+            self.request_dropped_table_purge();
+        }
+
+        // 7. Release only the catalog gate before filesystem cleanup. The redo
+        // retention lease remains held through cleanup so checkpoint scans
+        // cannot race disappearing retained redo files.
+        drop(catalog_checkpoint_lease);
+        let file_prefix = self.config.file_prefix()?;
+        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)?;
+
+        // 8. Return both halves of the maintenance result. The redo outcome
+        // reports marker advancement, retryable cleanup counts, and the
+        // blockers from the projected plan.
+        Ok(CatalogRedoMaintenanceOutcome {
+            catalog_checkpoint: checkpoint_outcome,
+            redo_truncation: RedoTruncationOutcome {
+                previous_first_retained_file_seq,
+                new_first_retained_file_seq,
+                advanced_files,
+                removed_files: cleanup.removed_files,
+                already_missing_files: cleanup.already_missing_files,
+                failed_unlink_files: cleanup.failed_unlink_files,
+                blockers: plan
+                    .blockers
+                    .into_iter()
+                    .map(public_redo_truncation_blocker)
+                    .collect(),
+            },
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +391,73 @@ struct RedoCleanupCounts {
     removed_files: usize,
     already_missing_files: usize,
     failed_unlink_files: usize,
+}
+
+fn projected_catalog_redo_retention_progress(
+    scanned: Option<CatalogRedoRetentionProgress>,
+    cached: Option<CatalogRedoRetentionProgress>,
+    first_retained_file_seq: u32,
+    projected_catalog_replay_start_ts: TrxID,
+) -> Option<CatalogRedoRetentionProgress> {
+    // Merge catalog-safe segment proof into the exact view used by the
+    // projected truncation plan. The map keeps file order deterministic and
+    // lets freshly scanned proof replace cached proof for the same file.
+    let mut segments = BTreeMap::new();
+    // Cached progress is reusable only when it belongs to the same retained
+    // redo suffix and was proven at or before the projected catalog boundary.
+    // A future-boundary cache would be proof for a state this plan has not
+    // published, so it must be ignored.
+    if let Some(cached) = cached
+        && cached.first_retained_file_seq == first_retained_file_seq
+        && cached.catalog_replay_start_ts <= projected_catalog_replay_start_ts
+    {
+        for segment in cached.segments {
+            // Never carry proof for files below the durable marker into the
+            // retained suffix. Those files are already obsolete by marker
+            // contract and should not affect planning for retained files.
+            if segment.file_seq >= first_retained_file_seq {
+                segments.insert(segment.file_seq, segment);
+            }
+        }
+    }
+    // The current scan is usable only when it exactly matches the projected
+    // checkpoint boundary. If the checkpoint batch was a no-op or did not cover
+    // this boundary, its segment proof cannot justify this projected plan.
+    if let Some(scanned) = scanned
+        && scanned.first_retained_file_seq == first_retained_file_seq
+        && scanned.catalog_replay_start_ts == projected_catalog_replay_start_ts
+    {
+        for segment in scanned.segments {
+            // Apply the same retained-suffix filter to scanned proof. This also
+            // keeps the helper correct if a later caller supplies progress
+            // collected before a marker advance.
+            if segment.file_seq >= first_retained_file_seq {
+                segments.insert(segment.file_seq, segment);
+            }
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(CatalogRedoRetentionProgress {
+        first_retained_file_seq,
+        catalog_replay_start_ts: projected_catalog_replay_start_ts,
+        segments: segments.into_values().collect(),
+    })
+}
+
+fn catalog_progress_for_final_marker(
+    progress: Option<CatalogRedoRetentionProgress>,
+    first_retained_file_seq: u32,
+    catalog_replay_start_ts: TrxID,
+) -> Option<CatalogRedoRetentionProgress> {
+    let mut progress = progress?;
+    progress.first_retained_file_seq = first_retained_file_seq;
+    progress.catalog_replay_start_ts = catalog_replay_start_ts;
+    progress
+        .segments
+        .retain(|segment| segment.file_seq >= first_retained_file_seq);
+    Some(progress)
 }
 
 fn cleanup_obsolete_redo_files(
@@ -349,11 +605,18 @@ fn catalog_safe_segments_for_plan(
         && progress.first_retained_file_seq == first_retained_file_seq
         && progress.catalog_replay_start_ts == catalog_replay_start_ts
     {
-        let mut safe = progress
-            .segments
-            .into_iter()
-            .map(|segment| (segment.file_seq, segment.redo_range))
-            .collect::<BTreeMap<_, _>>();
+        // Seed from current sealed segment CTS ranges before overlaying cached
+        // checkpoint-scan proof. Sealed non-empty ranges are immutable, so a
+        // file whose max CTS is already below `catalog_replay_start_ts` is
+        // catalog-safe even if the last checkpoint scan did not record it.
+        // Cached proof still wins for matching file sequences below.
+        let mut safe = fallback_catalog_safe_segments(catalog_replay_start_ts, segments);
+        safe.extend(
+            progress
+                .segments
+                .into_iter()
+                .map(|segment| (segment.file_seq, segment.redo_range)),
+        );
         add_sealed_empty_segments(&mut safe, segments);
         return safe;
     }
