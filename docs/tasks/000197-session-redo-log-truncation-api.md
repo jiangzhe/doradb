@@ -1,7 +1,7 @@
 ---
 id: 000197
 title: Session Redo Log Truncation API
-status: proposal
+status: implemented
 created: 2026-06-27
 github_issue: 777
 ---
@@ -287,6 +287,41 @@ impl Session {
 
 ## Implementation Notes
 
+- Implemented the public `Session::truncate_redo_log` maintenance API with
+  exported `RedoTruncationOutcome` and `RedoTruncationBlockerInfo`. The call
+  uses normal session admission, rejects active transactions, computes a fresh
+  gated plan, publishes the durable first-retained redo marker before cleanup,
+  and reports aggregate cleanup progress plus blockers.
+- Added production `CatalogStorage::publish_first_redo_log_seq`, marker-aware
+  redo family cleanup helpers, and retained-suffix discovery that tolerates
+  partially removed obsolete prefixes while preserving strict contiguity at and
+  above the durable marker.
+- Final gate placement changed from the design's redo-retention-only shape:
+  truncation now acquires the catalog checkpoint/metadata gate before the
+  redo-retention gate, then drops the catalog gate before physical unlink. This
+  protects the `catalog.mtb` root fork used for marker publication from
+  checkpoint/metadata writers while still keeping redo-retention protection
+  through cleanup.
+- Added runtime-health recheck after async gate waits so storage poison detected
+  while truncation is queued prevents both marker publication and unlink.
+- Added and expanded regression coverage for active-transaction admission,
+  no-candidate blockers, candidate marker advancement and unlink, restart
+  strictness, marker-publication failure before unlink, poison-after-wait,
+  catalog metadata/change exclusion, cleanup-gate release before unlink,
+  retryable `NotFound` and non-`NotFound` cleanup failures, and redo cleanup
+  test-hook serialization.
+- Resolved review and CI findings encountered during implementation: the
+  recovery checkpoint helper now retries normal checkpoint-readiness delay, and
+  a versioned evictable-buffer lookup race was fixed after CI exposed a stale
+  reused-page-range failure.
+- Deferred combined checkpoint-plus-truncate maintenance to
+  `docs/backlogs/000136-combine-catalog-checkpoint-redo-truncation.md`.
+- Deferred cross-cutting blocking-IO offload/runtime abstraction work to
+  `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md`.
+- Verified with `cargo nextest run -p doradb-storage`, focused
+  `truncate_redo_log` and recovery reruns, `cargo fmt --check`,
+  `git diff --check`, and `tools/style_audit.rs --diff-base origin/main`.
+
 ## Impacts
 
 - `doradb-storage/src/session.rs`
@@ -380,7 +415,18 @@ tools/style_audit.rs --diff-base origin/main
 
 ## Open Questions
 
-None for this task. Future work may add per-file public unlink details,
-background redo retention scheduling, richer retention telemetry, or automatic
-idle-table checkpoint hints, but those are intentionally outside RFC 0022
-Phase 4.
+No blocking open questions remain for RFC 0022 Phase 4.
+
+Follow-up work intentionally left outside this task:
+
+- `docs/backlogs/000136-combine-catalog-checkpoint-redo-truncation.md`
+  tracks a future combined checkpoint/truncate command that can publish catalog
+  checkpoint metadata and the first-retained redo marker in one `catalog.mtb`
+  root.
+- `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md` tracks
+  a runtime-agnostic blocking-work abstraction and audit for async storage
+  paths that currently perform synchronous filesystem work.
+
+Other future enhancements such as per-file public unlink details, background
+redo retention scheduling, richer retention telemetry, and automatic idle-table
+checkpoint hints remain intentionally outside RFC 0022 Phase 4.

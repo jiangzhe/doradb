@@ -367,10 +367,10 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
   - Phase-local Choices: Exact outcome struct fields; retry behavior for unlink
     errors; whether partial unlink success is reported per file or summarized;
     exact retention gate placement.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000197-session-redo-log-truncation-api.md`
+  - Task Issue: `#777`
+  - Phase Status: done
+  - Implementation Summary: Implemented public Session truncate_redo_log API with marker-before-unlink publication, redo-retention and catalog metadata gating, aggregate outcome and blocker reporting, retryable cleanup, restart strictness tests, and follow-up backlogs for combined checkpoint/truncate and runtime-agnostic blocking work. [Task Resolve Sync: docs/tasks/000197-session-redo-log-truncation-api.md @ 2026-06-28]
 
 ## Consequences
 
