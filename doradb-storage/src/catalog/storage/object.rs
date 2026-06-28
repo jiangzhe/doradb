@@ -55,7 +55,7 @@ pub(crate) struct IndexColumnObject {
 
 /// One row object in `catalog.table_replay_silent_watermarks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SlientWatermarkObject {
+pub(crate) struct SilentWatermarkObject {
     /// User table identifier.
     pub(crate) table_id: TableID,
     /// Silent heap replay lower bound.

@@ -61,7 +61,7 @@ pub(crate) struct CatalogStorage {
     /// durable proof until a catalog checkpoint folds them into `catalog.mtb`.
     /// Callers combine these overlays with user-table root floors by fieldwise
     /// maximum.
-    checkpointed_slient_watermarks: Mutex<Arc<FastHashMap<TableID, TableRedoReplayFloor>>>,
+    checkpointed_silent_watermarks: Mutex<Arc<FastHashMap<TableID, TableRedoReplayFloor>>>,
 }
 
 impl CatalogStorage {
@@ -110,7 +110,7 @@ impl CatalogStorage {
             next_table_id: mtb_snapshot.meta.next_table_id,
             mtb,
             disk_pool,
-            checkpointed_slient_watermarks: Mutex::new(Arc::new(FastHashMap::default())),
+            checkpointed_silent_watermarks: Mutex::new(Arc::new(FastHashMap::default())),
         })
     }
 
@@ -161,10 +161,10 @@ impl CatalogStorage {
     /// checkpoint, even though those rows are visible through
     /// `table_replay_silent_watermarks()`.
     #[inline]
-    pub(crate) fn checkpointed_slient_watermarks(
+    pub(crate) fn checkpointed_silent_watermarks(
         &self,
     ) -> Arc<FastHashMap<TableID, TableRedoReplayFloor>> {
-        Arc::clone(&self.checkpointed_slient_watermarks.lock())
+        Arc::clone(&self.checkpointed_silent_watermarks.lock())
     }
 
     /// Return one catalog table runtime by table id.
@@ -252,7 +252,7 @@ impl CatalogStorage {
                 snapshot.meta.table_roots[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()],
             )
             .await?;
-        self.install_checkpointed_slient_watermarks(watermarks);
+        self.install_checkpointed_silent_watermarks(watermarks);
         Ok(())
     }
 
@@ -353,7 +353,7 @@ impl CatalogStorage {
             mutable.reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)?;
         }
         let disk_pool_guard = self.disk_pool.pool_guard();
-        let checkpointed_slient_watermarks = self
+        let checkpointed_silent_watermarks = self
             .load_checkpointed_table_replay_silent_watermark_map(
                 &disk_pool_guard,
                 new_roots[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()],
@@ -361,18 +361,18 @@ impl CatalogStorage {
             .await?;
         let (_, old_root) = mutable.commit_prepared().await?;
         drop(old_root);
-        self.install_checkpointed_slient_watermarks(checkpointed_slient_watermarks);
+        self.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
         Ok(CatalogCheckpointApplyOutcome::Published {
             catalog_replay_start_ts: next_catalog_replay_start_ts,
         })
     }
 
     #[inline]
-    fn install_checkpointed_slient_watermarks(
+    fn install_checkpointed_silent_watermarks(
         &self,
         watermarks: FastHashMap<TableID, TableRedoReplayFloor>,
     ) {
-        *self.checkpointed_slient_watermarks.lock() = Arc::new(watermarks);
+        *self.checkpointed_silent_watermarks.lock() = Arc::new(watermarks);
     }
 
     async fn load_checkpointed_table_replay_silent_watermark_map(

@@ -131,7 +131,7 @@ Compatibility boundary:
    - Add an object type such as:
 
 ```rust
-pub(crate) struct SlientWatermarkObject {
+pub(crate) struct SilentWatermarkObject {
     pub(crate) table_id: TableID,
     pub(crate) heap_redo_start_ts: TrxID,
     pub(crate) deletion_cutoff_ts: TrxID,
@@ -273,7 +273,7 @@ DDLRedo::TableReplaySilentWatermark { table_id: TableID }
   - add fifth catalog logical table wiring, durable watermark cache, cache
     rebuild after checkpoint publish, and checkpoint-root loader
 - `doradb-storage/src/catalog/storage/object.rs`
-  - add `SlientWatermarkObject`
+  - add `SilentWatermarkObject`
 - `doradb-storage/src/catalog/storage/table_replay_silent_watermarks.rs`
   - new catalog table definition and row accessors
 - `doradb-storage/src/file/multi_table_file.rs`

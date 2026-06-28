@@ -1,5 +1,5 @@
 use super::lifecycle::TableLifecycleState;
-use crate::catalog::{IndexSpec, SlientWatermarkObject, TableMetadata};
+use crate::catalog::{IndexSpec, SilentWatermarkObject, TableMetadata};
 use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
     Result,
@@ -1038,6 +1038,8 @@ impl Table {
             )
             .await
         {
+            // A heartbeat checkpoint still advances the heap replay floor:
+            // its transaction STS comes from the global timestamp sequence.
             Ok(pages) => (pages, next_heap_redo_start_ts.unwrap_or(checkpoint_ts)),
             Err(err) => {
                 trx.rollback().await?;
@@ -1133,7 +1135,7 @@ impl Table {
                 old.as_deref(),
                 Some(DDLRedo::DataCheckpoint { .. })
             ));
-            let watermark = SlientWatermarkObject {
+            let watermark = SilentWatermarkObject {
                 table_id: self.table_id(),
                 heap_redo_start_ts: requested_floor.heap_redo_start_ts,
                 deletion_cutoff_ts: requested_floor.deletion_cutoff_ts,
@@ -1229,6 +1231,8 @@ fn silent_watermark_floor(
     if table_file_work {
         return None;
     }
+    // Root fields can be unchanged while checkpoint STS or delete cutoff
+    // progress advances replay bounds; publish that through a catalog watermark.
     Some(TableRedoReplayFloor {
         heap_redo_start_ts: mutable_root.heap_redo_start_ts,
         deletion_cutoff_ts: mutable_root.deletion_cutoff_ts,
@@ -3048,7 +3052,7 @@ mod tests {
                 engine
                     .catalog()
                     .storage
-                    .checkpointed_slient_watermarks()
+                    .checkpointed_silent_watermarks()
                     .get(&table_id)
                     .is_none(),
                 "uncheckpointed watermark rows must not update durable cache"
@@ -3065,7 +3069,7 @@ mod tests {
             );
 
             session.checkpoint_catalog().await.unwrap();
-            let checkpointed = engine.catalog().storage.checkpointed_slient_watermarks();
+            let checkpointed = engine.catalog().storage.checkpointed_silent_watermarks();
             let checkpointed_floor = checkpointed
                 .get(&table_id)
                 .copied()

@@ -384,7 +384,7 @@ impl Catalog {
     ) {
         let mut live = Vec::new();
         let mut dropped = Vec::new();
-        let checkpointed_slient_watermarks = self.storage.checkpointed_slient_watermarks();
+        let checkpointed_silent_watermarks = self.storage.checkpointed_silent_watermarks();
         for entry in &self.user_tables {
             let table_id = *entry.key();
             match entry.value() {
@@ -392,7 +392,7 @@ impl Catalog {
                     table_id,
                     floor: effective_table_redo_replay_floor(
                         table.redo_replay_floor_snapshot(),
-                        checkpointed_slient_watermarks.get(&table_id).copied(),
+                        checkpointed_silent_watermarks.get(&table_id).copied(),
                     ),
                 }),
                 UserTableEntry::DroppedRuntime {
@@ -421,10 +421,10 @@ impl Catalog {
         table_id: TableID,
         root_floor: TableRedoReplayFloor,
     ) -> TableRedoReplayFloor {
-        let checkpointed_slient_watermarks = self.storage.checkpointed_slient_watermarks();
+        let checkpointed_silent_watermarks = self.storage.checkpointed_silent_watermarks();
         effective_table_redo_replay_floor(
             root_floor,
-            checkpointed_slient_watermarks.get(&table_id).copied(),
+            checkpointed_silent_watermarks.get(&table_id).copied(),
         )
     }
 

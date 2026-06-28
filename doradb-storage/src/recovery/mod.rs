@@ -2659,7 +2659,7 @@ mod tests {
                     engine
                         .catalog()
                         .storage
-                        .checkpointed_slient_watermarks()
+                        .checkpointed_silent_watermarks()
                         .get(&table_id)
                         .copied(),
                     Some(watermark_floor)
@@ -2696,7 +2696,7 @@ mod tests {
                 recovered
                     .catalog()
                     .storage
-                    .checkpointed_slient_watermarks()
+                    .checkpointed_silent_watermarks()
                     .get(&table_id)
                     .is_none()
             );

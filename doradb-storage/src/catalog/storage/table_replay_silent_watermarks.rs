@@ -1,7 +1,7 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
-use crate::catalog::storage::object::SlientWatermarkObject;
+use crate::catalog::storage::object::SilentWatermarkObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
 use crate::error::{DataIntegrityError, Error, InternalError, Result};
@@ -42,7 +42,7 @@ impl TableReplaySilentWatermarks<'_> {
     pub(crate) async fn list_uncommitted(
         &self,
         guards: &PoolGuards,
-    ) -> Result<Vec<SlientWatermarkObject>> {
+    ) -> Result<Vec<SilentWatermarkObject>> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(guards, |col_layout, row| {
@@ -62,7 +62,7 @@ impl TableReplaySilentWatermarks<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<Option<SlientWatermarkObject>> {
+    ) -> Result<Option<SilentWatermarkObject>> {
         let key = SelectKey::new(
             PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
             vec![Val::from(table_id)],
@@ -80,12 +80,12 @@ impl TableReplaySilentWatermarks<'_> {
     pub(crate) async fn upsert(
         &self,
         stmt: &mut Statement<'_>,
-        obj: &SlientWatermarkObject,
+        obj: &SilentWatermarkObject,
     ) -> Result<bool> {
         let existing = self
             .find_uncommitted_by_table_id(stmt.runtime().pool_guards(), obj.table_id)
             .await?;
-        let merged = existing.map_or(*obj, |existing| SlientWatermarkObject {
+        let merged = existing.map_or(*obj, |existing| SilentWatermarkObject {
             table_id: obj.table_id,
             heap_redo_start_ts: existing.heap_redo_start_ts.max(obj.heap_redo_start_ts),
             deletion_cutoff_ts: existing.deletion_cutoff_ts.max(obj.deletion_cutoff_ts),
@@ -118,7 +118,7 @@ impl TableReplaySilentWatermarks<'_> {
         Ok(matches!(res, DeleteMvcc::Deleted))
     }
 
-    async fn insert(&self, stmt: &mut Statement<'_>, obj: &SlientWatermarkObject) -> Result<()> {
+    async fn insert(&self, stmt: &mut Statement<'_>, obj: &SilentWatermarkObject) -> Result<()> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.heap_redo_start_ts.as_u64()),
@@ -172,7 +172,7 @@ pub(super) fn catalog_definition_of_table_replay_silent_watermarks() -> &'static
 #[inline]
 pub(super) fn table_replay_silent_watermark_object_from_vals(
     vals: &[Val],
-) -> Result<SlientWatermarkObject> {
+) -> Result<SilentWatermarkObject> {
     let table_id = val_u64(
         vals,
         COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID,
@@ -188,7 +188,7 @@ pub(super) fn table_replay_silent_watermark_object_from_vals(
         COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS,
         "deletion_cutoff_ts",
     )?;
-    Ok(SlientWatermarkObject {
+    Ok(SilentWatermarkObject {
         table_id: TableID::new(table_id),
         heap_redo_start_ts: TrxID::new(heap_redo_start_ts),
         deletion_cutoff_ts: TrxID::new(deletion_cutoff_ts),
@@ -199,7 +199,7 @@ pub(super) fn table_replay_silent_watermark_object_from_vals(
 fn row_to_table_replay_silent_watermark_object(
     col_layout: &TableColumnLayout,
     row: Row<'_>,
-) -> SlientWatermarkObject {
+) -> SilentWatermarkObject {
     let table_id = TableID::from(
         row.val(col_layout, COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID)
             .as_u64()
@@ -219,7 +219,7 @@ fn row_to_table_replay_silent_watermark_object(
         )
         .as_u64()
         .unwrap();
-    SlientWatermarkObject {
+    SilentWatermarkObject {
         table_id,
         heap_redo_start_ts: TrxID::new(heap_redo_start_ts),
         deletion_cutoff_ts: TrxID::new(deletion_cutoff_ts),
@@ -270,7 +270,7 @@ mod tests {
                         .table_replay_silent_watermarks()
                         .upsert(
                             stmt,
-                            &SlientWatermarkObject {
+                            &SilentWatermarkObject {
                                 table_id,
                                 heap_redo_start_ts: TrxID::new(7),
                                 deletion_cutoff_ts: TrxID::new(9),
@@ -293,7 +293,7 @@ mod tests {
                         .table_replay_silent_watermarks()
                         .upsert(
                             stmt,
-                            &SlientWatermarkObject {
+                            &SilentWatermarkObject {
                                 table_id,
                                 heap_redo_start_ts: TrxID::new(6),
                                 deletion_cutoff_ts: TrxID::new(11),
@@ -316,7 +316,7 @@ mod tests {
                         .table_replay_silent_watermarks()
                         .upsert(
                             stmt,
-                            &SlientWatermarkObject {
+                            &SilentWatermarkObject {
                                 table_id,
                                 heap_redo_start_ts: TrxID::new(7),
                                 deletion_cutoff_ts: TrxID::new(10),
@@ -341,7 +341,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(
                 rows[0],
-                SlientWatermarkObject {
+                SilentWatermarkObject {
                     table_id,
                     heap_redo_start_ts: TrxID::new(7),
                     deletion_cutoff_ts: TrxID::new(11),
