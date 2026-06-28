@@ -129,7 +129,24 @@ struct CatalogCheckpointGateState {
     metadata_change: CatalogMetadataChangePhase,
 }
 
-/// Reversible catalog metadata-change gate for catalog checkpoint exclusion.
+/// Catalog-local checkpoint, marker-publish, and metadata-DDL exclusion gate.
+///
+/// A catalog checkpoint scans redo and publishes catalog table roots that must
+/// match a stable catalog metadata shape. Index DDL temporarily moves catalog
+/// rows, user-table roots, and runtime layouts through different intermediate
+/// states, so checkpoint scan/apply sections and catalog metadata-change
+/// sections must not overlap.
+///
+/// Redo truncation also uses the checkpoint side of this gate while it plans
+/// from the catalog snapshot and publishes the durable `first_redo_log_seq`
+/// marker. The marker is bootstrap metadata in the `catalog.mtb` root, not an
+/// ordinary catalog row: startup must read it before redo discovery so missing
+/// prefix files below the marker can be accepted without replaying catalog redo
+/// first.
+///
+/// Pending metadata changes reserve the next turn once an active checkpoint
+/// drains. This prevents later checkpoints from repeatedly entering ahead of a
+/// waiting DDL operation.
 pub(crate) struct CatalogCheckpointGate {
     state: Mutex<CatalogCheckpointGateState>,
     changed: Event,
@@ -145,7 +162,13 @@ impl CatalogCheckpointGate {
         }
     }
 
-    /// Acquires a catalog checkpoint lease, waiting for active metadata DDL.
+    /// Acquire a catalog checkpoint/marker-publish lease.
+    ///
+    /// The lease waits until no catalog metadata change is active or pending,
+    /// and also serializes overlapping catalog checkpoints or redo marker
+    /// publishes. It does not protect the retained redo suffix itself; callers
+    /// that scan retained redo, publish a marker, or unlink obsolete files must
+    /// also hold the transaction-system redo-retention lease.
     pub(crate) async fn begin_checkpoint(&self) -> CatalogCheckpointLease<'_> {
         loop {
             {
@@ -170,7 +193,11 @@ impl CatalogCheckpointGate {
         }
     }
 
-    /// Acquires a catalog metadata-change lease for future index DDL.
+    /// Acquire a catalog metadata-change lease for index DDL.
+    ///
+    /// When a checkpoint is active, the first metadata-change waiter records a
+    /// pending reservation so it will run before subsequent checkpoints. Dropping
+    /// a pending future before it becomes active reopens the gate.
     pub(crate) async fn begin_metadata_change(&self) -> CatalogMetadataChangeLease<'_> {
         let mut pending = None;
         loop {
@@ -282,7 +309,10 @@ impl Drop for PendingCatalogMetadataChange<'_> {
     }
 }
 
-/// RAII guard for a catalog checkpoint scan/apply section.
+/// RAII guard for one catalog checkpoint scan/apply section.
+///
+/// While held, other catalog checkpoints and catalog metadata DDL wait on the
+/// catalog checkpoint gate.
 pub(crate) struct CatalogCheckpointLease<'a> {
     gate: &'a CatalogCheckpointGate,
 }
@@ -294,7 +324,10 @@ impl Drop for CatalogCheckpointLease<'_> {
     }
 }
 
-/// RAII guard for future catalog metadata DDL sections.
+/// RAII guard for one catalog metadata DDL section.
+///
+/// While held, catalog checkpoints wait so they cannot scan or publish against
+/// partially updated catalog/table metadata.
 pub(crate) struct CatalogMetadataChangeLease<'a> {
     gate: &'a CatalogCheckpointGate,
 }
@@ -309,16 +342,19 @@ impl Drop for CatalogMetadataChangeLease<'_> {
 impl Catalog {
     /// Trigger one ad-hoc catalog checkpoint publish.
     ///
+    /// Normal overlap with another catalog checkpoint, catalog metadata DDL, or
+    /// redo truncation waits through the catalog checkpoint gate and the
+    /// transaction-system redo-retention gate.
+    ///
     /// # Panics
     ///
-    /// Normal overlapping calls to this method do not panic; they wait for the
-    /// active catalog checkpoint to finish before publishing. A panic indicates
-    /// an internal invariant violation, such as bypassing the checkpoint gate
-    /// and reaching the shared `CatalogStorage`/`MultiTableFile` with multiple
-    /// mutable writers.
+    /// A panic indicates an internal invariant violation, such as bypassing the
+    /// required gates and reaching the shared `CatalogStorage`/`MultiTableFile`
+    /// with multiple mutable writers.
     #[inline]
     pub(crate) async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
+        let _redo_retention_lease = trx_sys.begin_redo_retention().await;
         let batch = self.scan_checkpoint_batch(trx_sys).await?;
         let publishable_progress = batch
             .redo_retention_progress(batch.safe_cts.saturating_add(1).max(batch.replay_start_ts));

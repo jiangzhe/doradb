@@ -43,7 +43,7 @@ pub use engine::Engine;
 pub use error::{Error, ErrorKind, Result};
 pub use lock::LockMode;
 pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-pub use session::Session;
+pub use session::{RedoTruncationBlockerInfo, RedoTruncationOutcome, Session};
 pub use stats::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats, StorageIoStats,
     TransactionSystemStats,

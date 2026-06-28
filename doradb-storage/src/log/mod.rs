@@ -1850,35 +1850,7 @@ pub(crate) fn discover_redo_log_files(
     first_retained_file_seq: u32,
     desc: bool,
 ) -> Result<Vec<RedoLogFileDescriptor>> {
-    let pattern = format!("{}.*", Pattern::escape(file_prefix));
-    let mut files = vec![];
-    for entry in glob(&pattern).unwrap() {
-        let path = entry?;
-        let Some(suffix) = log_family_suffix(file_prefix, &path)? else {
-            continue;
-        };
-        if is_log_file_seq(suffix) {
-            let file_seq = parse_file_seq(&path)?;
-            files.push((file_seq, path));
-            continue;
-        }
-        if is_legacy_partitioned_log_suffix(suffix) {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "unsupported legacy partitioned redo log file: {}",
-                    path.display()
-                ))
-                .into());
-        }
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "invalid redo log file name for single-stream layout: {}",
-                path.display()
-            ))
-            .into());
-    }
-    files.sort_by_key(|(seq, _)| *seq);
-    let files = files
+    let files = collect_redo_log_family_files(file_prefix)?
         .into_iter()
         .filter(|(seq, _)| *seq >= first_retained_file_seq)
         .collect::<Vec<_>>();
@@ -1891,6 +1863,19 @@ pub(crate) fn discover_redo_log_files(
         res.reverse();
     }
     Ok(res)
+}
+
+/// List present redo files below the durable first-retained marker.
+#[inline]
+pub(crate) fn obsolete_redo_log_files_below_marker(
+    file_prefix: &str,
+    first_retained_file_seq: u32,
+) -> Result<Vec<RedoLogFileDescriptor>> {
+    Ok(collect_redo_log_family_files(file_prefix)?
+        .into_iter()
+        .filter(|(seq, _)| *seq < first_retained_file_seq)
+        .map(|(file_seq, path)| RedoLogFileDescriptor { file_seq, path })
+        .collect())
 }
 
 /// Parse the eight-hex redo file sequence suffix from a redo log path.
@@ -1933,6 +1918,35 @@ pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
         )
     })?;
     Ok(file_seq)
+}
+
+#[inline]
+fn collect_redo_log_family_files(file_prefix: &str) -> Result<Vec<(u32, PathBuf)>> {
+    // Collect only syntactically valid single-stream redo files. Sequence
+    // contiguity is caller-specific: recovery and scan paths validate the
+    // retained suffix, while post-truncation cleanup must tolerate an obsolete
+    // prefix that previous cleanup attempts may have partially removed.
+    let pattern = format!("{}.*", Pattern::escape(file_prefix));
+    let mut files = vec![];
+    for entry in glob(&pattern).unwrap() {
+        let path = entry?;
+        let Some(suffix) = log_family_suffix(file_prefix, &path)? else {
+            continue;
+        };
+        if is_log_file_seq(suffix) {
+            let file_seq = parse_file_seq(&path)?;
+            files.push((file_seq, path));
+            continue;
+        }
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "invalid redo log file name for single-stream layout: {}",
+                path.display()
+            ))
+            .into());
+    }
+    files.sort_by_key(|(seq, _)| *seq);
+    Ok(files)
 }
 
 #[inline]
@@ -2233,21 +2247,6 @@ fn log_family_suffix<'a>(file_prefix: &str, file_path: &'a Path) -> Result<Optio
 #[inline]
 fn is_log_file_seq(value: &str) -> bool {
     value.len() == 8 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
-}
-
-#[inline]
-fn is_legacy_partitioned_log_suffix(value: &str) -> bool {
-    let mut parts = value.split('.');
-    let Some(partition) = parts.next() else {
-        return false;
-    };
-    let Some(seq) = parts.next() else {
-        return false;
-    };
-    parts.next().is_none()
-        && !partition.is_empty()
-        && partition.as_bytes().iter().all(u8::is_ascii_digit)
-        && is_log_file_seq(seq)
 }
 
 #[cfg(test)]
@@ -4385,15 +4384,22 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_redo_log_files_rejects_legacy_partitioned_files() {
+    fn test_discover_redo_log_files_rejects_invalid_single_stream_name() {
         let temp_dir = TempDir::new().unwrap();
         let file_prefix = temp_dir.path().join("redo.log");
         let file_prefix = file_prefix.to_str().unwrap();
         File::create(format!("{file_prefix}.0.00000000")).unwrap();
 
         let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
         let report = format!("{err:?}");
-        assert!(report.contains("unsupported legacy partitioned redo log file"));
+        assert!(
+            report.contains("invalid redo log file name for single-stream layout"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -4783,22 +4789,25 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_startup_rejects_legacy_partitioned_redo_file() {
+    fn test_engine_startup_rejects_invalid_redo_file_name() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            File::create(temp_dir.path().join("legacy_redo.0.00000000")).unwrap();
+            File::create(temp_dir.path().join("invalid_redo.0.00000000")).unwrap();
 
             let err = match EngineConfig::default()
                 .storage_root(temp_dir.path())
-                .trx(TrxSysConfig::default().log_file_stem("legacy_redo"))
+                .trx(TrxSysConfig::default().log_file_stem("invalid_redo"))
                 .build()
                 .await
             {
-                Ok(_) => panic!("engine startup should reject legacy partitioned redo files"),
+                Ok(_) => panic!("engine startup should reject invalid redo file names"),
                 Err(err) => err,
             };
             let report = format!("{err:?}");
-            assert!(report.contains("unsupported legacy partitioned redo log file"));
+            assert!(
+                report.contains("invalid redo log file name for single-stream layout"),
+                "{report}"
+            );
         });
     }
 

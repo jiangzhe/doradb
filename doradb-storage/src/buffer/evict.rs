@@ -487,9 +487,6 @@ impl BufferPool for EvictableBufferPool {
             if frame.generation() != id.generation {
                 return Ok(None);
             }
-            if frame.kind() != FrameKind::Uninitialized {
-                validate_frame_page_kind::<T>(frame)?;
-            }
             match frame.kind() {
                 FrameKind::Uninitialized => return Ok(None),
                 FrameKind::Fixed | FrameKind::Hot => {
@@ -1601,6 +1598,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::EvictionArbiterBuilder;
     use crate::buffer::guard::PageGuard;
+    use crate::buffer::page::BufferPageKind;
     use crate::buffer::test_page_id;
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1617,13 +1615,17 @@ pub(crate) mod tests {
     use crate::index::BTreeNode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
+    use futures::task::noop_waker;
     use std::env::current_dir;
+    use std::future::Future;
     use std::io::Error as StdIoError;
     use std::ops::Deref;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::slice::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1705,6 +1707,12 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected internal buffer-page kind mismatch"),
             Err(err) => assert!(err.is_kind(ErrorKind::Internal)),
         }
+    }
+
+    fn assert_pending_once<F: Future>(future: Pin<&mut F>) {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(future.poll(&mut cx), Poll::Pending));
     }
 
     fn make_reload_submission_for_test(
@@ -1984,6 +1992,39 @@ pub(crate) mod tests {
                 assert!(c.unwrap().is_invalid());
             }
         })
+    }
+
+    #[test]
+    fn test_get_page_versioned_treats_same_generation_deinit_as_absent() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = StartedEvictPool::new(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(1024u64 * 1024 * 128)
+                    .max_file_size(1024u64 * 1024 * 256),
+            );
+            let pool_guard = pool.pool_guard();
+            let mut page_guard = pool
+                .allocate_page::<RowPage>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let versioned = page_guard.versioned_page_id();
+
+            page_guard
+                .bf_mut()
+                .set_page_kind(BufferPageKind::Uninitialized);
+            let mut get_page_versioned = Box::pin(pool.get_page_versioned::<RowPage>(
+                &pool_guard,
+                versioned,
+                LatchFallbackMode::Shared,
+            ));
+            assert_pending_once(get_page_versioned.as_mut());
+
+            pool.deallocate_page(page_guard);
+            assert!(get_page_versioned.await.unwrap().is_none());
+        });
     }
 
     #[test]

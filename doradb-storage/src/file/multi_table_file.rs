@@ -354,6 +354,17 @@ impl MutableMultiTableFile {
         Ok(())
     }
 
+    /// Apply a first-retained redo marker to the mutable catalog root.
+    #[inline]
+    pub(crate) fn apply_first_redo_log_seq(&mut self, first_redo_log_seq: u32) -> Result<bool> {
+        let root = &mut self.new_root.root;
+        if first_redo_log_seq <= root.first_redo_log_seq {
+            return Ok(false);
+        }
+        root.first_redo_log_seq = first_redo_log_seq;
+        Ok(true)
+    }
+
     /// Returns immutable reference to the mutable catalog root snapshot.
     #[inline]
     pub(crate) fn root(&self) -> &MultiTableActiveRoot {
