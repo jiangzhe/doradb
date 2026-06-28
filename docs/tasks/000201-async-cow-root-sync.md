@@ -1,7 +1,7 @@
 ---
 id: 000201
 title: Async CoW Root Sync
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-06-28
 github_issue: 787
 ---
@@ -188,6 +188,35 @@ is outside this task.
 
 ## Implementation Notes
 
+- Added an owner-retaining table-file sync submission path that prepares
+  backend `Operation::fsync(...)` only after admission to the shared storage
+  queue and retains the owning `Arc<SparseFile>` until completion.
+- Routed table-file sync requests through the existing `background_writes`
+  lane as backend `IOKind::Fsync`, preserving shared-worker depth accounting,
+  fairness, test-hook visibility, and shutdown drain behavior.
+- Replaced the blocking CoW root publication sync in
+  `CowFile::publish_prepared_root()` with awaited backend fsync after the
+  meta-block and inactive super-block writes and before `swap_active_root`.
+- Removed production `FileSyncer`, `FileSyncKind`, `SparseFile::syncer()`,
+  `CowFile::fsync()`, and raw libc sync imports. A production search found no
+  remaining `FileSyncer` callers; redo sync already uses backend-native
+  `Operation::fsync(...)` / `Operation::fdatasync(...)` from task 000192.
+- Added explicit table-file fsync completion handling: `Ok(0)` succeeds,
+  `Ok(nonzero)` reports an unexpected completion result, and backend `Err(io)`
+  reports an I/O completion failure through the existing completion transport.
+- Added regression coverage for sync submission shape and owner retention,
+  nonzero/backend-error sync completions, user-table commit fsync ordering and
+  failure atomicity, and catalog commit fsync ordering.
+- Updated `docs/async-io.md` and `docs/table-file.md` to describe
+  table/catalog CoW root fsyncs as shared-storage backend submissions.
+- Validation completed:
+  - `cargo fmt`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  - `tools/style_audit.rs --diff-base origin/main`
+
 ## Impacts
 
 - `doradb-storage/src/file/mod.rs`
@@ -254,9 +283,4 @@ is outside this task.
 
 ## Open Questions
 
-No blocking design questions remain.
-
-If implementation finds a remaining production `FileSyncer` caller outside
-redo, table files, or `catalog.mtb`, decide during review whether it belongs in
-this task's narrow migration or needs a follow-up backlog item. Do not weaken
-CoW root publication guarantees to make that cleanup fit.
+No unresolved implementation questions remain.

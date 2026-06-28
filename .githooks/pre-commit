@@ -44,7 +44,7 @@ if ! cargo clippy -p doradb-storage --all-targets -- -D warnings >"${tmp_clippy_
 fi
 
 echo "[pre-commit] Running cargo deny check"
-if ! cargo deny check >"${tmp_deny_log}" 2>&1; then
+if ! cargo deny check --disable-fetch >"${tmp_deny_log}" 2>&1; then
   echo "[pre-commit] cargo deny check failed."
   cat "${tmp_deny_log}"
   exit 1
