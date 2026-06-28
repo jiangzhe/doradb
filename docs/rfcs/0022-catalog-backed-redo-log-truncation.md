@@ -1,7 +1,7 @@
 ---
 id: 0022
 title: Catalog-Backed Redo Log Truncation
-status: draft
+status: implemented
 tags: [redo, recovery, catalog, checkpoint]
 created: 2026-06-26
 github_issue: 767
@@ -300,9 +300,10 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
     truncation API, background retention policy.
   - Prerequisites: Catalog storage is available before redo replay planning in
     startup, as it is today.
-  - Phase-local Choices: Exact marker field name and encoding in
-    `MultiTableMetaBlock`; whether marker advancement is exposed through a
-    narrow catalog-storage helper or a transaction-system helper.
+  - Phase-local Choices: Resolved with `first_redo_log_seq: u32` stored in the
+    existing `catalog.mtb` metadata reserved slot without changing
+    `CATALOG_MTB_VERSION`; phase 1 kept production marker advancement out of
+    the public surface and used narrow test helpers for nonzero marker setup.
   - Task Doc: `docs/tasks/000194-durable-retention-marker-for-redo-log.md`
   - Task Issue: `#769`
   - Phase Status: done
@@ -343,15 +344,23 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
   - Prerequisites: Phase 2 provides catalog-safe segment observations or a
     fallback segment-summary path; table active roots expose heap/deletion
     replay bounds in memory.
-  - Phase-local Choices: Public vs test-only exposure of a dry-run plan; exact
-    blocker taxonomy; whether live-table root snapshots are collected through a
-    new catalog iterator or transaction-system helper.
+  - Phase-local Choices: Resolved with a crate-private
+    `TransactionSystem::plan_redo_truncation()` path, explicit candidate and
+    blocker taxonomy, live-table floor snapshots through catalog/table helpers,
+    and pending dropped-table replay floors retained in purge-owned cleanup
+    queues. No public dry-run API was added.
   - Task Doc: `docs/tasks/000196-global-truncation-floor-planning.md`
   - Task Issue: `#773`
   - Phase Status: done
   - Implementation Summary: Implemented internal dry-run redo truncation planning from catalog-safe progress, live table floors, pending dropped-table floors, and retained segment metadata, with dropped-table floor retention and explicit candidate/blocker reporting. [Task Resolve Sync: docs/tasks/000196-global-truncation-floor-planning.md @ 2026-06-27]
   - Related Backlogs:
-    - `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
+    - `docs/backlogs/closed/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
+  - Deferred Follow-ups:
+    - `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md`
+      remains open for catalog-backed heartbeat watermark optimization.
+    - `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+      remains open for a cleaner dropped-table ownership model that removes the
+      foreground drop handoff gap.
 
 - **Phase 4: Session Truncate API**
   - Scope: Add `Session::truncate_redo_log`, publish marker advancement before
@@ -364,13 +373,21 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
     sparse-file hole punching, truncating unsealed active files.
   - Prerequisites: Phase 3 planning is available and phase 1 marker persistence
     is recovery-tested.
-  - Phase-local Choices: Exact outcome struct fields; retry behavior for unlink
-    errors; whether partial unlink success is reported per file or summarized;
-    exact retention gate placement.
+  - Phase-local Choices: Resolved with public aggregate
+    `RedoTruncationOutcome` and `RedoTruncationBlockerInfo` types, retryable
+    cleanup summary counters for already-missing and failed unlink attempts,
+    marker-before-unlink publication, catalog metadata gate acquisition before
+    the redo-retention gate, and catalog gate release before physical cleanup.
   - Task Doc: `docs/tasks/000197-session-redo-log-truncation-api.md`
   - Task Issue: `#777`
   - Phase Status: done
   - Implementation Summary: Implemented public Session truncate_redo_log API with marker-before-unlink publication, redo-retention and catalog metadata gating, aggregate outcome and blocker reporting, retryable cleanup, restart strictness tests, and follow-up backlogs for combined checkpoint/truncate and runtime-agnostic blocking work. [Task Resolve Sync: docs/tasks/000197-session-redo-log-truncation-api.md @ 2026-06-28]
+  - Deferred Follow-ups:
+    - `docs/backlogs/000136-combine-catalog-checkpoint-redo-truncation.md`
+      remains open for a future combined checkpoint-and-truncate maintenance
+      command.
+    - `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md`
+      remains open for async blocking-filesystem-work offload design.
 
 ## Consequences
 
@@ -397,20 +414,39 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
 
 ## Open Questions
 
-- Exact public names for catalog checkpoint and redo truncation outcome types
-  are left to phase task design.
-- Exact blocker taxonomy is left to Phase 3, but it must distinguish at least
-  catalog floor, live table floor, pending dropped table floor, unsealed file,
-  and unlink failure.
+None for RFC resolve. Implementation settled the public API as
+`Session::truncate_redo_log`, exported aggregate `RedoTruncationOutcome` and
+`RedoTruncationBlockerInfo` types, kept `Session::checkpoint_catalog` returning
+`Result<()>`, and represented catalog, live-table, pending-dropped-table, and
+unsealed-file blockers explicitly.
+
+## Deferred Follow-up Backlogs
+
+The implementation intentionally deferred the following non-blocking work. These
+items remain open for future task/RFC planning and are not required to close RFC
+0022:
+
+- `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md` -
+  catalog-backed heartbeat watermark overrides for static tables.
+- `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+  - retained dropped-table runtime ownership until catalog absence is durable.
+- `docs/backlogs/000136-combine-catalog-checkpoint-redo-truncation.md` -
+  combined catalog checkpoint plus redo truncation command and single
+  `catalog.mtb` publication.
+- `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md` -
+  storage-owned blocking-work offload abstraction for async maintenance paths.
 
 ## Future Work
 
 - Background redo retention scheduler.
 - Automatic idle-table checkpoint scheduling or hints.
+- Combined catalog checkpoint plus redo truncation maintenance command.
 - Persistent retention telemetry and user-facing truncation metrics.
 - Sparse-file hole punching or intra-file truncation. This RFC removes whole
   sealed files only.
 - Cached global floor maintenance if on-demand planning becomes too expensive.
+- Runtime-agnostic blocking work abstraction for filesystem scans/unlink in
+  async maintenance paths.
 
 ## References
 
@@ -418,4 +454,8 @@ repository unsafe guidance and keep the unsafe boundary local and documented.
 - `docs/rfcs/0021-redo-log-fixed-block-read-write-path.md`
 - `docs/redo-log.md`
 - `docs/checkpoint-and-recovery.md`
-- `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
+- `docs/backlogs/closed/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
+- `docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md`
+- `docs/backlogs/000135-defer-dropped-table-runtime-removal-until-catalog-absence-is-durable.md`
+- `docs/backlogs/000136-combine-catalog-checkpoint-redo-truncation.md`
+- `docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md`

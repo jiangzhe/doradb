@@ -19,3 +19,10 @@ Evaluate and implement expanded deletion watermark fields in metadata/redo paths
 
 Watermark model supports intended log-truncation policy with recovery-safe implementation.
 
+## Close Reason
+
+- Type: replaced
+- Detail: RFC 0022 implemented recovery-safe redo truncation using durable first-retained redo marker publication, table replay floors, and explicit blockers; remaining watermark optimization work is tracked by backlog 000134.
+- Closed By: backlog close
+- Reference: docs/rfcs/0022-catalog-backed-redo-log-truncation.md; docs/backlogs/000134-centralize-silent-table-checkpoint-watermarks.md
+- Closed At: 2026-06-28
