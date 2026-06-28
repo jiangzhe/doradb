@@ -27,67 +27,21 @@ const COL_NO_INDEXES_INDEX_ATTRIBUTES: usize = 2;
 const COL_NAME_INDEXES_INDEX_ATTRIBUTES: &str = "index_attributes";
 const PK_NO_INDEXES: usize = 0;
 
-/// Return static table definition of `catalog.indexes`.
-pub(super) fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
-    static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
-    DEF.get_or_init(|| {
-        CatalogDefinition {
-            table_id: TABLE_ID_INDEXES,
-            metadata: TableMetadata::try_new(
-                vec![
-                    // table_id unsgined bigint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEXES_TABLE_ID),
-                        column_type: ValKind::U64,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
-                    // index_no unsigned smallint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_NO),
-                        column_type: ValKind::U16,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
-                    // index_attributes unsigned int not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_ATTRIBUTES),
-                        column_type: ValKind::U32,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                ],
-                vec![
-                    // primary key (table_id, index_no)
-                    IndexSpec::new(
-                        vec![IndexKey::new(0), IndexKey::new(1)],
-                        IndexAttributes::PK,
-                    ),
-                ],
-            )
-            .expect("valid table metadata"),
-        }
-    })
-}
+/* Index columns table */
 
-#[inline]
-fn row_to_index_object(col_layout: &TableColumnLayout, row: Row<'_>) -> IndexObject {
-    let table_id = TableID::from(
-        row.val(col_layout, COL_NO_INDEXES_TABLE_ID)
-            .as_u64()
-            .unwrap(),
-    );
-    let index_no = row
-        .val(col_layout, COL_NO_INDEXES_INDEX_NO)
-        .as_u16()
-        .unwrap();
-    let index_attributes = row
-        .val(col_layout, COL_NO_INDEXES_INDEX_ATTRIBUTES)
-        .as_u32()
-        .unwrap();
-    IndexObject {
-        table_id,
-        index_no,
-        index_attributes: IndexAttributes::from_bits_truncate(index_attributes),
-    }
-}
+pub(super) const TABLE_ID_INDEX_COLUMNS: TableID = TableID::new(3);
+const COL_NO_INDEX_COLUMNS_TABLE_ID: usize = 0;
+const COL_NAME_INDEX_COLUMNS_TABLE_ID: &str = "table_id";
+const COL_NO_INDEX_COLUMNS_INDEX_NO: usize = 1;
+const COL_NAME_INDEX_COLUMNS_INDEX_NO: &str = "index_no";
+const COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO: usize = 2;
+const COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO: &str = "index_column_no";
+const COL_NO_INDEX_COLUMNS_COLUMN_NO: usize = 3;
+const COL_NAME_INDEX_COLUMNS_COLUMN_NO: &str = "column_no";
+
+const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 4;
+const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
+const PK_NO_INDEX_COLUMNS: usize = 0;
 
 /// Runtime accessor for `catalog.indexes`.
 pub(crate) struct Indexes<'a> {
@@ -164,107 +118,6 @@ impl Indexes<'_> {
             })
             .await?;
         Ok(res)
-    }
-}
-
-/* Index columns table */
-
-pub(super) const TABLE_ID_INDEX_COLUMNS: TableID = TableID::new(3);
-const COL_NO_INDEX_COLUMNS_TABLE_ID: usize = 0;
-const COL_NAME_INDEX_COLUMNS_TABLE_ID: &str = "table_id";
-const COL_NO_INDEX_COLUMNS_INDEX_NO: usize = 1;
-const COL_NAME_INDEX_COLUMNS_INDEX_NO: &str = "index_no";
-const COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO: usize = 2;
-const COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO: &str = "index_column_no";
-const COL_NO_INDEX_COLUMNS_COLUMN_NO: usize = 3;
-const COL_NAME_INDEX_COLUMNS_COLUMN_NO: &str = "column_no";
-
-const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 4;
-const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
-const PK_NO_INDEX_COLUMNS: usize = 0;
-
-/// Return static table definition of `catalog.index_columns`.
-pub(super) fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
-    static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
-    DEF.get_or_init(|| {
-        CatalogDefinition {
-            table_id: TABLE_ID_INDEX_COLUMNS,
-            metadata: TableMetadata::try_new(
-                vec![
-                    // table_id unsigned bigint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_TABLE_ID),
-                        column_type: ValKind::U64,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
-                    // index_no unsigned smallint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_NO),
-                        column_type: ValKind::U16,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
-                    // index_column_no unsigned smallint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO),
-                        column_type: ValKind::U16,
-                        column_attributes: ColumnAttributes::INDEX,
-                    },
-                    // column_no unsigned smallint not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_COLUMN_NO),
-                        column_type: ValKind::U16,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                    // descending boolean not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_ORDER),
-                        column_type: ValKind::U8,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                ],
-                vec![
-                    // primary key pk_index_columns
-                    // (table_id, index_no, index_column_no)
-                    IndexSpec::new(
-                        vec![IndexKey::new(0), IndexKey::new(1), IndexKey::new(2)],
-                        IndexAttributes::PK,
-                    ),
-                ],
-            )
-            .expect("valid table metadata"),
-        }
-    })
-}
-
-#[inline]
-fn row_to_index_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> IndexColumnObject {
-    let table_id = TableID::from(
-        row.val(col_layout, COL_NO_INDEX_COLUMNS_TABLE_ID)
-            .as_u64()
-            .unwrap(),
-    );
-    let index_no = row
-        .val(col_layout, COL_NO_INDEX_COLUMNS_INDEX_NO)
-        .as_u16()
-        .unwrap();
-    let index_column_no = row
-        .val(col_layout, COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO)
-        .as_u16()
-        .unwrap();
-    let column_no = row
-        .val(col_layout, COL_NO_INDEX_COLUMNS_COLUMN_NO)
-        .as_u16()
-        .unwrap();
-    let index_order = row
-        .val(col_layout, COL_NO_INDEX_COLUMNS_INDEX_ORDER)
-        .as_u8()
-        .unwrap();
-    IndexColumnObject {
-        table_id,
-        index_no,
-        index_column_no,
-        column_no,
-        index_order: IndexOrder::from(index_order),
     }
 }
 
@@ -381,6 +234,153 @@ impl IndexColumns<'_> {
             })
             .await?;
         Ok(res)
+    }
+}
+
+/// Return static table definition of `catalog.indexes`.
+pub(super) fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
+    static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
+    DEF.get_or_init(|| {
+        CatalogDefinition {
+            table_id: TABLE_ID_INDEXES,
+            metadata: TableMetadata::try_new(
+                vec![
+                    // table_id unsgined bigint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEXES_TABLE_ID),
+                        column_type: ValKind::U64,
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    // index_no unsigned smallint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_NO),
+                        column_type: ValKind::U16,
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    // index_attributes unsigned int not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_ATTRIBUTES),
+                        column_type: ValKind::U32,
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                ],
+                vec![
+                    // primary key (table_id, index_no)
+                    IndexSpec::new(
+                        vec![IndexKey::new(0), IndexKey::new(1)],
+                        IndexAttributes::PK,
+                    ),
+                ],
+            )
+            .expect("valid table metadata"),
+        }
+    })
+}
+
+/// Return static table definition of `catalog.index_columns`.
+pub(super) fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
+    static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
+    DEF.get_or_init(|| {
+        CatalogDefinition {
+            table_id: TABLE_ID_INDEX_COLUMNS,
+            metadata: TableMetadata::try_new(
+                vec![
+                    // table_id unsigned bigint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_TABLE_ID),
+                        column_type: ValKind::U64,
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    // index_no unsigned smallint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_NO),
+                        column_type: ValKind::U16,
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    // index_column_no unsigned smallint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_COLUMN_NO),
+                        column_type: ValKind::U16,
+                        column_attributes: ColumnAttributes::INDEX,
+                    },
+                    // column_no unsigned smallint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_COLUMN_NO),
+                        column_type: ValKind::U16,
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                    // descending boolean not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_INDEX_COLUMNS_INDEX_ORDER),
+                        column_type: ValKind::U8,
+                        column_attributes: ColumnAttributes::empty(),
+                    },
+                ],
+                vec![
+                    // primary key pk_index_columns
+                    // (table_id, index_no, index_column_no)
+                    IndexSpec::new(
+                        vec![IndexKey::new(0), IndexKey::new(1), IndexKey::new(2)],
+                        IndexAttributes::PK,
+                    ),
+                ],
+            )
+            .expect("valid table metadata"),
+        }
+    })
+}
+
+#[inline]
+fn row_to_index_object(col_layout: &TableColumnLayout, row: Row<'_>) -> IndexObject {
+    let table_id = TableID::from(
+        row.val(col_layout, COL_NO_INDEXES_TABLE_ID)
+            .as_u64()
+            .unwrap(),
+    );
+    let index_no = row
+        .val(col_layout, COL_NO_INDEXES_INDEX_NO)
+        .as_u16()
+        .unwrap();
+    let index_attributes = row
+        .val(col_layout, COL_NO_INDEXES_INDEX_ATTRIBUTES)
+        .as_u32()
+        .unwrap();
+    IndexObject {
+        table_id,
+        index_no,
+        index_attributes: IndexAttributes::from_bits_truncate(index_attributes),
+    }
+}
+
+#[inline]
+fn row_to_index_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> IndexColumnObject {
+    let table_id = TableID::from(
+        row.val(col_layout, COL_NO_INDEX_COLUMNS_TABLE_ID)
+            .as_u64()
+            .unwrap(),
+    );
+    let index_no = row
+        .val(col_layout, COL_NO_INDEX_COLUMNS_INDEX_NO)
+        .as_u16()
+        .unwrap();
+    let index_column_no = row
+        .val(col_layout, COL_NO_INDEX_COLUMNS_INDEX_COLUMN_NO)
+        .as_u16()
+        .unwrap();
+    let column_no = row
+        .val(col_layout, COL_NO_INDEX_COLUMNS_COLUMN_NO)
+        .as_u16()
+        .unwrap();
+    let index_order = row
+        .val(col_layout, COL_NO_INDEX_COLUMNS_INDEX_ORDER)
+        .as_u8()
+        .unwrap();
+    IndexColumnObject {
+        table_id,
+        index_no,
+        index_column_no,
+        column_no,
+        index_order: IndexOrder::from(index_order),
     }
 }
 
