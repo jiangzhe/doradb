@@ -102,6 +102,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         key: &SelectKey,
         row_id: RowID,
         mut update: Vec<UpdateCol>,
+        log_by_key: bool,
     ) -> UpdateRowInplace {
         let page_id = page_guard.page_id();
         let (_, page) = page_guard.ctx_and_page();
@@ -171,7 +172,11 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                             page_id,
                             row_id,
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
-                            kind: RowRedoKind::Delete,
+                            kind: if log_by_key {
+                                RowRedoKind::DeleteByUniqueKey(key.clone())
+                            } else {
+                                RowRedoKind::Delete
+                            },
                         };
                         effects.insert_row_redo(self.table_id, redo_entry);
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
@@ -223,7 +228,11 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                             let redo_entry = RowRedo {
                                 page_id,
                                 row_id,
-                                kind: RowRedoKind::Update(redo_cols),
+                                kind: if log_by_key {
+                                    RowRedoKind::UpdateByUniqueKey(key.clone(), redo_cols)
+                                } else {
+                                    RowRedoKind::Update(redo_cols)
+                                },
                             };
                             effects.insert_row_redo(self.table_id, redo_entry);
                         }

@@ -437,7 +437,7 @@ impl<'stmt> Statement<'stmt> {
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .upsert_unique_mvcc(rt, effects, unique_index_no, cols)
+            .upsert_unique_mvcc(rt, effects, unique_index_no, cols, false)
             .await
     }
 
@@ -458,7 +458,7 @@ impl<'stmt> Statement<'stmt> {
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .update_unique_mvcc(rt, effects, key, update)
+            .update_unique_mvcc(rt, effects, key, update, false)
             .await
     }
 
@@ -493,6 +493,21 @@ impl<'stmt> Statement<'stmt> {
         self.acquire_table_write_locks(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table.insert_mvcc(rt, effects, cols).await
+    }
+
+    /// Inserts or updates one catalog-table row by a stable unique key.
+    #[inline]
+    pub(crate) async fn catalog_upsert_unique_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        unique_index_no: usize,
+        cols: Vec<Val>,
+    ) -> Result<UpsertMvcc> {
+        self.acquire_table_write_locks(table.table_id()).await?;
+        let (rt, effects) = self.runtime_and_effects_mut();
+        table
+            .upsert_unique_mvcc(rt, effects, unique_index_no, cols, true)
+            .await
     }
 
     /// Deletes one catalog-table row through the foreground lock-aware path.
@@ -632,6 +647,11 @@ pub(crate) mod tests {
         stmt: &'borrow mut Statement<'_>,
     ) -> (TrxRuntime<'borrow>, &'borrow mut StmtEffects) {
         stmt.runtime_and_effects_mut()
+    }
+
+    #[inline]
+    pub(crate) fn redo_logs(effects: &StmtEffects) -> &RedoLogs {
+        &effects.redo
     }
 
     #[inline]

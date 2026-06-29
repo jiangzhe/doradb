@@ -7,7 +7,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
 use crate::catalog::{TableColumnLayout, TableMetadata};
-use crate::error::{Error, InternalError, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
@@ -1467,11 +1467,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     return self.catalog_lwc_error("delete unique no-trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self
-                        .get_row_page_exclusive(guards, page_id)
-                        .await
-                        .expect("delete_unique_no_trx should not ignore page-I/O failures")
-                        .expect("failed to lock exclusive row page");
+                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
                     (page_guard, row_id)
                 }
             },
@@ -1489,6 +1485,99 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             assert!(res);
         }
         page.set_deleted_exclusive(row_idx, true);
+        Ok(())
+    }
+
+    /// Update one catalog row through a stable unique key without transaction state.
+    #[inline]
+    pub(crate) async fn update_unique_no_trx(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        update: &[UpdateCol],
+    ) -> Result<()> {
+        let metadata = self.metadata();
+        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx key index not found: index_no={}, index_slot_count={}",
+                key.index_no,
+                metadata.idx.index_slot_count()
+            )));
+        };
+        if !index_spec.unique() {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx key is not unique: index_no={}",
+                key.index_no
+            )));
+        }
+        if !metadata
+            .idx
+            .index_type_match(metadata.col.as_ref(), key.index_no, &key.vals)
+        {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx key type mismatch: index_no={}",
+                key.index_no
+            )));
+        }
+        // This no-trx recovery path writes the row image directly and does not
+        // update MemIndex entries. Keep validate_update_by_key_cols() rejecting
+        // every indexed column; callers that need indexed-column changes must
+        // use a path that updates indexes as well.
+        validate_update_by_key_cols(metadata, update)?;
+
+        let sts = MIN_SNAPSHOT_TS;
+        let (mut page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
+            None => {
+                return Err(catalog_update_by_key_payload_error(format!(
+                    "update unique no-trx missing catalog row: index_no={}, key_vals={:?}",
+                    key.index_no, key.vals
+                )));
+            }
+            Some((row_id, _)) => match self.find_row(guards, row_id).await? {
+                RowLocation::NotFound => {
+                    return Err(catalog_update_by_key_payload_error(format!(
+                        "update unique no-trx row location missing: row_id={row_id}"
+                    )));
+                }
+                RowLocation::LwcBlock { .. } => {
+                    return self.catalog_lwc_error("update unique no-trx", row_id);
+                }
+                RowLocation::RowPage(page_id) => {
+                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
+                    (page_guard, row_id)
+                }
+            },
+        };
+        let page = page_guard.page_mut();
+        if !page.row_id_in_valid_range(row_id) {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx row id out of page range: row_id={row_id}"
+            )));
+        }
+        let row_idx = page.row_idx(row_id);
+        let row = page.row(row_idx);
+        if row.is_deleted() {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx row is deleted: row_id={row_id}"
+            )));
+        }
+        if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx row key mismatch: row_id={row_id}, index_no={}",
+                key.index_no
+            )));
+        }
+        let var_len = page.var_len_for_update(row_idx, update);
+        let Some(var_offset) = page.request_free_space(var_len) else {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx row update does not fit: row_id={row_id}"
+            )));
+        };
+        let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
+        for update_col in update {
+            row.update_col(metadata.col.as_ref(), update_col.idx, &update_col.val, true);
+        }
+        row.finish_update();
         Ok(())
     }
 
@@ -1633,6 +1722,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         effects: &mut StmtEffects,
         unique_index_no: usize,
         cols: Vec<Val>,
+        log_by_key: bool,
     ) -> Result<UpsertMvcc> {
         let key = unique_key_from_full_row(
             self.metadata(),
@@ -1641,7 +1731,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             "upsert unique MVCC",
         )?;
         match self
-            .update_unique_mvcc(rt, effects, &key, full_row_update_cols(&cols))
+            .update_unique_mvcc(rt, effects, &key, full_row_update_cols(&cols), log_by_key)
             .await?
         {
             UpdateMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
@@ -1663,6 +1753,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         effects: &mut StmtEffects,
         key: &SelectKey,
         update: Vec<UpdateCol>,
+        log_by_key: bool,
     ) -> Result<UpdateMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
@@ -1711,7 +1802,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 },
             };
             let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-                .update_inplace(effects, page_guard, key, row_id, update.clone())
+                .update_inplace(effects, page_guard, key, row_id, update.clone(), log_by_key)
                 .await;
             match res {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
@@ -2446,6 +2537,47 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
     Ok(builder.publish())
 }
 
+#[inline]
+fn validate_update_by_key_cols(metadata: &TableMetadata, update: &[UpdateCol]) -> Result<()> {
+    let mut last_idx = None;
+    for update_col in update {
+        if update_col.idx >= metadata.col.col_count() {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx column out of range: column_no={}, column_count={}",
+                update_col.idx,
+                metadata.col.col_count()
+            )));
+        }
+        if last_idx.is_some_and(|idx| update_col.idx <= idx) {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx columns not strictly ordered: column_no={}",
+                update_col.idx
+            )));
+        }
+        if !metadata.col.col_type_match(update_col.idx, &update_col.val) {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx column type mismatch: column_no={}",
+                update_col.idx
+            )));
+        }
+        if metadata.idx.index_columns().contains(&update_col.idx) {
+            return Err(catalog_update_by_key_payload_error(format!(
+                "update unique no-trx cannot change indexed column: column_no={}",
+                update_col.idx
+            )));
+        }
+        last_idx = Some(update_col.idx);
+    }
+    Ok(())
+}
+
+#[inline]
+fn catalog_update_by_key_payload_error(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::MemTable;
@@ -2456,7 +2588,9 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::engine::Engine;
-    use crate::error::{ErrorKind, InternalError, OperationError, ResourceError};
+    use crate::error::{
+        DataIntegrityError, ErrorKind, InternalError, OperationError, ResourceError,
+    };
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{RowID, TableID, TrxID};
     use crate::index::{BlockIndex, RowLocation};
@@ -2568,7 +2702,9 @@ mod tests {
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(table_id).await?;
                 let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                mem_table.update_unique_mvcc(rt, effects, key, update).await
+                mem_table
+                    .update_unique_mvcc(rt, effects, key, update, false)
+                    .await
             })
             .await
             .unwrap();
@@ -2669,6 +2805,7 @@ mod tests {
                             effects,
                             0,
                             vec![Val::from(1i32), Val::from("hello")],
+                            false,
                         )
                         .await
                 })
@@ -2691,6 +2828,7 @@ mod tests {
                             effects,
                             0,
                             vec![Val::from(1i32), Val::from("world")],
+                            false,
                         )
                         .await
                 })
@@ -2732,6 +2870,7 @@ mod tests {
                             effects,
                             0,
                             vec![Val::from(2i32), Val::from("first")],
+                            false,
                         )
                         .await
                 })
@@ -2752,6 +2891,7 @@ mod tests {
                             effects,
                             0,
                             vec![Val::from(2i32), Val::from("second")],
+                            false,
                         )
                         .await
                 })
@@ -2812,6 +2952,60 @@ mod tests {
             assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row1, None).await;
             assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row2, Some(true))
                 .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_update_unique_no_trx_updates_non_indexed_columns() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_011);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(1, "same", b"old"))
+                .await
+                .unwrap();
+            mem_table
+                .update_unique_no_trx(
+                    &guards,
+                    &single_key(1i32),
+                    &[UpdateCol {
+                        idx: 2,
+                        val: Val::from(&b"new"[..]),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_unique_row(
+                &mem_table,
+                &guards,
+                &single_key(1i32),
+                Some(indexed_payload_row(1, "same", b"new")),
+            )
+            .await;
+
+            let err = mem_table
+                .update_unique_no_trx(
+                    &guards,
+                    &single_key(1i32),
+                    &[UpdateCol {
+                        idx: 0,
+                        val: Val::from(1i32),
+                    }],
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
         });
     }
 
