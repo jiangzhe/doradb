@@ -1,6 +1,7 @@
 use super::{
-    DeleteInternal, InsertRowIntoPage, missing_secondary_index, read_latest_index_key, row_len,
-    secondary_index_kind_mismatch, validate_page_row_range,
+    DeleteInternal, InsertRowIntoPage, UpdateRowInplace, full_row_update_cols, hot::HotRowUpdater,
+    index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
+    row_len, secondary_index_kind_mismatch, unique_key_from_full_row, validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
@@ -15,11 +16,15 @@ use crate::index::{
 };
 use crate::latch::LatchFallbackMode;
 use crate::log::redo::{RowRedo, RowRedoKind};
+use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::{DeleteMvcc, InsertIndex, LinkForUniqueIndex, SelectKey};
+use crate::row::ops::{
+    DeleteMvcc, InsertIndex, LinkForUniqueIndex, SelectKey, UpdateCol, UpdateIndex, UpdateMvcc,
+    UpsertMvcc,
+};
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::row::{
-    FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
+    FindOldVersion, LockRowForWrite, ReadAllRows, RowReadAccess, RowWriteAccess,
 };
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
@@ -75,8 +80,8 @@ pub(crate) struct MemTable<D: 'static, I: 'static> {
 
 impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     /// Create a MemTable with freshly built in-memory secondary indexes.
-    #[inline]
     #[expect(clippy::too_many_arguments, reason = "code style")]
+    #[inline]
     pub(crate) async fn new(
         mem_pool: QuiescentGuard<D>,
         row_pool_role: RowPoolRole,
@@ -999,7 +1004,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.try_get_insert_page(guards, row_count, None).await
     }
 
-    #[expect(clippy::await_holding_lock, reason = "clippy false positive")]
     #[inline]
     async fn lock_row_for_write<'b>(
         &self,
@@ -1009,42 +1013,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_id: RowID,
         key: Option<&SelectKey>,
     ) -> LockRowForWrite<'b> {
-        let (page_ctx, page) = page_guard.ctx_and_page();
-        let ver_map = page_ctx.row_ver().unwrap();
-        loop {
-            let state_guard = ver_map.read_state();
-            if *state_guard == RowPageState::Transition {
-                return LockRowForWrite::RetryInTransition;
-            }
-            let mut access = RowWriteAccess::new_with_state_guard(
-                page,
-                page_ctx,
-                page.row_idx(row_id),
-                Some(rt.sts()),
-                false,
-                state_guard,
-            );
-            let lock_undo = access.lock_undo(
-                rt,
-                effects,
-                self.metadata(),
-                self.table_id(),
-                page_guard.versioned_page_id(),
-                row_id,
-                key,
-            );
-            match lock_undo {
-                LockUndo::Ok => return LockRowForWrite::Ok(Some(access)),
-                LockUndo::InvalidIndex => return LockRowForWrite::InvalidIndex,
-                LockUndo::WriteConflict => return LockRowForWrite::WriteConflict,
-                LockUndo::Preparing(listener) => {
-                    if let Some(listener) = listener {
-                        drop(access);
-                        listener.await;
-                    }
-                }
-            }
-        }
+        HotRowUpdater::new(self.table_id(), self.metadata(), rt)
+            .lock_for_write(effects, page_guard, row_id, key)
+            .await
     }
 
     #[inline]
@@ -1650,6 +1621,657 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         Ok(row_id)
     }
 
+    /// Insert or replace one MVCC row selected by a unique key derived from the row.
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    pub(crate) async fn upsert_unique_mvcc(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        unique_index_no: usize,
+        cols: Vec<Val>,
+    ) -> Result<UpsertMvcc> {
+        let key = unique_key_from_full_row(
+            self.metadata(),
+            unique_index_no,
+            &cols,
+            "upsert unique MVCC",
+        )?;
+        match self
+            .update_unique_mvcc(rt, effects, &key, full_row_update_cols(&cols))
+            .await?
+        {
+            UpdateMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
+            UpdateMvcc::NotFound => self
+                .insert_mvcc(rt, effects, cols)
+                .await
+                .map(UpsertMvcc::Inserted),
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_unique_mvcc(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Result<UpdateMvcc> {
+        debug_assert!(key.index_no < self.sec_idx_len());
+        debug_assert!(
+            self.metadata()
+                .idx
+                .require_index_spec(key.index_no)
+                .unwrap()
+                .unique()
+        );
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
+        debug_assert!(update.iter().all(|uc| {
+            uc.idx < self.metadata().col.col_count()
+                && self.metadata().col.col_type_match(uc.idx, &uc.val)
+        }));
+        debug_assert!(
+            update.is_empty()
+                || update
+                    .iter()
+                    .zip(update.iter().skip(1))
+                    .all(|(l, r)| l.idx < r.idx)
+        );
+        let guards = rt.pool_guards();
+        loop {
+            let lookup_sts = rt.sts();
+            let (page_guard, row_id) = match self.unique_lookup(guards, key, lookup_sts).await? {
+                None => return Ok(UpdateMvcc::NotFound),
+                Some((row_id, _)) => match self.find_row(guards, row_id).await {
+                    Ok(RowLocation::NotFound) => return Ok(UpdateMvcc::NotFound),
+                    Ok(RowLocation::LwcBlock { .. }) => {
+                        return self.catalog_lwc_error("update unique MVCC", row_id);
+                    }
+                    Ok(RowLocation::RowPage(page_id)) => {
+                        let Some(page_guard) = self
+                            .try_get_validated_row_page_shared_result(guards, page_id, row_id)
+                            .await?
+                        else {
+                            continue;
+                        };
+                        (page_guard, row_id)
+                    }
+                    Err(err) => return Err(err),
+                },
+            };
+            let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
+                .update_inplace(effects, page_guard, key, row_id, update.clone())
+                .await;
+            match res {
+                UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
+                    debug_assert!(row_id == new_row_id);
+                    if !index_change_cols.is_empty() {
+                        let res = self
+                            .update_indexes_only_key_change(
+                                rt,
+                                effects,
+                                row_id,
+                                &page_guard,
+                                &index_change_cols,
+                            )
+                            .await?;
+                        page_guard.set_dirty();
+                        return match res {
+                            UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
+                            UpdateIndex::DuplicateKey => {
+                                Err(Report::new(OperationError::DuplicateKey)
+                                    .attach("update MVCC key-change index update")
+                                    .into())
+                            }
+                            UpdateIndex::WriteConflict => {
+                                Err(Report::new(OperationError::WriteConflict)
+                                    .attach("update MVCC key-change index update")
+                                    .into())
+                            }
+                        };
+                    }
+                    page_guard.set_dirty();
+                    return Ok(UpdateMvcc::Updated(row_id));
+                }
+                UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => {
+                    return Ok(UpdateMvcc::NotFound);
+                }
+                UpdateRowInplace::WriteConflict => {
+                    return Err(Report::new(OperationError::WriteConflict)
+                        .attach("update MVCC row-page write lock")
+                        .into());
+                }
+                UpdateRowInplace::RetryInTransition => {
+                    Timer::after(Duration::from_millis(1)).await;
+                }
+                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
+                    let (new_row_id, index_change_cols, new_guard) = self
+                        .move_update_for_space(rt, effects, old_row, update, old_row_id, old_guard)
+                        .await?;
+                    if !index_change_cols.is_empty() {
+                        let res = self
+                            .update_indexes_may_both_change(
+                                rt,
+                                effects,
+                                old_row_id,
+                                new_row_id,
+                                &index_change_cols,
+                                &new_guard,
+                            )
+                            .await?;
+                        new_guard.set_dirty();
+                        return match res {
+                            UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
+                            UpdateIndex::DuplicateKey => {
+                                Err(Report::new(OperationError::DuplicateKey)
+                                    .attach("update MVCC moved-row index update")
+                                    .into())
+                            }
+                            UpdateIndex::WriteConflict => {
+                                Err(Report::new(OperationError::WriteConflict)
+                                    .attach("update MVCC moved-row index update")
+                                    .into())
+                            }
+                        };
+                    }
+                    let res = self
+                        .update_indexes_only_row_id_change(
+                            rt, effects, old_row_id, new_row_id, &new_guard,
+                        )
+                        .await?;
+                    new_guard.set_dirty();
+                    return match res {
+                        UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
+                        UpdateIndex::DuplicateKey => Err(Report::new(OperationError::DuplicateKey)
+                            .attach("update MVCC moved-row index update")
+                            .into()),
+                        UpdateIndex::WriteConflict => {
+                            Err(Report::new(OperationError::WriteConflict)
+                                .attach("update MVCC moved-row index update")
+                                .into())
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn move_update_for_space(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        old_row: Vec<(Val, Option<u16>)>,
+        update: Vec<UpdateCol>,
+        old_id: RowID,
+        old_guard: PageSharedGuard<RowPage>,
+    ) -> Result<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
+        let prepared = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
+            .prepare_move_update(old_row, update, old_id, old_guard);
+        let (new_row_id, new_guard) = self
+            .insert_row_internal(
+                rt,
+                effects,
+                prepared.row,
+                RowUndoKind::Insert,
+                prepared.index_branches,
+            )
+            .await?;
+        Ok((new_row_id, prepared.index_change_cols, new_guard))
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_indexes_only_key_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        page_guard: &PageSharedGuard<RowPage>,
+        index_change_cols: &FastHashMap<usize, Val>,
+    ) -> Result<UpdateIndex> {
+        let metadata = self.metadata();
+        for (index_no, index_schema) in metadata.idx.active_indexes() {
+            debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
+            if index_key_is_changed(index_schema, index_change_cols) {
+                let new_key = read_latest_index_key(metadata, index_no, page_guard, row_id);
+                let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
+                if index_schema.unique() {
+                    match self
+                        .update_unique_index_only_key_change(
+                            rt, effects, old_key, new_key, row_id, page_guard,
+                        )
+                        .await?
+                    {
+                        UpdateIndex::Updated => (),
+                        UpdateIndex::WriteConflict => return Ok(UpdateIndex::WriteConflict),
+                        UpdateIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
+                    }
+                } else {
+                    let res = self
+                        .update_non_unique_index_only_key_change(
+                            rt, effects, old_key, new_key, row_id,
+                        )
+                        .await?;
+                    debug_assert!(res.is_updated());
+                }
+            }
+        }
+        Ok(UpdateIndex::Updated)
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_indexes_only_row_id_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        old_row_id: RowID,
+        new_row_id: RowID,
+        page_guard: &PageSharedGuard<RowPage>,
+    ) -> Result<UpdateIndex> {
+        debug_assert!(old_row_id != new_row_id);
+        let metadata = self.metadata();
+        for (index_no, index_schema) in metadata.idx.active_indexes() {
+            debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
+            let key = read_latest_index_key(metadata, index_no, page_guard, new_row_id);
+            if index_schema.unique() {
+                let res = self
+                    .update_unique_index_only_row_id_change(
+                        rt, effects, key, old_row_id, new_row_id,
+                    )
+                    .await?;
+                debug_assert!(res.is_updated());
+            } else {
+                let res = self
+                    .update_non_unique_index_only_row_id_change(
+                        rt, effects, key, old_row_id, new_row_id,
+                    )
+                    .await?;
+                debug_assert!(res.is_updated());
+            }
+        }
+        Ok(UpdateIndex::Updated)
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_indexes_may_both_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        old_row_id: RowID,
+        new_row_id: RowID,
+        index_change_cols: &FastHashMap<usize, Val>,
+        page_guard: &PageSharedGuard<RowPage>,
+    ) -> Result<UpdateIndex> {
+        debug_assert!(old_row_id != new_row_id);
+        let metadata = self.metadata();
+        for (index_no, index_schema) in metadata.idx.active_indexes() {
+            debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
+            let key = read_latest_index_key(metadata, index_no, page_guard, new_row_id);
+            if index_key_is_changed(index_schema, index_change_cols) {
+                let old_key = index_key_replace(index_schema, &key, index_change_cols);
+                if index_schema.unique() {
+                    match self
+                        .update_unique_index_key_and_row_id_change(
+                            rt, effects, old_key, key, old_row_id, new_row_id, page_guard,
+                        )
+                        .await?
+                    {
+                        UpdateIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
+                        UpdateIndex::WriteConflict => return Ok(UpdateIndex::WriteConflict),
+                        UpdateIndex::Updated => (),
+                    }
+                } else {
+                    let res = self
+                        .update_non_unique_index_key_and_row_id_change(
+                            rt, effects, old_key, key, old_row_id, new_row_id,
+                        )
+                        .await?;
+                    debug_assert!(res.is_updated());
+                }
+            } else if index_schema.unique() {
+                match self
+                    .update_unique_index_only_row_id_change(
+                        rt, effects, key, old_row_id, new_row_id,
+                    )
+                    .await?
+                {
+                    UpdateIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
+                    UpdateIndex::WriteConflict => return Ok(UpdateIndex::WriteConflict),
+                    UpdateIndex::Updated => (),
+                }
+            } else {
+                let res = self
+                    .update_non_unique_index_only_row_id_change(
+                        rt, effects, key, old_row_id, new_row_id,
+                    )
+                    .await?;
+                debug_assert!(res.is_updated());
+            }
+        }
+        Ok(UpdateIndex::Updated)
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
+    async fn update_unique_index_key_and_row_id_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        old_key: SelectKey,
+        new_key: SelectKey,
+        old_row_id: RowID,
+        new_row_id: RowID,
+        new_guard: &PageSharedGuard<RowPage>,
+    ) -> Result<UpdateIndex> {
+        debug_assert!(old_row_id != new_row_id);
+        let sts = rt.sts();
+        let guards = rt.pool_guards();
+        loop {
+            match self
+                .unique_insert_if_not_exists(guards, &new_key, new_row_id, false, sts)
+                .await?
+            {
+                IndexInsert::Ok(merged) => {
+                    debug_assert!(!merged);
+                    self.push_insert_unique_index_undo(rt, effects, new_row_id, new_key, false);
+                    self.defer_delete_unique_index(rt, effects, old_row_id, old_key)
+                        .await?;
+                    return Ok(UpdateIndex::Updated);
+                }
+                IndexInsert::DuplicateKey(index_row_id, deleted) => {
+                    debug_assert!(index_row_id != new_row_id);
+                    if !deleted {
+                        return Ok(UpdateIndex::DuplicateKey);
+                    }
+                    if index_row_id == old_row_id {
+                        match self
+                            .unique_compare_exchange(
+                                guards,
+                                &new_key,
+                                old_row_id.deleted(),
+                                new_row_id,
+                                sts,
+                            )
+                            .await?
+                        {
+                            IndexCompareExchange::Ok => {
+                                self.push_update_unique_index_undo(
+                                    rt, effects, old_row_id, new_row_id, new_key, true,
+                                );
+                                self.defer_delete_unique_index(rt, effects, old_row_id, old_key)
+                                    .await?;
+                                return Ok(UpdateIndex::Updated);
+                            }
+                            IndexCompareExchange::Mismatch => unreachable!(),
+                            IndexCompareExchange::NotExists => continue,
+                        }
+                    }
+                    match self
+                        .link_for_unique_index(rt, index_row_id, &new_key, new_row_id, new_guard)
+                        .await?
+                    {
+                        LinkForUniqueIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
+                        LinkForUniqueIndex::WriteConflict => {
+                            return Ok(UpdateIndex::WriteConflict);
+                        }
+                        LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
+                            let index_old_row_id = index_row_id.deleted();
+                            match self
+                                .unique_compare_exchange(
+                                    guards,
+                                    &new_key,
+                                    index_old_row_id,
+                                    new_row_id,
+                                    sts,
+                                )
+                                .await?
+                            {
+                                IndexCompareExchange::Ok => {
+                                    self.push_update_unique_index_undo(
+                                        rt,
+                                        effects,
+                                        index_row_id,
+                                        new_row_id,
+                                        new_key,
+                                        true,
+                                    );
+                                    self.defer_delete_unique_index(
+                                        rt, effects, old_row_id, old_key,
+                                    )
+                                    .await?;
+                                    return Ok(UpdateIndex::Updated);
+                                }
+                                IndexCompareExchange::Mismatch => {
+                                    return Ok(UpdateIndex::WriteConflict);
+                                }
+                                IndexCompareExchange::NotExists => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_non_unique_index_key_and_row_id_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        old_key: SelectKey,
+        new_key: SelectKey,
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> Result<UpdateIndex> {
+        debug_assert!(old_row_id != new_row_id);
+        match self
+            .non_unique_insert_if_not_exists(
+                rt.pool_guards(),
+                &new_key,
+                new_row_id,
+                false,
+                rt.sts(),
+            )
+            .await?
+        {
+            IndexInsert::Ok(merged) => {
+                debug_assert!(!merged);
+                self.push_insert_non_unique_index_undo(rt, effects, new_row_id, new_key, false);
+                self.defer_delete_non_unique_index(rt, effects, old_row_id, old_key)
+                    .await?;
+                Ok(UpdateIndex::Updated)
+            }
+            IndexInsert::DuplicateKey(..) => unreachable!(),
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_unique_index_only_row_id_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        key: SelectKey,
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> Result<UpdateIndex> {
+        debug_assert!(old_row_id != new_row_id);
+        match self
+            .unique_compare_exchange(rt.pool_guards(), &key, old_row_id, new_row_id, rt.sts())
+            .await?
+        {
+            IndexCompareExchange::Ok => {
+                self.push_update_unique_index_undo(rt, effects, old_row_id, new_row_id, key, false);
+                Ok(UpdateIndex::Updated)
+            }
+            IndexCompareExchange::Mismatch | IndexCompareExchange::NotExists => unreachable!(),
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_non_unique_index_only_row_id_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        key: SelectKey,
+        old_row_id: RowID,
+        new_row_id: RowID,
+    ) -> Result<UpdateIndex> {
+        debug_assert!(old_row_id != new_row_id);
+        let res = self
+            .non_unique_insert_if_not_exists(rt.pool_guards(), &key, new_row_id, false, rt.sts())
+            .await?;
+        debug_assert!(res.is_ok());
+        self.push_insert_non_unique_index_undo(rt, effects, new_row_id, key.clone(), false);
+        self.defer_delete_non_unique_index(rt, effects, old_row_id, key)
+            .await?;
+        Ok(UpdateIndex::Updated)
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_unique_index_only_key_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        old_key: SelectKey,
+        new_key: SelectKey,
+        row_id: RowID,
+        page_guard: &PageSharedGuard<RowPage>,
+    ) -> Result<UpdateIndex> {
+        let sts = rt.sts();
+        let guards = rt.pool_guards();
+        loop {
+            match self
+                .unique_insert_if_not_exists(guards, &new_key, row_id, true, sts)
+                .await?
+            {
+                IndexInsert::Ok(merged) => {
+                    self.push_insert_unique_index_undo(rt, effects, row_id, new_key, merged);
+                    self.defer_delete_unique_index(rt, effects, row_id, old_key)
+                        .await?;
+                    return Ok(UpdateIndex::Updated);
+                }
+                IndexInsert::DuplicateKey(index_row_id, deleted) => {
+                    if !deleted {
+                        return Ok(UpdateIndex::DuplicateKey);
+                    }
+                    match self
+                        .link_for_unique_index(rt, index_row_id, &new_key, row_id, page_guard)
+                        .await?
+                    {
+                        LinkForUniqueIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
+                        LinkForUniqueIndex::WriteConflict => {
+                            return Ok(UpdateIndex::WriteConflict);
+                        }
+                        LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
+                            match self
+                                .unique_compare_exchange(
+                                    guards,
+                                    &new_key,
+                                    index_row_id.deleted(),
+                                    row_id,
+                                    sts,
+                                )
+                                .await?
+                            {
+                                IndexCompareExchange::Ok => {
+                                    self.push_update_unique_index_undo(
+                                        rt,
+                                        effects,
+                                        index_row_id,
+                                        row_id,
+                                        new_key,
+                                        true,
+                                    );
+                                    self.defer_delete_unique_index(rt, effects, row_id, old_key)
+                                        .await?;
+                                    return Ok(UpdateIndex::Updated);
+                                }
+                                IndexCompareExchange::Mismatch => {
+                                    return Ok(UpdateIndex::WriteConflict);
+                                }
+                                IndexCompareExchange::NotExists => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "reserved MemTable unique upsert API")
+    )]
+    async fn update_non_unique_index_only_key_change(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        old_key: SelectKey,
+        new_key: SelectKey,
+        row_id: RowID,
+    ) -> Result<UpdateIndex> {
+        match self
+            .non_unique_insert_if_not_exists(rt.pool_guards(), &new_key, row_id, true, rt.sts())
+            .await?
+        {
+            IndexInsert::Ok(merged) => {
+                self.push_insert_non_unique_index_undo(rt, effects, row_id, new_key, merged);
+                self.defer_delete_non_unique_index(rt, effects, row_id, old_key)
+                    .await?;
+                Ok(UpdateIndex::Updated)
+            }
+            IndexInsert::DuplicateKey(..) => unreachable!(),
+        }
+    }
+
     /// Delete row in transaction by unique index lookup.
     ///
     /// If `log_by_key` is true, redo logs the unique key instead of row id.
@@ -1826,16 +2448,178 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::BufferPool;
+    use super::MemTable;
     use crate::buffer::guard::PageGuard;
+    use crate::buffer::{BufferPool, EvictableBufferPool};
     use crate::buffer::{PoolGuards, PoolRole};
-    use crate::error::{ErrorKind, InternalError, ResourceError};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+    };
+    use crate::engine::Engine;
+    use crate::error::{ErrorKind, InternalError, OperationError, ResourceError};
     use crate::file::cow_file::SUPER_BLOCK_ID;
-    use crate::id::TrxID;
-    use crate::session::tests::SessionTestExt;
+    use crate::id::{RowID, TableID, TrxID};
+    use crate::index::{BlockIndex, RowLocation};
+    use crate::row::RowRead;
+    use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc};
+    use crate::session::{Session, tests::SessionTestExt};
     use crate::table::tests::*;
-    use crate::value::Val;
+    use crate::trx::MIN_SNAPSHOT_TS;
+    use crate::trx::stmt::tests as stmt_tests;
+    use crate::value::{Val, ValKind};
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    type TestMemTable = MemTable<EvictableBufferPool, EvictableBufferPool>;
+
+    fn indexed_payload_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                ],
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                ],
+            )
+            .expect("valid indexed payload metadata"),
+        )
+    }
+
+    async fn test_mem_table(engine: &Engine, mem_table_id: TableID) -> TestMemTable {
+        let source_table_id = create_table2_for_test(engine).await;
+        let metadata = table_for_internal_assertion(engine, source_table_id).metadata();
+        test_mem_table_with_metadata(engine, mem_table_id, metadata).await
+    }
+
+    async fn test_mem_table_with_metadata(
+        engine: &Engine,
+        mem_table_id: TableID,
+        metadata: Arc<TableMetadata>,
+    ) -> TestMemTable {
+        let meta_guard = engine.inner().meta_pool.pool_guard();
+        let index_guard = engine.inner().index_pool.pool_guard();
+        let mem_pool = engine.inner().mem_pool.clone_inner();
+        let blk_idx = BlockIndex::new(
+            engine.inner().meta_pool.clone_inner(),
+            &meta_guard,
+            RowID::new(0),
+            SUPER_BLOCK_ID,
+        )
+        .await
+        .unwrap();
+        MemTable::new(
+            mem_pool.clone(),
+            mem_pool.row_pool_role(),
+            engine.inner().index_pool.clone_inner(),
+            PoolRole::Index,
+            &index_guard,
+            mem_table_id,
+            metadata,
+            blk_idx,
+            MIN_SNAPSHOT_TS,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn name_key(value: &str) -> SelectKey {
+        SelectKey {
+            index_no: 1,
+            vals: vec![Val::from(value)],
+        }
+    }
+
+    fn indexed_payload_row(id: i32, name: &str, payload: &[u8]) -> Vec<Val> {
+        vec![Val::from(id), Val::from(name), Val::from(payload)]
+    }
+
+    async fn insert_mem_mvcc(
+        session: &mut Session,
+        table_id: TableID,
+        mem_table: &TestMemTable,
+        cols: Vec<Val>,
+    ) -> RowID {
+        let mut trx = session.begin_trx().unwrap();
+        let row_id = trx
+            .exec(async |stmt| {
+                stmt.acquire_table_write_locks(table_id).await?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                mem_table.insert_mvcc(rt, effects, cols).await
+            })
+            .await
+            .unwrap();
+        trx.commit().await.unwrap();
+        row_id
+    }
+
+    async fn update_mem_unique_mvcc(
+        session: &mut Session,
+        table_id: TableID,
+        mem_table: &TestMemTable,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> UpdateMvcc {
+        let mut trx = session.begin_trx().unwrap();
+        let updated = trx
+            .exec(async |stmt| {
+                stmt.acquire_table_write_locks(table_id).await?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                mem_table.update_unique_mvcc(rt, effects, key, update).await
+            })
+            .await
+            .unwrap();
+        trx.commit().await.unwrap();
+        updated
+    }
+
+    async fn assert_unique_index_entry(
+        mem_table: &TestMemTable,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        expected: Option<(RowID, bool)>,
+    ) {
+        let entry = mem_table
+            .unique_lookup(guards, key, MIN_SNAPSHOT_TS)
+            .await
+            .unwrap();
+        assert_eq!(entry, expected);
+    }
+
+    async fn assert_non_unique_index_entry(
+        mem_table: &TestMemTable,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+        expected: Option<bool>,
+    ) {
+        let entry = mem_table
+            .non_unique_lookup_unique(guards, key, row_id, MIN_SNAPSHOT_TS)
+            .await
+            .unwrap();
+        assert_eq!(entry, expected);
+    }
+
+    async fn assert_unique_row(
+        mem_table: &TestMemTable,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        expected: Option<Vec<Val>>,
+    ) {
+        let col_count = mem_table.metadata().col.col_count();
+        let row = mem_table
+            .index_lookup_unique_uncommitted(guards, key, |layout, row| {
+                (0..col_count)
+                    .map(|col_idx| row.val(layout, col_idx))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row, expected);
+    }
 
     #[test]
     fn test_evict_pool_insert_full() {
@@ -1861,6 +2645,550 @@ mod tests {
                 }
                 let _ = trx.commit().await.unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn test_mem_table_upsert_unique_insert_and_update() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_000);
+            let mem_table = test_mem_table(&engine, mem_table_id).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let inserted = trx
+                .exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table
+                        .upsert_unique_mvcc(
+                            rt,
+                            effects,
+                            0,
+                            vec![Val::from(1i32), Val::from("hello")],
+                        )
+                        .await
+                })
+                .await
+                .unwrap();
+            let inserted_row_id = match inserted {
+                UpsertMvcc::Inserted(row_id) => row_id,
+                UpsertMvcc::Updated(row_id) => panic!("unexpected update row_id={row_id}"),
+            };
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let updated = trx
+                .exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table
+                        .upsert_unique_mvcc(
+                            rt,
+                            effects,
+                            0,
+                            vec![Val::from(1i32), Val::from("world")],
+                        )
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(updated, UpsertMvcc::Updated(inserted_row_id));
+            trx.commit().await.unwrap();
+
+            let row = mem_table
+                .index_lookup_unique_uncommitted(
+                    &session.pool_guards(),
+                    &single_key(1i32),
+                    |layout, row| vec![row.val(layout, 0), row.val(layout, 1)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row, Some(vec![Val::from(1i32), Val::from("world")]));
+        });
+    }
+
+    #[test]
+    fn test_mem_table_upsert_unique_missing_key_write_conflict() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_001);
+            let mem_table = test_mem_table(&engine, mem_table_id).await;
+            let mut session1 = engine.new_session().unwrap();
+
+            let mut trx1 = session1.begin_trx().unwrap();
+            assert!(matches!(
+                trx1.exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table
+                        .upsert_unique_mvcc(
+                            rt,
+                            effects,
+                            0,
+                            vec![Val::from(2i32), Val::from("first")],
+                        )
+                        .await
+                })
+                .await
+                .unwrap(),
+                UpsertMvcc::Inserted(_)
+            ));
+
+            let mut session2 = engine.new_session().unwrap();
+            let mut trx2 = session2.begin_trx().unwrap();
+            let err = trx2
+                .exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table
+                        .upsert_unique_mvcc(
+                            rt,
+                            effects,
+                            0,
+                            vec![Val::from(2i32), Val::from("second")],
+                        )
+                        .await
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
+            trx2.rollback().await.unwrap();
+            trx1.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_mem_table_non_unique_no_trx_insert_and_delete() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_010);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+            let payload = b"payload";
+
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(1, "same", payload))
+                .await
+                .unwrap();
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(2, "same", payload))
+                .await
+                .unwrap();
+
+            let (row1, row1_deleted) = mem_table
+                .unique_lookup(&guards, &single_key(1i32), MIN_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .expect("first unique index entry should exist");
+            let (row2, row2_deleted) = mem_table
+                .unique_lookup(&guards, &single_key(2i32), MIN_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .expect("second unique index entry should exist");
+            assert!(!row1_deleted);
+            assert!(!row2_deleted);
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row1, Some(true))
+                .await;
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row2, Some(true))
+                .await;
+
+            mem_table
+                .delete_unique_no_trx(&guards, &single_key(1i32))
+                .await
+                .unwrap();
+
+            assert_unique_index_entry(&mem_table, &guards, &single_key(1i32), None).await;
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row1, None).await;
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row2, Some(true))
+                .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_delete_unique_mvcc_marks_non_unique_index() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_011);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let mut session = engine.new_session().unwrap();
+
+            let row_id = insert_mem_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                indexed_payload_row(10, "delete", b"payload"),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("delete"),
+                row_id,
+                Some(true),
+            )
+            .await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let deleted = trx
+                .exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table
+                        .delete_unique_mvcc(rt, effects, &single_key(10i32), false)
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(deleted, DeleteMvcc::Deleted);
+            trx.commit().await.unwrap();
+
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some((row_id, true)),
+            )
+            .await;
+            assert_unique_row(&mem_table, &session.pool_guards(), &single_key(10i32), None).await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("delete"),
+                row_id,
+                Some(false),
+            )
+            .await;
+
+            let removed = mem_table
+                .delete_index(
+                    &session.pool_guards(),
+                    &name_key("delete"),
+                    row_id,
+                    false,
+                    MIN_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(!removed);
+        });
+    }
+
+    #[test]
+    fn test_mem_table_update_key_change_updates_unique_and_non_unique_indexes() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_012);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let mut session = engine.new_session().unwrap();
+
+            let row_id = insert_mem_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                indexed_payload_row(1, "old", b"payload"),
+            )
+            .await;
+            insert_mem_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                indexed_payload_row(20, "other", b"payload"),
+            )
+            .await;
+
+            let updated = update_mem_unique_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                &single_key(1i32),
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(10i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("new"),
+                    },
+                ],
+            )
+            .await;
+            assert_eq!(updated, UpdateMvcc::Updated(row_id));
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(1i32),
+                Some((row_id, true)),
+            )
+            .await;
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some((row_id, false)),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("old"),
+                row_id,
+                Some(false),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("new"),
+                row_id,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some(indexed_payload_row(10, "new", b"payload")),
+            )
+            .await;
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.acquire_table_write_locks(mem_table_id).await?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                let page_id = match mem_table.find_row(rt.pool_guards(), row_id).await? {
+                    RowLocation::RowPage(page_id) => page_id,
+                    RowLocation::NotFound => panic!("updated row should exist"),
+                    RowLocation::LwcBlock { .. } => {
+                        panic!("standalone MemTable should not use LWC")
+                    }
+                };
+                let page_guard = mem_table
+                    .must_get_row_page_shared(rt.pool_guards(), page_id)
+                    .await?;
+                let res = mem_table
+                    .update_unique_index_only_key_change(
+                        rt,
+                        effects,
+                        single_key(10i32),
+                        single_key(20i32),
+                        row_id,
+                        &page_guard,
+                    )
+                    .await?;
+                assert_eq!(res, UpdateIndex::DuplicateKey);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.rollback().await.unwrap();
+
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some(indexed_payload_row(10, "new", b"payload")),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_moved_updates_refresh_unique_and_non_unique_indexes() {
+        smol::block_on(async {
+            const ROWS: i32 = 60;
+            const BASE_PAYLOAD_SIZE: usize = 1000;
+            const LARGE_PAYLOAD_SIZE: usize = 50_000;
+
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_013);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let mut session = engine.new_session().unwrap();
+            let base_payload = vec![b'a'; BASE_PAYLOAD_SIZE];
+            let mut row_ids = Vec::new();
+            for id in 0..ROWS {
+                let name = format!("name{id}");
+                let row_id = insert_mem_mvcc(
+                    &mut session,
+                    mem_table_id,
+                    &mem_table,
+                    indexed_payload_row(id, &name, &base_payload),
+                )
+                .await;
+                row_ids.push(row_id);
+            }
+
+            let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
+            let old_row0 = row_ids[0];
+            let updated = update_mem_unique_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                &single_key(0i32),
+                vec![UpdateCol {
+                    idx: 2,
+                    val: Val::from(&large_payload[..]),
+                }],
+            )
+            .await;
+            let new_row0 = match updated {
+                UpdateMvcc::Updated(row_id) => row_id,
+                UpdateMvcc::NotFound => panic!("payload update should find row"),
+            };
+            assert_ne!(new_row0, old_row0);
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(0i32),
+                Some((new_row0, false)),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("name0"),
+                old_row0,
+                Some(false),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("name0"),
+                new_row0,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(0i32),
+                Some(indexed_payload_row(0, "name0", &large_payload)),
+            )
+            .await;
+
+            let changed_payload = vec![b'c'; LARGE_PAYLOAD_SIZE];
+            let old_row1 = row_ids[1];
+            let updated = update_mem_unique_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                &single_key(1i32),
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(101i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("moved"),
+                    },
+                    UpdateCol {
+                        idx: 2,
+                        val: Val::from(&changed_payload[..]),
+                    },
+                ],
+            )
+            .await;
+            let new_row1 = match updated {
+                UpdateMvcc::Updated(row_id) => row_id,
+                UpdateMvcc::NotFound => panic!("key-changing update should find row"),
+            };
+            assert_ne!(new_row1, old_row1);
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(1i32),
+                Some((old_row1, true)),
+            )
+            .await;
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(101i32),
+                Some((new_row1, false)),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("name1"),
+                old_row1,
+                Some(false),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("moved"),
+                new_row1,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(&mem_table, &session.pool_guards(), &single_key(1i32), None).await;
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(101i32),
+                Some(indexed_payload_row(101, "moved", &changed_payload)),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_internal_error_helpers_report_context() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_014);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+
+            let err = mem_table.stale_block_index_leaf("test stale block-index");
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("test stale block-index"), "{report}");
+            assert!(report.contains(&mem_table_id.to_string()), "{report}");
+
+            let err = mem_table
+                .catalog_lwc_error::<()>("test catalog lwc", RowID::new(42))
+                .unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("test catalog lwc"), "{report}");
+            assert!(report.contains("row_id=42"), "{report}");
         });
     }
 

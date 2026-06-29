@@ -1,6 +1,7 @@
 mod access;
 mod deletion_buffer;
 mod gc;
+mod hot;
 mod layout;
 mod lifecycle;
 mod mem_table;
@@ -1380,6 +1381,40 @@ fn read_latest_index_key(
         new_key.vals[pos] = val;
     }
     new_key
+}
+
+#[inline]
+fn unique_key_from_full_row(
+    metadata: &TableMetadata,
+    unique_index_no: usize,
+    cols: &[Val],
+    operation: &'static str,
+) -> Result<SelectKey> {
+    debug_assert!(cols.len() == metadata.col.col_count());
+    debug_assert!(
+        cols.iter()
+            .enumerate()
+            .all(|(idx, val)| metadata.col.col_type_match(idx, val))
+    );
+    let index_spec = metadata.idx.require_index_spec(unique_index_no)?;
+    if !index_spec.unique() {
+        return Err(secondary_index_kind_mismatch(operation, "unique"));
+    }
+    let vals = index_spec
+        .cols
+        .iter()
+        .map(|key| cols[key.col_no as usize].clone())
+        .collect();
+    Ok(SelectKey::new(unique_index_no, vals))
+}
+
+#[inline]
+fn full_row_update_cols(cols: &[Val]) -> Vec<UpdateCol> {
+    cols.iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, val)| UpdateCol { idx, val })
+        .collect()
 }
 
 #[inline]
