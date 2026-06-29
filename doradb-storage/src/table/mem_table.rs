@@ -2452,26 +2452,54 @@ mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::{BufferPool, EvictableBufferPool};
     use crate::buffer::{PoolGuards, PoolRole};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+    };
     use crate::engine::Engine;
     use crate::error::{ErrorKind, InternalError, OperationError, ResourceError};
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{RowID, TableID, TrxID};
-    use crate::index::BlockIndex;
+    use crate::index::{BlockIndex, RowLocation};
     use crate::row::RowRead;
-    use crate::row::ops::UpsertMvcc;
-    use crate::session::tests::SessionTestExt;
+    use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc};
+    use crate::session::{Session, tests::SessionTestExt};
     use crate::table::tests::*;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::stmt::tests as stmt_tests;
-    use crate::value::Val;
+    use crate::value::{Val, ValKind};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn test_mem_table(
-        engine: &Engine,
-        mem_table_id: TableID,
-    ) -> MemTable<EvictableBufferPool, EvictableBufferPool> {
+    type TestMemTable = MemTable<EvictableBufferPool, EvictableBufferPool>;
+
+    fn indexed_payload_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                ],
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                ],
+            )
+            .expect("valid indexed payload metadata"),
+        )
+    }
+
+    async fn test_mem_table(engine: &Engine, mem_table_id: TableID) -> TestMemTable {
         let source_table_id = create_table2_for_test(engine).await;
         let metadata = table_for_internal_assertion(engine, source_table_id).metadata();
+        test_mem_table_with_metadata(engine, mem_table_id, metadata).await
+    }
+
+    async fn test_mem_table_with_metadata(
+        engine: &Engine,
+        mem_table_id: TableID,
+        metadata: Arc<TableMetadata>,
+    ) -> TestMemTable {
         let meta_guard = engine.inner().meta_pool.pool_guard();
         let index_guard = engine.inner().index_pool.pool_guard();
         let mem_pool = engine.inner().mem_pool.clone_inner();
@@ -2496,6 +2524,101 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn name_key(value: &str) -> SelectKey {
+        SelectKey {
+            index_no: 1,
+            vals: vec![Val::from(value)],
+        }
+    }
+
+    fn indexed_payload_row(id: i32, name: &str, payload: &[u8]) -> Vec<Val> {
+        vec![Val::from(id), Val::from(name), Val::from(payload)]
+    }
+
+    async fn insert_mem_mvcc(
+        session: &mut Session,
+        table_id: TableID,
+        mem_table: &TestMemTable,
+        cols: Vec<Val>,
+    ) -> RowID {
+        let mut trx = session.begin_trx().unwrap();
+        let row_id = trx
+            .exec(async |stmt| {
+                stmt.acquire_table_write_locks(table_id).await?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                mem_table.insert_mvcc(rt, effects, cols).await
+            })
+            .await
+            .unwrap();
+        trx.commit().await.unwrap();
+        row_id
+    }
+
+    async fn update_mem_unique_mvcc(
+        session: &mut Session,
+        table_id: TableID,
+        mem_table: &TestMemTable,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> UpdateMvcc {
+        let mut trx = session.begin_trx().unwrap();
+        let updated = trx
+            .exec(async |stmt| {
+                stmt.acquire_table_write_locks(table_id).await?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                mem_table.update_unique_mvcc(rt, effects, key, update).await
+            })
+            .await
+            .unwrap();
+        trx.commit().await.unwrap();
+        updated
+    }
+
+    async fn assert_unique_index_entry(
+        mem_table: &TestMemTable,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        expected: Option<(RowID, bool)>,
+    ) {
+        let entry = mem_table
+            .unique_lookup(guards, key, MIN_SNAPSHOT_TS)
+            .await
+            .unwrap();
+        assert_eq!(entry, expected);
+    }
+
+    async fn assert_non_unique_index_entry(
+        mem_table: &TestMemTable,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+        expected: Option<bool>,
+    ) {
+        let entry = mem_table
+            .non_unique_lookup_unique(guards, key, row_id, MIN_SNAPSHOT_TS)
+            .await
+            .unwrap();
+        assert_eq!(entry, expected);
+    }
+
+    async fn assert_unique_row(
+        mem_table: &TestMemTable,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        expected: Option<Vec<Val>>,
+    ) {
+        let col_count = mem_table.metadata().col.col_count();
+        let row = mem_table
+            .index_lookup_unique_uncommitted(guards, key, |layout, row| {
+                (0..col_count)
+                    .map(|col_idx| row.val(layout, col_idx))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(row, expected);
     }
 
     #[test]
@@ -2637,6 +2760,435 @@ mod tests {
             assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
             trx2.rollback().await.unwrap();
             trx1.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_mem_table_non_unique_no_trx_insert_and_delete() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_010);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+            let payload = b"payload";
+
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(1, "same", payload))
+                .await
+                .unwrap();
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(2, "same", payload))
+                .await
+                .unwrap();
+
+            let (row1, row1_deleted) = mem_table
+                .unique_lookup(&guards, &single_key(1i32), MIN_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .expect("first unique index entry should exist");
+            let (row2, row2_deleted) = mem_table
+                .unique_lookup(&guards, &single_key(2i32), MIN_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .expect("second unique index entry should exist");
+            assert!(!row1_deleted);
+            assert!(!row2_deleted);
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row1, Some(true))
+                .await;
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row2, Some(true))
+                .await;
+
+            mem_table
+                .delete_unique_no_trx(&guards, &single_key(1i32))
+                .await
+                .unwrap();
+
+            assert_unique_index_entry(&mem_table, &guards, &single_key(1i32), None).await;
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row1, None).await;
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row2, Some(true))
+                .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_delete_unique_mvcc_marks_non_unique_index() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_011);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let mut session = engine.new_session().unwrap();
+
+            let row_id = insert_mem_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                indexed_payload_row(10, "delete", b"payload"),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("delete"),
+                row_id,
+                Some(true),
+            )
+            .await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let deleted = trx
+                .exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table
+                        .delete_unique_mvcc(rt, effects, &single_key(10i32), false)
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(deleted, DeleteMvcc::Deleted);
+            trx.commit().await.unwrap();
+
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some((row_id, true)),
+            )
+            .await;
+            assert_unique_row(&mem_table, &session.pool_guards(), &single_key(10i32), None).await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("delete"),
+                row_id,
+                Some(false),
+            )
+            .await;
+
+            let removed = mem_table
+                .delete_index(
+                    &session.pool_guards(),
+                    &name_key("delete"),
+                    row_id,
+                    false,
+                    MIN_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(!removed);
+        });
+    }
+
+    #[test]
+    fn test_mem_table_update_key_change_updates_unique_and_non_unique_indexes() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_012);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let mut session = engine.new_session().unwrap();
+
+            let row_id = insert_mem_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                indexed_payload_row(1, "old", b"payload"),
+            )
+            .await;
+            insert_mem_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                indexed_payload_row(20, "other", b"payload"),
+            )
+            .await;
+
+            let updated = update_mem_unique_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                &single_key(1i32),
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(10i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("new"),
+                    },
+                ],
+            )
+            .await;
+            assert_eq!(updated, UpdateMvcc::Updated(row_id));
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(1i32),
+                Some((row_id, true)),
+            )
+            .await;
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some((row_id, false)),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("old"),
+                row_id,
+                Some(false),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("new"),
+                row_id,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some(indexed_payload_row(10, "new", b"payload")),
+            )
+            .await;
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.acquire_table_write_locks(mem_table_id).await?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                let page_id = match mem_table.find_row(rt.pool_guards(), row_id).await? {
+                    RowLocation::RowPage(page_id) => page_id,
+                    RowLocation::NotFound => panic!("updated row should exist"),
+                    RowLocation::LwcBlock { .. } => {
+                        panic!("standalone MemTable should not use LWC")
+                    }
+                };
+                let page_guard = mem_table
+                    .must_get_row_page_shared(rt.pool_guards(), page_id)
+                    .await?;
+                let res = mem_table
+                    .update_unique_index_only_key_change(
+                        rt,
+                        effects,
+                        single_key(10i32),
+                        single_key(20i32),
+                        row_id,
+                        &page_guard,
+                    )
+                    .await?;
+                assert_eq!(res, UpdateIndex::DuplicateKey);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.rollback().await.unwrap();
+
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(10i32),
+                Some(indexed_payload_row(10, "new", b"payload")),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_moved_updates_refresh_unique_and_non_unique_indexes() {
+        smol::block_on(async {
+            const ROWS: i32 = 60;
+            const BASE_PAYLOAD_SIZE: usize = 1000;
+            const LARGE_PAYLOAD_SIZE: usize = 50_000;
+
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_013);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let mut session = engine.new_session().unwrap();
+            let base_payload = vec![b'a'; BASE_PAYLOAD_SIZE];
+            let mut row_ids = Vec::new();
+            for id in 0..ROWS {
+                let name = format!("name{id}");
+                let row_id = insert_mem_mvcc(
+                    &mut session,
+                    mem_table_id,
+                    &mem_table,
+                    indexed_payload_row(id, &name, &base_payload),
+                )
+                .await;
+                row_ids.push(row_id);
+            }
+
+            let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
+            let old_row0 = row_ids[0];
+            let updated = update_mem_unique_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                &single_key(0i32),
+                vec![UpdateCol {
+                    idx: 2,
+                    val: Val::from(&large_payload[..]),
+                }],
+            )
+            .await;
+            let new_row0 = match updated {
+                UpdateMvcc::Updated(row_id) => row_id,
+                UpdateMvcc::NotFound => panic!("payload update should find row"),
+            };
+            assert_ne!(new_row0, old_row0);
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(0i32),
+                Some((new_row0, false)),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("name0"),
+                old_row0,
+                Some(false),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("name0"),
+                new_row0,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(0i32),
+                Some(indexed_payload_row(0, "name0", &large_payload)),
+            )
+            .await;
+
+            let changed_payload = vec![b'c'; LARGE_PAYLOAD_SIZE];
+            let old_row1 = row_ids[1];
+            let updated = update_mem_unique_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                &single_key(1i32),
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(101i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("moved"),
+                    },
+                    UpdateCol {
+                        idx: 2,
+                        val: Val::from(&changed_payload[..]),
+                    },
+                ],
+            )
+            .await;
+            let new_row1 = match updated {
+                UpdateMvcc::Updated(row_id) => row_id,
+                UpdateMvcc::NotFound => panic!("key-changing update should find row"),
+            };
+            assert_ne!(new_row1, old_row1);
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(1i32),
+                Some((old_row1, true)),
+            )
+            .await;
+            assert_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(101i32),
+                Some((new_row1, false)),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("name1"),
+                old_row1,
+                Some(false),
+            )
+            .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &session.pool_guards(),
+                &name_key("moved"),
+                new_row1,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(&mem_table, &session.pool_guards(), &single_key(1i32), None).await;
+            assert_unique_row(
+                &mem_table,
+                &session.pool_guards(),
+                &single_key(101i32),
+                Some(indexed_payload_row(101, "moved", &changed_payload)),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_internal_error_helpers_report_context() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_014);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+
+            let err = mem_table.stale_block_index_leaf("test stale block-index");
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("test stale block-index"), "{report}");
+            assert!(report.contains(&mem_table_id.to_string()), "{report}");
+
+            let err = mem_table
+                .catalog_lwc_error::<()>("test catalog lwc", RowID::new(42))
+                .unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("test catalog lwc"), "{report}");
+            assert!(report.contains("row_id=42"), "{report}");
         });
     }
 
