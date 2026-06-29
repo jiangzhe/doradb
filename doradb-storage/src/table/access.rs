@@ -2682,6 +2682,7 @@ impl<'a> UserTableAccessor<'a> {
         effects: &mut StmtEffects,
         unique_index_no: usize,
         cols: Vec<Val>,
+        log_by_key: bool,
     ) -> Result<UpsertMvcc> {
         let key = unique_key_from_full_row(
             self.metadata(),
@@ -2690,7 +2691,7 @@ impl<'a> UserTableAccessor<'a> {
             "upsert unique MVCC",
         )?;
         match self
-            .update_unique_mvcc(rt, effects, &key, full_row_update_cols(&cols))
+            .update_unique_mvcc(rt, effects, &key, full_row_update_cols(&cols), log_by_key)
             .await?
         {
             UpdateMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
@@ -2708,6 +2709,7 @@ impl<'a> UserTableAccessor<'a> {
         effects: &mut StmtEffects,
         key: &SelectKey,
         update: Vec<UpdateCol>,
+        log_by_key: bool,
     ) -> Result<UpdateMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
@@ -2886,7 +2888,7 @@ impl<'a> UserTableAccessor<'a> {
                 }
             };
             let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-                .update_inplace(effects, page_guard, key, row_id, update.clone())
+                .update_inplace(effects, page_guard, key, row_id, update.clone(), log_by_key)
                 .await;
             match res {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
@@ -4782,7 +4784,7 @@ mod tests {
                     let layout = table.layout_snapshot();
                     let accessor = table.accessor_with_layout(&layout);
                     let res = HotRowUpdater::new(accessor.table_id(), accessor.metadata(), rt)
-                        .update_inplace(effects, page_guard, &key, row_id, update)
+                        .update_inplace(effects, page_guard, &key, row_id, update, false)
                         .await;
                     assert!(matches!(res, UpdateRowInplace::RetryInTransition));
                     Err(Report::new(OperationError::NotSupported).into())

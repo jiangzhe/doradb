@@ -32,7 +32,7 @@ use crate::log::redo::RowRedoKind;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::SelectKey;
+use crate::row::ops::{SelectKey, UpdateCol};
 use crate::table::TableRedoReplayFloor;
 use crate::value::Val;
 use error_stack::Report;
@@ -521,18 +521,16 @@ impl CatalogStorage {
         );
         let mut next_row_id = root.pivot_row_id;
 
-        // Step 2: Preload existing visible rows only when delete-by-key appears.
-        let need_delete_lookup = table_ops
-            .iter()
-            .any(|kind| matches!(kind, RowRedoKind::DeleteByUniqueKey(_)));
-        let mut existing_rows = if need_delete_lookup {
-            self.load_visible_rows_for_delete_lookup(
-                metadata,
-                &disk_pool_guard,
-                &entries,
-                &base_index,
+        // Step 2: Preload existing visible rows only when key-based ops appear.
+        let need_key_lookup = table_ops.iter().any(|kind| {
+            matches!(
+                kind,
+                RowRedoKind::DeleteByUniqueKey(_) | RowRedoKind::UpdateByUniqueKey(..)
             )
-            .await?
+        });
+        let mut existing_rows = if need_key_lookup {
+            self.load_visible_rows_for_key_lookup(metadata, &disk_pool_guard, &entries, &base_index)
+                .await?
         } else {
             Vec::new()
         };
@@ -560,13 +558,13 @@ impl CatalogStorage {
                 RowRedoKind::DeleteByUniqueKey(key) => {
                     let index_spec = validate_catalog_delete_key(metadata, key)?;
                     if let Some(row_idx) =
-                        find_pending_delete_match(&pending_rows, index_spec, &key.vals)?
+                        find_pending_key_match(&pending_rows, index_spec, &key.vals)?
                     {
                         pending_rows[row_idx].deleted = true;
                         continue;
                     }
                     if let Some(row_idx) =
-                        find_existing_delete_match(&existing_rows, index_spec, &key.vals)?
+                        find_existing_key_match(&existing_rows, index_spec, &key.vals)?
                     {
                         let row = &mut existing_rows[row_idx];
                         row.deleted = true;
@@ -588,9 +586,42 @@ impl CatalogStorage {
                             .insert(delta as u32);
                     }
                 }
+                RowRedoKind::UpdateByUniqueKey(key, update) => {
+                    let index_spec = validate_catalog_update_key(metadata, key)?;
+                    if let Some(row_idx) =
+                        find_pending_key_match(&pending_rows, index_spec, &key.vals)?
+                    {
+                        apply_catalog_update_by_key(
+                            metadata,
+                            index_spec,
+                            key,
+                            &mut pending_rows[row_idx].vals,
+                            update,
+                        )?;
+                        continue;
+                    }
+                    let Some(row_idx) =
+                        find_existing_key_match(&existing_rows, index_spec, &key.vals)?
+                    else {
+                        return Err(invalid_catalog_payload(format!(
+                            "catalog checkpoint update-by-key target missing: index_no={}, key_vals={:?}",
+                            key.index_no, key.vals
+                        )));
+                    };
+                    let row = &mut existing_rows[row_idx];
+                    mark_existing_row_deleted(row, &mut delete_deltas)?;
+                    let mut vals = row.vals.clone();
+                    apply_catalog_update_by_key(metadata, index_spec, key, &mut vals, update)?;
+                    pending_rows.push(PendingInsertRow {
+                        row_id: next_row_id,
+                        vals,
+                        deleted: false,
+                    });
+                    next_row_id = next_row_id.saturating_add(1);
+                }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     return Err(invalid_catalog_payload(
-                        "catalog checkpoint table op must be insert or delete-by-key",
+                        "catalog checkpoint table op must be insert, delete-by-key, or update-by-key",
                     ));
                 }
             }
@@ -869,7 +900,7 @@ impl CatalogStorage {
         Ok(rows)
     }
 
-    async fn load_visible_rows_for_delete_lookup(
+    async fn load_visible_rows_for_key_lookup(
         &self,
         metadata: &TableMetadata,
         disk_pool_guard: &PoolGuard,
@@ -889,13 +920,13 @@ impl CatalogStorage {
             for row in page_rows {
                 let delta = row.row_id.checked_sub(entry.start_row_id).ok_or_else(|| {
                     invalid_catalog_payload(format!(
-                        "delete lookup row id precedes block start: row_id={}, start_row_id={}",
+                        "key lookup row id precedes block start: row_id={}, start_row_id={}",
                         row.row_id, entry.start_row_id
                     ))
                 })?;
                 if delta > u32::MAX as u64 {
                     return Err(invalid_catalog_payload(format!(
-                        "delete lookup row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
+                        "key lookup row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
                         row.row_id, entry.start_row_id
                     )));
                 }
@@ -1306,12 +1337,119 @@ fn validate_catalog_delete_key<'a>(
     Ok(index_spec)
 }
 
-fn validate_delete_candidate_row(index_spec: &IndexSpec, row: &[Val]) -> Result<()> {
+fn validate_catalog_update_key<'a>(
+    metadata: &'a TableMetadata,
+    key: &SelectKey,
+) -> Result<&'a IndexSpec> {
+    let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+        return Err(invalid_catalog_payload(format!(
+            "catalog checkpoint update key index not found: index_no={}, index_slot_count={}",
+            key.index_no,
+            metadata.idx.index_slot_count()
+        )));
+    };
+    if !index_spec.unique() {
+        return Err(invalid_catalog_payload(format!(
+            "catalog checkpoint update key must be unique: index_no={}",
+            key.index_no
+        )));
+    }
+    if index_spec.cols.len() != key.vals.len() {
+        return Err(invalid_catalog_payload(format!(
+            "catalog checkpoint update key value count {} does not match index column count {}",
+            key.vals.len(),
+            index_spec.cols.len()
+        )));
+    }
+    if !metadata
+        .idx
+        .index_type_match(metadata.col.as_ref(), key.index_no, &key.vals)
+    {
+        return Err(invalid_catalog_payload(format!(
+            "catalog checkpoint update key type mismatch: index_no={}",
+            key.index_no
+        )));
+    }
+    Ok(index_spec)
+}
+
+fn apply_catalog_update_by_key(
+    metadata: &TableMetadata,
+    index_spec: &IndexSpec,
+    key: &SelectKey,
+    row: &mut [Val],
+    update: &[UpdateCol],
+) -> Result<()> {
+    if row.len() != metadata.col.col_count() {
+        return Err(invalid_catalog_payload(format!(
+            "catalog checkpoint update candidate row value count {} does not match column count {}",
+            row.len(),
+            metadata.col.col_count()
+        )));
+    }
+    let mut last_idx = None;
+    for update_col in update {
+        if update_col.idx >= metadata.col.col_count() {
+            return Err(invalid_catalog_payload(format!(
+                "catalog checkpoint update column out of range: column_no={}, column_count={}",
+                update_col.idx,
+                metadata.col.col_count()
+            )));
+        }
+        if last_idx.is_some_and(|idx| update_col.idx <= idx) {
+            return Err(invalid_catalog_payload(format!(
+                "catalog checkpoint update columns not strictly ordered: column_no={}",
+                update_col.idx
+            )));
+        }
+        if !metadata.col.col_type_match(update_col.idx, &update_col.val) {
+            return Err(invalid_catalog_payload(format!(
+                "catalog checkpoint update column type mismatch: column_no={}",
+                update_col.idx
+            )));
+        }
+        row[update_col.idx] = update_col.val.clone();
+        last_idx = Some(update_col.idx);
+    }
+    if !row_matches_key(index_spec, row, &key.vals) {
+        return Err(invalid_catalog_payload(format!(
+            "catalog checkpoint update-by-key changed stable key: index_no={}, key_vals={:?}",
+            key.index_no, key.vals
+        )));
+    }
+    Ok(())
+}
+
+fn mark_existing_row_deleted(
+    row: &mut ExistingVisibleRow,
+    delete_deltas: &mut BTreeMap<RowID, BTreeSet<u32>>,
+) -> Result<()> {
+    row.deleted = true;
+    let delta = row.row_id.checked_sub(row.start_row_id).ok_or_else(|| {
+        invalid_catalog_payload(format!(
+            "delete row id precedes block start: row_id={}, start_row_id={}",
+            row.row_id, row.start_row_id
+        ))
+    })?;
+    if delta > u32::MAX as u64 {
+        return Err(invalid_catalog_payload(format!(
+            "delete delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
+            row.row_id, row.start_row_id
+        )));
+    }
+    delete_deltas
+        .entry(row.start_row_id)
+        .or_default()
+        .insert(delta as u32);
+    Ok(())
+}
+
+fn validate_key_candidate_row(index_spec: &IndexSpec, row: &[Val]) -> Result<()> {
     for index_key in &index_spec.cols {
         let col_idx = usize::from(index_key.col_no);
         if col_idx >= row.len() {
             return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint delete candidate row missing index column: column_no={}, row_value_count={}",
+                "catalog checkpoint key candidate row missing index column: column_no={}, row_value_count={}",
                 index_key.col_no,
                 row.len()
             )));
@@ -1320,7 +1458,7 @@ fn validate_delete_candidate_row(index_spec: &IndexSpec, row: &[Val]) -> Result<
     Ok(())
 }
 
-fn find_pending_delete_match(
+fn find_pending_key_match(
     rows: &[PendingInsertRow],
     index_spec: &IndexSpec,
     key_vals: &[Val],
@@ -1329,7 +1467,7 @@ fn find_pending_delete_match(
         if row.deleted {
             continue;
         }
-        validate_delete_candidate_row(index_spec, &row.vals)?;
+        validate_key_candidate_row(index_spec, &row.vals)?;
         if row_matches_key(index_spec, &row.vals, key_vals) {
             return Ok(Some(idx));
         }
@@ -1337,7 +1475,7 @@ fn find_pending_delete_match(
     Ok(None)
 }
 
-fn find_existing_delete_match(
+fn find_existing_key_match(
     rows: &[ExistingVisibleRow],
     index_spec: &IndexSpec,
     key_vals: &[Val],
@@ -1346,7 +1484,7 @@ fn find_existing_delete_match(
         if row.deleted {
             continue;
         }
-        validate_delete_candidate_row(index_spec, &row.vals)?;
+        validate_key_candidate_row(index_spec, &row.vals)?;
         if row_matches_key(index_spec, &row.vals, key_vals) {
             return Ok(Some(idx));
         }
@@ -1393,7 +1531,7 @@ pub(crate) mod tests {
         use crate::id::BlockID;
         use crate::index::{ColumnBlockIndex, ColumnDeleteDomain};
         use crate::log::redo::RowRedoKind;
-        use crate::row::ops::SelectKey;
+        use crate::row::ops::{SelectKey, UpdateCol};
         use crate::value::{Val, ValKind};
         use tempfile::TempDir;
 
@@ -1481,6 +1619,19 @@ pub(crate) mod tests {
                     Val::from(0u32),
                 ],
             }
+        }
+
+        async fn visible_catalog_rows(
+            storage: &CatalogStorage,
+            table_id: TableID,
+        ) -> Vec<RowRecord> {
+            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[table_id.as_usize()];
+            let table = storage.get_catalog_table(table_id).unwrap();
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            storage
+                .load_visible_rows_from_root(table.metadata(), &disk_pool_guard, root)
+                .await
+                .unwrap()
         }
 
         async fn assert_checkpoint_rejects_delete_key(
@@ -1653,7 +1804,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn test_catalog_delete_candidate_row_requires_index_column() {
+        fn test_catalog_key_candidate_row_requires_index_column() {
             smol::block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let main_dir = temp_dir.path().to_path_buf();
@@ -1664,7 +1815,7 @@ pub(crate) mod tests {
                 let table = storage.get_catalog_table(TableID::new(0)).unwrap();
                 let key = SelectKey::new(0, vec![Val::from(USER_OBJ_ID_START)]);
                 let index_spec = validate_catalog_delete_key(table.metadata(), &key).unwrap();
-                let err = validate_delete_candidate_row(index_spec, &[]).unwrap_err();
+                let err = validate_key_candidate_row(index_spec, &[]).unwrap_err();
 
                 assert_eq!(
                     err.data_integrity_error(),
@@ -1672,7 +1823,7 @@ pub(crate) mod tests {
                 );
                 let report = format!("{err:?}");
                 assert!(
-                    report.contains("catalog checkpoint delete candidate row missing index column"),
+                    report.contains("catalog checkpoint key candidate row missing index column"),
                     "{report}"
                 );
                 assert!(report.contains("column_no=0"), "{report}");
@@ -1924,6 +2075,100 @@ pub(crate) mod tests {
                 assert_eq!(after_root.alloc_map.allocated(), before_allocated);
                 assert_eq!(after_root.table_roots[0].root_block_id, None);
                 assert_eq!(after_root.table_roots[0].pivot_row_id, RowID::new(0));
+            });
+        }
+
+        #[test]
+        fn test_catalog_checkpoint_update_by_key_updates_same_batch_insert() {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let main_dir = temp_dir.path().to_path_buf();
+                let engine = open_catalog_test_engine(
+                    main_dir,
+                    Some("catalog-update-key-same-batch-insert"),
+                )
+                .await;
+
+                let storage = &engine.catalog().storage;
+                let table_id = USER_OBJ_ID_START + 5252;
+                let batch = checkpoint_batch_with_ops(
+                    storage,
+                    vec![
+                        CatalogRedoEntry {
+                            table_id: TableID::new(0),
+                            kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                        },
+                        CatalogRedoEntry {
+                            table_id: TableID::new(0),
+                            kind: RowRedoKind::UpdateByUniqueKey(
+                                SelectKey::new(0, vec![Val::from(table_id)]),
+                                vec![UpdateCol {
+                                    idx: 1,
+                                    val: Val::from(7u16),
+                                }],
+                            ),
+                        },
+                    ],
+                );
+
+                storage
+                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                    .await
+                    .unwrap();
+
+                let rows = visible_catalog_rows(storage, TableID::new(0)).await;
+                let matching_rows = rows
+                    .iter()
+                    .filter(|row| row.vals[0] == Val::from(table_id))
+                    .collect::<Vec<_>>();
+                assert_eq!(matching_rows.len(), 1);
+                assert_eq!(matching_rows[0].vals[1], Val::from(7u16));
+            });
+        }
+
+        #[test]
+        fn test_catalog_checkpoint_update_by_key_replaces_existing_row() {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let main_dir = temp_dir.path().to_path_buf();
+                let engine =
+                    open_catalog_test_engine(main_dir, Some("catalog-update-key-existing-row"))
+                        .await;
+
+                let table_id = table1(&engine).await;
+                engine
+                    .catalog()
+                    .checkpoint_now(&engine.inner().trx_sys)
+                    .await
+                    .unwrap();
+
+                let storage = &engine.catalog().storage;
+                let batch = checkpoint_batch_with_ops(
+                    storage,
+                    vec![CatalogRedoEntry {
+                        table_id: TableID::new(0),
+                        kind: RowRedoKind::UpdateByUniqueKey(
+                            SelectKey::new(0, vec![Val::from(table_id)]),
+                            vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from(9u16),
+                            }],
+                        ),
+                    }],
+                );
+
+                storage
+                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                    .await
+                    .unwrap();
+
+                let rows = visible_catalog_rows(storage, TableID::new(0)).await;
+                let matching_rows = rows
+                    .iter()
+                    .filter(|row| row.vals[0] == Val::from(table_id))
+                    .collect::<Vec<_>>();
+                assert_eq!(matching_rows.len(), 1);
+                assert_eq!(matching_rows[0].vals[1], Val::from(9u16));
             });
         }
 

@@ -925,8 +925,14 @@ impl<'a> RecoveryCoordinator<'a> {
                         .delete_unique_no_trx(&self.resources.buffers.pool_guards, key)
                         .await?;
                 }
+                RowRedoKind::UpdateByUniqueKey(key, cols) => {
+                    table
+                        .update_unique_no_trx(&self.resources.buffers.pool_guards, key, cols)
+                        .await?;
+                }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
-                    // updates of catalog are implemented as DeleteByUniqueKey and Insert.
+                    // Catalog row-id redo is invalid because catalog row IDs
+                    // are rebuilt when checkpointed rows are loaded.
                     unreachable!()
                 }
             }
@@ -991,8 +997,8 @@ impl<'a> RecoveryCoordinator<'a> {
                         )
                         .await?;
                 }
-                RowRedoKind::DeleteByUniqueKey(_) => {
-                    // We do not allow DeleteByUniqueKey log on data tables.
+                RowRedoKind::DeleteByUniqueKey(_) | RowRedoKind::UpdateByUniqueKey(..) => {
+                    // We do not allow key-based catalog redo on data tables.
                     unreachable!();
                 }
             }
@@ -1050,7 +1056,7 @@ fn unexpected_unsealed_terminal_error() -> Error {
 mod tests {
     use super::{RecoveryCoordinator, validate_create_table_reloaded_root_ts};
     use crate::buffer::PoolRole;
-    use crate::catalog::storage::publish_first_redo_log_seq_for_test;
+    use crate::catalog::storage::{SilentWatermarkObject, publish_first_redo_log_seq_for_test};
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
         IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
@@ -2735,6 +2741,84 @@ mod tests {
             assert_eq!(live_after_catalog_checkpoint[0].floor, expected_floor);
             drop(recovered);
         })
+    }
+
+    #[test]
+    fn test_recovery_replays_uncheckpointed_silent_watermark_keyed_update() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().join("keyed-update");
+            fs::create_dir_all(&main_dir).unwrap();
+            let log_file_stem = "recover-silent-keyed-update";
+            let engine = lightweight_recovery_engine_config(main_dir.clone(), log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                engine
+                    .catalog()
+                    .storage
+                    .table_replay_silent_watermarks()
+                    .upsert(
+                        stmt,
+                        &SilentWatermarkObject {
+                            table_id,
+                            heap_redo_start_ts: TrxID::new(10),
+                            deletion_cutoff_ts: TrxID::new(12),
+                        },
+                    )
+                    .await
+            })
+            .await
+            .unwrap();
+            trx.set_ddl_redo(DDLRedo::TableReplaySilentWatermark { table_id })
+                .unwrap();
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                engine
+                    .catalog()
+                    .storage
+                    .table_replay_silent_watermarks()
+                    .upsert(
+                        stmt,
+                        &SilentWatermarkObject {
+                            table_id,
+                            heap_redo_start_ts: TrxID::new(11),
+                            deletion_cutoff_ts: TrxID::new(14),
+                        },
+                    )
+                    .await
+            })
+            .await
+            .unwrap();
+            trx.set_ddl_redo(DDLRedo::TableReplaySilentWatermark { table_id })
+                .unwrap();
+            trx.commit().await.unwrap();
+            drop(session);
+            drop(engine);
+
+            let recovered = lightweight_recovery_engine_config(main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            let session = recovered.new_session().unwrap();
+            let watermark = recovered
+                .catalog()
+                .storage
+                .table_replay_silent_watermarks()
+                .find_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                .await
+                .unwrap()
+                .expect("recovery should replay keyed silent watermark update");
+            assert_eq!(watermark.heap_redo_start_ts, TrxID::new(11));
+            assert_eq!(watermark.deletion_cutoff_ts, TrxID::new(14));
+        });
     }
 
     #[test]

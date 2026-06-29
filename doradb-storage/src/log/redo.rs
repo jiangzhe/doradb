@@ -17,6 +17,7 @@ pub(crate) enum RowRedoCode {
     Delete = 2,
     Update = 3,
     DeleteByUniqueKey = 4,
+    UpdateByUniqueKey = 5,
 }
 
 impl TryFrom<u8> for RowRedoCode {
@@ -29,6 +30,7 @@ impl TryFrom<u8> for RowRedoCode {
             2 => Ok(RowRedoCode::Delete),
             3 => Ok(RowRedoCode::Update),
             4 => Ok(RowRedoCode::DeleteByUniqueKey),
+            5 => Ok(RowRedoCode::UpdateByUniqueKey),
             _ => Err(()),
         }
     }
@@ -42,6 +44,8 @@ pub(crate) enum RowRedoKind {
     Update(Vec<UpdateCol>),
     /// This is special kind for catalog update/delete.
     DeleteByUniqueKey(SelectKey),
+    /// Catalog update selected by a stable unique key instead of runtime row id.
+    UpdateByUniqueKey(SelectKey, Vec<UpdateCol>),
 }
 
 impl RowRedoKind {
@@ -53,6 +57,7 @@ impl RowRedoKind {
             RowRedoKind::Delete => RowRedoCode::Delete,
             RowRedoKind::Update(..) => RowRedoCode::Update,
             RowRedoKind::DeleteByUniqueKey(_) => RowRedoCode::DeleteByUniqueKey,
+            RowRedoKind::UpdateByUniqueKey(..) => RowRedoCode::UpdateByUniqueKey,
         }
     }
 }
@@ -65,6 +70,7 @@ impl Ser<'_> for RowRedoKind {
                 RowRedoKind::Delete => 0,
                 RowRedoKind::Update(cols) => cols.ser_len(),
                 RowRedoKind::DeleteByUniqueKey(key) => key.ser_len(),
+                RowRedoKind::UpdateByUniqueKey(key, cols) => key.ser_len() + cols.ser_len(),
             }
     }
 
@@ -82,6 +88,10 @@ impl Ser<'_> for RowRedoKind {
             }
             RowRedoKind::DeleteByUniqueKey(key) => {
                 idx = key.ser(out, idx);
+            }
+            RowRedoKind::UpdateByUniqueKey(key, cols) => {
+                idx = key.ser(out, idx);
+                idx = cols.ser(out, idx);
             }
         }
         idx
@@ -113,6 +123,11 @@ impl Deser for RowRedoKind {
             RowRedoCode::DeleteByUniqueKey => {
                 let (idx, key) = SelectKey::deser(input, idx)?;
                 Ok((idx, RowRedoKind::DeleteByUniqueKey(key)))
+            }
+            RowRedoCode::UpdateByUniqueKey => {
+                let (idx, key) = SelectKey::deser(input, idx)?;
+                let (idx, cols) = Vec::<UpdateCol>::deser(input, idx)?;
+                Ok((idx, RowRedoKind::UpdateByUniqueKey(key, cols)))
             }
         }
     }
@@ -557,7 +572,10 @@ impl TableDML {
                         // Same RowID cannot be inserted twice
                         unreachable!()
                     }
-                    (RowRedoKind::Insert(vals), RowRedoKind::Update(upd_cols)) => {
+                    (
+                        RowRedoKind::Insert(vals),
+                        RowRedoKind::Update(upd_cols) | RowRedoKind::UpdateByUniqueKey(_, upd_cols),
+                    ) => {
                         // Apply update to inserted rows.
                         // Insert contains all columns, so updating indexed columns won't fail.
                         for upd_col in upd_cols {
@@ -575,22 +593,34 @@ impl TableDML {
                     (RowRedoKind::Update(vals), RowRedoKind::Update(upd_cols)) => {
                         // Apply update to updated rows.
                         // Update any indexed columns that are not included in new update.
-                        for upd_col in upd_cols {
-                            match vals.binary_search_by_key(&upd_col.idx, |val| val.idx) {
-                                Ok(idx) => {
-                                    vals[idx] = upd_col;
-                                }
-                                Err(idx) => {
-                                    vals.insert(idx, upd_col);
-                                }
-                            }
-                        }
+                        merge_update_cols(vals, upd_cols);
+                    }
+                    (
+                        RowRedoKind::UpdateByUniqueKey(old_key, vals),
+                        RowRedoKind::UpdateByUniqueKey(new_key, upd_cols),
+                    ) => {
+                        debug_assert_eq!(
+                            *old_key, new_key,
+                            "catalog keyed update redo must preserve the logged unique key",
+                        );
+                        merge_update_cols(vals, upd_cols);
                     }
                     (RowRedoKind::Update(_), RowRedoKind::DeleteByUniqueKey(_)) => {
                         // We do not allow Update and then DeleteByUniqueKey,
                         // because DeleteByUniqueKey is only used for catalog tables.
                         // And they are not allow to update, instead we perform delete+insert.
                         unreachable!()
+                    }
+                    (RowRedoKind::Update(_), RowRedoKind::UpdateByUniqueKey(..)) => {
+                        unreachable!("row-id update cannot be followed by keyed update")
+                    }
+                    (RowRedoKind::UpdateByUniqueKey(key, _), RowRedoKind::DeleteByUniqueKey(_)) => {
+                        let key = key.clone();
+                        *old = RowRedo {
+                            page_id: entry.page_id,
+                            row_id: entry.row_id,
+                            kind: RowRedoKind::DeleteByUniqueKey(key),
+                        };
                     }
                     (RowRedoKind::Update(..), RowRedoKind::Delete) => {
                         // Update and then delete the same RowID.
@@ -601,11 +631,20 @@ impl TableDML {
                             kind: RowRedoKind::Delete,
                         };
                     }
-                    (RowRedoKind::Update(..), RowRedoKind::Insert(..)) => {
+                    (RowRedoKind::UpdateByUniqueKey(..), RowRedoKind::Delete) => {
+                        unreachable!("catalog keyed update must delete by unique key")
+                    }
+                    (
+                        RowRedoKind::Update(..) | RowRedoKind::UpdateByUniqueKey(..),
+                        RowRedoKind::Insert(..),
+                    ) => {
                         // It's impossible to insert a row with same RowID.
                         // As an existing row is updated indicates that the RowID
                         // is already inserted.
                         unreachable!()
+                    }
+                    (RowRedoKind::UpdateByUniqueKey(..), RowRedoKind::Update(_)) => {
+                        unreachable!("catalog keyed update must remain keyed")
                     }
                 }
             }
@@ -640,6 +679,20 @@ impl Deser for TableDML {
     fn deser<S: Serde + ?Sized>(data: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, rows) = BTreeMap::<RowID, RowRedo>::deser(data, start_idx)?;
         Ok((idx, TableDML { rows }))
+    }
+}
+
+#[inline]
+fn merge_update_cols(vals: &mut Vec<UpdateCol>, upd_cols: Vec<UpdateCol>) {
+    for upd_col in upd_cols {
+        match vals.binary_search_by_key(&upd_col.idx, |val| val.idx) {
+            Ok(idx) => {
+                vals[idx] = upd_col;
+            }
+            Err(idx) => {
+                vals.insert(idx, upd_col);
+            }
+        }
     }
 }
 
@@ -913,6 +966,135 @@ mod tests {
 
         let (_, deserialized) = TableDML::deser(&buf[..], 0).unwrap();
         assert_eq!(deserialized.rows.len(), 0);
+    }
+
+    #[test]
+    fn test_row_redo_kind_update_by_unique_key_serde() {
+        let key = SelectKey::new(0, vec![Val::U64(7)]);
+        let kind = RowRedoKind::UpdateByUniqueKey(
+            key.clone(),
+            vec![
+                UpdateCol {
+                    idx: 1,
+                    val: Val::U64(11),
+                },
+                UpdateCol {
+                    idx: 2,
+                    val: Val::U64(13),
+                },
+            ],
+        );
+        let mut buf = vec![0; kind.ser_len()];
+        kind.ser(&mut buf[..], 0);
+        assert_eq!(buf[0], RowRedoCode::UpdateByUniqueKey as u8);
+
+        let (_, decoded) = RowRedoKind::deser(&buf[..], 0).unwrap();
+        match decoded {
+            RowRedoKind::UpdateByUniqueKey(decoded_key, cols) => {
+                assert_eq!(decoded_key, key);
+                assert_eq!(
+                    cols,
+                    vec![
+                        UpdateCol {
+                            idx: 1,
+                            val: Val::U64(11),
+                        },
+                        UpdateCol {
+                            idx: 2,
+                            val: Val::U64(13),
+                        },
+                    ]
+                );
+            }
+            _ => panic!("Expected UpdateByUniqueKey kind"),
+        }
+    }
+
+    #[test]
+    fn test_table_dml_update_by_unique_key_merge() {
+        let key = SelectKey::new(0, vec![Val::U64(1)]);
+        let mut table = TableDML::default();
+        table.insert(RowRedo {
+            page_id: test_page_id(1),
+            row_id: RowID::new(10),
+            kind: RowRedoKind::Insert(vec![Val::U64(1), Val::U64(2)]),
+        });
+        table.insert(RowRedo {
+            page_id: test_page_id(1),
+            row_id: RowID::new(10),
+            kind: RowRedoKind::UpdateByUniqueKey(
+                key.clone(),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::U64(3),
+                }],
+            ),
+        });
+        match &table.rows.get(&RowID::new(10)).unwrap().kind {
+            RowRedoKind::Insert(vals) => {
+                assert_eq!(vals, &vec![Val::U64(1), Val::U64(3)]);
+            }
+            _ => panic!("Expected folded Insert kind"),
+        }
+
+        let mut table = TableDML::default();
+        table.insert(RowRedo {
+            page_id: test_page_id(1),
+            row_id: RowID::new(20),
+            kind: RowRedoKind::UpdateByUniqueKey(
+                key.clone(),
+                vec![UpdateCol {
+                    idx: 2,
+                    val: Val::U64(5),
+                }],
+            ),
+        });
+        table.insert(RowRedo {
+            page_id: test_page_id(1),
+            row_id: RowID::new(20),
+            kind: RowRedoKind::UpdateByUniqueKey(
+                key.clone(),
+                vec![
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::U64(7),
+                    },
+                    UpdateCol {
+                        idx: 2,
+                        val: Val::U64(9),
+                    },
+                ],
+            ),
+        });
+        match &table.rows.get(&RowID::new(20)).unwrap().kind {
+            RowRedoKind::UpdateByUniqueKey(decoded_key, cols) => {
+                assert_eq!(decoded_key, &key);
+                assert_eq!(
+                    cols,
+                    &vec![
+                        UpdateCol {
+                            idx: 1,
+                            val: Val::U64(7),
+                        },
+                        UpdateCol {
+                            idx: 2,
+                            val: Val::U64(9),
+                        },
+                    ]
+                );
+            }
+            _ => panic!("Expected merged UpdateByUniqueKey kind"),
+        }
+
+        table.insert(RowRedo {
+            page_id: test_page_id(1),
+            row_id: RowID::new(20),
+            kind: RowRedoKind::DeleteByUniqueKey(key.clone()),
+        });
+        match &table.rows.get(&RowID::new(20)).unwrap().kind {
+            RowRedoKind::DeleteByUniqueKey(decoded_key) => assert_eq!(decoded_key, &key),
+            _ => panic!("Expected DeleteByUniqueKey kind"),
+        }
     }
 
     #[test]
