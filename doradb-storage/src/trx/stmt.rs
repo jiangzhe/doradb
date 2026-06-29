@@ -5,7 +5,9 @@ use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
 use crate::error::{Error, FatalError, OperationError, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
-use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+use crate::row::ops::{
+    DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
+};
 use crate::session::TrxAttachment;
 use crate::table::Table;
 use crate::trx::undo::{
@@ -415,6 +417,27 @@ impl<'stmt> Statement<'stmt> {
         table
             .accessor_with_layout(&layout)
             .insert_mvcc(rt, effects, cols)
+            .await
+    }
+
+    /// Inserts or replaces one catalog-owned user-table row by table id and unique key.
+    ///
+    /// Strong table-runtime access is internal and operation-local.
+    #[inline]
+    pub async fn table_upsert_unique_mvcc(
+        &mut self,
+        table_id: TableID,
+        unique_index_no: usize,
+        cols: Vec<Val>,
+    ) -> Result<UpsertMvcc> {
+        let table = self.resolve_user_table(table_id, "table_upsert_unique_mvcc")?;
+        self.acquire_table_write_locks(table_id).await?;
+        table.check_foreground_live("table_upsert_unique_mvcc")?;
+        let layout = table.layout_snapshot();
+        let (rt, effects) = self.runtime_and_effects_mut();
+        table
+            .accessor_with_layout(&layout)
+            .upsert_unique_mvcc(rt, effects, unique_index_no, cols)
             .await
     }
 

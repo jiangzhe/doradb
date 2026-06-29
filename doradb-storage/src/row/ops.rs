@@ -188,6 +188,27 @@ impl UpdateMvcc {
     }
 }
 
+/// MVCC unique-key upsert result.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpsertMvcc {
+    Inserted(RowID),
+    Updated(RowID),
+}
+
+impl UpsertMvcc {
+    /// Returns whether the upsert inserted a new row.
+    #[inline]
+    pub fn is_inserted(&self) -> bool {
+        matches!(self, UpsertMvcc::Inserted(_))
+    }
+
+    /// Returns whether the upsert updated an existing row.
+    #[inline]
+    pub fn is_updated(&self) -> bool {
+        matches!(self, UpsertMvcc::Updated(_))
+    }
+}
+
 /// Secondary-index update result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateIndex {
@@ -333,5 +354,22 @@ impl DeleteMvcc {
     #[inline]
     pub fn not_found(&self) -> bool {
         matches!(self, DeleteMvcc::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpsertMvcc;
+    use crate::id::RowID;
+
+    #[test]
+    fn upsert_mvcc_predicates_report_variant() {
+        let inserted = UpsertMvcc::Inserted(RowID::new(1));
+        assert!(inserted.is_inserted());
+        assert!(!inserted.is_updated());
+
+        let updated = UpsertMvcc::Updated(RowID::new(2));
+        assert!(updated.is_updated());
+        assert!(!updated.is_inserted());
     }
 }
