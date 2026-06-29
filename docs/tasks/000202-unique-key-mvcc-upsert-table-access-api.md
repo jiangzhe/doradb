@@ -190,16 +190,23 @@ pub enum UpsertMvcc {
 - Added focused coverage for user-table upsert insert/update, existing-row
   write conflict, missing-key uncommitted-insert conflict handling, and direct
   `MemTable` insert/update behavior.
+- Added additional direct `MemTable` coverage for non-unique in-memory index
+  insert/delete, MVCC delete masking, in-place unique/non-unique key changes,
+  moved-row index remapping, and internal error helper context. The focused
+  coverage report for `doradb-storage/src/table/mem_table.rs` is now 91.33%,
+  with no fully uncovered functions remaining.
 - Validation passed with strict clippy, branch style audit, the standard
-  `cargo nextest run -p doradb-storage` suite, and focused coverage across the
-  changed targets. Focused coverage was 84.77% deduplicated overall; the
-  whole-file `mem_table.rs` target remains below 80% because it is a broad
-  shared implementation file with substantial pre-existing uncovered branches.
+  `cargo nextest run -p doradb-storage` suite, and focused coverage across
+  the changed targets.
 - Closed source backlog
   `docs/backlogs/000138-unique-key-mvcc-upsert-table-access-api.md` as
   implemented. Catalog silent-watermark adoption remains out of this task scope
   and is tracked by
   `docs/backlogs/000139-catalog-silent-watermark-upsert-adoption.md`.
+- Broader accessor deduplication and transaction value-ownership optimization
+  remain out of scope and are tracked by
+  `docs/backlogs/000140-share-table-accessor-lookup-mvcc-logic.md` and
+  `docs/backlogs/000141-optimize-transaction-row-value-ownership.md`.
 
 ## Impacts
 
