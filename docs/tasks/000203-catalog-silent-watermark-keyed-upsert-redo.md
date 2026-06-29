@@ -1,7 +1,7 @@
 ---
 id: 000203
 title: Catalog Silent Watermark Keyed Upsert Redo
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-06-29
 github_issue: 792
 ---
@@ -184,6 +184,29 @@ catalog row IDs have changed.
 
 ## Implementation Notes
 
+- Implemented logical catalog `UpdateByUniqueKey` redo, including codec,
+  transaction-local merge handling, catalog recovery replay, and catalog
+  checkpoint folding by unique key.
+- Routed catalog silent watermark upserts through the keyed catalog upsert path
+  so found-row updates emit key-based redo instead of row-id catalog updates.
+- Adjusted silent watermark upsert semantics after implementation review:
+  callers now pass the intended watermark row directly, `upsert` returns
+  `Result<()>`, and a debug assertion verifies existing watermarks do not exceed
+  the input values. No-op boolean reporting and fieldwise max computation inside
+  the accessor were intentionally removed.
+- Hardened review findings in the same recovery-facing path: documented that
+  no-trx keyed updates rely on rejecting indexed-column changes because they do
+  not update `MemIndex`, and replaced panic-based no-trx page acquisition in
+  keyed delete/update replay with recoverable error propagation.
+- Deferred broader catalog checkpoint PK-aware folding and compact catalog-root
+  materialization to `docs/backlogs/000142-catalog-checkpoint-pk-aware-folding-and-compaction-design.md`.
+- Validation completed:
+  `tools/style_audit.rs --diff-base origin/main`,
+  `cargo nextest run -p doradb-storage`,
+  `cargo test -p doradb-storage table_replay_silent_watermark`,
+  `cargo test -p doradb-storage no_trx`,
+  and `cargo fmt --all -- --check`.
+
 ## Impacts
 
 - `doradb-storage/src/log/redo.rs`
@@ -249,4 +272,6 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-- None.
+- Catalog checkpoint PK-aware folding and compact catalog root materialization
+  remain intentionally out of scope and are tracked in
+  `docs/backlogs/000142-catalog-checkpoint-pk-aware-folding-and-compaction-design.md`.
