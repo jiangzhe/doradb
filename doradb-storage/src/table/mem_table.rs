@@ -1467,11 +1467,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     return self.catalog_lwc_error("delete unique no-trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self
-                        .get_row_page_exclusive(guards, page_id)
-                        .await
-                        .expect("delete_unique_no_trx should not ignore page-I/O failures")
-                        .expect("failed to lock exclusive row page");
+                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
                     (page_guard, row_id)
                 }
             },
@@ -1523,6 +1519,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 key.index_no
             )));
         }
+        // This no-trx recovery path writes the row image directly and does not
+        // update MemIndex entries. Keep validate_update_by_key_cols() rejecting
+        // every indexed column; callers that need indexed-column changes must
+        // use a path that updates indexes as well.
         validate_update_by_key_cols(metadata, update)?;
 
         let sts = MIN_SNAPSHOT_TS;
@@ -1543,11 +1543,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     return self.catalog_lwc_error("update unique no-trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = self
-                        .get_row_page_exclusive(guards, page_id)
-                        .await
-                        .expect("update_unique_no_trx should not ignore page-I/O failures")
-                        .expect("failed to lock exclusive row page");
+                    let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
                     (page_guard, row_id)
                 }
             },
