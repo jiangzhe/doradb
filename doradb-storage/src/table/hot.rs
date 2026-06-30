@@ -14,6 +14,7 @@ use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::value::Val;
+use std::mem::replace;
 
 /// Hot row-page insert context shared by catalog and user-table accessors.
 pub(super) struct RowInserter<'m, 'r> {
@@ -438,7 +439,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                     let mut row = old_row;
                     for UpdateCol { idx, val } in update {
                         if row[idx] != val {
-                            let old_val = std::mem::replace(&mut row[idx], val);
+                            let old_val = replace(&mut row[idx], val);
                             if self.metadata.idx.index_columns().contains(&idx) {
                                 index_change_cols.insert(idx, old_val.clone());
                             }

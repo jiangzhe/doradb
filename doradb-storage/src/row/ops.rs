@@ -5,6 +5,7 @@ use crate::row::{Row, RowMut};
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
+use std::iter::Enumerate;
 use std::{mem, slice, vec};
 
 /// Logical lookup key for one table index.
@@ -346,7 +347,7 @@ pub(crate) enum RowUpdateIntoIter {
     /// Sparse update iterator.
     Sparse(vec::IntoIter<UpdateCol>),
     /// Full-row update iterator.
-    FullRow(std::iter::Enumerate<vec::IntoIter<Val>>),
+    FullRow(Enumerate<vec::IntoIter<Val>>),
 }
 
 impl Iterator for RowUpdateIntoIter {
@@ -420,7 +421,7 @@ pub(crate) enum RowUpdateIter<'a> {
     /// Sparse update iterator.
     Sparse(slice::Iter<'a, UpdateCol>),
     /// Full-row update iterator.
-    FullRow(std::iter::Enumerate<slice::Iter<'a, Val>>),
+    FullRow(Enumerate<slice::Iter<'a, Val>>),
 }
 
 impl<'a> Iterator for RowUpdateIter<'a> {
