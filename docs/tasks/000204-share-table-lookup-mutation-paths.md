@@ -1,7 +1,7 @@
 ---
 id: 000204
 title: Share Table Lookup and Mutation Paths
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-06-30
 github_issue: 794
 ---
@@ -31,7 +31,7 @@ deviation.
 `- codex`
 
 `Source Backlogs:`
-`- docs/backlogs/000140-share-table-accessor-lookup-mvcc-logic.md`
+`- docs/backlogs/closed/000140-share-table-accessor-lookup-mvcc-logic.md`
 
 Task `000202` added unique-key MVCC upsert support and extracted
 `table::hot::HotRowUpdater` to share row-page lock, in-place update, and
@@ -398,6 +398,33 @@ semantics.
    accessor-specific reason.
 
 ## Implementation Notes
+
+- Implemented the refactor as focused hot-row helpers rather than a broad
+  accessor abstraction. `table::hot` now owns shared hot-row MVCC reads,
+  row-page insertion through `RowInserter`, and row-page deletion through
+  `HotRowDeleter`, while `HotRowUpdater` remains the shared hot update helper.
+- Reused `MemTable` as the shared owner for validated hot row-page access.
+  `UserTableAccessor` now calls through `self.mem()` for validated row-page
+  lookup and versioned insert-page reuse instead of keeping duplicate wrappers.
+- Shared the repeated `UpdateIndex` to `UpdateMvcc`/error mapping with a small
+  helper. `IndexMutator` was intentionally not introduced: the remaining async
+  secondary-index loops still need explicit `TableRootSnapshot` capture timing
+  and cold-row semantics, and hiding those behind a trait would make the user
+  table path less clear.
+- Kept user-table LWC/CDB behavior explicit in `UserTableAccessor`; cold reads,
+  cold update/delete marker ownership, cold redo/undo, and cold terminal unique
+  branches were not moved behind a generic helper.
+- Removed now-dead duplicate local helpers where call sites could directly use
+  the shared helper. Later cleanup also renamed `MemTable` row-page scan helpers
+  to `scan`, `scan_from`, and `scan_from_with_meta_guard`, and moved
+  `invalid_scan_start` out of the impl block.
+- Review follow-up on cached active insert pages was verified against current
+  code and skipped: `load_active_insert_page` removes the cached entry, and the
+  `NoSpaceOrFrozen` retry path does not save it again, so the loop does not
+  immediately reselect the same session-cached page.
+- Validation completed with `tools/style_audit.rs --diff-base origin/main`
+  passing for 4 branch-diff Rust files and
+  `cargo nextest run -p doradb-storage` passing 1136 tests.
 
 ## Impacts
 
