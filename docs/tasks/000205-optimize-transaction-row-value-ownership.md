@@ -1,7 +1,7 @@
 ---
 id: 000205
 title: Optimize Transaction Row Value Ownership
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-06-30
 github_issue: 796
 ---
@@ -28,7 +28,7 @@ redo/undo serialization shapes.
 `- codex`
 
 `Source Backlogs:`
-`- docs/backlogs/000141-optimize-transaction-row-value-ownership.md`
+`- docs/backlogs/closed/000141-optimize-transaction-row-value-ownership.md`
 
 Task 000202 added unique-key MVCC upsert by deriving a lookup key from an
 owned full row, attempting update, and falling back to insert. Its
@@ -246,6 +246,44 @@ pub(crate) struct RowUpdateItem<'a> {
 
 ## Implementation Notes
 
+Implemented on 2026-06-30.
+
+- Added internal `RowUpdateInput`, `RowUpdateView`, owned and borrowed row-update
+  iterators, full-row consumption, and validation helpers. Public statement and
+  transaction update APIs remain source-compatible.
+- Reworked row-page variable-length estimation and row write preparation to use
+  borrowed update views while keeping owned values available for terminal redo,
+  undo, replacement-row, and index effects.
+- Reworked hot update ownership around owned `RowUpdateInput`. Failure paths
+  that can retry or continue now return the input, while successful in-place
+  update consumes owned values on the common path and emits redo only for
+  changed columns.
+- Reworked hot move-update preparation for both sparse and full-row inputs.
+  Move updates now build replacement rows directly from owned input and old-row
+  images, preserve changed old values for undo/index deltas, and cover the
+  full-row `NoFreeSpace` branch with a regression test.
+- Reworked full-row upsert in `MemTable` and `UserTableAccessor` to route
+  through `RowUpdateInput::FullRow`, removed `full_row_update_cols`, and carried
+  the owned full row back on not-found fallback so insert can consume it.
+- Simplified non-in-place old-row payloads to carry `Vec<Val>` instead of
+  preserving variable-offset metadata that only in-place rollback needs.
+- Removed retry-loop update vector clones in the hot/cold update paths and
+  cleaned up the stale `MemTable` dead-code allowances after verifying the
+  catalog upsert path is production-reachable.
+- Review follow-ups were addressed: the repeated unique-branch `undo_vals`
+  clone remains intentionally conservative because it only affects moved-row
+  updates with multiple unique indexes; a code comment records the potential
+  future `Arc<[UpdateCol]>` optimization if profiling proves it hot.
+
+Validation completed:
+
+- `tools/style_audit.rs --diff-base origin/main`
+- `cargo fmt --check`
+- `cargo check -p doradb-storage --all-targets`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage` - 1140 tests passed
+- `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/row/ops.rs`
@@ -313,10 +351,9 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-- Should `IndexBranch.undo_vals` become shared internal storage such as
-  `Arc<[UpdateCol]>` to avoid cloning the same changed-column delta across
-  multiple unique branches? This should be decided during implementation based
-  on measured simplicity and blast radius; it must not change redo format.
-- Should a future public API accept borrowed sparse updates or `Cow` after the
-  internal ownership model settles? This is intentionally deferred from this
-  task.
+- `IndexBranch.undo_vals` remains `Vec<UpdateCol>`. Sharing the moved-row
+  changed-column delta with `Arc<[UpdateCol]>` is intentionally deferred unless
+  profiling shows moved updates with multiple unique indexes are hot.
+- A future public API may accept borrowed sparse updates or `Cow` after the
+  internal ownership model settles. This remains intentionally deferred from
+  this task.

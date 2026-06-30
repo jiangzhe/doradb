@@ -55,3 +55,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000205.
+- Closed By: backlog close
+- Reference: docs/tasks/000205-optimize-transaction-row-value-ownership.md
+- Closed At: 2026-06-30
