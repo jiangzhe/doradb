@@ -3,9 +3,9 @@ use crate::catalog::TableMetadata;
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
-use crate::row::ops::{SelectKey, UndoCol, UpdateCol, UpdateRow};
-use crate::row::{RowPage, RowRead};
-use crate::table::UpdateRowInplace;
+use crate::row::ops::{ReadRow, SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateRow};
+use crate::row::{RowPage, RowRead, var_len_for_insert};
+use crate::table::{DeleteInternal, InsertRowIntoPage, UpdateRowInplace};
 use crate::trx::TrxRuntime;
 use crate::trx::row::{LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
@@ -13,6 +13,201 @@ use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::value::Val;
 use std::mem;
+
+/// Hot row-page insert context shared by catalog and user-table accessors.
+pub(super) struct RowInserter<'m, 'r> {
+    metadata: &'m TableMetadata,
+    table_id: TableID,
+    rt: TrxRuntime<'r>,
+}
+
+impl<'m, 'r> RowInserter<'m, 'r> {
+    /// Create a hot-row inserter for one metadata snapshot and transaction.
+    #[inline]
+    pub(super) fn new(table_id: TableID, metadata: &'m TableMetadata, rt: TrxRuntime<'r>) -> Self {
+        Self {
+            metadata,
+            table_id,
+            rt,
+        }
+    }
+
+    /// Insert one row into an active hot row page.
+    #[inline]
+    pub(super) fn insert_to_page(
+        &self,
+        effects: &mut StmtEffects,
+        page_guard: PageSharedGuard<RowPage>,
+        cols: Vec<Val>,
+        undo_kind: RowUndoKind,
+        index_branches: Vec<IndexBranch>,
+    ) -> InsertRowIntoPage {
+        debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
+        let page_id = page_guard.page_id();
+        let versioned_page_id = page_guard.versioned_page_id();
+        let (page_ctx, page) = page_guard.ctx_and_page();
+        let ver_map = page_ctx
+            .row_ver()
+            .expect("hot-row inserts require row-version metadata on page context");
+        let state_guard = ver_map.read_state();
+        if *state_guard != RowPageState::Active {
+            return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
+        }
+        debug_assert!(self.metadata.col.col_count() == page.header.col_count as usize);
+        debug_assert!(cols.len() == page.header.col_count as usize);
+
+        let var_len = var_len_for_insert(self.metadata.col.as_ref(), &cols);
+        let (row_idx, var_offset) =
+            if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
+                (row_idx, var_offset)
+            } else {
+                return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
+            };
+        // Before real insert, we need to lock the row.
+        let row_id = page.header.start_row_id + row_idx as u64;
+        let mut access = RowWriteAccess::new_with_state_guard(
+            page,
+            page_ctx,
+            row_idx,
+            Some(self.rt.sts()),
+            true,
+            state_guard,
+        );
+        let res = access.lock_undo(
+            self.rt,
+            effects,
+            self.metadata,
+            self.table_id,
+            versioned_page_id,
+            row_id,
+            None,
+        );
+        debug_assert!(res.is_ok());
+        // Apply insert
+        let mut new_row = page.new_row(row_idx, var_offset);
+        for v in &cols {
+            new_row.add_col(self.metadata.col.as_ref(), v);
+        }
+        let new_row_id = new_row.finish();
+        debug_assert!(new_row_id == row_id);
+        effects.update_last_row_undo(undo_kind);
+        for branch in index_branches {
+            match branch.target {
+                IndexBranchTarget::Hot { cts, entry } => {
+                    access.link_for_unique_index(branch.key, cts, entry, branch.undo_vals);
+                }
+                IndexBranchTarget::ColdTerminal { delete_cts } => {
+                    access.link_for_unique_index_cold_terminal(
+                        branch.key,
+                        delete_cts,
+                        branch.undo_vals,
+                    );
+                }
+            }
+        }
+        drop(access);
+
+        // Here we do not unlock the page because we need to verify validity of unique index update
+        // according to this insert.
+        // There might be scenario that a deleted row or old version of updated row shares the same
+        // key with this insert.
+        // Then we have to link insert's undo head to that version via *INDEX* branch.
+        // Hold the page guard in order to re-lock the undo head fast.
+        //
+        // create redo log.
+        let redo_entry = RowRedo {
+            page_id,
+            row_id,
+            kind: RowRedoKind::Insert(cols),
+        };
+        // Store redo in the statement buffer until the statement succeeds.
+        effects.insert_row_redo(self.table_id, redo_entry);
+        InsertRowIntoPage::Ok(row_id, page_guard)
+    }
+}
+
+/// Hot row-page delete context shared by catalog and user-table accessors.
+pub(super) struct HotRowDeleter<'m, 'r> {
+    metadata: &'m TableMetadata,
+    table_id: TableID,
+    rt: TrxRuntime<'r>,
+}
+
+impl<'m, 'r> HotRowDeleter<'m, 'r> {
+    /// Create a hot-row deleter for one metadata snapshot and transaction.
+    #[inline]
+    pub(super) fn new(table_id: TableID, metadata: &'m TableMetadata, rt: TrxRuntime<'r>) -> Self {
+        Self {
+            metadata,
+            table_id,
+            rt,
+        }
+    }
+
+    /// Delete one hot row after validating that the row belongs to the page.
+    #[inline]
+    pub(super) async fn delete(
+        &self,
+        effects: &mut StmtEffects,
+        page_guard: PageSharedGuard<RowPage>,
+        row_id: RowID,
+        key: &SelectKey,
+        log_by_key: bool,
+    ) -> DeleteInternal {
+        let page_id = page_guard.page_id();
+        let (_, page) = page_guard.ctx_and_page();
+        if !page.row_id_in_valid_range(row_id) {
+            return DeleteInternal::NotFound;
+        }
+        // The undo-head lock is the conflict check for hot delete. Once the
+        // lock is owned, the row-page delete bit becomes the latest image and
+        // the same undo entry is rewritten to `Delete`.
+        let mut lock_row = HotRowUpdater::new(self.table_id, self.metadata, self.rt)
+            .lock_for_write(effects, &page_guard, row_id, Some(key))
+            .await;
+        match &mut lock_row {
+            LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
+            LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
+            LockRowForWrite::RetryInTransition => DeleteInternal::RetryInTransition,
+            LockRowForWrite::Ok(access) => {
+                let mut access = access
+                    .take()
+                    .expect("successful hot-row write lock must provide row write access");
+                if access.row().is_deleted() {
+                    return DeleteInternal::NotFound;
+                }
+                access.delete_row();
+                // update LOCK entry to DELETE entry.
+                effects.update_last_row_undo(RowUndoKind::Delete);
+                drop(access); // unlock row.
+                drop(lock_row);
+                // hold page lock in order to update index later.
+                // create redo log.
+                let redo_entry = RowRedo {
+                    page_id,
+                    row_id,
+                    kind: if log_by_key {
+                        RowRedoKind::DeleteByUniqueKey(key.clone())
+                    } else {
+                        RowRedoKind::Delete
+                    },
+                };
+                effects.insert_row_redo(self.table_id, redo_entry);
+                DeleteInternal::Ok(page_guard)
+            }
+        }
+    }
+}
+
+/// Prepared replacement state for a hot-row move update.
+pub(super) struct PreparedHotMoveUpdate {
+    /// Replacement row values to insert as the new hot row.
+    pub(super) row: Vec<Val>,
+    /// Indexed columns changed by the update, keyed by column number.
+    pub(super) index_change_cols: FastHashMap<usize, Val>,
+    /// Runtime unique-index branches linking the replacement to the old row.
+    pub(super) index_branches: Vec<IndexBranch>,
+}
 
 /// Hot row-page update context shared by catalog and user-table accessors.
 pub(super) struct HotRowUpdater<'m, 'r> {
@@ -330,12 +525,20 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
     }
 }
 
-/// Prepared replacement state for a hot-row move update.
-pub(super) struct PreparedHotMoveUpdate {
-    /// Replacement row values to insert as the new hot row.
-    pub(super) row: Vec<Val>,
-    /// Indexed columns changed by the update, keyed by column number.
-    pub(super) index_change_cols: FastHashMap<usize, Val>,
-    /// Runtime unique-index branches linking the replacement to the old row.
-    pub(super) index_branches: Vec<IndexBranch>,
+/// Read a validated hot row page through MVCC.
+#[inline]
+pub(super) fn read_hot_row_mvcc(
+    rt: TrxRuntime<'_>,
+    metadata: &TableMetadata,
+    page_guard: &PageSharedGuard<RowPage>,
+    row_id: RowID,
+    key: Option<&SelectKey>,
+    read_set: &[usize],
+) -> SelectMvcc {
+    let (page_ctx, page) = page_guard.ctx_and_page();
+    let access = RowReadAccess::new(page, page_ctx, page.row_idx(row_id));
+    match access.read_row_mvcc(rt.ctx(), metadata, read_set, key) {
+        ReadRow::Ok(vals) => SelectMvcc::Found(vals),
+        ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
+    }
 }

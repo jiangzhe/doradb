@@ -31,7 +31,7 @@ use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{DataIntegrityError, Error, InternalError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
@@ -41,7 +41,7 @@ use crate::index::{
 use crate::lwc::LwcBuilder;
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::{SelectKey, UpdateCol};
+use crate::row::ops::{SelectKey, UpdateCol, UpdateIndex, UpdateMvcc};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
 use crate::trx::sys::TransactionSystem;
@@ -1280,6 +1280,23 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
         builder.push(index_no, index);
     }
     Ok(builder.publish())
+}
+
+#[inline]
+fn update_index_result_to_update_mvcc(
+    res: UpdateIndex,
+    row_id: RowID,
+    error_context: &'static str,
+) -> Result<UpdateMvcc> {
+    match res {
+        UpdateIndex::Updated => Ok(UpdateMvcc::Updated(row_id)),
+        UpdateIndex::DuplicateKey => Err(Report::new(OperationError::DuplicateKey)
+            .attach(error_context)
+            .into()),
+        UpdateIndex::WriteConflict => Err(Report::new(OperationError::WriteConflict)
+            .attach(error_context)
+            .into()),
+    }
 }
 
 #[inline]
