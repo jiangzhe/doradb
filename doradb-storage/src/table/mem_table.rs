@@ -1,9 +1,9 @@
 use super::{
-    DeleteInternal, InsertRowIntoPage, UpdateRowInplace, full_row_update_cols,
+    DeleteInternal, InsertRowIntoPage, UpdateRowInplace, UpdateUniqueMvcc,
     hot::{HotRowDeleter, HotRowUpdater, RowInserter},
     index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
     row_len, secondary_index_kind_mismatch, unique_key_from_full_row,
-    update_index_result_to_update_mvcc, validate_page_row_range,
+    update_index_result_to_update_unique_mvcc, validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
@@ -19,9 +19,11 @@ use crate::index::{
 use crate::latch::LatchFallbackMode;
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
+#[cfg(test)]
+use crate::row::ops::UpdateMvcc;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, LinkForUniqueIndex, SelectKey, UpdateCol, UpdateIndex, UpdateMvcc,
-    UpsertMvcc,
+    DeleteMvcc, InsertIndex, LinkForUniqueIndex, RowUpdateInput, RowUpdateView, SelectKey,
+    UpdateCol, UpdateIndex, UpsertMvcc,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
@@ -1410,7 +1412,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 key.index_no
             )));
         }
-        let var_len = page.var_len_for_update(row_idx, update);
+        let var_len = page.var_len_for_update(row_idx, RowUpdateView::Sparse(update));
         let Some(var_offset) = page.request_free_space(var_len) else {
             return Err(catalog_update_by_key_payload_error(format!(
                 "update unique no-trx row update does not fit: row_id={row_id}"
@@ -1555,10 +1557,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
 
     /// Insert or replace one MVCC row selected by a unique key derived from the row.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     pub(crate) async fn upsert_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -1573,23 +1571,25 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             &cols,
             "upsert unique MVCC",
         )?;
+        let input = RowUpdateInput::FullRow(cols);
         match self
-            .update_unique_mvcc(rt, effects, &key, full_row_update_cols(&cols), log_by_key)
+            .update_unique_mvcc_input(rt, effects, &key, input, log_by_key)
             .await?
         {
-            UpdateMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
-            UpdateMvcc::NotFound => self
-                .insert_mvcc(rt, effects, cols)
-                .await
-                .map(UpsertMvcc::Inserted),
+            UpdateUniqueMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
+            UpdateUniqueMvcc::NotFound(input) => {
+                let cols = input
+                    .into_full_row()
+                    .expect("upsert update input must preserve the full row");
+                self.insert_mvcc(rt, effects, cols)
+                    .await
+                    .map(UpsertMvcc::Inserted)
+            }
         }
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
+    #[cfg(test)]
     async fn update_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -1598,6 +1598,25 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         update: Vec<UpdateCol>,
         log_by_key: bool,
     ) -> Result<UpdateMvcc> {
+        let input = RowUpdateInput::Sparse(update);
+        match self
+            .update_unique_mvcc_input(rt, effects, key, input, log_by_key)
+            .await?
+        {
+            UpdateUniqueMvcc::Updated(row_id) => Ok(UpdateMvcc::Updated(row_id)),
+            UpdateUniqueMvcc::NotFound(_) => Ok(UpdateMvcc::NotFound),
+        }
+    }
+
+    #[inline]
+    async fn update_unique_mvcc_input(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        key: &SelectKey,
+        mut input: RowUpdateInput,
+        log_by_key: bool,
+    ) -> Result<UpdateUniqueMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
@@ -1611,24 +1630,19 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             key.index_no,
             &key.vals
         ));
-        debug_assert!(update.iter().all(|uc| {
-            uc.idx < self.metadata().col.col_count()
-                && self.metadata().col.col_type_match(uc.idx, &uc.val)
-        }));
         debug_assert!(
-            update.is_empty()
-                || update
-                    .iter()
-                    .zip(update.iter().skip(1))
-                    .all(|(l, r)| l.idx < r.idx)
+            input.as_view().is_valid_for(self.metadata().col.as_ref()),
+            "row update values must be ordered, in range, and type-compatible"
         );
         let guards = rt.pool_guards();
         loop {
             let lookup_sts = rt.sts();
             let (page_guard, row_id) = match self.unique_lookup(guards, key, lookup_sts).await? {
-                None => return Ok(UpdateMvcc::NotFound),
+                None => return Ok(UpdateUniqueMvcc::NotFound(input)),
                 Some((row_id, _)) => match self.find_row(guards, row_id).await {
-                    Ok(RowLocation::NotFound) => return Ok(UpdateMvcc::NotFound),
+                    Ok(RowLocation::NotFound) => {
+                        return Ok(UpdateUniqueMvcc::NotFound(input));
+                    }
                     Ok(RowLocation::LwcBlock { .. }) => {
                         return self.catalog_lwc_error("update unique MVCC", row_id);
                     }
@@ -1645,7 +1659,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 },
             };
             let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-                .update_inplace(effects, page_guard, key, row_id, update.clone(), log_by_key)
+                .update_inplace(effects, page_guard, key, row_id, input, log_by_key)
                 .await;
             match res {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
@@ -1661,29 +1675,37 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             )
                             .await?;
                         page_guard.set_dirty();
-                        return update_index_result_to_update_mvcc(
+                        return update_index_result_to_update_unique_mvcc(
                             res,
                             new_row_id,
                             "update MVCC key-change index update",
                         );
                     }
                     page_guard.set_dirty();
-                    return Ok(UpdateMvcc::Updated(row_id));
+                    return Ok(UpdateUniqueMvcc::Updated(row_id));
                 }
-                UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => {
-                    return Ok(UpdateMvcc::NotFound);
+                UpdateRowInplace::RowDeleted(input) | UpdateRowInplace::RowNotFound(input) => {
+                    return Ok(UpdateUniqueMvcc::NotFound(input));
                 }
                 UpdateRowInplace::WriteConflict => {
                     return Err(Report::new(OperationError::WriteConflict)
                         .attach("update MVCC row-page write lock")
                         .into());
                 }
-                UpdateRowInplace::RetryInTransition => {
+                UpdateRowInplace::RetryInTransition(returned_input) => {
+                    input = returned_input;
                     Timer::after(Duration::from_millis(1)).await;
                 }
-                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
+                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, returned_input, old_guard) => {
                     let (new_row_id, index_change_cols, new_guard) = self
-                        .move_update_for_space(rt, effects, old_row, update, old_row_id, old_guard)
+                        .move_update_for_space(
+                            rt,
+                            effects,
+                            old_row,
+                            returned_input,
+                            old_row_id,
+                            old_guard,
+                        )
                         .await?;
                     if !index_change_cols.is_empty() {
                         let res = self
@@ -1697,7 +1719,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             )
                             .await?;
                         new_guard.set_dirty();
-                        return update_index_result_to_update_mvcc(
+                        return update_index_result_to_update_unique_mvcc(
                             res,
                             new_row_id,
                             "update MVCC moved-row index update",
@@ -1709,7 +1731,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         )
                         .await?;
                     new_guard.set_dirty();
-                    return update_index_result_to_update_mvcc(
+                    return update_index_result_to_update_unique_mvcc(
                         res,
                         new_row_id,
                         "update MVCC moved-row index update",
@@ -1720,16 +1742,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn move_update_for_space(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        old_row: Vec<(Val, Option<u16>)>,
-        update: Vec<UpdateCol>,
+        old_row: Vec<Val>,
+        update: RowUpdateInput,
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> Result<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
@@ -1748,10 +1766,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_indexes_only_key_change(
         &self,
         rt: TrxRuntime<'_>,
@@ -1791,10 +1805,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_indexes_only_row_id_change(
         &self,
         rt: TrxRuntime<'_>,
@@ -1828,10 +1838,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_indexes_may_both_change(
         &self,
         rt: TrxRuntime<'_>,
@@ -1891,10 +1897,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     #[expect(clippy::too_many_arguments, reason = "code style")]
     async fn update_unique_index_key_and_row_id_change(
         &self,
@@ -1997,10 +1999,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_non_unique_index_key_and_row_id_change(
         &self,
         rt: TrxRuntime<'_>,
@@ -2033,10 +2031,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_unique_index_only_row_id_change(
         &self,
         rt: TrxRuntime<'_>,
@@ -2059,10 +2053,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_non_unique_index_only_row_id_change(
         &self,
         rt: TrxRuntime<'_>,
@@ -2083,10 +2073,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_unique_index_only_key_change(
         &self,
         rt: TrxRuntime<'_>,
@@ -2158,10 +2144,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved MemTable unique upsert API")
-    )]
     async fn update_non_unique_index_only_key_change(
         &self,
         rt: TrxRuntime<'_>,

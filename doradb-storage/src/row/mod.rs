@@ -384,7 +384,7 @@ impl RowPage {
         if self.row(row_idx).is_deleted() {
             return Update::Deleted;
         }
-        let var_len = self.var_len_for_update(row_idx, cols);
+        let var_len = self.var_len_for_update(row_idx, RowUpdateView::Sparse(cols));
         let var_offset = if let Some(var_offset) = self.request_free_space(var_len) {
             var_offset
         } else {
@@ -417,13 +417,13 @@ impl RowPage {
 
     /// Returns additional variable-length bytes needed to update an existing row.
     #[inline]
-    pub(crate) fn var_len_for_update(&self, row_idx: usize, user_cols: &[UpdateCol]) -> usize {
+    pub(crate) fn var_len_for_update(&self, row_idx: usize, update: RowUpdateView<'_>) -> usize {
         let row = self.row(row_idx);
-        user_cols
+        update
             .iter()
-            .map(|uc| match &uc.val {
+            .map(|item| match item.val {
                 Val::VarByte(var) => {
-                    let col = row.var(uc.idx);
+                    let col = row.var(item.idx);
                     let orig_var_len = PageVar::outline_len(col);
                     let upd_var_len = PageVar::outline_len(var.as_bytes());
                     if upd_var_len > orig_var_len {
@@ -1403,8 +1403,8 @@ pub(crate) trait RowRead {
 
     /// Returns additional variable length space required for this update.
     #[inline]
-    fn var_len_for_update(&self, cols: &[UpdateCol]) -> usize {
-        self.page().var_len_for_update(self.row_idx(), cols)
+    fn var_len_for_update(&self, update: RowUpdateView<'_>) -> usize {
+        self.page().var_len_for_update(self.row_idx(), update)
     }
 
     /// Returns value with optional intra-page offset if stored in page.
@@ -1433,14 +1433,6 @@ pub(crate) trait RowRead {
     fn clone_vals(&self, col_layout: &TableColumnLayout) -> Vec<Val> {
         (0..col_layout.col_count())
             .map(|col_idx| self.val(col_layout, col_idx))
-            .collect()
-    }
-
-    /// Clone all values with var-len offset.
-    #[inline]
-    fn vals_with_var_offsets(&self, col_layout: &TableColumnLayout) -> Vec<(Val, Option<u16>)> {
-        (0..col_layout.col_count())
-            .map(|col_idx| self.val_with_var_offset(col_layout, col_idx))
             .collect()
     }
 

@@ -18,15 +18,15 @@ use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::PersistedLwcBlock;
 use crate::map::FastHashMap;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey, SelectMvcc,
-    UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc,
+    DeleteMvcc, InsertIndex, LinkForUniqueIndex, ReadRow, RowUpdateInput, ScanMvcc, SelectKey,
+    SelectMvcc, UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
     InsertRowIntoPage, MemTable, Table, TableRootSnapshot, TableRuntimeLayout, UpdateRowInplace,
-    full_row_update_cols, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
-    unique_key_from_full_row, update_index_result_to_update_mvcc, validate_page_row_range,
+    UpdateUniqueMvcc, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
+    unique_key_from_full_row, update_index_result_to_update_unique_mvcc, validate_page_row_range,
 };
 use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
@@ -1027,8 +1027,8 @@ impl<'a> UserTableAccessor<'a> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        old_row: Vec<(Val, Option<u16>)>,
-        update: Vec<UpdateCol>,
+        old_row: Vec<Val>,
+        update: RowUpdateInput,
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> Result<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
@@ -1048,14 +1048,19 @@ impl<'a> UserTableAccessor<'a> {
     }
 
     #[inline]
-    fn build_cold_update_row(&self, mut vals: Vec<Val>, update: Vec<UpdateCol>) -> Vec<Val> {
-        for uc in update {
-            let val = &mut vals[uc.idx];
-            if val != &uc.val {
-                *val = uc.val;
+    fn build_cold_update_row(&self, mut vals: Vec<Val>, update: RowUpdateInput) -> Vec<Val> {
+        match update {
+            RowUpdateInput::Sparse(cols) => {
+                for UpdateCol { idx, val } in cols {
+                    let old_val = &mut vals[idx];
+                    if old_val != &val {
+                        *old_val = val;
+                    }
+                }
+                vals
             }
+            RowUpdateInput::FullRow(vals) => vals,
         }
-        vals
     }
 
     #[inline]
@@ -2480,15 +2485,20 @@ impl<'a> UserTableAccessor<'a> {
             &cols,
             "upsert unique MVCC",
         )?;
+        let input = RowUpdateInput::FullRow(cols);
         match self
-            .update_unique_mvcc(rt, effects, &key, full_row_update_cols(&cols), log_by_key)
+            .update_unique_mvcc_input(rt, effects, &key, input, log_by_key)
             .await?
         {
-            UpdateMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
-            UpdateMvcc::NotFound => self
-                .insert_mvcc(rt, effects, cols)
-                .await
-                .map(UpsertMvcc::Inserted),
+            UpdateUniqueMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
+            UpdateUniqueMvcc::NotFound(input) => {
+                let cols = input
+                    .into_full_row()
+                    .expect("upsert update input must preserve the full row");
+                self.insert_mvcc(rt, effects, cols)
+                    .await
+                    .map(UpsertMvcc::Inserted)
+            }
         }
     }
 
@@ -2501,6 +2511,25 @@ impl<'a> UserTableAccessor<'a> {
         update: Vec<UpdateCol>,
         log_by_key: bool,
     ) -> Result<UpdateMvcc> {
+        let input = RowUpdateInput::Sparse(update);
+        match self
+            .update_unique_mvcc_input(rt, effects, key, input, log_by_key)
+            .await?
+        {
+            UpdateUniqueMvcc::Updated(row_id) => Ok(UpdateMvcc::Updated(row_id)),
+            UpdateUniqueMvcc::NotFound(_) => Ok(UpdateMvcc::NotFound),
+        }
+    }
+
+    #[inline]
+    async fn update_unique_mvcc_input(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        key: &SelectKey,
+        mut input: RowUpdateInput,
+        log_by_key: bool,
+    ) -> Result<UpdateUniqueMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
@@ -2514,16 +2543,9 @@ impl<'a> UserTableAccessor<'a> {
             key.index_no,
             &key.vals
         ));
-        debug_assert!(update.iter().all(|uc| {
-            uc.idx < self.metadata().col.col_count()
-                && self.metadata().col.col_type_match(uc.idx, &uc.val)
-        }));
         debug_assert!(
-            update.is_empty()
-                || update
-                    .iter()
-                    .zip(update.iter().skip(1))
-                    .all(|(l, r)| l.idx < r.idx)
+            input.as_view().is_valid_for(self.metadata().col.as_ref()),
+            "row update values must be ordered, in range, and type-compatible"
         );
         loop {
             let root_snapshot = self.root_snapshot(rt.ctx())?;
@@ -2532,10 +2554,12 @@ impl<'a> UserTableAccessor<'a> {
                 .unique_lookup(rt.pool_guards(), key, lookup_root, rt.sts())
                 .await?
             {
-                None => return Ok(UpdateMvcc::NotFound),
+                None => return Ok(UpdateUniqueMvcc::NotFound(input)),
                 Some((row_id, _)) => {
                     match self.find_row_location(rt.pool_guards(), row_id).await {
-                        Ok(RowLocation::NotFound) => return Ok(UpdateMvcc::NotFound),
+                        Ok(RowLocation::NotFound) => {
+                            return Ok(UpdateUniqueMvcc::NotFound(input));
+                        }
                         Ok(RowLocation::LwcBlock {
                             block_id,
                             row_idx,
@@ -2558,7 +2582,9 @@ impl<'a> UserTableAccessor<'a> {
                                 .await?
                             {
                                 ColdRowUpdateRead::Ok(vals) => vals,
-                                ColdRowUpdateRead::NotFound => return Ok(UpdateMvcc::NotFound),
+                                ColdRowUpdateRead::NotFound => {
+                                    return Ok(UpdateUniqueMvcc::NotFound(input));
+                                }
                                 ColdRowUpdateRead::WriteConflict => {
                                     return Err(Report::new(OperationError::WriteConflict)
                                         .attach("update MVCC cold row read")
@@ -2579,7 +2605,7 @@ impl<'a> UserTableAccessor<'a> {
                                         .into());
                                 }
                                 Err(DeletionError::AlreadyDeleted) => {
-                                    return Ok(UpdateMvcc::NotFound);
+                                    return Ok(UpdateUniqueMvcc::NotFound(input));
                                 }
                             }
                             // Cold delete undo has no row page. Rollback routes
@@ -2618,7 +2644,7 @@ impl<'a> UserTableAccessor<'a> {
                             )
                             .await?;
 
-                            let new_row = self.build_cold_update_row(old_vals, update.clone());
+                            let new_row = self.build_cold_update_row(old_vals, input);
                             let new_index_keys = self.metadata().idx.keys_for_insert(&new_row);
                             let (new_row_id, new_guard) = self
                                 .insert_row_internal(
@@ -2655,7 +2681,7 @@ impl<'a> UserTableAccessor<'a> {
                                 }
                             }
                             new_guard.set_dirty();
-                            return Ok(UpdateMvcc::Updated(new_row_id));
+                            return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                         }
                         Ok(RowLocation::RowPage(page_id)) => {
                             // Hot-row update proceeds through row-page locking and
@@ -2679,7 +2705,7 @@ impl<'a> UserTableAccessor<'a> {
                 }
             };
             let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-                .update_inplace(effects, page_guard, key, row_id, update.clone(), log_by_key)
+                .update_inplace(effects, page_guard, key, row_id, input, log_by_key)
                 .await;
             match res {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
@@ -2699,33 +2725,41 @@ impl<'a> UserTableAccessor<'a> {
                             )
                             .await?;
                         page_guard.set_dirty(); // mark as dirty page.
-                        return update_index_result_to_update_mvcc(
+                        return update_index_result_to_update_unique_mvcc(
                             res,
                             new_row_id,
                             "update MVCC key-change index update",
                         );
                     } // otherwise, do nothing
                     page_guard.set_dirty(); // mark as dirty page.
-                    return Ok(UpdateMvcc::Updated(row_id));
+                    return Ok(UpdateUniqueMvcc::Updated(row_id));
                 }
-                UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => {
-                    return Ok(UpdateMvcc::NotFound);
+                UpdateRowInplace::RowDeleted(input) | UpdateRowInplace::RowNotFound(input) => {
+                    return Ok(UpdateUniqueMvcc::NotFound(input));
                 }
                 UpdateRowInplace::WriteConflict => {
                     return Err(Report::new(OperationError::WriteConflict)
                         .attach("update MVCC row-page write lock")
                         .into());
                 }
-                UpdateRowInplace::RetryInTransition => {
+                UpdateRowInplace::RetryInTransition(returned_input) => {
+                    input = returned_input;
                     Timer::after(Duration::from_millis(1)).await;
                 }
-                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
+                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, returned_input, old_guard) => {
                     // In-place update failed after the old row was locked and
                     // marked deleted. Finish the move update by inserting the
                     // replacement row and then update indexes for any RowID or
                     // key movement.
                     let (new_row_id, index_change_cols, new_guard) = self
-                        .move_update_for_space(rt, effects, old_row, update, old_row_id, old_guard)
+                        .move_update_for_space(
+                            rt,
+                            effects,
+                            old_row,
+                            returned_input,
+                            old_row_id,
+                            old_guard,
+                        )
                         .await?;
                     if !index_change_cols.is_empty() {
                         let res = self
@@ -2740,7 +2774,7 @@ impl<'a> UserTableAccessor<'a> {
                             .await?;
                         // old guard is already marked inside.
                         new_guard.set_dirty(); // mark as dirty page.
-                        return update_index_result_to_update_mvcc(
+                        return update_index_result_to_update_unique_mvcc(
                             res,
                             new_row_id,
                             "update MVCC moved-row index update",
@@ -2757,7 +2791,7 @@ impl<'a> UserTableAccessor<'a> {
                             )
                             .await?;
                         new_guard.set_dirty(); // mark as dirty page.
-                        return update_index_result_to_update_mvcc(
+                        return update_index_result_to_update_unique_mvcc(
                             res,
                             new_row_id,
                             "update MVCC moved-row index update",
@@ -2997,6 +3031,9 @@ mod tests {
     use crate::buffer::frame::FrameKind;
     use crate::buffer::{PoolRole, test_frame_kind};
     use crate::catalog::tests::table4;
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+    };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{
         CompletionErrorKind, DataIntegrityError, FatalError, InternalError, OperationError, Result,
@@ -3006,7 +3043,9 @@ mod tests {
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
-    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc};
+    use crate::row::ops::{
+        DeleteMvcc, RowUpdateInput, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
+    };
     use crate::session::tests::SessionTestExt;
     use crate::table::DeleteMarker;
     use crate::table::hot::{HotRowDeleter, HotRowUpdater, RowInserter};
@@ -3017,7 +3056,7 @@ mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::undo::RowUndoKind;
-    use crate::value::Val;
+    use crate::value::{Val, ValKind};
     use error_stack::Report;
     use smol::Timer;
     use std::io::Error as IoError;
@@ -3221,6 +3260,144 @@ mod tests {
             expect_select_committed(table_id, &mut session, &single_key(1i32), |row| {
                 assert_eq!(row, vec![Val::from(1i32), Val::from("world")]);
             })
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mvcc_upsert_unique_full_row_move_update_preserves_undo_and_indexes() {
+        smol::block_on(async {
+            const ROWS: i32 = 60;
+            const BASE_PAYLOAD_SIZE: usize = 1000;
+            const LARGE_PAYLOAD_SIZE: usize = 50_000;
+
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = {
+                let mut ddl_session = engine.new_session().unwrap();
+                ddl_session
+                    .create_table(
+                        TableSpec::new(vec![
+                            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                            ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                        ]),
+                        vec![
+                            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                            IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                        ],
+                    )
+                    .await
+                    .unwrap()
+            };
+            let mut session = engine.new_session().unwrap();
+            let base_payload = vec![b'a'; BASE_PAYLOAD_SIZE];
+            let mut row_ids = Vec::new();
+            for id in 0..ROWS {
+                let name = format!("name{id}");
+                row_ids.push(
+                    insert_one_row(
+                        table_id,
+                        &mut session,
+                        vec![
+                            Val::from(id),
+                            Val::from(&name[..]),
+                            Val::from(&base_payload[..]),
+                        ],
+                    )
+                    .await,
+                );
+            }
+
+            let key = single_key(0i32);
+            let old_row_id = row_ids[0];
+            let mut old_reader_session = engine.new_session().unwrap();
+            let mut old_reader = old_reader_session.begin_trx().unwrap();
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut old_reader, table_id, &key, &[0, 1, 2])
+                    .await
+                    .unwrap()
+                    .unwrap_found(),
+                vec![
+                    Val::from(0i32),
+                    Val::from("name0"),
+                    Val::from(&base_payload[..]),
+                ]
+            );
+
+            let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
+            let mut writer = session.begin_trx().unwrap();
+            let new_row_id = writer
+                .exec(async |stmt| {
+                    let updated = stmt
+                        .table_upsert_unique_mvcc(
+                            table_id,
+                            0,
+                            vec![
+                                Val::from(0i32),
+                                Val::from("name0"),
+                                Val::from(&large_payload[..]),
+                            ],
+                        )
+                        .await?;
+                    let new_row_id = match updated {
+                        UpsertMvcc::Updated(row_id) => row_id,
+                        UpsertMvcc::Inserted(row_id) => {
+                            panic!("expected full-row move update, inserted row_id={row_id}")
+                        }
+                    };
+                    assert_ne!(new_row_id, old_row_id);
+                    assert_unique_index_entry(
+                        &table_for_internal_assertion(&engine, table_id),
+                        &session.pool_guards(),
+                        &key,
+                        stmt.runtime().sts(),
+                        new_row_id,
+                        false,
+                    )
+                    .await;
+                    Ok(new_row_id)
+                })
+                .await
+                .unwrap();
+            writer.commit().await.unwrap();
+
+            let mut fresh_reader = session.begin_trx().unwrap();
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut fresh_reader, table_id, &key, &[0, 1, 2])
+                    .await
+                    .unwrap()
+                    .unwrap_found(),
+                vec![
+                    Val::from(0i32),
+                    Val::from("name0"),
+                    Val::from(&large_payload[..]),
+                ]
+            );
+            fresh_reader.commit().await.unwrap();
+
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut old_reader, table_id, &key, &[0, 1, 2])
+                    .await
+                    .unwrap()
+                    .unwrap_found(),
+                vec![
+                    Val::from(0i32),
+                    Val::from("name0"),
+                    Val::from(&base_payload[..]),
+                ]
+            );
+            old_reader.commit().await.unwrap();
+
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                MAX_SNAPSHOT_TS,
+                new_row_id,
+                false,
+            )
             .await;
         });
     }
@@ -4552,9 +4729,16 @@ mod tests {
                     let layout = table.layout_snapshot();
                     let accessor = table.accessor_with_layout(&layout);
                     let res = HotRowUpdater::new(accessor.table_id(), accessor.metadata(), rt)
-                        .update_inplace(effects, page_guard, &key, row_id, update, false)
+                        .update_inplace(
+                            effects,
+                            page_guard,
+                            &key,
+                            row_id,
+                            RowUpdateInput::Sparse(update),
+                            false,
+                        )
                         .await;
-                    assert!(matches!(res, UpdateRowInplace::RetryInTransition));
+                    assert!(matches!(res, UpdateRowInplace::RetryInTransition(_)));
                     Err(Report::new(OperationError::NotSupported).into())
                 })
                 .await;

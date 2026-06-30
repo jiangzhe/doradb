@@ -41,7 +41,7 @@ use crate::index::{
 use crate::lwc::LwcBuilder;
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::{SelectKey, UpdateCol, UpdateIndex, UpdateMvcc};
+use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol, UpdateIndex};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
 use crate::trx::sys::TransactionSystem;
@@ -959,7 +959,7 @@ impl Table {
                 "row is deleted",
             ));
         }
-        let var_len = page.var_len_for_update(row_idx, cols);
+        let var_len = page.var_len_for_update(row_idx, RowUpdateView::Sparse(cols));
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -1197,16 +1197,16 @@ enum UpdateRowInplace {
     // for other columns in the changed index, we can read value(old and new are same)
     // from current page.
     Ok(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>),
-    RowNotFound,
-    RowDeleted,
+    RowNotFound(RowUpdateInput),
+    RowDeleted(RowUpdateInput),
     WriteConflict,
-    RetryInTransition,
-    NoFreeSpace(
-        RowID,
-        Vec<(Val, Option<u16>)>,
-        Vec<UpdateCol>,
-        PageSharedGuard<RowPage>,
-    ),
+    RetryInTransition(RowUpdateInput),
+    NoFreeSpace(RowID, Vec<Val>, RowUpdateInput, PageSharedGuard<RowPage>),
+}
+
+enum UpdateUniqueMvcc {
+    Updated(RowID),
+    NotFound(RowUpdateInput),
 }
 
 enum DeleteInternal {
@@ -1283,13 +1283,13 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
 }
 
 #[inline]
-fn update_index_result_to_update_mvcc(
+fn update_index_result_to_update_unique_mvcc(
     res: UpdateIndex,
     row_id: RowID,
     error_context: &'static str,
-) -> Result<UpdateMvcc> {
+) -> Result<UpdateUniqueMvcc> {
     match res {
-        UpdateIndex::Updated => Ok(UpdateMvcc::Updated(row_id)),
+        UpdateIndex::Updated => Ok(UpdateUniqueMvcc::Updated(row_id)),
         UpdateIndex::DuplicateKey => Err(Report::new(OperationError::DuplicateKey)
             .attach(error_context)
             .into()),
@@ -1423,15 +1423,6 @@ fn unique_key_from_full_row(
         .map(|key| cols[key.col_no as usize].clone())
         .collect();
     Ok(SelectKey::new(unique_index_no, vals))
-}
-
-#[inline]
-fn full_row_update_cols(cols: &[Val]) -> Vec<UpdateCol> {
-    cols.iter()
-        .cloned()
-        .enumerate()
-        .map(|(idx, val)| UpdateCol { idx, val })
-        .collect()
 }
 
 #[inline]
