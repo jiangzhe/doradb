@@ -489,6 +489,10 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                             cts: undo_head.ts(),
                             entry: old_entry.clone(),
                         },
+                        // This deep-clones the same changed-column delta once per
+                        // unique index. Multiple unique indexes are rare, and this
+                        // moved-row path is cold, so keep the simpler Vec ownership
+                        // until profiling justifies sharing it with Arc<[UpdateCol]>.
                         undo_vals: undo_vals.clone(),
                     }
                 })

@@ -3031,6 +3031,9 @@ mod tests {
     use crate::buffer::frame::FrameKind;
     use crate::buffer::{PoolRole, test_frame_kind};
     use crate::catalog::tests::table4;
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+    };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{
         CompletionErrorKind, DataIntegrityError, FatalError, InternalError, OperationError, Result,
@@ -3053,7 +3056,7 @@ mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::undo::RowUndoKind;
-    use crate::value::Val;
+    use crate::value::{Val, ValKind};
     use error_stack::Report;
     use smol::Timer;
     use std::io::Error as IoError;
@@ -3257,6 +3260,144 @@ mod tests {
             expect_select_committed(table_id, &mut session, &single_key(1i32), |row| {
                 assert_eq!(row, vec![Val::from(1i32), Val::from("world")]);
             })
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mvcc_upsert_unique_full_row_move_update_preserves_undo_and_indexes() {
+        smol::block_on(async {
+            const ROWS: i32 = 60;
+            const BASE_PAYLOAD_SIZE: usize = 1000;
+            const LARGE_PAYLOAD_SIZE: usize = 50_000;
+
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = {
+                let mut ddl_session = engine.new_session().unwrap();
+                ddl_session
+                    .create_table(
+                        TableSpec::new(vec![
+                            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                            ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                        ]),
+                        vec![
+                            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                            IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                        ],
+                    )
+                    .await
+                    .unwrap()
+            };
+            let mut session = engine.new_session().unwrap();
+            let base_payload = vec![b'a'; BASE_PAYLOAD_SIZE];
+            let mut row_ids = Vec::new();
+            for id in 0..ROWS {
+                let name = format!("name{id}");
+                row_ids.push(
+                    insert_one_row(
+                        table_id,
+                        &mut session,
+                        vec![
+                            Val::from(id),
+                            Val::from(&name[..]),
+                            Val::from(&base_payload[..]),
+                        ],
+                    )
+                    .await,
+                );
+            }
+
+            let key = single_key(0i32);
+            let old_row_id = row_ids[0];
+            let mut old_reader_session = engine.new_session().unwrap();
+            let mut old_reader = old_reader_session.begin_trx().unwrap();
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut old_reader, table_id, &key, &[0, 1, 2])
+                    .await
+                    .unwrap()
+                    .unwrap_found(),
+                vec![
+                    Val::from(0i32),
+                    Val::from("name0"),
+                    Val::from(&base_payload[..]),
+                ]
+            );
+
+            let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
+            let mut writer = session.begin_trx().unwrap();
+            let new_row_id = writer
+                .exec(async |stmt| {
+                    let updated = stmt
+                        .table_upsert_unique_mvcc(
+                            table_id,
+                            0,
+                            vec![
+                                Val::from(0i32),
+                                Val::from("name0"),
+                                Val::from(&large_payload[..]),
+                            ],
+                        )
+                        .await?;
+                    let new_row_id = match updated {
+                        UpsertMvcc::Updated(row_id) => row_id,
+                        UpsertMvcc::Inserted(row_id) => {
+                            panic!("expected full-row move update, inserted row_id={row_id}")
+                        }
+                    };
+                    assert_ne!(new_row_id, old_row_id);
+                    assert_unique_index_entry(
+                        &table_for_internal_assertion(&engine, table_id),
+                        &session.pool_guards(),
+                        &key,
+                        stmt.runtime().sts(),
+                        new_row_id,
+                        false,
+                    )
+                    .await;
+                    Ok(new_row_id)
+                })
+                .await
+                .unwrap();
+            writer.commit().await.unwrap();
+
+            let mut fresh_reader = session.begin_trx().unwrap();
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut fresh_reader, table_id, &key, &[0, 1, 2])
+                    .await
+                    .unwrap()
+                    .unwrap_found(),
+                vec![
+                    Val::from(0i32),
+                    Val::from("name0"),
+                    Val::from(&large_payload[..]),
+                ]
+            );
+            fresh_reader.commit().await.unwrap();
+
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut old_reader, table_id, &key, &[0, 1, 2])
+                    .await
+                    .unwrap()
+                    .unwrap_found(),
+                vec![
+                    Val::from(0i32),
+                    Val::from("name0"),
+                    Val::from(&base_payload[..]),
+                ]
+            );
+            old_reader.commit().await.unwrap();
+
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                MAX_SNAPSHOT_TS,
+                new_row_id,
+                false,
+            )
             .await;
         });
     }
