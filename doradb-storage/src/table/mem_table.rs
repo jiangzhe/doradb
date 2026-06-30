@@ -1,7 +1,9 @@
 use super::{
-    DeleteInternal, InsertRowIntoPage, UpdateRowInplace, full_row_update_cols, hot::HotRowUpdater,
+    DeleteInternal, InsertRowIntoPage, UpdateRowInplace, full_row_update_cols,
+    hot::{HotRowDeleter, HotRowUpdater, RowInserter},
     index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
-    row_len, secondary_index_kind_mismatch, unique_key_from_full_row, validate_page_row_range,
+    row_len, secondary_index_kind_mismatch, unique_key_from_full_row,
+    update_index_result_to_update_mvcc, validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
@@ -15,7 +17,6 @@ use crate::index::{
     RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
-use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{
@@ -23,12 +24,9 @@ use crate::row::ops::{
     UpsertMvcc,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
-use crate::trx::row::{
-    FindOldVersion, LockRowForWrite, ReadAllRows, RowReadAccess, RowWriteAccess,
-};
+use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
-use crate::trx::ver_map::RowPageState;
+use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxRuntime};
 use crate::value::Val;
 use error_stack::Report;
@@ -618,13 +616,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ///
     /// The pivot must be an exact row-page start boundary, unless it equals
     /// the current row-page-index end and there are no pages left to scan.
-    pub(crate) async fn mem_scan<F>(&self, guards: &PoolGuards, page_action: F) -> Result<()>
+    pub(crate) async fn scan<F>(&self, guards: &PoolGuards, page_action: F) -> Result<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         let meta_pool_guard = self.meta_pool_guard(guards, "mem scan")?;
         let start_row_id = self.pivot_row_id();
-        self.mem_scan_from_with_meta_guard(
+        self.scan_from_with_meta_guard(
             guards,
             meta_pool_guard,
             start_row_id,
@@ -641,7 +639,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     /// boundary for the scan. The boundary must be an exact row-page start,
     /// unless it equals the current row-page-index end and there are no pages
     /// left to scan.
-    pub(crate) async fn mem_scan_from<F>(
+    pub(crate) async fn scan_from<F>(
         &self,
         guards: &PoolGuards,
         start_row_id: RowID,
@@ -651,7 +649,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         let meta_pool_guard = self.meta_pool_guard(guards, "mem scan from")?;
-        self.mem_scan_from_with_meta_guard(
+        self.scan_from_with_meta_guard(
             guards,
             meta_pool_guard,
             start_row_id,
@@ -661,17 +659,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         .await
     }
 
-    #[inline]
-    fn invalid_mem_scan_start(&self, operation: &'static str, start_row_id: RowID) -> Error {
-        Report::new(InternalError::Generic)
-            .attach(format!(
-                "operation={operation}, table_id={}, row-page scan start is not a row-page boundary: start_row_id={start_row_id}",
-                self.table_id()
-            ))
-            .into()
-    }
-
-    async fn mem_scan_from_with_meta_guard<F>(
+    async fn scan_from_with_meta_guard<F>(
         &self,
         guards: &PoolGuards,
         meta_pool_guard: &PoolGuard,
@@ -698,12 +686,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     if page.header.start_row_id == start_row_id {
                         return Ok(());
                     }
-                    return Err(self.invalid_mem_scan_start(operation, start_row_id));
+                    return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
                 }
                 match entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {
                     Ok(idx) => idx,
                     Err(_) if page.header.end_row_id == start_row_id => return Ok(()),
-                    Err(_) => return Err(self.invalid_mem_scan_start(operation, start_row_id)),
+                    Err(_) => {
+                        return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
+                    }
                 }
             } else {
                 0
@@ -878,16 +868,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let metadata = self.metadata();
         let row_len = row_len(metadata, &insert);
         let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
+        let inserter = RowInserter::new(self.table_id(), metadata, rt);
         loop {
             let page_guard = self.get_insert_page(rt, row_count).await?;
-            match self.insert_row_to_page(
-                rt,
-                effects,
-                page_guard,
-                insert,
-                undo_kind,
-                index_branches,
-            ) {
+            match inserter.insert_to_page(effects, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
                     rt.save_active_insert_page(
                         self.table_id(),
@@ -906,87 +890,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    fn insert_row_to_page(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
-        cols: Vec<Val>,
-        undo_kind: RowUndoKind,
-        index_branches: Vec<IndexBranch>,
-    ) -> InsertRowIntoPage {
-        debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
-        let metadata = self.metadata();
-        let page_id = page_guard.page_id();
-        let versioned_page_id = page_guard.versioned_page_id();
-        let (page_ctx, page) = page_guard.ctx_and_page();
-        let ver_map = page_ctx.row_ver().unwrap();
-        let state_guard = ver_map.read_state();
-        if *state_guard != RowPageState::Active {
-            return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
-        }
-        debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
-        debug_assert!(cols.len() == page.header.col_count as usize);
-
-        let var_len = var_len_for_insert(metadata.col.as_ref(), &cols);
-        let (row_idx, var_offset) =
-            if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
-                (row_idx, var_offset)
-            } else {
-                return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
-            };
-        let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new_with_state_guard(
-            page,
-            page_ctx,
-            row_idx,
-            Some(rt.sts()),
-            true,
-            state_guard,
-        );
-        let res = access.lock_undo(
-            rt,
-            effects,
-            metadata,
-            self.table_id(),
-            versioned_page_id,
-            row_id,
-            None,
-        );
-        debug_assert!(res.is_ok());
-        let mut new_row = page.new_row(row_idx, var_offset);
-        for v in &cols {
-            new_row.add_col(metadata.col.as_ref(), v);
-        }
-        let new_row_id = new_row.finish();
-        debug_assert!(new_row_id == row_id);
-        effects.update_last_row_undo(undo_kind);
-        for branch in index_branches {
-            match branch.target {
-                IndexBranchTarget::Hot { cts, entry } => {
-                    access.link_for_unique_index(branch.key, cts, entry, branch.undo_vals);
-                }
-                IndexBranchTarget::ColdTerminal { delete_cts } => {
-                    access.link_for_unique_index_cold_terminal(
-                        branch.key,
-                        delete_cts,
-                        branch.undo_vals,
-                    );
-                }
-            }
-        }
-        drop(access);
-
-        let redo_entry = RowRedo {
-            page_id,
-            row_id,
-            kind: RowRedoKind::Insert(cols),
-        };
-        effects.insert_row_redo(self.table_id(), redo_entry);
-        InsertRowIntoPage::Ok(row_id, page_guard)
-    }
-
-    #[inline]
     async fn get_insert_page(
         &self,
         rt: TrxRuntime<'_>,
@@ -1002,20 +905,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             }
         }
         self.try_get_insert_page(guards, row_count, None).await
-    }
-
-    #[inline]
-    async fn lock_row_for_write<'b>(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        page_guard: &'b PageSharedGuard<RowPage>,
-        row_id: RowID,
-        key: Option<&SelectKey>,
-    ) -> LockRowForWrite<'b> {
-        HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-            .lock_for_write(effects, page_guard, row_id, key)
-            .await
     }
 
     #[inline]
@@ -1160,52 +1049,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    async fn delete_row_internal(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
-        row_id: RowID,
-        key: &SelectKey,
-        log_by_key: bool,
-    ) -> DeleteInternal {
-        let page_id = page_guard.page_id();
-        let (_, page) = page_guard.ctx_and_page();
-        if !page.row_id_in_valid_range(row_id) {
-            return DeleteInternal::NotFound;
-        }
-        let mut lock_row = self
-            .lock_row_for_write(rt, effects, &page_guard, row_id, Some(key))
-            .await;
-        match &mut lock_row {
-            LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
-            LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
-            LockRowForWrite::RetryInTransition => DeleteInternal::RetryInTransition,
-            LockRowForWrite::Ok(access) => {
-                let mut access = access.take().unwrap();
-                if access.row().is_deleted() {
-                    return DeleteInternal::NotFound;
-                }
-                access.delete_row();
-                effects.update_last_row_undo(RowUndoKind::Delete);
-                drop(access);
-                drop(lock_row);
-                let redo_entry = RowRedo {
-                    page_id,
-                    row_id,
-                    kind: if log_by_key {
-                        RowRedoKind::DeleteByUniqueKey(key.clone())
-                    } else {
-                        RowRedoKind::Delete
-                    },
-                };
-                effects.insert_row_redo(self.table_id(), redo_entry);
-                DeleteInternal::Ok(page_guard)
-            }
-        }
-    }
-
-    #[inline]
     async fn defer_delete_indexes(
         &self,
         rt: TrxRuntime<'_>,
@@ -1282,7 +1125,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    async fn try_get_validated_row_page_shared_result(
+    pub(super) async fn try_get_validated_row_page_shared_result(
         &self,
         guards: &PoolGuards,
         page_id: PageID,
@@ -1598,7 +1441,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
-        self.mem_scan(guards, |page_guard| {
+        self.scan(guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let col_layout = ctx.row_ver().unwrap().column_layout.as_ref();
             for row_access in ReadAllRows::new(page, ctx) {
@@ -1818,19 +1661,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             )
                             .await?;
                         page_guard.set_dirty();
-                        return match res {
-                            UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => {
-                                Err(Report::new(OperationError::DuplicateKey)
-                                    .attach("update MVCC key-change index update")
-                                    .into())
-                            }
-                            UpdateIndex::WriteConflict => {
-                                Err(Report::new(OperationError::WriteConflict)
-                                    .attach("update MVCC key-change index update")
-                                    .into())
-                            }
-                        };
+                        return update_index_result_to_update_mvcc(
+                            res,
+                            new_row_id,
+                            "update MVCC key-change index update",
+                        );
                     }
                     page_guard.set_dirty();
                     return Ok(UpdateMvcc::Updated(row_id));
@@ -1862,19 +1697,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             )
                             .await?;
                         new_guard.set_dirty();
-                        return match res {
-                            UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => {
-                                Err(Report::new(OperationError::DuplicateKey)
-                                    .attach("update MVCC moved-row index update")
-                                    .into())
-                            }
-                            UpdateIndex::WriteConflict => {
-                                Err(Report::new(OperationError::WriteConflict)
-                                    .attach("update MVCC moved-row index update")
-                                    .into())
-                            }
-                        };
+                        return update_index_result_to_update_mvcc(
+                            res,
+                            new_row_id,
+                            "update MVCC moved-row index update",
+                        );
                     }
                     let res = self
                         .update_indexes_only_row_id_change(
@@ -1882,17 +1709,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         )
                         .await?;
                     new_guard.set_dirty();
-                    return match res {
-                        UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                        UpdateIndex::DuplicateKey => Err(Report::new(OperationError::DuplicateKey)
-                            .attach("update MVCC moved-row index update")
-                            .into()),
-                        UpdateIndex::WriteConflict => {
-                            Err(Report::new(OperationError::WriteConflict)
-                                .attach("update MVCC moved-row index update")
-                                .into())
-                        }
-                    };
+                    return update_index_result_to_update_mvcc(
+                        res,
+                        new_row_id,
+                        "update MVCC moved-row index update",
+                    );
                 }
             }
         }
@@ -2411,8 +2232,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     Err(err) => return Err(err),
                 },
             };
-            match self
-                .delete_row_internal(rt, effects, page_guard, row_id, key, log_by_key)
+            match HotRowDeleter::new(self.table_id(), self.metadata(), rt)
+                .delete(effects, page_guard, row_id, key, log_by_key)
                 .await
             {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
@@ -2575,6 +2396,15 @@ fn validate_update_by_key_cols(metadata: &TableMetadata, update: &[UpdateCol]) -
 fn catalog_update_by_key_payload_error(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn invalid_scan_start(table_id: TableID, operation: &'static str, start_row_id: RowID) -> Error {
+    Report::new(InternalError::Generic)
+        .attach(format!(
+            "operation={operation}, table_id={table_id}, row-page scan start is not a row-page boundary: start_row_id={start_row_id}"
+        ))
         .into()
 }
 
@@ -3447,7 +3277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_scan_from_requires_row_page_boundary() {
+    fn test_scan_from_requires_row_page_boundary() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -3465,7 +3295,7 @@ mod tests {
             let mut explicit_count = 0usize;
             table
                 .mem
-                .mem_scan_from(&session.pool_guards(), captured_pivot, |page_guard| {
+                .scan_from(&session.pool_guards(), captured_pivot, |page_guard| {
                     let page = page_guard.page();
                     explicit_count += page.header.approx_non_deleted();
                     later_pivot = page.header.start_row_id + u64::from(page.header.max_row_count);
@@ -3479,7 +3309,7 @@ mod tests {
             let interior_start = captured_pivot + 2;
             let err = table
                 .mem
-                .mem_scan_from(&session.pool_guards(), interior_start, |_| true)
+                .scan_from(&session.pool_guards(), interior_start, |_| true)
                 .await
                 .unwrap_err();
             assert!(err.kind() == ErrorKind::Internal);
@@ -3498,7 +3328,7 @@ mod tests {
             let mut current_hot_pages = 0usize;
             table
                 .mem
-                .mem_scan(&session.pool_guards(), |_| {
+                .scan(&session.pool_guards(), |_| {
                     current_hot_pages += 1;
                     true
                 })

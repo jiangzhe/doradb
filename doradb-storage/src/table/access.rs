@@ -1,6 +1,9 @@
-use super::{hot::HotRowUpdater, missing_secondary_index};
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::{INVALID_PAGE_ID, VersionedPageID};
+use super::{
+    hot::{HotRowDeleter, HotRowUpdater, RowInserter, read_hot_row_mvcc},
+    missing_secondary_index,
+};
+use crate::buffer::guard::PageSharedGuard;
+use crate::buffer::page::INVALID_PAGE_ID;
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
@@ -18,19 +21,16 @@ use crate::row::ops::{
     DeleteMvcc, InsertIndex, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey, SelectMvcc,
     UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc,
 };
-use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
+use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
     InsertRowIntoPage, MemTable, Table, TableRootSnapshot, TableRuntimeLayout, UpdateRowInplace,
     full_row_update_cols, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
-    unique_key_from_full_row, validate_page_row_range,
+    unique_key_from_full_row, update_index_result_to_update_mvcc, validate_page_row_range,
 };
-use crate::trx::row::{
-    FindOldVersion, LockRowForWrite, ReadAllRows, RowReadAccess, RowWriteAccess,
-};
+use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
-use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
-use crate::trx::ver_map::RowPageState;
+use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
@@ -412,7 +412,7 @@ impl<'a> UserTableAccessor<'a> {
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
-        self.mem().mem_scan(guards, page_action).await
+        self.mem().scan(guards, page_action).await
     }
 
     #[inline]
@@ -426,27 +426,7 @@ impl<'a> UserTableAccessor<'a> {
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         self.mem()
-            .mem_scan_from(guards, start_row_id, page_action)
-            .await
-    }
-
-    #[inline]
-    async fn get_row_page_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        self.mem().get_row_page_shared(guards, page_id).await
-    }
-
-    #[inline]
-    async fn get_row_page_versioned_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: VersionedPageID,
-    ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        self.mem()
-            .get_row_page_versioned_shared(guards, page_id)
+            .scan_from(guards, start_row_id, page_action)
             .await
     }
 
@@ -563,27 +543,21 @@ impl<'a> UserTableAccessor<'a> {
                     return Ok(SelectMvcc::Found(vals));
                 }
                 RowLocation::RowPage(page_id) => {
-                    let page_guard = match self.get_row_page_shared(rt.pool_guards(), page_id).await
-                    {
-                        Ok(Some(page_guard)) => page_guard,
-                        Ok(None) => continue,
-                        Err(err) => return Err(err),
-                    };
-                    let page = page_guard.page();
-                    if !page.row_id_in_valid_range(row_id) {
+                    let Some(page_guard) = self
+                        .mem()
+                        .try_get_validated_row_page_shared_result(rt.pool_guards(), page_id, row_id)
+                        .await?
+                    else {
                         continue;
-                    }
-                    let (page_ctx, page) = page_guard.ctx_and_page();
-                    let access = RowReadAccess::new(page, page_ctx, page.row_idx(row_id));
-                    return match access.read_row_mvcc(
-                        rt.ctx(),
-                        self.metadata(),
-                        user_read_set,
-                        Some(key),
-                    ) {
-                        ReadRow::Ok(vals) => Ok(SelectMvcc::Found(vals)),
-                        ReadRow::InvalidIndex | ReadRow::NotFound => Ok(SelectMvcc::NotFound),
                     };
+                    return Ok(read_hot_row_mvcc(
+                        rt,
+                        self.metadata(),
+                        &page_guard,
+                        row_id,
+                        Some(key),
+                        user_read_set,
+                    ));
                 }
             }
         }
@@ -1026,16 +1000,10 @@ impl<'a> UserTableAccessor<'a> {
         let metadata = self.metadata();
         let row_len = row_len(metadata, &insert);
         let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
+        let inserter = RowInserter::new(self.table_id(), metadata, rt);
         loop {
             let page_guard = self.get_insert_page(rt, row_count).await?;
-            match self.insert_row_to_page(
-                rt,
-                effects,
-                page_guard,
-                insert,
-                undo_kind,
-                index_branches,
-            ) {
+            match inserter.insert_to_page(effects, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
                     rt.save_active_insert_page(
                         self.table_id(),
@@ -1052,102 +1020,6 @@ impl<'a> UserTableAccessor<'a> {
                 }
             }
         }
-    }
-
-    /// Insert row into given page.
-    /// There might be move+update call this method, in such case, undo_kind will be
-    /// set to UndoKind::Update.
-    /// If row page is frozen, the insert will fail.
-    #[inline]
-    pub(super) fn insert_row_to_page(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
-        cols: Vec<Val>,
-        undo_kind: RowUndoKind,
-        index_branches: Vec<IndexBranch>,
-    ) -> InsertRowIntoPage {
-        debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
-        let metadata = self.metadata();
-        let page_id = page_guard.page_id();
-        let versioned_page_id = page_guard.versioned_page_id();
-        let (page_ctx, page) = page_guard.ctx_and_page();
-        let ver_map = page_ctx.row_ver().unwrap();
-        let state_guard = ver_map.read_state();
-        if *state_guard != RowPageState::Active {
-            return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
-        }
-        debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
-        debug_assert!(cols.len() == page.header.col_count as usize);
-
-        let var_len = var_len_for_insert(metadata.col.as_ref(), &cols);
-        let (row_idx, var_offset) =
-            if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
-                (row_idx, var_offset)
-            } else {
-                return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
-            };
-        // Before real insert, we need to lock the row.
-        let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new_with_state_guard(
-            page,
-            page_ctx,
-            row_idx,
-            Some(rt.sts()),
-            true,
-            state_guard,
-        );
-        let res = access.lock_undo(
-            rt,
-            effects,
-            metadata,
-            self.table_id(),
-            versioned_page_id,
-            row_id,
-            None,
-        );
-        debug_assert!(res.is_ok());
-        // Apply insert
-        let mut new_row = page.new_row(row_idx, var_offset);
-        for v in &cols {
-            new_row.add_col(metadata.col.as_ref(), v);
-        }
-        let new_row_id = new_row.finish();
-        debug_assert!(new_row_id == row_id);
-        effects.update_last_row_undo(undo_kind);
-        for branch in index_branches {
-            match branch.target {
-                IndexBranchTarget::Hot { cts, entry } => {
-                    access.link_for_unique_index(branch.key, cts, entry, branch.undo_vals);
-                }
-                IndexBranchTarget::ColdTerminal { delete_cts } => {
-                    access.link_for_unique_index_cold_terminal(
-                        branch.key,
-                        delete_cts,
-                        branch.undo_vals,
-                    );
-                }
-            }
-        }
-        drop(access);
-
-        // Here we do not unlock the page because we need to verify validity of unique index update
-        // according to this insert.
-        // There might be scenario that a deleted row or old version of updated row shares the same
-        // key with this insert.
-        // Then we have to link insert's undo head to that version via *INDEX* branch.
-        // Hold the page guard in order to re-lock the undo head fast.
-        //
-        // create redo log.
-        let redo_entry = RowRedo {
-            page_id,
-            row_id,
-            kind: RowRedoKind::Insert(cols),
-        };
-        // Store redo in the statement buffer until the statement succeeds.
-        effects.insert_row_redo(self.table_id(), redo_entry);
-        InsertRowIntoPage::Ok(row_id, page_guard)
     }
 
     #[inline]
@@ -1371,58 +1243,6 @@ impl<'a> UserTableAccessor<'a> {
     }
 
     #[inline]
-    pub(super) async fn delete_row_internal(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
-        row_id: RowID,
-        key: &SelectKey,
-        log_by_key: bool,
-    ) -> DeleteInternal {
-        let page_id = page_guard.page_id();
-        let (_, page) = page_guard.ctx_and_page();
-        if !page.row_id_in_valid_range(row_id) {
-            return DeleteInternal::NotFound;
-        }
-        // The undo-head lock is the conflict check for hot delete. Once the
-        // lock is owned, the row-page delete bit becomes the latest image and
-        // the same undo entry is rewritten to `Delete`.
-        let mut lock_row = self
-            .lock_row_for_write(rt, effects, &page_guard, row_id, Some(key))
-            .await;
-        match &mut lock_row {
-            LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
-            LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
-            LockRowForWrite::RetryInTransition => DeleteInternal::RetryInTransition,
-            LockRowForWrite::Ok(access) => {
-                let mut access = access.take().unwrap();
-                if access.row().is_deleted() {
-                    return DeleteInternal::NotFound;
-                }
-                access.delete_row();
-                // update LOCK entry to DELETE entry.
-                effects.update_last_row_undo(RowUndoKind::Delete);
-                drop(access); // unlock row.
-                drop(lock_row);
-                // hold page lock in order to update index later.
-                // create redo log.
-                let redo_entry = RowRedo {
-                    page_id,
-                    row_id,
-                    kind: if log_by_key {
-                        RowRedoKind::DeleteByUniqueKey(key.clone())
-                    } else {
-                        RowRedoKind::Delete
-                    },
-                };
-                effects.insert_row_redo(self.table_id(), redo_entry);
-                DeleteInternal::Ok(page_guard)
-            }
-        }
-    }
-
-    #[inline]
     async fn defer_delete_indexes(
         &self,
         rt: TrxRuntime<'_>,
@@ -1500,6 +1320,7 @@ impl<'a> UserTableAccessor<'a> {
                         IndexPurgeDecision::Keep => return Ok(false),
                         IndexPurgeDecision::RowPage(page_id) => {
                             let Some(page_guard) = self
+                                .mem()
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                                 .await?
                             else {
@@ -1567,6 +1388,7 @@ impl<'a> UserTableAccessor<'a> {
                         IndexPurgeDecision::Keep => return Ok(false),
                         IndexPurgeDecision::RowPage(page_id) => {
                             let Some(page_guard) = self
+                                .mem()
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                                 .await?
                             else {
@@ -1593,23 +1415,6 @@ impl<'a> UserTableAccessor<'a> {
     }
 
     #[inline]
-    pub(super) async fn try_get_validated_row_page_shared_result(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-        row_id: RowID,
-    ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        let Some(page_guard) = self.get_row_page_shared(guards, page_id).await? else {
-            return Ok(None);
-        };
-        if validate_page_row_range(&page_guard, page_id, row_id) {
-            Ok(Some(page_guard))
-        } else {
-            Ok(None)
-        }
-    }
-
-    #[inline]
     async fn get_insert_page(
         &self,
         rt: TrxRuntime<'_>,
@@ -1617,6 +1422,7 @@ impl<'a> UserTableAccessor<'a> {
     ) -> Result<PageSharedGuard<RowPage>> {
         if let Some((page_id, row_id)) = rt.load_active_insert_page(self.table_id()) {
             let page_guard = self
+                .mem()
                 .get_row_page_versioned_shared(rt.pool_guards(), page_id)
                 .await?;
             if let Some(page_guard) = page_guard {
@@ -1632,23 +1438,6 @@ impl<'a> UserTableAccessor<'a> {
         let redo_ctx = self.row_page_create_redo_ctx(rt);
         self.mem()
             .try_get_insert_page(rt.pool_guards(), row_count, redo_ctx)
-            .await
-    }
-
-    // Hot-row writes acquire ownership by installing a `Lock` undo entry at
-    // the row's undo head. That entry is the row-level write lock and the
-    // rollback anchor that is later rewritten to Insert/Update/Delete.
-    #[inline]
-    pub(super) async fn lock_row_for_write<'b>(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        page_guard: &'b PageSharedGuard<RowPage>,
-        row_id: RowID,
-        key: Option<&SelectKey>,
-    ) -> LockRowForWrite<'b> {
-        HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-            .lock_for_write(effects, page_guard, row_id, key)
             .await
     }
 
@@ -1788,6 +1577,7 @@ impl<'a> UserTableAccessor<'a> {
                     // deleted owner that older snapshots still need, or a true
                     // duplicate visible to this transaction.
                     let Some(old_guard) = self
+                        .mem()
                         .try_get_validated_row_page_shared_result(rt.pool_guards(), page_id, old_id)
                         .await?
                     else {
@@ -2872,6 +2662,7 @@ impl<'a> UserTableAccessor<'a> {
                             // undo-chain visibility. A stale index location is
                             // retried or rejected before any row mutation.
                             let Some(page_guard) = self
+                                .mem()
                                 .try_get_validated_row_page_shared_result(
                                     rt.pool_guards(),
                                     page_id,
@@ -2908,19 +2699,11 @@ impl<'a> UserTableAccessor<'a> {
                             )
                             .await?;
                         page_guard.set_dirty(); // mark as dirty page.
-                        return match res {
-                            UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => {
-                                Err(Report::new(OperationError::DuplicateKey)
-                                    .attach("update MVCC key-change index update")
-                                    .into())
-                            }
-                            UpdateIndex::WriteConflict => {
-                                Err(Report::new(OperationError::WriteConflict)
-                                    .attach("update MVCC key-change index update")
-                                    .into())
-                            }
-                        };
+                        return update_index_result_to_update_mvcc(
+                            res,
+                            new_row_id,
+                            "update MVCC key-change index update",
+                        );
                     } // otherwise, do nothing
                     page_guard.set_dirty(); // mark as dirty page.
                     return Ok(UpdateMvcc::Updated(row_id));
@@ -2957,19 +2740,11 @@ impl<'a> UserTableAccessor<'a> {
                             .await?;
                         // old guard is already marked inside.
                         new_guard.set_dirty(); // mark as dirty page.
-                        return match res {
-                            UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => {
-                                Err(Report::new(OperationError::DuplicateKey)
-                                    .attach("update MVCC moved-row index update")
-                                    .into())
-                            }
-                            UpdateIndex::WriteConflict => {
-                                Err(Report::new(OperationError::WriteConflict)
-                                    .attach("update MVCC moved-row index update")
-                                    .into())
-                            }
-                        };
+                        return update_index_result_to_update_mvcc(
+                            res,
+                            new_row_id,
+                            "update MVCC moved-row index update",
+                        );
                     } else {
                         let res = self
                             .update_indexes_only_row_id_change(
@@ -2982,19 +2757,11 @@ impl<'a> UserTableAccessor<'a> {
                             )
                             .await?;
                         new_guard.set_dirty(); // mark as dirty page.
-                        return match res {
-                            UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => {
-                                Err(Report::new(OperationError::DuplicateKey)
-                                    .attach("update MVCC moved-row index update")
-                                    .into())
-                            }
-                            UpdateIndex::WriteConflict => {
-                                Err(Report::new(OperationError::WriteConflict)
-                                    .attach("update MVCC moved-row index update")
-                                    .into())
-                            }
-                        };
+                        return update_index_result_to_update_mvcc(
+                            res,
+                            new_row_id,
+                            "update MVCC moved-row index update",
+                        );
                     }
                 }
             }
@@ -3105,6 +2872,7 @@ impl<'a> UserTableAccessor<'a> {
                             // undo. Index entries are masked after the row mutation
                             // and restored by index undo on rollback.
                             let Some(page_guard) = self
+                                .mem()
                                 .try_get_validated_row_page_shared_result(
                                     rt.pool_guards(),
                                     page_id,
@@ -3120,8 +2888,8 @@ impl<'a> UserTableAccessor<'a> {
                     }
                 }
             };
-            match self
-                .delete_row_internal(rt, effects, page_guard, row_id, key, log_by_key)
+            match HotRowDeleter::new(self.table_id(), self.metadata(), rt)
+                .delete(effects, page_guard, row_id, key, log_by_key)
                 .await
             {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
@@ -3241,7 +3009,7 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc};
     use crate::session::tests::SessionTestExt;
     use crate::table::DeleteMarker;
-    use crate::table::hot::HotRowUpdater;
+    use crate::table::hot::{HotRowDeleter, HotRowUpdater, RowInserter};
     use crate::table::tests::*;
     use crate::table::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
     use crate::trx::MAX_SNAPSHOT_TS;
@@ -4760,11 +4528,11 @@ mod tests {
                 .exec(async |stmt| {
                     stmt.acquire_table_write_locks(table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
-                    let insert_res = table_for_internal_assertion(&engine, table_id)
-                        .accessor_with_layout(&layout)
-                        .insert_row_to_page(
-                            rt,
+                    let table = table_for_internal_assertion(&engine, table_id);
+                    let layout = table.layout_snapshot();
+                    let accessor = table.accessor_with_layout(&layout);
+                    let insert_res = RowInserter::new(accessor.table_id(), accessor.metadata(), rt)
+                        .insert_to_page(
                             effects,
                             insert_page_guard,
                             insert,
@@ -4814,10 +4582,11 @@ mod tests {
                 .exec(async |stmt| {
                     stmt.acquire_table_write_locks(table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
-                    let res = table_for_internal_assertion(&engine, table_id)
-                        .accessor_with_layout(&layout)
-                        .delete_row_internal(rt, effects, page_guard, row_id, &key, false)
+                    let table = table_for_internal_assertion(&engine, table_id);
+                    let layout = table.layout_snapshot();
+                    let accessor = table.accessor_with_layout(&layout);
+                    let res = HotRowDeleter::new(accessor.table_id(), accessor.metadata(), rt)
+                        .delete(effects, page_guard, row_id, &key, false)
                         .await;
                     assert!(matches!(res, DeleteInternal::RetryInTransition));
                     Err(Report::new(OperationError::NotSupported).into())
@@ -5621,11 +5390,17 @@ mod tests {
                         .unwrap();
                     stmt.acquire_table_write_locks(table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
-                    let mut lock_row = table_for_internal_assertion(&engine, table_id)
-                        .accessor_with_layout(&layout)
-                        .lock_row_for_write(rt, effects, &page_guard, row_id, Some(&key))
-                        .await;
+                    let table = table_for_internal_assertion(&engine, table_id);
+                    let layout = table.layout_snapshot();
+                    let accessor = table.accessor_with_layout(&layout);
+                    // Hot-row writes acquire ownership by installing a `Lock`
+                    // undo entry at the row's undo head. That entry is the
+                    // row-level write lock and the rollback anchor that is
+                    // later rewritten to Insert/Update/Delete.
+                    let mut lock_row =
+                        HotRowUpdater::new(accessor.table_id(), accessor.metadata(), rt)
+                            .lock_for_write(effects, &page_guard, row_id, Some(&key))
+                            .await;
                     match &mut lock_row {
                         LockRowForWrite::Ok(access) => {
                             drop(access.take());
@@ -5890,6 +5665,7 @@ mod tests {
 
             let stale_guard = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
+                .mem()
                 .try_get_validated_row_page_shared_result(
                     &session.pool_guards(),
                     stale_page.page_id,
@@ -5906,6 +5682,7 @@ mod tests {
 
             let reused_guard = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
+                .mem()
                 .try_get_validated_row_page_shared_result(
                     &session.pool_guards(),
                     stale_page.page_id,
