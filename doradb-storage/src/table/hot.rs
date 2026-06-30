@@ -1,9 +1,11 @@
-use crate::buffer::guard::{PageGuard, PageSharedGuard};
+use crate::buffer::guard::PageSharedGuard;
 use crate::catalog::TableMetadata;
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
-use crate::row::ops::{ReadRow, SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateRow};
+use crate::row::ops::{
+    ReadRow, RowUpdateInput, SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateRow,
+};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::table::{DeleteInternal, InsertRowIntoPage, UpdateRowInplace};
 use crate::trx::TrxRuntime;
@@ -12,7 +14,6 @@ use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::value::Val;
-use std::mem;
 
 /// Hot row-page insert context shared by catalog and user-table accessors.
 pub(super) struct RowInserter<'m, 'r> {
@@ -296,35 +297,19 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         page_guard: PageSharedGuard<RowPage>,
         key: &SelectKey,
         row_id: RowID,
-        mut update: Vec<UpdateCol>,
+        update: RowUpdateInput,
         log_by_key: bool,
     ) -> UpdateRowInplace {
         let page_id = page_guard.page_id();
         let (_, page) = page_guard.ctx_and_page();
-        // column indexes must be in range
         debug_assert!(
-            {
-                update
-                    .iter()
-                    .all(|uc| uc.idx < page_guard.page().header.col_count as usize)
-            },
-            "update column indexes must be in range"
-        );
-        // column indexes should be in order.
-        debug_assert!(
-            {
-                update.is_empty()
-                    || update
-                        .iter()
-                        .zip(update.iter().skip(1))
-                        .all(|(l, r)| l.idx < r.idx)
-            },
-            "update columns should be in order"
+            update.as_view().is_valid_for(self.metadata.col.as_ref()),
+            "row update values must be ordered, in range, and type-compatible"
         );
         if row_id < page.header.start_row_id
             || row_id >= page.header.start_row_id + page.header.max_row_count as u64
         {
-            return UpdateRowInplace::RowNotFound;
+            return UpdateRowInplace::RowNotFound(update);
         }
         // The row-page image must not change until the undo-head lock is
         // installed. The lock path also rejects stale index candidates whose
@@ -333,18 +318,20 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
             .lock_for_write(effects, &page_guard, row_id, Some(key))
             .await;
         match &mut lock_row {
-            LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound,
+            LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound(update),
             LockRowForWrite::WriteConflict => UpdateRowInplace::WriteConflict,
-            LockRowForWrite::RetryInTransition => UpdateRowInplace::RetryInTransition,
+            LockRowForWrite::RetryInTransition => UpdateRowInplace::RetryInTransition(update),
             LockRowForWrite::Ok(access) => {
                 let mut access = access
                     .take()
                     .expect("successful hot-row write lock must provide row write access");
                 let frozen = access.page_state() == RowPageState::Frozen;
                 if access.row().is_deleted() {
-                    return UpdateRowInplace::RowDeleted;
+                    drop(access);
+                    drop(lock_row);
+                    return UpdateRowInplace::RowDeleted(update);
                 }
-                match access.update_row(self.metadata.col.as_ref(), &update, frozen) {
+                match access.update_row(self.metadata.col.as_ref(), update.as_view(), frozen) {
                     UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
                         // The hot row cannot be updated in place because the
                         // page has no reusable space or has been frozen for
@@ -377,36 +364,29 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
                     }
                     UpdateRow::Ok(mut row) => {
-                        // In-place update keeps the RowID stable. Only changed
-                        // columns are copied into undo/redo; indexed old values
-                        // are retained so MemIndex can shadow or remap keys
-                        // after the row latch is released.
+                        // In-place update keeps the RowID stable. Changed new
+                        // values are moved into redo on the successful path.
                         let mut index_change_cols = FastHashMap::default();
                         // perform in-place update.
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
-                        for uc in &mut update {
+                        for UpdateCol { idx, val } in update {
                             if let Some((old_val, var_offset)) =
-                                row.different(self.metadata.col.as_ref(), uc.idx, &uc.val)
+                                row.different(self.metadata.col.as_ref(), idx, &val)
                             {
-                                let new_val = mem::take(&mut uc.val);
                                 // we also check whether the value change is related to any index,
                                 // so we can update index later.
-                                if self.metadata.idx.index_columns().contains(&uc.idx) {
-                                    index_change_cols.insert(uc.idx, old_val.clone());
+                                if self.metadata.idx.index_columns().contains(&idx) {
+                                    index_change_cols.insert(idx, old_val.clone());
                                 }
                                 // actual update
-                                row.update_col(self.metadata.col.as_ref(), uc.idx, &new_val);
+                                row.update_col(self.metadata.col.as_ref(), idx, &val);
                                 // record undo and redo
                                 undo_cols.push(UndoCol {
-                                    idx: uc.idx,
+                                    idx,
                                     val: old_val,
                                     var_offset,
                                 });
-                                redo_cols.push(UpdateCol {
-                                    idx: uc.idx,
-                                    // new value no longer needed, so safe to take it here.
-                                    val: new_val,
-                                });
+                                redo_cols.push(UpdateCol { idx, val });
                             }
                         }
                         // The provisional row lock now becomes the operation
@@ -442,48 +422,46 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
     #[inline]
     pub(super) fn prepare_move_update(
         &self,
-        old_row: Vec<(Val, Option<u16>)>,
-        update: Vec<UpdateCol>,
+        old_row: Vec<Val>,
+        update: RowUpdateInput,
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> PreparedHotMoveUpdate {
         // Build the replacement hot row and remember indexed old values. The
         // caller already turned the old hot row's first undo entry into
         // `Delete`, so this path is logically delete-old plus insert-new.
-        let (new_row, old_vals, index_change_cols) = {
+        let (new_row, undo_vals, index_change_cols) = {
             let mut index_change_cols = FastHashMap::default();
-            let mut row = Vec::with_capacity(old_row.len());
-            let mut old_vals = Vec::with_capacity(old_row.len());
-            for (v, _) in old_row {
-                old_vals.push(v.clone());
-                row.push(v);
-            }
-            for mut uc in update {
-                let old_val = &mut row[uc.idx];
-                if old_val != &uc.val {
-                    if self.metadata.idx.index_columns().contains(&uc.idx) {
-                        index_change_cols.insert(uc.idx, old_val.clone());
+            match update {
+                RowUpdateInput::Sparse(update) => {
+                    let mut undo_vals = Vec::with_capacity(update.len());
+                    let mut row = old_row;
+                    for UpdateCol { idx, val } in update {
+                        if row[idx] != val {
+                            let old_val = std::mem::replace(&mut row[idx], val);
+                            if self.metadata.idx.index_columns().contains(&idx) {
+                                index_change_cols.insert(idx, old_val.clone());
+                            }
+                            undo_vals.push(UpdateCol { idx, val: old_val });
+                        }
                     }
-                    // swap old value and new value
-                    mem::swap(&mut uc.val, old_val);
+                    (row, undo_vals, index_change_cols)
+                }
+                RowUpdateInput::FullRow(row) => {
+                    let mut undo_vals = Vec::with_capacity(row.len());
+                    debug_assert!(row.len() == old_row.len());
+                    for (idx, old_val) in old_row.into_iter().enumerate() {
+                        if old_val != row[idx] {
+                            if self.metadata.idx.index_columns().contains(&idx) {
+                                index_change_cols.insert(idx, old_val.clone());
+                            }
+                            undo_vals.push(UpdateCol { idx, val: old_val });
+                        }
+                    }
+                    (row, undo_vals, index_change_cols)
                 }
             }
-            (row, old_vals, index_change_cols)
         };
-        let undo_vals: Vec<UpdateCol> = new_row
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, val)| {
-                if val != &old_vals[idx] {
-                    Some(UpdateCol {
-                        idx,
-                        val: old_vals[idx].clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
         let index_branches = {
             // Unique indexes keep only the latest owner in MemIndex. When a
             // move update changes RowID, the new hot row's insert undo carries

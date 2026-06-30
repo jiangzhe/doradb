@@ -1,10 +1,11 @@
+use crate::catalog::TableColumnLayout;
 use crate::error::Result;
 use crate::id::RowID;
 use crate::row::{Row, RowMut};
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
-use std::mem;
+use std::{mem, slice, vec};
 
 /// Logical lookup key for one table index.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,6 +298,148 @@ impl UndoVal for UpdateCol {
     }
 }
 
+/// Owned transaction-row update input held across retries and terminal effects.
+pub(crate) enum RowUpdateInput {
+    /// Sparse update payload supplied by public update APIs.
+    Sparse(Vec<UpdateCol>),
+    /// Full row supplied by upsert APIs.
+    FullRow(Vec<Val>),
+}
+
+impl RowUpdateInput {
+    /// Borrows this owned input as an update view.
+    #[inline]
+    pub(crate) fn as_view(&self) -> RowUpdateView<'_> {
+        match self {
+            RowUpdateInput::Sparse(cols) => RowUpdateView::Sparse(cols),
+            RowUpdateInput::FullRow(vals) => RowUpdateView::FullRow(vals),
+        }
+    }
+
+    /// Returns the owned full row, if this input contains one.
+    #[inline]
+    pub(crate) fn into_full_row(self) -> Option<Vec<Val>> {
+        match self {
+            RowUpdateInput::Sparse(_) => None,
+            RowUpdateInput::FullRow(vals) => Some(vals),
+        }
+    }
+}
+
+impl IntoIterator for RowUpdateInput {
+    type Item = UpdateCol;
+    type IntoIter = RowUpdateIntoIter;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            RowUpdateInput::Sparse(cols) => RowUpdateIntoIter::Sparse(cols.into_iter()),
+            RowUpdateInput::FullRow(vals) => {
+                RowUpdateIntoIter::FullRow(vals.into_iter().enumerate())
+            }
+        }
+    }
+}
+
+/// Iterator over owned row-update values.
+pub(crate) enum RowUpdateIntoIter {
+    /// Sparse update iterator.
+    Sparse(vec::IntoIter<UpdateCol>),
+    /// Full-row update iterator.
+    FullRow(std::iter::Enumerate<vec::IntoIter<Val>>),
+}
+
+impl Iterator for RowUpdateIntoIter {
+    type Item = UpdateCol;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RowUpdateIntoIter::Sparse(cols) => cols.next(),
+            RowUpdateIntoIter::FullRow(vals) => {
+                vals.next().map(|(idx, val)| UpdateCol { idx, val })
+            }
+        }
+    }
+}
+
+/// Borrowed transaction-row update values used by lookup, compare, and retry paths.
+#[derive(Clone, Copy)]
+pub(crate) enum RowUpdateView<'a> {
+    /// Sparse update columns.
+    Sparse(&'a [UpdateCol]),
+    /// Complete replacement row values.
+    FullRow(&'a [Val]),
+}
+
+impl<'a> RowUpdateView<'a> {
+    /// Returns an iterator over column indexes and borrowed new values.
+    #[inline]
+    pub(crate) fn iter(self) -> RowUpdateIter<'a> {
+        match self {
+            RowUpdateView::Sparse(cols) => RowUpdateIter::Sparse(cols.iter()),
+            RowUpdateView::FullRow(vals) => RowUpdateIter::FullRow(vals.iter().enumerate()),
+        }
+    }
+
+    /// Returns true when indexes and value kinds match the target column layout.
+    #[inline]
+    pub(crate) fn is_valid_for(self, col_layout: &TableColumnLayout) -> bool {
+        match self {
+            RowUpdateView::Sparse(cols) => {
+                let mut last_idx = None;
+                cols.iter().all(|col| {
+                    let valid = col.idx < col_layout.col_count()
+                        && last_idx.is_none_or(|idx| idx < col.idx)
+                        && col_layout.col_type_match(col.idx, &col.val);
+                    last_idx = Some(col.idx);
+                    valid
+                })
+            }
+            RowUpdateView::FullRow(vals) => {
+                vals.len() == col_layout.col_count()
+                    && vals
+                        .iter()
+                        .enumerate()
+                        .all(|(idx, val)| col_layout.col_type_match(idx, val))
+            }
+        }
+    }
+}
+
+/// Borrowed value for one updated column.
+pub(crate) struct RowUpdateItem<'a> {
+    /// Column index to update.
+    pub(crate) idx: usize,
+    /// Borrowed new column value.
+    pub(crate) val: &'a Val,
+}
+
+/// Iterator over borrowed row-update values.
+pub(crate) enum RowUpdateIter<'a> {
+    /// Sparse update iterator.
+    Sparse(slice::Iter<'a, UpdateCol>),
+    /// Full-row update iterator.
+    FullRow(std::iter::Enumerate<slice::Iter<'a, Val>>),
+}
+
+impl<'a> Iterator for RowUpdateIter<'a> {
+    type Item = RowUpdateItem<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RowUpdateIter::Sparse(cols) => cols.next().map(|col| RowUpdateItem {
+                idx: col.idx,
+                val: &col.val,
+            }),
+            RowUpdateIter::FullRow(vals) => {
+                vals.next().map(|(idx, val)| RowUpdateItem { idx, val })
+            }
+        }
+    }
+}
+
 /// Column value captured for undo processing.
 pub struct UndoCol {
     /// Column index to restore.
@@ -325,7 +468,7 @@ impl UndoVal for UndoCol {
 /// Transactional row-update result.
 pub(crate) enum UpdateRow<'a> {
     Ok(RowMut<'a>),
-    NoFreeSpaceOrFrozen(Vec<(Val, Option<u16>)>),
+    NoFreeSpaceOrFrozen(Vec<Val>),
 }
 
 /// Row-page delete result.
@@ -359,8 +502,157 @@ impl DeleteMvcc {
 
 #[cfg(test)]
 mod tests {
-    use super::UpsertMvcc;
+    use super::{RowUpdateInput, RowUpdateView, UpdateCol, UpsertMvcc};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableColumnLayout};
     use crate::id::RowID;
+    use crate::value::{Val, ValKind};
+
+    fn update_test_layout() -> TableColumnLayout {
+        TableColumnLayout::try_new(vec![
+            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            ColumnSpec::new("version", ValKind::U64, ColumnAttributes::empty()),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn row_update_view_iterates_sparse_and_full_row_inputs() {
+        let sparse = vec![
+            UpdateCol {
+                idx: 0,
+                val: Val::from(10i32),
+            },
+            UpdateCol {
+                idx: 2,
+                val: Val::from(42u64),
+            },
+        ];
+        let sparse_items = RowUpdateInput::Sparse(sparse)
+            .as_view()
+            .iter()
+            .map(|item| (item.idx, item.val.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sparse_items,
+            vec![(0, Val::from(10i32)), (2, Val::from(42u64))]
+        );
+
+        let full = vec![Val::from(11i32), Val::from("alice"), Val::from(43u64)];
+        let full_input = RowUpdateInput::FullRow(full.clone());
+        let full_items = full_input
+            .as_view()
+            .iter()
+            .map(|item| (item.idx, item.val.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            full_items,
+            vec![
+                (0, Val::from(11i32)),
+                (1, Val::from("alice")),
+                (2, Val::from(43u64)),
+            ]
+        );
+        assert_eq!(full_input.into_full_row(), Some(full));
+    }
+
+    #[test]
+    fn row_update_input_consumes_sparse_and_full_row_inputs() {
+        let sparse = RowUpdateInput::Sparse(vec![
+            UpdateCol {
+                idx: 0,
+                val: Val::from(10i32),
+            },
+            UpdateCol {
+                idx: 2,
+                val: Val::from(42u64),
+            },
+        ]);
+        let sparse_items = sparse.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            sparse_items,
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(10i32),
+                },
+                UpdateCol {
+                    idx: 2,
+                    val: Val::from(42u64),
+                },
+            ]
+        );
+
+        let full =
+            RowUpdateInput::FullRow(vec![Val::from(11i32), Val::from("alice"), Val::from(43u64)]);
+        let full_items = full.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            full_items,
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(11i32),
+                },
+                UpdateCol {
+                    idx: 1,
+                    val: Val::from("alice"),
+                },
+                UpdateCol {
+                    idx: 2,
+                    val: Val::from(43u64),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn row_update_view_validates_sparse_and_full_row_shape() {
+        let layout = update_test_layout();
+        let sparse = vec![
+            UpdateCol {
+                idx: 0,
+                val: Val::from(10i32),
+            },
+            UpdateCol {
+                idx: 2,
+                val: Val::from(42u64),
+            },
+        ];
+        assert!(RowUpdateView::Sparse(&sparse).is_valid_for(&layout));
+
+        let unordered = vec![
+            UpdateCol {
+                idx: 2,
+                val: Val::from(42u64),
+            },
+            UpdateCol {
+                idx: 0,
+                val: Val::from(10i32),
+            },
+        ];
+        assert!(!RowUpdateView::Sparse(&unordered).is_valid_for(&layout));
+
+        let out_of_range = vec![UpdateCol {
+            idx: 3,
+            val: Val::from(42u64),
+        }];
+        assert!(!RowUpdateView::Sparse(&out_of_range).is_valid_for(&layout));
+
+        let type_mismatch = vec![UpdateCol {
+            idx: 0,
+            val: Val::from("not an i32"),
+        }];
+        assert!(!RowUpdateView::Sparse(&type_mismatch).is_valid_for(&layout));
+
+        let full = vec![Val::from(11i32), Val::from("alice"), Val::from(43u64)];
+        assert!(RowUpdateView::FullRow(&full).is_valid_for(&layout));
+
+        let short = vec![Val::from(11i32), Val::from("alice")];
+        assert!(!RowUpdateView::FullRow(&short).is_valid_for(&layout));
+
+        let full_type_mismatch = vec![Val::from(11i32), Val::from(12i32), Val::from(43u64)];
+        assert!(!RowUpdateView::FullRow(&full_type_mismatch).is_valid_for(&layout));
+    }
 
     #[test]
     fn upsert_mvcc_predicates_report_variant() {

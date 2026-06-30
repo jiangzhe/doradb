@@ -4,7 +4,7 @@ use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::id::{RowID, TableID, TrxID};
 use crate::map::FastHashMap;
 use crate::recovery::RowRecoveryMap;
-use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
+use crate::row::ops::{ReadRow, RowUpdateView, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
@@ -727,14 +727,14 @@ impl<'a> RowWriteAccess<'a> {
     pub(crate) fn update_row(
         &self,
         col_layout: &TableColumnLayout,
-        cols: &[UpdateCol],
+        update: RowUpdateView<'_>,
         frozen: bool,
     ) -> UpdateRow<'_> {
         if frozen {
-            let old_row = self.row().vals_with_var_offsets(col_layout);
+            let old_row = self.row().clone_vals(col_layout);
             return UpdateRow::NoFreeSpaceOrFrozen(old_row);
         }
-        let var_len = self.row().var_len_for_update(cols);
+        let var_len = self.row().var_len_for_update(update);
         if var_len == 0 {
             // fast path, no change on var-length column.
             let offset = self.page.header.var_field_offset();
@@ -743,7 +743,7 @@ impl<'a> RowWriteAccess<'a> {
         }
         match self.page.request_free_space(var_len) {
             None => {
-                let old_row = self.row().vals_with_var_offsets(col_layout);
+                let old_row = self.row().clone_vals(col_layout);
                 UpdateRow::NoFreeSpaceOrFrozen(old_row)
             }
             Some(offset) => {
