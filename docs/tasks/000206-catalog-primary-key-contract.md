@@ -1,7 +1,7 @@
 ---
 id: 000206
 title: Catalog Primary Key Contract
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-01
 github_issue: 798
 ---
@@ -170,6 +170,36 @@ stable identity for each logical catalog row.
 
 ## Implementation Notes
 
+- Implemented the catalog primary-key contract with `IndexSpec::primary_key`,
+  `TableIndexLayout::primary_key_index`, `TableMetadata::primary_key`, and a
+  borrowed `PrimaryKeySpec` validator. Metadata now rejects multiple primary
+  keys and nullable primary-key columns while preserving PK-as-unique runtime
+  behavior.
+- Public user-table DDL now rejects `IndexAttributes::PK` in create-table and
+  create-index paths; static catalog table definitions continue to use one
+  internal primary-key index each.
+- Renamed catalog keyed redo to `DeleteByPrimaryKey` and
+  `UpdateByPrimaryKey` while keeping the existing redo numeric codes. Catalog
+  upsert/delete wrappers derive the primary-key index from catalog metadata and
+  report named catalog primary-key errors instead of generic internal errors.
+- Hardened catalog/recovery validation so malformed primary-key redo reports
+  `DataIntegrityError::InvalidPayload` instead of silently passing or panicking.
+  This includes catalog checkpoint drop-table delete detection and user-table
+  replay of key-based catalog redo.
+- `MemTable::update_primary_key_no_trx` now handles variable-length catalog
+  recovery updates that do not fit on the current row page by rebuilding the row
+  and falling back to delete plus insert. The recovery-only helper documents the
+  fail-fast behavior: if the replacement insert fails after delete, recovery
+  returns the error and engine startup aborts before exposing partial in-memory
+  catalog state.
+- During implementation review, ordinary storage DML type/nullability
+  validation was found to be mostly debug-only at table boundaries. That broader
+  public API policy is deferred to
+  `docs/backlogs/000143-opt-in-statement-type-validation-for-storage-dml.md`.
+- Validation passed with `tools/style_audit.rs --diff-base origin/main`,
+  `cargo build -p doradb-storage`, `cargo nextest run -p doradb-storage`, and
+  `git diff --check`.
+
 ## Impacts
 
 - `doradb-storage/src/catalog/spec.rs`
@@ -257,3 +287,6 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 - Catalog checkpoint primary-key-aware folding and compact catalog root
   materialization remain out of scope and continue to be tracked by
   `docs/backlogs/000142-catalog-checkpoint-pk-aware-folding-and-compaction-design.md`.
+- Opt-in runtime type/nullability validation for direct storage DML remains out
+  of scope and is tracked by
+  `docs/backlogs/000143-opt-in-statement-type-validation-for-storage-dml.md`.
