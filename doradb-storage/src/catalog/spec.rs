@@ -69,6 +69,12 @@ impl IndexSpec {
         self.attributes.contains(IndexAttributes::PK)
             || self.attributes.contains(IndexAttributes::UK)
     }
+
+    /// Return whether this index is the table primary key.
+    #[inline]
+    pub fn primary_key(&self) -> bool {
+        self.attributes.contains(IndexAttributes::PK)
+    }
 }
 
 /// One active index definition paired with its allocated stable table-local

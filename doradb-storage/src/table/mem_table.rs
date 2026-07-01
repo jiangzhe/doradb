@@ -8,7 +8,7 @@ use super::{
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
-use crate::catalog::{TableColumnLayout, TableMetadata};
+use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata};
 use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
@@ -1283,33 +1283,32 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         }
     }
 
-    /// Delete one catalog row through a unique index without transaction state.
+    /// Delete one catalog row through its primary key without transaction state.
     #[inline]
-    pub(crate) async fn delete_unique_no_trx(
+    pub(crate) async fn delete_primary_key_no_trx(
         &self,
         guards: &PoolGuards,
         key: &SelectKey,
     ) -> Result<()> {
-        debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(
-            self.metadata()
-                .idx
-                .require_index_spec(key.index_no)
-                .unwrap()
-                .unique()
-        );
-        debug_assert!(self.metadata().idx.index_type_match(
-            self.metadata().col.as_ref(),
-            key.index_no,
-            &key.vals
-        ));
+        let metadata = self.metadata();
+        let index_spec =
+            validate_primary_key_no_trx_key(metadata, key, "delete primary key no-trx")?;
         let sts = MIN_SNAPSHOT_TS;
         let (mut page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
-            None => unreachable!(),
+            None => {
+                return Err(catalog_primary_key_payload_error(format!(
+                    "delete primary key no-trx missing catalog row: index_no={}, key_vals={:?}",
+                    key.index_no, key.vals
+                )));
+            }
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
-                RowLocation::NotFound => unreachable!(),
+                RowLocation::NotFound => {
+                    return Err(catalog_primary_key_payload_error(format!(
+                        "delete primary key no-trx row location missing: row_id={row_id}"
+                    )));
+                }
                 RowLocation::LwcBlock { .. } => {
-                    return self.catalog_lwc_error("delete unique no-trx", row_id);
+                    return self.catalog_lwc_error("delete primary key no-trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
@@ -1319,8 +1318,18 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         };
         let page = page_guard.page_mut();
         let row_idx = page.row_idx(row_id);
-        debug_assert!(!page.is_deleted(row_idx));
+        if page.is_deleted(row_idx) {
+            return Err(catalog_primary_key_payload_error(format!(
+                "delete primary key no-trx row is deleted: row_id={row_id}"
+            )));
+        }
         let row = page.row(row_idx);
+        if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+            return Err(catalog_primary_key_payload_error(format!(
+                "delete primary key no-trx row key mismatch: row_id={row_id}, index_no={}",
+                key.index_no
+            )));
+        }
         let keys = self
             .metadata()
             .idx
@@ -1333,59 +1342,45 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         Ok(())
     }
 
-    /// Update one catalog row through a stable unique key without transaction state.
+    /// Update one catalog row through its primary key without transaction state.
+    ///
+    /// This is catalog logical recovery, not physical row-page recovery. The
+    /// input key identifies the catalog row, but the recovered row may live at
+    /// any row id. Fixed-size updates, such as silent-watermark replay, usually
+    /// fit in place. Variable-length non-indexed updates can outgrow the current
+    /// row page; in that case this helper relocates the row with delete+insert.
     #[inline]
-    pub(crate) async fn update_unique_no_trx(
+    pub(crate) async fn update_primary_key_no_trx(
         &self,
         guards: &PoolGuards,
         key: &SelectKey,
         update: &[UpdateCol],
     ) -> Result<()> {
         let metadata = self.metadata();
-        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx key index not found: index_no={}, index_slot_count={}",
-                key.index_no,
-                metadata.idx.index_slot_count()
-            )));
-        };
-        if !index_spec.unique() {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx key is not unique: index_no={}",
-                key.index_no
-            )));
-        }
-        if !metadata
-            .idx
-            .index_type_match(metadata.col.as_ref(), key.index_no, &key.vals)
-        {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx key type mismatch: index_no={}",
-                key.index_no
-            )));
-        }
+        let index_spec =
+            validate_primary_key_no_trx_key(metadata, key, "update primary key no-trx")?;
         // This no-trx recovery path writes the row image directly and does not
-        // update MemIndex entries. Keep validate_update_by_key_cols() rejecting
+        // update MemIndex entries. Keep validate_update_primary_key_no_trx_cols() rejecting
         // every indexed column; callers that need indexed-column changes must
         // use a path that updates indexes as well.
-        validate_update_by_key_cols(metadata, update)?;
+        validate_update_primary_key_no_trx_cols(metadata, update)?;
 
         let sts = MIN_SNAPSHOT_TS;
         let (mut page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
             None => {
-                return Err(catalog_update_by_key_payload_error(format!(
-                    "update unique no-trx missing catalog row: index_no={}, key_vals={:?}",
+                return Err(catalog_primary_key_payload_error(format!(
+                    "update primary key no-trx missing catalog row: index_no={}, key_vals={:?}",
                     key.index_no, key.vals
                 )));
             }
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
                 RowLocation::NotFound => {
-                    return Err(catalog_update_by_key_payload_error(format!(
-                        "update unique no-trx row location missing: row_id={row_id}"
+                    return Err(catalog_primary_key_payload_error(format!(
+                        "update primary key no-trx row location missing: row_id={row_id}"
                     )));
                 }
                 RowLocation::LwcBlock { .. } => {
-                    return self.catalog_lwc_error("update unique no-trx", row_id);
+                    return self.catalog_lwc_error("update primary key no-trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
@@ -1393,36 +1388,58 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 }
             },
         };
-        let page = page_guard.page_mut();
-        if !page.row_id_in_valid_range(row_id) {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx row id out of page range: row_id={row_id}"
-            )));
-        }
-        let row_idx = page.row_idx(row_id);
-        let row = page.row(row_idx);
-        if row.is_deleted() {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx row is deleted: row_id={row_id}"
-            )));
-        }
-        if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx row key mismatch: row_id={row_id}, index_no={}",
-                key.index_no
-            )));
-        }
-        let var_len = page.var_len_for_update(row_idx, RowUpdateView::Sparse(update));
-        let Some(var_offset) = page.request_free_space(var_len) else {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx row update does not fit: row_id={row_id}"
-            )));
+        let relocated_row = {
+            let page = page_guard.page_mut();
+            if !page.row_id_in_valid_range(row_id) {
+                return Err(catalog_primary_key_payload_error(format!(
+                    "update primary key no-trx row id out of page range: row_id={row_id}"
+                )));
+            }
+            let row_idx = page.row_idx(row_id);
+            let row = page.row(row_idx);
+            if row.is_deleted() {
+                return Err(catalog_primary_key_payload_error(format!(
+                    "update primary key no-trx row is deleted: row_id={row_id}"
+                )));
+            }
+            if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+                return Err(catalog_primary_key_payload_error(format!(
+                    "update primary key no-trx row key mismatch: row_id={row_id}, index_no={}",
+                    key.index_no
+                )));
+            }
+            let var_len = page.var_len_for_update(row_idx, RowUpdateView::Sparse(update));
+            match page.request_free_space(var_len) {
+                Some(var_offset) => {
+                    let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
+                    for update_col in update {
+                        row.update_col(
+                            metadata.col.as_ref(),
+                            update_col.idx,
+                            &update_col.val,
+                            true,
+                        );
+                    }
+                    row.finish_update();
+                    None
+                }
+                None => {
+                    // Catalog redo is logical by primary key. When variable-length
+                    // values do not fit the current in-memory row page, rebuild the
+                    // row at a new row id and refresh indexes through delete+insert.
+                    let mut row_vals = row.clone_vals(metadata.col.as_ref());
+                    for update_col in update {
+                        row_vals[update_col.idx] = update_col.val.clone();
+                    }
+                    Some(row_vals)
+                }
+            }
         };
-        let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
-        for update_col in update {
-            row.update_col(metadata.col.as_ref(), update_col.idx, &update_col.val, true);
+        if let Some(row_vals) = relocated_row {
+            drop(page_guard);
+            self.delete_primary_key_no_trx(guards, key).await?;
+            self.insert_no_trx(guards, &row_vals).await?;
         }
-        row.finish_update();
         Ok(())
     }
 
@@ -2341,31 +2358,34 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
 }
 
 #[inline]
-fn validate_update_by_key_cols(metadata: &TableMetadata, update: &[UpdateCol]) -> Result<()> {
+fn validate_update_primary_key_no_trx_cols(
+    metadata: &TableMetadata,
+    update: &[UpdateCol],
+) -> Result<()> {
     let mut last_idx = None;
     for update_col in update {
         if update_col.idx >= metadata.col.col_count() {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx column out of range: column_no={}, column_count={}",
+            return Err(catalog_primary_key_payload_error(format!(
+                "update primary key no-trx column out of range: column_no={}, column_count={}",
                 update_col.idx,
                 metadata.col.col_count()
             )));
         }
         if last_idx.is_some_and(|idx| update_col.idx <= idx) {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx columns not strictly ordered: column_no={}",
+            return Err(catalog_primary_key_payload_error(format!(
+                "update primary key no-trx columns not strictly ordered: column_no={}",
                 update_col.idx
             )));
         }
         if !metadata.col.col_type_match(update_col.idx, &update_col.val) {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx column type mismatch: column_no={}",
+            return Err(catalog_primary_key_payload_error(format!(
+                "update primary key no-trx column type mismatch: column_no={}",
                 update_col.idx
             )));
         }
         if metadata.idx.index_columns().contains(&update_col.idx) {
-            return Err(catalog_update_by_key_payload_error(format!(
-                "update unique no-trx cannot change indexed column: column_no={}",
+            return Err(catalog_primary_key_payload_error(format!(
+                "update primary key no-trx cannot change indexed column: column_no={}",
                 update_col.idx
             )));
         }
@@ -2375,7 +2395,36 @@ fn validate_update_by_key_cols(metadata: &TableMetadata, update: &[UpdateCol]) -
 }
 
 #[inline]
-fn catalog_update_by_key_payload_error(message: impl Into<String>) -> Error {
+fn validate_primary_key_no_trx_key<'a>(
+    metadata: &'a TableMetadata,
+    key: &SelectKey,
+    operation: &'static str,
+) -> Result<&'a IndexSpec> {
+    let Some(primary_key) = metadata.primary_key() else {
+        return Err(catalog_primary_key_payload_error(format!(
+            "{operation} primary key not found"
+        )));
+    };
+    match primary_key.validate_key(key) {
+        Ok(()) => Ok(primary_key.spec()),
+        Err(PrimaryKeyMatchError::IndexNo { actual, expected }) => {
+            Err(catalog_primary_key_payload_error(format!(
+                "{operation} key is not primary key: index_no={actual}, primary_key_index_no={expected}",
+            )))
+        }
+        Err(PrimaryKeyMatchError::ValueCount { actual, expected }) => {
+            Err(catalog_primary_key_payload_error(format!(
+                "{operation} key value count {actual} does not match primary key column count {expected}",
+            )))
+        }
+        Err(PrimaryKeyMatchError::Type { index_no }) => Err(catalog_primary_key_payload_error(
+            format!("{operation} key type mismatch: index_no={index_no}"),
+        )),
+    }
+}
+
+#[inline]
+fn catalog_primary_key_payload_error(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(message.into())
         .into()
@@ -2756,7 +2805,7 @@ mod tests {
                 .await;
 
             mem_table
-                .delete_unique_no_trx(&guards, &single_key(1i32))
+                .delete_primary_key_no_trx(&guards, &single_key(1i32))
                 .await
                 .unwrap();
 
@@ -2768,7 +2817,38 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_table_update_unique_no_trx_updates_non_indexed_columns() {
+    fn test_mem_table_primary_key_no_trx_rejects_non_primary_key() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_015);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(1, "same", b"payload"))
+                .await
+                .unwrap();
+            let err = mem_table
+                .delete_primary_key_no_trx(&guards, &name_key("same"))
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("key is not primary key"), "{report}");
+        });
+    }
+
+    #[test]
+    fn test_mem_table_update_primary_key_no_trx_updates_non_indexed_columns() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -2785,7 +2865,7 @@ mod tests {
                 .await
                 .unwrap();
             mem_table
-                .update_unique_no_trx(
+                .update_primary_key_no_trx(
                     &guards,
                     &single_key(1i32),
                     &[UpdateCol {
@@ -2804,7 +2884,7 @@ mod tests {
             .await;
 
             let err = mem_table
-                .update_unique_no_trx(
+                .update_primary_key_no_trx(
                     &guards,
                     &single_key(1i32),
                     &[UpdateCol {
@@ -2818,6 +2898,81 @@ mod tests {
                 err.data_integrity_error(),
                 Some(DataIntegrityError::InvalidPayload)
             );
+        });
+    }
+
+    #[test]
+    fn test_mem_table_update_primary_key_no_trx_relocates_on_no_free_space() {
+        smol::block_on(async {
+            const ROWS: i32 = 60;
+            const BASE_PAYLOAD_SIZE: usize = 1000;
+            const LARGE_PAYLOAD_SIZE: usize = 50_000;
+
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_015);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+            let base_payload = vec![b'a'; BASE_PAYLOAD_SIZE];
+            let mut row_ids = Vec::new();
+
+            for id in 0..ROWS {
+                let name = format!("name{id}");
+                mem_table
+                    .insert_no_trx(&guards, &indexed_payload_row(id, &name, &base_payload))
+                    .await
+                    .unwrap();
+                let (row_id, deleted) = mem_table
+                    .unique_lookup(&guards, &single_key(id), MIN_SNAPSHOT_TS)
+                    .await
+                    .unwrap()
+                    .expect("inserted primary key should be indexed");
+                assert!(!deleted);
+                row_ids.push(row_id);
+            }
+
+            let old_row0 = row_ids[0];
+            let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
+            mem_table
+                .update_primary_key_no_trx(
+                    &guards,
+                    &single_key(0i32),
+                    &[UpdateCol {
+                        idx: 2,
+                        val: Val::from(&large_payload[..]),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let (new_row0, deleted) = mem_table
+                .unique_lookup(&guards, &single_key(0i32), MIN_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .expect("relocated primary key should be indexed");
+            assert!(!deleted);
+            assert_ne!(new_row0, old_row0);
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("name0"), old_row0, None)
+                .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &guards,
+                &name_key("name0"),
+                new_row0,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(
+                &mem_table,
+                &guards,
+                &single_key(0i32),
+                Some(indexed_payload_row(0, "name0", &large_payload)),
+            )
+            .await;
         });
     }
 

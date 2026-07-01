@@ -269,6 +269,10 @@ pub(crate) enum InternalError {
     MutableRootMetadataRegression,
     #[error("catalog root descriptor invariant violated")]
     CatalogRootDescriptorInvariant,
+    #[error("catalog primary key missing")]
+    CatalogPrimaryKeyMissing,
+    #[error("catalog primary key mismatch")]
+    CatalogPrimaryKeyMismatch,
     #[error("column scan shape mismatch")]
     ColumnScanShapeMismatch,
     #[error("LWC block encoding invariant violated")]

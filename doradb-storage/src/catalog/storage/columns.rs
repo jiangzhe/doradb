@@ -83,7 +83,7 @@ impl Columns<'_> {
             PK_NO_COLUMNS,
             vec![Val::from(table_id), Val::from(column_no)],
         );
-        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
+        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }

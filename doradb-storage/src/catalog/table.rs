@@ -487,7 +487,12 @@ impl TableColumnLayout {
     /// Returns whether the type is matched at given column index.
     #[inline]
     pub(crate) fn col_type_match(&self, col_idx: usize, val: &Val) -> bool {
-        val.matches_kind(self.col_type(col_idx).kind)
+        let col_type = self.col_type(col_idx);
+        if matches!(val, Val::Null) {
+            col_type.nullable
+        } else {
+            val.matches_kind(col_type.kind)
+        }
     }
 
     /// Returns current column offset, compared to all nullable columns.
@@ -538,6 +543,78 @@ pub(crate) struct TableIndexLayout {
     index_cols: FastHashSet<usize>,
 }
 
+/// Borrowed primary-key metadata view with enough context to validate keys.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrimaryKeySpec<'a> {
+    index_no: usize,
+    index_spec: &'a IndexSpec,
+    column_layout: &'a TableColumnLayout,
+}
+
+impl<'a> PrimaryKeySpec<'a> {
+    /// Returns the stable table-local primary-key index number.
+    #[inline]
+    pub(crate) fn index_no(&self) -> usize {
+        self.index_no
+    }
+
+    /// Returns the primary-key index specification.
+    #[inline]
+    pub(crate) fn spec(&self) -> &'a IndexSpec {
+        self.index_spec
+    }
+
+    /// Returns whether the input key targets and matches this primary key.
+    #[inline]
+    pub(crate) fn matches_key(&self, key: &SelectKey) -> bool {
+        self.validate_key(key).is_ok()
+    }
+
+    /// Validates that the input key targets this primary key and matches its
+    /// column shape.
+    #[inline]
+    pub(crate) fn validate_key(
+        &self,
+        key: &SelectKey,
+    ) -> std::result::Result<(), PrimaryKeyMatchError> {
+        if key.index_no != self.index_no {
+            return Err(PrimaryKeyMatchError::IndexNo {
+                actual: key.index_no,
+                expected: self.index_no,
+            });
+        }
+        if key.vals.len() != self.index_spec.cols.len() {
+            return Err(PrimaryKeyMatchError::ValueCount {
+                actual: key.vals.len(),
+                expected: self.index_spec.cols.len(),
+            });
+        }
+        if !self
+            .index_spec
+            .cols
+            .iter()
+            .zip(&key.vals)
+            .all(|(index_key, val)| {
+                self.column_layout
+                    .col_type_match(usize::from(index_key.col_no), val)
+            })
+        {
+            return Err(PrimaryKeyMatchError::Type {
+                index_no: key.index_no,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why an input [`SelectKey`] does not match a primary-key specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrimaryKeyMatchError {
+    IndexNo { actual: usize, expected: usize },
+    ValueCount { actual: usize, expected: usize },
+    Type { index_no: usize },
+}
+
 impl TableIndexLayout {
     #[inline]
     fn try_create(
@@ -547,6 +624,7 @@ impl TableIndexLayout {
     ) -> Result<Self> {
         let index_specs =
             IndexSpecs::try_from_active(next_index_no, index_specs, column_layout.col_count())?;
+        validate_primary_key_contract(column_layout, &index_specs)?;
         let mut index_cols = FastHashSet::default();
         for index_spec in index_specs.values() {
             for key in &index_spec.cols {
@@ -656,6 +734,13 @@ impl TableIndexLayout {
         })
     }
 
+    /// Returns the primary-key index number and spec when this table has one.
+    #[inline]
+    pub(crate) fn primary_key_index(&self) -> Option<(usize, &IndexSpec)> {
+        self.active_indexes()
+            .find(|(_, index_spec)| index_spec.primary_key())
+    }
+
     /// Returns the sparse secondary-index specs.
     #[inline]
     pub(crate) fn index_specs(&self) -> &IndexSpecs {
@@ -685,9 +770,8 @@ impl TableIndexLayout {
         index
             .cols
             .iter()
-            .map(|k| column_layout.col_type(k.col_no as usize).kind)
             .zip(vals)
-            .all(|(kind, val)| val.matches_kind(kind))
+            .all(|(key, val)| column_layout.col_type_match(usize::from(key.col_no), val))
     }
 
     /// Returns index keys of a new row.
@@ -785,6 +869,18 @@ impl TableMetadata {
             col: column_layout,
             idx: index_layout,
         })
+    }
+
+    /// Returns the primary-key metadata view when this table has one.
+    #[inline]
+    pub(crate) fn primary_key(&self) -> Option<PrimaryKeySpec<'_>> {
+        self.idx
+            .primary_key_index()
+            .map(|(index_no, index_spec)| PrimaryKeySpec {
+                index_no,
+                index_spec,
+                column_layout: self.col.as_ref(),
+            })
     }
 
     #[inline]
@@ -966,6 +1062,7 @@ pub(crate) async fn create_table_for_session(
     let ctx = SessionDdlContext::new(&session)?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
+    reject_user_table_primary_key_indexes(&index_specs, "create table")?;
     let _namespace_lock = engine
         .lock_manager()
         .acquire_catalog_namespace_lock(ctx.owner, ctx.owner_group)
@@ -1221,6 +1318,31 @@ pub(crate) async fn validated_index_ddl_target(
         .await?;
     ensure_user_table_catalog_row(guards, engine, table_id, operation).await?;
     Ok(table)
+}
+
+/// Reject primary-key flags in public user-table DDL for now.
+#[inline]
+pub(crate) fn reject_user_table_primary_key_index(
+    index_spec: &IndexSpec,
+    operation: &'static str,
+) -> Result<()> {
+    if !index_spec.primary_key() {
+        return Ok(());
+    }
+    Err(invalid_index_spec(format!(
+        "{operation} does not support user-table primary keys"
+    )))
+}
+
+#[inline]
+fn reject_user_table_primary_key_indexes(
+    index_specs: &[IndexSpec],
+    operation: &'static str,
+) -> Result<()> {
+    for index_spec in index_specs {
+        reject_user_table_primary_key_index(index_spec, operation)?;
+    }
+    Ok(())
 }
 
 #[inline]
@@ -1532,6 +1654,34 @@ fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> R
     Ok(())
 }
 
+#[inline]
+fn validate_primary_key_contract(
+    column_layout: &TableColumnLayout,
+    index_specs: &IndexSpecs,
+) -> Result<()> {
+    let mut primary_key_index_no = None;
+    for (index_no, index_spec) in index_specs.active_indexes() {
+        if !index_spec.primary_key() {
+            continue;
+        }
+        if let Some(existing_index_no) = primary_key_index_no {
+            return Err(invalid_index_spec(format!(
+                "multiple primary keys: index_no {existing_index_no} and index_no {index_no}"
+            )));
+        }
+        for key in &index_spec.cols {
+            let col_no = usize::from(key.col_no);
+            if column_layout.nullable(col_no) {
+                return Err(invalid_index_spec(format!(
+                    "primary key index_no {index_no} references nullable column {col_no}"
+                )));
+            }
+        }
+        primary_key_index_no = Some(index_no);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,6 +1799,56 @@ mod tests {
         assert_eq!(metadata.idx.next_index_no(), 2);
         assert_eq!(metadata.idx.index_slot_count(), 2);
         assert_eq!(metadata.idx.active_index_count(), 2);
+        let primary_key = metadata
+            .primary_key()
+            .expect("metadata should expose primary key index");
+        assert_eq!(primary_key.index_no(), 0);
+        assert_eq!(primary_key.spec().cols, vec![IndexKey::new(0)]);
+    }
+
+    #[test]
+    fn test_primary_key_spec_validates_select_key() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+            ],
+            vec![
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
+            ],
+        )
+        .expect("valid table metadata");
+        let primary_key = metadata.primary_key().unwrap();
+
+        assert!(primary_key.matches_key(&SelectKey::new(0, vec![Val::from(42u32)])));
+        assert_eq!(
+            primary_key.validate_key(&SelectKey::new(1, vec![Val::from(42u32)])),
+            Err(PrimaryKeyMatchError::IndexNo {
+                actual: 1,
+                expected: 0
+            })
+        );
+        assert_eq!(
+            primary_key.validate_key(&SelectKey::new(0, vec![Val::from(42u32), Val::from(99u64)])),
+            Err(PrimaryKeyMatchError::ValueCount {
+                actual: 2,
+                expected: 1
+            })
+        );
+        assert_eq!(
+            primary_key.validate_key(&SelectKey::new(0, vec![Val::from(42u64)])),
+            Err(PrimaryKeyMatchError::Type { index_no: 0 })
+        );
+        assert_eq!(
+            primary_key.validate_key(&SelectKey::new(0, vec![Val::Null])),
+            Err(PrimaryKeyMatchError::Type { index_no: 0 })
+        );
+        assert!(
+            metadata
+                .idx
+                .index_type_match(metadata.col.as_ref(), 1, &[Val::Null])
+        );
     }
 
     #[test]
@@ -1794,6 +1994,66 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_table_metadata_rejects_multiple_primary_keys() {
+        let columns = vec![
+            ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+            ColumnSpec::new("c1", ValKind::U32, ColumnAttributes::empty()),
+        ];
+
+        let err = TableMetadata::try_new(
+            columns,
+            vec![
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK),
+            ],
+        )
+        .unwrap_err();
+
+        assert_invalid_index_spec(err, "multiple primary keys");
+    }
+
+    #[test]
+    fn test_table_metadata_rejects_sparse_multiple_primary_keys() {
+        let columns = vec![
+            ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+            ColumnSpec::new("c1", ValKind::U32, ColumnAttributes::empty()),
+        ];
+
+        let err = TableMetadata::try_new_with_next_index_no(
+            columns,
+            vec![
+                ActiveIndexSpec::new(
+                    0,
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                ),
+                ActiveIndexSpec::new(
+                    2,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK),
+                ),
+            ],
+            3,
+        )
+        .unwrap_err();
+
+        assert_invalid_index_spec(err, "multiple primary keys");
+    }
+
+    #[test]
+    fn test_table_metadata_rejects_nullable_primary_key_column() {
+        let err = TableMetadata::try_new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::NULLABLE,
+            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+        )
+        .unwrap_err();
+
+        assert_invalid_index_spec(err, "primary key index_no 0 references nullable column 0");
     }
 
     #[test]
@@ -2108,7 +2368,7 @@ mod tests {
                             crate::value::ValKind::I32,
                             ColumnAttributes::empty(),
                         )]),
-                        vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                        vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                     )
                     .await
             });
@@ -2153,7 +2413,7 @@ mod tests {
                         ValKind::I32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap_err();
@@ -2162,6 +2422,38 @@ mod tests {
                 err.report().downcast_ref::<ConfigError>().copied(),
                 Some(ConfigError::InvalidIndexSpec)
             );
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!session.in_trx().unwrap());
+            wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn test_create_table_rejects_primary_key_before_file_creation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "create_pk_rejected")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = engine.catalog().curr_next_table_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+
+            let err = session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "id",
+                        ValKind::I32,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                )
+                .await
+                .unwrap_err();
+
+            assert_invalid_index_spec(err, "create table does not support user-table primary keys");
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;

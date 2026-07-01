@@ -13,7 +13,7 @@ use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable, IndexSpec,
-    USER_OBJ_ID_START,
+    PrimaryKeyMatchError, USER_OBJ_ID_START,
 };
 use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
@@ -525,7 +525,7 @@ impl CatalogStorage {
         let need_key_lookup = table_ops.iter().any(|kind| {
             matches!(
                 kind,
-                RowRedoKind::DeleteByUniqueKey(_) | RowRedoKind::UpdateByUniqueKey(..)
+                RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..)
             )
         });
         let mut existing_rows = if need_key_lookup {
@@ -555,8 +555,8 @@ impl CatalogStorage {
                     });
                     next_row_id = next_row_id.saturating_add(1);
                 }
-                RowRedoKind::DeleteByUniqueKey(key) => {
-                    let index_spec = validate_catalog_delete_key(metadata, key)?;
+                RowRedoKind::DeleteByPrimaryKey(key) => {
+                    let index_spec = validate_catalog_delete_primary_key(metadata, key)?;
                     if let Some(row_idx) =
                         find_pending_key_match(&pending_rows, index_spec, &key.vals)?
                     {
@@ -586,12 +586,12 @@ impl CatalogStorage {
                             .insert(delta as u32);
                     }
                 }
-                RowRedoKind::UpdateByUniqueKey(key, update) => {
-                    let index_spec = validate_catalog_update_key(metadata, key)?;
+                RowRedoKind::UpdateByPrimaryKey(key, update) => {
+                    let index_spec = validate_catalog_update_primary_key(metadata, key)?;
                     if let Some(row_idx) =
                         find_pending_key_match(&pending_rows, index_spec, &key.vals)?
                     {
-                        apply_catalog_update_by_key(
+                        apply_catalog_update_by_primary_key(
                             metadata,
                             index_spec,
                             key,
@@ -604,14 +604,16 @@ impl CatalogStorage {
                         find_existing_key_match(&existing_rows, index_spec, &key.vals)?
                     else {
                         return Err(invalid_catalog_payload(format!(
-                            "catalog checkpoint update-by-key target missing: index_no={}, key_vals={:?}",
+                            "catalog checkpoint update-by-primary-key target missing: index_no={}, key_vals={:?}",
                             key.index_no, key.vals
                         )));
                     };
                     let row = &mut existing_rows[row_idx];
                     mark_existing_row_deleted(row, &mut delete_deltas)?;
                     let mut vals = row.vals.clone();
-                    apply_catalog_update_by_key(metadata, index_spec, key, &mut vals, update)?;
+                    apply_catalog_update_by_primary_key(
+                        metadata, index_spec, key, &mut vals, update,
+                    )?;
                     pending_rows.push(PendingInsertRow {
                         row_id: next_row_id,
                         vals,
@@ -621,7 +623,7 @@ impl CatalogStorage {
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     return Err(invalid_catalog_payload(
-                        "catalog checkpoint table op must be insert, delete-by-key, or update-by-key",
+                        "catalog checkpoint table op must be insert, delete-by-primary-key, or update-by-primary-key",
                     ));
                 }
             }
@@ -1306,74 +1308,49 @@ fn validate_catalog_reachable_block(root: &MultiTableActiveRoot, block_id: Block
     Ok(())
 }
 
-fn validate_catalog_delete_key<'a>(
+fn validate_catalog_delete_primary_key<'a>(
     metadata: &'a TableMetadata,
     key: &SelectKey,
 ) -> Result<&'a IndexSpec> {
-    let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+    validate_catalog_primary_key(metadata, key, "delete")
+}
+
+fn validate_catalog_update_primary_key<'a>(
+    metadata: &'a TableMetadata,
+    key: &SelectKey,
+) -> Result<&'a IndexSpec> {
+    validate_catalog_primary_key(metadata, key, "update")
+}
+
+fn validate_catalog_primary_key<'a>(
+    metadata: &'a TableMetadata,
+    key: &SelectKey,
+    operation: &'static str,
+) -> Result<&'a IndexSpec> {
+    let Some(primary_key) = metadata.primary_key() else {
         return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint delete key index not found: index_no={}, index_slot_count={}",
-            key.index_no,
-            metadata.idx.index_slot_count()
+            "catalog checkpoint {operation} primary key not found"
         )));
     };
-    if index_spec.cols.len() != key.vals.len() {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint delete key value count {} does not match index column count {}",
-            key.vals.len(),
-            index_spec.cols.len()
-        )));
-    }
-    let col_count = metadata.col.col_count();
-    for index_key in &index_spec.cols {
-        let col_idx = usize::from(index_key.col_no);
-        if col_idx >= col_count {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint delete key column out of range: index_no={}, column_no={}, column_count={}",
-                key.index_no, index_key.col_no, col_count
-            )));
+    match primary_key.validate_key(key) {
+        Ok(()) => Ok(primary_key.spec()),
+        Err(PrimaryKeyMatchError::IndexNo { actual, expected }) => {
+            Err(invalid_catalog_payload(format!(
+                "catalog checkpoint {operation} key is not primary key: index_no={actual}, primary_key_index_no={expected}",
+            )))
         }
+        Err(PrimaryKeyMatchError::ValueCount { actual, expected }) => {
+            Err(invalid_catalog_payload(format!(
+                "catalog checkpoint {operation} key value count {actual} does not match primary key column count {expected}",
+            )))
+        }
+        Err(PrimaryKeyMatchError::Type { index_no }) => Err(invalid_catalog_payload(format!(
+            "catalog checkpoint {operation} key type mismatch: index_no={index_no}",
+        ))),
     }
-    Ok(index_spec)
 }
 
-fn validate_catalog_update_key<'a>(
-    metadata: &'a TableMetadata,
-    key: &SelectKey,
-) -> Result<&'a IndexSpec> {
-    let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint update key index not found: index_no={}, index_slot_count={}",
-            key.index_no,
-            metadata.idx.index_slot_count()
-        )));
-    };
-    if !index_spec.unique() {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint update key must be unique: index_no={}",
-            key.index_no
-        )));
-    }
-    if index_spec.cols.len() != key.vals.len() {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint update key value count {} does not match index column count {}",
-            key.vals.len(),
-            index_spec.cols.len()
-        )));
-    }
-    if !metadata
-        .idx
-        .index_type_match(metadata.col.as_ref(), key.index_no, &key.vals)
-    {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint update key type mismatch: index_no={}",
-            key.index_no
-        )));
-    }
-    Ok(index_spec)
-}
-
-fn apply_catalog_update_by_key(
+fn apply_catalog_update_by_primary_key(
     metadata: &TableMetadata,
     index_spec: &IndexSpec,
     key: &SelectKey,
@@ -1408,12 +1385,22 @@ fn apply_catalog_update_by_key(
                 update_col.idx
             )));
         }
+        if index_spec
+            .cols
+            .iter()
+            .any(|index_key| usize::from(index_key.col_no) == update_col.idx)
+        {
+            return Err(invalid_catalog_payload(format!(
+                "catalog checkpoint update cannot change primary key column: column_no={}",
+                update_col.idx
+            )));
+        }
         row[update_col.idx] = update_col.val.clone();
         last_idx = Some(update_col.idx);
     }
     if !row_matches_key(index_spec, row, &key.vals) {
         return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint update-by-key changed stable key: index_no={}, key_vals={:?}",
+            "catalog checkpoint update-by-primary-key changed stable key: index_no={}, key_vals={:?}",
             key.index_no, key.vals
         )));
     }
@@ -1547,6 +1534,35 @@ pub(crate) mod tests {
             }
         }
 
+        #[test]
+        fn test_static_catalog_definitions_expose_one_primary_key() {
+            for CatalogDefinition { table_id, metadata } in [
+                catalog_definition_of_tables(),
+                catalog_definition_of_columns(),
+                catalog_definition_of_indexes(),
+                catalog_definition_of_index_columns(),
+                catalog_definition_of_table_replay_silent_watermarks(),
+            ] {
+                let primary_keys = metadata
+                    .idx
+                    .active_indexes()
+                    .filter(|(_, index_spec)| index_spec.primary_key())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    primary_keys.len(),
+                    1,
+                    "catalog table {table_id} must expose exactly one primary key"
+                );
+                for key in &primary_keys[0].1.cols {
+                    assert!(
+                        !metadata.col.nullable(usize::from(key.col_no)),
+                        "catalog table {table_id} primary key column {} must be non-null",
+                        key.col_no
+                    );
+                }
+            }
+        }
+
         async fn apply_metadata_only_checkpoint(
             storage: &CatalogStorage,
             next_table_id: TableID,
@@ -1655,7 +1671,7 @@ pub(crate) mod tests {
                 sealed_redo_segments: Vec::new(),
                 catalog_ops: vec![CatalogRedoEntry {
                     table_id: TableID::new(0),
-                    kind: RowRedoKind::DeleteByUniqueKey(key),
+                    kind: RowRedoKind::DeleteByPrimaryKey(key),
                 }],
                 catalog_ddl_txn_count: 0,
                 stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
@@ -1777,12 +1793,12 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn test_catalog_checkpoint_rejects_delete_key_index_not_found() {
+        fn test_catalog_checkpoint_rejects_delete_key_non_primary_key() {
             smol::block_on(async {
                 assert_checkpoint_rejects_delete_key(
-                    "catalog-delete-key-index-not-found",
+                    "catalog-delete-key-non-primary",
                     SelectKey::new(1, vec![Val::from(USER_OBJ_ID_START)]),
-                    "catalog checkpoint delete key index not found",
+                    "catalog checkpoint delete key is not primary key",
                 )
                 .await;
             });
@@ -1797,7 +1813,7 @@ pub(crate) mod tests {
                         0,
                         vec![Val::from(USER_OBJ_ID_START), Val::from(0u16)],
                     ),
-                    "catalog checkpoint delete key value count 2 does not match index column count 1",
+                    "catalog checkpoint delete key value count 2 does not match primary key column count 1",
                 )
                 .await;
             });
@@ -1814,7 +1830,8 @@ pub(crate) mod tests {
                 let storage = &engine.catalog().storage;
                 let table = storage.get_catalog_table(TableID::new(0)).unwrap();
                 let key = SelectKey::new(0, vec![Val::from(USER_OBJ_ID_START)]);
-                let index_spec = validate_catalog_delete_key(table.metadata(), &key).unwrap();
+                let index_spec =
+                    validate_catalog_delete_primary_key(table.metadata(), &key).unwrap();
                 let err = validate_key_candidate_row(index_spec, &[]).unwrap_err();
 
                 assert_eq!(
@@ -2050,7 +2067,7 @@ pub(crate) mod tests {
                         },
                         CatalogRedoEntry {
                             table_id: TableID::new(0),
-                            kind: RowRedoKind::DeleteByUniqueKey(SelectKey::new(
+                            kind: RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
                                 0,
                                 vec![Val::from(table_id)],
                             )),
@@ -2079,7 +2096,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn test_catalog_checkpoint_update_by_key_updates_same_batch_insert() {
+        fn test_catalog_checkpoint_update_by_primary_key_updates_same_batch_insert() {
             smol::block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let main_dir = temp_dir.path().to_path_buf();
@@ -2100,7 +2117,7 @@ pub(crate) mod tests {
                         },
                         CatalogRedoEntry {
                             table_id: TableID::new(0),
-                            kind: RowRedoKind::UpdateByUniqueKey(
+                            kind: RowRedoKind::UpdateByPrimaryKey(
                                 SelectKey::new(0, vec![Val::from(table_id)]),
                                 vec![UpdateCol {
                                     idx: 1,
@@ -2127,7 +2144,54 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn test_catalog_checkpoint_update_by_key_replaces_existing_row() {
+        fn test_catalog_checkpoint_update_by_primary_key_rejects_primary_key_column() {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let main_dir = temp_dir.path().to_path_buf();
+                let engine =
+                    open_catalog_test_engine(main_dir, Some("catalog-update-pk-column")).await;
+
+                let storage = &engine.catalog().storage;
+                let table_id = USER_OBJ_ID_START + 6262;
+                let batch = checkpoint_batch_with_ops(
+                    storage,
+                    vec![
+                        CatalogRedoEntry {
+                            table_id: TableID::new(0),
+                            kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                        },
+                        CatalogRedoEntry {
+                            table_id: TableID::new(0),
+                            kind: RowRedoKind::UpdateByPrimaryKey(
+                                SelectKey::new(0, vec![Val::from(table_id)]),
+                                vec![UpdateCol {
+                                    idx: 0,
+                                    val: Val::from(table_id),
+                                }],
+                            ),
+                        },
+                    ],
+                );
+
+                let err = storage
+                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                    .await
+                    .unwrap_err();
+
+                assert_eq!(
+                    err.data_integrity_error(),
+                    Some(DataIntegrityError::InvalidPayload)
+                );
+                let report = format!("{err:?}");
+                assert!(
+                    report.contains("catalog checkpoint update cannot change primary key column"),
+                    "{report}"
+                );
+            });
+        }
+
+        #[test]
+        fn test_catalog_checkpoint_update_by_primary_key_replaces_existing_row() {
             smol::block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let main_dir = temp_dir.path().to_path_buf();
@@ -2147,7 +2211,7 @@ pub(crate) mod tests {
                     storage,
                     vec![CatalogRedoEntry {
                         table_id: TableID::new(0),
-                        kind: RowRedoKind::UpdateByUniqueKey(
+                        kind: RowRedoKind::UpdateByPrimaryKey(
                             SelectKey::new(0, vec![Val::from(table_id)]),
                             vec![UpdateCol {
                                 idx: 1,
@@ -2239,7 +2303,7 @@ pub(crate) mod tests {
                 let table_id = USER_OBJ_ID_START + 42;
                 let table_ops = vec![
                     RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
-                    RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
+                    RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
                 ];
                 let mut mutable =
                     MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
@@ -2289,7 +2353,7 @@ pub(crate) mod tests {
                 let table_id = USER_OBJ_ID_START + 4242;
                 let table_ops = vec![
                     RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
-                    RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
+                    RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
                 ];
                 let mut mutable =
                     MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());

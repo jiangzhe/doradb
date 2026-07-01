@@ -91,9 +91,8 @@ impl TableReplaySilentWatermarks<'_> {
                     && existing.deletion_cutoff_ts <= obj.deletion_cutoff_ts
             })
         });
-        stmt.catalog_upsert_unique_mvcc(
+        stmt.catalog_upsert_primary_key_mvcc(
             self.table,
-            PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
             cols_from_table_replay_silent_watermark(obj),
         )
         .await?;
@@ -111,7 +110,7 @@ impl TableReplaySilentWatermarks<'_> {
             vec![Val::from(table_id)],
         );
         let res = stmt
-            .catalog_delete_unique_mvcc(self.table, &key, true)
+            .catalog_delete_primary_key_mvcc(self.table, &key, true)
             .await?;
         Ok(matches!(res, DeleteMvcc::Deleted))
     }
@@ -316,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_replay_silent_watermark_upsert_logs_keyed_update() {
+    fn test_table_replay_silent_watermark_upsert_logs_primary_key_update() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = open_catalog_test_engine(temp_dir.path().to_path_buf(), None).await;
@@ -367,7 +366,7 @@ mod tests {
                 assert_eq!(table_dml.rows.len(), 1);
                 let row_redo = table_dml.rows.values().next().unwrap();
                 match &row_redo.kind {
-                    RowRedoKind::UpdateByUniqueKey(key, cols) => {
+                    RowRedoKind::UpdateByPrimaryKey(key, cols) => {
                         assert_eq!(key.index_no, PK_NO_TABLE_REPLAY_SILENT_WATERMARKS);
                         assert_eq!(key.vals, vec![Val::from(table_id)]);
                         assert_eq!(
@@ -384,7 +383,7 @@ mod tests {
                             ]
                         );
                     }
-                    kind => panic!("expected keyed update redo, got {kind:?}"),
+                    kind => panic!("expected primary-key update redo, got {kind:?}"),
                 }
                 Ok(())
             })

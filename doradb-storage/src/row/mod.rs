@@ -1820,7 +1820,7 @@ mod tests {
             )],
             vec![IndexSpec {
                 cols: vec![IndexKey::new(0)],
-                attributes: IndexAttributes::PK,
+                attributes: IndexAttributes::UK,
             }],
         )
         .expect("valid table metadata");
@@ -1887,7 +1887,7 @@ mod tests {
             ],
             vec![IndexSpec {
                 cols: vec![IndexKey::new(0)],
-                attributes: IndexAttributes::PK,
+                attributes: IndexAttributes::UK,
             }],
         )
         .expect("valid table metadata");

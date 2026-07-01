@@ -65,7 +65,7 @@ impl Tables<'_> {
     /// Delete a table by id.
     pub(crate) async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
-        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
+        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }

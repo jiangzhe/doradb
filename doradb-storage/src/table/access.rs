@@ -2871,7 +2871,7 @@ impl<'a> UserTableAccessor<'a> {
                                     );
                                     effects.push_row_undo(undo);
                                     let redo_kind = if log_by_key {
-                                        RowRedoKind::DeleteByUniqueKey(key.clone())
+                                        RowRedoKind::DeleteByPrimaryKey(key.clone())
                                     } else {
                                         RowRedoKind::Delete
                                     };
@@ -3284,7 +3284,7 @@ mod tests {
                             ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
                         ]),
                         vec![
-                            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
                             IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
                         ],
                     )
@@ -6191,7 +6191,7 @@ mod tests {
                 .unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
-            let mut index_specs = vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)];
+            let mut index_specs = vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)];
             for _ in 0..12 {
                 index_specs.push(IndexSpec::new(
                     vec![IndexKey::new(1)],

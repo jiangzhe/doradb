@@ -1,4 +1,6 @@
-use super::table::{precheck_index_ddl_target, validated_index_ddl_target};
+use super::table::{
+    precheck_index_ddl_target, reject_user_table_primary_key_index, validated_index_ddl_target,
+};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{
     IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
@@ -397,6 +399,7 @@ pub(crate) async fn create_index_for_session(
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
+    reject_user_table_primary_key_index(&index_spec, "create index")?;
 
     // 1. Validate the target and acquire table-local DDL exclusion before
     // deriving any new metadata or touching mutable table roots.
@@ -1490,6 +1493,7 @@ mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::error::ConfigError;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::row::ops::{DeleteMvcc, SelectKey};
@@ -1848,6 +1852,41 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+            assert_root_metadata_unchanged(&root_before, &table);
+            assert_eq!(table.layout_snapshot().generation(), old_generation);
+            assert_eq!(table.metadata().idx.next_index_no(), 1);
+            assert!(table.metadata().idx.index_spec(1).is_none());
+        });
+    }
+
+    #[test]
+    fn test_create_index_rejects_primary_key_without_publish() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_pk_rejected").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_before = table.file().active_root_unchecked().clone();
+            let old_generation = table.layout_snapshot().generation();
+            let mut session = engine.new_session().unwrap();
+
+            let err = session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::InvalidIndexSpec)
+            );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("create index does not support user-table primary keys"),
+                "{report}"
+            );
             assert_root_metadata_unchanged(&root_before, &table);
             assert_eq!(table.layout_snapshot().generation(), old_generation);
             assert_eq!(table.metadata().idx.next_index_no(), 1);

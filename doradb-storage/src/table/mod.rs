@@ -1773,7 +1773,7 @@ pub(crate) mod tests {
                     ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                 ]),
                 vec![
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
                     IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
                 ],
             )
@@ -2024,7 +2024,7 @@ pub(crate) mod tests {
                 ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
             ]),
             vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
                 IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             ],
         )

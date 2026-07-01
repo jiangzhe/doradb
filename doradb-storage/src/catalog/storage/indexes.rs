@@ -70,7 +70,7 @@ impl Indexes<'_> {
             PK_NO_INDEXES,
             vec![Val::from(table_id), Val::from(index_no)],
         );
-        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
+        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
@@ -154,7 +154,7 @@ impl IndexColumns<'_> {
                 Val::from(index_column_no),
             ],
         );
-        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
+        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }

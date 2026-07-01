@@ -189,7 +189,7 @@ impl<'m, 'r> HotRowDeleter<'m, 'r> {
                     page_id,
                     row_id,
                     kind: if log_by_key {
-                        RowRedoKind::DeleteByUniqueKey(key.clone())
+                        RowRedoKind::DeleteByPrimaryKey(key.clone())
                     } else {
                         RowRedoKind::Delete
                     },
@@ -356,7 +356,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                             row_id,
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
                             kind: if log_by_key {
-                                RowRedoKind::DeleteByUniqueKey(key.clone())
+                                RowRedoKind::DeleteByPrimaryKey(key.clone())
                             } else {
                                 RowRedoKind::Delete
                             },
@@ -405,7 +405,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                                 page_id,
                                 row_id,
                                 kind: if log_by_key {
-                                    RowRedoKind::UpdateByUniqueKey(key.clone(), redo_cols)
+                                    RowRedoKind::UpdateByPrimaryKey(key.clone(), redo_cols)
                                 } else {
                                     RowRedoKind::Update(redo_cols)
                                 },
