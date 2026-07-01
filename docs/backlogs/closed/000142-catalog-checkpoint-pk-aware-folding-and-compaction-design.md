@@ -43,3 +43,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000207-catalog-checkpoint-pk-folding-and-compaction.md. Remaining affected-block strategy work was split to docs/backlogs/000144-catalog-checkpoint-affected-block-compaction-strategy.md.
+- Closed By: backlog close
+- Reference: docs/tasks/000207-catalog-checkpoint-pk-folding-and-compaction.md
+- Closed At: 2026-07-02

@@ -1,7 +1,7 @@
 ---
 id: 000207
 title: Catalog Checkpoint PK Folding And Compaction
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-01
 github_issue: 800
 ---
@@ -25,7 +25,7 @@ is unchanged, the existing catalog table root is reused.
 `- codex`
 
 `Source Backlogs:`
-`- docs/backlogs/000142-catalog-checkpoint-pk-aware-folding-and-compaction-design.md`
+`- docs/backlogs/closed/000142-catalog-checkpoint-pk-aware-folding-and-compaction-design.md`
 
 Task `000203` added keyed redo for
 `catalog.table_replay_silent_watermarks` so catalog checkpoint and recovery can
@@ -183,6 +183,33 @@ absent.
 
 ## Implementation Notes
 
+- Implemented PK-aware catalog checkpoint folding in
+  `catalog/storage/merge.rs` using `CatalogMergeKeyBuilder`,
+  `BTreeKeyEncoder`, `BTreeKey`, and one
+  `BTreeMap<BTreeKey, FoldedCatalogEntry>` state map. Folded output
+  materializes in encoded primary-key order, and unchanged final base state
+  skips root rewrite through `CatalogFoldedRows::should_rewrite()`.
+- Reworked changed catalog-table checkpoint materialization to load base rows
+  with `load_rows_from_root()`, validate root shape, row ids, row values, and
+  duplicate primary keys, debug-assert empty delete deltas, and publish dense
+  compact roots with empty delete-delta payloads. Empty folded output publishes
+  `root_block_id = None` and `pivot_row_id = RowID::new(0)`.
+- Refactored catalog checkpoint scan so the caller supplies durable upper CTS
+  and owned scan config, keeping scan/order policy and publication semantics
+  intact for silent watermark overlays, combined checkpoint plus redo
+  truncation planning, recovery, and catalog allocation-map rebuilds.
+- Refactored B-tree multi-column key encoding behind an internal
+  `MultiKeyEncoder` while keeping catalog storage dependent only on
+  `BTreeKeyEncoder` and `BTreeKey`.
+- Main plan deviations were intentional simplifications from implementation
+  review: catalog folding uses `BTreeKey` directly instead of a catalog-local
+  raw-byte merge key, does not preserve scan order for output, performs
+  delete-delta root checks only in debug assertions, and leaves affected-block
+  CoW strategy design to
+  `docs/backlogs/000144-catalog-checkpoint-affected-block-compaction-strategy.md`.
+- Validation passed with `tools/style_audit.rs --diff-base origin/main` and
+  `cargo nextest run -p doradb-storage`.
+
 ## Impacts
 
 - `doradb-storage/src/index/btree/key.rs`
@@ -272,4 +299,5 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 - Affected-block CoW compaction remains intentionally out of scope. If compact
   full-root rewrite becomes too expensive for larger future catalog tables, a
   follow-up should design the required block-local rewrite APIs plus a strategy
-  selector.
+  selector. This follow-up is tracked by
+  `docs/backlogs/000144-catalog-checkpoint-affected-block-compaction-strategy.md`.
