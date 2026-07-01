@@ -1349,6 +1349,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     /// any row id. Fixed-size updates, such as silent-watermark replay, usually
     /// fit in place. Variable-length non-indexed updates can outgrow the current
     /// row page; in that case this helper relocates the row with delete+insert.
+    ///
+    /// This helper does not provide local undo. Recovery callers propagate any
+    /// error and abort engine startup before the partially rebuilt in-memory
+    /// catalog can be exposed.
     #[inline]
     pub(crate) async fn update_primary_key_no_trx(
         &self,
@@ -1427,6 +1431,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     // Catalog redo is logical by primary key. When variable-length
                     // values do not fit the current in-memory row page, rebuild the
                     // row at a new row id and refresh indexes through delete+insert.
+                    // If the replacement insert fails after the delete, recovery
+                    // fails immediately; the partially rebuilt engine is discarded
+                    // instead of trying to undo no-trx state.
                     let mut row_vals = row.clone_vals(metadata.col.as_ref());
                     for update_col in update {
                         row_vals[update_col.idx] = update_col.val.clone();

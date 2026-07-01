@@ -998,8 +998,7 @@ impl<'a> RecoveryCoordinator<'a> {
                         .await?;
                 }
                 RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
-                    // We do not allow key-based catalog redo on data tables.
-                    unreachable!();
+                    return Err(invalid_user_table_keyed_redo(table_id, row, cts));
                 }
             }
         }
@@ -1052,9 +1051,21 @@ fn unexpected_unsealed_terminal_error() -> Error {
         .into()
 }
 
+#[inline]
+fn invalid_user_table_keyed_redo(table_id: TableID, row: &RowRedo, cts: TrxID) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "key-based catalog redo is invalid for user table replay: table_id={table_id}, page_id={}, row_id={}, cts={cts}, kind={:?}",
+            row.page_id, row.row_id, row.kind
+        ))
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryCoordinator, validate_create_table_reloaded_root_ts};
+    use super::{
+        RecoveryCoordinator, invalid_user_table_keyed_redo, validate_create_table_reloaded_root_ts,
+    };
     use crate::buffer::PoolRole;
     use crate::catalog::storage::{SilentWatermarkObject, publish_first_redo_log_seq_for_test};
     use crate::catalog::{
@@ -1119,6 +1130,49 @@ mod tests {
         assert!(report.contains("table-file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+    }
+
+    #[test]
+    fn test_invalid_user_table_keyed_redo_reports_invalid_payload() {
+        let table_id = TableID::new(42);
+        let cts = TrxID::new(11);
+        let cases = [
+            (
+                "DeleteByPrimaryKey",
+                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(42u64)])),
+            ),
+            (
+                "UpdateByPrimaryKey",
+                RowRedoKind::UpdateByPrimaryKey(
+                    SelectKey::new(0, vec![Val::from(42u64)]),
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from(7u64),
+                    }],
+                ),
+            ),
+        ];
+
+        for (expected_kind, kind) in cases {
+            let row = RowRedo {
+                page_id: PageID::new(7),
+                row_id: RowID::new(9),
+                kind,
+            };
+            let err = invalid_user_table_keyed_redo(table_id, &row, cts);
+            let report = format!("{err:?}");
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload),
+                "{report}"
+            );
+            assert!(report.contains("key-based catalog redo"), "{report}");
+            assert!(report.contains("table_id=42"), "{report}");
+            assert!(report.contains("page_id=7"), "{report}");
+            assert!(report.contains("row_id=9"), "{report}");
+            assert!(report.contains("cts=11"), "{report}");
+            assert!(report.contains(expected_kind), "{report}");
+        }
     }
 
     fn lightweight_recovery_engine_config(
