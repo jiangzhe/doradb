@@ -19,6 +19,7 @@ use error_stack::Report;
 use semistr::SemiStr;
 use std::mem;
 use std::ops::Index;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 #[cfg(test)]
 use tests::{
@@ -543,78 +544,6 @@ pub(crate) struct TableIndexLayout {
     index_cols: FastHashSet<usize>,
 }
 
-/// Borrowed primary-key metadata view with enough context to validate keys.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PrimaryKeySpec<'a> {
-    index_no: usize,
-    index_spec: &'a IndexSpec,
-    column_layout: &'a TableColumnLayout,
-}
-
-impl<'a> PrimaryKeySpec<'a> {
-    /// Returns the stable table-local primary-key index number.
-    #[inline]
-    pub(crate) fn index_no(&self) -> usize {
-        self.index_no
-    }
-
-    /// Returns the primary-key index specification.
-    #[inline]
-    pub(crate) fn spec(&self) -> &'a IndexSpec {
-        self.index_spec
-    }
-
-    /// Returns whether the input key targets and matches this primary key.
-    #[inline]
-    pub(crate) fn matches_key(&self, key: &SelectKey) -> bool {
-        self.validate_key(key).is_ok()
-    }
-
-    /// Validates that the input key targets this primary key and matches its
-    /// column shape.
-    #[inline]
-    pub(crate) fn validate_key(
-        &self,
-        key: &SelectKey,
-    ) -> std::result::Result<(), PrimaryKeyMatchError> {
-        if key.index_no != self.index_no {
-            return Err(PrimaryKeyMatchError::IndexNo {
-                actual: key.index_no,
-                expected: self.index_no,
-            });
-        }
-        if key.vals.len() != self.index_spec.cols.len() {
-            return Err(PrimaryKeyMatchError::ValueCount {
-                actual: key.vals.len(),
-                expected: self.index_spec.cols.len(),
-            });
-        }
-        if !self
-            .index_spec
-            .cols
-            .iter()
-            .zip(&key.vals)
-            .all(|(index_key, val)| {
-                self.column_layout
-                    .col_type_match(usize::from(index_key.col_no), val)
-            })
-        {
-            return Err(PrimaryKeyMatchError::Type {
-                index_no: key.index_no,
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Why an input [`SelectKey`] does not match a primary-key specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrimaryKeyMatchError {
-    IndexNo { actual: usize, expected: usize },
-    ValueCount { actual: usize, expected: usize },
-    Type { index_no: usize },
-}
-
 impl TableIndexLayout {
     #[inline]
     fn try_create(
@@ -819,6 +748,75 @@ impl TableIndexLayout {
             .zip(&key.vals)
             .all(|(key, val)| &row[key.col_no as usize] == val)
     }
+}
+
+/// Borrowed primary-key metadata view with enough context to validate keys.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrimaryKeySpec<'a> {
+    index_no: usize,
+    index_spec: &'a IndexSpec,
+    column_layout: &'a TableColumnLayout,
+}
+
+impl<'a> PrimaryKeySpec<'a> {
+    /// Returns the stable table-local primary-key index number.
+    #[inline]
+    pub(crate) fn index_no(&self) -> usize {
+        self.index_no
+    }
+
+    /// Returns the primary-key index specification.
+    #[inline]
+    pub(crate) fn spec(&self) -> &'a IndexSpec {
+        self.index_spec
+    }
+
+    /// Returns whether the input key targets and matches this primary key.
+    #[inline]
+    pub(crate) fn matches_key(&self, key: &SelectKey) -> bool {
+        self.validate_key(key).is_ok()
+    }
+
+    /// Validates that the input key targets this primary key and matches its
+    /// column shape.
+    #[inline]
+    pub(crate) fn validate_key(&self, key: &SelectKey) -> StdResult<(), PrimaryKeyMatchError> {
+        if key.index_no != self.index_no {
+            return Err(PrimaryKeyMatchError::IndexNo {
+                actual: key.index_no,
+                expected: self.index_no,
+            });
+        }
+        if key.vals.len() != self.index_spec.cols.len() {
+            return Err(PrimaryKeyMatchError::ValueCount {
+                actual: key.vals.len(),
+                expected: self.index_spec.cols.len(),
+            });
+        }
+        if !self
+            .index_spec
+            .cols
+            .iter()
+            .zip(&key.vals)
+            .all(|(index_key, val)| {
+                self.column_layout
+                    .col_type_match(usize::from(index_key.col_no), val)
+            })
+        {
+            return Err(PrimaryKeyMatchError::Type {
+                index_no: key.index_no,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why an input [`SelectKey`] does not match a primary-key specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrimaryKeyMatchError {
+    IndexNo { actual: usize, expected: usize },
+    ValueCount { actual: usize, expected: usize },
+    Type { index_no: usize },
 }
 
 /// Table metadata including column layout and index layout.
