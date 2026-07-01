@@ -142,15 +142,13 @@ impl CatalogFoldedRows {
                 *entry = FoldedCatalogEntry::Update(updated_vals);
             }
             FoldedCatalogEntry::Insert(vals) | FoldedCatalogEntry::Update(vals) => {
-                let mut updated_vals = vals.clone();
                 apply_catalog_update_by_primary_key(
                     metadata,
                     &self.key_builder,
                     key,
-                    &mut updated_vals,
+                    vals.as_mut_slice(),
                     update,
                 )?;
-                *vals = updated_vals;
             }
             FoldedCatalogEntry::Delete => {
                 return Err(invalid_catalog_payload(format!(
