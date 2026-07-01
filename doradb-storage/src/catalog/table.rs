@@ -3896,9 +3896,13 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             session.drop_table(table_id).await.unwrap();
+            let trx_sys = &engine.inner().trx_sys;
             let batch = engine
                 .catalog()
-                .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .scan_checkpoint_batch(
+                    trx_sys.persisted_watermark_cts(),
+                    trx_sys.catalog_checkpoint_scan_config().unwrap(),
+                )
                 .await
                 .unwrap();
 

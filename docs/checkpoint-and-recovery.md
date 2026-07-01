@@ -223,6 +223,13 @@ If only overlay metadata changed, it skips the trace and clears only the
 displaced meta block. The displaced active catalog root is not kept as a
 protected reader root.
 
+Changed catalog table roots are materialized as compact logical snapshots.
+Checkpoint folds scanned catalog row redo by each catalog table's internal
+primary key, merges the folded deltas with checkpoint-visible catalog rows, and
+rewrites the changed table root with fresh dense row ids. Persisted catalog
+roots contain only final live rows and empty delete-delta payloads; catalog
+root loading rejects non-empty persisted delete deltas as invalid payload.
+
 ### 4.3 No Independent Index Checkpoint
 
 The design explicitly does **not** do the following:

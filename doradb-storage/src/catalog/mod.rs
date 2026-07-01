@@ -1887,9 +1887,13 @@ pub(crate) mod tests {
             let _ = table1(&engine).await;
             let _ = table2(&engine).await;
 
+            let trx_sys = &engine.inner().trx_sys;
             let batch1 = engine
                 .catalog()
-                .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .scan_checkpoint_batch(
+                    trx_sys.persisted_watermark_cts(),
+                    trx_sys.catalog_checkpoint_scan_config().unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(batch1.catalog_ddl_txn_count, 2);
@@ -1908,7 +1912,10 @@ pub(crate) mod tests {
 
             let batch2 = engine
                 .catalog()
-                .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .scan_checkpoint_batch(
+                    trx_sys.persisted_watermark_cts(),
+                    trx_sys.catalog_checkpoint_scan_config().unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(batch2.catalog_ddl_txn_count, 0);

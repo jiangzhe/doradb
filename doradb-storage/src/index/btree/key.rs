@@ -216,11 +216,7 @@ impl KeyEncoder for PrefixKeyEncoder {
 /// Encoder for single-column and composite B-tree keys.
 pub(crate) enum BTreeKeyEncoder {
     Single(SingleKeyEncoder),
-    Multi {
-        prefix: Box<[PrefixKeyEncoder]>,
-        suffix: SingleKeyEncoder,
-        encode_len: Option<usize>,
-    },
+    Multi(MultiKeyEncoder),
 }
 
 impl BTreeKeyEncoder {
@@ -232,8 +228,69 @@ impl BTreeKeyEncoder {
             let ty = val_types.pop().unwrap();
             return BTreeKeyEncoder::Single(SingleKeyEncoder(ty));
         }
-        let last_ty = val_types.pop().unwrap();
+        BTreeKeyEncoder::Multi(MultiKeyEncoder::new(val_types))
+    }
 
+    /// Encode keys into a memory-comparable b-tree key.
+    #[inline]
+    pub(crate) fn encode<V: Borrow<Val>>(&self, keys: &[V]) -> BTreeKey {
+        match self {
+            BTreeKeyEncoder::Single(e) => {
+                debug_assert!(keys.len() == 1);
+                e.encode_single(keys[0].borrow())
+            }
+            BTreeKeyEncoder::Multi(e) => e.encode(keys),
+        }
+    }
+
+    /// Encode partial key as a prefix.
+    /// An optional suffix key length is provided to speed up the
+    /// encoding.
+    /// If we have known suffix length, we can canculate prefix length
+    /// accordingly.
+    #[inline]
+    pub(crate) fn encode_prefix<V: Borrow<Val>>(
+        &self,
+        key: &[V],
+        suffix_len: Option<usize>,
+    ) -> BTreeKey {
+        match self {
+            BTreeKeyEncoder::Single(_) => {
+                panic!("unexpected single key encoder")
+            }
+            BTreeKeyEncoder::Multi(e) => e.encode_prefix(key, suffix_len),
+        }
+    }
+
+    /// Encode a pair of keys into a memory-comparable b-tree key.
+    #[inline]
+    pub(crate) fn encode_pair<P: Borrow<Val>, S: Borrow<Val>>(
+        &self,
+        prefix_key: &[P],
+        suffix_key: S,
+    ) -> BTreeKey {
+        match self {
+            BTreeKeyEncoder::Single(_) => {
+                panic!("unexpected single key encoder");
+            }
+            BTreeKeyEncoder::Multi(e) => e.encode_pair(prefix_key, suffix_key),
+        }
+    }
+}
+
+/// Encoder for composite memory-comparable keys.
+pub(crate) struct MultiKeyEncoder {
+    prefix: Box<[PrefixKeyEncoder]>,
+    suffix: SingleKeyEncoder,
+    encode_len: Option<usize>,
+}
+
+impl MultiKeyEncoder {
+    /// Create a composite key encoder from ordered key value types.
+    #[inline]
+    fn new(mut val_types: Vec<ValType>) -> Self {
+        debug_assert!(val_types.len() >= 2);
+        let last_ty = val_types.pop().unwrap();
         let prefix: Vec<_> = val_types
             .into_iter()
             .map(|ty| {
@@ -254,40 +311,29 @@ impl BTreeKeyEncoder {
             .try_fold(0, |acc, elem| elem.map(|b| acc + b));
         let suffix_key_len = suffix.est_encode_len();
         let encode_len = prefix_key_len.and_then(|p| suffix_key_len.map(|s| p + s));
-        BTreeKeyEncoder::Multi {
+        Self {
             prefix: prefix.into_boxed_slice(),
             suffix,
             encode_len,
         }
     }
 
-    /// Encode keys into a memory-comparable b-tree key.
+    /// Encode all components into one memory-comparable key.
     #[inline]
-    pub(crate) fn encode<V: Borrow<Val>>(&self, keys: &[V]) -> BTreeKey {
-        match self {
-            BTreeKeyEncoder::Single(e) => {
-                debug_assert!(keys.len() == 1);
-                e.encode_single(keys[0].borrow())
-            }
-            BTreeKeyEncoder::Multi {
-                prefix,
-                suffix,
-                encode_len,
-            } => {
-                debug_assert!(keys.len() == prefix.len() + 1);
-                if let Some(encode_len) = encode_len {
-                    return encode_multi_keys(prefix, suffix, keys, *encode_len);
-                }
-                // Calculate the precise length of encoded keys.
-                let encode_len: usize = prefix
-                    .iter()
-                    .zip(keys)
-                    .map(|(e, k)| e.encode_len(k.borrow()))
-                    .sum::<usize>()
-                    + suffix.encode_len(keys.last().unwrap().borrow());
-                encode_multi_keys(prefix, suffix, keys, encode_len)
-            }
+    fn encode<V: Borrow<Val>>(&self, keys: &[V]) -> BTreeKey {
+        debug_assert!(keys.len() == self.prefix.len() + 1);
+        if let Some(encode_len) = self.encode_len {
+            return encode_multi_keys(&self.prefix, &self.suffix, keys, encode_len);
         }
+        // Calculate the precise length of encoded keys.
+        let encode_len: usize = self
+            .prefix
+            .iter()
+            .zip(keys)
+            .map(|(e, k)| e.encode_len(k.borrow()))
+            .sum::<usize>()
+            + self.suffix.encode_len(keys.last().unwrap().borrow());
+        encode_multi_keys(&self.prefix, &self.suffix, keys, encode_len)
     }
 
     /// Encode partial key as a prefix.
@@ -296,65 +342,55 @@ impl BTreeKeyEncoder {
     /// If we have known suffix length, we can canculate prefix length
     /// accordingly.
     #[inline]
-    pub(crate) fn encode_prefix<V: Borrow<Val>>(
-        &self,
-        key: &[V],
-        suffix_len: Option<usize>,
-    ) -> BTreeKey {
-        match self {
-            BTreeKeyEncoder::Single(_) => {
-                panic!("unexpected single key encoder")
-            }
-            BTreeKeyEncoder::Multi {
-                prefix, encode_len, ..
-            } => {
-                debug_assert!(key.len() <= prefix.len());
-                if let Some(encode_len) = encode_len
-                    && let Some(suffix_len) = suffix_len
-                {
-                    debug_assert!(*encode_len >= suffix_len);
-                    return encode_key_prefix(prefix, key, *encode_len - suffix_len);
-                }
-                let encode_len = prefix
-                    .iter()
-                    .zip(key)
-                    .map(|(e, k)| e.encode_len(k.borrow()))
-                    .sum::<usize>();
-                encode_key_prefix(prefix, key, encode_len)
-            }
+    fn encode_prefix<V: Borrow<Val>>(&self, key: &[V], suffix_len: Option<usize>) -> BTreeKey {
+        debug_assert!(key.len() <= self.prefix.len());
+        if let Some(encode_len) = self.encode_len
+            && let Some(suffix_len) = suffix_len
+        {
+            debug_assert!(encode_len >= suffix_len);
+            return encode_key_prefix(&self.prefix, key, encode_len - suffix_len);
         }
+        let encode_len = self
+            .prefix
+            .iter()
+            .zip(key)
+            .map(|(e, k)| e.encode_len(k.borrow()))
+            .sum::<usize>();
+        encode_key_prefix(&self.prefix, key, encode_len)
     }
 
     /// Encode a pair of keys into a memory-comparable b-tree key.
     #[inline]
-    pub(crate) fn encode_pair<P: Borrow<Val>, S: Borrow<Val>>(
+    fn encode_pair<P: Borrow<Val>, S: Borrow<Val>>(
         &self,
         prefix_key: &[P],
         suffix_key: S,
     ) -> BTreeKey {
-        match self {
-            BTreeKeyEncoder::Single(_) => {
-                panic!("unexpected single key encoder");
-            }
-            BTreeKeyEncoder::Multi {
-                prefix,
-                suffix,
+        debug_assert!(prefix_key.len() == self.prefix.len());
+        if let Some(encode_len) = self.encode_len {
+            return encode_key_pair(
+                &self.prefix,
+                &self.suffix,
+                prefix_key,
+                suffix_key,
                 encode_len,
-            } => {
-                debug_assert!(prefix_key.len() == prefix.len());
-                if let Some(encode_len) = encode_len {
-                    return encode_key_pair(prefix, suffix, prefix_key, suffix_key, *encode_len);
-                }
-                // Calculate the precise length of encoded keys.
-                let encode_len: usize = prefix
-                    .iter()
-                    .zip(prefix_key)
-                    .map(|(e, k)| e.encode_len(k.borrow()))
-                    .sum::<usize>()
-                    + suffix.encode_len(suffix_key.borrow());
-                encode_key_pair(prefix, suffix, prefix_key, suffix_key, encode_len)
-            }
+            );
         }
+        // Calculate the precise length of encoded keys.
+        let encode_len: usize = self
+            .prefix
+            .iter()
+            .zip(prefix_key)
+            .map(|(e, k)| e.encode_len(k.borrow()))
+            .sum::<usize>()
+            + self.suffix.encode_len(suffix_key.borrow());
+        encode_key_pair(
+            &self.prefix,
+            &self.suffix,
+            prefix_key,
+            suffix_key,
+            encode_len,
+        )
     }
 }
 
@@ -660,5 +696,23 @@ mod tests {
         let keys = vec![Val::Null, Val::from(b"null_test")];
         let key = encoder.encode(&keys);
         assert!(!key.is_empty());
+    }
+
+    #[test]
+    fn test_multi_key_encoder_matches_btree_multi_encoder() {
+        let val_types = vec![
+            ValType::new(ValKind::U32, false),
+            ValType::new(ValKind::VarByte, false),
+            ValType::new(ValKind::F64, true),
+        ];
+        let keys = vec![Val::from(42u32), Val::from(b"segmented-prefix"), Val::Null];
+
+        let btree_encoder = BTreeKeyEncoder::new(val_types.clone());
+        let multi_encoder = MultiKeyEncoder::new(val_types);
+
+        assert_eq!(
+            multi_encoder.encode(&keys).as_bytes(),
+            btree_encoder.encode(&keys).as_bytes()
+        );
     }
 }
