@@ -920,14 +920,14 @@ impl<'a> RecoveryCoordinator<'a> {
                         .insert_no_trx(&self.resources.buffers.pool_guards, vals)
                         .await?;
                 }
-                RowRedoKind::DeleteByUniqueKey(key) => {
+                RowRedoKind::DeleteByPrimaryKey(key) => {
                     table
-                        .delete_unique_no_trx(&self.resources.buffers.pool_guards, key)
+                        .delete_primary_key_no_trx(&self.resources.buffers.pool_guards, key)
                         .await?;
                 }
-                RowRedoKind::UpdateByUniqueKey(key, cols) => {
+                RowRedoKind::UpdateByPrimaryKey(key, cols) => {
                     table
-                        .update_unique_no_trx(&self.resources.buffers.pool_guards, key, cols)
+                        .update_primary_key_no_trx(&self.resources.buffers.pool_guards, key, cols)
                         .await?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
@@ -997,9 +997,8 @@ impl<'a> RecoveryCoordinator<'a> {
                         )
                         .await?;
                 }
-                RowRedoKind::DeleteByUniqueKey(_) | RowRedoKind::UpdateByUniqueKey(..) => {
-                    // We do not allow key-based catalog redo on data tables.
-                    unreachable!();
+                RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
+                    return Err(invalid_user_table_keyed_redo(table_id, row, cts));
                 }
             }
         }
@@ -1052,9 +1051,21 @@ fn unexpected_unsealed_terminal_error() -> Error {
         .into()
 }
 
+#[inline]
+fn invalid_user_table_keyed_redo(table_id: TableID, row: &RowRedo, cts: TrxID) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "key-based catalog redo is invalid for user table replay: table_id={table_id}, page_id={}, row_id={}, cts={cts}, kind={:?}",
+            row.page_id, row.row_id, row.kind
+        ))
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryCoordinator, validate_create_table_reloaded_root_ts};
+    use super::{
+        RecoveryCoordinator, invalid_user_table_keyed_redo, validate_create_table_reloaded_root_ts,
+    };
     use crate::buffer::PoolRole;
     use crate::catalog::storage::{SilentWatermarkObject, publish_first_redo_log_seq_for_test};
     use crate::catalog::{
@@ -1119,6 +1130,49 @@ mod tests {
         assert!(report.contains("table-file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+    }
+
+    #[test]
+    fn test_invalid_user_table_keyed_redo_reports_invalid_payload() {
+        let table_id = TableID::new(42);
+        let cts = TrxID::new(11);
+        let cases = [
+            (
+                "DeleteByPrimaryKey",
+                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(42u64)])),
+            ),
+            (
+                "UpdateByPrimaryKey",
+                RowRedoKind::UpdateByPrimaryKey(
+                    SelectKey::new(0, vec![Val::from(42u64)]),
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from(7u64),
+                    }],
+                ),
+            ),
+        ];
+
+        for (expected_kind, kind) in cases {
+            let row = RowRedo {
+                page_id: PageID::new(7),
+                row_id: RowID::new(9),
+                kind,
+            };
+            let err = invalid_user_table_keyed_redo(table_id, &row, cts);
+            let report = format!("{err:?}");
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload),
+                "{report}"
+            );
+            assert!(report.contains("key-based catalog redo"), "{report}");
+            assert!(report.contains("table_id=42"), "{report}");
+            assert!(report.contains("page_id=7"), "{report}");
+            assert!(report.contains("row_id=9"), "{report}");
+            assert!(report.contains("cts=11"), "{report}");
+            assert!(report.contains(expected_kind), "{report}");
+        }
     }
 
     fn lightweight_recovery_engine_config(
@@ -1195,7 +1249,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+        let table_id = create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
         let mut session = engine.new_session().unwrap();
         for value in 0..32 {
             let mut trx = session.begin_trx().unwrap();
@@ -1232,7 +1286,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+        let table_id = create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
         let mut session = engine.new_session().unwrap();
         session.drop_table(table_id).await.unwrap();
         drop(session);
@@ -1498,8 +1552,8 @@ mod tests {
         ]
     }
 
-    fn primary_index_spec() -> IndexSpec {
-        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)
+    fn base_unique_index_spec() -> IndexSpec {
+        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)
     }
 
     fn added_index_spec() -> IndexSpec {
@@ -1511,7 +1565,7 @@ mod tests {
             TableMetadata::try_new_with_next_index_no(
                 index_ddl_columns(),
                 vec![
-                    ActiveIndexSpec::new(0, primary_index_spec()),
+                    ActiveIndexSpec::new(0, base_unique_index_spec()),
                     ActiveIndexSpec::new(1, added_index_spec()),
                 ],
                 2,
@@ -1524,7 +1578,7 @@ mod tests {
         Arc::new(
             TableMetadata::try_new_with_next_index_no(
                 index_ddl_columns(),
-                vec![ActiveIndexSpec::new(0, primary_index_spec())],
+                vec![ActiveIndexSpec::new(0, base_unique_index_spec())],
                 2,
             )
             .unwrap(),
@@ -1896,7 +1950,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             engine
                 .catalog()
                 .checkpoint_now(&engine.inner().trx_sys)
@@ -1926,7 +1981,8 @@ mod tests {
                     .build()
                     .await
                     .unwrap();
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             engine
                 .catalog()
                 .checkpoint_now(&engine.inner().trx_sys)
@@ -1957,7 +2013,7 @@ mod tests {
                 .unwrap();
             let table_id = create_index_ddl_base_table(
                 &engine,
-                vec![primary_index_spec(), added_index_spec()],
+                vec![base_unique_index_spec(), added_index_spec()],
             )
             .await;
             engine
@@ -1989,7 +2045,8 @@ mod tests {
                     .build()
                     .await
                     .unwrap();
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             engine
                 .catalog()
                 .checkpoint_now(&engine.inner().trx_sys)
@@ -2032,7 +2089,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             let index_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
             publish_index_metadata_root(&engine, table_id, created_index_metadata(), index_cts)
                 .await;
@@ -2066,7 +2124,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
             publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
                 .await;
@@ -2097,7 +2156,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             engine
                 .catalog()
                 .checkpoint_now(&engine.inner().trx_sys)
@@ -2136,7 +2196,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             engine
                 .catalog()
                 .checkpoint_now(&engine.inner().trx_sys)
@@ -2412,7 +2473,7 @@ mod tests {
                 ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
             ]);
             let index_specs = vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
                 IndexSpec::new(
                     vec![
                         IndexKey {
@@ -2488,7 +2549,7 @@ mod tests {
             let table_id = session
                 .create_table(
                     table_spec,
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -2596,7 +2657,7 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -2640,7 +2701,8 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let root_floor = table.redo_replay_floor_snapshot();
             let mut session = engine.new_session().unwrap();
@@ -2754,7 +2816,8 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let table_id =
+                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -2846,7 +2909,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -2973,7 +3036,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -3104,7 +3167,7 @@ mod tests {
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
                     vec![
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
                         IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
                     ],
                 )
@@ -3243,7 +3306,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -3364,7 +3427,7 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -3526,7 +3589,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -3536,7 +3599,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -3726,7 +3789,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -3846,7 +3909,7 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();

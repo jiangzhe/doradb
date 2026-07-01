@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
-use crate::error::{Error, FatalError, OperationError, Result};
+use crate::error::{Error, FatalError, InternalError, OperationError, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::row::ops::{
@@ -495,29 +495,58 @@ impl<'stmt> Statement<'stmt> {
         table.insert_mvcc(rt, effects, cols).await
     }
 
-    /// Inserts or updates one catalog-table row by a stable unique key.
+    /// Inserts or updates one catalog-table row by its primary key.
     #[inline]
-    pub(crate) async fn catalog_upsert_unique_mvcc(
+    pub(crate) async fn catalog_upsert_primary_key_mvcc(
         &mut self,
         table: &CatalogTable,
-        unique_index_no: usize,
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
+        let primary_key_index_no = table
+            .metadata()
+            .primary_key()
+            .ok_or_else(|| {
+                Error::from(
+                    Report::new(InternalError::CatalogPrimaryKeyMissing).attach(format!(
+                        "catalog primary-key upsert requires primary key: table_id={}",
+                        table.table_id()
+                    )),
+                )
+            })?
+            .index_no();
         self.acquire_table_write_locks(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
-            .upsert_unique_mvcc(rt, effects, unique_index_no, cols, true)
+            .upsert_unique_mvcc(rt, effects, primary_key_index_no, cols, true)
             .await
     }
 
     /// Deletes one catalog-table row through the foreground lock-aware path.
     #[inline]
-    pub(crate) async fn catalog_delete_unique_mvcc(
+    pub(crate) async fn catalog_delete_primary_key_mvcc(
         &mut self,
         table: &CatalogTable,
         key: &SelectKey,
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
+        let Some(primary_key) = table.metadata().primary_key() else {
+            return Err(Error::from(
+                Report::new(InternalError::CatalogPrimaryKeyMissing).attach(format!(
+                    "catalog primary-key delete requires primary key: table_id={}",
+                    table.table_id()
+                )),
+            ));
+        };
+        if !primary_key.matches_key(key) {
+            return Err(Error::from(
+                Report::new(InternalError::CatalogPrimaryKeyMismatch).attach(format!(
+                    "catalog primary-key delete key mismatch: table_id={}, index_no={}, primary_key_index_no={primary_key_index_no}",
+                    table.table_id(),
+                    key.index_no,
+                    primary_key_index_no = primary_key.index_no()
+                )),
+            ));
+        }
         self.acquire_table_write_locks(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table.delete_unique_mvcc(rt, effects, key, log_by_key).await
@@ -762,6 +791,36 @@ pub(crate) mod tests {
         });
 
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_catalog_delete_primary_key_mvcc_rejects_non_primary_key() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_catalog_delete_pk_mismatch").await;
+            let catalog_table = engine
+                .catalog()
+                .storage
+                .get_catalog_table(TableID::new(0))
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+
+            let res: Result<()> = trx
+                .exec(async |stmt| {
+                    let key = SelectKey::new(1, vec![Val::from(TableID::new(42))]);
+                    stmt.catalog_delete_primary_key_mvcc(catalog_table.as_ref(), &key, true)
+                        .await?;
+                    Ok(())
+                })
+                .await;
+
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::CatalogPrimaryKeyMismatch)
+            );
+            trx.rollback().await.unwrap();
+        });
     }
 
     #[test]

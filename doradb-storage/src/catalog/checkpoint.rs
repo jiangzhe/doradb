@@ -3,12 +3,13 @@ use crate::catalog::{
     Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_table,
     is_user_table,
 };
-use crate::error::{ErrorKind, FatalError, Result};
+use crate::error::{DataIntegrityError, Error, ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
+use error_stack::Report;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -515,10 +516,10 @@ impl Catalog {
     ) -> Result<CatalogCheckpointTxnAction> {
         match ddl {
             DDLRedo::CreateTable(_) => Ok(CatalogCheckpointTxnAction::Include),
-            DDLRedo::DropTable(table_id)
-                if is_user_table(*table_id)
-                    && !drop_table_has_catalog_table_delete(*table_id, dml) =>
-            {
+            DDLRedo::DropTable(table_id) if is_user_table(*table_id) => {
+                if drop_table_has_catalog_table_delete(*table_id, dml)? {
+                    return Ok(CatalogCheckpointTxnAction::Include);
+                }
                 // A user-table drop without the matching catalog-table delete
                 // cannot be folded into the catalog checkpoint. Stop before
                 // it so replay still sees the table DDL in log order.
@@ -595,29 +596,145 @@ enum CatalogCheckpointTxnAction {
 fn drop_table_has_catalog_table_delete(
     table_id: TableID,
     dml: &BTreeMap<TableID, TableDML>,
-) -> bool {
+) -> Result<bool> {
     let Some(tables_dml) = dml.get(&TABLE_ID_TABLES) else {
-        return false;
+        return Ok(false);
     };
-    tables_dml.rows.values().any(|row| {
-        let RowRedoKind::DeleteByUniqueKey(key) = &row.kind else {
-            return false;
+    for row in tables_dml.rows.values() {
+        let RowRedoKind::DeleteByPrimaryKey(key) = &row.kind else {
+            continue;
         };
-        key.index_no == 0
-            && key.vals.len() == 1
-            && key.vals[0]
-                .as_u64()
-                .is_some_and(|id| id == table_id.as_u64())
-    })
+        if key.index_no != 0 {
+            return Err(malformed_catalog_drop_table_redo(format!(
+                "catalog.tables delete key is not primary key: drop_table_id={table_id}, index_no={}, primary_key_index_no=0",
+                key.index_no
+            )));
+        }
+        if key.vals.len() != 1 {
+            return Err(malformed_catalog_drop_table_redo(format!(
+                "catalog.tables delete key value count {} does not match primary key column count 1: drop_table_id={table_id}",
+                key.vals.len()
+            )));
+        }
+        let Some(deleted_table_id) = key.vals[0].as_u64() else {
+            return Err(malformed_catalog_drop_table_redo(format!(
+                "catalog.tables delete key type mismatch: drop_table_id={table_id}, index_no={}",
+                key.index_no
+            )));
+        };
+        if deleted_table_id == table_id.as_u64() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[inline]
+fn malformed_catalog_drop_table_redo(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "malformed catalog redo for drop table: {}",
+            message.into()
+        ))
+        .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::{PageID, RowID};
+    use crate::log::redo::RowRedo;
     use crate::recovery::stream::RedoSegmentCtsRange;
+    use crate::row::ops::SelectKey;
+    use crate::value::Val;
     use smol::Timer;
     use smol::future::or;
     use std::time::Duration;
+
+    fn catalog_tables_delete_dml(key: SelectKey) -> BTreeMap<TableID, TableDML> {
+        catalog_tables_dml(RowRedoKind::DeleteByPrimaryKey(key))
+    }
+
+    fn catalog_tables_dml(kind: RowRedoKind) -> BTreeMap<TableID, TableDML> {
+        let row_id = RowID::new(1);
+        let row = RowRedo {
+            page_id: PageID::new(0),
+            row_id,
+            kind,
+        };
+        let mut rows = BTreeMap::new();
+        rows.insert(row_id, row);
+        let mut dml = BTreeMap::new();
+        dml.insert(TABLE_ID_TABLES, TableDML { rows });
+        dml
+    }
+
+    fn assert_malformed_drop_table_redo(err: Error, expected: &str) {
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("malformed catalog redo"), "{report}");
+        assert!(report.contains(expected), "{report}");
+    }
+
+    #[test]
+    fn test_drop_table_has_catalog_table_delete_matches_table_key() {
+        let table_id = TableID::new(42);
+        let dml = catalog_tables_delete_dml(SelectKey::new(0, vec![Val::from(table_id.as_u64())]));
+
+        assert!(drop_table_has_catalog_table_delete(table_id, &dml).unwrap());
+    }
+
+    #[test]
+    fn test_drop_table_has_catalog_table_delete_missing_is_false() {
+        let table_id = TableID::new(42);
+        let dml = BTreeMap::new();
+
+        assert!(!drop_table_has_catalog_table_delete(table_id, &dml).unwrap());
+    }
+
+    #[test]
+    fn test_drop_table_has_catalog_table_delete_different_table_is_false() {
+        let table_id = TableID::new(42);
+        let dml = catalog_tables_delete_dml(SelectKey::new(
+            0,
+            vec![Val::from(TableID::new(43).as_u64())],
+        ));
+
+        assert!(!drop_table_has_catalog_table_delete(table_id, &dml).unwrap());
+    }
+
+    #[test]
+    fn test_drop_table_has_catalog_table_delete_rejects_wrong_index_no() {
+        let table_id = TableID::new(42);
+        let dml = catalog_tables_delete_dml(SelectKey::new(1, vec![Val::from(table_id.as_u64())]));
+        let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
+
+        assert_malformed_drop_table_redo(err, "key is not primary key");
+    }
+
+    #[test]
+    fn test_drop_table_has_catalog_table_delete_rejects_value_count_mismatch() {
+        let table_id = TableID::new(42);
+        let dml = catalog_tables_delete_dml(SelectKey::new(
+            0,
+            vec![Val::from(table_id.as_u64()), Val::from(1u64)],
+        ));
+        let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
+
+        assert_malformed_drop_table_redo(err, "key value count 2");
+    }
+
+    #[test]
+    fn test_drop_table_has_catalog_table_delete_rejects_value_type_mismatch() {
+        let table_id = TableID::new(42);
+        let dml = catalog_tables_delete_dml(SelectKey::new(0, vec![Val::from(42u32)]));
+        let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
+
+        assert_malformed_drop_table_redo(err, "key type mismatch");
+    }
 
     #[test]
     fn test_catalog_metadata_change_waits_for_active_checkpoint() {

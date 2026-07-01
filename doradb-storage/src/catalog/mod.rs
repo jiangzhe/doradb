@@ -1141,7 +1141,7 @@ pub(crate) mod tests {
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
             )
             .await
             .unwrap();
@@ -1170,7 +1170,7 @@ pub(crate) mod tests {
                         },
                     ],
                 },
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
             )
             .await
             .unwrap();
@@ -1193,7 +1193,7 @@ pub(crate) mod tests {
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
             )
             .await
             .unwrap();
@@ -1229,7 +1229,7 @@ pub(crate) mod tests {
                     IndexSpec::new(
                         vec![IndexKey::new(0)],
                         // unique index.
-                        IndexAttributes::PK,
+                        IndexAttributes::UK,
                     ),
                     IndexSpec::new(
                         vec![IndexKey::new(1)],
@@ -1347,12 +1347,12 @@ pub(crate) mod tests {
                 ValKind::I32,
                 ColumnAttributes::empty(),
             )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
         )
         .expect("valid table metadata");
         let file_metadata = TableMetadata::try_new(
             vec![ColumnSpec::new("id", ValKind::I32, ColumnAttributes::INDEX)],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
         )
         .expect("valid table metadata");
         assert_eq!(catalog_metadata.col.col_names, file_metadata.col.col_names);
@@ -1372,7 +1372,7 @@ pub(crate) mod tests {
                 ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
             ]
         };
-        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK);
+        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK);
         let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
 
         let catalog_metadata =
@@ -1396,7 +1396,7 @@ pub(crate) mod tests {
                 ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
             ]
         };
-        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK);
+        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK);
         let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
 
         let catalog_metadata =
@@ -1438,7 +1438,7 @@ pub(crate) mod tests {
                             ColumnAttributes::empty(),
                         )],
                     },
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
                 )
                 .await
                 .unwrap();
@@ -1530,7 +1530,7 @@ pub(crate) mod tests {
                 ColumnSpec::new("k2", ValKind::I32, ColumnAttributes::empty()),
             ]);
             let index_specs = vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
                 IndexSpec::new(
                     vec![IndexKey::new(1), IndexKey::new(2)],
                     IndexAttributes::empty(),
@@ -1568,7 +1568,7 @@ pub(crate) mod tests {
                         ],
                     },
                     vec![
-                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
                         IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
                     ],
                 )

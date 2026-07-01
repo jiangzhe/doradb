@@ -325,8 +325,14 @@ RowRedo :=
 - `1 Insert`: `Vec<Val>` full inserted row image.
 - `2 Delete`: no payload.
 - `3 Update`: `Vec<UpdateCol>`, where `UpdateCol = u32 col_idx + Val`.
-- `4 DeleteByUniqueKey`: `SelectKey`, where
+- `4 DeleteByPrimaryKey`: `SelectKey`, where
   `SelectKey = u32 index_no + Vec<Val>`.
+- `5 UpdateByPrimaryKey`: `SelectKey + Vec<UpdateCol>`.
+
+`DeleteByPrimaryKey` and `UpdateByPrimaryKey` are logical catalog-table redo.
+Catalog recovery locates rows by primary key instead of physical row id.
+`UpdateByPrimaryKey` may relocate a row with delete+insert when a
+variable-length update does not fit the current in-memory row page.
 
 `DDLRedo` codes:
 
