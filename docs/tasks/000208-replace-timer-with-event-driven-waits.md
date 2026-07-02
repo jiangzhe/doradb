@@ -1,7 +1,7 @@
 ---
 id: 000208
 title: Replace Timer With Event Driven Waits
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-02
 github_issue: 802
 ---
@@ -234,6 +234,33 @@ The relevant storage model is already event-friendly:
 
 ## Implementation Notes
 
+- Implemented event-driven production waits for the checkpoint and transition
+  retry paths: purge now publishes a monotonic active GC horizon, rollback can
+  send lossy horizon-advanced purge work, user-table transition retries wait on
+  block-index route progress or storage poison, and standalone/catalog
+  `MemTable` transition retry is treated as an internal error.
+- Added one-shot storage poison notification and a checkpoint transition
+  publication guard. Once row pages enter `TRANSITION`, any failure before cold
+  route publication poisons storage so foreground writers do not wait forever.
+- Added async `ChangeNotifier` support and block-index route change
+  notifications. Comments document the coalesced/predicate-based notification
+  invariants and the transition-route/poison boundaries.
+- During implementation review, `wait_for_frozen_pages_stable()` was tightened
+  further: it resumes scans from the first unstable frozen page after horizon
+  changes, and its horizon wait now races storage poison so checkpoint cannot
+  hang if poison prevents future purge publications.
+- Added focused tests for async notifier waits, poison listeners, purge horizon
+  coalescing, route publication waits, transition guard poison behavior,
+  standalone/catalog `MemTable` transition errors, frozen-page stabilization,
+  and the review regression where storage poison wakes a blocked frozen-page
+  wait.
+- Verified with:
+  - `tools/style_audit.rs --diff-base origin/main`
+  - `cargo check -p doradb-storage`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+
 ## Impacts
 
 - `doradb-storage/src/notify.rs`
@@ -326,5 +353,5 @@ The relevant storage model is already event-friendly:
 
 ## Open Questions
 
-None for this task. Full runtime-agnostic startup/runtime injection and removal
-of production `smol::block_on` remain separate future work.
+None for this task. Runtime-agnostic blocking work is tracked separately by
+`docs/backlogs/000137-runtime-agnostic-blocking-work-abstraction.md`.
