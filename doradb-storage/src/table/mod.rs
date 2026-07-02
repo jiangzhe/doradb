@@ -51,12 +51,10 @@ use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxReadProof, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
 use parking_lot::Mutex;
-use smol::Timer;
 use std::marker::PhantomData;
 use std::mem::take;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Copied replay floor fields from one user-table active root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,10 +559,17 @@ impl Table {
         trx_sys: &TransactionSystem,
         frozen_pages: &[FrozenPage],
     ) -> Result<()> {
+        // Resume from the first page that is not yet below the published GC
+        // horizon. The published horizon only advances, and these pages are
+        // already frozen so their row-version max insert/update STS cannot
+        // increase while checkpoint waits. Once a page satisfies the predicate,
+        // later horizon wakes cannot make it unstable again.
+        let mut next_unstable_idx = 0usize;
         loop {
-            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
-            let mut stabilized = true;
-            for page_info in frozen_pages {
+            trx_sys.ensure_runtime_healthy()?;
+            let observed_epoch = trx_sys.published_gc_horizon_epoch();
+            let published_horizon = trx_sys.published_gc_horizon();
+            while let Some(page_info) = frozen_pages.get(next_unstable_idx) {
                 // A potential optimization is to check row version map without loading
                 // row page back. This requires interface change of buffer pool.
                 let page_guard = self
@@ -576,35 +581,55 @@ impl Table {
                 // Check whether all insert and updates on this page are committed.
                 // This may be blocked by a long-running irrelevant transaction
                 // but we accept it now.
-                if row_ver.max_ins_sts() >= min_active_sts {
-                    stabilized = false;
+                if row_ver.max_ins_sts() >= published_horizon {
                     break;
                 }
+                next_unstable_idx += 1;
             }
-            if stabilized {
+            if next_unstable_idx == frozen_pages.len() {
                 break;
             }
-            Timer::after(Duration::from_secs(1)).await;
+            // Horizon notifications are coalesced and predicate-based. Purge
+            // publishes active-horizon progress before physical GC completes;
+            // frozen-page stabilization only needs to know the relevant
+            // transactions are no longer active.
+            trx_sys.ensure_runtime_healthy()?;
+            if trx_sys.published_gc_horizon_epoch() == observed_epoch {
+                trx_sys
+                    .wait_published_gc_horizon_since(observed_epoch)
+                    .await;
+            }
+            trx_sys.ensure_runtime_healthy()?;
         }
         Ok(())
     }
 
-    async fn set_frozen_pages_to_transition(
+    async fn load_frozen_pages_for_transition(
         &self,
         guards: &PoolGuards,
         frozen_pages: &[FrozenPage],
-        cutoff_ts: TrxID,
-    ) -> Result<()> {
+    ) -> Result<Vec<PageSharedGuard<RowPage>>> {
+        let mut page_guards = Vec::with_capacity(frozen_pages.len());
         for page_info in frozen_pages {
-            let page_guard = self
-                .mem
-                .must_get_row_page_shared(guards, page_info.page_id)
-                .await?;
+            page_guards.push(
+                self.mem
+                    .must_get_row_page_shared(guards, page_info.page_id)
+                    .await?,
+            );
+        }
+        Ok(page_guards)
+    }
+
+    fn set_loaded_frozen_pages_to_transition(
+        &self,
+        page_guards: &[PageSharedGuard<RowPage>],
+        cutoff_ts: TrxID,
+    ) {
+        for page_guard in page_guards {
             let (ctx, page) = page_guard.ctx_and_page();
             ctx.row_ver().unwrap().set_transition();
             self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
         }
-        Ok(())
     }
 
     async fn build_lwc_blocks<C>(

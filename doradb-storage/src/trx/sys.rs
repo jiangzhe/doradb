@@ -10,6 +10,7 @@ use crate::id::{SessionID, TrxID};
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
+use crate::notify::ChangeNotifier;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::session::{SessionState, TrxAttachment};
@@ -26,7 +27,7 @@ use crate::trx::{
 use crossbeam_utils::CachePadded;
 use either::Either::{Left, Right};
 use error_stack::Report;
-use event_listener::{Event, listener};
+use event_listener::{Event, EventListener, listener};
 use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeMap;
@@ -398,6 +399,13 @@ pub(crate) struct TransactionSystem {
     ///
     /// Data associated with smaller timestamp will be always visible to all transactions.
     global_visible_sts: CachePadded<AtomicU64>,
+    /// Purge-published active transaction horizon.
+    ///
+    /// This advances as soon as purge observes active-bucket progress. Unlike
+    /// `global_visible_sts`, it does not imply physical purge work has finished.
+    published_gc_horizon: CachePadded<AtomicU64>,
+    /// Change notifier for active GC horizon publication.
+    gc_horizon_changed: CachePadded<ChangeNotifier>,
     /// Round-robin GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
     /// Active and completed transaction buckets used by purge.
@@ -428,6 +436,8 @@ pub(crate) struct TransactionSystem {
     storage_poisoned: CachePadded<AtomicBool>,
     /// First fatal storage reason that poisoned runtime admission.
     storage_poison_err: CachePadded<Mutex<Option<FatalError>>>,
+    /// One-shot wake for event waits that must notice storage poison.
+    storage_poison_event: CachePadded<Event>,
     /// Rollback payloads retained after fatal rollback cleanup failure.
     ///
     /// Poisoning stops future admitted work, but row-version maps can already
@@ -466,6 +476,8 @@ impl TransactionSystem {
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
+            published_gc_horizon: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
+            gc_horizon_changed: CachePadded::new(ChangeNotifier::new()),
             rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
             gc_buckets: gc_buckets.into_boxed_slice(),
             redo_log,
@@ -478,6 +490,7 @@ impl TransactionSystem {
             dropped_table_files: CachePadded::new(Mutex::new(dropped_table_files)),
             storage_poisoned: CachePadded::new(AtomicBool::new(false)),
             storage_poison_err: CachePadded::new(Mutex::new(None)),
+            storage_poison_event: CachePadded::new(Event::new()),
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
             catalog_redo_retention: CachePadded::new(Mutex::new(None)),
             redo_retention_gate: CachePadded::new(RedoRetentionGate::new()),
@@ -548,6 +561,12 @@ impl TransactionSystem {
         }
     }
 
+    /// Registers for the one-shot storage poison event.
+    #[inline]
+    pub(crate) fn storage_poison_listener(&self) -> EventListener {
+        self.storage_poison_event.listen()
+    }
+
     /// Records the first fatal storage poison reason and returns a fresh poison error.
     ///
     /// The first caller wins: later poison attempts keep returning the already
@@ -564,7 +583,13 @@ impl TransactionSystem {
                 *guard = Some(reason);
             }
         }
-        self.storage_poisoned.swap(true, Ordering::AcqRel);
+        let already_poisoned = self.storage_poisoned.swap(true, Ordering::AcqRel);
+        if !already_poisoned {
+            // Poison is an admission barrier, not shutdown. Event waiters still
+            // need this one-shot wake so they do not sleep after the only
+            // progress producer has failed.
+            self.storage_poison_event.notify(usize::MAX);
+        }
         self.storage_poison_error().unwrap_or_else(|| {
             Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
         })
@@ -1030,7 +1055,7 @@ impl TransactionSystem {
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         inner.effects_mut().clear_for_rollback();
-        self.gc_buckets[gc_no].record_rollback_for_purge(sts);
+        self.record_rollback_for_purge(gc_no, sts);
         inner.release_transaction_locks(attachment);
         inner.finish_session_rollback(attachment);
         entry.finish(TrxEntryState::Terminal);
@@ -1049,7 +1074,7 @@ impl TransactionSystem {
             .payload
             .take()
             .expect("prepared no-op cleanup requires user transaction payload");
-        self.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
+        self.record_rollback_for_purge(payload.gc_no, payload.sts);
         if let Some(s) = trx.attachment.take() {
             s.rollback();
         }
@@ -1080,6 +1105,54 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn global_visible_sts(&self) -> TrxID {
         TrxID::new(self.global_visible_sts.load(Ordering::Relaxed))
+    }
+
+    /// Returns the purge-published active transaction GC horizon.
+    #[inline]
+    pub(crate) fn published_gc_horizon(&self) -> TrxID {
+        TrxID::new(self.published_gc_horizon.load(Ordering::Acquire))
+    }
+
+    /// Returns the current published-horizon notification epoch.
+    #[inline]
+    pub(crate) fn published_gc_horizon_epoch(&self) -> u64 {
+        self.gc_horizon_changed.epoch()
+    }
+
+    /// Wait asynchronously until purge publishes a newer active GC horizon.
+    #[inline]
+    pub(crate) async fn wait_published_gc_horizon_since(&self, observed_epoch: u64) {
+        self.gc_horizon_changed
+            .wait_since_async(observed_epoch)
+            .await;
+    }
+
+    /// Publish active transaction horizon progress observed by purge.
+    ///
+    /// This is intentionally separate from `global_visible_sts`: frozen-page
+    /// checkpoint stabilization only needs to know relevant transactions are no
+    /// longer active, while visibility acceleration waits until purge work
+    /// completes and updates `global_visible_sts`.
+    #[inline]
+    pub(crate) fn publish_gc_horizon(&self, sts: TrxID) -> bool {
+        let mut curr = self.published_gc_horizon.load(Ordering::Acquire);
+        loop {
+            if sts.as_u64() <= curr {
+                return false;
+            }
+            match self.published_gc_horizon.compare_exchange_weak(
+                curr,
+                sts.as_u64(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.gc_horizon_changed.notify();
+                    return true;
+                }
+                Err(observed) => curr = observed,
+            }
+        }
     }
 
     /// Update global visible snapshot timestamp.
@@ -1781,6 +1854,57 @@ pub(crate) mod tests {
                 stored_reason,
                 FatalError::RedoWrite | FatalError::RedoSync
             ));
+
+            drop(trx_sys);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_poison_storage_listener_wakes_first_waiters() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(128usize * 1024 * 1024)
+                        .max_file_size(256usize * 1024 * 1024),
+                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_poison_listener"))
+                .build()
+                .await
+                .unwrap();
+
+            let trx_sys = engine.inner().trx_sys.clone();
+            let listener = trx_sys.storage_poison_listener();
+            let waiter = smol::spawn(async move {
+                listener.await;
+            });
+
+            trx_sys.ensure_runtime_healthy().unwrap();
+            let err = trx_sys.poison_storage(FatalError::CheckpointWrite);
+            assert_eq!(*err.current_context(), FatalError::CheckpointWrite);
+            waiter.await;
+            assert!(
+                trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == FatalError::CheckpointWrite)
+            );
+
+            let late_listener = trx_sys.storage_poison_listener();
+            let err = trx_sys.poison_storage(FatalError::RedoSync);
+            assert_eq!(*err.current_context(), FatalError::CheckpointWrite);
+            drop(late_listener);
+            assert!(
+                trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == FatalError::CheckpointWrite)
+            );
 
             drop(trx_sys);
             drop(engine);

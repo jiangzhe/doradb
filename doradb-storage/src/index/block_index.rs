@@ -79,6 +79,18 @@ impl<P: BufferPool> BlockIndex<P> {
         self.root.pivot_row_id()
     }
 
+    /// Returns the route-publication notification epoch.
+    #[inline]
+    pub(crate) fn route_epoch(&self) -> u64 {
+        self.root.route_epoch()
+    }
+
+    /// Wait asynchronously until checkpoint publishes route progress.
+    #[inline]
+    pub(crate) async fn wait_route_since(&self, observed_epoch: u64) {
+        self.root.wait_route_since(observed_epoch).await;
+    }
+
     /// Destroy the in-memory row-page index owned by this facade.
     #[inline]
     pub(crate) async fn destroy<B: BufferPool>(

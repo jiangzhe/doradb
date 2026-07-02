@@ -37,6 +37,10 @@ impl Deref for EventNotifyOnDrop {
 }
 
 /// Epoch-based notifier for waiters interested in any state change.
+///
+/// Notifications are coalesced. Callers must treat this as a predicate wait:
+/// record an epoch, register a listener, recheck the predicate, then wait only
+/// if the predicate is still false.
 pub(crate) struct ChangeNotifier {
     event: Event,
     epoch: AtomicU64,
@@ -77,6 +81,21 @@ impl ChangeNotifier {
                 return;
             }
             listener.wait();
+        }
+    }
+
+    /// Wait asynchronously until the epoch differs from `observed_epoch`.
+    #[inline]
+    pub(crate) async fn wait_since_async(&self, observed_epoch: u64) {
+        loop {
+            if self.epoch() != observed_epoch {
+                return;
+            }
+            let listener = self.event.listen();
+            if self.epoch() != observed_epoch {
+                return;
+            }
+            listener.await;
         }
     }
 }
@@ -144,6 +163,52 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("waiter should wake after a notification");
         waiter.join().expect("waiter thread should finish");
+    }
+
+    #[test]
+    fn test_change_notifier_wait_since_async_returns_after_prior_notify() {
+        smol::block_on(async {
+            let notifier = ChangeNotifier::new();
+            let observed_epoch = notifier.epoch();
+
+            notifier.notify();
+            notifier.wait_since_async(observed_epoch).await;
+
+            assert_ne!(notifier.epoch(), observed_epoch);
+        });
+    }
+
+    #[test]
+    fn test_change_notifier_wait_since_async_wakes_after_future_notify() {
+        smol::block_on(async {
+            let notifier = Arc::new(ChangeNotifier::new());
+            let observed_epoch = notifier.epoch();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+
+            let waiter = {
+                let notifier = Arc::clone(&notifier);
+                thread::spawn(move || {
+                    ready_tx.send(()).expect("waiter should report ready");
+                    smol::block_on(notifier.wait_since_async(observed_epoch));
+                    done_tx.send(()).expect("waiter should report completion");
+                })
+            };
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waiter should start");
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                "waiter should block before a notification"
+            );
+
+            notifier.notify();
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waiter should wake after a notification");
+            waiter.join().expect("waiter thread should finish");
+        });
     }
 
     #[test]
