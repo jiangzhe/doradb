@@ -236,6 +236,21 @@ impl TransactionSystem {
         changed
     }
 
+    /// Record rollback progress and wake purge if the active horizon advanced.
+    ///
+    /// Commit handoffs are non-lossy through `Purge::Committed` because purge
+    /// must retain every committed payload batch. Rollback horizon wakeups are
+    /// lossy: bucket state is already authoritative, so the message only asks
+    /// purge to recalculate the horizon and run one full GC cycle.
+    #[inline]
+    pub(crate) fn record_rollback_for_purge(&self, gc_no: usize, sts: TrxID) -> bool {
+        let advanced = self.gc_buckets[gc_no].record_rollback_for_purge(sts);
+        if advanced {
+            let _ = self.purge_tx.send(Purge::HorizonAdvanced);
+        }
+        advanced
+    }
+
     #[inline]
     pub(super) fn dispatch_purge(
         trx_sys: SyncQuiescentGuard<Self>,
@@ -721,6 +736,8 @@ pub(crate) enum Purge {
     /// The payload map is grouped by GC bucket. The purge coordinator must
     /// record every accepted batch before it exits.
     Committed(FastHashMap<usize, Vec<CommittedTrx>>),
+    /// Lossy rollback-driven active-horizon wakeup.
+    HorizonAdvanced,
     /// Release retained table roots whose post-publish readers have drained.
     TableRootRetention,
     /// Run only dropped-table runtime/file cleanup.
@@ -799,6 +816,7 @@ impl PurgeWork {
                     *self = PurgeWork::full();
                 }
             }
+            Purge::HorizonAdvanced => *self = PurgeWork::full(),
             Purge::TableRootRetention => self.table_root_retention = true,
             Purge::DroppedTable => self.dropped_table = true,
         }
@@ -848,6 +866,7 @@ impl PurgeLoop for PurgeSingleThreaded {
                 return;
             }
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
+            trx_sys.publish_gc_horizon(curr_sts);
             if work.full_gc && curr_sts > min_sts {
                 // Start GC. Purge undo/index first, then deallocate retired
                 // row pages once all bucket lists have been collected.
@@ -919,6 +938,7 @@ impl PurgeLoop for PurgeDispatcher {
                 break 'DISPATCH_LOOP;
             }
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
+            trx_sys.publish_gc_horizon(curr_sts);
             if work.full_gc && curr_sts > min_sts {
                 // dispatch tasks to executors
                 let (done_tx, done_rx) = flume::unbounded();
@@ -1358,6 +1378,16 @@ mod tests {
         tx.send(Purge::DroppedTable).unwrap();
         assert_eq!(
             coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| true),
+            PurgeWork::full()
+        );
+
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::HorizonAdvanced).unwrap();
+        tx.send(Purge::HorizonAdvanced).unwrap();
+        assert_eq!(
+            coalesce_purge_work(&rx, Purge::HorizonAdvanced, |_| {
+                panic!("rollback horizon wakeups carry no committed payload")
+            }),
             PurgeWork::full()
         );
     }

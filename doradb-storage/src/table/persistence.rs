@@ -17,6 +17,7 @@ use crate::lwc::PersistedLwcBlock;
 use crate::row::RowPage;
 use crate::session::SessionPin;
 use crate::table::{CheckpointCancelReason, Table, TableRedoReplayFloor, TableRuntimeLayout};
+use crate::trx::sys::TransactionSystem;
 #[cfg(test)]
 use crate::trx::tests::discard_transaction_after_fatal_rollback;
 use crate::value::{Val, ValKind, ValType};
@@ -27,6 +28,39 @@ use std::collections::BTreeSet;
 pub(crate) use tests::test_hooks;
 
 const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
+
+struct TransitionRoutePublicationGuard<'a> {
+    trx_sys: &'a TransactionSystem,
+    armed: bool,
+}
+
+impl<'a> TransitionRoutePublicationGuard<'a> {
+    #[inline]
+    fn arm(trx_sys: &'a TransactionSystem) -> Self {
+        Self {
+            trx_sys,
+            armed: true,
+        }
+    }
+
+    #[inline]
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransitionRoutePublicationGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            // Once row pages enter TRANSITION, foreground hot writers cannot
+            // safely continue on those pages. Failure before cold-route
+            // publication must poison storage rather than leave route waiters
+            // blocked forever.
+            let _ = self.trx_sys.poison_storage(FatalError::CheckpointWrite);
+        }
+    }
+}
 
 /// Cheap checkpoint scheduling decision for one user-table root snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1005,9 +1039,15 @@ impl Table {
         let checkpoint_ts = trx.sts();
         #[cfg(test)]
         test_hooks::run_test_checkpoint_after_trx_start_hook().await;
+        let mut transition_publication_guard = None;
         if !frozen_pages.is_empty() {
-            self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)
+            let transition_pages = self
+                .load_frozen_pages_for_transition(&pool_guards, &frozen_pages)
                 .await?;
+            let guard = TransitionRoutePublicationGuard::arm(&trx_sys);
+            self.set_loaded_frozen_pages_to_transition(&transition_pages, cutoff_ts);
+            drop(transition_pages);
+            transition_publication_guard = Some(guard);
         }
 
         // Step 4: build LWC blocks from transition pages using the cutoff
@@ -1195,6 +1235,9 @@ impl Table {
             .blk_idx()
             .update_column_root(published_pivot_row_id, published_column_root)
             .await;
+        if let Some(guard) = transition_publication_guard.as_mut() {
+            guard.disarm();
+        }
         #[cfg(test)]
         if test_hooks::test_force_post_publish_checkpoint_error_enabled() {
             let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
@@ -2317,6 +2360,7 @@ mod tests {
                 matches!(outcome, CheckpointOutcome::Published { silent: false, .. }),
                 "{outcome:?}"
             );
+            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
 
             let new_root = table.file().active_root_unchecked().clone();
             assert!(new_root.pivot_row_id > old_root.pivot_row_id);
@@ -3128,6 +3172,85 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_frozen_pages_stable_wakes_on_storage_poison() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut writer = engine.new_session().unwrap();
+            let mut trx = writer.begin_trx().unwrap();
+            trx_insert_row_by_id(
+                &mut trx,
+                table_id,
+                vec![Val::from(1i32), Val::from("blocked")],
+            )
+            .await
+            .unwrap();
+
+            let checkpoint_session = engine.new_session().unwrap();
+            checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let pool_guards = checkpoint_session.pool_guards();
+            let (frozen_pages, _) = table.collect_frozen_pages(&pool_guards).await.unwrap();
+            assert_eq!(frozen_pages.len(), 1);
+
+            let trx_sys = engine.inner().trx_sys.clone();
+            let page_guard = table
+                .mem
+                .must_get_row_page_shared(&pool_guards, frozen_pages[0].page_id)
+                .await
+                .unwrap();
+            let (ctx, _) = page_guard.ctx_and_page();
+            assert!(
+                ctx.row_ver().unwrap().max_ins_sts() >= trx_sys.published_gc_horizon(),
+                "test setup must block on the published GC horizon"
+            );
+            drop(page_guard);
+
+            let wait = table
+                .wait_for_frozen_pages_stable(&pool_guards, &trx_sys, &frozen_pages)
+                .fuse();
+            let poison_trx_sys = trx_sys.clone();
+            let poison = async move {
+                Timer::after(Duration::from_millis(20)).await;
+                let poison = poison_trx_sys.poison_storage(FatalError::CheckpointWrite);
+                assert_eq!(*poison.current_context(), FatalError::CheckpointWrite);
+            }
+            .fuse();
+            let timeout = Timer::after(Duration::from_secs(2)).fuse();
+            futures::pin_mut!(wait);
+            futures::pin_mut!(poison);
+            futures::pin_mut!(timeout);
+
+            let mut poison_done = false;
+            let res = loop {
+                futures::select! {
+                    res = wait => {
+                        assert!(poison_done, "wait returned before storage poison");
+                        break res;
+                    }
+                    () = poison => {
+                        poison_done = true;
+                    }
+                    _ = timeout => {
+                        panic!("frozen-page stability wait did not wake on storage poison");
+                    }
+                }
+            };
+            let err = res.expect_err("storage poison should abort the wait");
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::CheckpointWrite)
+            );
+            discard_transaction_after_fatal_rollback(&mut trx);
+        });
+    }
+
+    #[test]
     fn test_checkpoint_error_rollback() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -3148,6 +3271,12 @@ mod tests {
             let res = session.checkpoint_table(table_id).await;
             set_test_force_lwc_build_error(false);
             assert!(res.is_err());
+            let poison = engine
+                .inner()
+                .trx_sys
+                .storage_poison_error()
+                .expect("transition publication guard should poison storage");
+            assert_eq!(*poison.current_context(), FatalError::CheckpointWrite);
 
             let root_after = table_for_internal_assertion(&engine, table_id)
                 .file()

@@ -32,11 +32,9 @@ use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxRuntime};
 use crate::value::Val;
 use error_stack::Report;
-use smol::Timer;
 use std::mem::take;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Shared in-memory table core used by both catalog and user tables.
 ///
@@ -1638,7 +1636,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         key: &SelectKey,
-        mut input: RowUpdateInput,
+        input: RowUpdateInput,
         log_by_key: bool,
     ) -> Result<UpdateUniqueMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
@@ -1717,8 +1715,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         .into());
                 }
                 UpdateRowInplace::RetryInTransition(returned_input) => {
-                    input = returned_input;
-                    Timer::after(Duration::from_millis(1)).await;
+                    let _ = returned_input;
+                    // Standalone/catalog MemTable owns hot row-store state
+                    // only. Without user-table column storage and checkpoint
+                    // route publication, TRANSITION is not a valid state here.
+                    return Err(Report::new(InternalError::Generic)
+                        .attach("standalone MemTable update observed TRANSITION row page")
+                        .into());
                 }
                 UpdateRowInplace::NoFreeSpace(old_row_id, old_row, returned_input, old_guard) => {
                     let (new_row_id, index_change_cols, new_guard) = self
@@ -2245,7 +2248,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
                 DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
-                    Timer::after(Duration::from_millis(1)).await;
+                    // Standalone/catalog MemTable owns hot row-store state
+                    // only. Without user-table column storage and checkpoint
+                    // route publication, TRANSITION is not a valid state here.
+                    return Err(Report::new(InternalError::Generic)
+                        .attach("standalone MemTable delete observed TRANSITION row page")
+                        .into());
                 }
                 DeleteInternal::Ok(page_guard) => {
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard)
@@ -3357,6 +3365,80 @@ mod tests {
             let report = format!("{err:?}");
             assert!(report.contains("test catalog lwc"), "{report}");
             assert!(report.contains("row_id=42"), "{report}");
+        });
+    }
+
+    #[test]
+    fn test_mem_table_transition_retry_is_internal_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_015);
+            let mem_table = test_mem_table(&engine, mem_table_id).await;
+            let mut session = engine.new_session().unwrap();
+            let row_id = insert_mem_mvcc(
+                &mut session,
+                mem_table_id,
+                &mem_table,
+                vec![Val::from(1i32), Val::from("transition")],
+            )
+            .await;
+            let page_id = match mem_table
+                .find_row(&session.pool_guards(), row_id)
+                .await
+                .unwrap()
+            {
+                RowLocation::RowPage(page_id) => page_id,
+                RowLocation::NotFound => panic!("inserted row should be found"),
+                RowLocation::LwcBlock { .. } => panic!("standalone MemTable should not use LWC"),
+            };
+            let page_guard = mem_table
+                .try_get_validated_row_page_shared_result(&session.pool_guards(), page_id, row_id)
+                .await
+                .unwrap()
+                .expect("inserted row page should validate");
+            let (ctx, _) = page_guard.ctx_and_page();
+            let row_ver = ctx.row_ver().unwrap();
+            row_ver.set_frozen();
+            row_ver.set_transition();
+            drop(page_guard);
+
+            let key = single_key(1i32);
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table
+                        .update_unique_mvcc(
+                            rt,
+                            effects,
+                            &key,
+                            vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("updated"),
+                            }],
+                            false,
+                        )
+                        .await
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Internal);
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.acquire_table_write_locks(mem_table_id).await?;
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    mem_table.delete_unique_mvcc(rt, effects, &key, false).await
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Internal);
+            trx.rollback().await.unwrap();
         });
     }
 

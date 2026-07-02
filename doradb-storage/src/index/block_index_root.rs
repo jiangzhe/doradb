@@ -1,5 +1,6 @@
 use crate::id::{BlockID, RowID};
 use crate::latch::HybridLatch;
+use crate::notify::ChangeNotifier;
 use std::cell::UnsafeCell;
 
 /// Route returned by `BlockIndexRoot::guide`.
@@ -30,6 +31,8 @@ pub(super) struct BlockIndexRoot {
     pivot_row_id: UnsafeCell<RowID>,
     // Root page id of column block index.
     column_root_block_id: UnsafeCell<BlockID>,
+    // Progress signal for row-transition waiters that need a new cold route.
+    route_changed: ChangeNotifier,
 }
 
 impl BlockIndexRoot {
@@ -40,6 +43,7 @@ impl BlockIndexRoot {
             latch: HybridLatch::new(),
             pivot_row_id: UnsafeCell::new(pivot_row_id),
             column_root_block_id: UnsafeCell::new(column_root_block_id),
+            route_changed: ChangeNotifier::new(),
         }
     }
 
@@ -75,12 +79,18 @@ impl BlockIndexRoot {
         pivot_row_id: RowID,
         column_root_block_id: BlockID,
     ) {
-        let _g = self.latch.exclusive_async().await;
-        // SAFETY: protected by exclusive latch.
-        unsafe {
-            *self.pivot_row_id.get() = pivot_row_id;
-            *self.column_root_block_id.get() = column_root_block_id;
+        {
+            let _g = self.latch.exclusive_async().await;
+            // SAFETY: protected by exclusive latch.
+            unsafe {
+                *self.pivot_row_id.get() = pivot_row_id;
+                *self.column_root_block_id.get() = column_root_block_id;
+            }
         }
+        // This notification is for row-transition waiters: they need route
+        // progress after checkpoint publication, not a generic table lifecycle
+        // wakeup.
+        self.route_changed.notify();
     }
 
     #[inline]
@@ -95,6 +105,16 @@ impl BlockIndexRoot {
     #[inline]
     pub(super) fn pivot_row_id(&self) -> RowID {
         self.snapshot().0
+    }
+
+    #[inline]
+    pub(super) fn route_epoch(&self) -> u64 {
+        self.route_changed.epoch()
+    }
+
+    #[inline]
+    pub(super) async fn wait_route_since(&self, observed_epoch: u64) {
+        self.route_changed.wait_since_async(observed_epoch).await;
     }
 }
 
@@ -136,8 +156,11 @@ mod tests {
     fn test_root_update_column_root() {
         smol::block_on(async {
             let root = BlockIndexRoot::new(RowID::new(1000), test_block_id(77));
+            let route_epoch = root.route_epoch();
             root.update_column_root(RowID::new(2000), test_block_id(88))
                 .await;
+            assert_ne!(root.route_epoch(), route_epoch);
+            root.wait_route_since(route_epoch).await;
 
             match root.guide(RowID::new(1999)) {
                 BlockIndexRoute::Column {
@@ -154,6 +177,26 @@ mod tests {
                 Some((RowID::new(2000), test_block_id(88)))
             );
             assert_eq!(root.try_column(RowID::new(2000)), None);
+        });
+    }
+
+    #[test]
+    fn test_root_route_wait_wakes_after_update() {
+        smol::block_on(async {
+            let root = Arc::new(BlockIndexRoot::new(RowID::new(1000), test_block_id(77)));
+            let route_epoch = root.route_epoch();
+            let waiter = {
+                let root = Arc::clone(&root);
+                smol::spawn(async move {
+                    root.wait_route_since(route_epoch).await;
+                })
+            };
+
+            root.update_column_root(RowID::new(2000), test_block_id(88))
+                .await;
+            waiter.await;
+            assert!(root.route_epoch() > route_epoch);
+            assert_eq!(root.pivot_row_id(), RowID::new(2000));
         });
     }
 

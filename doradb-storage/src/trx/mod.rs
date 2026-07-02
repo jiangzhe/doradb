@@ -1857,7 +1857,7 @@ impl PrecommitTrxPayload {
     #[inline]
     fn record_rollback_for_purge(&self, attachment: &TrxAttachment) {
         let trx_sys = &attachment.engine().trx_sys;
-        trx_sys.gc_buckets[self.gc_no].record_rollback_for_purge(self.sts);
+        trx_sys.record_rollback_for_purge(self.gc_no, self.sts);
     }
 
     #[inline]
@@ -2352,7 +2352,7 @@ pub(crate) mod tests {
                 0
             );
 
-            engine.inner().trx_sys.gc_buckets[gc_no].record_rollback_for_purge(sts);
+            engine.inner().trx_sys.record_rollback_for_purge(gc_no, sts);
             engine
                 .inner()
                 .session_registry
@@ -2490,7 +2490,7 @@ pub(crate) mod tests {
             && let Some(attachment) = prepared.attachment.as_ref()
         {
             let trx_sys = &attachment.engine().trx_sys;
-            trx_sys.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
+            trx_sys.record_rollback_for_purge(payload.gc_no, payload.sts);
         }
         prepared.redo_bin.take();
         if let Some(attachment) = prepared.attachment.take() {
@@ -2512,7 +2512,7 @@ pub(crate) mod tests {
         let gc_no = transaction_gc_no(trx);
         let engine = trx.engine().expect("test transaction must have engine");
         discard_transaction_after_fatal_rollback(trx);
-        engine.trx_sys.gc_buckets[gc_no].record_rollback_for_purge(sts);
+        engine.trx_sys.record_rollback_for_purge(gc_no, sts);
     }
 
     /// Add one redo log entry for tests that need a non-readonly transaction.

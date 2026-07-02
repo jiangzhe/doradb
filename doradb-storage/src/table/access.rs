@@ -34,11 +34,10 @@ use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
-use smol::Timer;
+use futures::FutureExt;
 use std::collections::BTreeSet;
 use std::ptr::addr_eq;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub(super) struct RowIdMove {
@@ -114,6 +113,40 @@ impl<'a> UserTableAccessor<'a> {
         self.require_sec_idx(index_no)
             .expect("active user index slot")
             .is_unique()
+    }
+
+    #[inline]
+    async fn wait_transition_route_or_poison(
+        &self,
+        rt: TrxRuntime<'_>,
+        row_id: RowID,
+    ) -> Result<()> {
+        let trx_sys = &rt.engine().trx_sys;
+        loop {
+            trx_sys.ensure_runtime_healthy()?;
+            if row_id < self.mem().blk_idx().pivot_row_id() {
+                return Ok(());
+            }
+            let route_epoch = self.mem().blk_idx().route_epoch();
+            let poison_listener = trx_sys.storage_poison_listener();
+            if row_id < self.mem().blk_idx().pivot_row_id() {
+                return Ok(());
+            }
+            trx_sys.ensure_runtime_healthy()?;
+
+            // Row pages in TRANSITION need either a newly published cold route
+            // or storage poison. Without the poison wake, writers could sleep
+            // after the checkpoint producer failed before route publication.
+            let route_wait = self.mem().blk_idx().wait_route_since(route_epoch).fuse();
+            let poison_wait = poison_listener.fuse();
+            futures::pin_mut!(route_wait);
+            futures::pin_mut!(poison_wait);
+            futures::select! {
+                () = route_wait => (),
+                () = poison_wait => (),
+            }
+            trx_sys.ensure_runtime_healthy()?;
+        }
     }
 
     #[inline]
@@ -2744,7 +2777,7 @@ impl<'a> UserTableAccessor<'a> {
                 }
                 UpdateRowInplace::RetryInTransition(returned_input) => {
                     input = returned_input;
-                    Timer::after(Duration::from_millis(1)).await;
+                    self.wait_transition_route_or_poison(rt, row_id).await?;
                 }
                 UpdateRowInplace::NoFreeSpace(old_row_id, old_row, returned_input, old_guard) => {
                     // In-place update failed after the old row was locked and
@@ -2929,7 +2962,7 @@ impl<'a> UserTableAccessor<'a> {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
                 DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
-                    Timer::after(Duration::from_millis(1)).await;
+                    self.wait_transition_route_or_poison(rt, row_id).await?;
                 }
                 DeleteInternal::Ok(page_guard) => {
                     // Mask every secondary-index entry for this hot row. The
@@ -5604,14 +5637,15 @@ mod tests {
                         page_ctx.row_ver().unwrap().set_frozen();
                         frozen_page
                     };
-                    table_for_internal_assertion(&engine, table_id)
-                        .set_frozen_pages_to_transition(
-                            &session.pool_guards(),
-                            &[frozen_page],
-                            stmt.runtime().sts(),
-                        )
+                    let table = table_for_internal_assertion(&engine, table_id);
+                    let transition_pages = table
+                        .load_frozen_pages_for_transition(&session.pool_guards(), &[frozen_page])
                         .await
                         .unwrap();
+                    table.set_loaded_frozen_pages_to_transition(
+                        &transition_pages,
+                        stmt.runtime().sts(),
+                    );
 
                     let marker = table_for_internal_assertion(&engine, table_id)
                         .deletion_buffer()
