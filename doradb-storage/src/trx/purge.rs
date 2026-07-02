@@ -10,13 +10,13 @@ use crate::latch::LatchFallbackMode;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
+use crate::runtime;
 use crate::table::Table;
 use crate::thread;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS};
-use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
@@ -171,15 +171,14 @@ impl TransactionSystem {
             let task_trx_sys = trx_sys.clone();
             let task_mem_pool = mem_pool.clone();
             let handle = thread::spawn_named("Purge-Thread", move || {
-                let ex = LocalExecutor::new();
                 let mut purger = PurgeSingleThreaded;
-                smol::block_on(ex.run(purger.purge_loop(
+                runtime::block_on(purger.purge_loop(
                     &task_mem_pool,
                     &task_trx_sys.catalog,
                     &task_trx_sys,
                     pool_guards,
                     purge_chan,
-                )))
+                ))
             });
             vec![handle]
         } else {
@@ -189,14 +188,13 @@ impl TransactionSystem {
             let task_trx_sys = trx_sys.clone();
             let task_mem_pool = mem_pool.clone();
             let handle = thread::spawn_named("Purge-Dispatcher", move || {
-                let ex = LocalExecutor::new();
-                smol::block_on(ex.run(dispatcher.purge_loop(
+                runtime::block_on(dispatcher.purge_loop(
                     &task_mem_pool,
                     &task_trx_sys.catalog,
                     &task_trx_sys,
                     dispatcher_guards,
                     purge_chan,
-                )));
+                ));
             });
             let mut handles = Vec::with_capacity(executors.len() + 1);
             handles.push(handle);
@@ -266,13 +264,12 @@ impl TransactionSystem {
             let task_trx_sys = trx_sys.clone();
             let handle = thread::spawn_named(thread_name, move || {
                 let mut purger = PurgeExecutor;
-                let ex = LocalExecutor::new();
-                smol::block_on(ex.run(purger.purge_task_loop(
+                runtime::block_on(purger.purge_task_loop(
                     &task_trx_sys.catalog,
                     &task_trx_sys,
                     pool_guards,
                     rx,
-                )));
+                ));
             });
             handles.push(handle);
         }

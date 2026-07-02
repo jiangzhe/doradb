@@ -597,6 +597,9 @@ impl Table {
             trx_sys.ensure_runtime_healthy()?;
             if trx_sys.published_gc_horizon_epoch() == observed_epoch {
                 let poison_listener = trx_sys.storage_poison_listener();
+                // Re-check after listener registration so poison that fired in
+                // the pre-registration gap is observed before sleeping.
+                trx_sys.ensure_runtime_healthy()?;
                 // Storage poison may stop future purge publications, so this
                 // wait must wake on either horizon progress or poison.
                 let horizon_wait = trx_sys

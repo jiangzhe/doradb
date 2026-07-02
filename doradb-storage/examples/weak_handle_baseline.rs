@@ -3,14 +3,19 @@
 // admission paths should respect this example by running it before and after the
 // task and comparing `baseline.csv` for performance impact.
 
+use doradb_storage::id::TableID;
 use doradb_storage::{
     ColumnAttributes, ColumnSpec, EngineConfig, EvictableBufferPoolConfig, FileSystemConfig,
     IndexAttributes, IndexKey, IndexSpec, Result as StorageResult, SelectKey, TableSpec,
     TrxSysConfig, UpdateCol, Val, ValKind,
 };
+use futures::executor;
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::exit;
+use std::result::Result;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -19,7 +24,7 @@ const DEFAULT_SCAN_ROWS: usize = 10_000;
 const DEFAULT_POOL_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_OUT_DIR: &str = "target/weak-handle-baseline";
 
-type ToolResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+type ToolResult<T> = Result<T, Box<dyn Error>>;
 
 struct Args {
     iterations: usize,
@@ -110,13 +115,13 @@ Output: <out-dir>/baseline.csv"
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
-        std::process::exit(1);
+        exit(1);
     }
 }
 
 fn run() -> ToolResult<()> {
     let args = parse_args()?;
-    let rows = smol::block_on(run_baseline(&args))?;
+    let rows = executor::block_on(run_baseline(&args))?;
     let report_path = write_csv(&args.out_dir, &rows)?;
     print_report(&rows, &report_path);
     Ok(())
@@ -155,7 +160,7 @@ fn parse_args() -> ToolResult<Args> {
             "--help" | "-h" => {
                 println!("{}", usage());
                 println!("Valid --only operations: {}", BenchOperation::valid_names());
-                std::process::exit(0);
+                exit(0);
             }
             _ => return Err(format!("unknown argument: {arg}\n{}", usage()).into()),
         }
@@ -329,9 +334,7 @@ fn baseline_engine_config(root: &Path) -> EngineConfig {
         .trx(TrxSysConfig::default())
 }
 
-async fn create_baseline_table(
-    engine: &doradb_storage::Engine,
-) -> StorageResult<doradb_storage::id::TableID> {
+async fn create_baseline_table(engine: &doradb_storage::Engine) -> StorageResult<TableID> {
     let mut session = engine.new_session()?;
     let table_id = session
         .create_table(
@@ -348,7 +351,7 @@ async fn create_baseline_table(
 
 async fn insert_range(
     session: &mut doradb_storage::Session,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     start: i32,
     count: usize,
 ) -> StorageResult<()> {
@@ -414,7 +417,7 @@ async fn measure_statement_exec(
 /// and empty MVCC scan scaffolding.
 async fn measure_first_resolution_empty_scan(
     engine: &doradb_storage::Engine,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let read_set = [];
@@ -442,7 +445,7 @@ async fn measure_first_resolution_empty_scan(
 /// warm so the table cache is hot, then times the full read-statement path.
 async fn measure_cached_resolution_empty_scan(
     engine: &doradb_storage::Engine,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -468,7 +471,7 @@ async fn measure_cached_resolution_empty_scan(
 
 async fn measure_point_lookup(
     engine: &doradb_storage::Engine,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -494,7 +497,7 @@ async fn measure_point_lookup(
 
 async fn measure_insert(
     engine: &doradb_storage::Engine,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -521,7 +524,7 @@ async fn measure_insert(
 
 async fn measure_update(
     engine: &doradb_storage::Engine,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -552,7 +555,7 @@ async fn measure_update(
 
 async fn measure_delete(
     engine: &doradb_storage::Engine,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -577,7 +580,7 @@ async fn measure_delete(
 
 async fn measure_table_scan(
     engine: &doradb_storage::Engine,
-    table_id: doradb_storage::id::TableID,
+    table_id: TableID,
     iterations: usize,
     expected_rows: usize,
 ) -> StorageResult<BenchRow> {
