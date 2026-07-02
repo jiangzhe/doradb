@@ -24,6 +24,7 @@ mod ptr;
 mod quiescent;
 mod recovery;
 mod row;
+mod runtime;
 mod serde;
 mod session;
 pub mod stats;

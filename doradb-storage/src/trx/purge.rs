@@ -10,6 +10,7 @@ use crate::latch::LatchFallbackMode;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
+use crate::runtime;
 use crate::table::Table;
 use crate::thread;
 use crate::trx::row::RowWriteAccess;
@@ -173,7 +174,7 @@ impl TransactionSystem {
             let handle = thread::spawn_named("Purge-Thread", move || {
                 let ex = LocalExecutor::new();
                 let mut purger = PurgeSingleThreaded;
-                smol::block_on(ex.run(purger.purge_loop(
+                runtime::block_on(ex.run(purger.purge_loop(
                     &task_mem_pool,
                     &task_trx_sys.catalog,
                     &task_trx_sys,
@@ -190,7 +191,7 @@ impl TransactionSystem {
             let task_mem_pool = mem_pool.clone();
             let handle = thread::spawn_named("Purge-Dispatcher", move || {
                 let ex = LocalExecutor::new();
-                smol::block_on(ex.run(dispatcher.purge_loop(
+                runtime::block_on(ex.run(dispatcher.purge_loop(
                     &task_mem_pool,
                     &task_trx_sys.catalog,
                     &task_trx_sys,
@@ -267,7 +268,7 @@ impl TransactionSystem {
             let handle = thread::spawn_named(thread_name, move || {
                 let mut purger = PurgeExecutor;
                 let ex = LocalExecutor::new();
-                smol::block_on(ex.run(purger.purge_task_loop(
+                runtime::block_on(ex.run(purger.purge_task_loop(
                     &task_trx_sys.catalog,
                     &task_trx_sys,
                     pool_guards,

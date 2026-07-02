@@ -13,6 +13,7 @@ use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, 
 use crate::notify::ChangeNotifier;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
+use crate::runtime;
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
@@ -1209,7 +1210,7 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn start_cleanup_thread(cleanup_rx: Receiver<TrxCleanupMessage>) -> JoinHandle<()> {
         thread::spawn_named("Trx-Cleanup-Thread", move || {
-            smol::block_on(async move {
+            runtime::block_on(async move {
                 while let Ok(message) = cleanup_rx.recv_async().await {
                     if run_trx_cleanup_message(message).await {
                         continue;
