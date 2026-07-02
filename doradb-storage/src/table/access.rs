@@ -4382,7 +4382,6 @@ mod tests {
             .await;
             let err = res.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
-            writer.rollback().await.unwrap();
 
             assert_unique_index_entry(
                 &table_for_internal_assertion(&engine, table_id),
@@ -4393,6 +4392,9 @@ mod tests {
                 true,
             )
             .await;
+
+            writer.rollback().await.unwrap();
+
             expect_select_committed(table_id, &mut session, &old_key, |vals| {
                 assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
             })
