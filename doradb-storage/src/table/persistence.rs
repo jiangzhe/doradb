@@ -3172,6 +3172,85 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_frozen_pages_stable_wakes_on_storage_poison() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut writer = engine.new_session().unwrap();
+            let mut trx = writer.begin_trx().unwrap();
+            trx_insert_row_by_id(
+                &mut trx,
+                table_id,
+                vec![Val::from(1i32), Val::from("blocked")],
+            )
+            .await
+            .unwrap();
+
+            let checkpoint_session = engine.new_session().unwrap();
+            checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let pool_guards = checkpoint_session.pool_guards();
+            let (frozen_pages, _) = table.collect_frozen_pages(&pool_guards).await.unwrap();
+            assert_eq!(frozen_pages.len(), 1);
+
+            let trx_sys = engine.inner().trx_sys.clone();
+            let page_guard = table
+                .mem
+                .must_get_row_page_shared(&pool_guards, frozen_pages[0].page_id)
+                .await
+                .unwrap();
+            let (ctx, _) = page_guard.ctx_and_page();
+            assert!(
+                ctx.row_ver().unwrap().max_ins_sts() >= trx_sys.published_gc_horizon(),
+                "test setup must block on the published GC horizon"
+            );
+            drop(page_guard);
+
+            let wait = table
+                .wait_for_frozen_pages_stable(&pool_guards, &trx_sys, &frozen_pages)
+                .fuse();
+            let poison_trx_sys = trx_sys.clone();
+            let poison = async move {
+                Timer::after(Duration::from_millis(20)).await;
+                let poison = poison_trx_sys.poison_storage(FatalError::CheckpointWrite);
+                assert_eq!(*poison.current_context(), FatalError::CheckpointWrite);
+            }
+            .fuse();
+            let timeout = Timer::after(Duration::from_secs(2)).fuse();
+            futures::pin_mut!(wait);
+            futures::pin_mut!(poison);
+            futures::pin_mut!(timeout);
+
+            let mut poison_done = false;
+            let res = loop {
+                futures::select! {
+                    res = wait => {
+                        assert!(poison_done, "wait returned before storage poison");
+                        break res;
+                    }
+                    () = poison => {
+                        poison_done = true;
+                    }
+                    _ = timeout => {
+                        panic!("frozen-page stability wait did not wake on storage poison");
+                    }
+                }
+            };
+            let err = res.expect_err("storage poison should abort the wait");
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::CheckpointWrite)
+            );
+            discard_transaction_after_fatal_rollback(&mut trx);
+        });
+    }
+
+    #[test]
     fn test_checkpoint_error_rollback() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();

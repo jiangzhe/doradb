@@ -50,6 +50,7 @@ use crate::trx::ver_map::RowPageState;
 use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxReadProof, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
+use futures::FutureExt;
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem::take;
@@ -595,9 +596,19 @@ impl Table {
             // transactions are no longer active.
             trx_sys.ensure_runtime_healthy()?;
             if trx_sys.published_gc_horizon_epoch() == observed_epoch {
-                trx_sys
+                let poison_listener = trx_sys.storage_poison_listener();
+                // Storage poison may stop future purge publications, so this
+                // wait must wake on either horizon progress or poison.
+                let horizon_wait = trx_sys
                     .wait_published_gc_horizon_since(observed_epoch)
-                    .await;
+                    .fuse();
+                let poison_wait = poison_listener.fuse();
+                futures::pin_mut!(horizon_wait);
+                futures::pin_mut!(poison_wait);
+                futures::select! {
+                    () = horizon_wait => (),
+                    () = poison_wait => (),
+                }
             }
             trx_sys.ensure_runtime_healthy()?;
         }
