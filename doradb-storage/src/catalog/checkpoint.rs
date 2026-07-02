@@ -115,8 +115,6 @@ pub enum CatalogCheckpointOutcome {
 pub(crate) struct CatalogCheckpointScanConfig {
     /// Redo log file prefix used to discover scan inputs.
     pub(crate) file_prefix: String,
-    /// First redo log file sequence retained for recovery.
-    pub(crate) first_retained_file_seq: u32,
     /// Maximum direct-IO read-ahead depth for redo scan input.
     pub(crate) read_ahead_depth: usize,
 }
@@ -364,7 +362,10 @@ impl Catalog {
     ) -> Result<CatalogCheckpointOutcome> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
         let _redo_retention_lease = trx_sys.begin_redo_retention().await;
-        let batch = self.scan_checkpoint_batch(trx_sys).await?;
+        let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
+        let batch = self
+            .scan_checkpoint_batch(trx_sys.persisted_watermark_cts(), scan_cfg)
+            .await?;
         let publishable_progress = batch.redo_retention_progress();
         match self.apply_checkpoint_batch(batch).await {
             Ok(CatalogCheckpointOutcome::Published {
@@ -389,41 +390,28 @@ impl Catalog {
 
     /// Scan persisted redo logs and collect one safe catalog checkpoint batch.
     ///
-    /// This call satisfies the persisted-watermark precondition by using the
-    /// durable watermark from the single redo log.
+    /// The caller owns selecting the durable upper CTS and base redo scan
+    /// config. The retained redo marker and replay cursor come from the same
+    /// catalog checkpoint snapshot.
     ///
     /// Scanned batches are intended for single-flight publish flow and must not
     /// be raced with other catalog checkpoint publishes against the same shared
     /// `CatalogStorage`/`MultiTableFile` writer.
     pub(crate) async fn scan_checkpoint_batch(
         &self,
-        trx_sys: &TransactionSystem,
+        durable_upper_cts: TrxID,
+        scan_cfg: CatalogCheckpointScanConfig,
     ) -> Result<CatalogCheckpointBatch> {
         let snapshot = self.storage.checkpoint_snapshot()?;
-        let mut scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
-        scan_cfg.first_retained_file_seq = snapshot.meta.first_redo_log_seq;
-        self.scan_checkpoint_batch_with_config(
-            snapshot.catalog_replay_start_ts,
-            trx_sys.persisted_watermark_cts(),
-            &scan_cfg,
-        )
-        .await
-    }
-
-    /// Scan catalog redo logs with an explicit replay window and log prefix.
-    pub(crate) async fn scan_checkpoint_batch_with_config(
-        &self,
-        replay_start_ts: TrxID,
-        durable_upper_cts: TrxID,
-        scan_cfg: &CatalogCheckpointScanConfig,
-    ) -> Result<CatalogCheckpointBatch> {
+        let first_retained_file_seq = snapshot.meta.first_redo_log_seq;
+        let replay_start_ts = snapshot.catalog_replay_start_ts;
         // Start with an empty batch whose safe point is just before the
         // catalog replay cursor. The scan only advances `safe_cts` after a
         // redo record is proven safe to cover in this checkpoint.
         let mut batch = CatalogCheckpointBatch {
             replay_start_ts,
             safe_cts: replay_start_ts.saturating_sub(1),
-            first_retained_file_seq: scan_cfg.first_retained_file_seq,
+            first_retained_file_seq,
             sealed_redo_segments: vec![],
             catalog_ops: vec![],
             catalog_ddl_txn_count: 0,
@@ -435,11 +423,7 @@ impl Catalog {
             return Ok(batch);
         }
 
-        let logs = discover_redo_log_files(
-            &scan_cfg.file_prefix,
-            scan_cfg.first_retained_file_seq,
-            false,
-        )?;
+        let logs = discover_redo_log_files(&scan_cfg.file_prefix, first_retained_file_seq, false)?;
         if logs.is_empty() {
             return Ok(batch);
         }

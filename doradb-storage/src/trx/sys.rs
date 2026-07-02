@@ -1214,7 +1214,6 @@ impl TransactionSystem {
     pub(crate) fn catalog_checkpoint_scan_config(&self) -> Result<CatalogCheckpointScanConfig> {
         Ok(CatalogCheckpointScanConfig {
             file_prefix: self.config.file_prefix()?,
-            first_retained_file_seq: 0,
             read_ahead_depth: self.config.catalog_checkpoint_scan_io_depth,
         })
     }

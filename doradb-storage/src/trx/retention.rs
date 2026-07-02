@@ -233,7 +233,11 @@ impl TransactionSystem {
         // 2. Scan exactly one catalog checkpoint batch and prepare, but do not
         // commit, the projected catalog root. Keeping the root mutable lets the
         // same publication also carry an advanced first-retained redo marker.
-        let batch = self.catalog.scan_checkpoint_batch(self).await?;
+        let scan_cfg = self.catalog_checkpoint_scan_config()?;
+        let batch = self
+            .catalog
+            .scan_checkpoint_batch(self.persisted_watermark_cts(), scan_cfg)
+            .await?;
         let checkpoint_progress = batch.redo_retention_progress();
         let mut prepared = self.catalog.prepare_checkpoint_batch(batch).await?;
         let checkpoint_will_publish = prepared.will_publish();

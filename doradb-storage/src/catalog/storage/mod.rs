@@ -1,5 +1,6 @@
 mod columns;
 mod indexes;
+mod merge;
 mod object;
 mod table_replay_silent_watermarks;
 pub(crate) mod tables;
@@ -7,13 +8,14 @@ pub(crate) mod tables;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
+use crate::catalog::storage::merge::{CatalogFoldedRows, CatalogMergeKeyBuilder};
 pub(crate) use crate::catalog::storage::object::*;
 use crate::catalog::storage::table_replay_silent_watermarks::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{
-    CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable, IndexSpec,
-    PrimaryKeyMatchError, USER_OBJ_ID_START,
+    CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
+    USER_OBJ_ID_START,
 };
 use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
@@ -23,21 +25,17 @@ use crate::file::multi_table_file::{
     MultiTableFileSnapshot, MutableMultiTableFile,
 };
 use crate::id::{BlockID, RowID, TableID, TrxID};
-use crate::index::{
-    BlockIndex, ColumnBlockEntryPatch, ColumnBlockEntryShape, ColumnBlockIndex,
-    ColumnDeleteDeltaPatch, ColumnDeleteDomain, ColumnLeafEntry,
-};
+use crate::index::{BlockIndex, ColumnBlockEntryShape, ColumnBlockIndex, ColumnLeafEntry};
 use crate::io::DirectBuf;
 use crate::log::redo::RowRedoKind;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
-use crate::map::FastHashMap;
+use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::{SelectKey, UpdateCol};
 use crate::table::TableRedoReplayFloor;
 use crate::value::Val;
 use error_stack::Report;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -240,7 +238,7 @@ impl CatalogStorage {
                 continue;
             }
             let rows = self
-                .load_visible_rows_from_root(self.tables[idx].metadata(), guards.disk_guard(), root)
+                .load_rows_from_root(self.tables[idx].metadata(), guards.disk_guard(), root)
                 .await?;
             for row in rows {
                 self.tables[idx].insert_no_trx(guards, &row.vals).await?;
@@ -405,7 +403,7 @@ impl CatalogStorage {
         root: CatalogTableRootDesc,
     ) -> Result<FastHashMap<TableID, TableRedoReplayFloor>> {
         let rows = self
-            .load_visible_rows_from_root(
+            .load_rows_from_root(
                 self.tables[TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS.as_usize()].metadata(),
                 disk_pool_guard,
                 root,
@@ -497,129 +495,17 @@ impl CatalogStorage {
         checkpoint_cts: TrxID,
     ) -> Result<(CatalogTableRootDesc, bool)> {
         let disk_pool_guard = self.disk_pool.pool_guard();
-        // Step 1: Validate root invariants and construct a base index snapshot for reads.
-        if root.root_block_id.is_none() && root.pivot_row_id != RowID::new(0) {
-            return Err(invalid_catalog_payload(format!(
-                "empty catalog table root has nonzero pivot_row_id={}",
-                root.pivot_row_id
-            )));
-        }
-        let root_block_id = root.checkpoint_root_block_id();
-        let entries = if let Some(root_block_id) = root_block_id {
-            self.collect_index_entries(&disk_pool_guard, root_block_id)
-                .await?
-        } else {
-            Vec::new()
-        };
-        let base_index = ColumnBlockIndex::new(
-            root_block_id.unwrap_or(SUPER_BLOCK_ID),
-            root.pivot_row_id,
-            self.mtb.file_kind(),
-            self.mtb.sparse_file(),
-            &self.disk_pool,
-            &disk_pool_guard,
-        );
-        let mut next_row_id = root.pivot_row_id;
+        let base_rows = self
+            .load_rows_from_root(metadata, &disk_pool_guard, root)
+            .await?;
+        let mut folded = CatalogFoldedRows::from_base_rows(metadata, base_rows)?;
 
-        // Step 2: Preload existing visible rows only when key-based ops appear.
-        let need_key_lookup = table_ops.iter().any(|kind| {
-            matches!(
-                kind,
-                RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..)
-            )
-        });
-        let mut existing_rows = if need_key_lookup {
-            self.load_visible_rows_for_key_lookup(metadata, &disk_pool_guard, &entries, &base_index)
-                .await?
-        } else {
-            Vec::new()
-        };
-        let mut pending_rows = Vec::new();
-        let mut delete_deltas: BTreeMap<RowID, BTreeSet<u32>> = BTreeMap::new();
-
-        // Step 3: Replay table ops into in-memory pending rows and deletion deltas.
         for kind in table_ops {
             match kind {
-                RowRedoKind::Insert(vals) => {
-                    if vals.len() != metadata.col.col_count() {
-                        return Err(invalid_catalog_payload(format!(
-                            "catalog checkpoint insert value count {} does not match column count {}",
-                            vals.len(),
-                            metadata.col.col_count()
-                        )));
-                    }
-                    pending_rows.push(PendingInsertRow {
-                        row_id: next_row_id,
-                        vals: vals.clone(),
-                        deleted: false,
-                    });
-                    next_row_id = next_row_id.saturating_add(1);
-                }
-                RowRedoKind::DeleteByPrimaryKey(key) => {
-                    let index_spec = validate_catalog_delete_primary_key(metadata, key)?;
-                    if let Some(row_idx) =
-                        find_pending_key_match(&pending_rows, index_spec, &key.vals)?
-                    {
-                        pending_rows[row_idx].deleted = true;
-                        continue;
-                    }
-                    if let Some(row_idx) =
-                        find_existing_key_match(&existing_rows, index_spec, &key.vals)?
-                    {
-                        let row = &mut existing_rows[row_idx];
-                        row.deleted = true;
-                        let delta = row.row_id.checked_sub(row.start_row_id).ok_or_else(|| {
-                            invalid_catalog_payload(format!(
-                                "delete row id precedes block start: row_id={}, start_row_id={}",
-                                row.row_id, row.start_row_id
-                            ))
-                        })?;
-                        if delta > u32::MAX as u64 {
-                            return Err(invalid_catalog_payload(format!(
-                                "delete delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
-                                row.row_id, row.start_row_id
-                            )));
-                        }
-                        delete_deltas
-                            .entry(row.start_row_id)
-                            .or_default()
-                            .insert(delta as u32);
-                    }
-                }
+                RowRedoKind::Insert(vals) => folded.fold_insert(metadata, vals.clone())?,
+                RowRedoKind::DeleteByPrimaryKey(key) => folded.fold_delete(key)?,
                 RowRedoKind::UpdateByPrimaryKey(key, update) => {
-                    let index_spec = validate_catalog_update_primary_key(metadata, key)?;
-                    if let Some(row_idx) =
-                        find_pending_key_match(&pending_rows, index_spec, &key.vals)?
-                    {
-                        apply_catalog_update_by_primary_key(
-                            metadata,
-                            index_spec,
-                            key,
-                            &mut pending_rows[row_idx].vals,
-                            update,
-                        )?;
-                        continue;
-                    }
-                    let Some(row_idx) =
-                        find_existing_key_match(&existing_rows, index_spec, &key.vals)?
-                    else {
-                        return Err(invalid_catalog_payload(format!(
-                            "catalog checkpoint update-by-primary-key target missing: index_no={}, key_vals={:?}",
-                            key.index_no, key.vals
-                        )));
-                    };
-                    let row = &mut existing_rows[row_idx];
-                    mark_existing_row_deleted(row, &mut delete_deltas)?;
-                    let mut vals = row.vals.clone();
-                    apply_catalog_update_by_primary_key(
-                        metadata, index_spec, key, &mut vals, update,
-                    )?;
-                    pending_rows.push(PendingInsertRow {
-                        row_id: next_row_id,
-                        vals,
-                        deleted: false,
-                    });
-                    next_row_id = next_row_id.saturating_add(1);
+                    folded.fold_update(metadata, key, update)?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     return Err(invalid_catalog_payload(
@@ -629,177 +515,58 @@ impl CatalogStorage {
             }
         }
 
-        // Step 4: Build the live-insert batch after canceling same-batch insert+delete rows.
-        let mut current_root_block_id = root_block_id.unwrap_or(SUPER_BLOCK_ID);
-        let mut current_end_row_id = root.pivot_row_id;
-        let mut blocks_changed = false;
-        let mut live_inserts = Vec::new();
-        for row in pending_rows {
-            if !row.deleted {
-                live_inserts.push(RowRecord {
-                    row_id: row.row_id,
-                    vals: row.vals,
-                });
-            }
+        if !folded.should_rewrite() {
+            return Ok((root, false));
         }
 
-        // Step 5: Try CoW-merging inserts into the right-most existing LWC block first.
-        if !live_inserts.is_empty()
-            && let Some(last_entry) = entries.last().copied()
-        {
-            let existing_tail_rows = self
-                .decode_lwc_page_rows(metadata, &disk_pool_guard, &base_index, &last_entry)
-                .await?;
-            if !existing_tail_rows.is_empty()
-                && let Some((merged_tail_buf, merged_row_ids, consumed)) =
-                    Self::build_merged_tail_lwc_block(
-                        metadata,
-                        last_entry.start_row_id,
-                        &existing_tail_rows,
-                        &live_inserts,
-                    )?
-            {
-                let new_tail_block_id = mutable.allocate_block()?;
-                mutable
-                    .write_block(new_tail_block_id, merged_tail_buf)
-                    .await?;
-                let merged_end_row_id = live_inserts
-                    .get(consumed.saturating_sub(1))
-                    .map(|row| row.row_id.saturating_add(1))
-                    .unwrap_or(current_end_row_id);
-                let existing_deletes = base_index.load_delete_deltas(&last_entry).await?;
-                let replacement = ColumnBlockEntryShape::new(
-                    last_entry.start_row_id,
-                    merged_end_row_id,
-                    merged_row_ids,
-                    existing_deletes,
-                )?
-                .with_delete_domain(ColumnDeleteDomain::Ordinal)
-                .with_block_id(new_tail_block_id);
-                let patches = [ColumnBlockEntryPatch {
-                    start_row_id: last_entry.start_row_id,
-                    entry: replacement,
-                }];
-                let column_index = ColumnBlockIndex::new(
-                    current_root_block_id,
-                    current_end_row_id,
-                    self.mtb.file_kind(),
-                    self.mtb.sparse_file(),
-                    &self.disk_pool,
-                    &disk_pool_guard,
-                );
-                current_root_block_id = column_index
-                    .batch_replace_entries(mutable, &patches, checkpoint_cts)
-                    .await?;
-                current_end_row_id = merged_end_row_id;
-                blocks_changed = true;
-                live_inserts.drain(0..consumed);
-                if live_inserts.is_empty() {
-                    current_end_row_id = next_row_id.max(root.pivot_row_id);
-                }
-            }
+        let output_vals = folded.materialize_output_rows()?;
+        if output_vals.is_empty() {
+            return Ok((
+                CatalogTableRootDesc {
+                    table_id,
+                    root_block_id: None,
+                    pivot_row_id: RowID::new(0),
+                },
+                root.root_block_id.is_some() || root.pivot_row_id != RowID::new(0),
+            ));
         }
 
-        // Step 6: Persist any remaining inserts as new LWC blocks and append index entries.
-        if !live_inserts.is_empty() {
-            let new_pages = Self::build_lwc_blocks_from_row_records(metadata, &live_inserts)?;
-            let mut new_entries = Vec::with_capacity(new_pages.len());
-            for page in new_pages {
-                let block_id = mutable.allocate_block()?;
-                mutable.write_block(block_id, page.buf).await?;
-                new_entries.push(page.shape.with_block_id(block_id));
-            }
-            if !new_entries.is_empty() {
-                let new_end_row_id = next_row_id.max(root.pivot_row_id);
-                let column_index = ColumnBlockIndex::new(
-                    current_root_block_id,
-                    current_end_row_id,
-                    self.mtb.file_kind(),
-                    self.mtb.sparse_file(),
-                    &self.disk_pool,
-                    &disk_pool_guard,
-                );
-                current_root_block_id = column_index
-                    .batch_insert(mutable, &new_entries, new_end_row_id, checkpoint_cts)
-                    .await?;
-                current_end_row_id = new_end_row_id;
-                blocks_changed = true;
-            }
+        let output_rows = output_vals
+            .into_iter()
+            .enumerate()
+            .map(|(idx, vals)| RowRecord {
+                row_id: RowID::new(idx as u64),
+                vals,
+            })
+            .collect::<Vec<_>>();
+        let new_pages = build_lwc_blocks_from_row_records(metadata, &output_rows)?;
+        let mut new_entries = Vec::with_capacity(new_pages.len());
+        for page in new_pages {
+            let block_id = mutable.allocate_block()?;
+            mutable.write_block(block_id, page.buf).await?;
+            new_entries.push(page.shape.with_block_id(block_id));
         }
-
-        // Step 7: Materialize typed delete rewrites keyed by leaf start-row-id.
-        let mut patch_storage: Vec<(RowID, Vec<u32>)> = Vec::new();
-        for (start_row_id, pending) in &delete_deltas {
-            let idx = entries
-                .binary_search_by_key(start_row_id, |entry| entry.start_row_id)
-                .map_err(|_| {
-                    invalid_catalog_payload(format!(
-                        "delete patch target missing: start_row_id={start_row_id}"
-                    ))
-                })?;
-            let entry = entries[idx];
-            let mut base: BTreeSet<u32> = base_index
-                .load_delete_deltas(&entry)
-                .await?
-                .into_iter()
-                .collect();
-            let old_len = base.len();
-            base.extend(pending.iter().copied());
-            if base.len() == old_len {
-                continue;
-            }
-            patch_storage.push((*start_row_id, base.into_iter().collect()));
-        }
-
-        // Step 8: Apply typed delete rewrites on the current root.
-        if !patch_storage.is_empty() {
-            let patches: Vec<ColumnDeleteDeltaPatch<'_>> = patch_storage
-                .iter()
-                .map(|(start_row_id, delete_deltas)| ColumnDeleteDeltaPatch {
-                    start_row_id: *start_row_id,
-                    delete_deltas,
-                })
-                .collect();
-            let column_index = ColumnBlockIndex::new(
-                current_root_block_id,
-                current_end_row_id,
-                self.mtb.file_kind(),
-                self.mtb.sparse_file(),
-                &self.disk_pool,
-                &disk_pool_guard,
-            );
-            current_root_block_id = column_index
-                .batch_replace_delete_deltas(mutable, &patches, checkpoint_cts)
-                .await?;
-            blocks_changed = true;
-        }
-
-        // Step 9: Publish final per-table root descriptor for this checkpoint batch.
-        let next_pivot_row_id = next_row_id.max(root.pivot_row_id);
-        let (root_block_id, pivot_row_id) = if current_root_block_id == SUPER_BLOCK_ID {
-            // Same-batch insert/delete on an empty root can advance `next_row_id`
-            // without materializing any persisted blocks. Keep the published
-            // descriptor empty instead of emitting `None` with a nonzero pivot.
-            (root.root_block_id, root.pivot_row_id)
-        } else {
-            let root_block_id = if blocks_changed || next_pivot_row_id > root.pivot_row_id {
-                Some(
-                    NonZeroU64::new(current_root_block_id.into()).ok_or_else(|| {
-                        invalid_catalog_payload("catalog root block id resolved to zero")
-                    })?,
-                )
-            } else {
-                root.root_block_id
-            };
-            (root_block_id, next_pivot_row_id)
-        };
+        let pivot_row_id = RowID::new(output_rows.len() as u64);
+        let column_index = ColumnBlockIndex::new(
+            SUPER_BLOCK_ID,
+            RowID::new(0),
+            self.mtb.file_kind(),
+            self.mtb.sparse_file(),
+            &self.disk_pool,
+            &disk_pool_guard,
+        );
+        let root_block_id = column_index
+            .batch_insert(mutable, &new_entries, pivot_row_id, checkpoint_cts)
+            .await?;
+        let root_block_id = NonZeroU64::new(root_block_id.into())
+            .ok_or_else(|| invalid_catalog_payload("catalog root block id resolved to zero"))?;
         Ok((
             CatalogTableRootDesc {
                 table_id,
-                root_block_id,
+                root_block_id: Some(root_block_id),
                 pivot_row_id,
             },
-            blocks_changed,
+            true,
         ))
     }
 
@@ -823,25 +590,25 @@ impl CatalogStorage {
         index.collect_leaf_entries().await
     }
 
-    /// Load checkpoint-visible rows from one catalog table root.
+    /// Load rows from one catalog table root.
     ///
     /// This is a disk-root reader, not a runtime catalog-table scan. The `root`
     /// must come from a checkpointed `catalog.mtb` root descriptor or from a
-    /// newly prepared descriptor that is about to be published. Rows committed
-    /// after that descriptor was produced are intentionally invisible here.
+    /// newly prepared descriptor that is about to be published. It returns only
+    /// rows encoded in that root's persisted LWC blocks.
     ///
-    /// `visible` means present in persisted LWC blocks and not tombstoned by the
-    /// column block's persisted delete deltas. This helper does not apply MVCC
-    /// visibility rules, does not read in-memory catalog rows, and does not
-    /// validate that the descriptor's `table_id` matches the supplied metadata;
-    /// callers that iterate descriptor slots must enforce that outer invariant.
+    /// Checkpoint roots are compact catalog snapshots and must not contain
+    /// delete deltas. This helper does not apply MVCC visibility rules, does not
+    /// read in-memory catalog rows, and does not validate that the descriptor's
+    /// `table_id` matches the supplied metadata; callers that iterate descriptor
+    /// slots must enforce that outer invariant.
     ///
     /// Empty roots are represented by `root_block_id == None` and
     /// `pivot_row_id == 0`. Any other empty-root shape is treated as catalog
     /// payload corruption. Returned rows are decoded with `metadata`; malformed
     /// row ids, delete deltas, or LWC payloads are surfaced as catalog payload
     /// errors.
-    async fn load_visible_rows_from_root(
+    async fn load_rows_from_root(
         &self,
         metadata: &TableMetadata,
         disk_pool_guard: &PoolGuard,
@@ -870,77 +637,43 @@ impl CatalogStorage {
             &self.disk_pool,
             disk_pool_guard,
         );
+        let key_builder = CatalogMergeKeyBuilder::new(metadata)?;
         let mut rows = Vec::new();
+        let mut primary_keys = FastHashSet::default();
         for entry in entries {
-            let deleted: BTreeSet<u32> = column_index
-                .load_delete_deltas(&entry)
-                .await?
-                .into_iter()
-                .collect();
+            debug_assert!(
+                {
+                    let delete_deltas = column_index.load_delete_deltas(&entry).await?;
+                    delete_deltas.is_empty()
+                },
+                "catalog root should not contain delete deltas: start_row_id={}",
+                entry.start_row_id
+            );
             let page_rows = self
                 .decode_lwc_page_rows(metadata, disk_pool_guard, &column_index, &entry)
                 .await?;
             for row in page_rows {
                 let delta = row.row_id.checked_sub(entry.start_row_id).ok_or_else(|| {
                     invalid_catalog_payload(format!(
-                        "visible row id precedes block start: row_id={}, start_row_id={}",
+                        "catalog root row id precedes block start: row_id={}, start_row_id={}",
                         row.row_id, entry.start_row_id
                     ))
                 })?;
                 if delta > u32::MAX as u64 {
                     return Err(invalid_catalog_payload(format!(
-                        "visible row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
+                        "catalog root row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
                         row.row_id, entry.start_row_id
                     )));
                 }
-                if deleted.contains(&(delta as u32)) {
-                    continue;
+                validate_catalog_row(metadata, &row.vals, "catalog checkpoint root row")?;
+                let primary_key = key_builder.key_from_row(&row.vals)?;
+                if primary_keys.contains(&primary_key) {
+                    return Err(invalid_catalog_payload(format!(
+                        "catalog root contains duplicate primary key: key={primary_key:?}"
+                    )));
                 }
+                primary_keys.insert(primary_key);
                 rows.push(row);
-            }
-        }
-        Ok(rows)
-    }
-
-    async fn load_visible_rows_for_key_lookup(
-        &self,
-        metadata: &TableMetadata,
-        disk_pool_guard: &PoolGuard,
-        entries: &[CatalogIndexEntry],
-        column_index: &ColumnBlockIndex<'_>,
-    ) -> Result<Vec<ExistingVisibleRow>> {
-        let mut rows = Vec::new();
-        for entry in entries {
-            let deleted: BTreeSet<u32> = column_index
-                .load_delete_deltas(entry)
-                .await?
-                .into_iter()
-                .collect();
-            let page_rows = self
-                .decode_lwc_page_rows(metadata, disk_pool_guard, column_index, entry)
-                .await?;
-            for row in page_rows {
-                let delta = row.row_id.checked_sub(entry.start_row_id).ok_or_else(|| {
-                    invalid_catalog_payload(format!(
-                        "key lookup row id precedes block start: row_id={}, start_row_id={}",
-                        row.row_id, entry.start_row_id
-                    ))
-                })?;
-                if delta > u32::MAX as u64 {
-                    return Err(invalid_catalog_payload(format!(
-                        "key lookup row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
-                        row.row_id, entry.start_row_id
-                    )));
-                }
-                if deleted.contains(&(delta as u32)) {
-                    continue;
-                }
-                rows.push(ExistingVisibleRow {
-                    row_id: row.row_id,
-                    start_row_id: entry.start_row_id,
-                    vals: row.vals,
-                    deleted: false,
-                });
             }
         }
         Ok(rows)
@@ -980,146 +713,6 @@ impl CatalogStorage {
         }
         Ok(rows)
     }
-
-    fn build_lwc_blocks_from_row_records(
-        metadata: &TableMetadata,
-        rows: &[RowRecord],
-    ) -> Result<Vec<PendingLwcBlock>> {
-        for row in rows {
-            if row.vals.len() != metadata.col.col_count() {
-                return Err(invalid_catalog_payload(format!(
-                    "catalog checkpoint row value count {} does not match column count {}",
-                    row.vals.len(),
-                    metadata.col.col_count()
-                )));
-            }
-        }
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut lwc_blocks = Vec::new();
-        let mut builder = LwcBuilder::new(&metadata.col);
-        let mut builder_start = None;
-        let mut builder_end = RowID::new(0);
-
-        for row in rows {
-            if builder.is_empty() {
-                builder_start = Some(row.row_id);
-            }
-            if !builder.append_row_values(row.row_id, &row.vals)? {
-                let start_row_id = builder_start.take().ok_or_else(|| {
-                    invalid_catalog_payload("catalog LWC builder missing start row id")
-                })?;
-                if builder_end <= start_row_id {
-                    return Err(invalid_catalog_payload(format!(
-                        "catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
-                    )));
-                }
-                let shape = ColumnBlockEntryShape::new(
-                    start_row_id,
-                    builder_end,
-                    builder.row_ids().to_vec(),
-                    Vec::new(),
-                )?;
-                let buf = builder.build(shape.row_shape_fingerprint())?;
-                lwc_blocks.push(PendingLwcBlock { shape, buf });
-
-                builder = LwcBuilder::new(&metadata.col);
-                builder_start = Some(row.row_id);
-                if !builder.append_row_values(row.row_id, &row.vals)? {
-                    return Err(invalid_catalog_payload(format!(
-                        "single catalog row does not fit in LWC block: row_id={}",
-                        row.row_id
-                    )));
-                }
-            }
-            builder_end = row.row_id.saturating_add(1);
-        }
-
-        if !builder.is_empty() {
-            let start_row_id = builder_start.ok_or_else(|| {
-                invalid_catalog_payload("catalog LWC builder missing final start row id")
-            })?;
-            if builder_end <= start_row_id {
-                return Err(invalid_catalog_payload(format!(
-                    "final catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
-                )));
-            }
-            let shape = ColumnBlockEntryShape::new(
-                start_row_id,
-                builder_end,
-                builder.row_ids().to_vec(),
-                Vec::new(),
-            )?;
-            let buf = builder.build(shape.row_shape_fingerprint())?;
-            lwc_blocks.push(PendingLwcBlock { shape, buf });
-        }
-        Ok(lwc_blocks)
-    }
-
-    fn build_merged_tail_lwc_block(
-        metadata: &TableMetadata,
-        start_row_id: RowID,
-        existing_tail_rows: &[RowRecord],
-        inserts: &[RowRecord],
-    ) -> Result<Option<(DirectBuf, Vec<RowID>, usize)>> {
-        if existing_tail_rows.is_empty() || inserts.is_empty() {
-            return Ok(None);
-        }
-        for row in existing_tail_rows {
-            if row.vals.len() != metadata.col.col_count() {
-                return Err(invalid_catalog_payload(format!(
-                    "catalog checkpoint existing row value count {} does not match column count {}",
-                    row.vals.len(),
-                    metadata.col.col_count()
-                )));
-            }
-        }
-        for row in inserts {
-            if row.vals.len() != metadata.col.col_count() {
-                return Err(invalid_catalog_payload(format!(
-                    "catalog checkpoint insert value count {} does not match column count {}",
-                    row.vals.len(),
-                    metadata.col.col_count()
-                )));
-            }
-        }
-
-        let mut builder = LwcBuilder::new(&metadata.col);
-
-        for row in existing_tail_rows {
-            if !builder.append_row_values(row.row_id, &row.vals)? {
-                return Err(invalid_catalog_payload(format!(
-                    "existing tail row does not fit in LWC block: row_id={}",
-                    row.row_id
-                )));
-            }
-        }
-
-        let mut consumed = 0usize;
-        for row in inserts {
-            if !builder.append_row_values(row.row_id, &row.vals)? {
-                break;
-            }
-            consumed += 1;
-        }
-
-        if consumed == 0 {
-            return Ok(None);
-        }
-        let row_ids = builder.row_ids().to_vec();
-        let end_row_id = row_ids
-            .last()
-            .copied()
-            .ok_or_else(|| invalid_catalog_payload("catalog tail merge produced no row ids"))?
-            .saturating_add(1);
-        let fingerprint =
-            ColumnBlockEntryShape::new(start_row_id, end_row_id, row_ids.clone(), Vec::new())?
-                .row_shape_fingerprint();
-        let buf = builder.build(fingerprint)?;
-        Ok(Some((buf, row_ids, consumed)))
-    }
 }
 
 /// Static definition used to bootstrap one catalog logical table.
@@ -1137,22 +730,10 @@ struct PendingLwcBlock {
 
 type CatalogIndexEntry = ColumnLeafEntry;
 
+#[derive(Debug)]
 struct RowRecord {
     row_id: RowID,
     vals: Vec<Val>,
-}
-
-struct ExistingVisibleRow {
-    row_id: RowID,
-    start_row_id: RowID,
-    vals: Vec<Val>,
-    deleted: bool,
-}
-
-struct PendingInsertRow {
-    row_id: RowID,
-    vals: Vec<Val>,
-    deleted: bool,
 }
 
 /// Prepared result of planning a catalog checkpoint root publication.
@@ -1242,6 +823,83 @@ pub(crate) struct PreparedCatalogPublish {
     checkpointed_silent_watermarks: Arc<FastHashMap<TableID, TableRedoReplayFloor>>,
 }
 
+fn build_lwc_blocks_from_row_records(
+    metadata: &TableMetadata,
+    rows: &[RowRecord],
+) -> Result<Vec<PendingLwcBlock>> {
+    for row in rows {
+        if row.vals.len() != metadata.col.col_count() {
+            return Err(invalid_catalog_payload(format!(
+                "catalog checkpoint row value count {} does not match column count {}",
+                row.vals.len(),
+                metadata.col.col_count()
+            )));
+        }
+    }
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut lwc_blocks = Vec::new();
+    let mut builder = LwcBuilder::new(&metadata.col);
+    let mut builder_start = None;
+    let mut builder_end = RowID::new(0);
+
+    for row in rows {
+        if builder.is_empty() {
+            builder_start = Some(row.row_id);
+        }
+        if !builder.append_row_values(row.row_id, &row.vals)? {
+            let start_row_id = builder_start.take().ok_or_else(|| {
+                invalid_catalog_payload("catalog LWC builder missing start row id")
+            })?;
+            if builder_end <= start_row_id {
+                return Err(invalid_catalog_payload(format!(
+                    "catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
+                )));
+            }
+            let shape = ColumnBlockEntryShape::new(
+                start_row_id,
+                builder_end,
+                builder.row_ids().to_vec(),
+                Vec::new(),
+            )?;
+            let buf = builder.build(shape.row_shape_fingerprint())?;
+            lwc_blocks.push(PendingLwcBlock { shape, buf });
+
+            builder = LwcBuilder::new(&metadata.col);
+            builder_start = Some(row.row_id);
+            if !builder.append_row_values(row.row_id, &row.vals)? {
+                return Err(invalid_catalog_payload(format!(
+                    "single catalog row does not fit in LWC block: row_id={}",
+                    row.row_id
+                )));
+            }
+        }
+        builder_end = row.row_id.saturating_add(1);
+    }
+
+    if !builder.is_empty() {
+        let start_row_id = builder_start.ok_or_else(|| {
+            invalid_catalog_payload("catalog LWC builder missing final start row id")
+        })?;
+        if builder_end <= start_row_id {
+            return Err(invalid_catalog_payload(format!(
+                "final catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
+            )));
+        }
+        let shape = ColumnBlockEntryShape::new(
+            start_row_id,
+            builder_end,
+            builder.row_ids().to_vec(),
+            Vec::new(),
+        )?;
+        let buf = builder.build(shape.row_shape_fingerprint())?;
+        lwc_blocks.push(PendingLwcBlock { shape, buf });
+    }
+    Ok(lwc_blocks)
+}
+
 #[inline]
 fn invalid_catalog_payload(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
@@ -1308,185 +966,26 @@ fn validate_catalog_reachable_block(root: &MultiTableActiveRoot, block_id: Block
     Ok(())
 }
 
-fn validate_catalog_delete_primary_key<'a>(
-    metadata: &'a TableMetadata,
-    key: &SelectKey,
-) -> Result<&'a IndexSpec> {
-    validate_catalog_primary_key(metadata, key, "delete")
-}
-
-fn validate_catalog_update_primary_key<'a>(
-    metadata: &'a TableMetadata,
-    key: &SelectKey,
-) -> Result<&'a IndexSpec> {
-    validate_catalog_primary_key(metadata, key, "update")
-}
-
-fn validate_catalog_primary_key<'a>(
-    metadata: &'a TableMetadata,
-    key: &SelectKey,
-    operation: &'static str,
-) -> Result<&'a IndexSpec> {
-    let Some(primary_key) = metadata.primary_key() else {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint {operation} primary key not found"
-        )));
-    };
-    match primary_key.validate_key(key) {
-        Ok(()) => Ok(primary_key.spec()),
-        Err(PrimaryKeyMatchError::IndexNo { actual, expected }) => {
-            Err(invalid_catalog_payload(format!(
-                "catalog checkpoint {operation} key is not primary key: index_no={actual}, primary_key_index_no={expected}",
-            )))
-        }
-        Err(PrimaryKeyMatchError::ValueCount { actual, expected }) => {
-            Err(invalid_catalog_payload(format!(
-                "catalog checkpoint {operation} key value count {actual} does not match primary key column count {expected}",
-            )))
-        }
-        Err(PrimaryKeyMatchError::Type { index_no }) => Err(invalid_catalog_payload(format!(
-            "catalog checkpoint {operation} key type mismatch: index_no={index_no}",
-        ))),
-    }
-}
-
-fn apply_catalog_update_by_primary_key(
+fn validate_catalog_row(
     metadata: &TableMetadata,
-    index_spec: &IndexSpec,
-    key: &SelectKey,
-    row: &mut [Val],
-    update: &[UpdateCol],
+    row: &[Val],
+    context: &'static str,
 ) -> Result<()> {
     if row.len() != metadata.col.col_count() {
         return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint update candidate row value count {} does not match column count {}",
+            "{context} value count {} does not match column count {}",
             row.len(),
             metadata.col.col_count()
         )));
     }
-    let mut last_idx = None;
-    for update_col in update {
-        if update_col.idx >= metadata.col.col_count() {
+    for (idx, val) in row.iter().enumerate() {
+        if !metadata.col.col_type_match(idx, val) {
             return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update column out of range: column_no={}, column_count={}",
-                update_col.idx,
-                metadata.col.col_count()
-            )));
-        }
-        if last_idx.is_some_and(|idx| update_col.idx <= idx) {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update columns not strictly ordered: column_no={}",
-                update_col.idx
-            )));
-        }
-        if !metadata.col.col_type_match(update_col.idx, &update_col.val) {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update column type mismatch: column_no={}",
-                update_col.idx
-            )));
-        }
-        if index_spec
-            .cols
-            .iter()
-            .any(|index_key| usize::from(index_key.col_no) == update_col.idx)
-        {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update cannot change primary key column: column_no={}",
-                update_col.idx
-            )));
-        }
-        row[update_col.idx] = update_col.val.clone();
-        last_idx = Some(update_col.idx);
-    }
-    if !row_matches_key(index_spec, row, &key.vals) {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint update-by-primary-key changed stable key: index_no={}, key_vals={:?}",
-            key.index_no, key.vals
-        )));
-    }
-    Ok(())
-}
-
-fn mark_existing_row_deleted(
-    row: &mut ExistingVisibleRow,
-    delete_deltas: &mut BTreeMap<RowID, BTreeSet<u32>>,
-) -> Result<()> {
-    row.deleted = true;
-    let delta = row.row_id.checked_sub(row.start_row_id).ok_or_else(|| {
-        invalid_catalog_payload(format!(
-            "delete row id precedes block start: row_id={}, start_row_id={}",
-            row.row_id, row.start_row_id
-        ))
-    })?;
-    if delta > u32::MAX as u64 {
-        return Err(invalid_catalog_payload(format!(
-            "delete delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
-            row.row_id, row.start_row_id
-        )));
-    }
-    delete_deltas
-        .entry(row.start_row_id)
-        .or_default()
-        .insert(delta as u32);
-    Ok(())
-}
-
-fn validate_key_candidate_row(index_spec: &IndexSpec, row: &[Val]) -> Result<()> {
-    for index_key in &index_spec.cols {
-        let col_idx = usize::from(index_key.col_no);
-        if col_idx >= row.len() {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint key candidate row missing index column: column_no={}, row_value_count={}",
-                index_key.col_no,
-                row.len()
+                "{context} column type mismatch: column_no={idx}",
             )));
         }
     }
     Ok(())
-}
-
-fn find_pending_key_match(
-    rows: &[PendingInsertRow],
-    index_spec: &IndexSpec,
-    key_vals: &[Val],
-) -> Result<Option<usize>> {
-    for (idx, row) in rows.iter().enumerate().rev() {
-        if row.deleted {
-            continue;
-        }
-        validate_key_candidate_row(index_spec, &row.vals)?;
-        if row_matches_key(index_spec, &row.vals, key_vals) {
-            return Ok(Some(idx));
-        }
-    }
-    Ok(None)
-}
-
-fn find_existing_key_match(
-    rows: &[ExistingVisibleRow],
-    index_spec: &IndexSpec,
-    key_vals: &[Val],
-) -> Result<Option<usize>> {
-    for (idx, row) in rows.iter().enumerate() {
-        if row.deleted {
-            continue;
-        }
-        validate_key_candidate_row(index_spec, &row.vals)?;
-        if row_matches_key(index_spec, &row.vals, key_vals) {
-            return Ok(Some(idx));
-        }
-    }
-    Ok(None)
-}
-
-fn row_matches_key(index_spec: &IndexSpec, row: &[Val], key_vals: &[Val]) -> bool {
-    for (index_key, key_val) in index_spec.cols.iter().zip(key_vals) {
-        let col_idx = usize::from(index_key.col_no);
-        if row[col_idx] != *key_val {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -1516,7 +1015,7 @@ pub(crate) mod tests {
         use crate::file::BlockKey;
         use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
         use crate::id::BlockID;
-        use crate::index::{ColumnBlockIndex, ColumnDeleteDomain};
+        use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
         use crate::log::redo::RowRedoKind;
         use crate::row::ops::{SelectKey, UpdateCol};
         use crate::value::{Val, ValKind};
@@ -1637,17 +1136,117 @@ pub(crate) mod tests {
             }
         }
 
-        async fn visible_catalog_rows(
-            storage: &CatalogStorage,
-            table_id: TableID,
-        ) -> Vec<RowRecord> {
+        fn catalog_table_vals(table_id: TableID, next_index_no: u16) -> Vec<Val> {
+            vec![Val::from(table_id), Val::from(next_index_no)]
+        }
+
+        async fn catalog_root_rows(storage: &CatalogStorage, table_id: TableID) -> Vec<RowRecord> {
             let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[table_id.as_usize()];
             let table = storage.get_catalog_table(table_id).unwrap();
             let disk_pool_guard = storage.disk_pool.pool_guard();
             storage
-                .load_visible_rows_from_root(table.metadata(), &disk_pool_guard, root)
+                .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
                 .await
                 .unwrap()
+        }
+
+        async fn assert_compact_catalog_root(
+            storage: &CatalogStorage,
+            table_id: TableID,
+        ) -> Vec<RowRecord> {
+            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[table_id.as_usize()];
+            let rows = catalog_root_rows(storage, table_id).await;
+            for (idx, row) in rows.iter().enumerate() {
+                assert_eq!(row.row_id, RowID::new(idx as u64));
+            }
+            if root.root_block_id.is_none() {
+                assert_eq!(root.pivot_row_id, RowID::new(0));
+                assert!(rows.is_empty());
+                return rows;
+            }
+            assert_eq!(root.pivot_row_id, RowID::new(rows.len() as u64));
+            let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let entries = storage
+                .collect_index_entries(&disk_pool_guard, root_block_id)
+                .await
+                .unwrap();
+            assert!(!entries.is_empty());
+            assert_eq!(entries[0].start_row_id, RowID::new(0));
+            for pair in entries.windows(2) {
+                assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
+            }
+            assert_eq!(entries.last().unwrap().end_row_id(), root.pivot_row_id);
+            let index = ColumnBlockIndex::new(
+                root_block_id,
+                root.pivot_row_id,
+                storage.mtb.file_kind(),
+                storage.mtb.sparse_file(),
+                &storage.disk_pool,
+                &disk_pool_guard,
+            );
+            for entry in entries {
+                assert!(index.load_delete_deltas(&entry).await.unwrap().is_empty());
+            }
+            rows
+        }
+
+        async fn build_unpublished_catalog_root(
+            storage: &CatalogStorage,
+            table_id: TableID,
+            metadata: &TableMetadata,
+            rows: &[RowRecord],
+            delete_deltas: Option<&[u32]>,
+        ) -> CatalogTableRootDesc {
+            let mut mutable =
+                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+            let pages = build_lwc_blocks_from_row_records(metadata, rows).unwrap();
+            let mut entries = Vec::with_capacity(pages.len());
+            for page in pages {
+                let block_id = mutable.allocate_block().unwrap();
+                mutable.write_block(block_id, page.buf).await.unwrap();
+                entries.push(page.shape.with_block_id(block_id));
+            }
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let pivot_row_id = RowID::new(rows.len() as u64);
+            let column_index = ColumnBlockIndex::new(
+                SUPER_BLOCK_ID,
+                RowID::new(0),
+                storage.mtb.file_kind(),
+                storage.mtb.sparse_file(),
+                &storage.disk_pool,
+                &disk_pool_guard,
+            );
+            let mut root_block_id = column_index
+                .batch_insert(&mut mutable, &entries, pivot_row_id, TrxID::new(77))
+                .await
+                .unwrap();
+            if let Some(delete_deltas) = delete_deltas {
+                let column_index = ColumnBlockIndex::new(
+                    root_block_id,
+                    pivot_row_id,
+                    storage.mtb.file_kind(),
+                    storage.mtb.sparse_file(),
+                    &storage.disk_pool,
+                    &disk_pool_guard,
+                );
+                root_block_id = column_index
+                    .batch_replace_delete_deltas(
+                        &mut mutable,
+                        &[ColumnDeleteDeltaPatch {
+                            start_row_id: RowID::new(0),
+                            delete_deltas,
+                        }],
+                        TrxID::new(78),
+                    )
+                    .await
+                    .unwrap();
+            }
+            CatalogTableRootDesc {
+                table_id,
+                root_block_id: NonZeroU64::new(root_block_id.into()),
+                pivot_row_id,
+            }
         }
 
         async fn assert_checkpoint_rejects_delete_key(
@@ -1820,35 +1419,6 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn test_catalog_key_candidate_row_requires_index_column() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-delete-row-shape")).await;
-
-                let storage = &engine.catalog().storage;
-                let table = storage.get_catalog_table(TableID::new(0)).unwrap();
-                let key = SelectKey::new(0, vec![Val::from(USER_OBJ_ID_START)]);
-                let index_spec =
-                    validate_catalog_delete_primary_key(table.metadata(), &key).unwrap();
-                let err = validate_key_candidate_row(index_spec, &[]).unwrap_err();
-
-                assert_eq!(
-                    err.data_integrity_error(),
-                    Some(DataIntegrityError::InvalidPayload)
-                );
-                let report = format!("{err:?}");
-                assert!(
-                    report.contains("catalog checkpoint key candidate row missing index column"),
-                    "{report}"
-                );
-                assert!(report.contains("column_no=0"), "{report}");
-                assert!(report.contains("row_value_count=0"), "{report}");
-            });
-        }
-
-        #[test]
         fn test_catalog_lwc_direct_building_does_not_allocate_meta_pages() {
             smol::block_on(async {
                 let temp_dir = TempDir::new().unwrap();
@@ -1866,15 +1436,14 @@ pub(crate) mod tests {
                     catalog_column_row_record(RowID::new(0), table_id, 0, 16),
                     catalog_column_row_record(RowID::new(1), table_id, 1, 24),
                 ];
-                let blocks = CatalogStorage::build_lwc_blocks_from_row_records(metadata, &rows)
+                let blocks = build_lwc_blocks_from_row_records(metadata, &rows)
                     .expect("small rows should build directly");
                 assert!(!blocks.is_empty());
                 assert_eq!(storage.meta_pool.allocated(), allocated_before);
 
                 let oversized_row =
                     catalog_column_row_record(RowID::new(0), table_id, 0, u16::MAX as usize);
-                let result =
-                    CatalogStorage::build_lwc_blocks_from_row_records(metadata, &[oversized_row]);
+                let result = build_lwc_blocks_from_row_records(metadata, &[oversized_row]);
                 let err = match result {
                     Ok(_) => panic!("oversized row should fail LWC block build"),
                     Err(err) => err,
@@ -1885,18 +1454,86 @@ pub(crate) mod tests {
                 );
                 assert_eq!(storage.meta_pool.allocated(), allocated_before);
 
-                let existing_row = catalog_column_row_record(RowID::new(0), table_id, 0, 16);
-                let insert_row = catalog_column_row_record(RowID::new(1), table_id, 1, 24);
-                let merged = CatalogStorage::build_merged_tail_lwc_block(
-                    metadata,
-                    RowID::new(0),
-                    &[existing_row],
-                    &[insert_row],
-                )
-                .expect("small tail merge should build directly")
-                .expect("insert should merge into tail block");
-                assert_eq!(merged.2, 1);
                 assert_eq!(storage.meta_pool.allocated(), allocated_before);
+            });
+        }
+
+        #[cfg(debug_assertions)]
+        #[test]
+        #[should_panic(expected = "catalog root should not contain delete deltas")]
+        fn test_catalog_root_loader_debug_asserts_delete_deltas() {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let main_dir = temp_dir.path().to_path_buf();
+                let engine =
+                    open_catalog_test_engine(main_dir, Some("catalog-root-delete-deltas")).await;
+
+                let storage = &engine.catalog().storage;
+                let table = storage.get_catalog_table(TableID::new(0)).unwrap();
+                let table_id = USER_OBJ_ID_START + 111;
+                let rows = vec![RowRecord {
+                    row_id: RowID::new(0),
+                    vals: catalog_table_vals(table_id, 0),
+                }];
+                let root = build_unpublished_catalog_root(
+                    storage,
+                    TableID::new(0),
+                    table.metadata(),
+                    &rows,
+                    Some(&[0]),
+                )
+                .await;
+
+                let disk_pool_guard = storage.disk_pool.pool_guard();
+                storage
+                    .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
+                    .await
+                    .unwrap();
+            });
+        }
+
+        #[test]
+        fn test_catalog_root_loader_rejects_duplicate_primary_keys() {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let main_dir = temp_dir.path().to_path_buf();
+                let engine =
+                    open_catalog_test_engine(main_dir, Some("catalog-root-duplicate-pk")).await;
+
+                let storage = &engine.catalog().storage;
+                let table = storage.get_catalog_table(TableID::new(0)).unwrap();
+                let table_id = USER_OBJ_ID_START + 112;
+                let rows = vec![
+                    RowRecord {
+                        row_id: RowID::new(0),
+                        vals: catalog_table_vals(table_id, 0),
+                    },
+                    RowRecord {
+                        row_id: RowID::new(1),
+                        vals: catalog_table_vals(table_id, 1),
+                    },
+                ];
+                let root = build_unpublished_catalog_root(
+                    storage,
+                    TableID::new(0),
+                    table.metadata(),
+                    &rows,
+                    None,
+                )
+                .await;
+
+                let disk_pool_guard = storage.disk_pool.pool_guard();
+                let err = storage
+                    .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
+                    .await
+                    .unwrap_err();
+
+                assert_eq!(
+                    err.data_integrity_error(),
+                    Some(DataIntegrityError::InvalidPayload)
+                );
+                let report = format!("{err:?}");
+                assert!(report.contains("duplicate primary key"), "{report}");
             });
         }
 
@@ -2133,13 +1770,14 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
 
-                let rows = visible_catalog_rows(storage, TableID::new(0)).await;
+                let rows = catalog_root_rows(storage, TableID::new(0)).await;
                 let matching_rows = rows
                     .iter()
                     .filter(|row| row.vals[0] == Val::from(table_id))
                     .collect::<Vec<_>>();
                 assert_eq!(matching_rows.len(), 1);
                 assert_eq!(matching_rows[0].vals[1], Val::from(7u16));
+                assert_compact_catalog_root(storage, TableID::new(0)).await;
             });
         }
 
@@ -2226,13 +1864,14 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
 
-                let rows = visible_catalog_rows(storage, TableID::new(0)).await;
+                let rows = catalog_root_rows(storage, TableID::new(0)).await;
                 let matching_rows = rows
                     .iter()
                     .filter(|row| row.vals[0] == Val::from(table_id))
                     .collect::<Vec<_>>();
                 assert_eq!(matching_rows.len(), 1);
                 assert_eq!(matching_rows[0].vals[1], Val::from(9u16));
+                assert_compact_catalog_root(storage, TableID::new(0)).await;
             });
         }
 
@@ -2327,8 +1966,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn test_catalog_checkpoint_apply_table_ops_advances_existing_root_for_canceled_insert_batch()
-         {
+        fn test_catalog_checkpoint_apply_table_ops_keeps_existing_root_for_canceled_insert_batch() {
             smol::block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let main_dir = temp_dir.path().to_path_buf();
@@ -2371,7 +2009,7 @@ pub(crate) mod tests {
                     .unwrap();
 
                 assert_eq!(next_root.root_block_id, root.root_block_id);
-                assert_eq!(next_root.pivot_row_id, root.pivot_row_id + 1);
+                assert_eq!(next_root.pivot_row_id, root.pivot_row_id);
                 assert!(!blocks_changed);
             });
         }
@@ -2430,14 +2068,17 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn test_catalog_checkpoint_tail_merge_rewrites_last_payload_without_new_entry() {
+        fn test_catalog_checkpoint_rewrites_changed_table_as_compact_root() {
             smol::block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-checkpoint-tail-merge")).await;
+                let engine = open_catalog_test_engine(
+                    main_dir.clone(),
+                    Some("catalog-checkpoint-compact-rewrite"),
+                )
+                .await;
 
-                let _ = table1(&engine).await;
+                let table1_id = table1(&engine).await;
                 engine
                     .catalog()
                     .checkpoint_now(&engine.inner().trx_sys)
@@ -2447,19 +2088,9 @@ pub(crate) mod tests {
                 let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
                 let tables_root1 = snap1.meta.table_roots[0];
                 assert!(tables_root1.root_block_id.is_some());
-                let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
-                let entries1 = engine
-                    .catalog()
-                    .storage
-                    .collect_index_entries(
-                        &disk_pool_guard,
-                        BlockID::from(tables_root1.root_block_id.unwrap().get()),
-                    )
-                    .await
-                    .unwrap();
-                assert!(!entries1.is_empty());
+                assert_compact_catalog_root(&engine.catalog().storage, TableID::new(0)).await;
 
-                let _ = table2(&engine).await;
+                let table2_id = table2(&engine).await;
                 engine
                     .catalog()
                     .checkpoint_now(&engine.inner().trx_sys)
@@ -2468,45 +2099,11 @@ pub(crate) mod tests {
 
                 let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
                 let tables_root2 = snap2.meta.table_roots[0];
-                let entries2 = engine
-                    .catalog()
-                    .storage
-                    .collect_index_entries(
-                        &disk_pool_guard,
-                        BlockID::from(tables_root2.root_block_id.unwrap().get()),
-                    )
-                    .await
-                    .unwrap();
+                let rows =
+                    assert_compact_catalog_root(&engine.catalog().storage, TableID::new(0)).await;
 
-                assert!(tables_root2.pivot_row_id > tables_root1.pivot_row_id);
                 assert!(tables_root2.root_block_id != tables_root1.root_block_id);
-                assert_eq!(
-                    entries2.len(),
-                    entries1.len(),
-                    "tail-page merge should reuse the existing last index entry when capacity allows"
-                );
-
-                let last1 = entries1.last().copied().unwrap();
-                let last2 = entries2.last().copied().unwrap();
-                let index1 = ColumnBlockIndex::new(
-                    BlockID::from(tables_root1.root_block_id.unwrap().get()),
-                    tables_root1.pivot_row_id,
-                    engine.catalog().storage.mtb.file_kind(),
-                    engine.catalog().storage.mtb.sparse_file(),
-                    &engine.catalog().storage.disk_pool,
-                    &disk_pool_guard,
-                );
-                let index2 = ColumnBlockIndex::new(
-                    BlockID::from(tables_root2.root_block_id.unwrap().get()),
-                    tables_root2.pivot_row_id,
-                    engine.catalog().storage.mtb.file_kind(),
-                    engine.catalog().storage.mtb.sparse_file(),
-                    &engine.catalog().storage.disk_pool,
-                    &disk_pool_guard,
-                );
-                assert_eq!(last2.start_row_id, last1.start_row_id);
-                assert_ne!(last2.block_id(), last1.block_id());
-                assert_eq!(last2.delete_domain(), ColumnDeleteDomain::Ordinal);
+                assert_eq!(tables_root2.pivot_row_id, RowID::new(rows.len() as u64));
                 let active_root = engine.catalog().storage.mtb.active_root_unchecked();
                 let root_block_id1 = BlockID::from(tables_root1.root_block_id.unwrap().get());
                 let root_block_id2 = BlockID::from(tables_root2.root_block_id.unwrap().get());
@@ -2516,43 +2113,36 @@ pub(crate) mod tests {
                         .is_allocated(usize::from(root_block_id1))
                 );
                 assert!(
-                    !active_root
-                        .alloc_map
-                        .is_allocated(usize::from(last1.block_id()))
-                );
-                assert!(
                     active_root
                         .alloc_map
                         .is_allocated(usize::from(root_block_id2))
                 );
-                assert!(
-                    active_root
-                        .alloc_map
-                        .is_allocated(usize::from(last2.block_id()))
+                drop(engine);
+
+                let recovered =
+                    open_catalog_test_engine(main_dir, Some("catalog-checkpoint-compact-rewrite"))
+                        .await;
+                let mut recovered_table_ids = recovered.catalog().list_user_table_ids_now();
+                recovered_table_ids.sort();
+                let mut expected_table_ids = vec![table1_id, table2_id];
+                expected_table_ids.sort();
+                assert_eq!(recovered_table_ids, expected_table_ids);
+                assert_eq!(
+                    assert_compact_catalog_root(&recovered.catalog().storage, TableID::new(0))
+                        .await
+                        .len(),
+                    rows.len()
                 );
-                let deletes2: BTreeSet<_> = index2
-                    .load_delete_deltas(&last2)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .collect();
-                let deletes1: BTreeSet<_> = index1
-                    .load_delete_deltas(&last1)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .collect();
-                assert_eq!(deletes2, deletes1);
             });
         }
 
         #[test]
-        fn test_catalog_checkpoint_partial_tail_merge_refreshes_append_bound() {
+        fn test_catalog_checkpoint_compact_rewrite_uses_dense_row_ids_after_large_append() {
             smol::block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let main_dir = temp_dir.path().to_path_buf();
                 let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-partial-tail-merge")).await;
+                    open_catalog_test_engine(main_dir, Some("catalog-compact-large-append")).await;
 
                 let storage = &engine.catalog().storage;
                 let table_id = USER_OBJ_ID_START + 9000;
@@ -2593,6 +2183,8 @@ pub(crate) mod tests {
 
                 let snap2 = storage.checkpoint_snapshot().unwrap();
                 let columns_root2 = snap2.meta.table_roots[1];
+                let rows = assert_compact_catalog_root(storage, TableID::new(1)).await;
+                assert_eq!(rows.len(), 5);
                 assert_eq!(columns_root2.pivot_row_id, RowID::new(5));
                 let entries2 = storage
                     .collect_index_entries(
@@ -2603,18 +2195,10 @@ pub(crate) mod tests {
                     .unwrap();
 
                 assert!(
-                    entries2.len() > entries1.len(),
-                    "partial merge should leave rows for batch_insert"
+                    columns_root2.root_block_id != columns_root1.root_block_id,
+                    "changed catalog tables should publish a rewritten compact root"
                 );
-                assert_eq!(entries2[0].start_row_id, entries1[0].start_row_id);
-                assert!(
-                    entries2[0].end_row_id() > entries1[0].end_row_id(),
-                    "tail entry should consume a prefix of the second batch"
-                );
-                assert!(
-                    entries2[0].end_row_id() < columns_root2.pivot_row_id,
-                    "tail entry should not consume the whole second batch"
-                );
+                assert_eq!(entries2[0].start_row_id, RowID::new(0));
                 for pair in entries2.windows(2) {
                     assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
                 }

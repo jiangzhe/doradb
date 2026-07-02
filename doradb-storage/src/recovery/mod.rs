@@ -2415,7 +2415,14 @@ mod tests {
 
             let batch = engine
                 .catalog()
-                .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .scan_checkpoint_batch(
+                    engine.inner().trx_sys.persisted_watermark_cts(),
+                    engine
+                        .inner()
+                        .trx_sys
+                        .catalog_checkpoint_scan_config()
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(
