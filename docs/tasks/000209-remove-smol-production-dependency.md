@@ -1,7 +1,7 @@
 ---
 id: 000209
 title: Remove smol Production Dependency
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-02
 github_issue: 805
 ---
@@ -42,16 +42,16 @@ usage is narrow:
 
 - `TransactionSystem::start_cleanup_thread()` blocks a cleanup future with
   `smol::block_on`.
-- `TransactionSystem::start_purge_threads()` and `dispatch_purge()` create
-  per-thread `async_executor::LocalExecutor` values and block
-  `LocalExecutor::run(...)` with `smol::block_on`.
+- `TransactionSystem::start_purge_threads()` and `dispatch_purge()` block purge
+  worker futures with `smol::block_on`.
 - `EvictableBufferPool::try_dispatch_io_read()` imports
   `smol::future::yield_now` only to yield after a retryable exclusive-page-lock
   miss.
 
-The purge code already owns the local executor it needs. Replacing the outer
-`smol::block_on(ex.run(...))` with `futures::executor::block_on(ex.run(...))`
-preserves that local executor boundary without depending on the smol runtime.
+The purge code does not spawn local async tasks. Replacing the outer
+`smol::block_on(...)` with `futures::executor::block_on(...)` drives the same
+top-level worker futures without depending on the smol runtime or on
+`async_executor::LocalExecutor`.
 
 `smol::block_on` is a re-export of `async_io::block_on`, which initializes
 async-io runtime machinery. Doradb does not need that machinery for these
@@ -98,10 +98,9 @@ this task.
   `smol::Timer`.
 - Do not introduce runtime injection, a public runtime trait, background-service
   abstraction, tokio compatibility, or a generic spawn API.
-- Do not change worker ownership, shutdown ordering, `LocalExecutor` use, purge
-  semantics, transaction cleanup semantics, or buffer-pool retry behavior.
-- Do not change async lock, event-listener, flume, or `async_executor`
-  dependencies.
+- Do not change worker ownership, shutdown ordering, purge semantics,
+  transaction cleanup semantics, or buffer-pool retry behavior.
+- Do not change async lock, event-listener, or flume dependencies.
 - Do not update unrelated task docs or process docs.
 
 ## Plan
@@ -141,10 +140,10 @@ this task.
      - single-threaded purger;
      - purge dispatcher;
      - purge executor.
-   - Preserve the existing `async_executor::LocalExecutor` construction in each
-     worker thread and continue blocking `ex.run(...)`.
-   - Do not replace `LocalExecutor` with `futures::executor::LocalPool`; that
-     would be a behavior change and is not needed to remove `smol`.
+   - Remove the unused `async_executor::LocalExecutor` construction in each
+     worker thread and block the purge loop future directly.
+   - Do not replace `LocalExecutor` with `futures::executor::LocalPool`; no
+     purge path spawns local tasks that require a scheduler.
 
 5. Replace the production async yield.
    - In `doradb-storage/src/buffer/evict.rs`, replace
@@ -161,6 +160,8 @@ this task.
    - Leave `smol = "2.0"` in `[workspace.dependencies]` so tests can continue
      to share the pinned version.
    - Leave `futures = { workspace = true }` in `[dependencies]`.
+   - Remove direct `async-executor` dependency entries from the storage crate
+     and workspace manifest because no workspace member uses them directly.
 
 7. Update example runtime driving.
    - In `doradb-storage/examples/weak_handle_baseline.rs`, change the top-level
@@ -182,6 +183,30 @@ this task.
 
 ## Implementation Notes
 
+- Implemented the crate-private `runtime` shim with `executor::block_on` and a
+  one-shot self-waking `YieldNow` future.
+- Replaced production `smol` use in transaction cleanup, purge worker startup,
+  and evictable-buffer retry-yield paths while preserving worker ownership and
+  retry semantics.
+- Removed direct `async-executor` dependency entries after confirming purge
+  workers do not spawn local tasks onto `LocalExecutor`.
+- Moved `smol` to `dev-dependencies`; normal dependency graph verification
+  reports no path from `doradb-storage` to `smol`.
+- Updated `weak_handle_baseline` to use `futures::executor` without adding a
+  normal `smol` edge.
+- Review follow-up on the task branch fixed a poison-listener TOCTOU wait in
+  `wait_frozen_pages_stabilized`; this was outside the original dependency
+  cleanup but resolved a blocking review issue.
+- Validation completed:
+  - `cargo build -p doradb-storage`
+  - `cargo build -p doradb-storage --example weak_handle_baseline`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  - `cargo tree -p doradb-storage --edges normal -i smol`
+  - `cargo tree -p doradb-storage -i smol`
+  - `tools/style_audit.rs --diff-base origin/main`
+
 ## Impacts
 
 - `doradb-storage/src/runtime.rs`
@@ -194,8 +219,8 @@ this task.
     `runtime::block_on`.
 - `doradb-storage/src/trx/purge.rs`
   - Purge worker, dispatcher, and executor top-level future driving changes
-    from `smol::block_on` to `runtime::block_on`, while retaining
-    `async_executor::LocalExecutor`.
+    from `smol::block_on` with `LocalExecutor::run(...)` to direct
+    `runtime::block_on`.
 - `doradb-storage/src/buffer/evict.rs`
   - Retry-yield helper changes from `smol::future::yield_now` to
     `runtime::yield_now`.
@@ -204,6 +229,9 @@ this task.
     `futures::executor::block_on`.
 - `doradb-storage/Cargo.toml`
   - `smol` moves from normal dependencies to dev-dependencies.
+  - Direct `async-executor` dependency is removed.
+- `Cargo.toml`
+  - Workspace `async-executor` dependency entry is removed.
 - `Cargo.lock`
   - May update dependency edge metadata after the manifest change.
 
@@ -220,6 +248,9 @@ this task.
     changes.
 - `cargo tree -p doradb-storage --edges normal -i smol`
   - Should report no normal dependency path from `doradb-storage` to `smol`.
+- `cargo tree -p doradb-storage --edges normal -i async-executor`
+  - Should report no normal dependency path from `doradb-storage` to
+    `async-executor`.
 - `cargo tree -p doradb-storage -i smol`
   - Should show only dev/test/example dependency paths, if requested with edge
     selection that includes dev dependencies.
