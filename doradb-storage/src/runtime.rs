@@ -3,18 +3,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// Block the current thread until `future` completes.
-#[inline]
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
-    executor::block_on(future)
-}
-
-/// Return a future that yields back to the current executor once.
-#[inline]
-pub(crate) fn yield_now() -> YieldNow {
-    YieldNow { yielded: false }
-}
-
 /// One-shot cooperative yield future.
 pub(crate) struct YieldNow {
     yielded: bool,
@@ -33,6 +21,18 @@ impl Future for YieldNow {
             Poll::Pending
         }
     }
+}
+
+/// Block the current thread until `future` completes.
+#[inline]
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+    executor::block_on(future)
+}
+
+/// Return a future that yields back to the current executor once.
+#[inline]
+pub(crate) fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
 }
 
 #[cfg(test)]
