@@ -5,7 +5,7 @@ use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_p
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::TableColumnLayout;
 use crate::error::{
-    InternalError, Result, Validation,
+    Error, InternalError, Result, Validation,
     Validation::{Invalid, Valid},
 };
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
@@ -19,6 +19,7 @@ use either::Either::{Left, Right};
 use error_stack::Report;
 use parking_lot::Mutex;
 use std::mem;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -94,10 +95,20 @@ enum InsertFreeListMiss {
     BufferPageGenerationMismatch,
 }
 
+enum InsertPageGuardError {
+    // The row-page index did not publish the new page id. The caller still
+    // owns an unlinked allocation and can deallocate it before returning.
+    Unpublished(Error),
+    // The row-page index already points at the new page id. The caller must
+    // keep the initialized empty page allocated so the index never contains a
+    // dangling page reference, even though the create-redo commit failed.
+    Published(Error),
+}
+
 struct RowPageIndexInsert {
     start_row_id: RowID,
     end_row_id: RowID,
-    create_cts: Option<TrxID>,
+    create_redo: Result<Option<TrxID>>,
 }
 
 #[derive(Clone, Copy)]
@@ -117,13 +128,16 @@ impl RowPageIndexAppend<'_> {
     #[inline]
     fn finish(self) -> RowPageIndexInsert {
         let end_row_id = self.end_row_id();
-        let create_cts = self
-            .redo_ctx
-            .map(|redo_ctx| redo_ctx.commit_row_page(self.page_id, self.start_row_id, end_row_id));
+        let create_redo = match self.redo_ctx {
+            Some(redo_ctx) => redo_ctx
+                .commit_row_page(self.page_id, self.start_row_id, end_row_id)
+                .map(Some),
+            None => Ok(None),
+        };
         RowPageIndexInsert {
             start_row_id: self.start_row_id,
             end_row_id,
-            create_cts,
+            create_redo,
         }
     }
 }
@@ -508,10 +522,7 @@ impl<P: BufferPool> RowPageIndex<P> {
             .insert_page_guard(meta_pool_guard, col_layout, count, redo_ctx, &mut new_page)
             .await
         {
-            // The row page was allocated locally and never published, so reclaim it
-            // before surfacing the metadata-side insertion failure.
-            mem_pool.deallocate_page(new_page);
-            return Err(err);
+            return Err(cleanup_failed_insert_page(mem_pool, new_page, err));
         }
         Ok(new_page.downgrade_shared())
     }
@@ -544,8 +555,7 @@ impl<P: BufferPool> RowPageIndex<P> {
             .insert_page_guard(meta_pool_guard, col_layout, count, redo_ctx, &mut new_page)
             .await
         {
-            mem_pool.deallocate_page(new_page);
-            return Err(err);
+            return Err(cleanup_failed_insert_page(mem_pool, new_page, err));
         }
         Ok(new_page)
     }
@@ -569,8 +579,7 @@ impl<P: BufferPool> RowPageIndex<P> {
             .insert_page_guard(meta_pool_guard, col_layout, count, None, &mut new_page)
             .await
         {
-            mem_pool.deallocate_page(new_page);
-            return Err(err);
+            return Err(cleanup_failed_insert_page(mem_pool, new_page, err));
         }
         Ok(new_page)
     }
@@ -583,12 +592,13 @@ impl<P: BufferPool> RowPageIndex<P> {
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
         new_page: &mut PageExclusiveGuard<RowPage>,
-    ) -> Result<()> {
+    ) -> StdResult<(), InsertPageGuardError> {
         let new_page_id = new_page.page_id();
         loop {
             match self
                 .insert_row_page(meta_pool_guard, count as u64, new_page_id, redo_ctx)
-                .await?
+                .await
+                .map_err(InsertPageGuardError::Unpublished)?
             {
                 Invalid => (),
                 Valid(inserted) => {
@@ -604,11 +614,21 @@ impl<P: BufferPool> RowPageIndex<P> {
                         .bf_mut()
                         .init_undo_map(Arc::clone(col_layout), count);
 
-                    if let Some(create_cts) = inserted.create_cts
-                        && let Some(row_ver) =
-                            new_page.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver())
-                    {
-                        row_ver.set_create_cts(create_cts);
+                    match inserted.create_redo {
+                        Ok(Some(create_cts)) => {
+                            if let Some(row_ver) =
+                                new_page.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver())
+                            {
+                                row_ver.set_create_cts(create_cts);
+                            }
+                        }
+                        Ok(None) => (),
+                        Err(err) => {
+                            // The append became visible before the create-redo
+                            // commit failed. Keep the page initialized so the
+                            // published index entry points at a valid empty page.
+                            return Err(InsertPageGuardError::Published(err));
+                        }
                     }
                     // finally, we downgrade the page lock for shared mode.
                     return Ok(());
@@ -1230,6 +1250,28 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
     }
 }
 
+#[inline]
+fn cleanup_failed_insert_page<B: BufferPool>(
+    mem_pool: &B,
+    new_page: PageExclusiveGuard<RowPage>,
+    err: InsertPageGuardError,
+) -> Error {
+    match err {
+        InsertPageGuardError::Unpublished(err) => {
+            // The row page was allocated locally and never published, so
+            // reclaim it before surfacing the metadata-side failure.
+            mem_pool.deallocate_page(new_page);
+            err
+        }
+        InsertPageGuardError::Published(err) => {
+            // The index entry is already visible. Leave the initialized empty
+            // page allocated; dropping the guard only releases the latch.
+            drop(new_page);
+            err
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,7 +1284,7 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{ErrorKind, IoError, ResourceError, Validation};
+    use crate::error::{ErrorKind, FatalError, IoError, ResourceError, Validation};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::id::{TableID, TrxID};
     use crate::latch::LatchFallbackMode;
@@ -2109,6 +2151,76 @@ mod tests {
     }
 
     #[test]
+    fn test_row_page_index_redo_failure_keeps_published_page_initialized() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_failure"))
+                .build()
+                .await
+                .unwrap();
+            let metadata = make_test_metadata();
+            let meta_guard = engine.inner().meta_pool.pool_guard();
+            let blk_idx = RowPageIndex::new(
+                engine.inner().meta_pool.clone_inner(),
+                &meta_guard,
+                RowID::new(0),
+            )
+            .await
+            .expect("test row-page-index construction should succeed");
+            let mem_guard = engine.inner().mem_pool.pool_guard();
+            let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(206));
+            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+
+            let err = match blk_idx
+                .get_insert_page(
+                    &meta_guard,
+                    &*engine.inner().mem_pool,
+                    &mem_guard,
+                    &metadata.col,
+                    100,
+                    Some(redo_ctx),
+                )
+                .await
+            {
+                Ok(_) => panic!("poisoned row-page create redo should fail"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), ErrorKind::Fatal);
+            let page_id = match blk_idx
+                .find_row(&meta_guard, RowID::new(0))
+                .await
+                .expect("published row-page index entry should remain readable")
+            {
+                RowLocation::RowPage(page_id) => page_id,
+                RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+                    panic!("expected published row page")
+                }
+            };
+            let page = engine
+                .inner()
+                .mem_pool
+                .get_page::<RowPage>(&mem_guard, page_id, LatchFallbackMode::Shared)
+                .await
+                .expect("published row page should remain allocated")
+                .lock_shared_async()
+                .await
+                .expect("published row page generation should remain current");
+            assert_eq!(page.page().header.start_row_id, RowID::new(0));
+            assert_eq!(page.page().header.max_row_count, 100);
+            assert_eq!(page.page().header.row_count(), 0);
+        })
+    }
+
+    #[test]
     fn test_row_page_index_create_row_page_redo_follows_append_order() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -2151,7 +2263,7 @@ mod tests {
                                     .expect("test row-page insertion should succeed")
                                 {
                                     Valid(inserted) => {
-                                        assert!(inserted.create_cts.is_some());
+                                        assert!(matches!(inserted.create_redo, Ok(Some(_))));
                                         break;
                                     }
                                     Invalid => {}
