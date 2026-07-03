@@ -1,3 +1,4 @@
+use crate::error::{LifecycleError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::INVALID_ROW_ID;
 use crate::trx::sys::TransactionSystem;
@@ -80,15 +81,21 @@ impl RowPageCreateRedoCtx<'_> {
         page_id: PageID,
         start_row_id: RowID,
         end_row_id: RowID,
-    ) -> TrxID {
+    ) -> Result<TrxID> {
         let mut trx = self.trx_sys.begin_sys_trx();
         let table_id = self.table_id;
-        // Safety currently relies on single-stream redo ordering plus
-        // commit_no_wait: later user redo that reuses this page must not
-        // persist ahead of the earlier CreateRowPage record.
+        // Safety relies on callers serializing this no-wait commit with the
+        // row-page-index append path. Later row-page creation and user redo
+        // must not persist ahead of this CreateRowPage record.
         trx.create_row_page(table_id, page_id, start_row_id, end_row_id);
-        self.trx_sys
-            .commit_sys(trx)
-            .expect("commit system transaction for row page")
+        let res = self.trx_sys.commit_sys(trx);
+        if let Err(err) = &res {
+            debug_assert!(
+                self.trx_sys.storage_poison_error().is_some()
+                    || err.lifecycle_error() == Some(LifecycleError::Shutdown),
+                "row-page create redo failed while transaction system is still healthy: {err:?}"
+            );
+        }
+        res
     }
 }
