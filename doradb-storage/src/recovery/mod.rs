@@ -57,6 +57,8 @@ pub(crate) struct RecoveryCoordinator<'a> {
     redo_planner: RedoReplayPlanner,
     /// Direct-IO read-ahead depth used by startup redo recovery.
     redo_read_depth: usize,
+    /// Whether recovery/no-trx DML payload validation is disabled.
+    recovery_disable_dml_validation: bool,
     /// Value-only finalizer for the writable redo log created after recovery.
     finalizer: RedoLogFinalizer,
     /// Replay cursors, per-table bounds, and recovered CTS watermark.
@@ -75,12 +77,14 @@ impl<'a> RecoveryCoordinator<'a> {
         resources: RecoveryResources<'a>,
         redo_planner: RedoReplayPlanner,
         redo_read_depth: usize,
+        recovery_disable_dml_validation: bool,
         finalizer: RedoLogFinalizer,
     ) -> Self {
         RecoveryCoordinator {
             resources,
             redo_planner,
             redo_read_depth,
+            recovery_disable_dml_validation,
             finalizer,
             timeline: RecoveryTimeline::new(MIN_SNAPSHOT_TS),
             pending_index_ddl_reconciliations: FastHashSet::default(),
@@ -917,17 +921,30 @@ impl<'a> RecoveryCoordinator<'a> {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
                     table
-                        .insert_no_trx(&self.resources.buffers.pool_guards, vals)
+                        .insert_no_trx(
+                            &self.resources.buffers.pool_guards,
+                            vals,
+                            self.recovery_disable_dml_validation,
+                        )
                         .await?;
                 }
                 RowRedoKind::DeleteByPrimaryKey(key) => {
                     table
-                        .delete_primary_key_no_trx(&self.resources.buffers.pool_guards, key)
+                        .delete_primary_key_no_trx(
+                            &self.resources.buffers.pool_guards,
+                            key,
+                            self.recovery_disable_dml_validation,
+                        )
                         .await?;
                 }
                 RowRedoKind::UpdateByPrimaryKey(key, cols) => {
                     table
-                        .update_primary_key_no_trx(&self.resources.buffers.pool_guards, key, cols)
+                        .update_primary_key_no_trx(
+                            &self.resources.buffers.pool_guards,
+                            key,
+                            cols,
+                            self.recovery_disable_dml_validation,
+                        )
                         .await?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
@@ -963,6 +980,7 @@ impl<'a> RecoveryCoordinator<'a> {
                             row.row_id,
                             vals,
                             cts,
+                            self.recovery_disable_dml_validation,
                         )
                         .await?;
                 }
@@ -977,6 +995,7 @@ impl<'a> RecoveryCoordinator<'a> {
                             row.row_id,
                             vals,
                             cts,
+                            self.recovery_disable_dml_validation,
                         )
                         .await?;
                 }

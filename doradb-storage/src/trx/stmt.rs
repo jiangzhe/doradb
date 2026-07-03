@@ -9,7 +9,10 @@ use crate::row::ops::{
     DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 use crate::session::TrxAttachment;
-use crate::table::Table;
+use crate::table::{
+    DmlValidationDomain, Table, validate_dml_full_row, validate_dml_primary_key,
+    validate_dml_sparse_update, validate_dml_unique_index, validate_dml_unique_key,
+};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
@@ -221,6 +224,7 @@ pub struct Statement<'stmt> {
     attachment: &'stmt TrxAttachment,
     effects: StmtEffects,
     stmt_locks: OwnerLockState,
+    disable_dml_validation: bool,
 }
 
 impl<'stmt> Statement<'stmt> {
@@ -240,7 +244,22 @@ impl<'stmt> Statement<'stmt> {
                 Some(owner_group) => OwnerLockState::new_grouped(owner, owner_group),
                 None => OwnerLockState::new(owner),
             },
+            disable_dml_validation: false,
         })
+    }
+
+    /// Disable default DML shape, type, nullability, sparse-update, and key
+    /// validation for this statement.
+    ///
+    /// Validation is enabled by default. Disable it only when the caller has
+    /// already validated full-row payload shape, value types, nullability,
+    /// sparse-update ordering/range/type compatibility, and DML lookup keys
+    /// including primary keys against the target table metadata for this
+    /// statement.
+    #[inline]
+    pub fn disable_dml_validation(&mut self) -> &mut Self {
+        self.disable_dml_validation = true;
+        self
     }
 
     /// Returns this statement's operation-local transaction runtime.
@@ -282,9 +301,12 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Acquires transaction-lifetime metadata and table-data intent for a write.
+    /// Acquires transaction-lifetime metadata protection for a table write.
     #[inline]
-    pub(crate) async fn acquire_table_write_locks(&mut self, table_id: TableID) -> Result<()> {
+    pub(crate) async fn acquire_table_write_metadata_lock(
+        &mut self,
+        table_id: TableID,
+    ) -> Result<()> {
         let lock_manager = self.attachment.engine().lock_manager();
         self.inner
             .checked_lock_state_mut("acquire table write locks")?
@@ -293,7 +315,13 @@ impl<'stmt> Statement<'stmt> {
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
             )
-            .await?;
+            .await
+    }
+
+    /// Acquires transaction-lifetime table-data intent for a table write.
+    #[inline]
+    pub(crate) async fn acquire_table_write_data_lock(&mut self, table_id: TableID) -> Result<()> {
+        let lock_manager = self.attachment.engine().lock_manager();
         self.inner
             .checked_lock_state_mut("acquire table write locks")?
             .acquire(
@@ -410,9 +438,19 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub async fn table_insert_mvcc(&mut self, table_id: TableID, cols: Vec<Val>) -> Result<RowID> {
         let table = self.resolve_user_table(table_id, "table_insert_mvcc")?;
-        self.acquire_table_write_locks(table_id).await?;
+        self.acquire_table_write_metadata_lock(table_id).await?;
         table.check_foreground_live("table_insert_mvcc")?;
         let layout = table.layout_snapshot();
+        if !self.disable_dml_validation {
+            validate_dml_full_row(
+                layout.metadata(),
+                Some(table_id),
+                "table_insert_mvcc",
+                &cols,
+                DmlValidationDomain::Foreground,
+            )?;
+        }
+        self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -431,9 +469,27 @@ impl<'stmt> Statement<'stmt> {
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
         let table = self.resolve_user_table(table_id, "table_upsert_unique_mvcc")?;
-        self.acquire_table_write_locks(table_id).await?;
+        self.acquire_table_write_metadata_lock(table_id).await?;
         table.check_foreground_live("table_upsert_unique_mvcc")?;
         let layout = table.layout_snapshot();
+        if !self.disable_dml_validation {
+            let metadata = layout.metadata();
+            validate_dml_full_row(
+                metadata,
+                Some(table_id),
+                "table_upsert_unique_mvcc",
+                &cols,
+                DmlValidationDomain::Foreground,
+            )?;
+            validate_dml_unique_index(
+                metadata,
+                Some(table_id),
+                "table_upsert_unique_mvcc",
+                unique_index_no,
+                DmlValidationDomain::Foreground,
+            )?;
+        }
+        self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -452,9 +508,27 @@ impl<'stmt> Statement<'stmt> {
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         let table = self.resolve_user_table(table_id, "table_update_unique_mvcc")?;
-        self.acquire_table_write_locks(table_id).await?;
+        self.acquire_table_write_metadata_lock(table_id).await?;
         table.check_foreground_live("table_update_unique_mvcc")?;
         let layout = table.layout_snapshot();
+        if !self.disable_dml_validation {
+            let metadata = layout.metadata();
+            validate_dml_unique_key(
+                metadata,
+                Some(table_id),
+                "table_update_unique_mvcc",
+                key,
+                DmlValidationDomain::Foreground,
+            )?;
+            validate_dml_sparse_update(
+                metadata,
+                Some(table_id),
+                "table_update_unique_mvcc",
+                &update,
+                DmlValidationDomain::Foreground,
+            )?;
+        }
+        self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -473,9 +547,19 @@ impl<'stmt> Statement<'stmt> {
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
         let table = self.resolve_user_table(table_id, "table_delete_unique_mvcc")?;
-        self.acquire_table_write_locks(table_id).await?;
+        self.acquire_table_write_metadata_lock(table_id).await?;
         table.check_foreground_live("table_delete_unique_mvcc")?;
         let layout = table.layout_snapshot();
+        if !self.disable_dml_validation {
+            validate_dml_unique_key(
+                layout.metadata(),
+                Some(table_id),
+                "table_delete_unique_mvcc",
+                key,
+                DmlValidationDomain::Foreground,
+            )?;
+        }
+        self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -490,7 +574,18 @@ impl<'stmt> Statement<'stmt> {
         table: &CatalogTable,
         cols: Vec<Val>,
     ) -> Result<RowID> {
-        self.acquire_table_write_locks(table.table_id()).await?;
+        self.acquire_table_write_metadata_lock(table.table_id())
+            .await?;
+        if !self.disable_dml_validation {
+            validate_dml_full_row(
+                table.metadata(),
+                Some(table.table_id()),
+                "catalog_insert_mvcc",
+                &cols,
+                DmlValidationDomain::Foreground,
+            )?;
+        }
+        self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table.insert_mvcc(rt, effects, cols).await
     }
@@ -502,6 +597,8 @@ impl<'stmt> Statement<'stmt> {
         table: &CatalogTable,
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
+        self.acquire_table_write_metadata_lock(table.table_id())
+            .await?;
         let primary_key_index_no = table
             .metadata()
             .primary_key()
@@ -514,7 +611,23 @@ impl<'stmt> Statement<'stmt> {
                 )
             })?
             .index_no();
-        self.acquire_table_write_locks(table.table_id()).await?;
+        if !self.disable_dml_validation {
+            validate_dml_full_row(
+                table.metadata(),
+                Some(table.table_id()),
+                "catalog_upsert_primary_key_mvcc",
+                &cols,
+                DmlValidationDomain::Foreground,
+            )?;
+            validate_dml_unique_index(
+                table.metadata(),
+                Some(table.table_id()),
+                "catalog_upsert_primary_key_mvcc",
+                primary_key_index_no,
+                DmlValidationDomain::Foreground,
+            )?;
+        }
+        self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .upsert_unique_mvcc(rt, effects, primary_key_index_no, cols, true)
@@ -529,25 +642,18 @@ impl<'stmt> Statement<'stmt> {
         key: &SelectKey,
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
-        let Some(primary_key) = table.metadata().primary_key() else {
-            return Err(Error::from(
-                Report::new(InternalError::CatalogPrimaryKeyMissing).attach(format!(
-                    "catalog primary-key delete requires primary key: table_id={}",
-                    table.table_id()
-                )),
-            ));
-        };
-        if !primary_key.matches_key(key) {
-            return Err(Error::from(
-                Report::new(InternalError::CatalogPrimaryKeyMismatch).attach(format!(
-                    "catalog primary-key delete key mismatch: table_id={}, index_no={}, primary_key_index_no={primary_key_index_no}",
-                    table.table_id(),
-                    key.index_no,
-                    primary_key_index_no = primary_key.index_no()
-                )),
-            ));
+        self.acquire_table_write_metadata_lock(table.table_id())
+            .await?;
+        if !self.disable_dml_validation {
+            validate_dml_primary_key(
+                table.metadata(),
+                Some(table.table_id()),
+                "catalog_delete_primary_key_mvcc",
+                key,
+                DmlValidationDomain::Foreground,
+            )?;
         }
-        self.acquire_table_write_locks(table.table_id()).await?;
+        self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table.delete_unique_mvcc(rt, effects, key, log_by_key).await
     }
@@ -815,10 +921,7 @@ pub(crate) mod tests {
                 .await;
 
             let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::CatalogPrimaryKeyMismatch)
-            );
+            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
             trx.rollback().await.unwrap();
         });
     }

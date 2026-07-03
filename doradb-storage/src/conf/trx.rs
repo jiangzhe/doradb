@@ -66,6 +66,8 @@ pub struct TrxSysConfig {
     pub log_sync: LogSync,
     /// Number of threads used to purge undo logs.
     pub purge_threads: usize,
+    /// Disable DML payload validation during recovery/no-transaction replay.
+    pub recovery_disable_dml_validation: bool,
 }
 
 impl Default for TrxSysConfig {
@@ -81,6 +83,7 @@ impl Default for TrxSysConfig {
             log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
             log_sync: DEFAULT_LOG_SYNC,
             purge_threads: DEFAULT_PURGE_THREADS,
+            recovery_disable_dml_validation: false,
         }
     }
 }
@@ -97,6 +100,13 @@ impl TrxSysConfig {
     #[inline]
     pub fn recovery_io_depth(mut self, io_depth: usize) -> Self {
         self.recovery_io_depth = io_depth;
+        self
+    }
+
+    /// Disable recovery/no-transaction DML shape, type, and nullability validation.
+    #[inline]
+    pub fn recovery_disable_dml_validation(mut self, disable: bool) -> Self {
+        self.recovery_disable_dml_validation = disable;
         self
     }
 
@@ -214,6 +224,7 @@ impl TrxSysConfig {
             resources,
             planner,
             self.recovery_io_depth,
+            self.recovery_disable_dml_validation,
             finalizer,
         ))
     }
@@ -443,6 +454,7 @@ mod tests {
         assert_eq!(config.log_write_io_depth, 32);
         assert_eq!(config.recovery_io_depth, 32);
         assert_eq!(config.catalog_checkpoint_scan_io_depth, 32);
+        assert!(!config.recovery_disable_dml_validation);
     }
 
     #[test]
@@ -455,6 +467,12 @@ mod tests {
         assert_eq!(config.log_write_io_depth, 2);
         assert_eq!(config.recovery_io_depth, 3);
         assert_eq!(config.catalog_checkpoint_scan_io_depth, 4);
+    }
+
+    #[test]
+    fn recovery_dml_validation_builder_sets_flag() {
+        let config = TrxSysConfig::default().recovery_disable_dml_validation(true);
+        assert!(config.recovery_disable_dml_validation);
     }
 
     #[test]

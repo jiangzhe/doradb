@@ -5,7 +5,9 @@ use crate::index::IndexInsert;
 use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
-use crate::table::{DeletionError, Table};
+use crate::table::{
+    DeletionError, DmlValidationDomain, Table, validate_dml_full_row, validate_dml_sparse_update,
+};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::row::ReadAllRows;
 use crate::value::Val;
@@ -20,9 +22,19 @@ impl Table {
         row_id: RowID,
         cols: &[Val],
         cts: TrxID,
+        disable_dml_validation: bool,
     ) -> Result<()> {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
+        if !disable_dml_validation {
+            validate_dml_full_row(
+                metadata,
+                Some(self.table_id()),
+                "recover_row_insert",
+                cols,
+                DmlValidationDomain::Recovery,
+            )?;
+        }
         debug_assert!(cols.len() == metadata.col.col_count());
         debug_assert!({
             cols.iter()
@@ -49,9 +61,19 @@ impl Table {
         row_id: RowID,
         update: &[UpdateCol],
         cts: TrxID,
+        disable_dml_validation: bool,
     ) -> Result<()> {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
+        if !disable_dml_validation {
+            validate_dml_sparse_update(
+                metadata,
+                Some(self.table_id()),
+                "recover_row_update",
+                update,
+                DmlValidationDomain::Recovery,
+            )?;
+        }
         let mut page_guard = self
             .mem
             .must_get_row_page_exclusive(guards, page_id)
@@ -344,6 +366,57 @@ mod tests {
                 .recover_row_delete_to_page(&mut page_guard, row_id + 2, TrxID::new(17))
                 .unwrap_err();
             assert_invalid_root(err, "row id outside page range");
+        });
+    }
+
+    #[test]
+    fn test_recover_row_dml_validation_rejects_malformed_payloads() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+
+            let err = table
+                .recover_row_insert(
+                    &session.pool_guards(),
+                    PageID::from(0u64),
+                    RowID::new(0),
+                    &[Val::from(1i32)],
+                    TrxID::new(10),
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("recover_row_insert"), "{report}");
+
+            let err = table
+                .recover_row_update(
+                    &session.pool_guards(),
+                    PageID::from(0u64),
+                    RowID::new(0),
+                    &[UpdateCol {
+                        idx: 2,
+                        val: Val::from("out-of-range"),
+                    }],
+                    TrxID::new(11),
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("recover_row_update"), "{report}");
         });
     }
 
