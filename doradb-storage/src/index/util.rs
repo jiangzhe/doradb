@@ -83,9 +83,9 @@ impl RowPageCreateRedoCtx<'_> {
     ) -> TrxID {
         let mut trx = self.trx_sys.begin_sys_trx();
         let table_id = self.table_id;
-        // Safety currently relies on single-stream redo ordering plus
-        // commit_no_wait: later user redo that reuses this page must not
-        // persist ahead of the earlier CreateRowPage record.
+        // Safety relies on callers serializing this no-wait commit with the
+        // row-page-index append path. Later row-page creation and user redo
+        // must not persist ahead of this CreateRowPage record.
         trx.create_row_page(table_id, page_id, start_row_id, end_row_id);
         self.trx_sys
             .commit_sys(trx)

@@ -9,7 +9,7 @@ use crate::error::{
     Validation::{Invalid, Valid},
 };
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
-use crate::id::{BlockID, PageID, RowID};
+use crate::id::{BlockID, PageID, RowID, TrxID};
 use crate::index::util::{Maskable, ParentPosition, RowPageCreateRedoCtx};
 use crate::latch::LatchFallbackMode;
 use crate::layout;
@@ -92,6 +92,40 @@ enum InsertFreeListProbe<T> {
 enum InsertFreeListMiss {
     Empty,
     BufferPageGenerationMismatch,
+}
+
+struct RowPageIndexInsert {
+    start_row_id: RowID,
+    end_row_id: RowID,
+    create_cts: Option<TrxID>,
+}
+
+#[derive(Clone, Copy)]
+struct RowPageIndexAppend<'a> {
+    start_row_id: RowID,
+    count: u64,
+    page_id: PageID,
+    redo_ctx: Option<RowPageCreateRedoCtx<'a>>,
+}
+
+impl RowPageIndexAppend<'_> {
+    #[inline]
+    fn end_row_id(&self) -> RowID {
+        self.start_row_id + self.count
+    }
+
+    #[inline]
+    fn finish(self) -> RowPageIndexInsert {
+        let end_row_id = self.end_row_id();
+        let create_cts = self
+            .redo_ctx
+            .map(|redo_ctx| redo_ctx.commit_row_page(self.page_id, self.start_row_id, end_row_id));
+        RowPageIndexInsert {
+            start_row_id: self.start_row_id,
+            end_row_id,
+            create_cts,
+        }
+    }
 }
 
 /// RowPageIndexNode is one B-tree node of the row-page index.
@@ -553,12 +587,14 @@ impl<P: BufferPool> RowPageIndex<P> {
         let new_page_id = new_page.page_id();
         loop {
             match self
-                .insert_row_page(meta_pool_guard, count as u64, new_page_id)
+                .insert_row_page(meta_pool_guard, count as u64, new_page_id, redo_ctx)
                 .await?
             {
                 Invalid => (),
-                Valid((start_row_id, end_row_id)) => {
+                Valid(inserted) => {
                     // initialize row page.
+                    let start_row_id = inserted.start_row_id;
+                    let end_row_id = inserted.end_row_id;
                     debug_assert!(end_row_id == start_row_id + count as u64);
                     new_page
                         .page_mut()
@@ -568,14 +604,11 @@ impl<P: BufferPool> RowPageIndex<P> {
                         .bf_mut()
                         .init_undo_map(Arc::clone(col_layout), count);
 
-                    if let Some(redo_ctx) = redo_ctx {
-                        let create_cts =
-                            redo_ctx.commit_row_page(new_page_id, start_row_id, end_row_id);
-                        if let Some(row_ver) =
+                    if let Some(create_cts) = inserted.create_cts
+                        && let Some(row_ver) =
                             new_page.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver())
-                        {
-                            row_ver.set_create_cts(create_cts);
-                        }
+                    {
+                        row_ver.set_create_cts(create_cts);
                     }
                     // finally, we downgrade the page lock for shared mode.
                     return Ok(());
@@ -675,10 +708,8 @@ impl<P: BufferPool> RowPageIndex<P> {
         &self,
         pool_guard: &PoolGuard,
         mut p_guard: PageExclusiveGuard<RowPageIndexNode>,
-        row_id: RowID,
-        count: u64,
-        insert_page_id: PageID,
-    ) -> Result<(RowID, RowID)> {
+        append: RowPageIndexAppend<'_>,
+    ) -> Result<RowPageIndexInsert> {
         debug_assert!(p_guard.page_id() == self.root_page_id);
         debug_assert!({
             let p = p_guard.page();
@@ -687,14 +718,13 @@ impl<P: BufferPool> RowPageIndex<P> {
         let root = p_guard.page();
         let new_height = root.header.height + 1;
         let l_row_id = root.header.start_row_id;
-        let r_row_id = row_id;
-        let max_row_id = r_row_id + count;
+        let r_row_id = append.start_row_id;
 
         // create left child and copy all contents to it.
         let mut l_guard = self.allocate_node_page(pool_guard).await?;
         let l_page_id = l_guard.page_id();
         l_guard.page_mut().clone_from(p_guard.page());
-        l_guard.page_mut().header.end_row_id = row_id; // update original page's end row id
+        l_guard.page_mut().header.end_row_id = r_row_id; // update original page's end row id
         drop(l_guard);
 
         // We may need to create a sub-tree on the right side.
@@ -702,15 +732,17 @@ impl<P: BufferPool> RowPageIndex<P> {
         // as same height as left.
         let r_page_id = if root.header.height == 0 {
             let mut r_guard = self.allocate_node_page(pool_guard).await?;
-            r_guard.page_mut().init(0, r_row_id, count, insert_page_id);
+            r_guard
+                .page_mut()
+                .init(0, r_row_id, append.count, append.page_id);
             r_guard.page_id()
         } else {
             self.create_sub_tree(
                 pool_guard,
                 root.header.height,
                 r_row_id,
-                count,
-                insert_page_id,
+                append.count,
+                append.page_id,
             )
             .await?
         };
@@ -734,7 +766,7 @@ impl<P: BufferPool> RowPageIndex<P> {
             });
             self.height.store(new_height as usize, Ordering::Relaxed);
         }
-        Ok((r_row_id, max_row_id))
+        Ok(append.finish())
     }
 
     #[inline]
@@ -777,10 +809,8 @@ impl<P: BufferPool> RowPageIndex<P> {
         pool_guard: &PoolGuard,
         stack: &mut Vec<PageOptimisticGuard<RowPageIndexNode>>,
         c_guard: PageExclusiveGuard<RowPageIndexNode>,
-        row_id: RowID,
-        count: u64,
-        insert_page_id: PageID,
-    ) -> Result<Validation<(RowID, RowID)>> {
+        append: RowPageIndexAppend<'_>,
+    ) -> Result<Validation<RowPageIndexInsert>> {
         debug_assert!(!stack.is_empty());
         let mut p_guard;
         // Block index is a special type of B+ tree, which does not implement
@@ -804,7 +834,7 @@ impl<P: BufferPool> RowPageIndex<P> {
             } else if stack.is_empty() {
                 // root is full, should split.
                 let res = self
-                    .insert_row_page_split_root(pool_guard, p_guard, row_id, count, insert_page_id)
+                    .insert_row_page_split_root(pool_guard, p_guard, append)
                     .await?;
                 return Ok(Valid(res));
             } // do not split branch node.
@@ -815,18 +845,25 @@ impl<P: BufferPool> RowPageIndex<P> {
         debug_assert!(p_height >= 1);
         let c_page_id = if p_height == 1 {
             let mut leaf = self.allocate_node_page(pool_guard).await?;
-            leaf.page_mut().init(0, row_id, count, insert_page_id);
-            debug_assert!(leaf.page_mut().header.end_row_id == row_id + count);
+            leaf.page_mut()
+                .init(0, append.start_row_id, append.count, append.page_id);
+            debug_assert!(leaf.page_mut().header.end_row_id == append.end_row_id());
             leaf.page_id()
         } else {
-            self.create_sub_tree(pool_guard, p_height - 1, row_id, count, insert_page_id)
-                .await?
+            self.create_sub_tree(
+                pool_guard,
+                p_height - 1,
+                append.start_row_id,
+                append.count,
+                append.page_id,
+            )
+            .await?
         };
         p_guard
             .page_mut()
-            .branch_add_entry(PageEntry::new(row_id, c_page_id));
+            .branch_add_entry(PageEntry::new(append.start_row_id, c_page_id));
         drop(c_guard);
-        Ok(Valid((row_id, row_id + count)))
+        Ok(Valid(append.finish()))
     }
 
     /// Inserts a row page id into the row-page index.
@@ -836,7 +873,8 @@ impl<P: BufferPool> RowPageIndex<P> {
         pool_guard: &PoolGuard,
         count: u64,
         insert_page_id: PageID,
-    ) -> Result<Validation<(RowID, RowID)>> {
+        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
+    ) -> Result<Validation<RowPageIndexInsert>> {
         // Stack holds the path from root to leaf.
         let mut stack = vec![];
         let mut p_guard = {
@@ -855,42 +893,41 @@ impl<P: BufferPool> RowPageIndex<P> {
         debug_assert!(p_guard.page().is_leaf());
         if p_guard.page().leaf_is_empty() {
             let start_row_id = p_guard.page().header.start_row_id;
+            let append = RowPageIndexAppend {
+                start_row_id,
+                count,
+                page_id: insert_page_id,
+                redo_ctx,
+            };
             p_guard
                 .page_mut()
                 .leaf_add_entry(start_row_id, count, insert_page_id);
-            return Ok(Valid((start_row_id, start_row_id + count)));
+            return Ok(Valid(append.finish()));
         }
         let end_row_id = p_guard.page().header.end_row_id;
+        let append = RowPageIndexAppend {
+            start_row_id: end_row_id,
+            count,
+            page_id: insert_page_id,
+            redo_ctx,
+        };
         if p_guard.page().leaf_is_full() {
             // Leaf is full, so we must add a new leaf to the row-page index.
             if stack.is_empty() {
                 // root is full and already exclusive locked
                 let res = self
-                    .insert_row_page_split_root(
-                        pool_guard,
-                        p_guard,
-                        end_row_id,
-                        count,
-                        insert_page_id,
-                    )
+                    .insert_row_page_split_root(pool_guard, p_guard, append)
                     .await?;
                 return Ok(Valid(res));
             }
             return self
-                .insert_row_page_to_new_leaf(
-                    pool_guard,
-                    &mut stack,
-                    p_guard,
-                    end_row_id,
-                    count,
-                    insert_page_id,
-                )
+                .insert_row_page_to_new_leaf(pool_guard, &mut stack, p_guard, append)
                 .await;
         }
         p_guard
             .page_mut()
             .leaf_add_entry(end_row_id, count, insert_page_id);
-        Ok(Valid((end_row_id, end_row_id + count)))
+        Ok(Valid(append.finish()))
     }
 
     #[inline]
@@ -1214,6 +1251,7 @@ mod tests {
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::recovery::stream::RedoReplayPlanner;
     use crate::value::ValKind;
+    use futures::future::join_all;
     use semistr::SemiStr;
     use std::future::Future;
     use std::io::Error as StdIoError;
@@ -1798,7 +1836,7 @@ mod tests {
             for row_page_id in 0..row_pages {
                 loop {
                     if let Valid(_) = blk_idx
-                        .insert_row_page(&pool_guard, 1, PageID::from(row_page_id))
+                        .insert_row_page(&pool_guard, 1, PageID::from(row_page_id), None)
                         .await
                         .expect("test row-page insertion should succeed")
                     {
@@ -1867,7 +1905,7 @@ mod tests {
             for i in 0..row_pages {
                 loop {
                     if let Valid(_) = blk_idx
-                        .insert_row_page(&pool_guard, rows_per_page as u64, PageID::from(i))
+                        .insert_row_page(&pool_guard, rows_per_page as u64, PageID::from(i), None)
                         .await
                         .expect("test row-page insertion should succeed")
                     {
@@ -1929,7 +1967,7 @@ mod tests {
             for row_page_id in 0..10000 {
                 loop {
                     if let Valid(_) = blk_idx
-                        .insert_row_page(&pool_guard, 100, test_page_id(row_page_id))
+                        .insert_row_page(&pool_guard, 100, test_page_id(row_page_id), None)
                         .await
                         .expect("test row-page insertion should succeed")
                     {
@@ -1969,7 +2007,7 @@ mod tests {
 
             loop {
                 if let Valid(_) = blk_idx
-                    .insert_row_page(&pool_guard, 100, test_page_id(20000))
+                    .insert_row_page(&pool_guard, 100, test_page_id(20000), None)
                     .await
                     .expect("test row-page insertion should succeed")
                 {
@@ -2067,6 +2105,90 @@ mod tests {
                 }
             }
             assert_eq!(create_row_page_logs, 1);
+        })
+    }
+
+    #[test]
+    fn test_row_page_index_create_row_page_redo_follows_append_order() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let table_id = TableID::new(205);
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_order"))
+                .build()
+                .await
+                .unwrap();
+            {
+                let meta_pool = &engine.inner().meta_pool;
+                let meta_guard = meta_pool.pool_guard();
+                let blk_idx =
+                    RowPageIndex::new(meta_pool.clone_inner(), &meta_guard, RowID::new(0))
+                        .await
+                        .expect("test row-page-index construction should succeed");
+                let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, table_id);
+                let total_pages = NBR_ROW_PAGE_ENTRIES_IN_LEAF + 64;
+                let worker_count = 8usize;
+                let pages_per_worker = total_pages.div_ceil(worker_count);
+                let jobs = (0..worker_count).map(|worker| {
+                    let blk_idx = &blk_idx;
+                    let meta_pool_ref = meta_pool;
+                    async move {
+                        let pool_guard = meta_pool_ref.pool_guard();
+                        let start = worker * pages_per_worker;
+                        let end = (start + pages_per_worker).min(total_pages);
+                        for page_no in start..end {
+                            loop {
+                                match blk_idx
+                                    .insert_row_page(
+                                        &pool_guard,
+                                        1,
+                                        test_page_id(10_000 + page_no as i32),
+                                        Some(redo_ctx),
+                                    )
+                                    .await
+                                    .expect("test row-page insertion should succeed")
+                                {
+                                    Valid(inserted) => {
+                                        assert!(inserted.create_cts.is_some());
+                                        break;
+                                    }
+                                    Invalid => {}
+                                }
+                            }
+                        }
+                    }
+                });
+                join_all(jobs).await;
+            }
+            engine.shutdown().unwrap();
+
+            let file_prefix = temp_dir.path().join("redo_row_page_order");
+            let file_prefix = file_prefix.to_str().unwrap();
+            let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
+            let planner = RedoReplayPlanner::new(logs);
+            let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
+            let mut expected_start = RowID::new(0);
+            let mut create_row_page_logs = 0usize;
+            while let Some(log) = stream.try_next().await.unwrap() {
+                let Some(DDLRedo::CreateRowPage {
+                    table_id: redo_table_id,
+                    start_row_id,
+                    end_row_id,
+                    ..
+                }) = log.payload.ddl.as_deref()
+                else {
+                    continue;
+                };
+                if *redo_table_id != table_id {
+                    continue;
+                }
+                assert_eq!(*start_row_id, expected_start);
+                expected_start = *end_row_id;
+                create_row_page_logs += 1;
+            }
+            assert_eq!(create_row_page_logs, NBR_ROW_PAGE_ENTRIES_IN_LEAF + 64);
         })
     }
 
