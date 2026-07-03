@@ -342,7 +342,7 @@ async fn create_baseline_table(engine: &doradb_storage::Engine) -> StorageResult
                 ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
                 ColumnSpec::new("payload", ValKind::I32, ColumnAttributes::empty()),
             ]),
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
         )
         .await?;
     session.close().await?;
