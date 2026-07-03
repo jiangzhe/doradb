@@ -1,7 +1,7 @@
 ---
 id: 000210
 title: Default-On Storage DML Validation
-status: proposal
+status: implemented
 created: 2026-07-03
 github_issue: 807
 ---
@@ -28,7 +28,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000143-opt-in-statement-type-validation-for-storage-dml.md
+- docs/backlogs/closed/000143-opt-in-statement-type-validation-for-storage-dml.md
 
 Task 000206 found that ordinary storage DML type/nullability checks are mostly
 `debug_assert!`-only at table boundaries. `TableColumnLayout::col_type_match`
@@ -195,9 +195,8 @@ stmt.disable_dml_validation()
      `validate_primary_key_no_trx_key()` on the same recovery/no-trx disable
      flag. When enabled by default, they must produce
      `DataIntegrityError::InvalidPayload` for persisted/recovery payloads.
-   - Keep non-DML recovery integrity and helper capability checks always-on,
-     including missing/deleted row checks, row-location consistency checks, and
-     the no-trx update restriction that rejects indexed-column changes.
+   - Keep non-DML recovery integrity checks always-on, including
+     missing/deleted row checks and row-location consistency checks.
    - Update `Table::recover_row_insert()` and `Table::recover_row_update()` to
      validate insert/update payload shape/type/nullability by default before
      writing recovered row pages. Respect
@@ -223,6 +222,33 @@ stmt.disable_dml_validation()
 
 ## Implementation Notes
 
+- Added shared DML validation helpers and default-on `Statement` validation for
+  user-table and catalog insert/upsert/update/delete DML. Public
+  `Statement::disable_dml_validation()` preserves a per-statement prevalidated
+  opt-out.
+- Split table write-lock acquisition so checked paths validate after metadata
+  protection and before `TableData(IX)` acquisition, key derivation, row-page
+  mutation, or secondary-index work. The unused combined write-lock helper was
+  removed.
+- Threaded `TrxSysConfig::recovery_disable_dml_validation` through engine
+  startup, catalog checkpoint bootstrap, and redo recovery. Recovery/no-trx DML
+  validates by default and reports malformed persisted payloads as
+  `DataIntegrityError::InvalidPayload`.
+- Resolve-time review tightened the opt-out contract: recovery/no-trx opt-out
+  is a fully unchecked/prevalidated path for DML shape/type/nullability, sparse
+  update range/order/type, and DML key checks, including primary-key checks.
+  Existing missing-row and row-location integrity checks remain always-on.
+- Refactored `update_primary_key_no_trx()` relocation handling into the
+  free-space match arm. Primary-key column updates remain rejected when DML
+  validation is enabled.
+- Validated with `cargo fmt`, focused `cargo nextest` runs for
+  `primary_key_no_trx` and `dml_validation`,
+  `cargo check -p doradb-storage --tests`,
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings`,
+  `tools/style_audit.rs --diff-base origin/main`, and the full
+  `cargo nextest run -p doradb-storage` suite passing 1180 tests.
+- Source backlog `docs/backlogs/000143-opt-in-statement-type-validation-for-storage-dml.md`
+  was closed as implemented and archived under `docs/backlogs/closed/`.
 
 ## Impacts
 
@@ -313,13 +339,15 @@ stmt.disable_dml_validation()
   - malformed primary-key keys are rejected by default;
   - configured recovery opt-out bypasses primary-key DML validation;
   - malformed sparse update payloads are rejected by default;
-  - configured recovery opt-out bypasses sparse update DML validation;
-  - update of indexed columns remains rejected.
+  - configured recovery opt-out bypasses sparse update DML validation,
+    including range/order/type checks;
+  - primary-key column updates are rejected when validation is enabled.
 - `Table::recover_row_insert()` and `Table::recover_row_update()` validation:
   - malformed user-table redo insert/update payloads fail before row-page
     mutation with `DataIntegrityError::InvalidPayload`;
-  - `recovery_disable_dml_validation(true)` bypasses DML shape/type/nullability
-    and DML key checks, not existing page/root invariants.
+  - `recovery_disable_dml_validation(true)` bypasses DML shape/type/nullability,
+    sparse update range/order/type, and DML key checks, not existing page/root
+    invariants.
 - Config tests:
   - `TrxSysConfig::default().recovery_disable_dml_validation` is `false`;
   - builder sets the flag;

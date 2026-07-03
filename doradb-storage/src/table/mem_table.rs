@@ -1383,13 +1383,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         } else {
             validate_primary_key_no_trx_key(metadata, key, "update primary key no-trx")?
         };
-        // This no-trx recovery path writes the row image directly and does not
-        // update MemIndex entries. Keep indexed-column changes rejected even
-        // when caller DML validation is disabled; callers that need
-        // indexed-column changes must use a path that updates indexes as well.
-        if disable_dml_validation {
-            validate_update_primary_key_no_trx_non_indexed_cols(metadata, update)?;
-        } else {
+        // Validation opt-out is an unchecked/prevalidated recovery path. When
+        // validation is enabled, keep primary-key column changes rejected
+        // because this helper addresses rows by primary key.
+        if !disable_dml_validation {
             validate_update_primary_key_no_trx_cols(metadata, update)?;
         }
 
@@ -2417,19 +2414,27 @@ fn validate_update_primary_key_no_trx_cols(
         }
         last_idx = Some(update_col.idx);
     }
-    validate_update_primary_key_no_trx_non_indexed_cols(metadata, update)?;
+    validate_update_primary_key_no_trx_primary_key_cols(metadata, update)?;
     Ok(())
 }
 
 #[inline]
-fn validate_update_primary_key_no_trx_non_indexed_cols(
+fn validate_update_primary_key_no_trx_primary_key_cols(
     metadata: &TableMetadata,
     update: &[UpdateCol],
 ) -> Result<()> {
+    let Some(primary_key) = metadata.primary_key() else {
+        return Ok(());
+    };
     for update_col in update {
-        if metadata.idx.index_columns().contains(&update_col.idx) {
+        if primary_key
+            .spec()
+            .cols
+            .iter()
+            .any(|key| usize::from(key.col_no) == update_col.idx)
+        {
             return Err(catalog_primary_key_payload_error(format!(
-                "update primary key no-trx cannot change indexed column: column_no={}",
+                "update primary key no-trx cannot change primary key column: column_no={}",
                 update_col.idx
             )));
         }
@@ -3094,7 +3099,7 @@ mod tests {
             )
             .await;
 
-            let err = mem_table
+            mem_table
                 .update_primary_key_no_trx(
                     &guards,
                     &name_key("unique"),
@@ -3105,13 +3110,14 @@ mod tests {
                     true,
                 )
                 .await
-                .unwrap_err();
-            assert_eq!(
-                err.data_integrity_error(),
-                Some(DataIntegrityError::InvalidPayload)
-            );
-            let report = format!("{err:?}");
-            assert!(report.contains("cannot change indexed column"), "{report}");
+                .unwrap();
+            assert_unique_row(
+                &mem_table,
+                &guards,
+                &single_key(1i32),
+                Some(indexed_payload_row(1, "changed", b"new")),
+            )
+            .await;
         });
     }
 
