@@ -1,5 +1,5 @@
 use crate::id::RowID;
-use error_stack::Report;
+use error_stack::{AttachmentKind, FrameKind, Report};
 use std::array::TryFromSliceError;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug, Display};
@@ -709,6 +709,32 @@ impl Error {
     pub(crate) fn engine_component_missing_dependency() -> Self {
         Report::new(InternalError::EngineComponentMissingDependency).into()
     }
+
+    #[inline]
+    fn fmt_report_line(report: &Report<ErrorKind>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for frame in report.frames() {
+            if let FrameKind::Context(context) = frame.kind() {
+                if first {
+                    first = false;
+                } else {
+                    f.write_str(": ")?;
+                }
+                Display::fmt(context, f)?;
+            }
+        }
+        for frame in report.frames() {
+            if let FrameKind::Attachment(AttachmentKind::Printable(attachment)) = frame.kind() {
+                if first {
+                    first = false;
+                } else {
+                    f.write_str(": ")?;
+                }
+                Display::fmt(attachment, f)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl From<Report<ConfigError>> for Error {
@@ -807,7 +833,7 @@ impl From<glob::GlobError> for Error {
 impl fmt::Display for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Display::fmt(&self.0, f)
+        Self::fmt_report_line(&self.0, f)
     }
 }
 
@@ -955,5 +981,30 @@ mod tests {
             Some(IoErrorKind::WouldBlock)
         );
         assert!(format!("{err:?}").contains("not ready"));
+    }
+
+    #[test]
+    fn test_storage_error_display_includes_config_detail() {
+        let err =
+            Error::from(Report::new(ConfigError::InvalidIoDepth).attach("recovery_io_depth=0"));
+
+        assert_eq!(
+            format!("{err}"),
+            "configuration error: invalid io depth: recovery_io_depth=0"
+        );
+    }
+
+    #[test]
+    fn test_storage_error_display_includes_io_detail() {
+        let err = Error::from(IoError::report_with_op(
+            StorageOp::FileOpen,
+            StdIoError::new(IoErrorKind::PermissionDenied, "open denied"),
+        ));
+
+        let output = format!("{err}");
+        assert!(output.contains("io error"), "{output}");
+        assert!(output.contains("permission denied"), "{output}");
+        assert!(output.contains("op=file open"), "{output}");
+        assert!(output.contains("open denied"), "{output}");
     }
 }
