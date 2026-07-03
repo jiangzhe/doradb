@@ -241,12 +241,16 @@ stmt.disable_dml_validation()
 - Refactored `update_primary_key_no_trx()` relocation handling into the
   free-space match arm. Primary-key column updates remain rejected when DML
   validation is enabled.
+- Post-resolve review added direct no-trx index refresh for in-place
+  `update_primary_key_no_trx()` updates that change indexed columns. Tables
+  with only a primary-key index skip the refresh preparation path, and in-place
+  refresh derives old/new keys from indexed columns without cloning the full row.
 - Validated with `cargo fmt`, focused `cargo nextest` runs for
   `primary_key_no_trx` and `dml_validation`,
   `cargo check -p doradb-storage --tests`,
   `cargo clippy -p doradb-storage --all-targets -- -D warnings`,
   `tools/style_audit.rs --diff-base origin/main`, and the full
-  `cargo nextest run -p doradb-storage` suite passing 1180 tests.
+  `cargo nextest run -p doradb-storage` suite passing 1183 tests.
 - Source backlog `docs/backlogs/000143-opt-in-statement-type-validation-for-storage-dml.md`
   was closed as implemented and archived under `docs/backlogs/closed/`.
 
@@ -341,6 +345,9 @@ stmt.disable_dml_validation()
   - malformed sparse update payloads are rejected by default;
   - configured recovery opt-out bypasses sparse update DML validation,
     including range/order/type checks;
+  - in-place updates that change indexed columns refresh the old/new MemIndex
+    entries for multi-index tables;
+  - tables with only the primary-key index avoid no-trx index refresh setup;
   - primary-key column updates are rejected when validation is enabled.
 - `Table::recover_row_insert()` and `Table::recover_row_update()` validation:
   - malformed user-table redo insert/update payloads fail before row-page

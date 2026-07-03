@@ -9,7 +9,9 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
 use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata};
-use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
+use crate::error::{
+    DataIntegrityError, Error, InternalError, OperationError, RecoveryDuplicateKey, Result,
+};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
@@ -35,6 +37,11 @@ use error_stack::Report;
 use std::mem::take;
 use std::result::Result as StdResult;
 use std::sync::Arc;
+
+struct NoTrxIndexRefresh {
+    old_keys: Vec<SelectKey>,
+    new_keys: Vec<SelectKey>,
+}
 
 /// Shared in-memory table core used by both catalog and user tables.
 ///
@@ -807,12 +814,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             let res = self
                 .unique_insert_if_not_exists(guards, &key, row_id, false, MIN_SNAPSHOT_TS)
                 .await?;
-            assert!(res.is_ok());
+            ensure_no_trx_index_insert(key.index_no, res)?;
         } else {
             let res = self
                 .non_unique_insert_if_not_exists(guards, &key, row_id, false, MIN_SNAPSHOT_TS)
                 .await?;
-            assert!(res.is_ok());
+            ensure_no_trx_index_insert(key.index_no, res)?;
         }
         Ok(())
     }
@@ -832,6 +839,43 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             self.non_unique_compare_delete(guards, key, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         }
+    }
+
+    #[inline]
+    async fn refresh_changed_indexes_no_trx(
+        &self,
+        guards: &PoolGuards,
+        row_id: RowID,
+        old_keys: &[SelectKey],
+        new_keys: &[SelectKey],
+    ) -> Result<()> {
+        if old_keys.len() != new_keys.len() {
+            return Err(catalog_primary_key_payload_error(format!(
+                "update primary key no-trx index refresh key count mismatch: old={}, new={}",
+                old_keys.len(),
+                new_keys.len()
+            )));
+        }
+        for (old_key, new_key) in old_keys.iter().zip(new_keys) {
+            if old_key.index_no != new_key.index_no {
+                return Err(catalog_primary_key_payload_error(format!(
+                    "update primary key no-trx index refresh key order mismatch: old_index_no={}, new_index_no={}",
+                    old_key.index_no, new_key.index_no
+                )));
+            }
+            if old_key == new_key {
+                continue;
+            }
+            self.insert_index_no_trx(guards, new_key.clone(), row_id)
+                .await?;
+            if !self.delete_index_directly(guards, old_key, row_id).await? {
+                return Err(catalog_primary_key_payload_error(format!(
+                    "update primary key no-trx index refresh missing old key: index_no={}, row_id={row_id}",
+                    old_key.index_no
+                )));
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -1435,11 +1479,29 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let var_len = page.var_len_for_update(row_idx, RowUpdateView::Sparse(update));
         match page.request_free_space(var_len) {
             Some(var_offset) => {
-                let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
-                for update_col in update {
-                    row.update_col(metadata.col.as_ref(), update_col.idx, &update_col.val, true);
+                let index_refresh =
+                    prepare_update_primary_key_no_trx_index_refresh(metadata, row.clone(), update);
+                {
+                    let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
+                    for update_col in update {
+                        row.update_col(
+                            metadata.col.as_ref(),
+                            update_col.idx,
+                            &update_col.val,
+                            true,
+                        );
+                    }
+                    row.finish_update();
                 }
-                row.finish_update();
+                if let Some(index_refresh) = index_refresh {
+                    self.refresh_changed_indexes_no_trx(
+                        guards,
+                        row_id,
+                        &index_refresh.old_keys,
+                        &index_refresh.new_keys,
+                    )
+                    .await?;
+                }
                 Ok(())
             }
             None => {
@@ -2387,6 +2449,66 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
 }
 
 #[inline]
+fn prepare_update_primary_key_no_trx_index_refresh(
+    metadata: &TableMetadata,
+    row: Row<'_>,
+    update: &[UpdateCol],
+) -> Option<NoTrxIndexRefresh> {
+    if metadata.idx.active_index_count() <= 1 {
+        return None;
+    }
+
+    let mut updated_index_vals = FastHashMap::default();
+    for update_col in update {
+        if metadata.idx.index_columns().contains(&update_col.idx) {
+            updated_index_vals.insert(update_col.idx, update_col.val.clone());
+        }
+    }
+    if updated_index_vals.is_empty() {
+        return None;
+    }
+
+    let mut old_keys = Vec::new();
+    let mut new_keys = Vec::new();
+    for (index_no, index_spec) in metadata.idx.active_indexes() {
+        if !index_key_is_changed(index_spec, &updated_index_vals) {
+            continue;
+        }
+        let old_key_vals = index_spec
+            .cols
+            .iter()
+            .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
+            .collect();
+        let old_key = SelectKey::new(index_no, old_key_vals);
+        let new_key = index_key_replace(index_spec, &old_key, &updated_index_vals);
+        if old_key != new_key {
+            old_keys.push(old_key);
+            new_keys.push(new_key);
+        }
+    }
+    if old_keys.is_empty() {
+        return None;
+    }
+    Some(NoTrxIndexRefresh { old_keys, new_keys })
+}
+
+#[inline]
+fn ensure_no_trx_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
+    match res {
+        IndexInsert::Ok(_) => Ok(()),
+        IndexInsert::DuplicateKey(row_id, deleted) => Err(Report::new(
+            DataIntegrityError::UnexpectedRecoveryDuplicateKey,
+        )
+        .attach(RecoveryDuplicateKey {
+            index_no,
+            row_id,
+            deleted,
+        })
+        .into()),
+    }
+}
+
+#[inline]
 fn validate_update_primary_key_no_trx_cols(
     metadata: &TableMetadata,
     update: &[UpdateCol],
@@ -2546,6 +2668,20 @@ mod tests {
                 ],
             )
             .expect("valid unique name payload metadata"),
+        )
+    }
+
+    fn primary_key_payload_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                ],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid primary-key payload metadata"),
         )
     }
 
@@ -3045,6 +3181,103 @@ mod tests {
     }
 
     #[test]
+    fn test_mem_table_update_primary_key_no_trx_refreshes_non_unique_index() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_019);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(1, "old", b"payload"), false)
+                .await
+                .unwrap();
+            let (row_id, deleted) = mem_table
+                .unique_lookup(&guards, &single_key(1i32), MIN_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .expect("inserted primary key should be indexed");
+            assert!(!deleted);
+
+            mem_table
+                .update_primary_key_no_trx(
+                    &guards,
+                    &single_key(1i32),
+                    &[UpdateCol {
+                        idx: 1,
+                        val: Val::from("new"),
+                    }],
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_non_unique_index_entry(&mem_table, &guards, &name_key("old"), row_id, None)
+                .await;
+            assert_non_unique_index_entry(
+                &mem_table,
+                &guards,
+                &name_key("new"),
+                row_id,
+                Some(true),
+            )
+            .await;
+            assert_unique_row(
+                &mem_table,
+                &guards,
+                &single_key(1i32),
+                Some(indexed_payload_row(1, "new", b"payload")),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_update_primary_key_no_trx_single_primary_key_updates_without_refresh() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_020);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, primary_key_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(1, "old", b"payload"), false)
+                .await
+                .unwrap();
+            mem_table
+                .update_primary_key_no_trx(
+                    &guards,
+                    &single_key(1i32),
+                    &[UpdateCol {
+                        idx: 1,
+                        val: Val::from("new"),
+                    }],
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_unique_row(
+                &mem_table,
+                &guards,
+                &single_key(1i32),
+                Some(indexed_payload_row(1, "new", b"payload")),
+            )
+            .await;
+        });
+    }
+
+    #[test]
     fn test_mem_table_update_primary_key_no_trx_opt_out_skips_primary_key_validation() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -3118,6 +3351,55 @@ mod tests {
                 Some(indexed_payload_row(1, "changed", b"new")),
             )
             .await;
+            assert_unique_row(&mem_table, &guards, &name_key("unique"), None).await;
+            assert_unique_row(
+                &mem_table,
+                &guards,
+                &name_key("changed"),
+                Some(indexed_payload_row(1, "changed", b"new")),
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_update_primary_key_no_trx_rejects_duplicate_unique_index_refresh() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let mem_table_id = test_user_table_id(10_021);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, unique_name_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(1, "one", b"payload"), false)
+                .await
+                .unwrap();
+            mem_table
+                .insert_no_trx(&guards, &indexed_payload_row(2, "two", b"payload"), false)
+                .await
+                .unwrap();
+
+            let err = mem_table
+                .update_primary_key_no_trx(
+                    &guards,
+                    &single_key(1i32),
+                    &[UpdateCol {
+                        idx: 1,
+                        val: Val::from("two"),
+                    }],
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::UnexpectedRecoveryDuplicateKey)
+            );
         });
     }
 
