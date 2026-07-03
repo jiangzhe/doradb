@@ -86,6 +86,23 @@ impl Deref for CatalogTable {
     }
 }
 
+/// Catalog startup options that must be available before transaction-system build.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CatalogConfig {
+    /// Disable DML payload validation while bootstrapping checkpointed catalog rows.
+    pub(crate) recovery_disable_dml_validation: bool,
+}
+
+impl CatalogConfig {
+    /// Build catalog startup options from the transaction-system recovery policy.
+    #[inline]
+    pub(crate) fn new(recovery_disable_dml_validation: bool) -> Self {
+        Self {
+            recovery_disable_dml_validation,
+        }
+    }
+}
+
 /// Catalog contains metadata of user tables.
 pub(crate) struct Catalog {
     next_table_id: AtomicU64,
@@ -98,14 +115,18 @@ pub(crate) struct Catalog {
 impl Catalog {
     /// Create a catalog runtime from persisted catalog storage.
     #[inline]
-    pub(crate) async fn new(storage: CatalogStorage) -> Result<Self> {
+    pub(crate) async fn new(storage: CatalogStorage, config: CatalogConfig) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, storage.meta_pool.pool_guard())
             .push(PoolRole::Disk, storage.disk_pool.pool_guard())
             .build();
         let snapshot = storage.checkpoint_snapshot()?;
         storage
-            .bootstrap_from_checkpoint(&snapshot, &pool_guards)
+            .bootstrap_from_checkpoint(
+                &snapshot,
+                &pool_guards,
+                config.recovery_disable_dml_validation,
+            )
             .await?;
         let next_table_id = storage.next_table_id();
         Ok(Catalog {
@@ -711,7 +732,7 @@ impl Catalog {
 }
 
 impl Component for Catalog {
-    type Config = ();
+    type Config = CatalogConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
 
@@ -719,7 +740,7 @@ impl Component for Catalog {
 
     #[inline]
     async fn build(
-        _config: Self::Config,
+        config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
@@ -732,7 +753,7 @@ impl Component for Catalog {
             disk_pool.clone_inner(),
         )
         .await?;
-        registry.register::<Self>(Catalog::new(storage).await?)
+        registry.register::<Self>(Catalog::new(storage, config).await?)
     }
 
     #[inline]

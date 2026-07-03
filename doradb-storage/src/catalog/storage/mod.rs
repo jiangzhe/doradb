@@ -217,6 +217,7 @@ impl CatalogStorage {
         &self,
         snapshot: &MultiTableFileSnapshot,
         guards: &PoolGuards,
+        disable_dml_validation: bool,
     ) -> Result<()> {
         for (idx, root) in snapshot.meta.table_roots.iter().copied().enumerate() {
             if idx >= self.tables.len() {
@@ -241,7 +242,9 @@ impl CatalogStorage {
                 .load_rows_from_root(self.tables[idx].metadata(), guards.disk_guard(), root)
                 .await?;
             for row in rows {
-                self.tables[idx].insert_no_trx(guards, &row.vals).await?;
+                self.tables[idx]
+                    .insert_no_trx(guards, &row.vals, disable_dml_validation)
+                    .await?;
             }
         }
         let watermarks = self
@@ -1314,7 +1317,7 @@ pub(crate) mod tests {
                     .push(PoolRole::Disk, storage.disk_pool.pool_guard())
                     .build();
                 let err = storage
-                    .bootstrap_from_checkpoint(&snapshot, &guards)
+                    .bootstrap_from_checkpoint(&snapshot, &guards, false)
                     .await
                     .unwrap_err();
 

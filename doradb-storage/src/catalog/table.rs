@@ -771,12 +771,6 @@ impl<'a> PrimaryKeySpec<'a> {
         self.index_spec
     }
 
-    /// Returns whether the input key targets and matches this primary key.
-    #[inline]
-    pub(crate) fn matches_key(&self, key: &SelectKey) -> bool {
-        self.validate_key(key).is_ok()
-    }
-
     /// Validates that the input key targets this primary key and matches its
     /// column shape.
     #[inline]
@@ -1819,7 +1813,11 @@ mod tests {
         .expect("valid table metadata");
         let primary_key = metadata.primary_key().unwrap();
 
-        assert!(primary_key.matches_key(&SelectKey::new(0, vec![Val::from(42u32)])));
+        assert!(
+            primary_key
+                .validate_key(&SelectKey::new(0, vec![Val::from(42u32)]))
+                .is_ok()
+        );
         assert_eq!(
             primary_key.validate_key(&SelectKey::new(1, vec![Val::from(42u32)])),
             Err(PrimaryKeyMatchError::IndexNo {

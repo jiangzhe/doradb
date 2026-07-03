@@ -1,5 +1,6 @@
 mod access;
 mod deletion_buffer;
+mod dml;
 mod gc;
 mod hot;
 mod layout;
@@ -11,6 +12,7 @@ mod rollback;
 mod storage;
 pub(crate) use access::*;
 pub(crate) use deletion_buffer::*;
+pub(crate) use dml::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
@@ -1490,7 +1492,8 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        CompletionErrorKind, DataIntegrityError, Error, FatalError, FileKind, Result,
+        CompletionErrorKind, DataIntegrityError, Error, FatalError, FileKind, OperationError,
+        Result,
     };
     use crate::file::SparseFile;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
@@ -1820,6 +1823,189 @@ pub(crate) mod tests {
             .unwrap();
         drop(ddl_session);
         table_id
+    }
+
+    #[inline]
+    pub(crate) async fn create_nullable_name_table_for_test(engine: &Engine) -> TableID {
+        let mut ddl_session = engine.new_session().unwrap();
+        let table_id = ddl_session
+            .create_table(
+                TableSpec::new(vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::NULLABLE),
+                ]),
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            )
+            .await
+            .unwrap();
+        drop(ddl_session);
+        table_id
+    }
+
+    fn assert_invalid_dml_input(err: Error) {
+        assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+    }
+
+    #[test]
+    fn test_statement_insert_dml_validation_default_on() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "stmt_insert_dml_validation").await;
+            let table_id = create_nullable_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.table_insert_mvcc(table_id, vec![Val::from(1i32)])
+                        .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert_invalid_dml_input(err);
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.table_insert_mvcc(
+                        table_id,
+                        vec![Val::from("wrong-id-type"), Val::from("name")],
+                    )
+                    .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert_invalid_dml_input(err);
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.table_insert_mvcc(table_id, vec![Val::Null, Val::from("name")])
+                        .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert_invalid_dml_input(err);
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::Null])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_statement_dml_validation_opt_out_is_statement_local() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "stmt_dml_validation_opt_out").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.disable_dml_validation()
+                    .table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("name")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.table_insert_mvcc(table_id, vec![Val::from(2i32)])
+                        .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert_invalid_dml_input(err);
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_statement_unique_dml_validation_default_on() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "stmt_unique_dml_validation").await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            expect_insert_committed(
+                table_id,
+                &mut session,
+                vec![Val::from(1i32), Val::from("old")],
+            )
+            .await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.table_upsert_unique_mvcc(
+                        table_id,
+                        1,
+                        vec![Val::from(2i32), Val::from("new")],
+                    )
+                    .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert_invalid_dml_input(err);
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                    stmt.table_update_unique_mvcc(
+                        table_id,
+                        &key,
+                        vec![
+                            UpdateCol {
+                                idx: 1,
+                                val: Val::from("new"),
+                            },
+                            UpdateCol {
+                                idx: 1,
+                                val: Val::from("duplicate"),
+                            },
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert_invalid_dml_input(err);
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    let key = SelectKey::new(1, vec![Val::from("old")]);
+                    stmt.table_delete_unique_mvcc(table_id, &key, false).await?;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert_invalid_dml_input(err);
+            trx.rollback().await.unwrap();
+        });
     }
 
     pub(crate) fn lightweight_test_engine_config(

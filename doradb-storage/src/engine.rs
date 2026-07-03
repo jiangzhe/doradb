@@ -6,7 +6,7 @@
 //! model that this module enforces with the component registry.
 use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, CatalogConfig};
 use crate::component::{
     ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
 };
@@ -684,6 +684,7 @@ impl EngineConfig {
         let file = self.file.data_dir(resolved.data_dir_path());
         let readonly_buffer_size = file.readonly_buffer_size;
         let trx_cfg = self.trx.log_dir(resolved.log_dir_path());
+        let catalog_cfg = CatalogConfig::new(trx_cfg.recovery_disable_dml_validation);
         let mut builder = RegistryBuilder::new();
         // Components are registered in one fixed dependency order. Reverse
         // registration order then defines both explicit shutdown order and the
@@ -716,7 +717,7 @@ impl EngineConfig {
         // guards for row/index/readonly access. Register catalog after the pools it
         // can pin so reverse shutdown/drop order releases table guards before pool
         // owners are torn down.
-        builder.build::<Catalog>(()).await?;
+        builder.build::<Catalog>(catalog_cfg).await?;
         builder.build::<TransactionSystem>(trx_cfg).await?;
 
         resolved.persist_marker_if_missing()?;
@@ -826,6 +827,7 @@ mod tests {
         assert!(config_str.contains("data_swap_file"));
         assert!(config_str.contains("log_write_io_depth"));
         assert!(config_str.contains("recovery_io_depth"));
+        assert!(config_str.contains("recovery_disable_dml_validation"));
         assert!(config_str.contains("catalog_checkpoint_scan_io_depth"));
         assert!(config_str.contains("log_dir"));
         assert!(config_str.contains("log_file_stem"));

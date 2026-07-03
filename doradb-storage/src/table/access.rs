@@ -4738,7 +4738,8 @@ mod tests {
             let insert = vec![Val::from(2i32), Val::from("insert")];
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.acquire_table_write_locks(table_id).await?;
+                    stmt.acquire_table_write_metadata_lock(table_id).await?;
+                    stmt.acquire_table_write_data_lock(table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();
@@ -4799,7 +4800,8 @@ mod tests {
                 .unwrap();
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.acquire_table_write_locks(table_id).await?;
+                    stmt.acquire_table_write_metadata_lock(table_id).await?;
+                    stmt.acquire_table_write_data_lock(table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();
@@ -5607,7 +5609,8 @@ mod tests {
                         .lock_shared_async()
                         .await
                         .unwrap();
-                    stmt.acquire_table_write_locks(table_id).await?;
+                    stmt.acquire_table_write_metadata_lock(table_id).await?;
+                    stmt.acquire_table_write_data_lock(table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();

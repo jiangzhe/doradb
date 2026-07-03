@@ -167,6 +167,8 @@ pub(crate) enum OperationError {
     DuplicateKey,
     #[error("write conflict")]
     WriteConflict,
+    #[error("invalid DML input")]
+    InvalidDmlInput,
     #[error("invalid lock mode")]
     InvalidLockMode,
     #[error("lock upgrade would block")]
@@ -271,8 +273,6 @@ pub(crate) enum InternalError {
     CatalogRootDescriptorInvariant,
     #[error("catalog primary key missing")]
     CatalogPrimaryKeyMissing,
-    #[error("catalog primary key mismatch")]
-    CatalogPrimaryKeyMismatch,
     #[error("column scan shape mismatch")]
     ColumnScanShapeMismatch,
     #[error("LWC block encoding invariant violated")]
