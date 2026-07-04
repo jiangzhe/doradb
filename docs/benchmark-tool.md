@@ -76,8 +76,8 @@ all sessions.
 | `--seed` | `run insert` | `0` | `u64` reproducibility input. It affects generated payload bytes for all insert runs and, with `--rand`, also affects pseudo-random key order. |
 | `--rand` | `run insert` | Disabled | Enables pseudo-random logical key generation. Without `--rand`, `insert` uses increasing logical key order. |
 | `--index`, `-i` | `prepare`, `run insert` | `prepare`: `none`; `run insert`: prepared index | Controls or validates the benchmark table's index shape. `none` creates no secondary indexes and allows duplicate logical key values. `unique` creates one unique secondary index on the logical key column. |
-| `--threads`, `-t` | `run insert` | `1` | Number of operating-system worker threads created by the benchmark harness. It is not an async task count. |
-| `--sessions`, `-s` | `run insert` | `--threads` | Number of independent DoraDB public sessions, meaning logical benchmark clients. Both values must be positive, and `--threads > --sessions` is rejected. |
+| `--threads`, `-t` | `run insert` | `1` | Number of operating-system worker threads that drive the benchmark executor. It is not an async task count. |
+| `--sessions`, `-s` | `run insert` | `--threads` | Number of independent DoraDB public sessions, meaning logical benchmark clients scheduled on the worker threads. Both values must be positive, and `--threads > --sessions` is rejected. |
 Non-unique indexes and multiple indexes are deferred to later work.
 
 ## Key Ranges
@@ -98,6 +98,11 @@ for `--threads 1 --sessions 1`. With multiple sessions or threads, the
 benchmark still uses deterministic per-session key ranges and seeded local
 generation, but it does not promise one deterministic whole-run operation or
 commit order.
+
+When `--sessions` is greater than `--threads`, each session still runs as an
+independent async benchmark client. The requested worker threads drive those
+session tasks concurrently, so a session waiting on storage I/O does not
+serialize other ready sessions.
 
 ## Output
 

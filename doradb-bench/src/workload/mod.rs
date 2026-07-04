@@ -11,26 +11,9 @@ pub(super) struct SessionPlan {
     pub(super) rows: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct WorkerPlan {
-    pub(super) worker_index: usize,
-    pub(super) sessions: Vec<SessionPlan>,
-}
-
-pub(super) fn build_worker_plans(
-    range: KeyRange,
-    sessions: usize,
-    threads: usize,
-) -> Result<Vec<WorkerPlan>> {
-    if threads == 0 || sessions == 0 {
-        return Err(BenchError::message(
-            "threads and sessions must both be positive",
-        ));
-    }
-    if threads > sessions {
-        return Err(BenchError::message(
-            "threads must not exceed sessions when building worker plans",
-        ));
+pub(super) fn build_session_plans(range: KeyRange, sessions: usize) -> Result<Vec<SessionPlan>> {
+    if sessions == 0 {
+        return Err(BenchError::message("sessions must be positive"));
     }
     let mut session_plans = Vec::with_capacity(sessions);
     let mut key_start = range.start;
@@ -45,19 +28,7 @@ pub(super) fn build_worker_plans(
             .checked_add(rows)
             .ok_or_else(|| BenchError::message("session key range overflow"))?;
     }
-
-    let mut plans = Vec::with_capacity(threads);
-    let mut next_session = 0usize;
-    for worker_index in 0..threads {
-        let session_count = partition_count(sessions as u64, threads, worker_index) as usize;
-        let worker_sessions = session_plans[next_session..next_session + session_count].to_vec();
-        plans.push(WorkerPlan {
-            worker_index,
-            sessions: worker_sessions,
-        });
-        next_session += session_count;
-    }
-    Ok(plans)
+    Ok(session_plans)
 }
 
 pub(super) fn generate_keys(
@@ -85,30 +56,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn partition_rows_across_sessions_and_workers() {
-        let plans = build_worker_plans(
+    fn partition_rows_across_sessions() {
+        let plans = build_session_plans(
             KeyRange {
                 start: 100,
                 len: 10,
             },
             4,
-            2,
         )
         .unwrap();
-        assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].sessions.len(), 2);
-        assert_eq!(plans[1].sessions.len(), 2);
-        let sessions: Vec<_> = plans
-            .iter()
-            .flat_map(|worker| worker.sessions.iter())
-            .collect();
-        assert_eq!(sessions[0].rows, 3);
-        assert_eq!(sessions[1].rows, 3);
-        assert_eq!(sessions[2].rows, 2);
-        assert_eq!(sessions[3].rows, 2);
-        assert_eq!(sessions[0].key_start, 100);
-        assert_eq!(sessions[1].key_start, 103);
-        assert_eq!(sessions[2].key_start, 106);
-        assert_eq!(sessions[3].key_start, 108);
+        assert_eq!(plans.len(), 4);
+        assert_eq!(plans[0].rows, 3);
+        assert_eq!(plans[1].rows, 3);
+        assert_eq!(plans[2].rows, 2);
+        assert_eq!(plans[3].rows, 2);
+        assert_eq!(plans[0].key_start, 100);
+        assert_eq!(plans[1].key_start, 103);
+        assert_eq!(plans[2].key_start, 106);
+        assert_eq!(plans[3].key_start, 108);
+    }
+
+    #[test]
+    fn reject_zero_sessions() {
+        assert!(
+            build_session_plans(
+                KeyRange {
+                    start: 100,
+                    len: 10,
+                },
+                0,
+            )
+            .is_err()
+        );
     }
 }
