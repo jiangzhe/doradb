@@ -1,4 +1,4 @@
-use crate::cli::{IndexMode, LoadArgs, LoadConfig, PrepareArgs};
+use crate::cli::{IndexMode, LoadArgs, LoadConfig, LogSyncMode, PrepareArgs};
 use crate::error::{BenchError, Result};
 use crate::manifest::{
     KeyRange, Manifest, read_manifest, write_manifest, write_manifest_exclusive,
@@ -10,7 +10,7 @@ use crate::workload::{SessionPlan, build_session_plans, generate_keys, payload_b
 use doradb_storage::id::TableID;
 use doradb_storage::{
     ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
-    Session, TableSpec, Val, ValKind,
+    Session, TableSpec, TrxSysConfig, Val, ValKind,
 };
 use easy_parallel::Parallel;
 use std::fs;
@@ -29,7 +29,7 @@ struct WorkerSummary {
 pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
     prepare_storage_root(&storage_root)?;
 
-    let engine = open_engine(&storage_root).await?;
+    let engine = open_engine(&storage_root, LogSyncMode::Fsync).await?;
     let mut session = engine.new_session()?;
     let table_id = session
         .create_table(benchmark_table_spec(), benchmark_index_specs(args.index))
@@ -56,7 +56,7 @@ pub async fn run_load(storage_root: PathBuf, args: LoadArgs, command_context: &s
     let key_range = manifest.key_range(config.num)?;
     let table_id = TableID::new(manifest.table_id);
 
-    let engine = open_engine(&config.storage_root).await?;
+    let engine = open_engine(&config.storage_root, config.log_sync).await?;
     let mut stats_session = engine.new_session()?;
     let before = InternalStatsSnapshot::capture(&stats_session)?;
     let started = Instant::now();
@@ -81,6 +81,7 @@ pub async fn run_load(storage_root: PathBuf, args: LoadArgs, command_context: &s
         index: config.index,
         threads: config.threads,
         sessions: config.sessions,
+        log_sync: config.log_sync,
         table_id: manifest.table_id,
     };
     write_benchmark_outputs(&output_config, &metrics, &result, command_context)?;
@@ -118,9 +119,10 @@ fn prepare_storage_root(storage_root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn open_engine(storage_root: &Path) -> Result<Engine> {
+async fn open_engine(storage_root: &Path, log_sync: LogSyncMode) -> Result<Engine> {
     Ok(EngineConfig::default()
         .storage_root(storage_root)
+        .trx(TrxSysConfig::default().log_sync(log_sync.as_storage()))
         .build()
         .await?)
 }
@@ -432,6 +434,7 @@ mod tests {
             index: IndexMode::None,
             threads: 1,
             sessions: 1,
+            log_sync: LogSyncMode::Fsync,
         }
     }
 }

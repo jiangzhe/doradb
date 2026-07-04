@@ -92,8 +92,9 @@ mod tests {
         assert_eq!(columns[1], "false");
         assert_eq!(columns[3], "3");
         assert_eq!(columns[5], "2");
-        assert_eq!(columns[11], "3");
-        assert_eq!(columns[15], "0");
+        assert_eq!(columns[10], "fsync");
+        assert_eq!(columns[12], "3");
+        assert_eq!(columns[16], "0");
 
         let cleanup_stdout = assert_success(run_bench(&root, &["cleanup"]));
         assert!(cleanup_stdout.contains("removed storage_root="));
