@@ -9,5 +9,4 @@ coverage:
         target: auto
         threshold: 80%
   ignore:
-    - "legacy/"
     - "doradb-storage/examples/"
