@@ -1,7 +1,7 @@
 ---
 id: 000211
 title: Create doradb-bench Load Benchmark Crate
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-03
 github_issue: 812
 ---
@@ -326,6 +326,57 @@ benchmark task.
 
 ## Implementation Notes
 
+Implemented the initial `doradb-bench` workspace crate and standalone binary.
+The crate now exposes a library surface, a `src/bin/doradb_bench.rs` entry
+point, and split modules for CLI parsing, manifest handling, output rendering,
+runner orchestration, and insert workload generation.
+
+The implemented lifecycle follows the final task contract:
+
+- `prepare` resolves global `--root`/`-r` or `DORADB_BENCH_ROOT`, requires a
+  non-existing root, creates the benchmark table through public
+  `doradb-storage` APIs, and writes `benchmark-manifest.toml` with an exclusive
+  create-only manifest write.
+- `run insert` supports sequential and random insert generation, `none` and
+  `unique` index modes, seeded deterministic single-session random generation,
+  runtime `next_key` advancement across repeated runs, `easy-parallel` OS
+  worker threads, `smol::block_on`, and deterministic session/key-range
+  partitioning.
+- `cleanup` treats manifest presence as the safety marker and removes the
+  benchmark root directory.
+- Benchmark output always goes to stdout/stderr and fixed result files under
+  the storage root. Result artifacts are staged and renamed into place before
+  the manifest runtime state is advanced, so output failures do not silently
+  advance `next_key`.
+
+The implementation also added `docs/benchmark-tool.md`, linked the deferred
+read/mutation/checkpoint/index follow-ups, and updated repository configuration
+so `doradb-bench` participates in workspace build, coverage, Codacy, Codecov,
+and GitHub workflow checks.
+
+Review-driven hardening completed during implementation:
+
+- removed racy prepare-time manifest pre-checks in favor of
+  `create_new(true)`;
+- changed command-context capture to use `args_os()` with lossy conversion so
+  non-UTF-8 arguments do not panic benchmark reporting;
+- moved manifest advancement after successful benchmark output generation;
+- fixed random-key overflow handling to match sequential key-range validation;
+- documented and simplified cleanup behavior around manifest-owned benchmark
+  roots.
+
+Validation performed:
+
+- `tools/style_audit.rs --diff-base origin/main`
+- `cargo fmt --all --check`
+- `cargo check -p doradb-bench`
+- `cargo nextest run -p doradb-bench`
+- `cargo clippy -p doradb-bench --all-targets -- -D warnings`
+- workspace coverage command path was verified by running
+  `cargo llvm-cov nextest --no-report --workspace --profile ci` followed by
+  the corrected `cargo llvm-cov report --lcov ...` form without `--workspace`
+  on the `report` subcommand.
+
 ## Impacts
 
 - `Cargo.toml`
@@ -460,6 +511,10 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 ```
 
 ## Open Questions
+
+No unresolved design questions remain for the initial insert benchmark crate.
+The resolved decisions and deferred follow-ups below are retained for
+traceability.
 
 Resolved design decisions for this task:
 

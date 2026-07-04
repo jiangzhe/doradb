@@ -79,6 +79,23 @@ impl BenchmarkResult {
     }
 }
 
+struct OutputArtifact {
+    path: PathBuf,
+    staged_path: PathBuf,
+    contents: String,
+}
+
+impl OutputArtifact {
+    fn new(path: PathBuf, contents: String) -> Self {
+        let staged_path = staged_output_path(&path);
+        Self {
+            path,
+            staged_path,
+            contents,
+        }
+    }
+}
+
 pub(super) fn internal_metrics(
     before: &InternalStatsSnapshot,
     after: &InternalStatsSnapshot,
@@ -112,23 +129,6 @@ pub(super) fn write_benchmark_outputs(
         ),
     ];
     write_staged_outputs(&artifacts)
-}
-
-struct OutputArtifact {
-    path: PathBuf,
-    staged_path: PathBuf,
-    contents: String,
-}
-
-impl OutputArtifact {
-    fn new(path: PathBuf, contents: String) -> Self {
-        let staged_path = staged_output_path(&path);
-        Self {
-            path,
-            staged_path,
-            contents,
-        }
-    }
 }
 
 fn write_staged_outputs(artifacts: &[OutputArtifact]) -> Result<()> {
