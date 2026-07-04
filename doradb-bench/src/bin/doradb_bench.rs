@@ -2,7 +2,7 @@ use clap::Parser;
 use doradb_bench::cli::{Cli, Command};
 use doradb_bench::error::Result;
 use doradb_bench::runner::{cleanup, prepare, run_load};
-use std::env::args;
+use std::env::args_os;
 use std::process::exit;
 
 fn main() {
@@ -13,7 +13,10 @@ fn main() {
 }
 
 fn execute(cli: Cli) -> Result<()> {
-    let command_context = args().collect::<Vec<_>>().join(" ");
+    let command_context = args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
     let storage_root = cli.resolve_root_from_env()?;
     smol::block_on(async {
         match cli.command {

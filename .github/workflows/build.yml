@@ -132,8 +132,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_build != 'true'
     runs-on: ubuntu-22.04
+    permissions: {}
     steps:
     - name: Skip heavy CI for non-build delta
+      env:
+        DIFF_RANGE: ${{ needs.changes.outputs.diff_range }}
       run: |
-        echo "No build changes detected in update range: ${{ needs.changes.outputs.diff_range }}"
+        echo "No build changes detected in update range: ${DIFF_RANGE}"
         echo "Compile/test jobs are intentionally skipped."

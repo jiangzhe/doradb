@@ -1,7 +1,8 @@
 use crate::cli::IndexMode;
 use crate::error::{BenchError, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub(super) const MANIFEST_FILE_NAME: &str = "benchmark-manifest.toml";
@@ -97,15 +98,25 @@ pub(super) fn write_manifest(storage_root: &Path, manifest: &Manifest) -> Result
     })
 }
 
-pub(super) fn ensure_manifest_absent(storage_root: &Path) -> Result<()> {
+pub(super) fn write_manifest_exclusive(storage_root: &Path, manifest: &Manifest) -> Result<()> {
     let path = manifest_path(storage_root);
-    if path.exists() {
-        return Err(BenchError::message(format!(
-            "{} already exists",
+    let contents = toml::to_string_pretty(manifest)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| {
+            BenchError::message(format!(
+                "failed to create benchmark manifest {}: {err}",
+                path.display()
+            ))
+        })?;
+    file.write_all(contents.as_bytes()).map_err(|err| {
+        BenchError::message(format!(
+            "failed to write benchmark manifest {}: {err}",
             path.display()
-        )));
-    }
-    Ok(())
+        ))
+    })
 }
 
 fn next_key_after(start: u64, rows: u64) -> Result<u64> {
@@ -159,6 +170,20 @@ mod tests {
         assert!(!contents.contains("schema_version"));
         assert!(!contents.contains("[prepare]"));
         assert!(!contents.contains("workload_set"));
+    }
+
+    #[test]
+    fn exclusive_manifest_write_rejects_existing_manifest_without_overwrite() {
+        let temp = TempDir::new().unwrap();
+        let first = Manifest::new(42, IndexMode::Unique);
+        write_manifest_exclusive(temp.path(), &first).unwrap();
+
+        let second = Manifest::new(7, IndexMode::None);
+        assert!(write_manifest_exclusive(temp.path(), &second).is_err());
+
+        let loaded = read_manifest(temp.path()).unwrap();
+        assert_eq!(loaded.table_id, 42);
+        assert_eq!(loaded.index, IndexMode::Unique);
     }
 
     #[test]

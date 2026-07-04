@@ -1,12 +1,12 @@
 use crate::cli::{IndexMode, Workload};
-use crate::error::Result;
+use crate::error::{BenchError, Result};
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
 use doradb_storage::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, Session, StorageIoStats,
     TransactionSystemStats,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,19 +97,78 @@ pub(super) fn write_benchmark_outputs(
     command_context: &str,
 ) -> Result<()> {
     print_stdout(config, metrics, result);
-    fs::write(
-        result_markdown_path(&config.storage_root),
-        render_markdown(config, metrics, result, command_context),
-    )?;
-    fs::write(
-        internal_stats_csv_path(&config.storage_root),
-        render_internal_stats_csv(metrics),
-    )?;
-    fs::write(
-        result_csv_path(&config.storage_root),
-        render_result_csv(config, result),
-    )?;
-    Ok(())
+    let artifacts = [
+        OutputArtifact::new(
+            result_markdown_path(&config.storage_root),
+            render_markdown(config, metrics, result, command_context),
+        ),
+        OutputArtifact::new(
+            internal_stats_csv_path(&config.storage_root),
+            render_internal_stats_csv(metrics),
+        ),
+        OutputArtifact::new(
+            result_csv_path(&config.storage_root),
+            render_result_csv(config, result),
+        ),
+    ];
+    write_staged_outputs(&artifacts)
+}
+
+struct OutputArtifact {
+    path: PathBuf,
+    staged_path: PathBuf,
+    contents: String,
+}
+
+impl OutputArtifact {
+    fn new(path: PathBuf, contents: String) -> Self {
+        let staged_path = staged_output_path(&path);
+        Self {
+            path,
+            staged_path,
+            contents,
+        }
+    }
+}
+
+fn write_staged_outputs(artifacts: &[OutputArtifact]) -> Result<()> {
+    let result = (|| {
+        for artifact in artifacts {
+            fs::write(&artifact.staged_path, &artifact.contents).map_err(|err| {
+                BenchError::message(format!(
+                    "failed to write benchmark output {}: {err}",
+                    artifact.staged_path.display()
+                ))
+            })?;
+        }
+        for artifact in artifacts {
+            fs::rename(&artifact.staged_path, &artifact.path).map_err(|err| {
+                BenchError::message(format!(
+                    "failed to install benchmark output {}: {err}",
+                    artifact.path.display()
+                ))
+            })?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        cleanup_staged_outputs(artifacts);
+    }
+    result
+}
+
+fn cleanup_staged_outputs(artifacts: &[OutputArtifact]) {
+    for artifact in artifacts {
+        let _ = fs::remove_file(&artifact.staged_path);
+    }
+}
+
+fn staged_output_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "benchmark-output".into());
+    path.with_file_name(format!(".{file_name}.tmp"))
 }
 
 fn print_stdout(config: &OutputConfig, metrics: &[Metric], result: &BenchmarkResult) {
@@ -493,6 +552,7 @@ fn csv_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use doradb_storage::IoBackendStats;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -510,6 +570,122 @@ mod tests {
             sessions: 1,
             table_id: 7,
         }
+    }
+
+    fn metric_value(metrics: &[Metric], name: &str) -> u128 {
+        metrics
+            .iter()
+            .find(|metric| metric.name == name)
+            .map(|metric| metric.value)
+            .unwrap_or_else(|| panic!("missing metric {name}"))
+    }
+
+    #[test]
+    fn benchmark_result_handles_zero_denominators() {
+        let zero_elapsed = BenchmarkResult::new(4, Duration::ZERO, 1);
+        assert_eq!(zero_elapsed.operations_per_second, 0.0);
+        assert_eq!(zero_elapsed.average_nanos_per_operation, 0.0);
+        assert_eq!(zero_elapsed.failures, 1);
+
+        let zero_operations = BenchmarkResult::new(0, Duration::from_nanos(100), 0);
+        assert_eq!(zero_operations.operations_per_second, 0.0);
+        assert_eq!(zero_operations.average_nanos_per_operation, 0.0);
+    }
+
+    #[test]
+    fn internal_metrics_include_stat_deltas_and_buffer_capacity() {
+        let before = InternalStatsSnapshot {
+            trx: TransactionSystemStats {
+                commit_count: 10,
+                trx_count: 7,
+                log_bytes: 4,
+                ..TransactionSystemStats::default()
+            },
+            storage: StorageIoStats {
+                backend: IoBackendStats {
+                    submitted_ops: 8,
+                    ..IoBackendStats::default()
+                },
+                table_read_requests: 10,
+                ..StorageIoStats::default()
+            },
+            buffer: BufferPoolStats {
+                meta: BufferPoolRuntimeStats {
+                    capacity: 11,
+                    allocated: 2,
+                    counters: BufferPoolCounters {
+                        cache_hits: 5,
+                        write_errors: 4,
+                        ..BufferPoolCounters::default()
+                    },
+                },
+                mem: BufferPoolRuntimeStats {
+                    counters: BufferPoolCounters {
+                        completed_reads: 1,
+                        ..BufferPoolCounters::default()
+                    },
+                    ..BufferPoolRuntimeStats::default()
+                },
+                ..BufferPoolStats::default()
+            },
+        };
+        let after = InternalStatsSnapshot {
+            trx: TransactionSystemStats {
+                commit_count: 15,
+                trx_count: 6,
+                log_bytes: 9,
+                ..TransactionSystemStats::default()
+            },
+            storage: StorageIoStats {
+                backend: IoBackendStats {
+                    submitted_ops: 12,
+                    ..IoBackendStats::default()
+                },
+                table_read_requests: 7,
+                ..StorageIoStats::default()
+            },
+            buffer: BufferPoolStats {
+                meta: BufferPoolRuntimeStats {
+                    capacity: 13,
+                    allocated: 3,
+                    counters: BufferPoolCounters {
+                        cache_hits: 8,
+                        write_errors: 1,
+                        ..BufferPoolCounters::default()
+                    },
+                },
+                mem: BufferPoolRuntimeStats {
+                    counters: BufferPoolCounters {
+                        completed_reads: 4,
+                        ..BufferPoolCounters::default()
+                    },
+                    ..BufferPoolRuntimeStats::default()
+                },
+                ..BufferPoolStats::default()
+            },
+        };
+
+        let metrics = internal_metrics(&before, &after);
+        assert_eq!(metrics.len(), 73);
+        assert_eq!(metric_value(&metrics, "transaction.commit_count"), 5);
+        assert_eq!(metric_value(&metrics, "transaction.trx_count"), 0);
+        assert_eq!(metric_value(&metrics, "transaction.log_bytes"), 5);
+        assert_eq!(metric_value(&metrics, "storage.backend.submitted_ops"), 4);
+        assert_eq!(metric_value(&metrics, "storage.table_read_requests"), 0);
+        assert_eq!(metric_value(&metrics, "buffer.meta.capacity"), 13);
+        assert_eq!(metric_value(&metrics, "buffer.meta.allocated"), 3);
+        assert_eq!(metric_value(&metrics, "buffer.meta.cache_hits"), 3);
+        assert_eq!(metric_value(&metrics, "buffer.meta.write_errors"), 0);
+        assert_eq!(metric_value(&metrics, "buffer.mem.completed_reads"), 3);
+        assert_eq!(metric_value(&metrics, "buffer.disk.write_errors"), 0);
+    }
+
+    #[test]
+    fn csv_escape_quotes_special_values() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("with,comma"), "\"with,comma\"");
+        assert_eq!(csv_escape("with\"quote"), "\"with\"\"quote\"");
+        assert_eq!(csv_escape("with\nnewline"), "\"with\nnewline\"");
     }
 
     #[test]
@@ -571,5 +747,31 @@ mod tests {
         assert!(result_markdown_path(temp.path()).exists());
         assert!(internal_stats_csv_path(temp.path()).exists());
         assert!(result_csv_path(temp.path()).exists());
+        assert!(!staged_output_path(&result_markdown_path(temp.path())).exists());
+        assert!(!staged_output_path(&internal_stats_csv_path(temp.path())).exists());
+        assert!(!staged_output_path(&result_csv_path(temp.path())).exists());
+    }
+
+    #[test]
+    fn removes_staged_result_files_after_output_failure() {
+        let temp = TempDir::new().unwrap();
+        let config = sample_config(temp.path());
+        let metrics = vec![Metric {
+            name: "transaction.commit_count".to_owned(),
+            value: 3,
+        }];
+        fs::create_dir(result_csv_path(temp.path())).unwrap();
+
+        let result = write_benchmark_outputs(
+            &config,
+            &metrics,
+            &BenchmarkResult::new(10, Duration::from_nanos(100), 0),
+            "doradb-bench run",
+        );
+
+        assert!(result.is_err());
+        assert!(!staged_output_path(&result_markdown_path(temp.path())).exists());
+        assert!(!staged_output_path(&internal_stats_csv_path(temp.path())).exists());
+        assert!(!staged_output_path(&result_csv_path(temp.path())).exists());
     }
 }

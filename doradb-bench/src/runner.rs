@@ -1,6 +1,8 @@
 use crate::cli::{IndexMode, LoadArgs, LoadConfig, PrepareArgs};
 use crate::error::{BenchError, Result};
-use crate::manifest::{KeyRange, Manifest, ensure_manifest_absent, read_manifest, write_manifest};
+use crate::manifest::{
+    KeyRange, Manifest, read_manifest, write_manifest, write_manifest_exclusive,
+};
 use crate::output::{
     BenchmarkResult, InternalStatsSnapshot, OutputConfig, internal_metrics, write_benchmark_outputs,
 };
@@ -26,7 +28,6 @@ struct WorkerSummary {
 /// Prepare a benchmark storage root and manifest.
 pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
     prepare_storage_root(&storage_root)?;
-    ensure_manifest_absent(&storage_root)?;
 
     let engine = open_engine(&storage_root).await?;
     let mut session = engine.new_session()?;
@@ -37,7 +38,7 @@ pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
     engine.shutdown()?;
 
     let manifest = Manifest::new(table_id.as_u64(), args.index);
-    write_manifest(&storage_root, &manifest)?;
+    write_manifest_exclusive(&storage_root, &manifest)?;
     println!(
         "prepared storage_root={} table_id={} index={}",
         storage_root.display(),
@@ -67,9 +68,6 @@ pub async fn run_load(storage_root: PathBuf, args: LoadArgs, command_context: &s
 
     let summary = worker_result?;
 
-    manifest.advance_key_range(config.num)?;
-    write_manifest(&config.storage_root, &manifest)?;
-
     let metrics = internal_metrics(&before, &after);
     let result = BenchmarkResult::new(summary.inserted, elapsed, summary.failures);
     let output_config = OutputConfig {
@@ -85,7 +83,10 @@ pub async fn run_load(storage_root: PathBuf, args: LoadArgs, command_context: &s
         sessions: config.sessions,
         table_id: manifest.table_id,
     };
-    write_benchmark_outputs(&output_config, &metrics, &result, command_context)
+    write_benchmark_outputs(&output_config, &metrics, &result, command_context)?;
+
+    manifest.advance_key_range(config.num)?;
+    write_manifest(&config.storage_root, &manifest)
 }
 
 /// Clean benchmark artifacts from a prepared storage root.
@@ -337,5 +338,22 @@ mod tests {
             sessions: 1,
         };
         assert_eq!(effective_batch_size(&config, 10).unwrap(), 1);
+    }
+
+    #[test]
+    fn validate_load_config_rejects_value_size_above_row_payload_limit() {
+        let config = LoadConfig {
+            storage_root: "root".into(),
+            workload: Workload::Insert,
+            num: 10,
+            value_size: MAX_VALUE_SIZE + 1,
+            batch_size: 1,
+            rand: false,
+            seed: 0,
+            index: IndexMode::None,
+            threads: 1,
+            sessions: 1,
+        };
+        assert!(validate_load_config(&config).is_err());
     }
 }
