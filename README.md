@@ -14,6 +14,120 @@ Build a modern and fast storage engine.
 
 The storage engine is designed as a hybrid engine managing both in-memory row store and on-disk column store, with full transactional support across all data.
 
+## Quick Start
+
+The snippets below assume an async function returning `doradb_storage::Result<()>`.
+DoraDB is runtime agnostic, so you can run these futures on whichever async runtime your application already uses.
+For a complete runnable version, see [quick_start.rs](./doradb-storage/examples/quick_start.rs) or run `cargo run -p doradb-storage --example quick_start`.
+
+Create a table with a schema and indexes, then drop it from an idle session.
+
+```rust
+use doradb_storage::{
+    ColumnAttributes, ColumnSpec, EngineConfig, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+    ValKind,
+};
+
+let engine = EngineConfig::default()
+    .storage_root("target/doradb-quick-start")
+    .build()
+    .await?;
+let mut session = engine.new_session()?;
+
+let table_id = session
+    .create_table(
+        TableSpec::new(vec![
+            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+        ]),
+        vec![
+            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+            IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+        ],
+    )
+    .await?;
+
+session.drop_table(table_id).await?;
+session.close().await?;
+engine.shutdown()?;
+```
+
+Insert, update, and delete rows by executing statements inside a transaction.
+
+```rust
+use doradb_storage::{SelectKey, UpdateCol, Val};
+
+let mut trx = session.begin_trx()?;
+
+trx.exec(async |stmt| {
+    stmt.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("alice")])
+        .await?;
+    Ok(())
+})
+.await?;
+
+let key = SelectKey::new(0, vec![Val::from(1i32)]);
+trx.exec(async |stmt| {
+    stmt.table_update_unique_mvcc(
+        table_id,
+        &key,
+        vec![UpdateCol {
+            idx: 1,
+            val: Val::from("ada"),
+        }],
+    )
+    .await?;
+    Ok(())
+})
+.await?;
+
+trx.exec(async |stmt| {
+    stmt.table_delete_unique_mvcc(table_id, &key, false).await?;
+    Ok(())
+})
+.await?;
+
+trx.commit().await?;
+```
+
+Scan rows, read one unique-key row, and scan matching rows through a secondary index.
+
+```rust
+use doradb_storage::{SelectKey, Val};
+
+let mut trx = session.begin_trx()?;
+let mut rows = Vec::new();
+
+trx.exec(async |stmt| {
+    stmt.table_scan_mvcc(table_id, &[0, 1], |vals| {
+        rows.push(vals);
+        true
+    })
+    .await?;
+    Ok(())
+})
+.await?;
+
+let id_key = SelectKey::new(0, vec![Val::from(1i32)]);
+let _row = trx
+    .exec(async |stmt| {
+        stmt.table_lookup_unique_mvcc(table_id, &id_key, &[0, 1])
+            .await
+    })
+    .await?;
+
+let name_key = SelectKey::new(1, vec![Val::from("ada")]);
+let _matching_rows = trx
+    .exec(async |stmt| {
+        stmt.table_index_scan_mvcc(table_id, &name_key, &[0, 1])
+            .await
+    })
+    .await?
+    .unwrap_rows();
+
+trx.rollback().await?;
+```
+
 ## Design 
 
 - [Storage Architecture](./docs/architecture.md)
