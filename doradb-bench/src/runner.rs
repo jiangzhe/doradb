@@ -6,7 +6,7 @@ use crate::manifest::{
 use crate::output::{
     BenchmarkResult, InternalStatsSnapshot, OutputConfig, internal_metrics, write_benchmark_outputs,
 };
-use crate::workload::{SessionPlan, WorkerPlan, build_worker_plans, generate_keys, payload_bytes};
+use crate::workload::{SessionPlan, build_session_plans, generate_keys, payload_bytes};
 use doradb_storage::id::TableID;
 use doradb_storage::{
     ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
@@ -140,6 +140,17 @@ fn benchmark_index_specs(index: IndexMode) -> Vec<IndexSpec> {
 }
 
 fn validate_load_config(config: &LoadConfig) -> Result<()> {
+    if config.threads == 0 || config.sessions == 0 {
+        return Err(BenchError::message(
+            "threads and sessions must both be positive",
+        ));
+    }
+    if config.threads > config.sessions {
+        return Err(BenchError::message(format!(
+            "--threads ({}) must not exceed --sessions ({})",
+            config.threads, config.sessions
+        )));
+    }
     if config.value_size > MAX_VALUE_SIZE {
         return Err(BenchError::message(format!(
             "--value-size must not exceed {MAX_VALUE_SIZE} bytes"
@@ -159,39 +170,50 @@ fn run_workers(
     table_id: TableID,
     key_range: KeyRange,
 ) -> Result<WorkerSummary> {
-    let plans = build_worker_plans(key_range, config.sessions, config.threads)?;
-    let results = Parallel::new()
-        .each(plans, |plan| {
-            smol::block_on(execute_worker(engine, config, table_id, plan))
+    let session_plans = build_session_plans(key_range, config.sessions)?;
+    let executor = smol::Executor::new();
+    let tasks = session_plans
+        .into_iter()
+        .map(|plan| executor.spawn(execute_session(engine, config, table_id, plan)))
+        .collect();
+    let (signal, shutdown) = smol::channel::unbounded::<()>();
+    let executor_ref = &executor;
+    let shutdown_receiver = shutdown.clone();
+
+    let (_worker_results, summary) = Parallel::new()
+        .each(0..config.threads, move |_| {
+            let _ = smol::block_on(executor_ref.run(shutdown_receiver.recv()));
         })
-        .run();
-    let mut summary = WorkerSummary {
-        inserted: 0,
-        failures: 0,
-    };
-    for result in results {
-        let worker = result?;
-        summary.inserted += worker.inserted;
-        summary.failures += worker.failures;
-    }
-    Ok(summary)
+        .finish(move || {
+            let _signal = signal;
+            smol::block_on(collect_session_tasks(tasks))
+        });
+    summary
 }
 
-async fn execute_worker(
-    engine: &Engine,
-    config: &LoadConfig,
-    table_id: TableID,
-    plan: WorkerPlan,
+async fn collect_session_tasks(
+    tasks: Vec<smol::Task<Result<WorkerSummary>>>,
 ) -> Result<WorkerSummary> {
-    let _worker_index = plan.worker_index;
     let mut summary = WorkerSummary {
         inserted: 0,
         failures: 0,
     };
-    for session_plan in plan.sessions {
-        let session_summary = execute_session(engine, config, table_id, &session_plan).await?;
-        summary.inserted += session_summary.inserted;
-        summary.failures += session_summary.failures;
+    let mut first_error = None;
+    for task in tasks {
+        match task.await {
+            Ok(session) => {
+                summary.inserted += session.inserted;
+                summary.failures += session.failures;
+            }
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
     }
     Ok(summary)
 }
@@ -200,9 +222,9 @@ async fn execute_session(
     engine: &Engine,
     config: &LoadConfig,
     table_id: TableID,
-    plan: &SessionPlan,
+    plan: SessionPlan,
 ) -> Result<WorkerSummary> {
-    let keys = generate_keys(config.rand, config.index, config.seed, plan)?;
+    let keys = generate_keys(config.rand, config.index, config.seed, &plan)?;
     let mut session = engine.new_session()?;
     let load_result = insert_keys(&mut session, config, table_id, &keys).await;
     let close_result = session.close().await;
@@ -271,6 +293,8 @@ mod tests {
     use super::*;
     use crate::cli::Workload;
     use std::fs::File;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     #[test]
@@ -325,7 +349,79 @@ mod tests {
 
     #[test]
     fn effective_batch_size_defaults_to_configured_insert_batch_size() {
-        let config = LoadConfig {
+        let config = test_load_config();
+        assert_eq!(effective_batch_size(&config, 10).unwrap(), 1);
+    }
+
+    #[test]
+    fn validate_load_config_rejects_value_size_above_row_payload_limit() {
+        let mut config = test_load_config();
+        config.value_size = MAX_VALUE_SIZE + 1;
+        assert!(validate_load_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_load_config_rejects_invalid_thread_session_counts() {
+        let mut config = test_load_config();
+
+        config.threads = 0;
+        assert!(validate_load_config(&config).is_err());
+
+        config.threads = 2;
+        config.sessions = 1;
+        assert!(validate_load_config(&config).is_err());
+    }
+
+    #[test]
+    fn collect_session_tasks_sums_successes() {
+        let executor = smol::Executor::new();
+        let tasks = vec![
+            executor.spawn(async {
+                Ok(WorkerSummary {
+                    inserted: 2,
+                    failures: 0,
+                })
+            }),
+            executor.spawn(async {
+                Ok(WorkerSummary {
+                    inserted: 3,
+                    failures: 1,
+                })
+            }),
+        ];
+
+        let summary = smol::block_on(executor.run(collect_session_tasks(tasks))).unwrap();
+
+        assert_eq!(
+            summary,
+            WorkerSummary {
+                inserted: 5,
+                failures: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn collect_session_tasks_returns_first_error_after_draining_tasks() {
+        let executor = smol::Executor::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let drained_task = Arc::clone(&drained);
+        let tasks = vec![
+            executor.spawn(async { Err(BenchError::message("first")) }),
+            executor.spawn(async move {
+                drained_task.fetch_add(1, Ordering::SeqCst);
+                Err(BenchError::message("second"))
+            }),
+        ];
+
+        let err = smol::block_on(executor.run(collect_session_tasks(tasks))).unwrap_err();
+
+        assert_eq!(err.to_string(), "first");
+        assert_eq!(drained.load(Ordering::SeqCst), 1);
+    }
+
+    fn test_load_config() -> LoadConfig {
+        LoadConfig {
             storage_root: "root".into(),
             workload: Workload::Insert,
             num: 10,
@@ -336,24 +432,6 @@ mod tests {
             index: IndexMode::None,
             threads: 1,
             sessions: 1,
-        };
-        assert_eq!(effective_batch_size(&config, 10).unwrap(), 1);
-    }
-
-    #[test]
-    fn validate_load_config_rejects_value_size_above_row_payload_limit() {
-        let config = LoadConfig {
-            storage_root: "root".into(),
-            workload: Workload::Insert,
-            num: 10,
-            value_size: MAX_VALUE_SIZE + 1,
-            batch_size: 1,
-            rand: false,
-            seed: 0,
-            index: IndexMode::None,
-            threads: 1,
-            sessions: 1,
-        };
-        assert!(validate_load_config(&config).is_err());
+        }
     }
 }
