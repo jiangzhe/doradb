@@ -17,7 +17,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    - name: Detect storage build changes in current update
+    - name: Detect build changes in current update
       id: delta
       shell: bash
       run: |
@@ -64,7 +64,7 @@ jobs:
         else
           while IFS= read -r file; do
             [[ -z "$file" ]] && continue
-            if [[ "$file" == doradb-storage/* || "$file" == Cargo.toml || "$file" == .github/workflows/* ]]; then
+            if [[ "$file" == doradb-bench/* || "$file" == doradb-storage/* || "$file" == Cargo.toml || "$file" == .github/workflows/* ]]; then
               run_build="true"
               break
             fi
@@ -93,13 +93,13 @@ jobs:
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
     - name: Clippy (default backend)
-      run: cargo clippy -p doradb-storage --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Validate with cargo llvm-cov nextest
       env:
         CARGO_TARGET_DIR: "target/coverage"
         CARGO_LLVM_COV_TARGET_DIR: "target/coverage/llvm-cov-target"
         RUST_BACKTRACE: "full"
-      run: cargo llvm-cov nextest --no-report -p doradb-storage --profile ci
+      run: cargo llvm-cov nextest --no-report --workspace --profile ci
     - name: Validate alternate libaio backend
       env:
         RUST_BACKTRACE: "full"
@@ -122,19 +122,19 @@ jobs:
         --output-path lcov.info
         --no-default-ignore-filename-regex
         --ignore-filename-regex '(^|/)target(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/'
-        -p doradb-storage
+        --workspace
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v5
       with:
         files: lcov.info
         token: ${{secrets.CODECOV_TOKEN}}
 
-  non-storage-build-change:
+  non-build-change:
     needs: changes
     if: needs.changes.outputs.run_build != 'true'
     runs-on: ubuntu-22.04
     steps:
-    - name: Skip heavy CI for non-storage build delta
+    - name: Skip heavy CI for non-build delta
       run: |
-        echo "No storage build changes detected in update range: ${{ needs.changes.outputs.diff_range }}"
+        echo "No build changes detected in update range: ${{ needs.changes.outputs.diff_range }}"
         echo "Compile/test jobs are intentionally skipped."

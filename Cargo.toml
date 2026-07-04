@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "doradb-bench",
     "doradb-storage",
 ]
 resolver = "2"
@@ -7,6 +8,7 @@ resolver = "2"
 [workspace.dependencies]
 thiserror = "1.0"
 error-stack = "0.7"
+clap = { version = "4", features = ["derive"] }
 bitflags = "2.1"
 zerocopy = "0.8"
 zerocopy-derive = "0.8"
@@ -19,6 +21,7 @@ either = "1.13"
 event-listener = "5.4"
 semistr = "0.1"
 smol = "2.0"
+easy-parallel = "3.3.1"
 toml = "1.1"
 byte-unit = { version = "5", features = ["serde"] }
 ahash = "0.8"
