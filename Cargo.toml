@@ -7,7 +7,7 @@ resolver = "2"
 
 [workspace.dependencies]
 thiserror = "1.0"
-error-stack = "0.7"
+error-stack = "0.8"
 clap = { version = "4", features = ["derive"] }
 bitflags = "2.1"
 zerocopy = "0.8"

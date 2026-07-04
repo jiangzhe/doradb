@@ -50,8 +50,8 @@ pub enum Command {
     Prepare(PrepareArgs),
     /// Run a measured workload and write benchmark results.
     Run(LoadArgs),
-    /// Remove benchmark-owned artifacts.
-    Cleanup(CleanupArgs),
+    /// Remove the prepared benchmark storage root.
+    Cleanup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -181,14 +181,6 @@ impl InsertArgs {
             sessions,
         })
     }
-}
-
-/// Arguments for benchmark cleanup.
-#[derive(Clone, Debug, Args)]
-pub struct CleanupArgs {
-    /// Remove the storage root even when the manifest records it as unowned.
-    #[arg(long)]
-    pub(super) force: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

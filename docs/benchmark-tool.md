@@ -34,23 +34,18 @@ The tool has three lifecycle commands.
 `--root` or `-r` is a global option shared by all lifecycle commands. It can be
 placed before the lifecycle command, or supplied through `DORADB_BENCH_ROOT`.
 
-`prepare` creates the benchmark storage root when it does not exist, or uses an
-existing empty directory. It rejects any existing non-empty storage root before
-opening DoraDB. It then creates the benchmark table and writes
+`prepare` requires the benchmark storage root to be a non-existing path. It
+creates that root, creates the benchmark table, and writes
 `benchmark-manifest.toml` directly under the storage root. The manifest records
-the created table id, selected index mode, which artifacts are owned by the
-benchmark tool, schema column names, and mutable runtime state such as the next
-generated logical key.
+the created table id, selected index mode, schema column names, and mutable
+runtime state such as the next generated logical key.
 
 `run insert` runs the insert workload and reports row throughput and latency. A
 run inserts new rows into the benchmark table; it is not a read-only command.
 
-`cleanup` shuts the engine down cleanly and removes benchmark-owned artifacts.
-By default, cleanup follows ownership recorded by `prepare`: it may drop the
-benchmark table, remove benchmark metadata, remove benchmark result artifacts,
-and remove the storage root only when the root was created by the benchmark
-tool. `cleanup --force` may remove the benchmark storage root even when the
-manifest says the root was not created by the benchmark tool.
+`cleanup` requires `benchmark-manifest.toml` to exist under the storage root,
+then removes the entire benchmark storage root. There is no force mode; manifest
+presence is the cleanup safety marker.
 
 ## Workloads
 
@@ -74,7 +69,7 @@ all sessions.
 
 | Flag | Commands | Default | Usage |
 | --- | --- | --- | --- |
-| `--root`, `-r` | Global | `DORADB_BENCH_ROOT` when set | Selects the DoraDB storage root. An explicit CLI value overrides the environment variable. For `prepare`, the path must either not exist or be an existing empty directory. `benchmark-manifest.toml` is always stored directly under this root. |
+| `--root`, `-r` | Global | `DORADB_BENCH_ROOT` when set | Selects the DoraDB storage root. An explicit CLI value overrides the environment variable. For `prepare`, the path must not exist. `benchmark-manifest.toml` is always stored directly under this root, and `cleanup` requires it before deleting the root. |
 | `--num`, `-n` | `run insert` | Required | Total rows inserted by one invocation across all sessions. For example, `--num 1000 --sessions 4` inserts 1000 total rows, not 4000 rows. |
 | `--value-size`, `-v` | `run insert` | `128` | Generated payload size in bytes. The generated schema has a logical key column and a payload column large enough for this payload. |
 | `--batch-size`, `-b` | `run insert` | `1` | Rows per transaction commit for `insert`. The value is applied per session while `--num` remains the aggregate row count. |
@@ -83,8 +78,6 @@ all sessions.
 | `--index`, `-i` | `prepare`, `run insert` | `prepare`: `none`; `run insert`: prepared index | Controls or validates the benchmark table's index shape. `none` creates no secondary indexes and allows duplicate logical key values. `unique` creates one unique secondary index on the logical key column. |
 | `--threads`, `-t` | `run insert` | `1` | Number of operating-system worker threads created by the benchmark harness. It is not an async task count. |
 | `--sessions`, `-s` | `run insert` | `--threads` | Number of independent DoraDB public sessions, meaning logical benchmark clients. Both values must be positive, and `--threads > --sessions` is rejected. |
-| `--force` | `cleanup` | Disabled | Permits removal of an unowned benchmark storage root. |
-
 Non-unique indexes and multiple indexes are deferred to later work.
 
 ## Key Ranges

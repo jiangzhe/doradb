@@ -62,7 +62,12 @@ fn random_keys_with_replacement(seed: u64, plan: &SessionPlan) -> Result<Vec<u64
     );
     let mut keys = Vec::with_capacity(rows);
     for _ in 0..plan.rows {
-        keys.push(plan.key_start + splitmix64(&mut state) % plan.rows);
+        let offset = splitmix64(&mut state) % plan.rows;
+        keys.push(
+            plan.key_start
+                .checked_add(offset)
+                .ok_or_else(|| BenchError::message("random key overflow"))?,
+        );
     }
     Ok(keys)
 }
@@ -127,6 +132,16 @@ mod tests {
         let keys = generate_keys(true, IndexMode::None, 2, &plan).unwrap();
         let unique: HashSet<_> = keys.iter().copied().collect();
         assert!(unique.len() < keys.len());
+    }
+
+    #[test]
+    fn random_insert_none_rejects_key_overflow() {
+        let plan = SessionPlan {
+            session_index: 0,
+            key_start: u64::MAX,
+            rows: 2,
+        };
+        assert!(generate_keys(true, IndexMode::None, 0, &plan).is_err());
     }
 
     #[test]

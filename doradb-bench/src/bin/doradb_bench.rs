@@ -19,7 +19,7 @@ fn execute(cli: Cli) -> Result<()> {
         match cli.command {
             Command::Prepare(args) => prepare(storage_root, args).await,
             Command::Run(args) => run_load(storage_root, args, &command_context).await,
-            Command::Cleanup(args) => cleanup(storage_root, args).await,
+            Command::Cleanup => cleanup(storage_root).await,
         }
     })
 }

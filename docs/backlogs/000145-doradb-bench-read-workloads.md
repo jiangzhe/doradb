@@ -15,8 +15,8 @@ docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000211 intentionally establishes the benchmark crate and only the first load workloads so lifecycle, manifest, output, and worker semantics can settle before read semantics are added.
-- Findings: The implemented crate now has prepare, warmup, run, cleanup, fixed manifests, result artifacts, deterministic key ranges, and public-session execution. Read workloads need separate decisions for hot versus cold state, lookup/index choice, missing-key ranges, and whether batched reads should share controls with write batches.
-- Direction Hint: Prefer reusing the manifest key-range and result-output machinery from doradb-bench. Keep read execution on public Session and Statement APIs, distinguish hot-cache from cold/persisted measurements explicitly, and link or coordinate with backlog 000074 for cold persisted lookup expansion.
+- Findings: The implemented crate now has prepare, run, cleanup, fixed manifests, result artifacts, deterministic key ranges, and public-session execution. The warmup phase was removed because doradb-bench targets an embedded storage engine. Read workloads need separate decisions for hot versus cold state, lookup/index choice, missing-key ranges, and whether batched reads should share controls with write batches.
+- Direction Hint: Prefer reusing the manifest key-range and result-output machinery from doradb-bench. Keep read execution on public Session and Statement APIs, distinguish hot-cache from cold/persisted measurements explicitly without assuming a warmup command, and link or coordinate with backlog 000074 for cold persisted lookup expansion.
 
 ## Scope Hint
 

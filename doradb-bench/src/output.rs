@@ -1,13 +1,12 @@
 use crate::cli::{IndexMode, Workload};
-use crate::error::{BenchError, Result};
+use crate::error::Result;
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
 use doradb_storage::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, Session, StorageIoStats,
     TransactionSystemStats,
 };
 use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,29 +490,10 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-pub(super) fn remove_result_artifacts(storage_root: &Path) -> Result<()> {
-    for path in [
-        result_markdown_path(storage_root),
-        internal_stats_csv_path(storage_root),
-        result_csv_path(storage_root),
-    ] {
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(BenchError::message(format!(
-                    "failed to remove result artifact {}: {err}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn sample_config(root: &Path) -> OutputConfig {

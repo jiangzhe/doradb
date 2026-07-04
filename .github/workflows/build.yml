@@ -122,7 +122,6 @@ jobs:
         --output-path lcov.info
         --no-default-ignore-filename-regex
         --ignore-filename-regex '(^|/)target(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/'
-        --workspace
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v5
       with:

@@ -28,7 +28,6 @@ pub(super) struct RuntimeManifest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Manifest {
-    pub(super) storage_root_owned: bool,
     pub(super) table_id: u64,
     pub(super) index: IndexMode,
     pub(super) schema: SchemaManifest,
@@ -36,9 +35,8 @@ pub(super) struct Manifest {
 }
 
 impl Manifest {
-    pub(super) fn new(storage_root_owned: bool, table_id: u64, index: IndexMode) -> Self {
+    pub(super) fn new(table_id: u64, index: IndexMode) -> Self {
         Self {
-            storage_root_owned,
             table_id,
             index,
             schema: SchemaManifest {
@@ -123,7 +121,7 @@ mod tests {
 
     #[test]
     fn allocate_runtime_key_ranges_across_runs() {
-        let mut manifest = Manifest::new(true, 7, IndexMode::None);
+        let mut manifest = Manifest::new(7, IndexMode::None);
         let first_run = manifest.key_range(10).unwrap();
         assert_eq!(first_run.start, 0);
         manifest.advance_key_range(10).unwrap();
@@ -137,7 +135,7 @@ mod tests {
 
     #[test]
     fn reject_exhausted_runtime_key_range() {
-        let mut manifest = Manifest::new(true, 7, IndexMode::None);
+        let mut manifest = Manifest::new(7, IndexMode::None);
         manifest.runtime.next_key = u64::MAX;
         assert!(manifest.key_range(1).is_err());
     }
@@ -145,10 +143,9 @@ mod tests {
     #[test]
     fn roundtrip_manifest_toml() {
         let temp = TempDir::new().unwrap();
-        let manifest = Manifest::new(false, 42, IndexMode::Unique);
+        let manifest = Manifest::new(42, IndexMode::Unique);
         write_manifest(temp.path(), &manifest).unwrap();
         let loaded = read_manifest(temp.path()).unwrap();
-        assert!(!loaded.storage_root_owned);
         assert_eq!(loaded.table_id, 42);
         assert_eq!(loaded.index, IndexMode::Unique);
     }
@@ -156,7 +153,7 @@ mod tests {
     #[test]
     fn written_manifest_omits_version_and_prepare_footprint() {
         let temp = TempDir::new().unwrap();
-        let manifest = Manifest::new(false, 42, IndexMode::Unique);
+        let manifest = Manifest::new(42, IndexMode::Unique);
         write_manifest(temp.path(), &manifest).unwrap();
         let contents = fs::read_to_string(manifest_path(temp.path())).unwrap();
         assert!(!contents.contains("schema_version"));
@@ -165,13 +162,12 @@ mod tests {
     }
 
     #[test]
-    fn read_manifest_tolerates_old_extra_fields() {
+    fn read_manifest_tolerates_extra_fields() {
         let temp = TempDir::new().unwrap();
         fs::write(
             manifest_path(temp.path()),
             r#"
 schema_version = 2
-storage_root_owned = false
 table_id = 42
 index = "unique"
 
@@ -188,7 +184,6 @@ next_key = 11
         )
         .unwrap();
         let loaded = read_manifest(temp.path()).unwrap();
-        assert!(!loaded.storage_root_owned);
         assert_eq!(loaded.table_id, 42);
         assert_eq!(loaded.index, IndexMode::Unique);
         assert_eq!(loaded.runtime.next_key, 11);

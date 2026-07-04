@@ -1,11 +1,8 @@
-use crate::cli::{CleanupArgs, IndexMode, LoadArgs, LoadConfig, PrepareArgs};
+use crate::cli::{IndexMode, LoadArgs, LoadConfig, PrepareArgs};
 use crate::error::{BenchError, Result};
-use crate::manifest::{
-    KeyRange, Manifest, ensure_manifest_absent, manifest_path, read_manifest, write_manifest,
-};
+use crate::manifest::{KeyRange, Manifest, ensure_manifest_absent, read_manifest, write_manifest};
 use crate::output::{
-    BenchmarkResult, InternalStatsSnapshot, OutputConfig, internal_metrics,
-    remove_result_artifacts, write_benchmark_outputs,
+    BenchmarkResult, InternalStatsSnapshot, OutputConfig, internal_metrics, write_benchmark_outputs,
 };
 use crate::workload::{SessionPlan, WorkerPlan, build_worker_plans, generate_keys, payload_bytes};
 use doradb_storage::id::TableID;
@@ -28,7 +25,7 @@ struct WorkerSummary {
 
 /// Prepare a benchmark storage root and manifest.
 pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
-    let storage_root_owned = prepare_storage_root(&storage_root)?;
+    prepare_storage_root(&storage_root)?;
     ensure_manifest_absent(&storage_root)?;
 
     let engine = open_engine(&storage_root).await?;
@@ -39,14 +36,13 @@ pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
     session.close().await?;
     engine.shutdown()?;
 
-    let manifest = Manifest::new(storage_root_owned, table_id.as_u64(), args.index);
+    let manifest = Manifest::new(table_id.as_u64(), args.index);
     write_manifest(&storage_root, &manifest)?;
     println!(
-        "prepared storage_root={} table_id={} index={} root_owned={}",
+        "prepared storage_root={} table_id={} index={}",
         storage_root.display(),
         table_id,
-        args.index,
-        storage_root_owned
+        args.index
     );
     Ok(())
 }
@@ -93,49 +89,24 @@ pub async fn run_load(storage_root: PathBuf, args: LoadArgs, command_context: &s
 }
 
 /// Clean benchmark artifacts from a prepared storage root.
-pub async fn cleanup(storage_root: PathBuf, args: CleanupArgs) -> Result<()> {
-    let manifest = read_manifest(&storage_root)?;
-    let remove_root = manifest.storage_root_owned || args.force;
-    let engine = open_engine(&storage_root).await?;
-    let mut session = engine.new_session()?;
-    session.drop_table(TableID::new(manifest.table_id)).await?;
-    session.close().await?;
-    engine.shutdown()?;
-
-    if remove_root {
-        fs::remove_dir_all(&storage_root).map_err(|err| {
-            BenchError::message(format!(
-                "failed to remove storage root {}: {err}",
-                storage_root.display()
-            ))
-        })?;
-        println!("removed storage_root={}", storage_root.display());
-    } else {
-        remove_result_artifacts(&storage_root)?;
-        remove_manifest_file(&storage_root)?;
-        println!(
-            "removed benchmark table and metadata; kept unowned storage_root={}",
+pub async fn cleanup(storage_root: PathBuf) -> Result<()> {
+    let _manifest = read_manifest(&storage_root)?;
+    fs::remove_dir_all(&storage_root).map_err(|err| {
+        BenchError::message(format!(
+            "failed to remove storage root {}: {err}",
             storage_root.display()
-        );
-    }
+        ))
+    })?;
+    println!("removed storage_root={}", storage_root.display());
     Ok(())
 }
 
-fn prepare_storage_root(storage_root: &Path) -> Result<bool> {
+fn prepare_storage_root(storage_root: &Path) -> Result<()> {
     if storage_root.exists() {
-        if !storage_root.is_dir() {
-            return Err(BenchError::message(format!(
-                "--root {} exists but is not a directory",
-                storage_root.display()
-            )));
-        }
-        if fs::read_dir(storage_root)?.next().is_some() {
-            return Err(BenchError::message(format!(
-                "--root {} must be empty for prepare",
-                storage_root.display()
-            )));
-        }
-        return Ok(false);
+        return Err(BenchError::message(format!(
+            "--root {} must not exist for prepare",
+            storage_root.display()
+        )));
     }
     fs::create_dir_all(storage_root).map_err(|err| {
         BenchError::message(format!(
@@ -143,7 +114,7 @@ fn prepare_storage_root(storage_root: &Path) -> Result<bool> {
             storage_root.display()
         ))
     })?;
-    Ok(true)
+    Ok(())
 }
 
 async fn open_engine(storage_root: &Path) -> Result<Engine> {
@@ -294,16 +265,6 @@ fn effective_batch_size(config: &LoadConfig, row_count: u64) -> Result<usize> {
         .map_err(|_| BenchError::message("effective batch size exceeds addressable memory"))
 }
 
-fn remove_manifest_file(storage_root: &Path) -> Result<()> {
-    let path = manifest_path(storage_root);
-    fs::remove_file(&path).map_err(|err| {
-        BenchError::message(format!(
-            "failed to remove benchmark manifest {}: {err}",
-            path.display()
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,17 +273,17 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn prepare_storage_root_accepts_missing_and_records_owned() {
+    fn prepare_storage_root_creates_missing_root() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
-        assert!(prepare_storage_root(&root).unwrap());
+        prepare_storage_root(&root).unwrap();
         assert!(root.is_dir());
     }
 
     #[test]
-    fn prepare_storage_root_accepts_empty_existing_as_unowned() {
+    fn prepare_storage_root_rejects_empty_existing() {
         let temp = TempDir::new().unwrap();
-        assert!(!prepare_storage_root(temp.path()).unwrap());
+        assert!(prepare_storage_root(temp.path()).is_err());
     }
 
     #[test]
@@ -330,6 +291,27 @@ mod tests {
         let temp = TempDir::new().unwrap();
         File::create(temp.path().join("marker")).unwrap();
         assert!(prepare_storage_root(temp.path()).is_err());
+    }
+
+    #[test]
+    fn cleanup_rejects_missing_manifest() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+        fs::create_dir(&root).unwrap();
+
+        assert!(smol::block_on(cleanup(root.clone())).is_err());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn cleanup_removes_root_after_manifest_validation() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+        fs::create_dir(&root).unwrap();
+        write_manifest(&root, &Manifest::new(42, IndexMode::None)).unwrap();
+
+        smol::block_on(cleanup(root.clone())).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]

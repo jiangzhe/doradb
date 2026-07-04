@@ -3,6 +3,7 @@ id: 000211
 title: Create doradb-bench Load Benchmark Crate
 status: proposal  # proposal | implemented | superseded
 created: 2026-07-03
+github_issue: 812
 ---
 
 # Task: Create doradb-bench Load Benchmark Crate
@@ -66,15 +67,13 @@ Related Backlogs:
 4. Make `doradb-bench` depend on `doradb-storage` through the public facade.
 5. Provide explicit lifecycle commands:
    - `prepare`: require a storage root resolved from global `--root`/`-r` or
-     `DORADB_BENCH_ROOT`, require it to point to a non-existing path or an
-     existing empty directory, create or open that root, create the benchmark
-     table, and write `benchmark-manifest.toml` containing the created
-     `TableID`, selected index mode, schema column names, storage root
-     ownership marker, and runtime key state needed by later commands;
+     `DORADB_BENCH_ROOT`, require it to point to a non-existing path, create
+     that root, create the benchmark table, and write `benchmark-manifest.toml`
+     containing the created `TableID`, selected index mode, schema column
+     names, and runtime key state needed by later commands;
    - `run`: run the measured workload and report throughput and latency;
-   - `cleanup`: close/shutdown cleanly and remove owned benchmark artifacts by
-     default, with an explicit `--force` override for removing an unowned
-     benchmark storage root.
+   - `cleanup`: require `benchmark-manifest.toml` under the storage root and
+     remove the whole benchmark storage root.
 6. Support only the initial `insert` workload:
    - by default, insert generated rows in increasing logical key order;
    - with `--rand`, insert generated rows with deterministic pseudo-random
@@ -93,10 +92,7 @@ Related Backlogs:
      the benchmark harness;
    - `--sessions`/`-s`, defaulting to `--threads`, meaning independent DoraDB
      public sessions/logical benchmark clients distributed across worker
-     threads;
-   - `--force` on `cleanup` to remove an unowned benchmark storage root; without
-     `--force`, cleanup removes only artifacts recorded as owned in the
-     manifest.
+     threads.
 8. Generate a stable benchmark table schema through public `TableSpec` and
    `IndexSpec` APIs. Use a logical key column plus a generated payload column
    large enough to honor `--value-size`/`-v`. When `--index unique` is selected,
@@ -186,13 +182,9 @@ benchmark task.
      `benchmark-manifest.toml` directly under the resolved storage root.
    - Do not support `--state-file`.
    - `prepare` must fail before opening DoraDB when the resolved storage root
-     already exists and is non-empty.
-   - `prepare` must create a missing storage root and record it as owned by the
-     benchmark tool.
-   - `prepare` may use an existing empty storage root, but must record that the
-     root itself is not owned by the benchmark tool.
+     already exists.
+   - `prepare` must create a missing storage root.
    - Persist at minimum:
-     - storage root ownership marker;
      - created user `TableID`;
      - selected index mode;
      - schema column names;
@@ -200,11 +192,8 @@ benchmark task.
    - `prepare` must fail clearly when `benchmark-manifest.toml` already exists.
    - `run` and `cleanup` must read `benchmark-manifest.toml` before using the
      prepared storage root.
-   - `cleanup` must use the persisted storage root ownership marker instead of
-     inferring ownership at cleanup time. By default it removes only owned
-     artifacts. With `--force`, it may remove the benchmark storage root even
-     when the manifest records that the root was not created by this benchmark
-     tool.
+   - `cleanup` must treat manifest presence as the cleanup safety marker and
+     remove the whole benchmark storage root.
 
 4. Build the storage engine through public APIs.
    - Construct `EngineConfig` from the selected storage root.
@@ -403,16 +392,13 @@ benchmark task.
    - multi-session `insert --rand --index unique` preserves unique aggregate
      key coverage without promising deterministic whole-run order.
 4. Prepare root and manifest tests cover:
-   - `prepare` accepts a missing `--root`, creates it, and records root
-     ownership in `benchmark-manifest.toml`;
-   - `prepare` accepts an existing empty `--root` and records that the
-     root itself is not owned;
-   - `prepare` rejects an existing non-empty `--root` before opening
-     DoraDB;
+   - `prepare` accepts a missing `--root` and creates it;
+   - `prepare` rejects an existing empty `--root` before opening DoraDB;
+   - `prepare` rejects an existing non-empty `--root` before opening DoraDB;
    - `prepare` writes `benchmark-manifest.toml` with a table id;
    - `prepare` records the selected index mode;
    - `run` rejects missing or incompatible manifests;
-   - `cleanup` respects persisted ownership and the `--force` override.
+   - `cleanup` requires `benchmark-manifest.toml` and removes the storage root.
 5. Output tests cover:
    - normal lifecycle and benchmark output is written to stdout;
    - diagnostics and errors are written to stderr;
