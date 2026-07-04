@@ -1,5 +1,6 @@
 use crate::error::{BenchError, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use doradb_storage::LogSync;
 use serde::{Deserialize, Serialize};
 use std::env::var_os;
 use std::fmt;
@@ -73,6 +74,40 @@ impl fmt::Display for IndexMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+pub(super) enum LogSyncMode {
+    #[serde(rename = "fsync")]
+    #[value(name = "fsync")]
+    Fsync,
+    #[serde(rename = "fdatasync")]
+    #[value(name = "fdatasync")]
+    Fdatasync,
+    #[serde(rename = "none")]
+    #[value(name = "none")]
+    None,
+}
+
+impl LogSyncMode {
+    #[inline]
+    pub(super) fn as_storage(self) -> LogSync {
+        match self {
+            Self::Fsync => LogSync::Fsync,
+            Self::Fdatasync => LogSync::Fdatasync,
+            Self::None => LogSync::None,
+        }
+    }
+}
+
+impl fmt::Display for LogSyncMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fsync => f.write_str("fsync"),
+            Self::Fdatasync => f.write_str("fdatasync"),
+            Self::None => f.write_str("none"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Workload {
     Insert,
@@ -130,6 +165,9 @@ struct LoadCommonArgs {
     /// Independent DoraDB public sessions; defaults to --threads.
     #[arg(long, short = 's')]
     sessions: Option<NonZeroUsize>,
+    /// Redo-log durability sync method.
+    #[arg(long, value_enum, default_value_t = LogSyncMode::Fsync)]
+    log_sync: LogSyncMode,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -179,6 +217,7 @@ impl InsertArgs {
             index,
             threads,
             sessions,
+            log_sync: self.common.log_sync,
         })
     }
 }
@@ -195,6 +234,7 @@ pub(super) struct LoadConfig {
     pub(super) index: IndexMode,
     pub(super) threads: usize,
     pub(super) sessions: usize,
+    pub(super) log_sync: LogSyncMode,
 }
 
 #[cfg(test)]
@@ -287,6 +327,7 @@ mod tests {
                     index: None,
                     threads: NonZeroUsize::new(2).unwrap(),
                     sessions: None,
+                    log_sync: LogSyncMode::Fsync,
                 },
                 num: NonZeroU64::new(1).unwrap(),
                 value_size: NonZeroUsize::new(128).unwrap(),
@@ -331,6 +372,7 @@ mod tests {
             .unwrap();
         assert_eq!(config.workload, Workload::Insert);
         assert_eq!(config.batch_size, 1);
+        assert_eq!(config.log_sync, LogSyncMode::Fsync);
         assert!(!config.rand);
     }
 
@@ -376,6 +418,8 @@ mod tests {
             "2",
             "-s",
             "4",
+            "--log-sync",
+            "fdatasync",
         ])
         .unwrap();
         let Command::Run(args) = cli.command else {
@@ -391,6 +435,7 @@ mod tests {
         assert_eq!(config.index, IndexMode::Unique);
         assert_eq!(config.threads, 2);
         assert_eq!(config.sessions, 4);
+        assert_eq!(config.log_sync, LogSyncMode::Fdatasync);
     }
 
     #[test]

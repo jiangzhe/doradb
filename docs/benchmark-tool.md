@@ -78,6 +78,7 @@ all sessions.
 | `--index`, `-i` | `prepare`, `run insert` | `prepare`: `none`; `run insert`: prepared index | Controls or validates the benchmark table's index shape. `none` creates no secondary indexes and allows duplicate logical key values. `unique` creates one unique secondary index on the logical key column. |
 | `--threads`, `-t` | `run insert` | `1` | Number of operating-system worker threads that drive the benchmark executor. It is not an async task count. |
 | `--sessions`, `-s` | `run insert` | `--threads` | Number of independent DoraDB public sessions, meaning logical benchmark clients scheduled on the worker threads. Both values must be positive, and `--threads > --sessions` is rejected. |
+| `--log-sync` | `run insert` | `fsync` | Redo-log durability sync method. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
 Non-unique indexes and multiple indexes are deferred to later work.
 
 ## Key Ranges
@@ -112,7 +113,8 @@ errors are written to stderr.
 `run` prints three stdout sections in this order:
 
 - `Configuration`: workload, random-key mode, storage root, row count, value
-  size, batch size, seed, index mode, threads, sessions, and table id.
+  size, batch size, seed, index mode, threads, sessions, log sync mode, and
+  table id.
 - `Internal Stats`: public transaction-system, storage-IO, and buffer-pool stats
   deltas when available.
 - `Final Result`: operation count, elapsed time, operations per second, average

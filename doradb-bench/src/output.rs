@@ -1,4 +1,4 @@
-use crate::cli::{IndexMode, Workload};
+use crate::cli::{IndexMode, LogSyncMode, Workload};
 use crate::error::{BenchError, Result};
 use crate::manifest::{internal_stats_csv_path, result_csv_path, result_markdown_path};
 use doradb_storage::{
@@ -44,6 +44,7 @@ pub(super) struct OutputConfig {
     pub(super) index: IndexMode,
     pub(super) threads: usize,
     pub(super) sessions: usize,
+    pub(super) log_sync: LogSyncMode,
     pub(super) table_id: u64,
 }
 
@@ -252,6 +253,7 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         "index",
         "threads",
         "sessions",
+        "log_sync",
         "table_id",
         "operations",
         "elapsed_nanos",
@@ -270,6 +272,7 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         config.index.to_string(),
         config.threads.to_string(),
         config.sessions.to_string(),
+        config.log_sync.to_string(),
         config.table_id.to_string(),
         result.operations.to_string(),
         result.elapsed.as_nanos().to_string(),
@@ -299,6 +302,7 @@ fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
         ("index".to_owned(), config.index.to_string()),
         ("threads".to_owned(), config.threads.to_string()),
         ("sessions".to_owned(), config.sessions.to_string()),
+        ("log_sync".to_owned(), config.log_sync.to_string()),
         ("table_id".to_owned(), config.table_id.to_string()),
     ]
 }
@@ -568,6 +572,7 @@ mod tests {
             index: IndexMode::None,
             threads: 1,
             sessions: 1,
+            log_sync: LogSyncMode::Fsync,
             table_id: 7,
         }
     }
@@ -726,6 +731,11 @@ mod tests {
             pairs
                 .iter()
                 .any(|(name, value)| name == "rand" && value == "false")
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "log_sync" && value == "fsync")
         );
     }
 

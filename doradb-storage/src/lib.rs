@@ -39,7 +39,7 @@ pub use catalog::{
     CatalogCheckpointOutcome, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo,
     IndexOrder, IndexSpec, TableSpec,
 };
-pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LogSync, TrxSysConfig};
 pub use engine::Engine;
 pub use error::{Error, ErrorKind, Result};
 pub use lock::LockMode;
