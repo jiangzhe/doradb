@@ -2177,7 +2177,7 @@ mod tests {
             .expect("test row-page-index construction should succeed");
             let mem_guard = engine.inner().mem_pool.pool_guard();
             let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(206));
-            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
 
             let err = match blk_idx
                 .get_insert_page(

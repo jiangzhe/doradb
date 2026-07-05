@@ -18,6 +18,18 @@ Backend-specific code only prepares kernel submission objects, stages them into
 the backend's submission format, submits batches, and decodes completions back
 into worker tokens.
 
+Backend submit and wait progress is fallible. A backend-level syscall failure
+before a normal per-operation completion exists is reported as a
+`Report<IoError>` with typed backend-progress attachments. The backend-owned
+attachment records the backend name, syscall phase, errno, call count, queue
+state, and backend notes; worker-owned context such as the first known
+operation kind is attached separately. Unknown queue values are left unknown
+rather than encoded as zero. Transient progress conditions keep their local
+policy: `EINTR` is retried, `io_uring` `EAGAIN` / `EBUSY` submit pressure and
+`libaio` `io_submit` `EAGAIN` are reported as explicit submit-retry outcomes.
+Schedulers wait on already-accepted work when possible and otherwise use a
+bounded submit backoff before retrying staged submissions.
+
 In the current runtime topology, the storage engine uses one shared
 storage-adjacent worker plus one redo driver owned by the transaction log
 thread:
@@ -61,13 +73,19 @@ That is the shared contract across both supported backends.
 - one backend-owned submit-batch type;
 - one backend-owned completion-event buffer type;
 - translation from `Operation` to the backend submission format; and
-- batch submit plus completion wait methods that return `BackendToken`s.
+- fallible batch submit plus completion wait methods that return
+  `BackendToken`s when progress succeeds.
 
 Schedulers remain backend-neutral. The shared storage service uses
 domain-specific state-machine methods to decide how requests become
 submissions and how completions update subsystem state. The redo path uses a
 small `LogWriteDriver` wrapper around the shared submission driver for direct
 log writes.
+
+Backend progress errors are not used for scheduler invariants. Invalid or
+stale completion tokens, impossible completion counts, and state-machine
+ownership mismatches remain assertion or panic boundaries because they indicate
+internal corruption rather than kernel IO failure.
 
 ## Supported Backends
 
@@ -131,6 +149,16 @@ inside `Log-Thread`:
 Fatal redo write or sync failures poison runtime admission through
 `FatalError::{RedoWrite, RedoSync}`.
 
+Backend progress failures in the live shared storage worker poison runtime
+admission through the engine-level poison component with `FatalError::StorageIo`.
+The worker completes work that had not yet been accepted by the backend with
+clear IO completion errors. If a wait failure leaves already accepted
+operations without a trustworthy completion path, the worker keeps those
+inflight buffers and borrowed page guards quarantined instead of dropping them.
+
+Startup recovery read-ahead treats backend progress failures as recovery stream
+IO errors. It does not poison runtime admission during engine startup.
+
 ## Telemetry
 
 Two layers of runtime-local storage telemetry are available:
@@ -150,7 +178,8 @@ shared-worker fairness from raw backend saturation.
   build the alternate `libaio` backend.
 - The `libaio` backend does not provide a fallback for kernels before Linux
   4.18, where native async file-sync opcodes may be rejected by `io_submit`
-  with `EINVAL`.
+  with `EINVAL`; this is reported as a backend progress error with an
+  unsupported native sync diagnostic.
 - The initial phase-6 performance bar is manual: compare the default
   `io_uring` path against explicit `libaio` builds using the existing storage
   examples on the same machine.

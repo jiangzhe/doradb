@@ -5,7 +5,7 @@ use super::{
 use crate::conf::TrxSysConfig;
 use crate::error::{CompletionErrorKind, FatalError};
 use crate::id::TrxID;
-use crate::io::{DirectBuf, IOBackend, IOBuf};
+use crate::io::{DirectBuf, IOBackend, IOBuf, SubmitAttempt};
 use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoSuperBlock,
     serialize_redo_super_block, slot_offset,
@@ -174,15 +174,23 @@ impl LogFileSealer {
             submission.fail_unsubmitted_header(FatalError::RedoWrite);
             return Err(FatalError::RedoWrite);
         }
-        if write_driver.submit_ready() == 0 && write_driver.submitted_len() == 0 {
-            return Err(FatalError::RedoWrite);
+        match write_driver
+            .submit_ready()
+            .map_err(|_| FatalError::RedoWrite)?
+        {
+            SubmitAttempt::Noop | SubmitAttempt::Retry(_) if write_driver.submitted_len() == 0 => {
+                return Err(FatalError::RedoWrite);
+            }
+            SubmitAttempt::Submitted(_) | SubmitAttempt::Retry(_) | SubmitAttempt::Noop => {}
         }
         let LogWriteCompletion {
             owner: _,
             kind,
             buf,
             poison,
-        } = write_driver.wait_at_least_one();
+        } = write_driver
+            .wait_at_least_one()
+            .map_err(|_| FatalError::RedoWrite)?;
         // This best-effort shutdown path starts from an empty driver and
         // submits exactly one header write above. Any other completion kind
         // means the caller violated that isolation invariant.
@@ -213,15 +221,23 @@ impl LogFileSealer {
         if write_driver.push_write(submission).is_err() {
             return Err(FatalError::RedoSync);
         }
-        if write_driver.submit_ready() == 0 && write_driver.submitted_len() == 0 {
-            return Err(FatalError::RedoSync);
+        match write_driver
+            .submit_ready()
+            .map_err(|_| FatalError::RedoSync)?
+        {
+            SubmitAttempt::Noop | SubmitAttempt::Retry(_) if write_driver.submitted_len() == 0 => {
+                return Err(FatalError::RedoSync);
+            }
+            SubmitAttempt::Submitted(_) | SubmitAttempt::Retry(_) | SubmitAttempt::Noop => {}
         }
         let LogWriteCompletion {
             owner: _,
             kind,
             buf,
             poison,
-        } = write_driver.wait_at_least_one();
+        } = write_driver
+            .wait_at_least_one()
+            .map_err(|_| FatalError::RedoSync)?;
         let LogWriteKind::StandaloneSync = kind else {
             unreachable!("active file seal submits exactly one standalone sync");
         };

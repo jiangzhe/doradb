@@ -1,5 +1,5 @@
 use crate::buffer::page::VersionedPageID;
-use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
     CatalogCheckpointOutcome, IndexNo, IndexSpec, TableSpec, create_index_for_session,
     create_table_for_session, drop_index_for_session, drop_table_for_session,
@@ -817,12 +817,7 @@ impl SessionState {
     /// Create a new session state and populate its default pool guards.
     #[inline]
     pub(crate) fn new(engine_ref: EngineRef, id: SessionID) -> Self {
-        let pool_guards = PoolGuards::builder()
-            .push(PoolRole::Meta, engine_ref.meta_pool.pool_guard())
-            .push(PoolRole::Index, engine_ref.index_pool.pool_guard())
-            .push(PoolRole::Mem, engine_ref.mem_pool.pool_guard())
-            .push(PoolRole::Disk, engine_ref.disk_pool.pool_guard())
-            .build();
+        let pool_guards = engine_ref.pools().pool_guards();
         let lock_manager = engine_ref.lock_manager().clone();
         SessionState {
             id,
@@ -2206,7 +2201,7 @@ pub(crate) mod tests {
                 std::task::Poll::Pending
             ));
 
-            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
             drop(redo_retention_lease);
 
             let err = maintenance_fut.await.unwrap_err();
@@ -2553,7 +2548,7 @@ pub(crate) mod tests {
                 std::task::Poll::Pending
             ));
 
-            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
             drop(redo_retention_lease);
 
             let err = truncate_fut.await.unwrap_err();
@@ -2749,7 +2744,7 @@ pub(crate) mod tests {
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
 
-            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
 
             assert_eq!(session.list_table_ids().unwrap(), vec![table_id]);
             assert!(session.transaction_system_stats().is_ok());

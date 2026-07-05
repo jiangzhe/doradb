@@ -1,8 +1,11 @@
 use crate::DiskPool;
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
-use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
+use crate::component::{
+    Component, ComponentRegistry, EnginePools, IndexPool, MemPool, MetaPool, ShelfScope,
+};
 use crate::conf::TrxSysConfig;
 use crate::engine::EngineRef;
+use crate::engine_poison::EnginePoisoner;
 use crate::error::{CompletionErrorKind, Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
@@ -463,9 +466,11 @@ pub(crate) struct TransactionSystem {
     /// Transaction system configuration.
     pub(crate) config: CachePadded<TrxSysConfig>,
     /// Catalog of the database.
-    pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
+    pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Table file facade used by background dropped-table cleanup.
-    pub(super) table_fs: CachePadded<QuiescentGuard<FileSystem>>,
+    pub(super) table_fs: QuiescentGuard<FileSystem>,
+    /// Engine-level fatal runtime poison state.
+    engine_poisoner: QuiescentGuard<EnginePoisoner>,
     /// Wakeup channel for purge coordination.
     pub(super) purge_tx: CachePadded<Sender<Purge>>,
     /// Transaction cleanup queue for abandoned and mandatory rollback work.
@@ -477,12 +482,6 @@ pub(crate) struct TransactionSystem {
     /// The catalog's retained dropped-floor entries remain authoritative; this
     /// queue only avoids full catalog-map scans during purge wakeups.
     pub(super) dropped_table_files: CachePadded<Mutex<DroppedTableFileCleanupQueue>>,
-    /// Storage-runtime poison flag for fatal storage background or durability failures.
-    storage_poisoned: CachePadded<AtomicBool>,
-    /// First fatal storage reason that poisoned runtime admission.
-    storage_poison_err: CachePadded<Mutex<Option<FatalError>>>,
-    /// One-shot wake for event waits that must notice storage poison.
-    storage_poison_event: CachePadded<Event>,
     /// Rollback payloads retained after fatal rollback cleanup failure.
     ///
     /// Poisoning stops future admitted work, but row-version maps can already
@@ -504,6 +503,7 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn new(
         config: TrxSysConfig,
+        engine_poisoner: QuiescentGuard<EnginePoisoner>,
         catalog: QuiescentGuard<Catalog>,
         table_fs: QuiescentGuard<FileSystem>,
         redo_log: CachePadded<RedoLog>,
@@ -527,38 +527,28 @@ impl TransactionSystem {
             gc_buckets: gc_buckets.into_boxed_slice(),
             redo_log,
             config: CachePadded::new(config),
-            catalog: CachePadded::new(catalog),
-            table_fs: CachePadded::new(table_fs),
+            catalog,
+            table_fs,
+            engine_poisoner,
             purge_tx: CachePadded::new(queues.purge_tx),
             cleanup_tx: CachePadded::new(queues.cleanup_tx),
             table_roots: CachePadded::new(Mutex::new(TableRootQueue::default())),
             dropped_table_files: CachePadded::new(Mutex::new(dropped_table_files)),
-            storage_poisoned: CachePadded::new(AtomicBool::new(false)),
-            storage_poison_err: CachePadded::new(Mutex::new(None)),
-            storage_poison_event: CachePadded::new(Event::new()),
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
             catalog_redo_retention: CachePadded::new(Mutex::new(None)),
             redo_retention_gate: CachePadded::new(RedoRetentionGate::new()),
         }
     }
 
-    /// Returns the first fatal storage poison error, if runtime admission has been poisoned.
+    /// Returns the first fatal engine poison error, if runtime admission has been poisoned.
     ///
     /// Poison is an admission barrier, not a shutdown mechanism. It prevents new
     /// foreground/system work from entering paths that depend on durable
     /// consistency, while the engine owner remains responsible for the normal
     /// explicit shutdown sequence.
     #[inline]
-    pub(crate) fn storage_poison_error(&self) -> Option<Report<FatalError>> {
-        if !self.storage_poisoned.load(Ordering::Acquire) {
-            return None;
-        }
-        let guard = self.storage_poison_err.lock();
-        debug_assert!(
-            guard.is_some(),
-            "storage poison flag published before poison error was recorded"
-        );
-        guard.as_ref().copied().map(Report::new)
+    pub(crate) fn poison_error(&self) -> Option<Report<FatalError>> {
+        self.engine_poisoner.poison_error()
     }
 
     /// Record catalog-safe redo retention progress after a catalog checkpoint publish.
@@ -593,64 +583,50 @@ impl TransactionSystem {
         self.redo_retention_gate.acquire().await
     }
 
-    /// Returns `Err` once a fatal storage failure poisoned runtime admission.
+    /// Returns `Err` once a fatal engine failure poisoned runtime admission.
     ///
     /// Call this at work-admission boundaries. Background worker shutdown must
     /// not call it, because shutdown must remain available after the runtime has
     /// already been poisoned.
     #[inline]
     pub(crate) fn ensure_runtime_healthy(&self) -> FatalResult<()> {
-        match self.storage_poison_error() {
+        match self.poison_error() {
             Some(err) => Err(err),
             None => Ok(()),
         }
     }
 
-    /// Registers for the one-shot storage poison event.
+    /// Registers for the one-shot engine poison event.
     #[inline]
-    pub(crate) fn storage_poison_listener(&self) -> EventListener {
-        self.storage_poison_event.listen()
+    pub(crate) fn poison_listener(&self) -> EventListener {
+        self.engine_poisoner.listener()
     }
 
-    /// Records the first fatal storage poison reason and returns a fresh poison error.
+    /// Records the first fatal engine poison reason and returns a fresh poison error.
     ///
     /// The first caller wins: later poison attempts keep returning the already
     /// recorded reason. The reason is stored before the atomic flag is published
-    /// so a thread that observes `storage_poisoned == true` can immediately load
-    /// a meaningful error. The first poison also performs a one-shot wake for
-    /// storage-poison listeners and waiters, such as `storage_poison_listener`
-    /// and `wait_transition_route_or_poison`. This method intentionally does not
+    /// so a thread that observes `poisoned == true` can immediately load a
+    /// meaningful error. The first poison also performs a one-shot wake for
+    /// engine-poison listeners and waiters, such as `poison_listener` and
+    /// `wait_transition_route_or_poison`. This method intentionally does not
     /// stop worker threads; callers that hit an unrecoverable background failure
     /// should return from their worker loop after poisoning.
     #[inline]
-    pub(crate) fn poison_storage(&self, reason: FatalError) -> Report<FatalError> {
-        {
-            let mut guard = self.storage_poison_err.lock();
-            if guard.is_none() {
-                *guard = Some(reason);
-            }
-        }
-        let already_poisoned = self.storage_poisoned.swap(true, Ordering::AcqRel);
-        let poison = self.storage_poison_error().unwrap_or_else(|| {
-            Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
-        });
-        if !already_poisoned {
-            obs::error!(
-                "event=storage_poison component=trx action=poison result=error fatal_reason={:?}",
-                poison.current_context()
-            );
-            // Poison is an admission barrier, not shutdown. Event waiters still
-            // need this one-shot wake so they do not sleep after the only
-            // progress producer has failed.
-            self.storage_poison_event.notify(usize::MAX);
-        } else if obs::log_enabled!(obs::Level::Debug) {
-            obs::debug!(
-                "event=storage_poison component=trx action=poison result=ignored fatal_reason={:?} published_fatal_reason={:?}",
-                reason,
-                poison.current_context()
-            );
-        }
-        poison
+    pub(crate) fn poison_engine(&self, reason: FatalError) -> Report<FatalError> {
+        self.engine_poisoner
+            .poison(reason, "trx_sys", format!("fatal_reason={reason}"))
+    }
+
+    /// Records fatal engine poison with explicit component context.
+    #[inline]
+    pub(crate) fn poison_engine_with_context(
+        &self,
+        reason: FatalError,
+        component: &'static str,
+        context: impl Into<String>,
+    ) -> Report<FatalError> {
+        self.engine_poisoner.poison(reason, component, context)
     }
 
     /// Retain undo/effect ownership after rollback can no longer finish safely.
@@ -702,7 +678,7 @@ impl TransactionSystem {
         } = error;
         let cts = trx.cts;
         if close_admission {
-            let err = self.poison_storage(match reason {
+            let err = self.poison_engine(match reason {
                 FailedPrecommitReason::Fatal(reason) => reason,
                 FailedPrecommitReason::Resource(_) | FailedPrecommitReason::Shutdown => {
                     FatalError::RedoWrite
@@ -1098,7 +1074,7 @@ impl TransactionSystem {
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
-            return Err(self.poison_storage(FatalError::RollbackAccess).into());
+            return Err(self.poison_engine(FatalError::RollbackAccess).into());
         }
         if inner
             .row_undo_mut()
@@ -1110,7 +1086,7 @@ impl TransactionSystem {
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
-            return Err(self.poison_storage(FatalError::RollbackAccess).into());
+            return Err(self.poison_engine(FatalError::RollbackAccess).into());
         }
         inner.effects_mut().clear_for_rollback();
         self.record_rollback_for_purge(gc_no, sts);
@@ -1245,7 +1221,7 @@ impl TransactionSystem {
             debug_assert!(writer.shutdown());
             debug_assert!(!writer.has_pending_io());
         }
-        if self.storage_poison_error().is_none() {
+        if self.poison_error().is_none() {
             sealer.seal_active_file_best_effort(self, &mut write_driver);
         }
     }
@@ -1369,14 +1345,18 @@ impl Component for TransactionSystem {
         let table_fs = registry.dependency::<FileSystem>()?;
         let disk_pool = registry.dependency::<DiskPool>()?;
         let catalog = registry.dependency::<Catalog>()?;
+        let engine_poisoner = registry.dependency::<EnginePoisoner>()?;
 
         let (trx_sys, startup) = config
             .prepare(
-                meta_pool.clone_inner(),
-                index_pool.clone_inner(),
-                mem_pool.clone_inner(),
+                engine_poisoner,
+                EnginePools::new(
+                    meta_pool.clone_inner(),
+                    index_pool.clone_inner(),
+                    mem_pool.clone_inner(),
+                    disk_pool.clone_inner(),
+                ),
                 table_fs,
-                disk_pool.clone_inner(),
                 catalog,
             )
             .await?;
@@ -1534,10 +1514,8 @@ pub(crate) mod tests {
     use crate::session::tests::SessionTestExt;
     use crate::trx::SharedTrxStatus;
     use crate::value::Val;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, OnceLock};
-    use std::thread::{sleep, spawn, yield_now};
-    use std::time::Duration;
+    use std::thread::spawn;
     use tempfile::TempDir;
 
     type TerminalRollbackTestHook = Arc<dyn Fn(TrxID, &'static str) + Send + Sync + 'static>;
@@ -1784,79 +1762,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_poison_storage_records_error_before_publishing_flag() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_poison_lock_order"))
-                .build()
-                .await
-                .unwrap();
-
-            let trx_sys = engine.inner().trx_sys.clone();
-            let blocked = trx_sys.storage_poison_err.lock();
-            let started = Arc::new(AtomicBool::new(false));
-            let finished = Arc::new(AtomicBool::new(false));
-
-            let worker_started = Arc::clone(&started);
-            let worker_finished = Arc::clone(&finished);
-            let worker_trx_sys = trx_sys.clone();
-            let handle = spawn(move || {
-                worker_started.store(true, Ordering::Release);
-                let err = worker_trx_sys.poison_storage(FatalError::RedoWrite);
-                worker_finished.store(true, Ordering::Release);
-                err
-            });
-
-            while !started.load(Ordering::Acquire) {
-                yield_now();
-            }
-            for _ in 0..20 {
-                assert!(
-                    !trx_sys.storage_poisoned.load(Ordering::Acquire),
-                    "poison flag must not publish before poison error is recorded"
-                );
-                assert!(
-                    !finished.load(Ordering::Acquire),
-                    "poison call should remain blocked while poison error lock is held"
-                );
-                sleep(Duration::from_millis(1));
-            }
-            assert!(trx_sys.storage_poison_error().is_none());
-
-            drop(blocked);
-
-            let err = handle.join().unwrap();
-            assert_eq!(*err.current_context(), FatalError::RedoWrite);
-            assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
-            assert!(
-                trx_sys
-                    .storage_poison_error()
-                    .as_ref()
-                    .is_some_and(|err| { *err.current_context() == FatalError::RedoWrite })
-            );
-            assert!(
-                trx_sys
-                    .ensure_runtime_healthy()
-                    .as_ref()
-                    .is_err_and(|err| { *err.current_context() == FatalError::RedoWrite })
-            );
-
-            drop(trx_sys);
-            drop(engine);
-        });
-    }
-
-    #[test]
-    fn test_poison_storage_concurrent_callers_share_first_error() {
+    fn test_poison_engine_concurrent_callers_share_first_error() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1880,26 +1786,26 @@ pub(crate) mod tests {
             let worker_a_trx_sys = trx_sys.clone();
             let worker_a = spawn(move || {
                 worker_a_barrier.wait();
-                worker_a_trx_sys.poison_storage(FatalError::RedoWrite)
+                worker_a_trx_sys.poison_engine(FatalError::RedoWrite)
             });
 
             let worker_b_barrier = Arc::clone(&barrier);
             let worker_b_trx_sys = trx_sys.clone();
             let worker_b = spawn(move || {
                 worker_b_barrier.wait();
-                worker_b_trx_sys.poison_storage(FatalError::RedoSync)
+                worker_b_trx_sys.poison_engine(FatalError::RedoSync)
             });
 
             barrier.wait();
 
             let err_a = worker_a.join().unwrap();
             let err_b = worker_b.join().unwrap();
-            let stored = trx_sys.storage_poison_error().unwrap();
+            let stored = trx_sys.poison_error().unwrap();
             let err_a_reason = *err_a.current_context();
             let err_b_reason = *err_b.current_context();
             let stored_reason = *stored.current_context();
 
-            assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
+            assert!(trx_sys.poison_error().is_some());
             assert_eq!(err_a_reason, err_b_reason);
             assert_eq!(stored_reason, err_a_reason);
             assert!(
@@ -1919,7 +1825,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_poison_storage_listener_wakes_first_waiters() {
+    fn test_poison_engine_listener_wakes_first_waiters() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1937,13 +1843,13 @@ pub(crate) mod tests {
                 .unwrap();
 
             let trx_sys = engine.inner().trx_sys.clone();
-            let listener = trx_sys.storage_poison_listener();
+            let listener = trx_sys.poison_listener();
             let waiter = smol::spawn(async move {
                 listener.await;
             });
 
             trx_sys.ensure_runtime_healthy().unwrap();
-            let err = trx_sys.poison_storage(FatalError::CheckpointWrite);
+            let err = trx_sys.poison_engine(FatalError::CheckpointWrite);
             assert_eq!(*err.current_context(), FatalError::CheckpointWrite);
             waiter.await;
             assert!(
@@ -1953,8 +1859,8 @@ pub(crate) mod tests {
                     .is_err_and(|err| *err.current_context() == FatalError::CheckpointWrite)
             );
 
-            let late_listener = trx_sys.storage_poison_listener();
-            let err = trx_sys.poison_storage(FatalError::RedoSync);
+            let late_listener = trx_sys.poison_listener();
+            let err = trx_sys.poison_engine(FatalError::RedoSync);
             assert_eq!(*err.current_context(), FatalError::CheckpointWrite);
             drop(late_listener);
             assert!(

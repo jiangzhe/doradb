@@ -1,12 +1,17 @@
 use super::libaio_abi::{
     io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
-use super::{BackendToken, IOBackend, IOBackendStatsHandle, IOKind, Operation, StdIoResult};
+use super::{
+    BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
+    IOBackendQueueState, IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt,
+    SubmitRetryReason, backend_call_count,
+};
 use crate::error::{ConfigError, IoError, Result, StorageOp};
 use error_stack::Report;
-use libc::{EAGAIN, EINTR, c_long};
+use libc::{EAGAIN, EINTR, EINVAL, c_long};
 use std::collections::VecDeque;
 use std::io::Error as StdIoError;
+use std::num::NonZeroUsize;
 use std::ptr::null_mut;
 use std::time::Instant;
 
@@ -67,23 +72,36 @@ impl LibaioBackend {
     /// Submit count will be returned, and caller need to take
     /// care of cleaning the input slice.
     #[inline]
-    fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> usize {
+    fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> BackendResult<SubmitAttempt> {
         if reqs.is_empty() || limit == 0 {
-            return 0;
+            return Ok(SubmitAttempt::Noop);
         }
         let batch_size = limit.min(reqs.len());
         let ret = io_submit_impl(self.ctx, batch_size as c_long, reqs.as_ptr() as *mut _);
         if ret < 0 {
             let errcode = -ret;
             if errcode == EAGAIN {
-                return 0;
+                let reason = SubmitRetryReason::from_raw_errno(errcode)
+                    .expect("EAGAIN must convert to submit retry reason");
+                return Ok(SubmitAttempt::Retry(reason));
             }
-            panic!(
-                "io_submit returns error code {errcode}: batch_size={batch_size} limit={limit} reqs_len={}",
-                reqs.len()
-            );
+            let err = StdIoError::from_raw_os_error(errcode);
+            let queue_state = IOBackendQueueState::submit(reqs.len(), batch_size);
+            let err = if errcode == EINVAL {
+                IOBackendFailure::report_with_note(
+                    "libaio",
+                    IOBackendErrorPhase::Submit,
+                    err,
+                    1,
+                    queue_state,
+                    "native libaio IO_CMD_FSYNC/IO_CMD_FDSYNC may be unsupported by this kernel",
+                )
+            } else {
+                IOBackendFailure::report("libaio", IOBackendErrorPhase::Submit, err, 1, queue_state)
+            };
+            return Err(err);
         }
-        ret as usize
+        Ok(NonZeroUsize::new(ret as usize).map_or(SubmitAttempt::Noop, SubmitAttempt::Submitted))
     }
 
     /// Wait until at least the requested number of IO operations finish.
@@ -92,7 +110,7 @@ impl LibaioBackend {
         &self,
         events: &mut [io_event],
         min_nr: usize,
-    ) -> (usize, Vec<(BackendToken, StdIoResult<usize>)>) {
+    ) -> BackendResult<(usize, Vec<(BackendToken, StdIoResult<usize>)>)> {
         let max_nwait = events.len();
         let mut wait_calls = 0;
         let count = loop {
@@ -108,7 +126,14 @@ impl LibaioBackend {
                 if errcode == EINTR {
                     continue;
                 }
-                panic!("io_getevents returns error code {errcode}");
+                let err = StdIoError::from_raw_os_error(errcode);
+                return Err(IOBackendFailure::report(
+                    "libaio",
+                    IOBackendErrorPhase::Wait,
+                    err,
+                    wait_calls,
+                    IOBackendQueueState::unknown(),
+                ));
             }
             break ret as usize;
         };
@@ -126,7 +151,7 @@ impl LibaioBackend {
             };
             completed.push((BackendToken::from_raw(ev.data), res));
         }
-        (wait_calls, completed)
+        Ok((wait_calls, completed))
     }
 }
 
@@ -200,23 +225,31 @@ impl IOBackend for LibaioBackend {
     }
 
     #[inline]
-    fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
+    fn submit_batch(
+        &mut self,
+        batch: &mut Self::SubmitBatch,
+        limit: usize,
+    ) -> BackendResult<SubmitAttempt> {
         if batch.staged.is_empty() || limit == 0 {
-            return 0;
+            return Ok(SubmitAttempt::Noop);
         }
         let start = Instant::now();
         batch.prefix.clear();
         batch
             .prefix
             .extend(batch.staged.iter().take(limit).copied());
-        let submit_count = self.submit_limit(&batch.prefix, limit);
+        let submit_result = self.submit_limit(&batch.prefix, limit);
         self.stats
             .record_submit_and_wait(1, start.elapsed().as_nanos() as usize);
-        self.stats.record_submitted_ops(submit_count);
-        if submit_count != 0 {
-            batch.staged.drain(0..submit_count);
+        let submit_result = submit_result.inspect(|attempt| {
+            if let SubmitAttempt::Submitted(submit_count) = attempt {
+                self.stats.record_submitted_ops(submit_count.get());
+            }
+        })?;
+        if let SubmitAttempt::Submitted(submit_count) = submit_result {
+            batch.staged.drain(0..submit_count.get());
         }
-        submit_count
+        Ok(submit_result)
     }
 
     #[inline]
@@ -224,13 +257,22 @@ impl IOBackend for LibaioBackend {
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
-    ) -> Vec<(BackendToken, StdIoResult<usize>)> {
+    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
         let start = Instant::now();
-        let (wait_calls, completed) = self.wait_at_least_with_attempts(events, min_nr);
-        self.stats
-            .record_submit_and_wait(wait_calls, start.elapsed().as_nanos() as usize);
-        self.stats.record_wait_completions(completed.len());
-        completed
+        let (_wait_calls, completed) = self
+            .wait_at_least_with_attempts(events, min_nr)
+            .inspect(|(wait_calls, completed)| {
+                self.stats
+                    .record_submit_and_wait(*wait_calls, start.elapsed().as_nanos() as usize);
+                self.stats.record_wait_completions(completed.len());
+            })
+            .inspect_err(|err| {
+                self.stats.record_submit_and_wait(
+                    backend_call_count(err),
+                    start.elapsed().as_nanos() as usize,
+                );
+            })?;
+        Ok(completed)
     }
 }
 
@@ -358,8 +400,11 @@ pub(crate) mod tests {
                 })
                 .is_ok()
         );
-        assert_eq!(driver.submit_ready(), 1);
-        let completed = driver.wait_at_least_one();
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        let completed = driver.wait_at_least_one().unwrap();
         assert_eq!(completed.submission.kind, IOKind::Write);
         assert_eq!(completed.result.unwrap(), 4096);
 
@@ -373,8 +418,11 @@ pub(crate) mod tests {
                 })
                 .is_ok()
         );
-        assert_eq!(driver.submit_ready(), 1);
-        let completed = driver.wait_at_least_one();
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        let completed = driver.wait_at_least_one().unwrap();
         assert_eq!(completed.submission.kind, IOKind::Read);
         assert_eq!(completed.result.unwrap(), 4096);
         let buf = completed.submission.operation.buf().unwrap();
@@ -387,9 +435,12 @@ pub(crate) mod tests {
         let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
         let iocb = iocb::boxed();
         let reqs = vec![iocb.as_mut_ptr()];
-        let submit_count = ctx.submit_limit(&reqs, 1);
+        let submit_result = ctx.submit_limit(&reqs, 1).unwrap();
         set_io_submit_hook(previous);
-        assert_eq!(submit_count, 0);
+        assert_eq!(
+            submit_result,
+            SubmitAttempt::Retry(SubmitRetryReason::Eagain)
+        );
     }
 
     #[test]
@@ -472,7 +523,8 @@ pub(crate) mod tests {
         IO_GETEVENTS_CALLS.store(0, Ordering::SeqCst);
         let previous = set_io_getevents_hook(Some(eintr_then_one_completion));
         let baseline = backend.stats_handle().snapshot();
-        let completions = <LibaioBackend as IOBackend>::wait_at_least(&mut backend, &mut events, 1);
+        let completions =
+            <LibaioBackend as IOBackend>::wait_at_least(&mut backend, &mut events, 1).unwrap();
         set_io_getevents_hook(previous);
 
         assert_eq!(IO_GETEVENTS_CALLS.load(Ordering::SeqCst), 2);

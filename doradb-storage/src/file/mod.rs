@@ -334,6 +334,18 @@ impl WriteSubmission {
             completion,
         }
     }
+
+    /// Fail a table write before backend submission accepted it.
+    #[inline]
+    pub(crate) fn fail(mut self, err: &Report<IoError>) {
+        drop(self.buf);
+        drop(self.write_lease.take());
+        self.completion
+            .complete(Err(CompletionErrorKind::report_backend_io(
+                err,
+                format!("submit table file write: key={:?}", self.key),
+            )));
+    }
 }
 
 /// Backend-prepared write submission retained until completion.
@@ -389,6 +401,16 @@ impl SyncSubmission {
             operation,
             completion,
         }
+    }
+
+    /// Fail a table sync before backend submission accepted it.
+    #[inline]
+    pub(crate) fn fail(self, err: &Report<IoError>) {
+        self.completion
+            .complete(Err(CompletionErrorKind::report_backend_io(
+                err,
+                "submit table file fsync",
+            )));
     }
 }
 

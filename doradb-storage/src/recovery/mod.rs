@@ -38,7 +38,7 @@ use crate::trx::MIN_SNAPSHOT_TS;
 use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
 use error_stack::Report;
-pub(crate) use resources::{RecoveryBuffers, RecoveryResources};
+pub(crate) use resources::RecoveryResources;
 pub(crate) use row_state::RowRecoveryMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -314,7 +314,7 @@ impl<'a> RecoveryCoordinator<'a> {
             .catalog
             .storage
             .tables()
-            .list_uncommitted(&self.resources.buffers.pool_guards)
+            .list_uncommitted(&self.resources.pool_guards)
             .await?;
         let checkpointed_user_table_ids = checkpointed_tables
             .iter()
@@ -339,10 +339,10 @@ impl<'a> RecoveryCoordinator<'a> {
                 .resources
                 .catalog
                 .reload_create_table(
-                    self.resources.buffers.mem_pool.clone(),
-                    self.resources.buffers.index_pool.clone(),
+                    self.resources.pools.mem.clone(),
+                    self.resources.pools.index.clone(),
                     &self.resources.table_fs,
-                    self.resources.buffers.disk_pool.clone(),
+                    self.resources.pools.disk.clone(),
                     table.table_id,
                 )
                 .await?;
@@ -522,7 +522,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 let metadata = table.metadata();
                 for page_id in pages {
                     table
-                        .populate_index_via_row_page(&self.resources.buffers.pool_guards, *page_id)
+                        .populate_index_via_row_page(&self.resources.pool_guards, *page_id)
                         .await?;
                     self.refresh_page(Arc::clone(&metadata.col), *page_id)
                         .await?;
@@ -554,7 +554,7 @@ impl<'a> RecoveryCoordinator<'a> {
             let (_, catalog_metadata) = self
                 .resources
                 .catalog
-                .user_table_metadata_from_catalog(&self.resources.buffers.pool_guards, table_id)
+                .user_table_metadata_from_catalog(&self.resources.pool_guards, table_id)
                 .await?;
             if catalog_metadata != *active_root.metadata {
                 let pending = self.pending_index_ddl_reconciliations.contains(&table_id);
@@ -613,10 +613,10 @@ impl<'a> RecoveryCoordinator<'a> {
     ) -> Result<()> {
         let mut page_guard = self
             .resources
-            .buffers
-            .mem_pool
+            .pools
+            .mem
             .get_page::<RowPage>(
-                self.resources.buffers.pool_guards.mem_guard(),
+                self.resources.pool_guards.mem_guard(),
                 page_id,
                 LatchFallbackMode::Exclusive,
             )
@@ -703,10 +703,10 @@ impl<'a> RecoveryCoordinator<'a> {
             .resources
             .catalog
             .reload_create_table(
-                self.resources.buffers.mem_pool.clone(),
-                self.resources.buffers.index_pool.clone(),
+                self.resources.pools.mem.clone(),
+                self.resources.pools.index.clone(),
                 &self.resources.table_fs,
-                self.resources.buffers.disk_pool.clone(),
+                self.resources.pools.disk.clone(),
                 table_id,
             )
             .await?;
@@ -767,7 +767,7 @@ impl<'a> RecoveryCoordinator<'a> {
         // should have the only remaining table runtime handle here. Destroy the
         // row/index runtime state immediately after logical removal.
         table
-            .destroy_dropped_runtime(&self.resources.buffers.pool_guards)
+            .destroy_dropped_runtime(&self.resources.pool_guards)
             .await?;
         if self.timeline.catalog_replay_start_ts <= cts {
             // The catalog checkpoint has not yet made this table absence
@@ -873,7 +873,7 @@ impl<'a> RecoveryCoordinator<'a> {
         let count = end_row_id - start_row_id;
         let mut page_guard = table
             .mem
-            .allocate_row_page_at(&self.resources.buffers.pool_guards, count as usize, page_id)
+            .allocate_row_page_at(&self.resources.pool_guards, count as usize, page_id)
             .await?;
         // Here we switch row page to recover mode.
         page_guard.bf_mut().init_recover_map(cts);
@@ -1049,7 +1049,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 RowRedoKind::Insert(vals) => {
                     table
                         .insert_no_trx(
-                            &self.resources.buffers.pool_guards,
+                            &self.resources.pool_guards,
                             vals,
                             self.recovery_disable_dml_validation,
                         )
@@ -1058,7 +1058,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 RowRedoKind::DeleteByPrimaryKey(key) => {
                     table
                         .delete_primary_key_no_trx(
-                            &self.resources.buffers.pool_guards,
+                            &self.resources.pool_guards,
                             key,
                             self.recovery_disable_dml_validation,
                         )
@@ -1067,7 +1067,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 RowRedoKind::UpdateByPrimaryKey(key, cols) => {
                     table
                         .update_primary_key_no_trx(
-                            &self.resources.buffers.pool_guards,
+                            &self.resources.pool_guards,
                             key,
                             cols,
                             self.recovery_disable_dml_validation,
@@ -1102,7 +1102,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     }
                     table
                         .recover_row_insert(
-                            &self.resources.buffers.pool_guards,
+                            &self.resources.pool_guards,
                             row.page_id,
                             row.row_id,
                             vals,
@@ -1117,7 +1117,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     }
                     table
                         .recover_row_update(
-                            &self.resources.buffers.pool_guards,
+                            &self.resources.pool_guards,
                             row.page_id,
                             row.row_id,
                             vals,
@@ -1136,7 +1136,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     }
                     table
                         .recover_row_delete(
-                            &self.resources.buffers.pool_guards,
+                            &self.resources.pool_guards,
                             row.page_id,
                             row.row_id,
                             cts,
@@ -1235,7 +1235,7 @@ mod tests {
         parse_redo_super_block, serialize_redo_super_block, slot_offset,
     };
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
-    use crate::recovery::{RecoveryBuffers, RecoveryResources, RowRecoveryMap, TableReplayBounds};
+    use crate::recovery::{RecoveryResources, RowRecoveryMap, TableReplayBounds};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::serde::Ser;
@@ -1550,14 +1550,11 @@ mod tests {
         engine: &'a Engine,
         catalog_replay_start_ts: TrxID,
     ) -> RecoveryCoordinator<'a> {
-        let buffers = RecoveryBuffers::new(
-            engine.inner().meta_pool.clone_inner(),
-            engine.inner().index_pool.clone_inner(),
-            engine.inner().mem_pool.clone_inner(),
-            engine.inner().disk_pool.clone_inner(),
+        let resources = RecoveryResources::new(
+            engine.inner().pools(),
+            engine.inner().table_fs.clone(),
+            engine.catalog(),
         );
-        let resources =
-            RecoveryResources::new(buffers, engine.inner().table_fs.clone(), engine.catalog());
         let mut recovery = engine
             .inner()
             .trx_sys

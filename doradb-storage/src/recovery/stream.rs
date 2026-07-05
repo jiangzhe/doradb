@@ -3,7 +3,7 @@ use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::id::TrxID;
 use crate::io::{
     CompletedSubmission, DirectBuf, IOBuf, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
-    StorageBackend, SubmissionDriver,
+    StorageBackend, SubmissionDriver, SubmitAttempt,
 };
 use crate::log::block_group::{TrxLog, block_count_for_payload};
 use crate::log::format::{
@@ -23,7 +23,7 @@ use std::mem::take;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::resume_unwind;
 use std::path::PathBuf;
-use std::thread::{JoinHandle, panicking, yield_now};
+use std::thread::{JoinHandle, panicking};
 use std::time::Duration;
 
 const REDO_READ_AHEAD_SEND_TIMEOUT: Duration = Duration::from_millis(100);
@@ -1025,7 +1025,34 @@ impl RedoReadAheadWorker {
                             )
                         })?;
             }
-            driver.submit_ready();
+            let submit_retry_without_inflight = match driver
+                .submit_ready()
+                .map_err(backend_progress_error)?
+            {
+                SubmitAttempt::Noop | SubmitAttempt::Submitted(_) => false,
+                SubmitAttempt::Retry(reason) => {
+                    if driver.submitted_len() == 0 {
+                        obs::debug!(
+                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={} submitted={} pending={} action=backoff",
+                            reason,
+                            reason.raw_errno(),
+                            driver.submitted_len(),
+                            driver.pending_len()
+                        );
+                        driver.backoff_submit_retry();
+                        true
+                    } else {
+                        obs::debug!(
+                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={} submitted={} pending={} action=wait",
+                            reason,
+                            reason.raw_errno(),
+                            driver.submitted_len(),
+                            driver.pending_len()
+                        );
+                        false
+                    }
+                }
+            };
             if !self.emit_ready(
                 file_seq,
                 &mut next_emit_offset,
@@ -1043,10 +1070,13 @@ impl RedoReadAheadWorker {
                 if driver.pending_len() == 0 {
                     continue;
                 }
-                yield_now();
+                if !submit_retry_without_inflight {
+                    driver.backoff_submit_retry();
+                }
                 continue;
             }
-            let completion = take_read_completion(driver.wait_at_least_one())?;
+            let completion =
+                take_read_completion(driver.wait_at_least_one().map_err(backend_progress_error)?)?;
             let (completed_file_seq, completed_offset, buf) = match completion.validate() {
                 Ok(completed) => completed,
                 Err(err) => {
@@ -1121,12 +1151,19 @@ impl RedoReadAheadWorker {
     #[inline]
     fn drain_driver(&mut self, driver: &mut SubmissionDriver<RedoReadSubmission>) {
         while driver.pending_len() != 0 {
-            driver.submit_ready();
+            match driver.submit_ready() {
+                Ok(SubmitAttempt::Noop | SubmitAttempt::Submitted(_) | SubmitAttempt::Retry(_)) => {
+                }
+                Err(_) => break,
+            }
             if driver.submitted_len() == 0 {
-                yield_now();
+                driver.backoff_submit_retry();
                 continue;
             }
-            if let Ok(completion) = take_read_completion(driver.wait_at_least_one()) {
+            let Ok(completed) = driver.wait_at_least_one() else {
+                break;
+            };
+            if let Ok(completion) = take_read_completion(completed) {
                 drop(completion.buf);
             }
         }
@@ -1162,6 +1199,12 @@ impl RedoReadAheadWorker {
             Err(TryRecvError::Empty) => false,
         }
     }
+}
+
+#[inline]
+fn backend_progress_error(err: Report<IoError>) -> Error {
+    err.attach("redo read-ahead backend progress failure")
+        .into()
 }
 
 #[derive(Debug)]

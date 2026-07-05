@@ -16,6 +16,8 @@ mod libaio_backend;
 use flume::{Receiver, SendError, Sender};
 use std::collections::VecDeque;
 use std::mem::replace;
+#[cfg(test)]
+use std::num::NonZeroUsize;
 use std::os::unix::io::RawFd;
 use std::ptr::null_mut;
 use std::result::Result as StdResult;
@@ -436,6 +438,7 @@ where
     staged_slots: VecDeque<u32>,
     submitted: usize,
     completed: VecDeque<CompletedSubmission<S>>,
+    submit_backoff: SubmitRetryBackoff,
 }
 
 impl<S, B> SubmissionDriver<S, B>
@@ -457,6 +460,7 @@ where
             staged_slots: VecDeque::with_capacity(capacity),
             submitted: 0,
             completed: VecDeque::new(),
+            submit_backoff: SubmitRetryBackoff::default(),
         }
     }
 
@@ -523,12 +527,17 @@ where
     /// Submits staged operations up to backend capacity and returns the count
     /// accepted by the backend.
     #[inline]
-    pub(crate) fn submit_ready(&mut self) -> usize {
+    pub(crate) fn submit_ready(&mut self) -> BackendResult<SubmitAttempt> {
         if self.staged_slots.is_empty() {
-            return 0;
+            return Ok(SubmitAttempt::Noop);
         }
         let limit = self.capacity().saturating_sub(self.submitted);
-        let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
+        let submit_result = self.backend.submit_batch(&mut self.submit_batch, limit)?;
+        let SubmitAttempt::Submitted(submitted) = submit_result else {
+            return Ok(submit_result);
+        };
+        let submit_count = submitted.get();
+        self.submit_backoff.reset();
         #[cfg(test)]
         let hook = tests::current_storage_backend_test_hook();
         for _ in 0..submit_count {
@@ -547,7 +556,14 @@ where
         }
         self.submitted += submit_count;
         debug_assert!(self.submitted <= self.capacity());
-        submit_count
+        Ok(SubmitAttempt::Submitted(submitted))
+    }
+
+    /// Back off one retry step when staged work could not be submitted and no
+    /// accepted backend work can be waited on.
+    #[inline]
+    pub(crate) fn backoff_submit_retry(&mut self) {
+        self.submit_backoff.backoff();
     }
 
     /// Waits for at least one accepted submission to complete.
@@ -555,44 +571,51 @@ where
     /// If a previous backend wait returned several completions, this returns
     /// the next buffered completion without entering the backend wait path.
     #[inline]
-    pub(crate) fn wait_at_least_one(&mut self) -> CompletedSubmission<S> {
-        if self.completed.is_empty() {
-            assert!(
-                self.submitted != 0,
-                "wait_at_least_one requires at least one backend-submitted operation"
-            );
-            let completions = self.backend.wait_at_least(&mut self.events, 1);
-            let completed_count = completions.len();
-            assert!(
-                completed_count <= self.submitted,
-                "backend returned more completions than submitted operations"
-            );
-            self.submitted -= completed_count;
-            for (token, res) in completions {
-                let entry = self.slots.take(token);
-                debug_assert!(entry.submitted);
-                #[cfg(test)]
-                let (entry, res) = {
-                    let mut entry = entry;
-                    let mut res = res;
-                    if let Some(hook) = tests::current_storage_backend_test_hook() {
-                        let op = entry.submission.operation();
-                        hook.on_complete(
-                            StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
-                            &mut res,
-                        );
-                    }
-                    (entry, res)
-                };
-                self.completed.push_back(CompletedSubmission {
-                    submission: entry.submission,
-                    result: res,
-                });
+    pub(crate) fn wait_at_least_one(&mut self) -> BackendResult<CompletedSubmission<S>> {
+        match self.completed.pop_front() {
+            Some(completed) => Ok(completed),
+            None => {
+                assert!(
+                    self.submitted != 0,
+                    "wait_at_least_one requires at least one backend-submitted operation"
+                );
+                let completions = self.backend.wait_at_least(&mut self.events, 1)?;
+                let completed_count = completions.len();
+                assert!(
+                    completed_count <= self.submitted,
+                    "backend returned more completions than submitted operations"
+                );
+                if completed_count != 0 {
+                    self.submit_backoff.reset();
+                }
+                self.submitted -= completed_count;
+                for (token, res) in completions {
+                    let entry = self.slots.take(token);
+                    debug_assert!(entry.submitted);
+                    #[cfg(test)]
+                    let (entry, res) = {
+                        let mut entry = entry;
+                        let mut res = res;
+                        if let Some(hook) = tests::current_storage_backend_test_hook() {
+                            let op = entry.submission.operation();
+                            hook.on_complete(
+                                StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
+                                &mut res,
+                            );
+                        }
+                        (entry, res)
+                    };
+                    self.completed.push_back(CompletedSubmission {
+                        submission: entry.submission,
+                        result: res,
+                    });
+                }
+                match self.completed.pop_front() {
+                    Some(completed) => Ok(completed),
+                    None => panic!("backend wait must return at least one completion"),
+                }
             }
         }
-        self.completed
-            .pop_front()
-            .expect("backend wait must return at least one completion")
     }
 
     /// Pops one backend completion that was already fetched by an earlier wait.
@@ -906,7 +929,7 @@ mod tests {
 
     struct DriverBackend {
         max_events: usize,
-        submit_results: VecDeque<usize>,
+        submit_results: VecDeque<SubmitAttempt>,
         inflight: VecDeque<BackendToken>,
         panic_on_wait: bool,
     }
@@ -926,6 +949,26 @@ mod tests {
         fn with_submit_results(
             max_events: usize,
             submit_results: impl Into<VecDeque<usize>>,
+        ) -> Self {
+            DriverBackend {
+                max_events,
+                submit_results: submit_results
+                    .into()
+                    .into_iter()
+                    .map(|submit_count| match NonZeroUsize::new(submit_count) {
+                        Some(submit_count) => SubmitAttempt::Submitted(submit_count),
+                        None => SubmitAttempt::Noop,
+                    })
+                    .collect(),
+                inflight: VecDeque::new(),
+                panic_on_wait: false,
+            }
+        }
+
+        #[inline]
+        fn with_submit_outcomes(
+            max_events: usize,
+            submit_results: impl Into<VecDeque<SubmitAttempt>>,
         ) -> Self {
             DriverBackend {
                 max_events,
@@ -969,27 +1012,36 @@ mod tests {
             batch.push_back(*prepared);
         }
 
-        fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
+        fn submit_batch(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            limit: usize,
+        ) -> BackendResult<SubmitAttempt> {
             let allowed = limit.min(batch.len());
-            let submit_count = self
-                .submit_results
-                .pop_front()
-                .unwrap_or(allowed)
-                .min(allowed);
-            for _ in 0..submit_count {
+            let submit_result = self.submit_results.pop_front().unwrap_or_else(|| {
+                NonZeroUsize::new(allowed).map_or(SubmitAttempt::Noop, SubmitAttempt::Submitted)
+            });
+            let SubmitAttempt::Submitted(scripted_submit_count) = submit_result else {
+                return Ok(submit_result);
+            };
+            let submit_count = scripted_submit_count.get().min(allowed);
+            let Some(submit_count) = NonZeroUsize::new(submit_count) else {
+                return Ok(SubmitAttempt::Noop);
+            };
+            for _ in 0..submit_count.get() {
                 let token = batch
                     .pop_front()
                     .expect("submit batch length must match queued tokens");
                 self.inflight.push_back(token);
             }
-            submit_count
+            Ok(SubmitAttempt::Submitted(submit_count))
         }
 
         fn wait_at_least(
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> Vec<(BackendToken, StdIoResult<usize>)> {
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(!self.panic_on_wait, "backend wait must not be called");
             assert!(
                 self.inflight.len() >= min_nr,
@@ -999,7 +1051,7 @@ mod tests {
             while let Some(token) = self.inflight.pop_front() {
                 completions.push((token, Ok(STORAGE_SECTOR_SIZE)));
             }
-            completions
+            Ok(completions)
         }
     }
 
@@ -1067,17 +1119,20 @@ mod tests {
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 0);
 
-        assert_eq!(driver.submit_ready(), 2);
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(2).unwrap())
+        );
         assert_eq!(driver.pending_len(), 2);
         assert_eq!(driver.submitted_len(), 2);
 
-        let first = driver.wait_at_least_one();
+        let first = driver.wait_at_least_one().unwrap();
         assert_eq!(first.submission.op.id, 1);
         assert_eq!(first.result.unwrap(), STORAGE_SECTOR_SIZE);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 1);
 
-        let second = driver.wait_at_least_one();
+        let second = driver.wait_at_least_one().unwrap();
         assert_eq!(second.submission.op.id, 2);
         assert_eq!(second.result.unwrap(), STORAGE_SECTOR_SIZE);
         assert_eq!(driver.pending_len(), 0);
@@ -1108,9 +1163,12 @@ mod tests {
                 .push(DriverSubmission::new(2, 43, STORAGE_SECTOR_SIZE))
                 .is_ok()
         );
-        assert_eq!(driver.submit_ready(), 2);
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(2).unwrap())
+        );
 
-        let first = driver.wait_at_least_one();
+        let first = driver.wait_at_least_one().unwrap();
         assert_eq!(first.submission.op.id, 1);
         assert_eq!(first.result.unwrap(), STORAGE_SECTOR_SIZE);
         assert_eq!(driver.pending_len(), 1);
@@ -1130,7 +1188,10 @@ mod tests {
         let mut driver = SubmissionDriver::new(DriverBackend::wait_panics(1));
 
         assert!(driver.push(DriverSubmission::new(1, 44, 0)).is_ok());
-        assert_eq!(driver.submit_ready(), 1);
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 1);
 
@@ -1153,27 +1214,109 @@ mod tests {
                 .is_ok()
         );
 
-        assert_eq!(driver.submit_ready(), 0);
+        assert_eq!(driver.submit_ready().unwrap(), SubmitAttempt::Noop);
         assert_eq!(driver.pending_len(), 2);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 0);
 
-        assert_eq!(driver.submit_ready(), 1);
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
         assert_eq!(driver.pending_len(), 2);
         assert_eq!(driver.submitted_len(), 1);
         assert_eq!(driver.available_capacity(), 0);
 
-        let first = driver.wait_at_least_one();
+        let first = driver.wait_at_least_one().unwrap();
         assert_eq!(first.submission.op.id, 1);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 1);
 
-        assert_eq!(driver.submit_ready(), 1);
-        let second = driver.wait_at_least_one();
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        let second = driver.wait_at_least_one().unwrap();
         assert_eq!(second.submission.op.id, 2);
         assert_eq!(driver.pending_len(), 0);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 2);
+    }
+
+    #[test]
+    fn test_submission_driver_keeps_submit_retry_staged() {
+        let mut driver = SubmissionDriver::new(DriverBackend::with_submit_outcomes(
+            2,
+            VecDeque::from([
+                SubmitAttempt::Retry(SubmitRetryReason::Eagain),
+                SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),
+            ]),
+        ));
+
+        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
+
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Retry(SubmitRetryReason::Eagain)
+        );
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 1);
+
+        driver.backoff_submit_retry();
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 1);
+    }
+
+    #[test]
+    fn test_submission_driver_retry_preserves_existing_inflight_work() {
+        let mut driver = SubmissionDriver::new(DriverBackend::with_submit_outcomes(
+            2,
+            VecDeque::from([
+                SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),
+                SubmitAttempt::Retry(SubmitRetryReason::Ebusy),
+                SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),
+            ]),
+        ));
+
+        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
+        assert!(
+            driver
+                .push(DriverSubmission::new(2, 42, STORAGE_SECTOR_SIZE))
+                .is_ok()
+        );
+
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        assert_eq!(driver.pending_len(), 2);
+        assert_eq!(driver.submitted_len(), 1);
+
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Retry(SubmitRetryReason::Ebusy)
+        );
+        assert_eq!(driver.pending_len(), 2);
+        assert_eq!(driver.submitted_len(), 1);
+
+        let first = driver.wait_at_least_one().unwrap();
+        assert_eq!(first.submission.op.id, 1);
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 0);
+
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        let second = driver.wait_at_least_one().unwrap();
+        assert_eq!(second.submission.op.id, 2);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
     }
 }

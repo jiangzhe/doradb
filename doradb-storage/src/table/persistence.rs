@@ -58,7 +58,7 @@ impl Drop for TransitionRoutePublicationGuard<'_> {
             // safely continue on those pages. Failure before cold-route
             // publication must poison storage rather than leave route waiters
             // blocked forever.
-            let _ = self.trx_sys.poison_storage(FatalError::CheckpointWrite);
+            let _ = self.trx_sys.poison_engine(FatalError::CheckpointWrite);
         }
     }
 }
@@ -1261,7 +1261,7 @@ impl Table {
             Ok(res) => res,
             Err(err) if err.kind() == ErrorKind::Io => {
                 let _ = trx.rollback().await;
-                let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
+                let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
                 return Err(poison.into());
             }
             Err(err) => {
@@ -1278,13 +1278,13 @@ impl Table {
         }
         #[cfg(test)]
         if test_hooks::test_force_post_publish_checkpoint_error_enabled() {
-            let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
+            let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
             discard_transaction_after_fatal_rollback(&mut trx);
             return Err(poison.into());
         }
 
         if trx.commit().await.is_err() {
-            let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
+            let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
             return Err(poison.into());
         }
         drop(publish_lease);
@@ -2398,7 +2398,7 @@ mod tests {
                 matches!(outcome, CheckpointOutcome::Published { silent: false, .. }),
                 "{outcome:?}"
             );
-            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
+            assert!(engine.inner().trx_sys.poison_error().is_none());
 
             let new_root = table.file().active_root_unchecked().clone();
             assert!(new_root.pivot_row_id > old_root.pivot_row_id);
@@ -3255,7 +3255,7 @@ mod tests {
             let poison_trx_sys = trx_sys.clone();
             let poison = async move {
                 Timer::after(Duration::from_millis(20)).await;
-                let poison = poison_trx_sys.poison_storage(FatalError::CheckpointWrite);
+                let poison = poison_trx_sys.poison_engine(FatalError::CheckpointWrite);
                 assert_eq!(*poison.current_context(), FatalError::CheckpointWrite);
             }
             .fuse();
@@ -3312,7 +3312,7 @@ mod tests {
             let poison = engine
                 .inner()
                 .trx_sys
-                .storage_poison_error()
+                .poison_error()
                 .expect("transition publication guard should poison storage");
             assert_eq!(*poison.current_context(), FatalError::CheckpointWrite);
 

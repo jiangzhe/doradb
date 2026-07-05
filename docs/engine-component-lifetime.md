@@ -27,6 +27,7 @@ The runtime uses an explicit owner/runtime split:
   - `components: ComponentRegistry`
 - `EngineInner` owns only crate-private shared runtime handles and the
   lifecycle gate:
+  - engine poisoner
   - catalog
   - transaction system
   - logical lock manager
@@ -45,21 +46,27 @@ indirect access to teardown-only owner state.
 Engine startup resolves storage paths, validates layout markers, then registers
 components in one fixed dependency order:
 
-1. `FileSystem`
-2. `DiskPool`
-3. `MetaPool`
-4. `IndexPool`
-5. `MemPool`
-6. `FileSystemWorkers`
-7. `SharedPoolEvictorWorkers`
-8. `LockManager`
-9. `Catalog`
-10. `TransactionSystem`
-11. `TransactionSystemWorkers`
+1. `EnginePoisoner`
+2. `FileSystem`
+3. `DiskPool`
+4. `MetaPool`
+5. `IndexPool`
+6. `MemPool`
+7. `FileSystemWorkers`
+8. `SharedPoolEvictorWorkers`
+9. `LockManager`
+10. `Catalog`
+11. `TransactionSystem`
+12. `TransactionSystemWorkers`
 
 `DiskPool` now depends on `FileSystem` directly because readonly-cache miss
 loads are dispatched through the shared storage worker rather than file-scoped
 wrappers.
+
+`EnginePoisoner` is registered first because runtime poison is engine-level
+admission state. Lower-level workers such as shared storage IO can poison the
+engine without depending on `TransactionSystem`, while transaction-system
+helpers continue to delegate to the same component during the migration.
 
 Registration order is the dependency order. Reverse registration order is both:
 
@@ -88,7 +95,9 @@ The two storage-runtime worker components currently own:
   - the shared storage-I/O thread;
   - shutdown sequencing for the three ingress lanes owned by `FileSystem`; and
   - the backend-owned completion lifecycle for table-file and evictable-pool
-    IO.
+    IO. Backend progress failures poison through `EnginePoisoner`; accepted
+    inflight operations are retained if the backend can no longer provide a
+    safe completion path.
 - `SharedPoolEvictorWorkers`
   - one shared eviction thread for the global readonly pool, `mem_pool`, and
     `index_pool`;

@@ -174,7 +174,11 @@ submits the configured seal sync policy through the redo backend driver. The
 new-file header and later data writes may be submitted before the old seal
 finishes, but transaction publication for the new file cannot pass the old-file
 seal barrier. Seal write failure poisons storage as `RedoWrite`; seal sync
-failure poisons storage as `RedoSync`.
+failure poisons storage as `RedoSync`. Backend-level submit or wait progress
+failures enter the same fatal cleanup path as redo completion failures:
+runtime admission is poisoned, pending precommit work is failed through ordered
+cleanup, and transaction waiters are completed only after required
+failed-precommit cleanup is queued.
 
 ## Serialization Rules
 

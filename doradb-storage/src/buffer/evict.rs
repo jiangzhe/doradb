@@ -674,6 +674,39 @@ impl EvictablePoolStateMachine {
     fn block_key(&self, page_id: PageID) -> BlockKey {
         BlockKey::new(self.file.file_id(), BlockID::from(u64::from(page_id)))
     }
+
+    /// Fail one not-yet-submitted pool request after backend progress failure.
+    #[inline]
+    pub(crate) fn fail_request_with_backend_error(
+        &mut self,
+        req: PoolRequest,
+        err: &Report<IoError>,
+    ) {
+        match req {
+            PoolRequest::Read(req) => {
+                let page_id = req.page_id();
+                req.fail(CompletionErrorKind::report_backend_io(
+                    err,
+                    format!("submit evict pool read: page_id={page_id}"),
+                ));
+            }
+            PoolRequest::BatchWrite(page_guards, done_ev) => {
+                for page_guard in page_guards {
+                    let page_id = page_guard.page_id();
+                    self.pool.inflight_io.fail_writeback(
+                        &self.pool.stats,
+                        page_guard,
+                        IoError::report_backend(
+                            err,
+                            format!("submit evict pool writeback: page_id={page_id}"),
+                        )
+                        .into(),
+                    );
+                }
+                drop(done_ev);
+            }
+        }
+    }
 }
 
 impl IOStateMachine for EvictablePoolStateMachine {

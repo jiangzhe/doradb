@@ -9,14 +9,15 @@ pub(crate) use self::seal::LogFileSealer;
 use crate::conf::TrxSysConfig;
 use crate::error::{
     CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, InternalError,
-    ResourceError, Result,
+    IoError, ResourceError, Result,
 };
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
-    CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats, IOBackendStatsHandle,
-    IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver,
+    BackendResult, CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats,
+    IOBackendStatsHandle, IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver,
+    SubmitAttempt, backend_failure, backend_report_summary,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -24,6 +25,7 @@ use crate::log::format::{
     serialize_redo_super_block,
 };
 use crate::map::FastHashMap;
+use crate::obs;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, GroupCommit, MutexGroupCommit,
@@ -569,13 +571,20 @@ where
     }
 
     #[inline]
-    fn submit_ready(&mut self) -> usize {
+    fn submit_ready(&mut self) -> BackendResult<SubmitAttempt> {
         self.driver.submit_ready()
     }
 
     #[inline]
-    fn wait_at_least_one(&mut self) -> LogWriteCompletion {
-        log_write_completion_from_completed(self.driver.wait_at_least_one())
+    fn backoff_submit_retry(&mut self) {
+        self.driver.backoff_submit_retry();
+    }
+
+    #[inline]
+    fn wait_at_least_one(&mut self) -> BackendResult<LogWriteCompletion> {
+        self.driver
+            .wait_at_least_one()
+            .map(log_write_completion_from_completed)
     }
 
     #[inline]
@@ -1183,7 +1192,9 @@ where
                 // `submit_io` can make progress.
                 self.advance_ordered_prefix(sealer);
             }
-            self.submit_io();
+            if self.submit_io(sealer) {
+                return;
+            }
             // This may wait for rotated-file seal I/O even when no prefix
             // group/header write is submitted. Rotated-file sealing is required
             // maintenance for ended files: completion performs the configured
@@ -1399,7 +1410,7 @@ where
             Err(reason) => {
                 *failure = Some(reason);
                 *ready = true;
-                let err = self.trx_sys.poison_storage(reason);
+                let err = self.trx_sys.poison_engine(reason);
                 self.fail_pending(sealer, err);
             }
         }
@@ -1535,7 +1546,7 @@ where
     /// capacity. Groups without redo bytes are ready as soon as they enter the
     /// prefix and are published by `advance_ordered_prefix`.
     #[inline]
-    fn submit_io(&mut self) {
+    fn submit_io(&mut self, sealer: &mut LogFileSealer) -> bool {
         let mut idx = 0;
         while idx < self.prefix.entries.len() {
             if self.write_driver.available_capacity() == 0 {
@@ -1556,7 +1567,40 @@ where
                 idx += 1;
             }
         }
-        self.write_driver.submit_ready();
+        match self.write_driver.submit_ready() {
+            Ok(SubmitAttempt::Noop) => {
+                if self.write_driver.submitted_len() == 0 && self.write_driver.pending_len() != 0 {
+                    self.write_driver.backoff_submit_retry();
+                }
+                false
+            }
+            Ok(SubmitAttempt::Submitted(_)) => false,
+            Ok(SubmitAttempt::Retry(reason)) => {
+                if self.write_driver.submitted_len() == 0 {
+                    obs::debug!(
+                        "event=redo_backend_submit_retry component=redo_log reason={} errno={} submitted={} pending={} action=backoff",
+                        reason,
+                        reason.raw_errno(),
+                        self.write_driver.submitted_len(),
+                        self.write_driver.pending_len()
+                    );
+                    self.write_driver.backoff_submit_retry();
+                } else {
+                    obs::debug!(
+                        "event=redo_backend_submit_retry component=redo_log reason={} errno={} submitted={} pending={} action=wait",
+                        reason,
+                        reason.raw_errno(),
+                        self.write_driver.submitted_len(),
+                        self.write_driver.pending_len()
+                    );
+                }
+                false
+            }
+            Err(err) => {
+                self.handle_backend_progress_error(sealer, FatalError::RedoWrite, err);
+                true
+            }
+        }
     }
 
     #[inline]
@@ -1591,7 +1635,13 @@ where
         if self.write_driver.submitted_len() == 0 {
             return;
         }
-        let completion = self.write_driver.wait_at_least_one();
+        let completion = match self.write_driver.wait_at_least_one() {
+            Ok(completion) => completion,
+            Err(err) => {
+                self.handle_backend_progress_error(sealer, FatalError::RedoWrite, err);
+                return;
+            }
+        };
         let entered_fatal = self.handle_write_completion(sealer, completion);
         if entered_fatal {
             return;
@@ -1601,6 +1651,49 @@ where
                 return;
             }
         }
+    }
+
+    #[inline]
+    fn handle_backend_progress_error(
+        &mut self,
+        sealer: &mut LogFileSealer,
+        reason: FatalError,
+        err: Report<IoError>,
+    ) {
+        let backend = backend_failure(&err);
+        let backend_name = backend.map_or("unknown", |failure| failure.backend());
+        let phase = backend
+            .map(|failure| failure.phase().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let raw_errno = backend.and_then(|failure| failure.raw_errno());
+        let error = backend_report_summary(&err);
+        obs::error!(
+            "event=redo_backend_progress_failure component=redo backend={} phase={} errno={:?} action=poison result=error error={}",
+            backend_name,
+            phase,
+            raw_errno,
+            error
+        );
+        let poison = self.trx_sys.poison_engine_with_context(
+            reason,
+            "redo",
+            format!("backend progress failure: {error}"),
+        );
+        self.fail_pending(sealer, poison);
+    }
+
+    #[inline]
+    fn fail_pending_if_poisoned(
+        &mut self,
+        sealer: &mut LogFileSealer,
+        poison: Option<FatalError>,
+    ) -> bool {
+        let Some(reason) = poison else {
+            return false;
+        };
+        let err = self.trx_sys.poison_engine(reason);
+        self.fail_pending(sealer, err);
+        true
     }
 
     #[inline]
@@ -1634,9 +1727,7 @@ where
                     .prefix_id
                     .expect("redo header request must carry a prefix entry id");
                 self.complete_header_request(prefix_id, poison);
-                if let Some(source) = poison {
-                    let err = self.trx_sys.poison_storage(source);
-                    self.fail_pending(sealer, err);
+                if self.fail_pending_if_poisoned(sealer, poison) {
                     return true;
                 }
             }
@@ -1652,9 +1743,7 @@ where
                     buf.expect("redo group write completion must return a buffer"),
                     poison,
                 );
-                if let Some(source) = poison {
-                    let err = self.trx_sys.poison_storage(source);
-                    self.fail_pending(sealer, err);
+                if self.fail_pending_if_poisoned(sealer, poison) {
                     return true;
                 }
             }
@@ -1666,9 +1755,7 @@ where
                     .prefix_id
                     .expect("redo sync request must carry a prefix entry id");
                 self.complete_sync_request(prefix_id, poison);
-                if let Some(source) = poison {
-                    let err = self.trx_sys.poison_storage(source);
-                    self.fail_pending(sealer, err);
+                if self.fail_pending_if_poisoned(sealer, poison) {
                     return true;
                 }
             }
@@ -1679,10 +1766,8 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo seal write request must carry a prefix entry id");
-                if let Some(reason) = self.complete_seal_write_request(prefix_id, log_file, poison)
-                {
-                    let err = self.trx_sys.poison_storage(reason);
-                    self.fail_pending(sealer, err);
+                let poison = self.complete_seal_write_request(prefix_id, log_file, poison);
+                if self.fail_pending_if_poisoned(sealer, poison) {
                     return true;
                 }
             }
@@ -1693,9 +1778,8 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo seal sync request must carry a prefix entry id");
-                if let Some(reason) = self.complete_seal_sync_request(prefix_id, log_file, poison) {
-                    let err = self.trx_sys.poison_storage(reason);
-                    self.fail_pending(sealer, err);
+                let poison = self.complete_seal_sync_request(prefix_id, log_file, poison);
+                if self.fail_pending_if_poisoned(sealer, poison) {
                     return true;
                 }
             }
@@ -2416,13 +2500,16 @@ mod tests {
     ) {
         let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
         assert!(write_driver.push_write(header_write).is_ok());
-        assert_eq!(write_driver.submit_ready(), 1);
+        assert_eq!(
+            write_driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(std::num::NonZeroUsize::new(1).unwrap())
+        );
         let LogWriteCompletion {
             owner,
             kind,
             buf,
             poison,
-        } = write_driver.wait_at_least_one();
+        } = write_driver.wait_at_least_one().unwrap();
         match kind {
             LogWriteKind::Header { completion } => {
                 drop(buf.expect("redo header write completion must return a buffer"));
@@ -2767,7 +2854,7 @@ mod tests {
         while !writer.prefix.is_empty() {
             writer.advance_ordered_prefix(sealer);
             writer.shrink_prefix_if_sparse();
-            writer.submit_io();
+            assert!(!writer.submit_io(sealer));
             writer.wait_and_drain_io_if_submitted(sealer);
             writer.advance_ordered_prefix(sealer);
             writer.shrink_prefix_if_sparse();
@@ -2827,6 +2914,7 @@ mod tests {
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
         let trx_sys = TransactionSystem::new(
             config,
+            engine.inner().engine_poisoner.clone(),
             engine.inner().catalog.clone(),
             engine.inner().table_fs.clone(),
             CachePadded::new(redo_log),
@@ -3191,7 +3279,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
             );
@@ -3313,22 +3401,29 @@ mod tests {
             batch.push_back(*prepared);
         }
 
-        fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
+        fn submit_batch(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            limit: usize,
+        ) -> BackendResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
+            let Some(accepted) = std::num::NonZeroUsize::new(submit_count) else {
+                return Ok(SubmitAttempt::Noop);
+            };
             for _ in 0..submit_count {
                 let token = batch
                     .pop_front()
                     .expect("submit batch length must match queued tokens");
                 self.inflight.push_back(token);
             }
-            submit_count
+            Ok(SubmitAttempt::Submitted(accepted))
         }
 
         fn wait_at_least(
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> Vec<(BackendToken, StdIoResult<usize>)> {
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(
                 self.inflight.len() >= min_nr,
                 "test backend requires enough inflight work to satisfy wait"
@@ -3338,17 +3433,17 @@ mod tests {
                 .pop_front()
                 .unwrap_or(LogTestCompletionBatch::AllFront)
             {
-                LogTestCompletionBatch::AllFront => self
+                LogTestCompletionBatch::AllFront => Ok(self
                     .inflight
                     .drain(..)
                     .map(|(token, kind)| (token, Ok(log_test_completion_len(kind))))
-                    .collect(),
+                    .collect()),
                 LogTestCompletionBatch::OneBack => {
                     let (token, kind) = self
                         .inflight
                         .pop_back()
                         .expect("test backend must have one back completion");
-                    vec![(token, Ok(log_test_completion_len(kind)))]
+                    Ok(vec![(token, Ok(log_test_completion_len(kind)))])
                 }
             }
         }
@@ -3411,10 +3506,10 @@ mod tests {
                         REDO_DEFAULT_DATA_START_OFFSET + 4096,
                     ));
 
-                writer.submit_io();
+                assert!(!writer.submit_io(&mut sealer));
                 writer.wait_and_drain_io_if_submitted(&mut sealer);
                 writer.advance_ordered_prefix(&mut sealer);
-                writer.submit_io();
+                assert!(!writer.submit_io(&mut sealer));
                 writer.wait_and_drain_io_if_submitted(&mut sealer);
                 writer.advance_ordered_prefix(&mut sealer);
 
@@ -3508,7 +3603,7 @@ mod tests {
                         REDO_DEFAULT_DATA_START_OFFSET + 4096,
                     ));
 
-                writer.submit_io();
+                assert!(!writer.submit_io(&mut sealer));
                 writer.wait_and_drain_io_if_submitted(&mut sealer);
                 writer.advance_ordered_prefix(&mut sealer);
 
@@ -3662,7 +3757,7 @@ mod tests {
                     &mut write_driver,
                 );
                 fp.fetch_io_reqs();
-                fp.submit_io();
+                assert!(!fp.submit_io(&mut sealer));
 
                 assert_eq!(
                     hook.submits(),
@@ -4018,7 +4113,7 @@ mod tests {
             assert!(
                 harness
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
             );
@@ -4060,7 +4155,7 @@ mod tests {
             assert!(
                 harness
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
             );
@@ -4102,7 +4197,7 @@ mod tests {
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             sealer.seal_active_file_best_effort(&harness.trx_sys, &mut write_driver);
 
-            assert!(harness.trx_sys.storage_poison_error().is_none());
+            assert!(harness.trx_sys.poison_error().is_none());
             assert_eq!(
                 harness
                     .trx_sys
@@ -4707,13 +4802,16 @@ mod tests {
                         .is_ok()
                 );
             }
-            assert_eq!(write_driver.submit_ready(), 1);
+            assert_eq!(
+                write_driver.submit_ready().unwrap(),
+                SubmitAttempt::Submitted(std::num::NonZeroUsize::new(1).unwrap())
+            );
             let LogWriteCompletion {
                 owner,
                 kind,
                 buf,
                 poison,
-            } = write_driver.wait_at_least_one();
+            } = write_driver.wait_at_least_one().unwrap();
             match kind {
                 LogWriteKind::Group { .. } => {
                     drop(buf.expect("redo group write completion must return a buffer"));

@@ -598,7 +598,7 @@ impl Table {
             // transactions are no longer active.
             trx_sys.ensure_runtime_healthy()?;
             if trx_sys.published_gc_horizon_epoch() == observed_epoch {
-                let poison_listener = trx_sys.storage_poison_listener();
+                let poison_listener = trx_sys.poison_listener();
                 // Re-check after listener registration so poison that fired in
                 // the pre-registration gap is observed before sleeping.
                 trx_sys.ensure_runtime_healthy()?;
@@ -1581,7 +1581,7 @@ pub(crate) mod tests {
             engine
                 .inner()
                 .trx_sys
-                .storage_poison_error()
+                .poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::CheckpointWrite)
         );

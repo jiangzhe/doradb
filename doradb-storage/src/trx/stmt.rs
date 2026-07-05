@@ -686,7 +686,7 @@ impl<'stmt> Statement<'stmt> {
             engine.trx_sys.retain_fatal_rollback(retention);
             return Err(engine
                 .trx_sys
-                .poison_storage(FatalError::RollbackAccess)
+                .poison_engine(FatalError::RollbackAccess)
                 .into());
         }
         if self
@@ -699,7 +699,7 @@ impl<'stmt> Statement<'stmt> {
             engine.trx_sys.retain_fatal_rollback(retention);
             return Err(engine
                 .trx_sys
-                .poison_storage(FatalError::RollbackAccess)
+                .poison_engine(FatalError::RollbackAccess)
                 .into());
         }
         self.effects.clear_redo();
@@ -986,7 +986,7 @@ pub(crate) mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
             );

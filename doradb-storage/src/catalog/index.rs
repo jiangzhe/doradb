@@ -1474,7 +1474,7 @@ fn poison_index_after_catalog_commit_with_source(
         IndexDdlKind::Create => "create index",
         IndexDdlKind::Drop => "drop index",
     };
-    let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
+    let poison = engine.trx_sys.poison_engine(FatalError::Poisoned);
     source
         .into_report()
         .change_context(*poison.current_context())

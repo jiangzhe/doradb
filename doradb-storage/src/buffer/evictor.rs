@@ -1007,6 +1007,7 @@ mod tests {
     };
     use crate::component::{ComponentRegistry, DiskPoolConfig, IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
+    use crate::engine_poison::EnginePoisoner;
     use crate::error::FileKind;
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::fs::{FileSystem, FileSystemWorkers};
@@ -1265,6 +1266,7 @@ mod tests {
                 let file = FileSystemConfig::default()
                     .data_dir(root)
                     .readonly_buffer_size(frame_page_bytes(256));
+                builder.build::<EnginePoisoner>(()).await.unwrap();
                 builder.build::<FileSystem>(file.clone()).await.unwrap();
                 builder
                     .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
