@@ -617,9 +617,11 @@ impl TransactionSystem {
     /// The first caller wins: later poison attempts keep returning the already
     /// recorded reason. The reason is stored before the atomic flag is published
     /// so a thread that observes `storage_poisoned == true` can immediately load
-    /// a meaningful error. This method intentionally does not wake or stop worker
-    /// threads; callers that hit an unrecoverable background failure should
-    /// return from their worker loop after poisoning.
+    /// a meaningful error. The first poison also performs a one-shot wake for
+    /// storage-poison listeners and waiters, such as `storage_poison_listener`
+    /// and `wait_transition_route_or_poison`. This method intentionally does not
+    /// stop worker threads; callers that hit an unrecoverable background failure
+    /// should return from their worker loop after poisoning.
     #[inline]
     pub(crate) fn poison_storage(&self, reason: FatalError) -> Report<FatalError> {
         {

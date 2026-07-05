@@ -1,7 +1,7 @@
 ---
 id: 000212
 title: Introduce Observability Logging
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-04
 github_issue: 817
 ---
@@ -292,6 +292,30 @@ not widen unsafe contracts or alter memory/lifetime invariants.
       guards.
 
 ## Implementation Notes
+
+- Implemented the crate-private `obs` facade over the Rust `log` facade, added
+  direct workspace/crate `log` dependency wiring, and kept logger installation
+  out of the storage library.
+- Added `docs/observability-logging.md` and routed production observability
+  call sites through `obs::...!` for engine/component lifecycle, named worker
+  lifecycle and failures, storage poison publication, recovery phases,
+  checkpoint outcomes, and selected shared I/O or evictor worker failure
+  boundaries.
+- Replaced production library `eprintln!` usage under `doradb-storage/src`.
+  Direct redo-log `crate::log` references remain unchanged; direct
+  observability `log::...!` macro calls are avoided outside the facade.
+- Review follow-up: corrected the `poison_storage` method docs to state that
+  first poison performs a one-shot wake for storage-poison listeners/waiters
+  while still not stopping worker threads.
+- Validation passed:
+  `tools/style_audit.rs --diff-base origin/main`;
+  `cargo nextest run -p doradb-storage` (1191 tests);
+  `rg -n "eprintln!" doradb-storage/src` (no matches); narrowed direct
+  observability macro search for `log::...!` call sites (no matches); concrete
+  logger dependency search (no matches).
+- Alternate `libaio` validation was not run because backend-neutral I/O changes
+  were limited to ordinary observability logging and did not alter backend
+  behavior.
 
 ## Impacts
 
