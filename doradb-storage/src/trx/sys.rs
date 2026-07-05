@@ -34,6 +34,7 @@ use flume::{Receiver, Sender};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeMap;
 use std::mem::{forget, take};
+use std::panic::resume_unwind;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -292,11 +293,19 @@ impl TransactionBackgroundWorkers {
         // committed-payload handoff and no new failed-precommit cleanup job can
         // be produced by redo.
         if let Some(handle) = self.log_thread.lock().take() {
-            let _ = handle.join().inspect_err(|_| {
+            match handle.join().inspect_err(|_| {
                 obs::error!(
                     "event=worker_shutdown component=trx worker=Log-Thread action=join result=error reason=panic"
                 );
-            });
+            }) {
+                Ok(()) => {}
+                Err(payload) => {
+                    // Known redo failures poison storage before thread exit. A
+                    // join panic is an invariant failure; do not downgrade it
+                    // to a successful shutdown.
+                    resume_unwind(payload);
+                }
+            }
         }
 
         // Cleanup can update GC bucket state while rolling back failed,
@@ -310,11 +319,18 @@ impl TransactionBackgroundWorkers {
             );
         }
         if let Some(handle) = self.cleanup_thread.lock().take() {
-            let _ = handle.join().inspect_err(|_| {
+            match handle.join().inspect_err(|_| {
                 obs::error!(
                     "event=worker_shutdown component=trx worker=Trx-Cleanup-Thread action=join result=error reason=panic"
                 );
-            });
+            }) {
+                Ok(()) => {}
+                Err(payload) => {
+                    // Cleanup handles known messages explicitly. A thread panic
+                    // means its ownership invariants may be broken.
+                    resume_unwind(payload);
+                }
+            }
         }
 
         // Purge receives non-lossy committed-payload batches from redo. Its
@@ -330,11 +346,16 @@ impl TransactionBackgroundWorkers {
         }
         let purge_threads = { take(&mut *self.purge_threads.lock()) };
         for handle in purge_threads {
-            let _ = handle.join().inspect_err(|_| {
+            if let Err(payload) = handle.join().inspect_err(|_| {
                 obs::error!(
                     "event=worker_shutdown component=trx worker=purge action=join result=error reason=panic"
                 );
-            });
+            }) {
+                // Purge known failures should be represented before thread
+                // exit. A join panic is an invariant failure that must remain
+                // visible to the owner.
+                resume_unwind(payload);
+            }
         }
 
         // Close the active redo file last. Redo has stopped using it, and

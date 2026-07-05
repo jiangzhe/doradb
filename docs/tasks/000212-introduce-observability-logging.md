@@ -269,9 +269,18 @@ not widen unsafe contracts or alter memory/lifetime invariants.
       boundary. Avoid separate helper functions whose only job is result
       logging unless they are shared by multiple call sites or materially
       improve readability.
-    - For production worker-owner join paths where shutdown or drop is already
-      best-effort, log join panics with `inspect_err` and ignore the join
-      result. Keep test joins strict so worker panics still fail tests.
+    - For known errors, keep the existing handling path and add logging at the
+      boundary; for example, redo and I/O failures should continue through
+      completion, channel, or poison-state results as appropriate.
+    - For unknown or unexpected non-invariant errors, log explicit local context
+      and poison the engine with a message that makes the case actionable.
+    - For invariant failures, panic remains the correct behavior because the
+      system state may no longer be recoverable. Production worker-owner join
+      paths should use `inspect_err` for the log side effect, then propagate the
+      original panic payload instead of converting it to storage poison or a
+      successful shutdown. Drop paths may log and skip rethrowing only while the
+      current thread is already panicking to avoid a double-panic abort.
+      Keep test joins strict so worker panics still fail tests.
     - Keep free-form errors at the end as `error=...`.
 
 11. Validate with code review and commands.

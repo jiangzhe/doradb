@@ -1185,14 +1185,19 @@ impl ReadonlyRuntime {
     fn drop_resident_page(&self, mut page_guard: PageExclusiveGuard<Page>) {
         let frame_id = page_guard.page_id();
         let frame = page_guard.bf_mut();
-        if frame.kind() != FrameKind::Evicting {
-            return;
-        }
+        let frame_kind = frame.kind();
+        assert!(
+            frame_kind == FrameKind::Evicting,
+            "readonly evictor expected evicting frame: frame_id={frame_id}, actual_kind={frame_kind:?}"
+        );
 
         if let Some((file_id, block_id)) = frame.persisted_block_key() {
             let key = BlockKey::new(file_id, block_id);
             if let Some((_, mapped_frame_id)) = self.pool.mappings.remove(&key) {
-                debug_assert_eq!(mapped_frame_id, frame_id);
+                assert!(
+                    mapped_frame_id == frame_id,
+                    "readonly evictor mapping frame mismatch: key={key:?}, expected_frame_id={frame_id}, mapped_frame_id={mapped_frame_id}"
+                );
             }
         }
 
@@ -1200,14 +1205,23 @@ impl ReadonlyRuntime {
         frame.set_dirty(false);
         frame.bump_generation();
         let prev = frame.compare_exchange_kind(FrameKind::Evicting, FrameKind::Uninitialized);
-        debug_assert_eq!(prev, FrameKind::Evicting);
+        assert!(
+            prev == FrameKind::Evicting,
+            "readonly evictor failed evicting-to-uninitialized transition: frame_id={frame_id}, actual_kind={prev:?}"
+        );
         page_guard.page_mut().zero();
         // SAFETY: page pointer belongs to frame arena and has page-sized length.
         unsafe {
-            let _ = madvise_dontneed(page_guard.page_mut() as *mut Page as *mut u8, PAGE_SIZE);
+            assert!(
+                madvise_dontneed(page_guard.page_mut() as *mut Page as *mut u8, PAGE_SIZE),
+                "readonly evictor madvise_dontneed failed: frame_id={frame_id}"
+            );
         }
         drop(page_guard);
-        let _ = self.pool.residency.move_resident_to_free(frame_id);
+        assert!(
+            self.pool.residency.move_resident_to_free(frame_id),
+            "readonly evictor failed to move resident frame to free list: frame_id={frame_id}"
+        );
     }
 }
 
@@ -2271,6 +2285,48 @@ pub(crate) mod tests {
 
         assert_eq!(global.try_get_frame_id(&catalog_key), Some(test_page_id(1)));
         assert_eq!(global.try_get_frame_id(&user_key), Some(test_page_id(2)));
+    }
+
+    #[test]
+    #[should_panic(expected = "readonly evictor mapping frame mismatch")]
+    fn test_readonly_evictor_panics_on_mapping_frame_mismatch() {
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).pool_guard();
+        let key = BlockKey::new(test_file_id(301), test_block_id(11));
+        let frame_id = test_page_id(1);
+        let mut page_guard = global
+            .try_lock_page_exclusive(&global_guard, frame_id)
+            .unwrap();
+        global.bind_frame(key, &mut page_guard).unwrap();
+        global.mappings.insert(key, test_page_id(2));
+        page_guard.bf_mut().set_kind(FrameKind::Evicting);
+        let runtime = ReadonlyRuntime {
+            arena: global.arena.arena_guard(global.pool_guard()),
+            pool: global.guard().into_sync(),
+        };
+
+        runtime.drop_resident_page(page_guard);
+    }
+
+    #[test]
+    #[should_panic(expected = "readonly evictor failed to move resident frame to free list")]
+    fn test_readonly_evictor_panics_when_residency_entry_missing() {
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).pool_guard();
+        let key = BlockKey::new(test_file_id(302), test_block_id(12));
+        let frame_id = test_page_id(1);
+        let mut page_guard = global
+            .try_lock_page_exclusive(&global_guard, frame_id)
+            .unwrap();
+        global.bind_frame(key, &mut page_guard).unwrap();
+        assert!(global.residency.move_resident_to_free(frame_id));
+        page_guard.bf_mut().set_kind(FrameKind::Evicting);
+        let runtime = ReadonlyRuntime {
+            arena: global.arena.arena_guard(global.pool_guard()),
+            pool: global.guard().into_sync(),
+        };
+
+        runtime.drop_resident_page(page_guard);
     }
 
     #[test]

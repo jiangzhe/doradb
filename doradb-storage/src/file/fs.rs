@@ -40,6 +40,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
 use std::mem::replace;
+use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -1340,11 +1341,19 @@ impl Component for FileSystemWorkers {
     fn shutdown(component: &Self::Owned) {
         component.fs.shutdown_io_clients();
         if let Some(handle) = component.handle.lock().take() {
-            let _ = handle.join().inspect_err(|_| {
+            match handle.join().inspect_err(|_| {
                 obs::error!(
                     "event=worker_shutdown component=io worker=IO-Thread action=join result=error reason=panic"
                 );
-            });
+            }) {
+                Ok(()) => {}
+                Err(payload) => {
+                    // IO request failures are reported through their
+                    // completions. A worker panic indicates broken IO-thread
+                    // invariants.
+                    resume_unwind(payload);
+                }
+            }
         }
     }
 }
