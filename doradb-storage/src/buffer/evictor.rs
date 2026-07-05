@@ -6,6 +6,7 @@ use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Result;
 use crate::id::PageID;
+use crate::obs;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::thread;
 use crate::{DiskPool, IndexPool, MemPool};
@@ -14,6 +15,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ops::{Range, RangeFrom, RangeTo};
+use std::panic::resume_unwind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -840,7 +842,19 @@ impl Component for SharedPoolEvictorWorkers {
         component.mem_pool.signal_shutdown();
         component.wake_event.notify(usize::MAX);
         if let Some(handle) = component.evict_thread.lock().take() {
-            handle.join().unwrap();
+            match handle.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=buffer worker=Shared-Pool-Evictor action=join result=error reason=panic"
+                );
+            }) {
+                Ok(()) => {}
+                Err(payload) => {
+                    // Eviction errors are handled through pool state machines.
+                    // A worker panic is an invariant failure in shared pool
+                    // eviction.
+                    resume_unwind(payload);
+                }
+            }
         }
     }
 }

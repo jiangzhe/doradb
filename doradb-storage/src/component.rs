@@ -1,6 +1,7 @@
 use crate::buffer::{EvictableBufferPool, FixedBufferPool, ReadonlyBufferPool};
 use crate::error::{Error, InternalError, Result};
 use crate::map::FastHashMap;
+use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use error_stack::Report;
 use std::any::{Any, TypeId};
@@ -58,6 +59,8 @@ pub(crate) trait Supplier<Down: Component>: Component {
 }
 
 trait ErasedComponentBox: Send + Sync {
+    fn name(&self) -> &'static str;
+
     fn shutdown(&self);
 }
 
@@ -66,6 +69,11 @@ struct TypedComponentBox<C: Component> {
 }
 
 impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        C::NAME
+    }
+
     #[inline]
     fn shutdown(&self) {
         C::shutdown(&self.owner);
@@ -179,7 +187,16 @@ impl ComponentRegistry {
             return;
         }
         for component in self.boxed_vec.iter().rev() {
+            let component_name = component.name();
+            obs::info!(
+                "event=component_lifecycle component=engine storage_component={} action=shutdown_start result=ok",
+                component_name
+            );
             component.shutdown();
+            obs::info!(
+                "event=component_lifecycle component=engine storage_component={} action=shutdown_finish result=ok",
+                component_name
+            );
         }
     }
 }
@@ -328,7 +345,25 @@ impl RegistryBuilder {
             .as_mut()
             .expect("registry builder is armed until finish");
         let shelf = self.shelf.scope::<C>();
-        C::build(config, registry, shelf).await
+        obs::info!(
+            "event=component_lifecycle component=engine storage_component={} action=build_start result=ok",
+            C::NAME
+        );
+        C::build(config, registry, shelf)
+            .await
+            .inspect(|_| {
+                obs::info!(
+                    "event=component_lifecycle component=engine storage_component={} action=build_finish result=ok",
+                    C::NAME
+                );
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=component_lifecycle component=engine storage_component={} action=build_finish result=error error={}",
+                    C::NAME,
+                    err
+                );
+            })
     }
 
     /// Finishes the builder and returns the completed registry.

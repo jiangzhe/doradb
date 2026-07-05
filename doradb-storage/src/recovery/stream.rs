@@ -11,6 +11,7 @@ use crate::log::format::{
     is_zero_redo_block, select_redo_super_block,
 };
 use crate::log::{RedoLogFileDescriptor, next_redo_file_seq};
+use crate::obs;
 use crate::serde::Deser;
 use crate::thread as doradb_thread;
 use error_stack::Report;
@@ -20,8 +21,9 @@ use std::fs::File;
 use std::io::{ErrorKind as IoErrorKind, Read, Result as IoResult};
 use std::mem::take;
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::resume_unwind;
 use std::path::PathBuf;
-use std::thread::{JoinHandle, yield_now};
+use std::thread::{JoinHandle, panicking, yield_now};
 use std::time::Duration;
 
 const REDO_READ_AHEAD_SEND_TIMEOUT: Duration = Duration::from_millis(100);
@@ -838,7 +840,26 @@ impl Drop for RedoReadAheadHandle {
     fn drop(&mut self) {
         let _ = self.stop.try_send(());
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            match join.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=recovery worker=Redo-ReadAhead action=join result=error reason=panic"
+                );
+            }) {
+                Ok(()) => {}
+                Err(payload) => {
+                    // Known read-ahead failures are emitted as
+                    // RedoReadItem::Error. A join panic is an invariant
+                    // failure. During unwinding we only log it to avoid
+                    // aborting on a second panic from Drop.
+                    if panicking() {
+                        obs::error!(
+                            "event=worker_shutdown component=recovery worker=Redo-ReadAhead action=join result=ignored reason=caller_panicking"
+                        );
+                    } else {
+                        resume_unwind(payload);
+                    }
+                }
+            }
         }
     }
 }
@@ -933,6 +954,10 @@ impl RedoReadAheadWorker {
                 }
                 Ok(false) => {}
                 Err(err) => {
+                    obs::error!(
+                        "event=worker_failure component=recovery worker=Redo-ReadAhead action=read_ahead result=error error={}",
+                        err
+                    );
                     let _ = worker.send_item(RedoReadItem::Error(err));
                 }
             }

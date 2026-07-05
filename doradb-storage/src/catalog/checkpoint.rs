@@ -7,6 +7,7 @@ use crate::error::{DataIntegrityError, Error, ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
+use crate::obs;
 use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use error_stack::Report;
@@ -360,32 +361,53 @@ impl Catalog {
         &self,
         trx_sys: &TransactionSystem,
     ) -> Result<CatalogCheckpointOutcome> {
-        let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
-        let _redo_retention_lease = trx_sys.begin_redo_retention().await;
-        let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
-        let batch = self
-            .scan_checkpoint_batch(trx_sys.persisted_watermark_cts(), scan_cfg)
-            .await?;
-        let publishable_progress = batch.redo_retention_progress();
-        match self.apply_checkpoint_batch(batch).await {
-            Ok(CatalogCheckpointOutcome::Published {
-                catalog_replay_start_ts,
-            }) => {
-                if let Some(progress) = publishable_progress {
-                    debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
-                    trx_sys.record_catalog_redo_retention_progress(progress);
-                }
-                trx_sys.request_dropped_table_purge();
+        obs::info!("event=checkpoint_publish component=catalog action=start result=ok");
+        async {
+            let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
+            let _redo_retention_lease = trx_sys.begin_redo_retention().await;
+            let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
+            let batch = self
+                .scan_checkpoint_batch(trx_sys.persisted_watermark_cts(), scan_cfg)
+                .await?;
+            let publishable_progress = batch.redo_retention_progress();
+            match self.apply_checkpoint_batch(batch).await {
                 Ok(CatalogCheckpointOutcome::Published {
                     catalog_replay_start_ts,
-                })
+                }) => {
+                    if let Some(progress) = publishable_progress {
+                        debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
+                        trx_sys.record_catalog_redo_retention_progress(progress);
+                    }
+                    trx_sys.request_dropped_table_purge();
+                    Ok(CatalogCheckpointOutcome::Published {
+                        catalog_replay_start_ts,
+                    })
+                }
+                Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
+                Err(err) if err.kind() == ErrorKind::Io => {
+                    Err(trx_sys.poison_storage(FatalError::CheckpointWrite).into())
+                }
+                Err(err) => Err(err),
             }
-            Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
-            Err(err) if err.kind() == ErrorKind::Io => {
-                Err(trx_sys.poison_storage(FatalError::CheckpointWrite).into())
-            }
-            Err(err) => Err(err),
         }
+        .await
+        .inspect(|outcome| match outcome {
+            CatalogCheckpointOutcome::Published {
+                catalog_replay_start_ts,
+            } => obs::info!(
+                "event=checkpoint_publish component=catalog action=publish result=ok catalog_replay_start_ts={}",
+                catalog_replay_start_ts
+            ),
+            CatalogCheckpointOutcome::Noop => obs::debug!(
+                "event=checkpoint_publish component=catalog action=publish result=skipped reason=noop"
+            ),
+        })
+        .inspect_err(|err| {
+            obs::error!(
+                "event=checkpoint_publish component=catalog action=publish result=error error={}",
+                err
+            );
+        })
     }
 
     /// Scan persisted redo logs and collect one safe catalog checkpoint batch.

@@ -14,6 +14,7 @@ use crate::index::disk_tree::{
 use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
 use crate::log::redo::DDLRedo;
 use crate::lwc::PersistedLwcBlock;
+use crate::obs;
 use crate::row::RowPage;
 use crate::session::SessionPin;
 use crate::table::{CheckpointCancelReason, Table, TableRedoReplayFloor, TableRuntimeLayout};
@@ -984,6 +985,43 @@ impl Table {
 
     /// Execute one user-table checkpoint attempt.
     pub(crate) async fn checkpoint(&self, session: SessionPin) -> Result<CheckpointOutcome> {
+        let table_id = self.table_id();
+        self.checkpoint_inner(session)
+            .await
+            .inspect(|outcome| match outcome {
+                CheckpointOutcome::Published {
+                    checkpoint_ts,
+                    silent,
+                } => obs::info!(
+                    "event=checkpoint_publish component=table table_id={} action=publish result=ok checkpoint_ts={} silent={}",
+                    table_id,
+                    checkpoint_ts,
+                    silent
+                ),
+                CheckpointOutcome::Delayed { reason } => obs::warn!(
+                    "event=checkpoint_publish component=table table_id={} action=delay result=delayed effective_ts={} min_active_sts={}",
+                    table_id,
+                    reason.effective_ts,
+                    reason.min_active_sts
+                ),
+                CheckpointOutcome::Cancelled { reason } => obs::warn!(
+                    "event=checkpoint_publish component=table table_id={} action=cancel result=cancelled reason={:?}",
+                    table_id,
+                    reason
+                ),
+            })
+            .inspect_err(|err| {
+                if err.kind() == ErrorKind::Fatal {
+                    obs::error!(
+                        "event=checkpoint_publish component=table table_id={} action=publish result=error error={}",
+                        table_id,
+                        err
+                    );
+                }
+            })
+    }
+
+    async fn checkpoint_inner(&self, session: SessionPin) -> Result<CheckpointOutcome> {
         if session.in_trx(CHECKPOINT_REQUIRES_IDLE_SESSION)? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach(CHECKPOINT_REQUIRES_IDLE_SESSION)

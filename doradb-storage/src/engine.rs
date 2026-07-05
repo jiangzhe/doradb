@@ -15,6 +15,7 @@ use crate::error::{LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
 use crate::lock::LockManager;
+use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::session::{Session, SessionRegistry};
 use crate::trx::sys::TransactionSystem;
@@ -330,11 +331,20 @@ impl Engine {
     #[inline]
     pub fn try_shutdown(&self) -> Result<()> {
         let inner = self.inner();
+        if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+            return Ok(());
+        }
+        obs::info!(
+            "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=try"
+        );
         inner.lifecycle.close_admission();
         inner.lifecycle.wait_for_admissions_drained();
 
         let _shutdown = inner.lifecycle.shutdown_lock.lock();
         if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+            obs::info!(
+                "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try already_shutdown=true"
+            );
             return Ok(());
         }
 
@@ -345,11 +355,21 @@ impl Engine {
             let busy = (strong_count - 1)
                 .max(active_transactions)
                 .max(queued_cleanup);
+            obs::warn!(
+                "event=engine_lifecycle component=engine action=shutdown_finish result=busy mode=try busy={} strong_refs={} active_transactions={} queued_cleanup={}",
+                busy,
+                strong_count - 1,
+                active_transactions,
+                queued_cleanup
+            );
             return Err(Report::new(LifecycleError::ShutdownBusy)
                 .attach(busy)
                 .into());
         }
         self.finish_shutdown_locked(inner);
+        obs::info!(
+            "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=try"
+        );
         Ok(())
     }
 
@@ -362,6 +382,12 @@ impl Engine {
     #[inline]
     pub fn shutdown(&self) -> Result<()> {
         let inner = self.inner();
+        if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+            return Ok(());
+        }
+        obs::info!(
+            "event=engine_lifecycle component=engine action=shutdown_start result=ok mode=wait"
+        );
         inner.lifecycle.close_admission();
         inner.lifecycle.wait_for_admissions_drained();
 
@@ -370,6 +396,9 @@ impl Engine {
 
             let _shutdown = inner.lifecycle.shutdown_lock.lock();
             if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
+                obs::info!(
+                    "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait already_shutdown=true"
+                );
                 return Ok(());
             }
 
@@ -379,6 +408,9 @@ impl Engine {
             let strong_count = Arc::strong_count(inner);
             if strong_count == 1 && active_transactions == 0 && queued_cleanup == 0 {
                 self.finish_shutdown_locked(inner);
+                obs::info!(
+                    "event=engine_lifecycle component=engine action=shutdown_finish result=ok mode=wait"
+                );
                 return Ok(());
             }
             drop(_shutdown);
@@ -442,6 +474,10 @@ impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
         if let Err(err) = self.try_shutdown() {
+            obs::error!(
+                "event=engine_lifecycle component=engine action=shutdown_finish result=error mode=drop error={}",
+                err
+            );
             if err.lifecycle_error() == Some(LifecycleError::ShutdownBusy) {
                 // Fatal owner-drop violations still need to stop background
                 // workers, but the owner registry cannot be dropped while
@@ -673,6 +709,22 @@ impl EngineConfig {
     /// Build the storage engine and all registered components.
     #[inline]
     pub async fn build(self) -> Result<Engine> {
+        obs::info!("event=engine_lifecycle component=engine action=build_start result=ok");
+        self.build_inner()
+            .await
+            .inspect(|_| {
+                obs::info!("event=engine_lifecycle component=engine action=build_finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=engine_lifecycle component=engine action=build_finish result=error error={}",
+                    err
+                );
+            })
+    }
+
+    #[inline]
+    async fn build_inner(self) -> Result<Engine> {
         let resolved = self.resolve_storage_paths()?;
         resolved.validate_marker_if_present()?;
         // Startup prefers a small, durable-safety-focused preflight over trying

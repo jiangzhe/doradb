@@ -7,6 +7,7 @@ use crate::id::TrxID;
 use crate::io::{Completion, STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::{LogSync, RedoLogFinalizer};
+use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::RedoReplayPlanner;
 use crate::recovery::{RecoveryBuffers, RecoveryCoordinator, RecoveryResources};
@@ -21,6 +22,7 @@ use crossbeam_utils::CachePadded;
 use error_stack::{Report, ResultExt};
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
+use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -323,7 +325,16 @@ impl PendingTransactionSystemStartup {
         // workers; later redo records must not be accepted until the active log
         // file has a valid super-block.
         if let Err(report) = self.initial_redo_header.wait_result().await {
-            log_thread.join().unwrap();
+            if let Err(payload) = log_thread.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=trx worker=Log-Thread action=join result=error reason=panic"
+                );
+            }) {
+                // Known startup redo failures are returned through the header
+                // completion above. A log-thread panic means an invariant broke,
+                // so report its position and keep the original panic payload.
+                resume_unwind(payload);
+            }
             return Err(Error::from_completion_report(
                 report,
                 "wait for initial redo super-block write",

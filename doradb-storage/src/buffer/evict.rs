@@ -694,7 +694,10 @@ impl IOStateMachine for EvictablePoolStateMachine {
         match req {
             PoolRequest::Read(req) => {
                 let page_id = req.page_id();
-                debug_assert!(self.pool.inflight_io.contains(page_id));
+                assert!(
+                    self.pool.inflight_io.contains(page_id),
+                    "evictable read request missing inflight entry before prepare: page_id={page_id}"
+                );
                 queue.push(EvictSubmission::Read(
                     req.into_prepared(self.file.as_raw_fd(), self.block_key(page_id)),
                 ));
@@ -708,8 +711,15 @@ impl IOStateMachine for EvictablePoolStateMachine {
                 };
                 for mut page_guard in page_guards {
                     let page_id = page_guard.page_id();
-                    debug_assert!(self.pool.inflight_io.contains(page_id));
-                    debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                    assert!(
+                        self.pool.inflight_io.contains(page_id),
+                        "evictable writeback missing inflight entry before prepare: page_id={page_id}"
+                    );
+                    let frame_kind = page_guard.bf().kind();
+                    assert!(
+                        frame_kind == FrameKind::Evicting,
+                        "evictable writeback expected evicting frame before prepare: page_id={page_id}, actual_kind={frame_kind:?}"
+                    );
                     write_evictable_spill_checksum(page_guard.page_mut());
                     // SAFETY: the borrowed page pointer refers to one live page-sized arena
                     // allocation, and the resulting `PageIO` owns `page_guard` until completion.
@@ -740,12 +750,20 @@ impl IOStateMachine for EvictablePoolStateMachine {
         match sub {
             EvictSubmission::Read(sub) => {
                 let _ = sub.block_key;
-                debug_assert!(self.pool.inflight_io.contains(sub.page_id()));
+                assert!(
+                    self.pool.inflight_io.contains(sub.page_id()),
+                    "evictable read submission missing inflight entry on submit: page_id={}",
+                    sub.page_id()
+                );
                 sub.record_running();
             }
             EvictSubmission::Write(sub) => {
                 let _ = sub.block_key;
-                debug_assert!(self.pool.inflight_io.contains(sub.page_id()));
+                assert!(
+                    self.pool.inflight_io.contains(sub.page_id()),
+                    "evictable write submission missing inflight entry on submit: page_id={}",
+                    sub.page_id()
+                );
                 self.pool.stats.add_running_writes(1);
             }
         }
@@ -784,20 +802,26 @@ impl IOStateMachine for EvictablePoolStateMachine {
                 let page_id = page_guard.page_id();
                 let completion = {
                     let mut g = self.pool.inflight_io.map.lock();
-                    let mut status = g.remove(&page_id).unwrap();
+                    let mut status = g.remove(&page_id).unwrap_or_else(|| {
+                        panic!("inflight write entry missing during completion: page_id={page_id}")
+                    });
                     match status.kind {
                         IOKind::Write => {
                             self.pool.inflight_io.writes.fetch_sub(1, Ordering::Relaxed);
-                            debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                            let frame_kind = page_guard.bf().kind();
+                            assert!(
+                                frame_kind == FrameKind::Evicting,
+                                "evictable write completion expected evicting frame: page_id={page_id}, actual_kind={frame_kind:?}"
+                            );
                             self.pool.in_mem.evict_page(page_guard);
                             self.pool.stats.add_completed_writes(1);
                             status.completion.take()
                         }
-                        IOKind::ReadWaitForWrite => {
-                            // Write request will overwrite it to IOKind::Write.
-                            unreachable!()
+                        other => {
+                            panic!(
+                                "inflight write entry has invalid kind during completion: page_id={page_id}, kind={other:?}"
+                            )
                         }
-                        IOKind::Read => unreachable!(),
                     }
                 };
                 if let Some(completion) = completion {
@@ -898,19 +922,27 @@ impl EvictionRuntime for EvictableRuntime {
                 let page_id = page_guard.page_id();
                 let waiter_completion = {
                     let mut g = self.pool.inflight_io.map.lock();
-                    let waiter_completion = if matches!(
-                        g.get(&page_id).map(|status| status.kind),
-                        Some(IOKind::ReadWaitForWrite)
-                    ) {
-                        let mut status = g.remove(&page_id).unwrap();
-                        status.completion.take()
-                    } else {
-                        if let Some(status) = g.get(&page_id) {
-                            debug_assert!(status.kind != IOKind::Write);
+                    let waiter_completion = match g.get(&page_id).map(|status| status.kind) {
+                        Some(IOKind::ReadWaitForWrite) => {
+                            let mut status = g.remove(&page_id).unwrap_or_else(|| {
+                                panic!(
+                                    "read-wait entry missing during clean evictable eviction: page_id={page_id}"
+                                )
+                            });
+                            status.completion.take()
                         }
-                        None
+                        Some(kind) => {
+                            panic!(
+                                "clean evictable eviction found unexpected inflight entry: page_id={page_id}, kind={kind:?}"
+                            )
+                        }
+                        None => None,
                     };
-                    debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                    let frame_kind = page_guard.bf().kind();
+                    assert!(
+                        frame_kind == FrameKind::Evicting,
+                        "clean evictable eviction expected evicting frame: page_id={page_id}, actual_kind={frame_kind:?}"
+                    );
                     self.pool.in_mem.evict_page(page_guard);
                     waiter_completion
                 };
@@ -1043,7 +1075,10 @@ impl InMemPageSet {
         let old_kind = g
             .bf_mut()
             .compare_exchange_kind(FrameKind::Evicting, FrameKind::Evicted);
-        debug_assert!(old_kind == FrameKind::Evicting);
+        assert!(
+            old_kind == FrameKind::Evicting,
+            "evictable page eviction expected evicting frame: page_id={page_id}, actual_kind={old_kind:?}"
+        );
         self.unpin(page_id);
         self.mark_page_dontneed(g);
     }
@@ -1052,13 +1087,14 @@ impl InMemPageSet {
     /// This method is invoked after page eviction.
     #[inline]
     fn mark_page_dontneed<T: BufferPage>(&self, mut page_guard: PageExclusiveGuard<T>) {
+        let page_id = page_guard.page_id();
         // SAFETY: the exclusive page guard yields a live page pointer owned by
         // the arena, and `PAGE_SIZE` matches the mapped page allocation size.
         unsafe {
-            assert!(madvise_dontneed(
-                page_guard.page_mut() as *mut T as *mut u8,
-                PAGE_SIZE
-            ));
+            assert!(
+                madvise_dontneed(page_guard.page_mut() as *mut T as *mut u8, PAGE_SIZE),
+                "evictable page eviction madvise_dontneed failed: page_id={page_id}"
+            );
         }
         drop(page_guard);
         self.dec();
@@ -1122,7 +1158,10 @@ impl PageReservation for EvictPageReservation {
             let bf = page_guard.bf_mut();
             bf.set_dirty(false);
             let old_kind = bf.compare_exchange_kind(FrameKind::Evicted, FrameKind::Hot);
-            debug_assert!(old_kind == FrameKind::Evicted);
+            assert!(
+                old_kind == FrameKind::Evicted,
+                "evictable read publish expected evicted frame: page_id={page_id}, actual_kind={old_kind:?}"
+            );
         }
         drop(page_guard);
         in_mem.pin(page_id);
@@ -1214,7 +1253,12 @@ impl EvictReadSubmission {
                     self.key
                 )
             });
-            debug_assert!(status.kind == IOKind::Read);
+            assert!(
+                status.kind == IOKind::Read,
+                "inflight read entry has invalid kind during completion: page_id={}, kind={:?}",
+                self.key,
+                status.kind
+            );
             self.inflight_io.reads.fetch_sub(1, Ordering::Relaxed);
             status.completion.take()
         };
@@ -1404,10 +1448,11 @@ impl InflightIO {
             Entry::Occupied(mut occ) => {
                 // There is a write in progress, or a preceding read, waiting for write.
                 // In both cases, we can just wait for the event.
-                debug_assert!({
-                    let kind = occ.get().kind;
-                    kind == IOKind::ReadWaitForWrite || kind == IOKind::Write
-                });
+                let kind = occ.get().kind;
+                assert!(
+                    kind == IOKind::ReadWaitForWrite || kind == IOKind::Write,
+                    "wait for evictable writeback found unexpected inflight entry: page_id={page_id}, kind={kind:?}"
+                );
                 let completion = occ
                     .get_mut()
                     .completion
@@ -1445,7 +1490,11 @@ impl InflightIO {
                 Entry::Occupied(mut occ) => {
                     // There could be concurrent read requests.
                     let status = occ.get_mut();
-                    debug_assert!(status.kind == IOKind::ReadWaitForWrite);
+                    assert!(
+                        status.kind == IOKind::ReadWaitForWrite,
+                        "evictable writeback batch found unexpected existing entry: page_id={page_id}, kind={:?}",
+                        status.kind
+                    );
                     status.kind = IOKind::Write;
                 }
             }
@@ -1472,17 +1521,21 @@ impl InflightIO {
             match status.kind {
                 IOKind::Write => {
                     self.writes.fetch_sub(1, Ordering::Relaxed);
-                    debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                    let frame_kind = page_guard.bf().kind();
+                    assert!(
+                        frame_kind == FrameKind::Evicting,
+                        "evictable write failure expected evicting frame: page_id={page_id}, actual_kind={frame_kind:?}"
+                    );
                     page_guard.bf_mut().set_kind(FrameKind::Hot);
                     stats.add_completed_writes(1);
                     stats.add_write_errors(1);
                     status.completion.take()
                 }
-                IOKind::ReadWaitForWrite => {
-                    // Write request will overwrite it to IOKind::Write.
-                    unreachable!()
+                other => {
+                    panic!(
+                        "inflight write entry has invalid kind during failure cleanup: page_id={page_id}, kind={other:?}"
+                    )
                 }
-                IOKind::Read => unreachable!(),
             }
         };
         drop(page_guard);
@@ -2401,6 +2454,116 @@ pub(crate) mod tests {
             drop(state_machine);
             drop(pool_guard);
             drop(owner);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "inflight write entry missing during completion")]
+    fn test_writeback_completion_panics_when_inflight_entry_missing() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+            let mut state_machine = EvictablePoolStateMachine {
+                pool: owner.guard().into_sync(),
+                file: storage,
+            };
+
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = page_guard.page_id();
+            page_guard.bf_mut().set_dirty(true);
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+            // SAFETY: the borrowed page pointer refers to one live page-sized arena
+            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
+            let operation = unsafe {
+                Operation::pwrite_borrowed(
+                    state_machine.file.as_raw_fd(),
+                    usize::from(page_id) * PAGE_SIZE,
+                    page_guard.page_mut() as *mut Page as *mut u8,
+                    PAGE_SIZE,
+                )
+            };
+
+            let _ = state_machine.on_complete(
+                EvictSubmission::Write(PageIO {
+                    block_key: state_machine.block_key(page_id),
+                    operation,
+                    page_guard,
+                    batch_done: None,
+                }),
+                Ok(PAGE_SIZE),
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "inflight write entry has invalid kind during failure cleanup")]
+    fn test_writeback_failure_panics_on_non_write_inflight_entry() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+            let mut state_machine = EvictablePoolStateMachine {
+                pool: owner.guard().into_sync(),
+                file: storage,
+            };
+
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = page_guard.page_id();
+            page_guard.bf_mut().set_dirty(true);
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+            {
+                let mut g = owner.inflight_io.map.lock();
+                g.insert(
+                    page_id,
+                    IOStatus {
+                        kind: IOKind::ReadWaitForWrite,
+                        completion: None,
+                    },
+                );
+            }
+            // SAFETY: the borrowed page pointer refers to one live page-sized arena
+            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
+            let operation = unsafe {
+                Operation::pwrite_borrowed(
+                    state_machine.file.as_raw_fd(),
+                    usize::from(page_id) * PAGE_SIZE,
+                    page_guard.page_mut() as *mut Page as *mut u8,
+                    PAGE_SIZE,
+                )
+            };
+
+            let _ = state_machine.on_complete(
+                EvictSubmission::Write(PageIO {
+                    block_key: state_machine.block_key(page_id),
+                    operation,
+                    page_guard,
+                    batch_done: None,
+                }),
+                Err(StdIoError::from_raw_os_error(libc::EIO)),
+            );
         });
     }
 

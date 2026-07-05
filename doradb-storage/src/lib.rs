@@ -20,6 +20,7 @@ mod lwc;
 mod map;
 mod memcmp;
 mod notify;
+mod obs;
 mod ptr;
 mod quiescent;
 mod recovery;
