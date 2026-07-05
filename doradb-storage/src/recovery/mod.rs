@@ -30,6 +30,7 @@ use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::{FastHashMap, FastHashSet};
+use crate::obs;
 use crate::recovery::stream::PlannedRedoRecovery;
 use crate::row::RowPage;
 use crate::table::{Table, TableRedoReplayFloor};
@@ -94,35 +95,161 @@ impl<'a> RecoveryCoordinator<'a> {
 
     /// Replay redo, rebuild indexes, and return recovery outcomes plus redo startup.
     #[inline]
-    pub(crate) async fn recover_all(mut self) -> Result<(TrxID, RedoLogFinalizer)> {
-        self.bootstrap_checkpointed_user_tables().await?;
+    pub(crate) async fn recover_all(self) -> Result<(TrxID, RedoLogFinalizer)> {
+        obs::info!("event=recovery_lifecycle component=recovery action=start result=ok");
+        self.recover_all_inner()
+            .await
+            .inspect(|(max_recovered_cts, _)| {
+                obs::info!(
+                    "event=recovery_lifecycle component=recovery action=finish result=ok max_recovered_cts={}",
+                    max_recovered_cts
+                );
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_lifecycle component=recovery action=finish result=error error={}",
+                    err
+                );
+            })
+    }
+
+    async fn recover_all_inner(mut self) -> Result<(TrxID, RedoLogFinalizer)> {
+        obs::info!(
+            "event=recovery_phase component=recovery phase=checkpoint_bootstrap action=start result=ok"
+        );
+        self.bootstrap_checkpointed_user_tables()
+            .await
+            .inspect(|_| {
+                obs::info!("event=recovery_phase component=recovery phase=checkpoint_bootstrap action=finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_phase component=recovery phase=checkpoint_bootstrap action=finish result=error error={}",
+                    err
+                );
+            })?;
+
+        obs::info!(
+            "event=recovery_phase component=recovery phase=redo_planning action=start result=ok"
+        );
         let PlannedRedoRecovery {
             skipped_max_recovered_cts,
             mut stream,
             repair_policy,
         } = self
             .redo_planner
-            .plan_recovery(self.timeline.replay_floor, self.redo_read_depth)?;
+            .plan_recovery(self.timeline.replay_floor, self.redo_read_depth)
+            .inspect(|_| {
+                obs::info!(
+                    "event=recovery_phase component=recovery phase=redo_planning action=finish result=ok"
+                );
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_phase component=recovery phase=redo_planning action=finish result=error error={}",
+                    err
+                );
+            })?;
         if let Some(skipped_max_cts) = skipped_max_recovered_cts {
             self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(skipped_max_cts);
         }
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
-        while let Some(log) = stream.try_next().await? {
-            self.replay_log(log).await?;
+        obs::info!(
+            "event=recovery_phase component=recovery phase=redo_replay action=start result=ok"
+        );
+        let mut replayed_logs = 0usize;
+        loop {
+            let next_log = stream
+                .try_next()
+                .await
+                .inspect_err(|err| {
+                    obs::error!(
+                        "event=recovery_phase component=recovery phase=redo_replay action=finish result=error replayed_logs={} error={}",
+                        replayed_logs,
+                        err
+                    );
+                })?;
+            let Some(log) = next_log else {
+                break;
+            };
+            self.replay_log(log)
+                .await
+                .inspect_err(|err| {
+                    obs::error!(
+                        "event=recovery_phase component=recovery phase=redo_replay action=finish result=error replayed_logs={} error={}",
+                        replayed_logs,
+                        err
+                    );
+                })?;
+            replayed_logs += 1;
         }
+        obs::info!(
+            "event=recovery_phase component=recovery phase=redo_replay action=finish result=ok replayed_logs={}",
+            replayed_logs
+        );
         let unsealed_terminals = stream.take_unsealed_terminals();
         // 2. Ensure catalog metadata caught up with table-file roots.
-        self.validate_loaded_table_metadata().await?;
+        obs::info!(
+            "event=recovery_phase component=recovery phase=metadata_validation action=start result=ok"
+        );
+        self.validate_loaded_table_metadata()
+            .await
+            .inspect(|_| {
+                obs::info!("event=recovery_phase component=recovery phase=metadata_validation action=finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_phase component=recovery phase=metadata_validation action=finish result=error error={}",
+                    err
+                );
+            })?;
         // 3. Remove create-table provisional files whose catalog redo never
         //    became durable.
-        self.cleanup_post_replay_absent_user_table_files()?;
+        obs::info!(
+            "event=recovery_phase component=recovery phase=absent_file_cleanup action=start result=ok"
+        );
+        self.cleanup_post_replay_absent_user_table_files()
+            .inspect(|_| {
+                obs::info!("event=recovery_phase component=recovery phase=absent_file_cleanup action=finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_phase component=recovery phase=absent_file_cleanup action=finish result=error error={}",
+                    err
+                );
+            })?;
         // 4. Rebuild hot secondary-index state from recovered RowStore pages
         //    and refresh pages to enable undo maps.
-        self.recover_indexes_and_refresh_pages().await?;
+        obs::info!(
+            "event=recovery_phase component=recovery phase=index_rebuild_page_refresh action=start result=ok"
+        );
+        self.recover_indexes_and_refresh_pages()
+            .await
+            .inspect(|_| {
+                obs::info!("event=recovery_phase component=recovery phase=index_rebuild_page_refresh action=finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_phase component=recovery phase=index_rebuild_page_refresh action=finish result=error error={}",
+                    err
+                );
+            })?;
         // 5. Repair accepted unsealed redo prefixes and select the runtime
         //    active file only after replay has succeeded.
-        self.repair_redo_and_prepare_startup(repair_policy, unsealed_terminals)?;
+        obs::info!(
+            "event=recovery_phase component=recovery phase=redo_repair_startup action=start result=ok"
+        );
+        self.repair_redo_and_prepare_startup(repair_policy, unsealed_terminals)
+            .inspect(|_| {
+                obs::info!("event=recovery_phase component=recovery phase=redo_repair_startup action=finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=recovery_phase component=recovery phase=redo_repair_startup action=finish result=error error={}",
+                    err
+                );
+            })?;
 
         Ok((self.timeline.max_recovered_cts, self.finalizer))
     }

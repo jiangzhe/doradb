@@ -25,6 +25,7 @@ zerocopy = { workspace = true }
 zerocopy-derive = { workspace = true }
 parking_lot = { workspace = true }
 libc = { workspace = true }
+log = { workspace = true }
 crossbeam-utils = { workspace = true }
 serde = { workspace = true }
 flume = { workspace = true }

@@ -7,6 +7,7 @@ use crate::id::TrxID;
 use crate::io::{Completion, STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::{LogSync, RedoLogFinalizer};
+use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::RedoReplayPlanner;
 use crate::recovery::{RecoveryBuffers, RecoveryCoordinator, RecoveryResources};
@@ -323,7 +324,11 @@ impl PendingTransactionSystemStartup {
         // workers; later redo records must not be accepted until the active log
         // file has a valid super-block.
         if let Err(report) = self.initial_redo_header.wait_result().await {
-            log_thread.join().unwrap();
+            let _ = log_thread.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=trx worker=Log-Thread action=join result=error reason=panic"
+                );
+            });
             return Err(Error::from_completion_report(
                 report,
                 "wait for initial redo super-block write",

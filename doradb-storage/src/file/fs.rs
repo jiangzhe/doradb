@@ -28,6 +28,7 @@ use crate::io::{
 use crate::io::{StorageBackendOp, current_storage_backend_test_hook};
 use crate::map::FastHashSet;
 use crate::notify::EventNotifyOnDrop;
+use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::thread;
 use crate::{IndexPool, MemPool};
@@ -1339,7 +1340,11 @@ impl Component for FileSystemWorkers {
     fn shutdown(component: &Self::Owned) {
         component.fs.shutdown_io_clients();
         if let Some(handle) = component.handle.lock().take() {
-            handle.join().unwrap();
+            let _ = handle.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=io worker=IO-Thread action=join result=error reason=panic"
+                );
+            });
         }
     }
 }

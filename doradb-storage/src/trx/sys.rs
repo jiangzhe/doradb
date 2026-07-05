@@ -11,6 +11,7 @@ use crate::io::Completion;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
 use crate::notify::ChangeNotifier;
+use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::runtime;
@@ -267,6 +268,7 @@ impl TransactionBackgroundWorkers {
     #[inline]
     fn shutdown(&self, trx_sys: &TransactionSystem) {
         let redo_log = &*trx_sys.redo_log;
+        obs::info!("event=worker_shutdown component=trx action=start result=ok");
 
         // This shutdown order is a correctness contract, not only a resource
         // cleanup preference. Redo owns the final commit/fail-precommit outcome
@@ -290,7 +292,11 @@ impl TransactionBackgroundWorkers {
         // committed-payload handoff and no new failed-precommit cleanup job can
         // be produced by redo.
         if let Some(handle) = self.log_thread.lock().take() {
-            handle.join().unwrap();
+            let _ = handle.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=trx worker=Log-Thread action=join result=error reason=panic"
+                );
+            });
         }
 
         // Cleanup can update GC bucket state while rolling back failed,
@@ -298,9 +304,17 @@ impl TransactionBackgroundWorkers {
         // finished producing failed-precommit jobs, and join it before purge
         // shutdown so purge does not exit while cleanup can still move the GC
         // horizon.
-        let _ = self.cleanup_tx.send(TrxCleanupMessage::Stop);
+        if self.cleanup_tx.send(TrxCleanupMessage::Stop).is_err() {
+            obs::warn!(
+                "event=worker_shutdown component=trx worker=Trx-Cleanup-Thread action=signal_stop result=ignored reason=receiver_closed"
+            );
+        }
         if let Some(handle) = self.cleanup_thread.lock().take() {
-            handle.join().unwrap();
+            let _ = handle.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=trx worker=Trx-Cleanup-Thread action=join result=error reason=panic"
+                );
+            });
         }
 
         // Purge receives non-lossy committed-payload batches from redo. Its
@@ -309,10 +323,18 @@ impl TransactionBackgroundWorkers {
         // The purge coalescer treats Stop as terminal and may skip a final scan,
         // so this ordering is not optional: there must be no later committed
         // handoff behind Stop.
-        let _ = self.purge_tx.send(Purge::Stop);
+        if self.purge_tx.send(Purge::Stop).is_err() {
+            obs::warn!(
+                "event=worker_shutdown component=trx worker=purge action=signal_stop result=ignored reason=receiver_closed"
+            );
+        }
         let purge_threads = { take(&mut *self.purge_threads.lock()) };
         for handle in purge_threads {
-            handle.join().unwrap();
+            let _ = handle.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=trx worker=purge action=join result=error reason=panic"
+                );
+            });
         }
 
         // Close the active redo file last. Redo has stopped using it, and
@@ -322,6 +344,7 @@ impl TransactionBackgroundWorkers {
         if let Some(log_file) = group_commit_g.log_file.take() {
             drop(log_file);
         }
+        obs::info!("event=worker_shutdown component=trx action=finish result=ok");
     }
 }
 
@@ -585,15 +608,26 @@ impl TransactionSystem {
             }
         }
         let already_poisoned = self.storage_poisoned.swap(true, Ordering::AcqRel);
+        let poison = self.storage_poison_error().unwrap_or_else(|| {
+            Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
+        });
         if !already_poisoned {
+            obs::error!(
+                "event=storage_poison component=trx action=poison result=error fatal_reason={:?}",
+                poison.current_context()
+            );
             // Poison is an admission barrier, not shutdown. Event waiters still
             // need this one-shot wake so they do not sleep after the only
             // progress producer has failed.
             self.storage_poison_event.notify(usize::MAX);
+        } else if obs::log_enabled!(obs::Level::Debug) {
+            obs::debug!(
+                "event=storage_poison component=trx action=poison result=ignored fatal_reason={:?} published_fatal_reason={:?}",
+                reason,
+                poison.current_context()
+            );
         }
-        self.storage_poison_error().unwrap_or_else(|| {
-            Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
-        })
+        poison
     }
 
     /// Retain undo/effect ownership after rollback can no longer finish safely.

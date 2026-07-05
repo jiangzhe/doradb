@@ -6,6 +6,7 @@ use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Result;
 use crate::id::PageID;
+use crate::obs;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::thread;
 use crate::{DiskPool, IndexPool, MemPool};
@@ -840,7 +841,11 @@ impl Component for SharedPoolEvictorWorkers {
         component.mem_pool.signal_shutdown();
         component.wake_event.notify(usize::MAX);
         if let Some(handle) = component.evict_thread.lock().take() {
-            handle.join().unwrap();
+            let _ = handle.join().inspect_err(|_| {
+                obs::error!(
+                    "event=worker_shutdown component=buffer worker=Shared-Pool-Evictor action=join result=error reason=panic"
+                );
+            });
         }
     }
 }
