@@ -15,12 +15,13 @@ mod libaio_backend;
 
 use flume::{Receiver, SendError, Sender};
 use std::collections::VecDeque;
-use std::mem::replace;
+use std::mem::{forget, replace};
 #[cfg(test)]
 use std::num::NonZeroUsize;
 use std::os::unix::io::RawFd;
 use std::ptr::null_mut;
 use std::result::Result as StdResult;
+use std::time::Duration;
 
 pub(crate) use backend::*;
 pub(crate) use buf::*;
@@ -449,6 +450,15 @@ where
     /// Create a submission driver around one storage backend.
     #[inline]
     pub(crate) fn new(backend: B) -> Self {
+        Self::new_with_submit_retry_timeout(backend, DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT)
+    }
+
+    /// Create a submission driver with a custom submit-pressure retry timeout.
+    #[inline]
+    pub(crate) fn new_with_submit_retry_timeout(
+        backend: B,
+        submit_retry_timeout: Duration,
+    ) -> Self {
         let events = backend.new_events();
         let submit_batch = backend.new_submit_batch();
         let capacity = backend.max_events();
@@ -460,7 +470,7 @@ where
             staged_slots: VecDeque::with_capacity(capacity),
             submitted: 0,
             completed: VecDeque::new(),
-            submit_backoff: SubmitRetryBackoff::default(),
+            submit_backoff: SubmitRetryBackoff::new(submit_retry_timeout),
         }
     }
 
@@ -495,6 +505,42 @@ where
     #[inline]
     pub(crate) fn submitted_len(&self) -> usize {
         self.submitted + self.completed.len()
+    }
+
+    /// Returns submissions still owned by the driver.
+    #[inline]
+    pub(crate) fn owned_submissions(&self) -> impl Iterator<Item = &S> {
+        let occupied = self
+            .slots
+            .slots
+            .iter()
+            .filter_map(|slot| match &slot.entry {
+                Entry::Occupied(entry) => Some(&entry.submission),
+                Entry::Vacant(_) => None,
+            });
+        let completed = self.completed.iter().map(|completed| &completed.submission);
+        occupied.chain(completed)
+    }
+
+    /// Quarantines direct buffers owned by submissions still held by the driver.
+    ///
+    /// This is only for terminal backend progress failures, where accepted IO may
+    /// still write into its direct buffer but the backend can no longer prove
+    /// completion. The driver keeps the submissions so token/accounting state is
+    /// not fabricated; only their owned buffers are intentionally leaked.
+    #[inline]
+    pub(crate) fn quarantine_owned_buffers(&mut self) -> usize {
+        let mut count = 0;
+        for slot in &mut self.slots.slots {
+            let Entry::Occupied(entry) = &mut slot.entry else {
+                continue;
+            };
+            count += quarantine_submission_buffer(&mut entry.submission);
+        }
+        for completed in &mut self.completed {
+            count += quarantine_submission_buffer(&mut completed.submission);
+        }
+        count
     }
 
     /// Stages one submission for backend submission.
@@ -566,6 +612,18 @@ where
         self.submit_backoff.backoff();
     }
 
+    /// Back off a no-inflight submit retry or fail after the configured timeout.
+    #[inline]
+    pub(crate) fn backoff_submit_retry_or_progress_error(
+        &mut self,
+        retry: SubmitRetry,
+    ) -> BackendResult<()> {
+        self.submit_backoff.backoff_or_progress_error(
+            retry,
+            IOBackendQueueState::submit(self.staged_slots.len(), self.pending_len()),
+        )
+    }
+
     /// Waits for at least one accepted submission to complete.
     ///
     /// If a previous backend wait returned several completions, this returns
@@ -627,6 +685,22 @@ where
     pub(crate) fn try_pop_completed(&mut self) -> Option<CompletedSubmission<S>> {
         self.completed.pop_front()
     }
+}
+
+#[inline]
+fn quarantine_submission_buffer<S>(submission: &mut S) -> usize
+where
+    S: IOSubmission,
+{
+    let Some(buf) = submission.operation().take_buf() else {
+        return 0;
+    };
+    // Intentional quarantine: after a backend progress failure, the kernel may
+    // still hold this direct buffer pointer, and freeing it could turn a later
+    // completion into a write-after-free. Recovery is already terminal here, so
+    // retaining the allocation is the safer failure mode.
+    forget(buf);
+    1
 }
 
 /// IOStateMachine defines how one scheduler maps requests to submissions and
@@ -1085,6 +1159,11 @@ mod tests {
         }
     }
 
+    #[inline]
+    fn driver_submit_retry(reason: SubmitRetryReason) -> SubmitAttempt {
+        SubmitAttempt::Retry(SubmitRetry::new("driver_test", reason, 1))
+    }
+
     #[derive(Default)]
     struct RecordingHook {
         submits: Mutex<Vec<StorageBackendOp>>,
@@ -1249,7 +1328,7 @@ mod tests {
         let mut driver = SubmissionDriver::new(DriverBackend::with_submit_outcomes(
             2,
             VecDeque::from([
-                SubmitAttempt::Retry(SubmitRetryReason::Eagain),
+                driver_submit_retry(SubmitRetryReason::Eagain),
                 SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),
             ]),
         ));
@@ -1258,7 +1337,7 @@ mod tests {
 
         assert_eq!(
             driver.submit_ready().unwrap(),
-            SubmitAttempt::Retry(SubmitRetryReason::Eagain)
+            driver_submit_retry(SubmitRetryReason::Eagain)
         );
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
@@ -1279,7 +1358,7 @@ mod tests {
             2,
             VecDeque::from([
                 SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),
-                SubmitAttempt::Retry(SubmitRetryReason::Ebusy),
+                driver_submit_retry(SubmitRetryReason::Ebusy),
                 SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),
             ]),
         ));
@@ -1300,7 +1379,7 @@ mod tests {
 
         assert_eq!(
             driver.submit_ready().unwrap(),
-            SubmitAttempt::Retry(SubmitRetryReason::Ebusy)
+            driver_submit_retry(SubmitRetryReason::Ebusy)
         );
         assert_eq!(driver.pending_len(), 2);
         assert_eq!(driver.submitted_len(), 1);
@@ -1317,6 +1396,48 @@ mod tests {
         let second = driver.wait_at_least_one().unwrap();
         assert_eq!(second.submission.op.id, 2);
         assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
+    }
+
+    #[test]
+    fn test_submit_retry_backoff_timeout_defaults_and_customizes() {
+        assert_eq!(
+            SubmitRetryBackoff::default().no_progress_timeout(),
+            DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT
+        );
+        assert_eq!(
+            SubmitRetryBackoff::new(Duration::from_millis(500)).no_progress_timeout(),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn test_submission_driver_retry_without_inflight_expires_as_progress_error() {
+        let mut driver = SubmissionDriver::new_with_submit_retry_timeout(
+            DriverBackend::with_submit_outcomes(
+                1,
+                VecDeque::from([driver_submit_retry(SubmitRetryReason::Eagain)]),
+            ),
+            Duration::from_millis(0),
+        );
+
+        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
+        let SubmitAttempt::Retry(retry) = driver.submit_ready().unwrap() else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "driver_test");
+        assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
+        assert_eq!(retry.call_count(), 1);
+
+        let err = driver
+            .backoff_submit_retry_or_progress_error(retry)
+            .unwrap_err();
+        let failure = backend_failure(&err).expect("retry expiry must attach backend failure");
+        assert_eq!(failure.backend(), "driver_test");
+        assert_eq!(failure.phase(), IOBackendErrorPhase::Submit);
+        assert_eq!(failure.raw_errno(), Some(libc::EAGAIN));
+        assert_eq!(failure.call_count(), 1);
+        assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
     }
 }

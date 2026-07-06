@@ -17,7 +17,7 @@ use crate::id::TrxID;
 use crate::io::{
     BackendResult, CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats,
     IOBackendStatsHandle, IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver,
-    SubmitAttempt, backend_failure, backend_report_summary,
+    SubmitAttempt, SubmitRetry, backend_failure, backend_report_summary,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -492,6 +492,14 @@ impl LogWriteSubmission {
     }
 
     #[inline]
+    fn is_sync_operation(&self) -> bool {
+        matches!(
+            &self.kind,
+            LogWriteKind::CommitSync | LogWriteKind::SealSync { .. } | LogWriteKind::StandaloneSync
+        )
+    }
+
+    #[inline]
     fn fail_unsubmitted_header(mut self, reason: FatalError) {
         let _ = self.operation.take_buf();
         if let LogWriteKind::Header { completion } = self.kind {
@@ -576,8 +584,29 @@ where
     }
 
     #[inline]
+    fn backend_progress_failure_reason(&self) -> FatalError {
+        let mut has_owned_work = false;
+        for submission in self.driver.owned_submissions() {
+            has_owned_work = true;
+            if !submission.is_sync_operation() {
+                return FatalError::RedoWrite;
+            }
+        }
+        if has_owned_work {
+            FatalError::RedoSync
+        } else {
+            FatalError::RedoWrite
+        }
+    }
+
+    #[inline]
     fn backoff_submit_retry(&mut self) {
         self.driver.backoff_submit_retry();
+    }
+
+    #[inline]
+    fn backoff_submit_retry_or_progress_error(&mut self, retry: SubmitRetry) -> BackendResult<()> {
+        self.driver.backoff_submit_retry_or_progress_error(retry)
     }
 
     #[inline]
@@ -1584,7 +1613,14 @@ where
                         self.write_driver.submitted_len(),
                         self.write_driver.pending_len()
                     );
-                    self.write_driver.backoff_submit_retry();
+                    if let Err(err) = self
+                        .write_driver
+                        .backoff_submit_retry_or_progress_error(reason)
+                    {
+                        let reason = self.write_driver.backend_progress_failure_reason();
+                        self.handle_backend_progress_error(sealer, reason, err);
+                        return true;
+                    }
                 } else {
                     obs::debug!(
                         "event=redo_backend_submit_retry component=redo_log reason={} errno={} submitted={} pending={} action=wait",
@@ -1597,7 +1633,8 @@ where
                 false
             }
             Err(err) => {
-                self.handle_backend_progress_error(sealer, FatalError::RedoWrite, err);
+                let reason = self.write_driver.backend_progress_failure_reason();
+                self.handle_backend_progress_error(sealer, reason, err);
                 true
             }
         }
@@ -1638,7 +1675,8 @@ where
         let completion = match self.write_driver.wait_at_least_one() {
             Ok(completion) => completion,
             Err(err) => {
-                self.handle_backend_progress_error(sealer, FatalError::RedoWrite, err);
+                let reason = self.write_driver.backend_progress_failure_reason();
+                self.handle_backend_progress_error(sealer, reason, err);
                 return;
             }
         };
@@ -2345,7 +2383,8 @@ mod tests {
     };
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
-        BackendToken, IOBackend, IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
+        BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState,
+        IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
     use crate::log::format::{
@@ -2902,7 +2941,7 @@ mod tests {
     struct ManualLogProcessorHarness {
         trx_sys: TransactionSystem,
         _purge_rx: flume::Receiver<Purge>,
-        _cleanup_rx: flume::Receiver<TrxCleanupMessage>,
+        cleanup_rx: flume::Receiver<TrxCleanupMessage>,
     }
 
     fn manual_log_processor_harness(
@@ -2927,7 +2966,7 @@ mod tests {
         ManualLogProcessorHarness {
             trx_sys,
             _purge_rx: purge_rx,
-            _cleanup_rx: cleanup_rx,
+            cleanup_rx,
         }
     }
 
@@ -3352,6 +3391,7 @@ mod tests {
     enum LogTestCompletionBatch {
         AllFront,
         OneBack,
+        WaitError,
     }
 
     struct LogTestBackend {
@@ -3374,6 +3414,17 @@ mod tests {
                 max_events,
                 inflight: VecDeque::new(),
                 wait_batches: VecDeque::from([LogTestCompletionBatch::OneBack]),
+            }
+        }
+
+        fn complete_all_then_wait_error(max_events: usize) -> Self {
+            Self {
+                max_events,
+                inflight: VecDeque::new(),
+                wait_batches: VecDeque::from([
+                    LogTestCompletionBatch::AllFront,
+                    LogTestCompletionBatch::WaitError,
+                ]),
             }
         }
     }
@@ -3445,6 +3496,13 @@ mod tests {
                         .expect("test backend must have one back completion");
                     Ok(vec![(token, Ok(log_test_completion_len(kind)))])
                 }
+                LogTestCompletionBatch::WaitError => Err(IOBackendFailure::report(
+                    "log_test",
+                    IOBackendErrorPhase::Wait,
+                    IoError::from_raw_os_error(libc::EIO),
+                    1,
+                    IOBackendQueueState::wait_with_completions(0),
+                )),
             }
         }
     }
@@ -3628,6 +3686,75 @@ mod tests {
                     .load(Ordering::SeqCst),
                 MIN_SNAPSHOT_TS.as_u64()
             );
+
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_sync_only_backend_wait_progress_failure_poisons_redo_sync() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("sync_only_backend_wait_failure", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_sync_only_wait_failure_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let log_fd = redo_log
+                .group_commit
+                .lock()
+                .log_file
+                .as_ref()
+                .unwrap()
+                .as_raw_fd();
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::Fsync);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let mut write_driver =
+                LogWriteDriver::new(LogTestBackend::complete_all_then_wait_error(1));
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+
+            {
+                let mut writer = RedoLogWriter::new(
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
+                    &mut write_driver,
+                );
+                writer
+                    .prefix
+                    .push_group(sync_group_with_pending_write_for_test(
+                        TrxID::new(94),
+                        log_fd,
+                        REDO_DEFAULT_DATA_START_OFFSET,
+                    ));
+
+                assert!(!writer.submit_io(&mut sealer));
+                writer.wait_and_drain_io_if_submitted(&mut sealer);
+                writer.advance_ordered_prefix(&mut sealer);
+                assert!(!writer.submit_io(&mut sealer));
+                assert_eq!(writer.write_driver.submitted_len(), 1);
+
+                writer.wait_and_drain_io_if_submitted(&mut sealer);
+                assert!(writer.shutdown);
+            }
+
+            assert!(
+                harness
+                    .trx_sys
+                    .poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
+            );
+            assert!(matches!(
+                harness.cleanup_rx.try_recv().unwrap(),
+                TrxCleanupMessage::FailedPrecommit(_)
+            ));
 
             drop(harness);
             engine.shutdown().unwrap();

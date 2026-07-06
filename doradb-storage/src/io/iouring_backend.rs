@@ -1,7 +1,7 @@
 use super::{
     BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
     IOBackendQueueState, IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult,
-    SubmitAttempt, SubmitRetryReason, backend_call_count,
+    SubmitAttempt, SubmitRetry, SubmitRetryReason, backend_call_count,
 };
 use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
 use error_stack::Report;
@@ -330,7 +330,7 @@ fn invalid_io_depth(max_events: usize) -> Error {
 #[inline]
 fn retry_submit(reason: SubmitRetryReason, call_count: usize) -> SubmitOutcome {
     SubmitOutcome {
-        result: SubmitAttempt::Retry(reason),
+        result: SubmitAttempt::Retry(SubmitRetry::new("io_uring", reason, call_count)),
         call_count,
     }
 }
@@ -402,6 +402,19 @@ mod tests {
             Some(SubmitRetryReason::Ebusy)
         );
         assert_eq!(SubmitRetryReason::from_raw_errno(EINTR), None);
+    }
+
+    #[test]
+    fn test_retry_submit_carries_backend_context() {
+        let outcome = retry_submit(SubmitRetryReason::Ebusy, 3);
+        let SubmitAttempt::Retry(retry) = outcome.result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "io_uring");
+        assert_eq!(retry.reason(), SubmitRetryReason::Ebusy);
+        assert_eq!(retry.raw_errno(), EBUSY);
+        assert_eq!(retry.call_count(), 3);
+        assert_eq!(outcome.call_count, 3);
     }
 
     #[test]

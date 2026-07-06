@@ -8,13 +8,16 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Standard IO result returned by backend completion paths.
 pub(crate) type StdIoResult<T> = StdResult<T, StdIoError>;
 
 /// Result returned by backend submit and wait progress paths.
 pub(crate) type BackendResult<T> = StdResult<T, Report<IoError>>;
+
+/// Default no-progress window for submit-pressure retry loops.
+pub(crate) const DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Transient submit pressure reported by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,85 @@ impl fmt::Display for SubmitRetryReason {
     }
 }
 
+/// Backend submit pressure details retained across retry handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubmitRetry {
+    backend: &'static str,
+    reason: SubmitRetryReason,
+    call_count: usize,
+}
+
+impl SubmitRetry {
+    /// Build one submit-pressure retry description.
+    #[inline]
+    pub(crate) const fn new(
+        backend: &'static str,
+        reason: SubmitRetryReason,
+        call_count: usize,
+    ) -> Self {
+        Self {
+            backend,
+            reason,
+            call_count,
+        }
+    }
+
+    /// Backend that reported submit pressure.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) const fn backend(self) -> &'static str {
+        self.backend
+    }
+
+    /// Submit-pressure reason.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) const fn reason(self) -> SubmitRetryReason {
+        self.reason
+    }
+
+    /// Raw errno represented by this retry.
+    #[inline]
+    pub(crate) const fn raw_errno(self) -> i32 {
+        self.reason.raw_errno()
+    }
+
+    /// Syscall attempt count from the backend submit call.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) const fn call_count(self) -> usize {
+        self.call_count
+    }
+
+    #[inline]
+    fn progress_error(
+        self,
+        queue_state: IOBackendQueueState,
+        attempts: u32,
+        elapsed: Duration,
+        timeout: Duration,
+    ) -> Report<IoError> {
+        IOBackendFailure::report(
+            self.backend,
+            IOBackendErrorPhase::Submit,
+            StdIoError::from_raw_os_error(self.raw_errno()),
+            self.call_count,
+            queue_state,
+        )
+        .attach(format!("submit_retry_reason={}", self.reason))
+        .attach(format!("submit_retry_attempts={attempts}"))
+        .attach(format!("submit_retry_elapsed_ms={}", elapsed.as_millis()))
+        .attach(format!("submit_retry_timeout_ms={}", timeout.as_millis()))
+    }
+}
+
+impl fmt::Display for SubmitRetry {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+
 /// Outcome of a backend submit attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmitAttempt {
@@ -64,22 +146,49 @@ pub(crate) enum SubmitAttempt {
     /// The backend accepted this many staged operations.
     Submitted(NonZeroUsize),
     /// Transient submit pressure; staged operations remain queued for retry.
-    Retry(SubmitRetryReason),
+    Retry(SubmitRetry),
 }
 
 /// Bounded backoff used when a ring has staged work but no accepted work to wait on.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SubmitRetryBackoff {
     attempts: u32,
+    started_at: Option<Instant>,
+    no_progress_timeout: Duration,
+}
+
+impl Default for SubmitRetryBackoff {
+    #[inline]
+    fn default() -> Self {
+        Self::new(DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT)
+    }
 }
 
 impl SubmitRetryBackoff {
     const MAX_SLEEP_MICROS: u64 = 1024;
 
+    /// Build submit retry backoff with a custom no-progress timeout.
+    #[inline]
+    pub(crate) const fn new(no_progress_timeout: Duration) -> Self {
+        Self {
+            attempts: 0,
+            started_at: None,
+            no_progress_timeout,
+        }
+    }
+
+    /// Return the configured no-progress timeout.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) const fn no_progress_timeout(&self) -> Duration {
+        self.no_progress_timeout
+    }
+
     /// Reset the retry sequence after backend progress.
     #[inline]
     pub(crate) fn reset(&mut self) {
         self.attempts = 0;
+        self.started_at = None;
     }
 
     /// Wait briefly before retrying submit when there is no accepted work.
@@ -94,6 +203,34 @@ impl SubmitRetryBackoff {
         let shift = attempts.saturating_sub(1).min(10);
         let micros = (1u64 << shift).min(Self::MAX_SLEEP_MICROS);
         thread::sleep(Duration::from_micros(micros));
+    }
+
+    /// Back off one retry step or convert persistent pressure into a progress error.
+    #[inline]
+    pub(crate) fn backoff_or_progress_error(
+        &mut self,
+        retry: SubmitRetry,
+        queue_state: IOBackendQueueState,
+    ) -> BackendResult<()> {
+        let now = Instant::now();
+        let started_at = match self.started_at {
+            Some(started_at) => started_at,
+            None => {
+                self.started_at = Some(now);
+                now
+            }
+        };
+        let elapsed = now.saturating_duration_since(started_at);
+        if elapsed >= self.no_progress_timeout {
+            return Err(retry.progress_error(
+                queue_state,
+                self.attempts,
+                elapsed,
+                self.no_progress_timeout,
+            ));
+        }
+        self.backoff();
+        Ok(())
     }
 }
 

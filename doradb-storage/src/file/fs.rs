@@ -22,10 +22,10 @@ use crate::file::{
 };
 use crate::id::{TableID, TrxID};
 use crate::io::{
-    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
-    IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend, SubmitAttempt,
-    SubmitRetryBackoff, attach_backend_operation_kind, backend_failure, backend_report_summary,
-    backend_report_to_io_error,
+    BackendToken, IOBackend, IOBackendQueueState, IOBackendStats, IOBackendStatsHandle, IOClient,
+    IOKind, IOMessage, IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult,
+    StorageBackend, SubmitAttempt, SubmitRetryBackoff, attach_backend_operation_kind,
+    backend_failure, backend_report_summary, backend_report_to_io_error,
 };
 #[cfg(test)]
 use crate::io::{StorageBackendOp, current_storage_backend_test_hook};
@@ -1419,7 +1419,20 @@ where
                                 self.staged_slots.len(),
                                 queue.len()
                             );
-                            self.submit_backoff.backoff();
+                            if let Err(err) = self.submit_backoff.backoff_or_progress_error(
+                                reason,
+                                IOBackendQueueState::submit(
+                                    self.staged_slots.len(),
+                                    self.staged_slots.len(),
+                                ),
+                            ) {
+                                let quarantine =
+                                    self.handle_backend_progress_failure(&mut queue, err);
+                                if quarantine {
+                                    std::mem::forget(self);
+                                }
+                                return;
+                            }
                             continue;
                         }
                         obs::debug!(

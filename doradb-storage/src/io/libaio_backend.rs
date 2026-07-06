@@ -4,7 +4,7 @@ use super::libaio_abi::{
 use super::{
     BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
     IOBackendQueueState, IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt,
-    SubmitRetryReason, backend_call_count,
+    SubmitRetry, SubmitRetryReason, backend_call_count,
 };
 use crate::error::{ConfigError, IoError, Result, StorageOp};
 use error_stack::Report;
@@ -83,7 +83,7 @@ impl LibaioBackend {
             if errcode == EAGAIN {
                 let reason = SubmitRetryReason::from_raw_errno(errcode)
                     .expect("EAGAIN must convert to submit retry reason");
-                return Ok(SubmitAttempt::Retry(reason));
+                return Ok(SubmitAttempt::Retry(SubmitRetry::new("libaio", reason, 1)));
             }
             let err = StdIoError::from_raw_os_error(errcode);
             let queue_state = IOBackendQueueState::submit(reqs.len(), batch_size);
@@ -437,10 +437,13 @@ pub(crate) mod tests {
         let reqs = vec![iocb.as_mut_ptr()];
         let submit_result = ctx.submit_limit(&reqs, 1).unwrap();
         set_io_submit_hook(previous);
-        assert_eq!(
-            submit_result,
-            SubmitAttempt::Retry(SubmitRetryReason::Eagain)
-        );
+        let SubmitAttempt::Retry(retry) = submit_result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "libaio");
+        assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
+        assert_eq!(retry.raw_errno(), EAGAIN);
+        assert_eq!(retry.call_count(), 1);
     }
 
     #[test]
