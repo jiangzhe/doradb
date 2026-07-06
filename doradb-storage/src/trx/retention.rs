@@ -189,7 +189,7 @@ impl TransactionSystem {
             {
                 Ok(marker) => marker,
                 Err(err) if err.kind() == ErrorKind::Io => {
-                    return Err(self.poison_storage(FatalError::CheckpointWrite).into());
+                    return Err(self.poison_engine(FatalError::CheckpointWrite).into());
                 }
                 Err(err) => return Err(err),
             }
@@ -321,7 +321,7 @@ impl TransactionSystem {
             match prepared.commit(&self.catalog.storage).await {
                 Ok(outcome) => outcome,
                 Err(err) if err.kind() == ErrorKind::Io => {
-                    return Err(self.poison_storage(FatalError::CheckpointWrite).into());
+                    return Err(self.poison_engine(FatalError::CheckpointWrite).into());
                 }
                 Err(err) => return Err(err),
             }
@@ -335,7 +335,7 @@ impl TransactionSystem {
                 {
                     Ok(marker) => marker,
                     Err(err) if err.kind() == ErrorKind::Io => {
-                        return Err(self.poison_storage(FatalError::CheckpointWrite).into());
+                        return Err(self.poison_engine(FatalError::CheckpointWrite).into());
                     }
                     Err(err) => return Err(err),
                 };

@@ -1549,7 +1549,7 @@ fn poison_create_table_after_root_publish_with_source(
     operation: &'static str,
     source: Error,
 ) -> Report<FatalError> {
-    let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
+    let poison = engine.trx_sys.poison_engine(FatalError::Poisoned);
     source
         .into_report()
         .change_context(*poison.current_context())
@@ -1566,7 +1566,7 @@ fn poison_create_table_rollback_with_source(
     source_debug: &str,
     rollback_err: Error,
 ) -> Report<FatalError> {
-    let poison = engine.trx_sys.poison_storage(FatalError::RollbackAccess);
+    let poison = engine.trx_sys.poison_engine(FatalError::RollbackAccess);
     rollback_err
         .into_report()
         .change_context(*poison.current_context())
@@ -1584,7 +1584,7 @@ fn poison_create_table_cleanup_with_source(
     source_debug: &str,
     cleanup_err: Error,
 ) -> Report<FatalError> {
-    let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
+    let poison = engine.trx_sys.poison_engine(FatalError::Poisoned);
     cleanup_err
         .into_report()
         .change_context(*poison.current_context())
@@ -1605,7 +1605,7 @@ fn poison_drop_table_after_gate(
     // engine shutdown remains responsible for stopping background workers.
     engine
         .trx_sys
-        .poison_storage(FatalError::Poisoned)
+        .poison_engine(FatalError::Poisoned)
         .attach(drop_table_after_gate_message(table_id, operation))
 }
 
@@ -1728,7 +1728,7 @@ mod tests {
         if CREATE_TABLE_FAILURE.with(|slot| slot.get())
             == Some(CreateTableTestFailure::PoisonBeforeCatalogCommit)
         {
-            let _ = engine.trx_sys.poison_storage(FatalError::Poisoned);
+            let _ = engine.trx_sys.poison_engine(FatalError::Poisoned);
         }
     }
 
@@ -2599,7 +2599,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
             );
@@ -3094,7 +3094,7 @@ mod tests {
                 TableLifecycleState::Dropping
             );
             assert!(!session.in_trx().unwrap());
-            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
+            assert!(engine.inner().trx_sys.poison_error().is_none());
         });
     }
 
@@ -3170,7 +3170,7 @@ mod tests {
                 TableLifecycleState::Live
             );
             assert!(!drop_session.in_trx().unwrap());
-            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
+            assert!(engine.inner().trx_sys.poison_error().is_none());
             assert!(engine.catalog().get_table(table_id).await.is_some());
         });
     }
@@ -3632,7 +3632,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
             );
@@ -3763,7 +3763,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
             );
@@ -3800,7 +3800,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
             );

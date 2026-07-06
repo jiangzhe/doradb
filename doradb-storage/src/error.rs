@@ -1,4 +1,7 @@
 use crate::id::RowID;
+use crate::io::{
+    IOBackendFailure, IOBackendOperationKind, backend_failure, backend_operation_kind,
+};
 use error_stack::{AttachmentKind, FrameKind, Report};
 use std::array::TryFromSliceError;
 use std::error::Error as StdError;
@@ -190,6 +193,8 @@ pub(crate) enum FatalError {
     RedoWrite,
     #[error("redo sync failed")]
     RedoSync,
+    #[error("storage io failed")]
+    StorageIo,
     #[error("checkpoint write failed")]
     CheckpointWrite,
     #[error("purge deallocate failed")]
@@ -324,6 +329,15 @@ impl IoError {
         Report::new(Self::from(err.kind())).attach(format!("op={op}, {err}"))
     }
 
+    /// Builds an IO-domain report from a backend progress error.
+    #[inline]
+    pub(crate) fn report_backend(
+        err: &Report<IoError>,
+        message: impl Into<String>,
+    ) -> Report<Self> {
+        copy_backend_io_report(err).attach(message.into())
+    }
+
     /// Builds an unexpected-EOF report with byte counts.
     #[inline]
     pub(crate) fn report_unexpected_eof(
@@ -380,6 +394,18 @@ impl CompletionErrorKind {
         Report::new(IoError::from(kind))
             .change_context(Self::Io(kind))
             .attach(format!("{err}"))
+            .attach(message.into())
+    }
+
+    /// Builds a completion report from a backend progress error.
+    #[inline]
+    pub(crate) fn report_backend_io(
+        err: &Report<IoError>,
+        message: impl Into<String>,
+    ) -> Report<Self> {
+        let kind = err.current_context().kind();
+        copy_backend_io_report(err)
+            .change_context(Self::Io(kind))
             .attach(message.into())
     }
 
@@ -914,6 +940,37 @@ impl<T> Validation<T> {
     }
 }
 
+/// Propagate a completion report while preserving structured backend context.
+#[inline]
+pub(crate) fn propagate_completion_report(
+    report: &Report<CompletionErrorKind>,
+    message: impl Into<String>,
+) -> Report<CompletionErrorKind> {
+    let mut propagated = match report.downcast_ref::<IoError>().copied() {
+        Some(io) => Report::new(io).change_context(*report.current_context()),
+        None => Report::new(*report.current_context()),
+    };
+    if let Some(failure) = report.downcast_ref::<IOBackendFailure>() {
+        propagated = propagated.attach(failure.clone());
+    }
+    if let Some(operation_kind) = report.downcast_ref::<IOBackendOperationKind>() {
+        propagated = propagated.attach(*operation_kind);
+    }
+    propagated.attach(message.into())
+}
+
+#[inline]
+fn copy_backend_io_report(err: &Report<IoError>) -> Report<IoError> {
+    let mut report = Report::new(*err.current_context());
+    if let Some(failure) = backend_failure(err) {
+        report = report.attach(failure.clone());
+    }
+    if let Some(operation_kind) = backend_operation_kind(err) {
+        report = report.attach(operation_kind);
+    }
+    report
+}
+
 #[cold]
 #[inline(never)]
 fn unwrap_failed(msg: &str) -> ! {
@@ -947,6 +1004,10 @@ macro_rules! verify_continue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::{
+        IOBackendErrorPhase, IOBackendFailure, IOBackendOperationKind, IOBackendQueueState, IOKind,
+        attach_backend_operation_kind,
+    };
     use std::io::Error as StdIoError;
 
     #[test]
@@ -1006,5 +1067,34 @@ mod tests {
         assert!(output.contains("permission denied"), "{output}");
         assert!(output.contains("op=file open"), "{output}");
         assert!(output.contains("open denied"), "{output}");
+    }
+
+    #[test]
+    fn test_completion_backend_report_preserves_typed_attachments() {
+        let backend_report = IOBackendFailure::report(
+            "test_backend",
+            IOBackendErrorPhase::Wait,
+            StdIoError::new(IoErrorKind::TimedOut, "wait timed out"),
+            3,
+            IOBackendQueueState::wait_with_completions(0),
+        );
+        let backend_report = attach_backend_operation_kind(backend_report, Some(IOKind::Read));
+        let completion =
+            CompletionErrorKind::report_backend_io(&backend_report, "completion context");
+
+        assert_eq!(
+            *completion.current_context(),
+            CompletionErrorKind::Io(IoErrorKind::TimedOut)
+        );
+        assert!(completion.downcast_ref::<IOBackendFailure>().is_some());
+        assert!(
+            completion
+                .downcast_ref::<IOBackendOperationKind>()
+                .is_some()
+        );
+        let output = format!("{completion:?}");
+        assert!(output.contains("backend=test_backend"), "{output}");
+        assert!(output.contains("operation_kind=Read"), "{output}");
+        assert!(output.contains("completion context"), "{output}");
     }
 }

@@ -9,6 +9,7 @@ mod component;
 mod compression;
 pub mod conf;
 mod engine;
+mod engine_poison;
 mod file;
 mod free_list;
 mod index;

@@ -9,7 +9,8 @@ use crate::catalog::table::TableMetadata;
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
-use crate::error::{Error, InternalError, Result};
+use crate::engine_poison::EnginePoisoner;
+use crate::error::{CompletionErrorKind, Error, FatalError, InternalError, IoError, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
     MultiTableActiveRoot, MultiTableFile, MultiTableFileOpenOutcome, MutableMultiTableFile,
@@ -21,8 +22,10 @@ use crate::file::{
 };
 use crate::id::{TableID, TrxID};
 use crate::io::{
-    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
-    IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
+    BackendToken, IOBackend, IOBackendQueueState, IOBackendStats, IOBackendStatsHandle, IOClient,
+    IOKind, IOMessage, IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult,
+    StorageBackend, SubmitAttempt, SubmitRetryBackoff, SubmittedIoCleanup,
+    attach_backend_operation_kind, backend_failure, backend_report_summary,
 };
 #[cfg(test)]
 use crate::io::{StorageBackendOp, current_storage_backend_test_hook};
@@ -39,7 +42,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
-use std::mem::replace;
+use std::mem::{forget, replace, take};
 use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
@@ -225,6 +228,24 @@ impl StorageSubmission {
         Self {
             inner: StorageSubmissionKind::IndexPool(sub),
         }
+    }
+
+    #[inline]
+    fn io_kind(&self) -> IOKind {
+        match &self.inner {
+            StorageSubmissionKind::Table(TableFsSubmission::Write(_)) => IOKind::Write,
+            StorageSubmissionKind::Table(TableFsSubmission::Sync(_)) => IOKind::Fsync,
+            StorageSubmissionKind::Table(TableFsSubmission::Read(_))
+            | StorageSubmissionKind::MemPool(EvictSubmission::Read(_))
+            | StorageSubmissionKind::IndexPool(EvictSubmission::Read(_)) => IOKind::Read,
+            StorageSubmissionKind::MemPool(EvictSubmission::Write(_))
+            | StorageSubmissionKind::IndexPool(EvictSubmission::Write(_)) => IOKind::Write,
+        }
+    }
+
+    #[inline]
+    fn binds_io_memory(&mut self) -> bool {
+        self.operation().len() != 0
     }
 }
 
@@ -430,6 +451,88 @@ impl StorageStateMachine {
             StorageSubmissionKind::IndexPool(sub) => self.index_pool.on_complete(sub, res),
         }
     }
+
+    /// Fail one prepared submission that the backend did not accept.
+    #[inline]
+    fn fail_submission_with_backend_error(
+        &mut self,
+        sub: StorageSubmission,
+        err: &Report<IoError>,
+    ) -> IOKind {
+        match sub.inner {
+            StorageSubmissionKind::Table(sub) => {
+                self.table_fs.fail_submission_with_backend_error(sub, err)
+            }
+            StorageSubmissionKind::MemPool(sub) => {
+                self.mem_pool.fail_submission_with_backend_error(sub, err)
+            }
+            StorageSubmissionKind::IndexPool(sub) => {
+                self.index_pool.fail_submission_with_backend_error(sub, err)
+            }
+        }
+    }
+
+    /// Fail one backend-accepted submission without dropping memory that the
+    /// backend may still access.
+    #[inline]
+    fn fail_submitted_with_backend_error(
+        &mut self,
+        sub: &mut StorageSubmission,
+        err: &Report<IoError>,
+    ) -> IOKind {
+        match &mut sub.inner {
+            StorageSubmissionKind::Table(sub) => {
+                self.table_fs.fail_submitted_with_backend_error(sub, err)
+            }
+            StorageSubmissionKind::MemPool(sub) => {
+                self.mem_pool.fail_submitted_with_backend_error(sub, err)
+            }
+            StorageSubmissionKind::IndexPool(sub) => {
+                self.index_pool.fail_submitted_with_backend_error(sub, err)
+            }
+        }
+    }
+
+    /// Fail one deferred table-read request that never reached backend submission.
+    #[inline]
+    fn fail_table_read_request(&mut self, req: ReadSubmission, err: &Report<IoError>) {
+        req.fail(CompletionErrorKind::report_backend_io(
+            err,
+            "submit readonly table read",
+        ));
+    }
+
+    /// Fail one deferred pool-read request that never reached backend submission.
+    #[inline]
+    fn fail_pool_read_request(&mut self, req: PoolReadRequest, err: &Report<IoError>) {
+        match req {
+            PoolReadRequest::Mem(req) => self
+                .mem_pool
+                .fail_request_with_backend_error(PoolRequest::Read(req), err),
+            PoolReadRequest::Index(req) => self
+                .index_pool
+                .fail_request_with_backend_error(PoolRequest::Read(req), err),
+        }
+    }
+
+    /// Fail one deferred background-write request that never reached backend submission.
+    #[inline]
+    fn fail_background_write_request(
+        &mut self,
+        req: BackgroundWriteRequest,
+        err: &Report<IoError>,
+    ) {
+        match req {
+            BackgroundWriteRequest::Table(req) => req.fail(err),
+            BackgroundWriteRequest::TableSync(req) => req.fail(err),
+            BackgroundWriteRequest::MemPool(req) => self
+                .mem_pool
+                .fail_request_with_backend_error(req.into_pool_request(), err),
+            BackgroundWriteRequest::IndexPool(req) => self
+                .index_pool
+                .fail_request_with_backend_error(req.into_pool_request(), err),
+        }
+    }
 }
 
 /// Scheduler state for the table-read ingress lane.
@@ -549,6 +652,23 @@ impl StorageRequestScheduler {
         self.table_reads.deferred_req.is_some()
             || self.pool_reads.deferred_req.is_some()
             || self.background_writes.deferred_req.is_some()
+    }
+
+    /// Fail all lane-deferred requests that cannot be submitted after backend failure.
+    #[inline]
+    fn fail_deferred(&mut self, state_machine: &mut StorageStateMachine, err: &Report<IoError>) {
+        if let Some(req) = self.table_reads.deferred_req.take() {
+            state_machine.fail_table_read_request(req, err);
+        }
+        if let Some(req) = self.pool_reads.deferred_req.take() {
+            state_machine.fail_pool_read_request(req, err);
+        }
+        if let Some(req) = self.background_writes.deferred_req.take() {
+            state_machine.fail_background_write_request(req, err);
+        }
+        self.table_reads.shutdown = true;
+        self.pool_reads.shutdown = true;
+        self.background_writes.shutdown = true;
     }
 
     #[inline]
@@ -1002,6 +1122,32 @@ impl<T> StorageInflightSlots<T> {
         }
     }
 
+    #[inline]
+    fn get(&self, slot: u32) -> &T {
+        match &self.slots[slot as usize].entry {
+            StorageSlotEntry::Occupied(value) => value,
+            StorageSlotEntry::Vacant(_) => panic!("slot {slot} is not occupied"),
+        }
+    }
+
+    /// Take an occupied slot by local slot index before backend submission.
+    #[inline]
+    fn take_slot(&mut self, slot: u32) -> T {
+        let slot_ref = self.slots.get_mut(slot as usize).unwrap_or_else(|| {
+            panic!("staged submission references invalid inflight slot: slot={slot}")
+        });
+        let prev_head = self.free_head;
+        let entry = replace(&mut slot_ref.entry, StorageSlotEntry::Vacant(prev_head));
+        slot_ref.generation = slot_ref.generation.wrapping_add(1);
+        self.free_head = slot;
+        match entry {
+            StorageSlotEntry::Occupied(value) => value,
+            StorageSlotEntry::Vacant(_) => {
+                panic!("staged submission references vacant inflight slot: slot={slot}")
+            }
+        }
+    }
+
     /// Take the inflight value referenced by one backend completion token.
     #[inline]
     fn take(&mut self, token: BackendToken) -> T {
@@ -1038,6 +1184,83 @@ struct StorageInflightEntry<S, P> {
     submission: S,
     _prepared: P,
     submitted: bool,
+}
+
+struct SubmittedStorageIoLeak {
+    backend: &'static str,
+    reason: String,
+}
+
+/// Submitted entries retained after a fatal backend progress failure.
+///
+/// Field order on `StorageIOWorker` drops this quarantine after the backend.
+/// That makes libaio cleanup rely on `io_destroy` first, while io_uring can
+/// intentionally leak memory-bound entries when sync cancel cannot prove
+/// submitted user memory is safe to free.
+struct SubmittedStorageIoQuarantine<P> {
+    entries: Vec<StorageInflightEntry<StorageSubmission, P>>,
+    leak: Option<SubmittedStorageIoLeak>,
+}
+
+impl<P> SubmittedStorageIoQuarantine<P> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            leak: None,
+        }
+    }
+
+    #[inline]
+    fn retain(
+        &mut self,
+        entries: Vec<StorageInflightEntry<StorageSubmission, P>>,
+        cleanup: SubmittedIoCleanup,
+    ) {
+        debug_assert!(self.entries.is_empty());
+        match cleanup {
+            SubmittedIoCleanup::DropAfterBackend => {
+                self.leak = None;
+            }
+            SubmittedIoCleanup::LeakAfterBackend { backend, reason } => {
+                self.leak = Some(SubmittedStorageIoLeak { backend, reason });
+            }
+        }
+        self.entries = entries;
+    }
+}
+
+impl<P> Drop for SubmittedStorageIoQuarantine<P> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let Some(leak) = self.leak.take() else {
+            return;
+        };
+        let entries = take(&mut self.entries);
+        let retained = entries.len();
+        let mut leaked = 0usize;
+        let mut dropped = 0usize;
+        for mut entry in entries {
+            if entry.submission.binds_io_memory() {
+                leaked += 1;
+                forget(entry);
+            } else {
+                dropped += 1;
+                drop(entry);
+            }
+        }
+        obs::error!(
+            "event=storage_submitted_io_quarantine component=storage_io backend={} action=leak result=error retained={} leaked={} dropped={} reason={}",
+            leak.backend,
+            retained,
+            leaked,
+            dropped,
+            leak.reason
+        );
+    }
 }
 
 /// Late-bound builder for the shared storage worker.
@@ -1086,11 +1309,16 @@ where
 
     /// Bind the late-resolved state machine and finalize the worker.
     #[inline]
-    fn bind(self, state_machine: StorageStateMachine) -> StorageIOWorker<B> {
+    fn bind(
+        self,
+        engine_poisoner: QuiescentGuard<EnginePoisoner>,
+        state_machine: StorageStateMachine,
+    ) -> StorageIOWorker<B> {
         let io_depth = self.backend.max_events();
         let submit_batch = self.backend.new_submit_batch();
         StorageIOWorker {
             backend: self.backend,
+            submitted_quarantine: SubmittedStorageIoQuarantine::new(),
             scheduler: StorageRequestScheduler {
                 table_reads: TableReadLane {
                     rx: self.table_reads_rx,
@@ -1113,8 +1341,10 @@ where
             submitted: 0,
             staged_slots: VecDeque::new(),
             submit_batch,
+            submit_backoff: SubmitRetryBackoff::default(),
             slots: StorageInflightSlots::new(io_depth),
             state_machine,
+            engine_poisoner,
         }
     }
 }
@@ -1122,12 +1352,15 @@ where
 /// Backend-owning event loop for the shared storage service.
 struct StorageIOWorker<B: IOBackend = StorageBackend> {
     backend: B,
+    submitted_quarantine: SubmittedStorageIoQuarantine<B::Prepared>,
     scheduler: StorageRequestScheduler,
     submitted: usize,
     staged_slots: VecDeque<u32>,
     submit_batch: B::SubmitBatch,
+    submit_backoff: SubmitRetryBackoff,
     slots: StorageInflightSlots<StorageInflightEntry<StorageSubmission, B::Prepared>>,
     state_machine: StorageStateMachine,
+    engine_poisoner: QuiescentGuard<EnginePoisoner>,
 }
 
 impl<B> StorageIOWorker<B>
@@ -1195,6 +1428,122 @@ where
         }
     }
 
+    #[inline]
+    fn fail_not_submitted(
+        &mut self,
+        queue: &mut IOQueue<StorageSubmission>,
+        err: &Report<IoError>,
+    ) {
+        self.scheduler.fail_deferred(&mut self.state_machine, err);
+        for sub in queue.drain_to(queue.len()) {
+            self.state_machine
+                .fail_submission_with_backend_error(sub, err);
+        }
+        while let Some(slot) = self.staged_slots.pop_front() {
+            let entry = self.slots.take_slot(slot);
+            debug_assert!(!entry.submitted);
+            self.state_machine
+                .fail_submission_with_backend_error(entry.submission, err);
+        }
+    }
+
+    #[inline]
+    fn fail_submitted(&mut self, err: &Report<IoError>) {
+        for slot in &mut self.slots.slots {
+            let StorageSlotEntry::Occupied(entry) = &mut slot.entry else {
+                continue;
+            };
+            if entry.submitted {
+                let _ = self
+                    .state_machine
+                    .fail_submitted_with_backend_error(&mut entry.submission, err);
+            }
+        }
+    }
+
+    #[inline]
+    fn take_submitted_entries(
+        &mut self,
+    ) -> Vec<StorageInflightEntry<StorageSubmission, B::Prepared>> {
+        if self.submitted == 0 {
+            return Vec::new();
+        }
+        let mut entries = Vec::with_capacity(self.submitted);
+        for slot_idx in 0..self.slots.slots.len() {
+            let submitted = match &self.slots.slots[slot_idx].entry {
+                StorageSlotEntry::Occupied(entry) => entry.submitted,
+                StorageSlotEntry::Vacant(_) => false,
+            };
+            if !submitted {
+                continue;
+            }
+            let slot = &mut self.slots.slots[slot_idx];
+            let prev_head = self.slots.free_head;
+            let entry = replace(&mut slot.entry, StorageSlotEntry::Vacant(prev_head));
+            slot.generation = slot.generation.wrapping_add(1);
+            self.slots.free_head = slot_idx as u32;
+            match entry {
+                StorageSlotEntry::Occupied(entry) => entries.push(entry),
+                StorageSlotEntry::Vacant(_) => {
+                    unreachable!("submitted slot became vacant while taking it")
+                }
+            }
+        }
+        assert_eq!(
+            entries.len(),
+            self.submitted,
+            "submitted slot count must match worker counter"
+        );
+        self.submitted = 0;
+        entries
+    }
+
+    #[inline]
+    fn quarantine_submitted(&mut self, cleanup: SubmittedIoCleanup) {
+        let entries = self.take_submitted_entries();
+        self.submitted_quarantine.retain(entries, cleanup);
+    }
+
+    #[inline]
+    fn handle_backend_progress_failure(
+        &mut self,
+        queue: &mut IOQueue<StorageSubmission>,
+        err: Report<IoError>,
+    ) {
+        let err = attach_backend_operation_kind(
+            err,
+            self.staged_slots
+                .front()
+                .map(|slot| self.slots.get(*slot).submission.io_kind()),
+        );
+        let backend = backend_failure(&err);
+        let backend_name = backend.map_or("unknown", |failure| failure.backend());
+        let phase = backend
+            .map(|failure| failure.phase().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let raw_errno = backend.and_then(|failure| failure.raw_errno());
+        let error = backend_report_summary(&err);
+        obs::error!(
+            "event=storage_backend_progress_failure component=storage_io backend={} phase={} errno={:?} submitted={} staged={} queued={} action=poison result=error error={}",
+            backend_name,
+            phase,
+            raw_errno,
+            self.submitted,
+            self.staged_slots.len(),
+            queue.len(),
+            error
+        );
+        let _ = self.engine_poisoner.poison(
+            FatalError::StorageIo,
+            "storage_io",
+            format!("backend progress failure: {error}"),
+        );
+        self.fail_not_submitted(queue, &err);
+        self.fail_submitted(&err);
+        let cleanup = self.backend.cleanup_submitted_io(self.submitted);
+        self.quarantine_submitted(cleanup);
+    }
+
     fn run(mut self) {
         let mut results = self.backend.new_events();
         let mut queue: IOQueue<StorageSubmission> = IOQueue::with_capacity(self.io_depth());
@@ -1212,7 +1561,58 @@ where
             self.prepare_staged(&mut queue);
             if !self.staged_slots.is_empty() {
                 let limit = self.io_depth() - self.submitted;
-                let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
+                let submit_result = match self.backend.submit_batch(&mut self.submit_batch, limit) {
+                    Ok(submit_result) => submit_result,
+                    Err(err) => {
+                        self.handle_backend_progress_failure(&mut queue, err);
+                        return;
+                    }
+                };
+                let submit_count = match submit_result {
+                    SubmitAttempt::Submitted(submit_count) => {
+                        self.submit_backoff.reset();
+                        submit_count.get()
+                    }
+                    SubmitAttempt::Noop => {
+                        if self.submitted == 0 {
+                            self.submit_backoff.backoff();
+                            continue;
+                        }
+                        0
+                    }
+                    SubmitAttempt::Retry(reason) => {
+                        if self.submitted == 0 {
+                            obs::debug!(
+                                "event=storage_backend_submit_retry component=storage_io reason={} errno={:?} submitted={} staged={} queued={} action=backoff",
+                                reason,
+                                reason.raw_errno(),
+                                self.submitted,
+                                self.staged_slots.len(),
+                                queue.len()
+                            );
+                            if let Err(err) = self.submit_backoff.backoff_or_progress_error(
+                                reason,
+                                IOBackendQueueState::submit(
+                                    self.staged_slots.len(),
+                                    self.staged_slots.len(),
+                                ),
+                            ) {
+                                self.handle_backend_progress_failure(&mut queue, err);
+                                return;
+                            }
+                            continue;
+                        }
+                        obs::debug!(
+                            "event=storage_backend_submit_retry component=storage_io reason={} errno={:?} submitted={} staged={} queued={} action=wait",
+                            reason,
+                            reason.raw_errno(),
+                            self.submitted,
+                            self.staged_slots.len(),
+                            queue.len()
+                        );
+                        0
+                    }
+                };
                 #[cfg(test)]
                 let hook = current_storage_backend_test_hook();
                 for _ in 0..submit_count {
@@ -1237,8 +1637,17 @@ where
             }
 
             if self.submitted != 0 {
-                let completions = self.backend.wait_at_least(&mut results, 1);
+                let completions = match self.backend.wait_at_least(&mut results, 1) {
+                    Ok(completions) => completions,
+                    Err(err) => {
+                        self.handle_backend_progress_failure(&mut queue, err);
+                        return;
+                    }
+                };
                 let completed_count = completions.len();
+                if completed_count != 0 {
+                    self.submit_backoff.reset();
+                }
                 for (token, res) in completions {
                     let entry = self.slots.take(token);
                     debug_assert!(entry.submitted);
@@ -1317,15 +1726,19 @@ impl Component for FileSystemWorkers {
         })?;
 
         let fs = registry.dependency::<FileSystem>()?;
+        let engine_poisoner = registry.dependency::<EnginePoisoner>()?;
         let mem_pool = registry.dependency::<MemPool>()?;
         let index_pool = registry.dependency::<IndexPool>()?;
         let handle = builder
-            .bind(StorageStateMachine::new(
-                mem_pool.clone_inner().into_sync(),
-                mem_pool_file,
-                index_pool.clone_inner().into_sync(),
-                index_pool_file,
-            ))
+            .bind(
+                engine_poisoner,
+                StorageStateMachine::new(
+                    mem_pool.clone_inner().into_sync(),
+                    mem_pool_file,
+                    index_pool.clone_inner().into_sync(),
+                    index_pool_file,
+                ),
+            )
             .start_thread();
         registry.register::<Self>(FileSystemWorkersOwned {
             fs,
@@ -1747,10 +2160,12 @@ pub(crate) mod tests {
     use crate::error::{ConfigError, ErrorKind};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::table_file::TableFile;
+    use crate::file::{BlockKey, UNTRACKED_FILE_ID};
     use crate::id::BlockID;
     use crate::io::{
-        DirectBuf, IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp,
-        StorageBackendTestHook, install_storage_backend_test_hook,
+        BackendResult, Completion, DirectBuf, IOBackendErrorPhase, IOBackendFailure,
+        IOBackendOperationKind, IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp,
+        StorageBackendTestHook, SubmittedIoCleanup, install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
     use crate::table::test_user_table_id;
@@ -1761,6 +2176,7 @@ pub(crate) mod tests {
     use smol::Timer;
     use std::fs::{create_dir, write};
     use std::io::Error as StdIoError;
+    use std::num::NonZeroUsize;
     use std::ops::Deref;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
@@ -1875,6 +2291,7 @@ pub(crate) mod tests {
                 .data_dir(data_dir)
                 .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES);
             let mut builder = RegistryBuilder::new();
+            builder.build::<EnginePoisoner>(()).await?;
             builder.build::<FileSystem>(file.clone()).await?;
             builder
                 .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
@@ -2170,6 +2587,106 @@ pub(crate) mod tests {
         }
     }
 
+    struct SubmittedWaitFailureBackend {
+        max_events: usize,
+        inflight: VecDeque<BackendToken>,
+        cleanup_submitted: Arc<AtomicUsize>,
+    }
+
+    impl SubmittedWaitFailureBackend {
+        #[inline]
+        fn new(max_events: usize, cleanup_submitted: Arc<AtomicUsize>) -> Self {
+            Self {
+                max_events,
+                inflight: VecDeque::new(),
+                cleanup_submitted,
+            }
+        }
+    }
+
+    impl IOBackend for SubmittedWaitFailureBackend {
+        type Prepared = BackendToken;
+        type SubmitBatch = VecDeque<BackendToken>;
+        type Events = ();
+
+        #[inline]
+        fn max_events(&self) -> usize {
+            self.max_events
+        }
+
+        #[inline]
+        fn new_submit_batch(&self) -> Self::SubmitBatch {
+            VecDeque::with_capacity(self.max_events)
+        }
+
+        #[inline]
+        fn new_events(&self) -> Self::Events {}
+
+        #[inline]
+        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
+            token
+        }
+
+        #[inline]
+        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
+            batch.push_back(*prepared);
+        }
+
+        #[inline]
+        fn submit_batch(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            limit: usize,
+        ) -> BackendResult<SubmitAttempt> {
+            let submit_count = limit.min(batch.len());
+            let Some(submitted) = NonZeroUsize::new(submit_count) else {
+                return Ok(SubmitAttempt::Noop);
+            };
+            for _ in 0..submit_count {
+                let token = batch
+                    .pop_front()
+                    .expect("test submit count must match staged tokens");
+                self.inflight.push_back(token);
+            }
+            Ok(SubmitAttempt::Submitted(submitted))
+        }
+
+        #[inline]
+        fn wait_at_least(
+            &mut self,
+            _events: &mut Self::Events,
+            min_nr: usize,
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+            assert!(
+                self.inflight.len() >= min_nr,
+                "test backend requires submitted work before wait failure"
+            );
+            Err(IOBackendFailure::report(
+                "submitted_wait_failure_test",
+                IOBackendErrorPhase::Wait,
+                StdIoError::from_raw_os_error(libc::EIO),
+                1,
+                IOBackendQueueState::wait_with_completions(0),
+            ))
+        }
+
+        #[inline]
+        fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup {
+            self.cleanup_submitted
+                .fetch_add(submitted, Ordering::SeqCst);
+            SubmittedIoCleanup::DropAfterBackend
+        }
+    }
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        #[inline]
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn op_kinds(ops: &[StorageBackendOp]) -> Vec<IOKind> {
         ops.iter().map(StorageBackendOp::kind).collect()
     }
@@ -2182,6 +2699,267 @@ pub(crate) mod tests {
             Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    fn create_sparse_for_test(path: &Path) -> Arc<SparseFile> {
+        Arc::new(
+            SparseFile::create_or_trunc(
+                path.to_str().expect("test path must be utf8"),
+                COW_FILE_PAGE_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn backend_progress_failure_for_test(phase: IOBackendErrorPhase) -> Report<IoError> {
+        let queue_state = match phase {
+            IOBackendErrorPhase::Submit => IOBackendQueueState::submit(1, 1),
+            IOBackendErrorPhase::Wait => IOBackendQueueState::wait_with_completions(0),
+        };
+        IOBackendFailure::report(
+            "submitted_wait_failure_test",
+            phase,
+            StdIoError::from_raw_os_error(libc::EIO),
+            1,
+            queue_state,
+        )
+    }
+
+    fn assert_backend_sync_completion_error(
+        completion: &Completion<()>,
+        phase: IOBackendErrorPhase,
+        expected_operation_kind: Option<&str>,
+    ) {
+        let report = completion
+            .completed_result()
+            .expect("sync waiter should be completed")
+            .expect_err("sync waiter should fail with backend error");
+        let failure = report
+            .downcast_ref::<IOBackendFailure>()
+            .expect("backend failure context should be preserved");
+        assert_eq!(failure.backend(), "submitted_wait_failure_test");
+        assert_eq!(failure.phase(), phase);
+        assert_eq!(failure.raw_errno(), Some(libc::EIO));
+        assert_eq!(
+            report
+                .downcast_ref::<IOBackendOperationKind>()
+                .map(ToString::to_string)
+                .as_deref(),
+            expected_operation_kind
+        );
+    }
+
+    #[test]
+    fn test_submitted_io_quarantine_leaks_memory_bound_entries_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let sparse = create_sparse_for_test(&temp_dir.path().join("quarantine.tbl"));
+        let block_key = BlockKey::new(UNTRACKED_FILE_ID, BlockID::new(0));
+        let (write, _write_waiter) = WriteSubmission::prepare(
+            block_key,
+            Arc::clone(&sparse),
+            0,
+            DirectBuf::zeroed(COW_FILE_PAGE_SIZE),
+            None,
+        );
+        let write_drops = Arc::new(AtomicUsize::new(0));
+        let write_entry = StorageInflightEntry {
+            submission: StorageSubmission::table(TableFsSubmission::Write(write.into_prepared())),
+            _prepared: DropCounter(Arc::clone(&write_drops)),
+            submitted: true,
+        };
+        {
+            let mut quarantine = SubmittedStorageIoQuarantine::new();
+            quarantine.retain(
+                vec![write_entry],
+                SubmittedIoCleanup::LeakAfterBackend {
+                    backend: "test_backend",
+                    reason: "forced test leak".to_string(),
+                },
+            );
+        }
+        assert_eq!(write_drops.load(Ordering::SeqCst), 0);
+
+        let (sync, _sync_waiter) = SyncSubmission::prepare_fsync(sparse);
+        let sync_drops = Arc::new(AtomicUsize::new(0));
+        let sync_entry = StorageInflightEntry {
+            submission: StorageSubmission::table(TableFsSubmission::Sync(sync.into_prepared())),
+            _prepared: DropCounter(Arc::clone(&sync_drops)),
+            submitted: true,
+        };
+        {
+            let mut quarantine = SubmittedStorageIoQuarantine::new();
+            quarantine.retain(
+                vec![sync_entry],
+                SubmittedIoCleanup::LeakAfterBackend {
+                    backend: "test_backend",
+                    reason: "forced test leak".to_string(),
+                },
+            );
+        }
+        assert_eq!(sync_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_backend_progress_failure_completes_submitted_sync_waiter() {
+        smol::block_on(async {
+            let (temp_dir, fs) = build_test_fs();
+            let cleanup_submitted = Arc::new(AtomicUsize::new(0));
+            let (builder, table_reads, pool_reads, background_writes) = StorageIOWorkerBuilder::new(
+                SubmittedWaitFailureBackend::new(1, Arc::clone(&cleanup_submitted)),
+            );
+            let worker_dir = temp_dir.path().join("submitted-wait-failure");
+            create_dir(&worker_dir).unwrap();
+            let table_file = create_sparse_for_test(&worker_dir.join("table.tbl"));
+            let mem_pool_file = SparseFile::create_or_trunc(
+                worker_dir.join("mem.swp").to_str().unwrap(),
+                COW_FILE_PAGE_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap();
+            let index_pool_file = SparseFile::create_or_trunc(
+                worker_dir.join("index.swp").to_str().unwrap(),
+                COW_FILE_PAGE_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap();
+            let mut poison_builder = RegistryBuilder::new();
+            poison_builder.build::<EnginePoisoner>(()).await.unwrap();
+            let poison_registry = poison_builder.finish().unwrap();
+            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>().unwrap();
+            let state_machine = StorageStateMachine::new(
+                fs.mem_pool().into_sync(),
+                mem_pool_file,
+                fs.index_pool().into_sync(),
+                index_pool_file,
+            );
+            let worker = builder.bind(engine_poisoner.clone(), state_machine);
+            let (submission, completion) = SyncSubmission::prepare_fsync(table_file);
+            let handle = worker.start_thread();
+            background_writes
+                .send(BackgroundWriteRequest::TableSync(submission))
+                .expect("test background write lane should accept fsync");
+            handle
+                .join()
+                .expect("test storage IO worker should not panic");
+
+            assert_backend_sync_completion_error(&completion, IOBackendErrorPhase::Wait, None);
+            assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *engine_poisoner
+                    .poison_error()
+                    .expect("backend wait failure should poison engine")
+                    .current_context(),
+                FatalError::StorageIo
+            );
+            drop(table_reads);
+            drop(pool_reads);
+            drop(background_writes);
+            drop(engine_poisoner);
+            drop(poison_registry);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_backend_progress_failure_fails_staged_and_queued_sync_waiters() {
+        smol::block_on(async {
+            let (temp_dir, fs) = build_test_fs();
+            let cleanup_submitted = Arc::new(AtomicUsize::new(0));
+            let (builder, table_reads, pool_reads, background_writes) = StorageIOWorkerBuilder::new(
+                SubmittedWaitFailureBackend::new(1, Arc::clone(&cleanup_submitted)),
+            );
+            let worker_dir = temp_dir.path().join("staged-queued-failure");
+            create_dir(&worker_dir).unwrap();
+            let staged_file = create_sparse_for_test(&worker_dir.join("staged.tbl"));
+            let queued_file = create_sparse_for_test(&worker_dir.join("queued.tbl"));
+            let mem_pool_file = SparseFile::create_or_trunc(
+                worker_dir.join("mem.swp").to_str().unwrap(),
+                COW_FILE_PAGE_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap();
+            let index_pool_file = SparseFile::create_or_trunc(
+                worker_dir.join("index.swp").to_str().unwrap(),
+                COW_FILE_PAGE_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap();
+            let mut poison_builder = RegistryBuilder::new();
+            poison_builder.build::<EnginePoisoner>(()).await.unwrap();
+            let poison_registry = poison_builder.finish().unwrap();
+            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>().unwrap();
+            let state_machine = StorageStateMachine::new(
+                fs.mem_pool().into_sync(),
+                mem_pool_file,
+                fs.index_pool().into_sync(),
+                index_pool_file,
+            );
+            let mut worker = builder.bind(engine_poisoner.clone(), state_machine);
+
+            let (staged_submission, staged_completion) = SyncSubmission::prepare_fsync(staged_file);
+            let mut staged_submission = StorageSubmission::table(TableFsSubmission::Sync(
+                staged_submission.into_prepared(),
+            ));
+            let (token, slot) = worker
+                .slots
+                .reserve()
+                .expect("test worker should have one free slot");
+            let mut prepared = worker.backend.prepare(token, staged_submission.operation());
+            worker
+                .backend
+                .push_prepared(&mut worker.submit_batch, &mut prepared);
+            worker.slots.occupy_reserved(
+                slot,
+                StorageInflightEntry {
+                    submission: staged_submission,
+                    _prepared: prepared,
+                    submitted: false,
+                },
+            );
+            worker.staged_slots.push_back(slot);
+
+            let (queued_submission, queued_completion) = SyncSubmission::prepare_fsync(queued_file);
+            let mut queue = IOQueue::with_capacity(1);
+            queue.push(StorageSubmission::table(TableFsSubmission::Sync(
+                queued_submission.into_prepared(),
+            )));
+
+            worker.handle_backend_progress_failure(
+                &mut queue,
+                backend_progress_failure_for_test(IOBackendErrorPhase::Submit),
+            );
+
+            assert_eq!(queue.len(), 0);
+            assert!(worker.staged_slots.is_empty());
+            assert_eq!(worker.submitted, 0);
+            assert!(worker.slots.has_vacant());
+            assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 0);
+            assert_backend_sync_completion_error(
+                &staged_completion,
+                IOBackendErrorPhase::Submit,
+                Some("operation_kind=Fsync"),
+            );
+            assert_backend_sync_completion_error(
+                &queued_completion,
+                IOBackendErrorPhase::Submit,
+                Some("operation_kind=Fsync"),
+            );
+            assert_eq!(
+                *engine_poisoner
+                    .poison_error()
+                    .expect("backend submit failure should poison engine")
+                    .current_context(),
+                FatalError::StorageIo
+            );
+            drop(worker);
+            drop(table_reads);
+            drop(pool_reads);
+            drop(background_writes);
+            drop(engine_poisoner);
+            drop(poison_registry);
+            drop(fs);
+        });
     }
 
     #[test]

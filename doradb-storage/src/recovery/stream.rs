@@ -2,8 +2,8 @@ use crate::error::{DataIntegrityError, Error, InternalError, IoError, Result};
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::id::TrxID;
 use crate::io::{
-    CompletedSubmission, DirectBuf, IOBuf, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
-    StorageBackend, SubmissionDriver,
+    CompletedSubmission, DirectBuf, IOBackend, IOBuf, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
+    StorageBackend, SubmissionDriver, SubmitAttempt,
 };
 use crate::log::block_group::{TrxLog, block_count_for_payload};
 use crate::log::format::{
@@ -23,7 +23,7 @@ use std::mem::take;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::resume_unwind;
 use std::path::PathBuf;
-use std::thread::{JoinHandle, panicking, yield_now};
+use std::thread::{JoinHandle, panicking};
 use std::time::Duration;
 
 const REDO_READ_AHEAD_SEND_TIMEOUT: Duration = Duration::from_millis(100);
@@ -1025,7 +1025,37 @@ impl RedoReadAheadWorker {
                             )
                         })?;
             }
-            driver.submit_ready();
+            let submit_attempt = match driver.submit_ready() {
+                Ok(attempt) => attempt,
+                Err(err) => return Err(self.handle_backend_progress_error(driver, err)),
+            };
+            let submit_retry_without_inflight = match submit_attempt {
+                SubmitAttempt::Noop | SubmitAttempt::Submitted(_) => false,
+                SubmitAttempt::Retry(reason) => {
+                    if driver.submitted_len() == 0 {
+                        obs::debug!(
+                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={:?} submitted={} pending={} action=backoff",
+                            reason,
+                            reason.raw_errno(),
+                            driver.submitted_len(),
+                            driver.pending_len()
+                        );
+                        if let Err(err) = driver.backoff_submit_retry_or_progress_error(reason) {
+                            return Err(self.handle_backend_progress_error(driver, err));
+                        }
+                        true
+                    } else {
+                        obs::debug!(
+                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={:?} submitted={} pending={} action=wait",
+                            reason,
+                            reason.raw_errno(),
+                            driver.submitted_len(),
+                            driver.pending_len()
+                        );
+                        false
+                    }
+                }
+            };
             if !self.emit_ready(
                 file_seq,
                 &mut next_emit_offset,
@@ -1043,10 +1073,16 @@ impl RedoReadAheadWorker {
                 if driver.pending_len() == 0 {
                     continue;
                 }
-                yield_now();
+                if !submit_retry_without_inflight {
+                    driver.backoff_submit_retry();
+                }
                 continue;
             }
-            let completion = take_read_completion(driver.wait_at_least_one())?;
+            let completed_submission = match driver.wait_at_least_one() {
+                Ok(completed) => completed,
+                Err(err) => return Err(self.handle_backend_progress_error(driver, err)),
+            };
+            let completion = take_read_completion(completed_submission)?;
             let (completed_file_seq, completed_offset, buf) = match completion.validate() {
                 Ok(completed) => completed,
                 Err(err) => {
@@ -1119,18 +1155,79 @@ impl RedoReadAheadWorker {
     }
 
     #[inline]
-    fn drain_driver(&mut self, driver: &mut SubmissionDriver<RedoReadSubmission>) {
+    fn drain_driver<B>(&mut self, driver: &mut SubmissionDriver<RedoReadSubmission, B>) -> usize
+    where
+        B: IOBackend,
+    {
+        let mut retained = 0;
         while driver.pending_len() != 0 {
-            driver.submit_ready();
+            match driver.submit_ready() {
+                Ok(SubmitAttempt::Retry(reason)) if driver.submitted_len() == 0 => {
+                    if driver
+                        .backoff_submit_retry_or_progress_error(reason)
+                        .is_err()
+                    {
+                        retained += self.cleanup_driver_after_backend_failure(driver);
+                        break;
+                    }
+                    continue;
+                }
+                Ok(SubmitAttempt::Noop | SubmitAttempt::Submitted(_) | SubmitAttempt::Retry(_)) => {
+                }
+                Err(_) => {
+                    retained += self.cleanup_driver_after_backend_failure(driver);
+                    break;
+                }
+            }
             if driver.submitted_len() == 0 {
-                yield_now();
+                driver.backoff_submit_retry();
                 continue;
             }
-            if let Ok(completion) = take_read_completion(driver.wait_at_least_one()) {
+            let Ok(completed) = driver.wait_at_least_one() else {
+                retained += self.cleanup_driver_after_backend_failure(driver);
+                break;
+            };
+            if let Ok(completion) = take_read_completion(completed) {
                 drop(completion.buf);
             }
         }
         self.drain_recycled();
+        retained
+    }
+
+    #[inline]
+    fn handle_backend_progress_error<B>(
+        &mut self,
+        driver: &mut SubmissionDriver<RedoReadSubmission, B>,
+        err: Report<IoError>,
+    ) -> Error
+    where
+        B: IOBackend,
+    {
+        self.cleanup_driver_after_backend_failure(driver);
+        backend_progress_error(err)
+    }
+
+    #[inline]
+    fn cleanup_driver_after_backend_failure<B>(
+        &mut self,
+        driver: &mut SubmissionDriver<RedoReadSubmission, B>,
+    ) -> usize
+    where
+        B: IOBackend,
+    {
+        let pending = driver.pending_len();
+        let submitted = driver.submitted_len();
+        let retained = driver.cleanup_after_backend_progress_failure();
+        if retained != 0 {
+            obs::error!(
+                "event=redo_readahead_backend_cleanup component=recovery pending={} submitted={} retained_submitted={} action=cleanup",
+                pending,
+                submitted,
+                retained
+            );
+        }
+        retained
     }
 
     #[inline]
@@ -1453,6 +1550,12 @@ struct ValidatedGroupStart {
 }
 
 #[inline]
+fn backend_progress_error(err: Report<IoError>) -> Error {
+    err.attach("redo read-ahead backend progress failure")
+        .into()
+}
+
+#[inline]
 fn replay_suffix_start(segments: &[RedoLogSegment], floor: TrxID) -> usize {
     let mut suffix_start = segments.len();
     for (idx, segment) in segments.iter().enumerate().rev() {
@@ -1589,7 +1692,10 @@ mod tests {
     use super::*;
     use crate::buffer::test_page_id;
     use crate::id::{RowID, TableID, TrxID};
-    use crate::io::{DirectBuf, IOBuf};
+    use crate::io::{
+        BackendResult, BackendToken, DirectBuf, IOBackendErrorPhase, IOBackendFailure,
+        IOBackendQueueState, IOBuf, SubmittedIoCleanup,
+    };
     use crate::log::block_group::LogBlockGroup;
     use crate::log::format::{
         REDO_BLOCK_GROUP_END, REDO_BLOCK_GROUP_START, REDO_SUPER_BLOCK_SLOT_SIZE,
@@ -1600,7 +1706,8 @@ mod tests {
     };
     use crate::serde::Ser;
     use std::collections::{BTreeMap, VecDeque};
-    use std::io::Write;
+    use std::io::{Error as StdIoError, Write};
+    use std::num::NonZeroUsize;
     use std::path::Path;
     use std::thread::spawn;
 
@@ -1730,6 +1837,81 @@ mod tests {
         }
     }
 
+    struct WaitErrorBackend {
+        max_events: usize,
+        inflight: VecDeque<BackendToken>,
+    }
+
+    impl WaitErrorBackend {
+        #[inline]
+        fn new(max_events: usize) -> Self {
+            Self {
+                max_events,
+                inflight: VecDeque::new(),
+            }
+        }
+    }
+
+    impl IOBackend for WaitErrorBackend {
+        type Prepared = BackendToken;
+        type SubmitBatch = VecDeque<BackendToken>;
+        type Events = ();
+
+        fn max_events(&self) -> usize {
+            self.max_events
+        }
+
+        fn new_submit_batch(&self) -> Self::SubmitBatch {
+            VecDeque::with_capacity(self.max_events)
+        }
+
+        fn new_events(&self) -> Self::Events {}
+
+        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
+            token
+        }
+
+        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
+            batch.push_back(*prepared);
+        }
+
+        fn submit_batch(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            limit: usize,
+        ) -> BackendResult<SubmitAttempt> {
+            let submit_count = limit.min(batch.len());
+            let Some(submitted) = NonZeroUsize::new(submit_count) else {
+                return Ok(SubmitAttempt::Noop);
+            };
+            for _ in 0..submit_count {
+                let token = batch
+                    .pop_front()
+                    .expect("test backend submit count must match staged tokens");
+                self.inflight.push_back(token);
+            }
+            Ok(SubmitAttempt::Submitted(submitted))
+        }
+
+        fn wait_at_least(
+            &mut self,
+            _events: &mut Self::Events,
+            _min_nr: usize,
+        ) -> BackendResult<Vec<(BackendToken, IoResult<usize>)>> {
+            Err(IOBackendFailure::report(
+                "recovery_test",
+                IOBackendErrorPhase::Wait,
+                StdIoError::from_raw_os_error(libc::EIO),
+                1,
+                IOBackendQueueState::wait_with_completions(0),
+            ))
+        }
+
+        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
+            SubmittedIoCleanup::DropAfterBackend
+        }
+    }
+
     #[test]
     fn test_read_ahead_send_item_stops_while_item_queue_full() {
         let (items_tx, items_rx) = flume::bounded(1);
@@ -1756,6 +1938,38 @@ mod tests {
         stop_tx.send(()).unwrap();
         assert!(!join.join().unwrap());
         assert_eq!(items_rx.len(), 1);
+    }
+
+    #[test]
+    fn test_read_ahead_drain_cleans_pending_reads_after_wait_error() {
+        let (items_tx, _items_rx) = flume::bounded(1);
+        let (_recycle_tx, recycle_rx) = flume::bounded(1);
+        let (_stop_tx, stop_rx) = flume::bounded(1);
+        let mut worker = RedoReadAheadWorker {
+            segments: Vec::new(),
+            read_depth: 1,
+            items: items_tx,
+            recycle: recycle_rx,
+            stop: stop_rx,
+            stop_requested: false,
+            free: Vec::new(),
+            free_block_size: Some(STORAGE_SECTOR_SIZE),
+        };
+        let mut driver = SubmissionDriver::new(WaitErrorBackend::new(1));
+        assert!(
+            driver
+                .push(RedoReadSubmission::new(
+                    TEST_FILE_SEQ,
+                    REDO_DEFAULT_DATA_START_OFFSET,
+                    0,
+                    DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+                ))
+                .is_ok()
+        );
+
+        assert_eq!(worker.drain_driver(&mut driver), 1);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
     }
 
     async fn assert_stream_corrupted(stream: &mut RedoLogStream) {

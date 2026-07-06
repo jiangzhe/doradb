@@ -173,8 +173,12 @@ durable end offset, and the real redo CTS range accumulated for that file, then
 submits the configured seal sync policy through the redo backend driver. The
 new-file header and later data writes may be submitted before the old seal
 finishes, but transaction publication for the new file cannot pass the old-file
-seal barrier. Seal write failure poisons storage as `RedoWrite`; seal sync
-failure poisons storage as `RedoSync`.
+seal barrier. Seal write failure poisons engine as `RedoWrite`; seal sync
+failure poisons engine as `RedoSync`. Backend-level submit or wait progress
+failures enter the same fatal cleanup path as redo completion failures:
+runtime admission is poisoned, pending precommit work is failed through ordered
+cleanup, and transaction waiters are completed only after required
+failed-precommit cleanup is queued.
 
 ## Serialization Rules
 
@@ -421,7 +425,7 @@ physical row page.
 11. During clean shutdown, after pending redo work drains, the log thread
     best-effort seals the active file with the same segment metadata and sync
     policy through the redo backend driver. A clean-shutdown seal failure
-    increments a redo seal failure stat but does not poison storage or fail
+    increments a redo seal failure stat but does not poison engine or fail
     shutdown by itself; recovery treats the file as unsealed if the inactive
     slot was not durably published.
 
@@ -612,7 +616,7 @@ lose recent log writes.
   live-table, and pending dropped-table replay floors. A marker publication
   failure stops before unlink and is treated like a fatal checkpoint-write
   failure. Non-`NotFound` unlink failures are reported as retryable cleanup
-  failures and do not poison storage.
+  failures and do not poison engine.
 - `Session::checkpoint_catalog_and_truncate_redo_log` batches explicit catalog
   checkpoint and truncation work, including a single `catalog.mtb` root publish
   when checkpoint metadata and `first_redo_log_seq` both advance.

@@ -91,7 +91,7 @@ impl RowPageCreateRedoCtx<'_> {
         let res = self.trx_sys.commit_sys(trx);
         if let Err(err) = &res {
             debug_assert!(
-                self.trx_sys.storage_poison_error().is_some()
+                self.trx_sys.poison_error().is_some()
                     || err.lifecycle_error() == Some(LifecycleError::Shutdown),
                 "row-page create redo failed while transaction system is still healthy: {err:?}"
             );

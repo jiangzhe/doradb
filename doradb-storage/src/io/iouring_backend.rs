@@ -1,15 +1,20 @@
 use super::{
-    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult,
+    BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
+    IOBackendQueueState, IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult,
+    SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
 };
 use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
 use error_stack::Report;
 use io_uring::opcode::{Fsync, Read, Write};
-use io_uring::types::FsyncFlags;
+use io_uring::types::{CancelBuilder, FsyncFlags, Timespec};
 use io_uring::{IoUring, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
 use std::io::Error as StdIoError;
-use std::time::Instant;
+use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
+
+const IOURING_SYNC_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Concrete io_uring context used by the storage-engine backend.
 pub(crate) struct IouringBackend {
@@ -58,10 +63,10 @@ impl IouringBackend {
     }
 
     #[inline]
-    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) {
+    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) -> bool {
         let target = limit.min(batch.staged.len());
         if target == 0 {
-            return;
+            return false;
         }
 
         while batch.pending_sqes < target {
@@ -76,10 +81,11 @@ impl IouringBackend {
                 unsafe { sq.push(entry) }
             };
             if push_res.is_err() {
-                break;
+                return true;
             }
             batch.pending_sqes += 1;
         }
+        false
     }
 
     #[inline]
@@ -96,6 +102,70 @@ impl IouringBackend {
         }
         self.stats.record_wait_completions(completed.len());
         completed
+    }
+
+    #[inline]
+    fn submit_pending_sqes(
+        &mut self,
+        batch: &mut IouringSubmitBatch,
+    ) -> BackendResult<SubmitOutcome> {
+        debug_assert!(batch.pending_sqes != 0);
+
+        let mut call_count = 0usize;
+        let submitted = loop {
+            call_count += 1;
+            match self.ring.submit() {
+                Ok(submitted) => break submitted,
+                Err(err) if err.raw_os_error() == Some(EINTR) => {}
+                Err(err) if matches!(err.raw_os_error(), Some(EAGAIN | EBUSY)) => {
+                    let reason = SubmitRetryReason::from_raw_errno(
+                        err.raw_os_error()
+                            .expect("EAGAIN/EBUSY match guarantees raw errno"),
+                    )
+                    .expect("EAGAIN/EBUSY match must convert to retry reason");
+                    return Ok(retry_submit(reason, call_count));
+                }
+                Err(err) => {
+                    return Err(IOBackendFailure::report(
+                        "io_uring",
+                        IOBackendErrorPhase::Submit,
+                        err,
+                        call_count,
+                        IOBackendQueueState::submit(batch.staged.len(), batch.pending_sqes),
+                    ));
+                }
+            }
+        };
+
+        Ok(batch.finish_submit(submitted, call_count))
+    }
+
+    fn blocking_submit_and_wait(
+        &mut self,
+        min_nr: usize,
+        observed_completions: usize,
+    ) -> BackendResult<BlockingWaitOutcome> {
+        let mut call_count = 0usize;
+        let submitted = loop {
+            call_count += 1;
+            match self.ring.submit_and_wait(min_nr) {
+                Ok(submitted) => break submitted,
+                Err(err) if err.raw_os_error() == Some(EINTR) => {}
+                Err(err) => {
+                    return Err(IOBackendFailure::report(
+                        "io_uring",
+                        IOBackendErrorPhase::Wait,
+                        err,
+                        call_count,
+                        IOBackendQueueState::wait_with_completions(observed_completions),
+                    ));
+                }
+            }
+        };
+        Ok(BlockingWaitOutcome {
+            submitted,
+            call_count,
+        })
     }
 }
 
@@ -148,24 +218,45 @@ impl IOBackend for IouringBackend {
     }
 
     #[inline]
-    fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
+    fn submit_batch(
+        &mut self,
+        batch: &mut Self::SubmitBatch,
+        limit: usize,
+    ) -> BackendResult<SubmitAttempt> {
         let start = Instant::now();
-        self.stage_pending_sqes(batch, limit);
+        let sq_full = self.stage_pending_sqes(batch, limit);
 
         if batch.pending_sqes == 0 {
-            return 0;
+            if sq_full {
+                // Work was available, but the SQ accepted no staged SQEs.
+                // Treat this as submit pressure so bounded retry can fail
+                // sustained no-progress instead of spinning on Noop.
+                return Ok(SubmitAttempt::Retry(SubmitRetry::new(
+                    "io_uring",
+                    SubmitRetryReason::NoProgress,
+                    0,
+                )));
+            }
+            return Ok(SubmitAttempt::Noop);
         }
 
-        let outcome = submit_pending_sqes(
-            batch,
-            limit,
-            || self.ring.submit(),
-            |min_nr| self.ring.submit_and_wait(min_nr),
-        );
-        self.stats
-            .record_submit_and_wait(outcome.call_count, start.elapsed().as_nanos() as usize);
-        self.stats.record_submitted_ops(outcome.submitted);
-        outcome.submitted
+        self.submit_pending_sqes(batch)
+            .inspect(|outcome| {
+                self.stats.record_submit_and_wait(
+                    outcome.call_count,
+                    start.elapsed().as_nanos() as usize,
+                );
+                if let SubmitAttempt::Submitted(submitted) = outcome.result {
+                    self.stats.record_submitted_ops(submitted.get());
+                }
+            })
+            .inspect_err(|err| {
+                self.stats.record_submit_and_wait(
+                    backend_call_count(err),
+                    start.elapsed().as_nanos() as usize,
+                );
+            })
+            .map(|outcome| outcome.result)
     }
 
     #[inline]
@@ -173,22 +264,52 @@ impl IOBackend for IouringBackend {
         &mut self,
         _events: &mut Self::Events,
         min_nr: usize,
-    ) -> Vec<(BackendToken, StdIoResult<usize>)> {
+    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
         {
             let cq = self.ring.completion();
             if cq.len() < min_nr {
+                let completions = cq.len();
                 drop(cq);
                 let start = Instant::now();
-                let outcome =
-                    blocking_submit_and_wait(min_nr, |min_nr| self.ring.submit_and_wait(min_nr));
-                record_blocking_wait_stats(
-                    &self.stats,
-                    outcome,
-                    start.elapsed().as_nanos() as usize,
-                );
+                self.blocking_submit_and_wait(min_nr, completions)
+                    .inspect(|outcome| {
+                        record_blocking_wait_stats(
+                            &self.stats,
+                            Some(outcome),
+                            outcome.call_count,
+                            start.elapsed().as_nanos() as usize,
+                        );
+                    })
+                    .inspect_err(|err| {
+                        record_blocking_wait_stats(
+                            &self.stats,
+                            None,
+                            backend_call_count(err),
+                            start.elapsed().as_nanos() as usize,
+                        );
+                    })?;
             }
         }
-        self.take_completions()
+        Ok(self.take_completions())
+    }
+
+    #[inline]
+    fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup {
+        if submitted == 0 {
+            return SubmittedIoCleanup::DropAfterBackend;
+        }
+        let timeout = Timespec::from(IOURING_SYNC_CANCEL_TIMEOUT);
+        match self
+            .ring
+            .submitter()
+            .register_sync_cancel(Some(timeout), CancelBuilder::any().all())
+        {
+            Ok(()) => SubmittedIoCleanup::DropAfterBackend,
+            Err(err) => SubmittedIoCleanup::LeakAfterBackend {
+                backend: "io_uring",
+                reason: format!("sync cancel failed for {submitted} submitted ops: {err}"),
+            },
+        }
     }
 }
 
@@ -202,8 +323,36 @@ pub(crate) struct IouringSubmitBatch {
     pending_sqes: usize,
 }
 
+impl IouringSubmitBatch {
+    #[inline]
+    fn finish_submit(&mut self, submitted: usize, call_count: usize) -> SubmitOutcome {
+        assert!(
+            submitted <= self.pending_sqes,
+            "io_uring submit reported more accepted SQEs than staged pending entries"
+        );
+        if submitted != 0 {
+            self.staged.drain(0..submitted);
+            self.pending_sqes -= submitted;
+        }
+        let result = match NonZeroUsize::new(submitted) {
+            Some(submitted) => SubmitAttempt::Submitted(submitted),
+            None => {
+                // `submit()` was called with pending SQEs but accepted none.
+                // Keep the pending prefix intact and let callers use the
+                // bounded retry/progress-failure path.
+                SubmitAttempt::Retry(SubmitRetry::new(
+                    "io_uring",
+                    SubmitRetryReason::NoProgress,
+                    call_count,
+                ))
+            }
+        };
+        SubmitOutcome { result, call_count }
+    }
+}
+
 struct SubmitOutcome {
-    submitted: usize,
+    result: SubmitAttempt,
     call_count: usize,
 }
 
@@ -220,94 +369,9 @@ fn invalid_io_depth(max_events: usize) -> Error {
 }
 
 #[inline]
-fn finish_submit(
-    batch: &mut IouringSubmitBatch,
-    submitted: usize,
-    call_count: usize,
-) -> SubmitOutcome {
-    assert!(
-        submitted <= batch.pending_sqes,
-        "io_uring submit reported more accepted SQEs than staged pending entries"
-    );
-    if submitted != 0 {
-        batch.staged.drain(0..submitted);
-        batch.pending_sqes -= submitted;
-    }
+fn retry_submit(reason: SubmitRetryReason, call_count: usize) -> SubmitOutcome {
     SubmitOutcome {
-        submitted,
-        call_count,
-    }
-}
-
-#[inline]
-fn submit_pending_sqes<Submit, SubmitAndWait>(
-    batch: &mut IouringSubmitBatch,
-    limit: usize,
-    mut submit: Submit,
-    mut submit_and_wait: SubmitAndWait,
-) -> SubmitOutcome
-where
-    Submit: FnMut() -> StdIoResult<usize>,
-    SubmitAndWait: FnMut(usize) -> StdIoResult<usize>,
-{
-    debug_assert!(batch.pending_sqes != 0);
-
-    let mut call_count = 0usize;
-    let submitted = loop {
-        call_count += 1;
-        match submit() {
-            Ok(submitted) => break submitted,
-            Err(err) if err.raw_os_error() == Some(EINTR) => {}
-            Err(err) if matches!(err.raw_os_error(), Some(EAGAIN | EBUSY)) => {
-                let submitted = loop {
-                    call_count += 1;
-                    match submit_and_wait(1) {
-                        Ok(submitted) => break submitted,
-                        Err(err) if err.raw_os_error() == Some(EINTR) => {}
-                        Err(err) => {
-                            panic!(
-                                "io_uring blocking submit failed: err={err} pending_sqes={} limit={} staged_len={}",
-                                batch.pending_sqes,
-                                limit,
-                                batch.staged.len()
-                            );
-                        }
-                    }
-                };
-                break submitted;
-            }
-            Err(err) => {
-                panic!(
-                    "io_uring submit failed: err={err} pending_sqes={} limit={} staged_len={}",
-                    batch.pending_sqes,
-                    limit,
-                    batch.staged.len()
-                );
-            }
-        }
-    };
-
-    finish_submit(batch, submitted, call_count)
-}
-
-fn blocking_submit_and_wait<SubmitAndWait>(
-    min_nr: usize,
-    mut submit_and_wait: SubmitAndWait,
-) -> BlockingWaitOutcome
-where
-    SubmitAndWait: FnMut(usize) -> StdIoResult<usize>,
-{
-    let mut call_count = 0usize;
-    let submitted = loop {
-        call_count += 1;
-        match submit_and_wait(min_nr) {
-            Ok(submitted) => break submitted,
-            Err(err) if err.raw_os_error() == Some(EINTR) => {}
-            Err(err) => panic!("io_uring wait failed: err={err} min_nr={min_nr}"),
-        }
-    };
-    BlockingWaitOutcome {
-        submitted,
+        result: SubmitAttempt::Retry(SubmitRetry::new("io_uring", reason, call_count)),
         call_count,
     }
 }
@@ -315,18 +379,20 @@ where
 #[inline]
 fn record_blocking_wait_stats(
     stats: &IOBackendStatsHandle,
-    outcome: BlockingWaitOutcome,
+    outcome: Option<&BlockingWaitOutcome>,
+    call_count: usize,
     elapsed_nanos: usize,
 ) {
-    stats.record_submit_and_wait(outcome.call_count, elapsed_nanos);
-    stats.record_submitted_ops(outcome.submitted);
+    stats.record_submit_and_wait(call_count, elapsed_nanos);
+    if let Some(outcome) = outcome {
+        stats.record_submitted_ops(outcome.submitted);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use io_uring::opcode::Nop;
-    use std::io::Error as StdIoError;
 
     fn nop_entry() -> squeue::Entry {
         Nop::new().build()
@@ -344,102 +410,97 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_pending_sqes_applies_successful_submit_bookkeeping() {
+    fn test_finish_submit_applies_successful_submit_bookkeeping() {
         let mut batch = submit_batch_with_pending(3, 3);
-        let outcome = submit_pending_sqes(
-            &mut batch,
-            3,
-            || Ok(2),
-            |_| panic!("blocking fallback should not run on successful submit"),
+        let outcome = batch.finish_submit(2, 1);
+        assert_eq!(
+            outcome.result,
+            SubmitAttempt::Submitted(NonZeroUsize::new(2).unwrap())
         );
-        assert_eq!(outcome.submitted, 2);
         assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 1);
         assert_eq!(batch.staged.len(), 1);
     }
 
     #[test]
-    fn test_submit_pending_sqes_falls_back_to_blocking_submit_on_eagain() {
+    fn test_finish_submit_returns_no_progress_retry_for_zero_submit() {
         let mut batch = submit_batch_with_pending(2, 2);
-        let mut submit_calls = 0;
-        let outcome = submit_pending_sqes(
-            &mut batch,
-            2,
-            || {
-                submit_calls += 1;
-                Err(StdIoError::from_raw_os_error(EAGAIN))
-            },
-            |min_nr| {
-                assert_eq!(min_nr, 1);
-                Ok(2)
-            },
-        );
-        assert_eq!(outcome.submitted, 2);
-        assert_eq!(outcome.call_count, 2);
-        assert_eq!(submit_calls, 1);
-        assert_eq!(batch.pending_sqes, 0);
-        assert!(batch.staged.is_empty());
-    }
-
-    #[test]
-    fn test_submit_pending_sqes_preserves_unaccepted_suffix_after_blocking_fallback() {
-        let mut batch = submit_batch_with_pending(3, 3);
-        let outcome = submit_pending_sqes(
-            &mut batch,
-            3,
-            || Err(StdIoError::from_raw_os_error(EBUSY)),
-            |min_nr| {
-                assert_eq!(min_nr, 1);
-                Ok(1)
-            },
-        );
-        assert_eq!(outcome.submitted, 1);
-        assert_eq!(outcome.call_count, 2);
+        let outcome = batch.finish_submit(0, 1);
+        let SubmitAttempt::Retry(retry) = outcome.result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "io_uring");
+        assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
+        assert_eq!(retry.raw_errno(), None);
+        assert_eq!(retry.call_count(), 1);
+        assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 2);
         assert_eq!(batch.staged.len(), 2);
     }
 
     #[test]
-    fn test_blocking_submit_and_wait_counts_successful_attempt() {
-        let mut calls = 0usize;
-        let outcome = blocking_submit_and_wait(3, |min_nr| {
-            calls += 1;
-            assert_eq!(min_nr, 3);
-            Ok(2)
-        });
-        assert_eq!(outcome.submitted, 2);
-        assert_eq!(outcome.call_count, 1);
-        assert_eq!(calls, 1);
+    fn test_submit_retry_reason_maps_pressure_errno() {
+        assert_eq!(
+            SubmitRetryReason::from_raw_errno(EAGAIN),
+            Some(SubmitRetryReason::Eagain)
+        );
+        assert_eq!(
+            SubmitRetryReason::from_raw_errno(EBUSY),
+            Some(SubmitRetryReason::Ebusy)
+        );
+        assert_eq!(SubmitRetryReason::from_raw_errno(EINTR), None);
+        assert_eq!(SubmitRetryReason::NoProgress.raw_errno(), None);
     }
 
     #[test]
-    fn test_blocking_submit_and_wait_retries_on_eintr() {
-        let mut calls = 0usize;
-        let outcome = blocking_submit_and_wait(4, |min_nr| {
-            calls += 1;
-            assert_eq!(min_nr, 4);
-            if calls == 1 {
-                Err(StdIoError::from_raw_os_error(EINTR))
-            } else {
-                Ok(3)
+    fn test_retry_submit_carries_backend_context() {
+        let outcome = retry_submit(SubmitRetryReason::Ebusy, 3);
+        let SubmitAttempt::Retry(retry) = outcome.result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "io_uring");
+        assert_eq!(retry.reason(), SubmitRetryReason::Ebusy);
+        assert_eq!(retry.raw_errno(), Some(EBUSY));
+        assert_eq!(retry.call_count(), 3);
+        assert_eq!(outcome.call_count, 3);
+    }
+
+    #[test]
+    fn test_submit_batch_reports_no_progress_when_sq_full() {
+        let mut backend = IouringBackend::new(1).unwrap();
+        {
+            let mut sq = backend.ring.submission();
+            loop {
+                let entry = nop_entry();
+                // SAFETY: this test intentionally fills the SQ with copied NOP
+                // SQEs to make the next staged push observe SQ-full.
+                if unsafe { sq.push(&entry) }.is_err() {
+                    break;
+                }
             }
-        });
-        assert_eq!(outcome.submitted, 3);
-        assert_eq!(outcome.call_count, 2);
-        assert_eq!(calls, 2);
+        }
+        let mut batch = submit_batch_with_pending(1, 0);
+
+        let submit_result = backend.submit_batch(&mut batch, 1).unwrap();
+
+        let SubmitAttempt::Retry(retry) = submit_result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
+        assert_eq!(retry.raw_errno(), None);
+        assert_eq!(retry.call_count(), 0);
+        assert_eq!(batch.pending_sqes, 0);
+        assert_eq!(batch.staged.len(), 1);
     }
 
     #[test]
     fn test_record_blocking_wait_stats_counts_combined_fields() {
         let stats = IOBackendStatsHandle::default();
-        record_blocking_wait_stats(
-            &stats,
-            BlockingWaitOutcome {
-                submitted: 5,
-                call_count: 2,
-            },
-            17,
-        );
+        let outcome = BlockingWaitOutcome {
+            submitted: 5,
+            call_count: 2,
+        };
+        record_blocking_wait_stats(&stats, Some(&outcome), outcome.call_count, 17);
         stats.record_wait_completions(3);
 
         let snapshot = stats.snapshot();

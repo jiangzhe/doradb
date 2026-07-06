@@ -1966,7 +1966,7 @@ impl PrecommitTrx {
                 let _ = attachment
                     .engine()
                     .trx_sys
-                    .poison_storage(FatalError::RollbackAccess);
+                    .poison_engine(FatalError::RollbackAccess);
                 self.finish_failed_precommit_with_retention(engine);
                 return false;
             }
@@ -3610,7 +3610,7 @@ pub(crate) mod tests {
 
             let (_hook, started_rx, release) =
                 install_blocking_terminal_rollback_hook(trx_id, "rollback poisoned commit");
-            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
             let mut commit = Box::pin(trx.commit());
             assert!(matches!(
                 futures::poll!(commit.as_mut()),
@@ -3737,7 +3737,7 @@ pub(crate) mod tests {
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
 
-            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
             let completion = Arc::new(Completion::new());
             let job = FailedPrecommitCleanupJob::new(
                 vec![precommit1, precommit2, precommit3],
@@ -3770,7 +3770,7 @@ pub(crate) mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
             );
 

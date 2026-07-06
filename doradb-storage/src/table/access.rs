@@ -128,7 +128,7 @@ impl<'a> UserTableAccessor<'a> {
                 return Ok(());
             }
             let route_epoch = self.mem().blk_idx().route_epoch();
-            let poison_listener = trx_sys.storage_poison_listener();
+            let poison_listener = trx_sys.poison_listener();
             if row_id < self.mem().blk_idx().pivot_row_id() {
                 return Ok(());
             }
@@ -6081,7 +6081,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
             );
@@ -6190,7 +6190,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
             );

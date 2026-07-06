@@ -385,7 +385,7 @@ impl Catalog {
                 }
                 Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
                 Err(err) if err.kind() == ErrorKind::Io => {
-                    Err(trx_sys.poison_storage(FatalError::CheckpointWrite).into())
+                    Err(trx_sys.poison_engine(FatalError::CheckpointWrite).into())
                 }
                 Err(err) => Err(err),
             }

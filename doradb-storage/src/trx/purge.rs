@@ -392,7 +392,7 @@ impl TransactionSystem {
         .await;
         match res {
             Ok(gc_row_pages) => Ok(gc_row_pages),
-            Err(_) => Err(self.poison_storage(FatalError::PurgeAccess).into()),
+            Err(_) => Err(self.poison_engine(FatalError::PurgeAccess).into()),
         }
     }
 
@@ -431,7 +431,7 @@ impl TransactionSystem {
         {
             Ok(()) => true,
             Err(_) => {
-                let _ = self.poison_storage(FatalError::PurgeDeallocate);
+                let _ = self.poison_engine(FatalError::PurgeDeallocate);
                 false
             }
         }
@@ -518,7 +518,7 @@ impl TransactionSystem {
         match self.process_dropped_table_gc(guards, min_active_sts).await {
             Ok(()) => true,
             Err(_) => {
-                let _ = self.poison_storage(FatalError::PurgeDeallocate);
+                let _ = self.poison_engine(FatalError::PurgeDeallocate);
                 false
             }
         }
@@ -1497,7 +1497,7 @@ mod tests {
                     )
                     .await
             );
-            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
+            assert!(engine.inner().trx_sys.poison_error().is_none());
 
             let raw_page = engine
                 .inner()
@@ -1522,7 +1522,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::PurgeDeallocate)
             );
@@ -1598,7 +1598,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .storage_poison_error()
+                    .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::PurgeAccess)
             );

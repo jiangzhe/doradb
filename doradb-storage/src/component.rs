@@ -1,4 +1,6 @@
-use crate::buffer::{EvictableBufferPool, FixedBufferPool, ReadonlyBufferPool};
+use crate::buffer::{
+    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
+};
 use crate::error::{Error, InternalError, Result};
 use crate::map::FastHashMap;
 use crate::obs;
@@ -89,18 +91,20 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// - reverse-order final owner drop in [`Drop`]
 ///
 /// Current engine registration order:
-/// 1. `FileSystem`
-/// 2. `DiskPool`
-/// 3. `MetaPool`
-/// 4. `IndexPool`
-/// 5. `MemPool`
-/// 6. `FileSystemWorkers` -> `FileSystem`, `IndexPool`, `MemPool`
-/// 7. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
-/// 8. `LockManager`
-/// 9. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
-/// 10. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`, `FileSystem`,
-///     `DiskPool`, `Catalog`
-/// 11. `TransactionSystemWorkers` -> `TransactionSystem`
+/// 1. `EnginePoisoner`
+/// 2. `FileSystem`
+/// 3. `DiskPool`
+/// 4. `MetaPool`
+/// 5. `IndexPool`
+/// 6. `MemPool`
+/// 7. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
+///    `MemPool`
+/// 8. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
+/// 9. `LockManager`
+/// 10. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
+/// 11. `TransactionSystem` -> `EnginePoisoner`, `MetaPool`, `IndexPool`,
+///     `MemPool`, `FileSystem`, `DiskPool`, `Catalog`
+/// 12. `TransactionSystemWorkers` -> `TransactionSystem`
 ///
 /// In addition to the direct component edges above, `Catalog` owns user-table
 /// runtimes that retain guards into `MemPool`, `IndexPool`, `FileSystem`,
@@ -430,6 +434,47 @@ pool_access_newtype!(MetaPool, FixedBufferPool);
 pool_access_newtype!(IndexPool, EvictableBufferPool);
 pool_access_newtype!(MemPool, EvictableBufferPool);
 pool_access_newtype!(DiskPool, ReadonlyBufferPool);
+
+/// Inner buffer-pool handles used by engine startup and recovery.
+pub(crate) struct EnginePools {
+    /// Metadata pool used for catalog and block-index pages.
+    pub(crate) meta: QuiescentGuard<FixedBufferPool>,
+    /// Secondary-index pool.
+    pub(crate) index: QuiescentGuard<EvictableBufferPool>,
+    /// Mutable row-page pool.
+    pub(crate) mem: QuiescentGuard<EvictableBufferPool>,
+    /// Readonly persisted-page pool.
+    pub(crate) disk: QuiescentGuard<ReadonlyBufferPool>,
+}
+
+impl EnginePools {
+    /// Create a bundle from explicit inner pool handles.
+    #[inline]
+    pub(crate) fn new(
+        meta: QuiescentGuard<FixedBufferPool>,
+        index: QuiescentGuard<EvictableBufferPool>,
+        mem: QuiescentGuard<EvictableBufferPool>,
+        disk: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Self {
+        Self {
+            meta,
+            index,
+            mem,
+            disk,
+        }
+    }
+
+    /// Build a full guard bundle for all engine buffer pools.
+    #[inline]
+    pub(crate) fn pool_guards(&self) -> PoolGuards {
+        PoolGuards::builder()
+            .push(PoolRole::Meta, self.meta.pool_guard())
+            .push(PoolRole::Index, self.index.pool_guard())
+            .push(PoolRole::Mem, self.mem.pool_guard())
+            .push(PoolRole::Disk, self.disk.pool_guard())
+            .build()
+    }
+}
 
 /// Configuration for the metadata buffer pool.
 #[derive(Clone, Copy)]

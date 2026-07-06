@@ -1,6 +1,7 @@
-use crate::buffer::{EvictableBufferPool, FixedBufferPool, PoolGuards, ReadonlyBufferPool};
+use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::Catalog;
-use crate::component::Supplier;
+use crate::component::{EnginePools, Supplier};
+use crate::engine_poison::EnginePoisoner;
 use crate::error::{ConfigError, ConfigResult, DataIntegrityError, Error, Result};
 use crate::file::fs::FileSystem;
 use crate::id::TrxID;
@@ -10,7 +11,7 @@ use crate::log::{LogSync, RedoLogFinalizer};
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::RedoReplayPlanner;
-use crate::recovery::{RecoveryBuffers, RecoveryCoordinator, RecoveryResources};
+use crate::recovery::{RecoveryCoordinator, RecoveryResources};
 use crate::trx::MAX_SNAPSHOT_TS;
 use crate::trx::purge::Purge;
 use crate::trx::sys::{
@@ -252,22 +253,18 @@ impl TrxSysConfig {
     /// Recover durable state and prepare transaction-system startup handles.
     pub(crate) async fn prepare(
         self,
-        meta_pool: QuiescentGuard<FixedBufferPool>,
-        index_pool: QuiescentGuard<EvictableBufferPool>,
-        mem_pool: QuiescentGuard<EvictableBufferPool>,
+        engine_poisoner: QuiescentGuard<EnginePoisoner>,
+        pools: EnginePools,
         table_fs: QuiescentGuard<FileSystem>,
-        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         catalog: QuiescentGuard<Catalog>,
     ) -> Result<(TransactionSystem, PendingTransactionSystemStartup)> {
         let config = self.normalize_redo_file_layout()?;
-        let mem_pool_for_purge = mem_pool.clone();
-        let recovery_buffers = RecoveryBuffers::new(meta_pool, index_pool, mem_pool, disk_pool);
-        let pool_guards = recovery_buffers.pool_guards().clone();
+        let mem_pool_for_purge = pools.mem.clone();
+        let pool_guards = pools.pool_guards();
 
         let (purge_tx, purge_rx) = flume::unbounded();
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
-        let recovery_resources =
-            RecoveryResources::new(recovery_buffers, table_fs.clone(), &catalog);
+        let recovery_resources = RecoveryResources::new(pools, table_fs.clone(), &catalog);
         let coordinator = config.prepare_recovery(recovery_resources)?;
         let (max_recovered_cts, finalizer) = coordinator.recover_all().await?;
         let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)?;
@@ -276,6 +273,7 @@ impl TrxSysConfig {
 
         let trx_sys = TransactionSystem::new(
             config,
+            engine_poisoner,
             catalog,
             table_fs,
             redo_log,

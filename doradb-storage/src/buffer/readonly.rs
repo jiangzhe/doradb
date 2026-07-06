@@ -951,6 +951,14 @@ impl ReadSubmission {
         self.complete_inflight_once(Err(err));
     }
 
+    /// Fails a submitted miss load while retaining its borrowed page memory.
+    #[inline]
+    pub(crate) fn fail_backend_submitted(&mut self, err: Report<CompletionErrorKind>) {
+        self.pool.stats.add_completed_reads(1);
+        self.pool.stats.add_read_errors(1);
+        self.complete_inflight_once(Err(err));
+    }
+
     /// Records that the backend accepted this read submission into running state.
     #[inline]
     pub(crate) fn record_running(&self) {

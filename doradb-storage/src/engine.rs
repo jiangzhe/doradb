@@ -8,9 +8,11 @@ use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
 use crate::catalog::{Catalog, CatalogConfig};
 use crate::component::{
-    ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
+    ComponentRegistry, DiskPoolConfig, EnginePools, IndexPoolConfig, MetaPoolConfig,
+    RegistryBuilder,
 };
 use crate::conf::EngineConfig;
+use crate::engine_poison::EnginePoisoner;
 use crate::error::{LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
@@ -623,6 +625,8 @@ impl WeakEngineRef {
 /// The fields here are the cloneable handles that sessions and other runtime
 /// objects may retain. Owner-only teardown state lives on [`Engine`] itself.
 pub(crate) struct EngineInner {
+    /// Engine-level fatal runtime poison state.
+    pub(crate) engine_poisoner: QuiescentGuard<EnginePoisoner>,
     /// Shared catalog handle.
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
@@ -653,6 +657,17 @@ impl EngineInner {
         &self.catalog
     }
 
+    /// Clone the inner engine buffer-pool handles as one startup/recovery bundle.
+    #[inline]
+    pub(crate) fn pools(&self) -> EnginePools {
+        EnginePools::new(
+            self.meta_pool.clone_inner(),
+            self.index_pool.clone_inner(),
+            self.mem_pool.clone_inner(),
+            self.disk_pool.clone_inner(),
+        )
+    }
+
     /// Return the shared logical lock manager.
     #[inline]
     pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
@@ -673,7 +688,7 @@ impl EngineInner {
     #[inline]
     pub(crate) fn acquire_admission(&self) -> Result<EngineAdmission<'_>> {
         let admission = self.lifecycle.admit()?;
-        self.trx_sys.ensure_runtime_healthy()?;
+        self.engine_poisoner.ensure_healthy()?;
         Ok(admission)
     }
 
@@ -741,6 +756,7 @@ impl EngineConfig {
         // Components are registered in one fixed dependency order. Reverse
         // registration order then defines both explicit shutdown order and the
         // final owner drop order.
+        builder.build::<EnginePoisoner>(()).await?;
         builder.build::<FileSystem>(file).await?;
         builder
             .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
@@ -774,6 +790,7 @@ impl EngineConfig {
 
         resolved.persist_marker_if_missing()?;
         let registry = builder.finish()?;
+        let engine_poisoner = registry.dependency::<EnginePoisoner>()?;
         let catalog = registry.dependency::<Catalog>()?;
         let trx_sys = registry.dependency::<TransactionSystem>()?;
         let meta_pool = registry.dependency::<MetaPool>()?;
@@ -783,6 +800,7 @@ impl EngineConfig {
         let disk_pool = registry.dependency::<DiskPool>()?;
         let lock_manager = registry.dependency::<LockManager>()?;
         let engine_inner = EngineInner {
+            engine_poisoner,
             catalog,
             trx_sys,
             meta_pool,
@@ -2059,11 +2077,9 @@ mod tests {
                 .log_dir(&log_dir)
                 .log_file_stem("pending-startup-cleanup")
                 .prepare(
-                    engine.inner().meta_pool.clone_inner(),
-                    engine.inner().index_pool.clone_inner(),
-                    engine.inner().mem_pool.clone_inner(),
+                    engine.inner().engine_poisoner.clone(),
+                    engine.inner().pools(),
                     engine.inner().table_fs.clone(),
-                    engine.inner().disk_pool.clone_inner(),
                     engine.inner().catalog.clone(),
                 )
                 .await
