@@ -2163,9 +2163,9 @@ pub(crate) mod tests {
     use crate::file::{BlockKey, UNTRACKED_FILE_ID};
     use crate::id::BlockID;
     use crate::io::{
-        BackendResult, DirectBuf, IOBackendErrorPhase, IOBackendFailure, IOBuf, IOKind,
-        StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook, SubmittedIoCleanup,
-        install_storage_backend_test_hook,
+        BackendResult, Completion, DirectBuf, IOBackendErrorPhase, IOBackendFailure,
+        IOBackendOperationKind, IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp,
+        StorageBackendTestHook, SubmittedIoCleanup, install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
     use crate::table::test_user_table_id;
@@ -2712,6 +2712,44 @@ pub(crate) mod tests {
         )
     }
 
+    fn backend_progress_failure_for_test(phase: IOBackendErrorPhase) -> Report<IoError> {
+        let queue_state = match phase {
+            IOBackendErrorPhase::Submit => IOBackendQueueState::submit(1, 1),
+            IOBackendErrorPhase::Wait => IOBackendQueueState::wait_with_completions(0),
+        };
+        IOBackendFailure::report(
+            "submitted_wait_failure_test",
+            phase,
+            StdIoError::from_raw_os_error(libc::EIO),
+            1,
+            queue_state,
+        )
+    }
+
+    fn assert_backend_sync_completion_error(
+        completion: &Completion<()>,
+        phase: IOBackendErrorPhase,
+        expected_operation_kind: Option<&str>,
+    ) {
+        let report = completion
+            .completed_result()
+            .expect("sync waiter should be completed")
+            .expect_err("sync waiter should fail with backend error");
+        let failure = report
+            .downcast_ref::<IOBackendFailure>()
+            .expect("backend failure context should be preserved");
+        assert_eq!(failure.backend(), "submitted_wait_failure_test");
+        assert_eq!(failure.phase(), phase);
+        assert_eq!(failure.raw_errno(), Some(libc::EIO));
+        assert_eq!(
+            report
+                .downcast_ref::<IOBackendOperationKind>()
+                .map(ToString::to_string)
+                .as_deref(),
+            expected_operation_kind
+        );
+    }
+
     #[test]
     fn test_submitted_io_quarantine_leaks_memory_bound_entries_only() {
         let temp_dir = TempDir::new().unwrap();
@@ -2767,11 +2805,9 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (temp_dir, fs) = build_test_fs();
             let cleanup_submitted = Arc::new(AtomicUsize::new(0));
-            let (builder, _table_reads, _pool_reads, background_writes) =
-                StorageIOWorkerBuilder::new(SubmittedWaitFailureBackend::new(
-                    1,
-                    Arc::clone(&cleanup_submitted),
-                ));
+            let (builder, table_reads, pool_reads, background_writes) = StorageIOWorkerBuilder::new(
+                SubmittedWaitFailureBackend::new(1, Arc::clone(&cleanup_submitted)),
+            );
             let worker_dir = temp_dir.path().join("submitted-wait-failure");
             create_dir(&worker_dir).unwrap();
             let table_file = create_sparse_for_test(&worker_dir.join("table.tbl"));
@@ -2787,7 +2823,68 @@ pub(crate) mod tests {
                 UNTRACKED_FILE_ID,
             )
             .unwrap();
+            let mut poison_builder = RegistryBuilder::new();
+            poison_builder.build::<EnginePoisoner>(()).await.unwrap();
+            let poison_registry = poison_builder.finish().unwrap();
+            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>().unwrap();
+            let state_machine = StorageStateMachine::new(
+                fs.mem_pool().into_sync(),
+                mem_pool_file,
+                fs.index_pool().into_sync(),
+                index_pool_file,
+            );
+            let worker = builder.bind(engine_poisoner.clone(), state_machine);
+            let (submission, completion) = SyncSubmission::prepare_fsync(table_file);
+            let handle = worker.start_thread();
+            background_writes
+                .send(BackgroundWriteRequest::TableSync(submission))
+                .expect("test background write lane should accept fsync");
+            handle
+                .join()
+                .expect("test storage IO worker should not panic");
+
+            assert_backend_sync_completion_error(&completion, IOBackendErrorPhase::Wait, None);
+            assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *engine_poisoner
+                    .poison_error()
+                    .expect("backend wait failure should poison engine")
+                    .current_context(),
+                FatalError::StorageIo
+            );
+            drop(table_reads);
+            drop(pool_reads);
             drop(background_writes);
+            drop(engine_poisoner);
+            drop(poison_registry);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_backend_progress_failure_fails_staged_and_queued_sync_waiters() {
+        smol::block_on(async {
+            let (temp_dir, fs) = build_test_fs();
+            let cleanup_submitted = Arc::new(AtomicUsize::new(0));
+            let (builder, table_reads, pool_reads, background_writes) = StorageIOWorkerBuilder::new(
+                SubmittedWaitFailureBackend::new(1, Arc::clone(&cleanup_submitted)),
+            );
+            let worker_dir = temp_dir.path().join("staged-queued-failure");
+            create_dir(&worker_dir).unwrap();
+            let staged_file = create_sparse_for_test(&worker_dir.join("staged.tbl"));
+            let queued_file = create_sparse_for_test(&worker_dir.join("queued.tbl"));
+            let mem_pool_file = SparseFile::create_or_trunc(
+                worker_dir.join("mem.swp").to_str().unwrap(),
+                COW_FILE_PAGE_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap();
+            let index_pool_file = SparseFile::create_or_trunc(
+                worker_dir.join("index.swp").to_str().unwrap(),
+                COW_FILE_PAGE_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap();
             let mut poison_builder = RegistryBuilder::new();
             poison_builder.build::<EnginePoisoner>(()).await.unwrap();
             let poison_registry = poison_builder.finish().unwrap();
@@ -2799,56 +2896,66 @@ pub(crate) mod tests {
                 index_pool_file,
             );
             let mut worker = builder.bind(engine_poisoner.clone(), state_machine);
-            let (submission, completion) = SyncSubmission::prepare_fsync(table_file);
-            let mut storage_submission =
-                StorageSubmission::table(TableFsSubmission::Sync(submission.into_prepared()));
+
+            let (staged_submission, staged_completion) = SyncSubmission::prepare_fsync(staged_file);
+            let mut staged_submission = StorageSubmission::table(TableFsSubmission::Sync(
+                staged_submission.into_prepared(),
+            ));
             let (token, slot) = worker
                 .slots
                 .reserve()
-                .expect("test worker must have one free slot");
-            let mut prepared = worker
-                .backend
-                .prepare(token, storage_submission.operation());
+                .expect("test worker should have one free slot");
+            let mut prepared = worker.backend.prepare(token, staged_submission.operation());
             worker
                 .backend
                 .push_prepared(&mut worker.submit_batch, &mut prepared);
             worker.slots.occupy_reserved(
                 slot,
                 StorageInflightEntry {
-                    submission: storage_submission,
+                    submission: staged_submission,
                     _prepared: prepared,
-                    submitted: true,
+                    submitted: false,
                 },
             );
-            worker.submitted = 1;
+            worker.staged_slots.push_back(slot);
 
+            let (queued_submission, queued_completion) = SyncSubmission::prepare_fsync(queued_file);
             let mut queue = IOQueue::with_capacity(1);
-            let backend_report = IOBackendFailure::report(
-                "submitted_wait_failure_test",
-                IOBackendErrorPhase::Wait,
-                StdIoError::from_raw_os_error(libc::EIO),
-                1,
-                IOBackendQueueState::wait_with_completions(0),
+            queue.push(StorageSubmission::table(TableFsSubmission::Sync(
+                queued_submission.into_prepared(),
+            )));
+
+            worker.handle_backend_progress_failure(
+                &mut queue,
+                backend_progress_failure_for_test(IOBackendErrorPhase::Submit),
             );
-            worker.handle_backend_progress_failure(&mut queue, backend_report);
-            let report = completion
-                .completed_result()
-                .expect("submitted fsync waiter should be completed")
-                .expect_err("submitted fsync should fail after backend wait failure");
-            let failure = report
-                .downcast_ref::<IOBackendFailure>()
-                .expect("submitted wait failure should preserve backend failure context");
-            assert_eq!(failure.backend(), "submitted_wait_failure_test");
-            assert_eq!(failure.phase(), IOBackendErrorPhase::Wait);
-            assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 1);
+
+            assert_eq!(queue.len(), 0);
+            assert!(worker.staged_slots.is_empty());
+            assert_eq!(worker.submitted, 0);
+            assert!(worker.slots.has_vacant());
+            assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 0);
+            assert_backend_sync_completion_error(
+                &staged_completion,
+                IOBackendErrorPhase::Submit,
+                Some("operation_kind=Fsync"),
+            );
+            assert_backend_sync_completion_error(
+                &queued_completion,
+                IOBackendErrorPhase::Submit,
+                Some("operation_kind=Fsync"),
+            );
             assert_eq!(
                 *engine_poisoner
                     .poison_error()
-                    .expect("backend wait failure should poison engine")
+                    .expect("backend submit failure should poison engine")
                     .current_context(),
                 FatalError::StorageIo
             );
             drop(worker);
+            drop(table_reads);
+            drop(pool_reads);
+            drop(background_writes);
             drop(engine_poisoner);
             drop(poison_registry);
             drop(fs);
