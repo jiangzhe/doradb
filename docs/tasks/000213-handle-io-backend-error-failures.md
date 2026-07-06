@@ -1,7 +1,7 @@
 ---
 id: 000213
 title: Handle IO Backend Error Failures
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-05
 github_issue: 819
 ---
@@ -25,7 +25,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000133-return-io-backend-submit-wait-errors-instead-of-panicking.md
+- docs/backlogs/closed/000133-return-io-backend-submit-wait-errors-instead-of-panicking.md
 
 Related Context:
 - docs/architecture.md
@@ -301,6 +301,60 @@ owning the poison state.
       convert them into ordinary IO errors.
 
 ## Implementation Notes
+
+- Added `EnginePoisoner` as the engine-level poison owner and registered it
+  ahead of lower-level runtime components. Transaction-system poison helpers now
+  delegate to that component, and engine admission checks read engine poison
+  state directly.
+- Made backend submit/wait progress fallible through typed backend failure
+  reports carrying backend name, phase, raw errno, queue state, call counts, and
+  operation kind when known. `Completion` and public storage errors preserve
+  backend failure attachments across waiter propagation.
+- Preserved transient submit/wait policy while making no-progress submit
+  pressure explicit. `EINTR` remains retried, known submit pressure remains a
+  bounded retry path, and both `io_uring` SQ-full/no-accepted work and libaio
+  zero-submit behavior now report unified `SubmitRetryReason::NoProgress`
+  instead of silently stalling as idle `Noop`.
+- Added submitted-IO cleanup contracts and quarantine handling. Runtime drivers
+  now fail or wake waiters on backend progress failure, call backend
+  `cleanup_submitted_io`, retain submitted entries until backend teardown, and
+  intentionally leak memory-bound submitted entries only when a backend cannot
+  prove user memory is safe to drop after best-effort cleanup. `io_uring`
+  attempts synchronous cancellation for submitted operations; libaio relies on
+  backend teardown before retained entries drop.
+- Updated shared storage IO, redo writer, and recovery read-ahead failure
+  routing. Shared storage backend progress failure poisons through
+  `EnginePoisoner`, fails queued/staged work, completes submitted waiters, and
+  quarantines submitted entries. Redo uses the existing fatal cleanup path and
+  submitted-driver cleanup. Recovery read-ahead reports startup recovery errors
+  without runtime poison and drains/cleans submitted driver state.
+- Reused existing domain failure paths for table-file, readonly-cache,
+  evictable-pool, redo, and recovery submissions instead of relying on
+  `Drop`/`CompletionDropped` for planned backend-progress failure.
+- Updated async IO, engine component lifetime, redo-log, and unsafe-usage docs
+  to match the new backend-progress failure and engine-poison ownership model.
+- Addressed review follow-ups found during implementation:
+  - storage submitted buffers no longer rely on `mem::forget(self)` as the
+    quarantine mechanism;
+  - submitted buffer cleanup policy is driven by `SubmittedIoCleanup`;
+  - `io_uring` SQ-full and libaio zero-submit paths use the bounded
+    `NoProgress` retry/progress-error path;
+  - `SubmittedStorageIoQuarantine` uses `mem::take`;
+  - focused coverage was added for `evict.rs` and `fs.rs` backend-failure
+    cleanup paths.
+- Validation completed:
+  - `tools/style_audit.rs --diff-base origin/main`;
+  - `tools/style_audit.rs`;
+  - `tools/coverage_focus.rs --path doradb-storage/src/buffer/evict.rs --path
+    doradb-storage/src/file/fs.rs` (`evict.rs` 93.34%, `fs.rs` 90.68%);
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`;
+  - `cargo nextest run -p doradb-storage` (`1213` passed);
+  - targeted default-backend tests for `evictable_pool_backend_failure`,
+    `backend_progress_failure`, and `no_progress`;
+  - targeted libaio-feature tests for `evictable_pool_backend_failure`,
+    `backend_progress_failure`, and `no_progress`;
+  - full libaio-feature validation was run before the final coverage-only test
+    additions and passed.
 
 ## Impacts
 
