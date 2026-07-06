@@ -6,7 +6,7 @@ use super::{
 use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
 use error_stack::Report;
 use io_uring::opcode::{Fsync, Read, Write};
-use io_uring::types::FsyncFlags;
+use io_uring::types::{CancelBuilder, FsyncFlags, Timespec};
 use io_uring::{IoUring, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
@@ -228,9 +228,12 @@ impl IOBackend for IouringBackend {
 
         if batch.pending_sqes == 0 {
             if sq_full {
+                // Work was available, but the SQ accepted no staged SQEs.
+                // Treat this as submit pressure so bounded retry can fail
+                // sustained no-progress instead of spinning on Noop.
                 return Ok(SubmitAttempt::Retry(SubmitRetry::new(
                     "io_uring",
-                    SubmitRetryReason::FullQueue,
+                    SubmitRetryReason::NoProgress,
                     0,
                 )));
             }
@@ -295,11 +298,11 @@ impl IOBackend for IouringBackend {
         if submitted == 0 {
             return SubmittedIoCleanup::DropAfterBackend;
         }
-        let timeout = types::Timespec::from(IOURING_SYNC_CANCEL_TIMEOUT);
+        let timeout = Timespec::from(IOURING_SYNC_CANCEL_TIMEOUT);
         match self
             .ring
             .submitter()
-            .register_sync_cancel(Some(timeout), types::CancelBuilder::any().all())
+            .register_sync_cancel(Some(timeout), CancelBuilder::any().all())
         {
             Ok(()) => SubmittedIoCleanup::DropAfterBackend,
             Err(err) => SubmittedIoCleanup::LeakAfterBackend {
@@ -333,7 +336,16 @@ impl IouringSubmitBatch {
         }
         let result = match NonZeroUsize::new(submitted) {
             Some(submitted) => SubmitAttempt::Submitted(submitted),
-            None => SubmitAttempt::Noop,
+            None => {
+                // `submit()` was called with pending SQEs but accepted none.
+                // Keep the pending prefix intact and let callers use the
+                // bounded retry/progress-failure path.
+                SubmitAttempt::Retry(SubmitRetry::new(
+                    "io_uring",
+                    SubmitRetryReason::NoProgress,
+                    call_count,
+                ))
+            }
         };
         SubmitOutcome { result, call_count }
     }
@@ -411,10 +423,16 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_submit_returns_noop_for_zero_submit() {
+    fn test_finish_submit_returns_no_progress_retry_for_zero_submit() {
         let mut batch = submit_batch_with_pending(2, 2);
         let outcome = batch.finish_submit(0, 1);
-        assert_eq!(outcome.result, SubmitAttempt::Noop);
+        let SubmitAttempt::Retry(retry) = outcome.result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "io_uring");
+        assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
+        assert_eq!(retry.raw_errno(), None);
+        assert_eq!(retry.call_count(), 1);
         assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 2);
         assert_eq!(batch.staged.len(), 2);
@@ -431,7 +449,7 @@ mod tests {
             Some(SubmitRetryReason::Ebusy)
         );
         assert_eq!(SubmitRetryReason::from_raw_errno(EINTR), None);
-        assert_eq!(SubmitRetryReason::FullQueue.raw_errno(), None);
+        assert_eq!(SubmitRetryReason::NoProgress.raw_errno(), None);
     }
 
     #[test]
@@ -448,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_batch_reports_full_queue_retry() {
+    fn test_submit_batch_reports_no_progress_when_sq_full() {
         let mut backend = IouringBackend::new(1).unwrap();
         {
             let mut sq = backend.ring.submission();
@@ -468,7 +486,7 @@ mod tests {
         let SubmitAttempt::Retry(retry) = submit_result else {
             panic!("expected submit retry");
         };
-        assert_eq!(retry.reason(), SubmitRetryReason::FullQueue);
+        assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
         assert_eq!(retry.raw_errno(), None);
         assert_eq!(retry.call_count(), 0);
         assert_eq!(batch.pending_sqes, 0);

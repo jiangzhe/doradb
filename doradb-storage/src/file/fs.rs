@@ -42,7 +42,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
-use std::mem::{forget, replace};
+use std::mem::{forget, replace, take};
 use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
@@ -1239,7 +1239,7 @@ impl<P> Drop for SubmittedStorageIoQuarantine<P> {
         let Some(leak) = self.leak.take() else {
             return;
         };
-        let entries = std::mem::take(&mut self.entries);
+        let entries = take(&mut self.entries);
         let retained = entries.len();
         let mut leaked = 0usize;
         let mut dropped = 0usize;

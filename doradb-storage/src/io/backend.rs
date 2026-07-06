@@ -10,14 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Default no-progress window for submit-pressure retry loops.
+pub(crate) const DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Standard IO result returned by backend completion paths.
 pub(crate) type StdIoResult<T> = StdResult<T, StdIoError>;
 
 /// Result returned by backend submit and wait progress paths.
 pub(crate) type BackendResult<T> = StdResult<T, Report<IoError>>;
-
-/// Default no-progress window for submit-pressure retry loops.
-pub(crate) const DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Transient submit pressure reported by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,12 +26,11 @@ pub(crate) enum SubmitRetryReason {
     Eagain,
     /// Kernel submit returned `EBUSY`.
     Ebusy,
-    /// The backend submission queue was full before entering a submit syscall.
-    #[cfg_attr(
-        not(feature = "iouring"),
-        allow(dead_code, reason = "io_uring-only submit pressure reason")
-    )]
-    FullQueue,
+    /// Submit-side work was available, but the backend staged or accepted no operations.
+    ///
+    /// This is a non-errno progress failure signal. Callers retry it through
+    /// the bounded no-progress path instead of treating it as idle `Noop`.
+    NoProgress,
 }
 
 impl SubmitRetryReason {
@@ -51,7 +50,7 @@ impl SubmitRetryReason {
         match self {
             Self::Eagain => Some(EAGAIN),
             Self::Ebusy => Some(EBUSY),
-            Self::FullQueue => None,
+            Self::NoProgress => None,
         }
     }
 }
@@ -62,7 +61,7 @@ impl fmt::Display for SubmitRetryReason {
         match self {
             Self::Eagain => f.write_str("EAGAIN"),
             Self::Ebusy => f.write_str("EBUSY"),
-            Self::FullQueue => f.write_str("FULL_QUEUE"),
+            Self::NoProgress => f.write_str("NO_PROGRESS"),
         }
     }
 }
@@ -479,50 +478,6 @@ impl fmt::Display for IOBackendOperationKind {
     }
 }
 
-/// Return the backend failure details attached to a progress report.
-#[inline]
-pub(crate) fn backend_failure(report: &Report<IoError>) -> Option<&IOBackendFailure> {
-    report.downcast_ref::<IOBackendFailure>()
-}
-
-/// Return the backend syscall attempt count attached to a progress report.
-#[inline]
-pub(crate) fn backend_call_count(report: &Report<IoError>) -> usize {
-    backend_failure(report).map_or(0, IOBackendFailure::call_count)
-}
-
-/// Attach the first known logical operation kind affected by a backend failure.
-#[inline]
-pub(crate) fn attach_backend_operation_kind(
-    report: Report<IoError>,
-    kind: Option<super::IOKind>,
-) -> Report<IoError> {
-    match kind {
-        Some(kind) => report.attach(IOBackendOperationKind { kind }),
-        None => report,
-    }
-}
-
-/// Return the attached logical operation kind when one has been added.
-#[inline]
-pub(crate) fn backend_operation_kind(report: &Report<IoError>) -> Option<IOBackendOperationKind> {
-    report.downcast_ref::<IOBackendOperationKind>().copied()
-}
-
-/// Format backend progress context for logs and poison diagnostics.
-pub(crate) fn backend_report_summary(report: &Report<IoError>) -> String {
-    let mut summary = report.current_context().to_string();
-    if let Some(failure) = backend_failure(report) {
-        summary.push_str(": ");
-        summary.push_str(&failure.to_string());
-    }
-    if let Some(operation_kind) = backend_operation_kind(report) {
-        summary.push_str(": ");
-        summary.push_str(&operation_kind.to_string());
-    }
-    summary
-}
-
 /// Worker-owned completion token stored in backend user-data fields.
 ///
 /// The token packs the inflight-slot generation into the high 32 bits and the
@@ -718,8 +673,53 @@ pub(crate) trait IOBackend {
     fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup;
 }
 
+/// Return the backend failure details attached to a progress report.
+#[inline]
+pub(crate) fn backend_failure(report: &Report<IoError>) -> Option<&IOBackendFailure> {
+    report.downcast_ref::<IOBackendFailure>()
+}
+
+/// Return the backend syscall attempt count attached to a progress report.
+#[inline]
+pub(crate) fn backend_call_count(report: &Report<IoError>) -> usize {
+    backend_failure(report).map_or(0, IOBackendFailure::call_count)
+}
+
+/// Attach the first known logical operation kind affected by a backend failure.
+#[inline]
+pub(crate) fn attach_backend_operation_kind(
+    report: Report<IoError>,
+    kind: Option<super::IOKind>,
+) -> Report<IoError> {
+    match kind {
+        Some(kind) => report.attach(IOBackendOperationKind { kind }),
+        None => report,
+    }
+}
+
+/// Return the attached logical operation kind when one has been added.
+#[inline]
+pub(crate) fn backend_operation_kind(report: &Report<IoError>) -> Option<IOBackendOperationKind> {
+    report.downcast_ref::<IOBackendOperationKind>().copied()
+}
+
+/// Format backend progress context for logs and poison diagnostics.
+pub(crate) fn backend_report_summary(report: &Report<IoError>) -> String {
+    let mut summary = report.current_context().to_string();
+    if let Some(failure) = backend_failure(report) {
+        summary.push_str(": ");
+        summary.push_str(&failure.to_string());
+    }
+    if let Some(operation_kind) = backend_operation_kind(report) {
+        summary.push_str(": ");
+        summary.push_str(&operation_kind.to_string());
+    }
+    summary
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::IOKind;
     use super::*;
     use std::io::ErrorKind as StdIoErrorKind;
 
@@ -752,7 +752,7 @@ mod tests {
             4,
             IOBackendQueueState::wait_with_completions(1),
         );
-        let report = attach_backend_operation_kind(report, Some(super::super::IOKind::Fsync));
+        let report = attach_backend_operation_kind(report, Some(IOKind::Fsync));
         let operation_kind = backend_operation_kind(&report).unwrap();
 
         assert_eq!(operation_kind.to_string(), "operation_kind=Fsync");

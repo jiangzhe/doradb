@@ -622,6 +622,11 @@ where
             .try_pop_completed()
             .map(log_write_completion_from_completed)
     }
+
+    #[inline]
+    fn cleanup_after_backend_progress_failure(&mut self) -> usize {
+        self.driver.cleanup_after_backend_progress_failure()
+    }
 }
 
 /// Shared redo log state used by commit admission and the log writer.
@@ -1712,6 +1717,17 @@ where
             raw_errno,
             error
         );
+        let pending = self.write_driver.pending_len();
+        let submitted = self.write_driver.submitted_len();
+        let retained = self.write_driver.cleanup_after_backend_progress_failure();
+        if retained != 0 {
+            obs::error!(
+                "event=redo_backend_cleanup component=redo pending={} submitted={} retained_submitted={} action=cleanup",
+                pending,
+                submitted,
+                retained
+            );
+        }
         let poison = self.trx_sys.poison_engine_with_context(
             reason,
             "redo",
@@ -2406,6 +2422,7 @@ mod tests {
     use std::future::Future;
     use std::io::{Error as IoError, Seek, SeekFrom, Write};
     use std::iter::repeat_n;
+    use std::num::NonZeroUsize;
     use std::os::fd::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -2541,7 +2558,7 @@ mod tests {
         assert!(write_driver.push_write(header_write).is_ok());
         assert_eq!(
             write_driver.submit_ready().unwrap(),
-            SubmitAttempt::Submitted(std::num::NonZeroUsize::new(1).unwrap())
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
         );
         let LogWriteCompletion {
             owner,
@@ -3458,7 +3475,7 @@ mod tests {
             limit: usize,
         ) -> BackendResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
-            let Some(accepted) = std::num::NonZeroUsize::new(submit_count) else {
+            let Some(accepted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
             };
             for _ in 0..submit_count {
@@ -4935,7 +4952,7 @@ mod tests {
             }
             assert_eq!(
                 write_driver.submit_ready().unwrap(),
-                SubmitAttempt::Submitted(std::num::NonZeroUsize::new(1).unwrap())
+                SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
             );
             let LogWriteCompletion {
                 owner,

@@ -363,18 +363,6 @@ impl From<IoErrorKind> for IoError {
     }
 }
 
-#[inline]
-fn copy_backend_io_report(err: &Report<IoError>) -> Report<IoError> {
-    let mut report = Report::new(*err.current_context());
-    if let Some(failure) = backend_failure(err) {
-        report = report.attach(failure.clone());
-    }
-    if let Some(operation_kind) = backend_operation_kind(err) {
-        report = report.attach(operation_kind);
-    }
-    report
-}
-
 /// Cross-thread completion transport errors preserving their exact cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum CompletionErrorKind {
@@ -532,25 +520,6 @@ impl CompletionErrorKind {
             CompletionErrorKind::Internal(_) => ErrorKind::Internal,
         }
     }
-}
-
-/// Propagate a completion report while preserving structured backend context.
-#[inline]
-pub(crate) fn propagate_completion_report(
-    report: &Report<CompletionErrorKind>,
-    message: impl Into<String>,
-) -> Report<CompletionErrorKind> {
-    let mut propagated = match report.downcast_ref::<IoError>().copied() {
-        Some(io) => Report::new(io).change_context(*report.current_context()),
-        None => Report::new(*report.current_context()),
-    };
-    if let Some(failure) = report.downcast_ref::<IOBackendFailure>() {
-        propagated = propagated.attach(failure.clone());
-    }
-    if let Some(operation_kind) = report.downcast_ref::<IOBackendOperationKind>() {
-        propagated = propagated.attach(*operation_kind);
-    }
-    propagated.attach(message.into())
 }
 
 /// Identifies which persisted CoW file surfaced a corruption failure.
@@ -969,6 +938,37 @@ impl<T> Validation<T> {
     pub fn is_invalid(&self) -> bool {
         matches!(self, Validation::Invalid)
     }
+}
+
+/// Propagate a completion report while preserving structured backend context.
+#[inline]
+pub(crate) fn propagate_completion_report(
+    report: &Report<CompletionErrorKind>,
+    message: impl Into<String>,
+) -> Report<CompletionErrorKind> {
+    let mut propagated = match report.downcast_ref::<IoError>().copied() {
+        Some(io) => Report::new(io).change_context(*report.current_context()),
+        None => Report::new(*report.current_context()),
+    };
+    if let Some(failure) = report.downcast_ref::<IOBackendFailure>() {
+        propagated = propagated.attach(failure.clone());
+    }
+    if let Some(operation_kind) = report.downcast_ref::<IOBackendOperationKind>() {
+        propagated = propagated.attach(*operation_kind);
+    }
+    propagated.attach(message.into())
+}
+
+#[inline]
+fn copy_backend_io_report(err: &Report<IoError>) -> Report<IoError> {
+    let mut report = Report::new(*err.current_context());
+    if let Some(failure) = backend_failure(err) {
+        report = report.attach(failure.clone());
+    }
+    if let Some(operation_kind) = backend_operation_kind(err) {
+        report = report.attach(operation_kind);
+    }
+    report
 }
 
 #[cold]

@@ -1159,7 +1159,7 @@ impl RedoReadAheadWorker {
     where
         B: IOBackend,
     {
-        let mut quarantined = 0;
+        let mut retained = 0;
         while driver.pending_len() != 0 {
             match driver.submit_ready() {
                 Ok(SubmitAttempt::Retry(reason)) if driver.submitted_len() == 0 => {
@@ -1167,7 +1167,7 @@ impl RedoReadAheadWorker {
                         .backoff_submit_retry_or_progress_error(reason)
                         .is_err()
                     {
-                        quarantined += self.quarantine_driver(driver);
+                        retained += self.cleanup_driver_after_backend_failure(driver);
                         break;
                     }
                     continue;
@@ -1175,7 +1175,7 @@ impl RedoReadAheadWorker {
                 Ok(SubmitAttempt::Noop | SubmitAttempt::Submitted(_) | SubmitAttempt::Retry(_)) => {
                 }
                 Err(_) => {
-                    quarantined += self.quarantine_driver(driver);
+                    retained += self.cleanup_driver_after_backend_failure(driver);
                     break;
                 }
             }
@@ -1184,7 +1184,7 @@ impl RedoReadAheadWorker {
                 continue;
             }
             let Ok(completed) = driver.wait_at_least_one() else {
-                quarantined += self.quarantine_driver(driver);
+                retained += self.cleanup_driver_after_backend_failure(driver);
                 break;
             };
             if let Ok(completion) = take_read_completion(completed) {
@@ -1192,7 +1192,7 @@ impl RedoReadAheadWorker {
             }
         }
         self.drain_recycled();
-        quarantined
+        retained
     }
 
     #[inline]
@@ -1204,12 +1204,12 @@ impl RedoReadAheadWorker {
     where
         B: IOBackend,
     {
-        self.quarantine_driver(driver);
+        self.cleanup_driver_after_backend_failure(driver);
         backend_progress_error(err)
     }
 
     #[inline]
-    fn quarantine_driver<B>(
+    fn cleanup_driver_after_backend_failure<B>(
         &mut self,
         driver: &mut SubmissionDriver<RedoReadSubmission, B>,
     ) -> usize
@@ -1218,16 +1218,16 @@ impl RedoReadAheadWorker {
     {
         let pending = driver.pending_len();
         let submitted = driver.submitted_len();
-        let quarantined = driver.quarantine_owned_buffers();
-        if quarantined != 0 {
+        let retained = driver.cleanup_after_backend_progress_failure();
+        if retained != 0 {
             obs::error!(
-                "event=redo_readahead_backend_quarantine component=recovery pending={} submitted={} quarantined_buffers={} action=quarantine",
+                "event=redo_readahead_backend_cleanup component=recovery pending={} submitted={} retained_submitted={} action=cleanup",
                 pending,
                 submitted,
-                quarantined
+                retained
             );
         }
-        quarantined
+        retained
     }
 
     #[inline]
@@ -1259,12 +1259,6 @@ impl RedoReadAheadWorker {
             Err(TryRecvError::Empty) => false,
         }
     }
-}
-
-#[inline]
-fn backend_progress_error(err: Report<IoError>) -> Error {
-    err.attach("redo read-ahead backend progress failure")
-        .into()
 }
 
 #[derive(Debug)]
@@ -1556,6 +1550,12 @@ struct ValidatedGroupStart {
 }
 
 #[inline]
+fn backend_progress_error(err: Report<IoError>) -> Error {
+    err.attach("redo read-ahead backend progress failure")
+        .into()
+}
+
+#[inline]
 fn replay_suffix_start(segments: &[RedoLogSegment], floor: TrxID) -> usize {
     let mut suffix_start = segments.len();
     for (idx, segment) in segments.iter().enumerate().rev() {
@@ -1707,6 +1707,7 @@ mod tests {
     use crate::serde::Ser;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{Error as StdIoError, Write};
+    use std::num::NonZeroUsize;
     use std::path::Path;
     use std::thread::spawn;
 
@@ -1880,7 +1881,7 @@ mod tests {
             limit: usize,
         ) -> BackendResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
-            let Some(submitted) = std::num::NonZeroUsize::new(submit_count) else {
+            let Some(submitted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
             };
             for _ in 0..submit_count {
@@ -1940,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_ahead_drain_quarantines_pending_reads_after_wait_error() {
+    fn test_read_ahead_drain_cleans_pending_reads_after_wait_error() {
         let (items_tx, _items_rx) = flume::bounded(1);
         let (_recycle_tx, recycle_rx) = flume::bounded(1);
         let (_stop_tx, stop_rx) = flume::bounded(1);
@@ -1967,8 +1968,8 @@ mod tests {
         );
 
         assert_eq!(worker.drain_driver(&mut driver), 1);
-        assert_eq!(driver.pending_len(), 1);
-        assert_eq!(driver.quarantine_owned_buffers(), 0);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
     }
 
     async fn assert_stream_corrupted(stream: &mut RedoLogStream) {

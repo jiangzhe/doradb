@@ -15,6 +15,8 @@ use std::num::NonZeroUsize;
 use std::ptr::null_mut;
 use std::time::Instant;
 
+type LibaioWaitResult = (usize, Vec<(BackendToken, StdIoResult<usize>)>);
+
 /// Concrete libaio context used by the current storage-engine backend.
 ///
 /// This type implements the generic [`IOBackend`] contract used by the storage
@@ -101,7 +103,19 @@ impl LibaioBackend {
             };
             return Err(err);
         }
-        Ok(NonZeroUsize::new(ret as usize).map_or(SubmitAttempt::Noop, SubmitAttempt::Submitted))
+        if ret == 0 {
+            // A non-empty submit prefix reached io_submit, but the kernel
+            // accepted no iocbs. Keep the staged batch intact and enter the
+            // bounded retry/progress-failure path.
+            return Ok(SubmitAttempt::Retry(SubmitRetry::new(
+                "libaio",
+                SubmitRetryReason::NoProgress,
+                1,
+            )));
+        }
+        let submitted =
+            NonZeroUsize::new(ret as usize).expect("positive io_submit return must be non-zero");
+        Ok(SubmitAttempt::Submitted(submitted))
     }
 
     /// Wait until at least the requested number of IO operations finish.
@@ -110,7 +124,7 @@ impl LibaioBackend {
         &self,
         events: &mut [io_event],
         min_nr: usize,
-    ) -> BackendResult<(usize, Vec<(BackendToken, StdIoResult<usize>)>)> {
+    ) -> BackendResult<LibaioWaitResult> {
         let max_nwait = events.len();
         let mut wait_calls = 0;
         let count = loop {
@@ -448,6 +462,23 @@ pub(crate) mod tests {
         assert_eq!(retry.backend(), "libaio");
         assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
         assert_eq!(retry.raw_errno(), Some(EAGAIN));
+        assert_eq!(retry.call_count(), 1);
+    }
+
+    #[test]
+    fn test_submit_limit_zero_submit_reports_no_progress_retry() {
+        let ctx = LibaioBackend::new(32).unwrap();
+        let previous = set_io_submit_hook(Some(|_, _, _| 0));
+        let iocb = iocb::boxed();
+        let reqs = vec![iocb.as_mut_ptr()];
+        let submit_result = ctx.submit_limit(&reqs, 1).unwrap();
+        set_io_submit_hook(previous);
+        let SubmitAttempt::Retry(retry) = submit_result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "libaio");
+        assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
+        assert_eq!(retry.raw_errno(), None);
         assert_eq!(retry.call_count(), 1);
     }
 

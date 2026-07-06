@@ -8,6 +8,7 @@ use event_listener::{Event, EventListener};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// First fatal engine poison reason published to future admission checks.
 #[derive(Debug, Clone)]
 pub(crate) struct EnginePoisonReason {
     reason: FatalError,
