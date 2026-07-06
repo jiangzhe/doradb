@@ -1127,6 +1127,10 @@ mod tests {
             }
             Ok(completions)
         }
+
+        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
+            SubmittedIoCleanup::DropAfterBackend
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1437,6 +1441,41 @@ mod tests {
         assert_eq!(failure.phase(), IOBackendErrorPhase::Submit);
         assert_eq!(failure.raw_errno(), Some(libc::EAGAIN));
         assert_eq!(failure.call_count(), 1);
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 0);
+    }
+
+    #[test]
+    fn test_submission_driver_full_queue_retry_expires_without_errno() {
+        let mut driver = SubmissionDriver::new_with_submit_retry_timeout(
+            DriverBackend::with_submit_outcomes(
+                1,
+                VecDeque::from([SubmitAttempt::Retry(SubmitRetry::new(
+                    "driver_test",
+                    SubmitRetryReason::FullQueue,
+                    0,
+                ))]),
+            ),
+            Duration::from_millis(0),
+        );
+
+        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
+        let SubmitAttempt::Retry(retry) = driver.submit_ready().unwrap() else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.backend(), "driver_test");
+        assert_eq!(retry.reason(), SubmitRetryReason::FullQueue);
+        assert_eq!(retry.raw_errno(), None);
+        assert_eq!(retry.call_count(), 0);
+
+        let err = driver
+            .backoff_submit_retry_or_progress_error(retry)
+            .unwrap_err();
+        let failure = backend_failure(&err).expect("retry expiry must attach backend failure");
+        assert_eq!(failure.backend(), "driver_test");
+        assert_eq!(failure.phase(), IOBackendErrorPhase::Submit);
+        assert_eq!(failure.raw_errno(), None);
+        assert_eq!(failure.call_count(), 0);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
     }

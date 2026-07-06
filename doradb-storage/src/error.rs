@@ -1,5 +1,7 @@
 use crate::id::RowID;
-use crate::io::{backend_failure, backend_operation_kind};
+use crate::io::{
+    IOBackendFailure, IOBackendOperationKind, backend_failure, backend_operation_kind,
+};
 use error_stack::{AttachmentKind, FrameKind, Report};
 use std::array::TryFromSliceError;
 use std::error::Error as StdError;
@@ -530,6 +532,25 @@ impl CompletionErrorKind {
             CompletionErrorKind::Internal(_) => ErrorKind::Internal,
         }
     }
+}
+
+/// Propagate a completion report while preserving structured backend context.
+#[inline]
+pub(crate) fn propagate_completion_report(
+    report: &Report<CompletionErrorKind>,
+    message: impl Into<String>,
+) -> Report<CompletionErrorKind> {
+    let mut propagated = match report.downcast_ref::<IoError>().copied() {
+        Some(io) => Report::new(io).change_context(*report.current_context()),
+        None => Report::new(*report.current_context()),
+    };
+    if let Some(failure) = report.downcast_ref::<IOBackendFailure>() {
+        propagated = propagated.attach(failure.clone());
+    }
+    if let Some(operation_kind) = report.downcast_ref::<IOBackendOperationKind>() {
+        propagated = propagated.attach(*operation_kind);
+    }
+    propagated.attach(message.into())
 }
 
 /// Identifies which persisted CoW file surfaced a corruption failure.

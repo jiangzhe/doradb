@@ -1034,7 +1034,7 @@ impl RedoReadAheadWorker {
                 SubmitAttempt::Retry(reason) => {
                     if driver.submitted_len() == 0 {
                         obs::debug!(
-                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={} submitted={} pending={} action=backoff",
+                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={:?} submitted={} pending={} action=backoff",
                             reason,
                             reason.raw_errno(),
                             driver.submitted_len(),
@@ -1046,7 +1046,7 @@ impl RedoReadAheadWorker {
                         true
                     } else {
                         obs::debug!(
-                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={} submitted={} pending={} action=wait",
+                            "event=redo_readahead_backend_submit_retry component=recovery reason={} errno={:?} submitted={} pending={} action=wait",
                             reason,
                             reason.raw_errno(),
                             driver.submitted_len(),
@@ -1694,7 +1694,7 @@ mod tests {
     use crate::id::{RowID, TableID, TrxID};
     use crate::io::{
         BackendResult, BackendToken, DirectBuf, IOBackendErrorPhase, IOBackendFailure,
-        IOBackendQueueState, IOBuf,
+        IOBackendQueueState, IOBuf, SubmittedIoCleanup,
     };
     use crate::log::block_group::LogBlockGroup;
     use crate::log::format::{
@@ -1904,6 +1904,10 @@ mod tests {
                 1,
                 IOBackendQueueState::wait_with_completions(0),
             ))
+        }
+
+        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
+            SubmittedIoCleanup::DropAfterBackend
         }
     }
 

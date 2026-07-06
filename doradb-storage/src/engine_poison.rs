@@ -31,11 +31,11 @@ impl EnginePoisonReason {
 /// consistency, while the engine owner remains responsible for normal explicit
 /// shutdown.
 pub(crate) struct EnginePoisoner {
-    /// Storage-runtime poison flag for fatal storage background or durability failures.
+    /// Engine-runtime poison flag for fatal storage background or durability failures.
     poisoned: CachePadded<AtomicBool>,
-    /// First fatal storage reason and diagnostic context that poisoned runtime admission.
+    /// First fatal engine reason and diagnostic context that poisoned runtime admission.
     poison_reason: CachePadded<Mutex<Option<EnginePoisonReason>>>,
-    /// One-shot wake for event waits that must notice storage poison.
+    /// One-shot wake for event waits that must notice engine poison.
     poison_event: CachePadded<Event>,
 }
 
@@ -50,7 +50,7 @@ impl EnginePoisoner {
         }
     }
 
-    /// Returns the first fatal storage poison error, if runtime admission has been poisoned.
+    /// Returns the first fatal engine poison error, if runtime admission has been poisoned.
     #[inline]
     pub(crate) fn poison_error(&self) -> Option<Report<FatalError>> {
         if !self.poisoned.load(Ordering::Acquire) {
@@ -64,7 +64,7 @@ impl EnginePoisoner {
         guard.as_ref().map(EnginePoisonReason::report)
     }
 
-    /// Returns `Err` once a fatal storage failure poisoned runtime admission.
+    /// Returns `Err` once a fatal engine failure poisoned runtime admission.
     #[inline]
     pub(crate) fn ensure_healthy(&self) -> FatalResult<()> {
         match self.poison_error() {

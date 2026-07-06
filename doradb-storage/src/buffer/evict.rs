@@ -707,6 +707,75 @@ impl EvictablePoolStateMachine {
             }
         }
     }
+
+    /// Fail one prepared pool submission before backend submission accepted it.
+    #[inline]
+    pub(crate) fn fail_submission_with_backend_error(
+        &mut self,
+        sub: EvictSubmission,
+        err: &Report<IoError>,
+    ) -> StorageIOKind {
+        match sub {
+            EvictSubmission::Read(sub) => {
+                let _ = sub.block_key;
+                sub.fail_backend_not_accepted(err);
+                StorageIOKind::Read
+            }
+            EvictSubmission::Write(sub) => {
+                let PageIO {
+                    block_key,
+                    operation: _,
+                    page_guard,
+                    batch_done,
+                } = sub;
+                let _ = block_key;
+                let page_id = page_guard.page_id();
+                self.pool.inflight_io.fail_writeback(
+                    &self.pool.stats,
+                    page_guard,
+                    IoError::report_backend(
+                        err,
+                        format!("submit evict pool writeback: page_id={page_id}"),
+                    )
+                    .into(),
+                );
+                drop(batch_done);
+                StorageIOKind::Write
+            }
+        }
+    }
+
+    /// Fail one already-submitted pool submission without releasing
+    /// kernel-facing page memory.
+    #[inline]
+    pub(crate) fn fail_submitted_with_backend_error(
+        &mut self,
+        sub: &mut EvictSubmission,
+        err: &Report<IoError>,
+    ) -> StorageIOKind {
+        match sub {
+            EvictSubmission::Read(sub) => {
+                let _ = sub.block_key;
+                sub.fail_backend_submitted(err);
+                StorageIOKind::Read
+            }
+            EvictSubmission::Write(sub) => {
+                let _ = sub.block_key;
+                let page_id = sub.page_id();
+                self.pool.inflight_io.fail_submitted_writeback(
+                    &self.pool.stats,
+                    &mut sub.page_guard,
+                    IoError::report_backend(
+                        err,
+                        format!("complete submitted evict pool writeback: page_id={page_id}"),
+                    )
+                    .into(),
+                );
+                drop(sub.batch_done.take());
+                StorageIOKind::Write
+            }
+        }
+    }
 }
 
 impl IOStateMachine for EvictablePoolStateMachine {
@@ -1309,6 +1378,14 @@ impl EvictReadSubmission {
         self.complete_waiters(Err(err));
     }
 
+    /// Fails a submitted reload while retaining its borrowed page memory.
+    #[inline]
+    fn fail_backend_submitted(&mut self, err: Report<CompletionErrorKind>) {
+        self.stats.add_completed_reads(1);
+        self.stats.add_read_errors(1);
+        self.complete_waiters(Err(err));
+    }
+
     /// Records that the backend accepted this read submission into running state.
     #[inline]
     pub(crate) fn record_running(&self) {
@@ -1401,6 +1478,25 @@ impl PreparedEvictReadSubmission {
     #[inline]
     fn page_id(&self) -> PageID {
         self.inner.page_id()
+    }
+
+    #[inline]
+    fn fail_backend_not_accepted(self, err: &Report<IoError>) {
+        let page_id = self.page_id();
+        self.inner.fail(CompletionErrorKind::report_backend_io(
+            err,
+            format!("submit evict pool read: page_id={page_id}"),
+        ));
+    }
+
+    #[inline]
+    fn fail_backend_submitted(&mut self, err: &Report<IoError>) {
+        let page_id = self.page_id();
+        self.inner
+            .fail_backend_submitted(CompletionErrorKind::report_backend_io(
+                err,
+                format!("complete submitted evict pool read: page_id={page_id}"),
+            ));
     }
 
     #[inline]
@@ -1576,6 +1672,50 @@ impl InflightIO {
             completion.complete(Err(CompletionErrorKind::report_error(
                 err,
                 format!("fail evict pool writeback: page_id={page_id}"),
+            )));
+        }
+    }
+
+    #[inline]
+    fn fail_submitted_writeback(
+        &self,
+        stats: &BufferPoolStatsHandle,
+        page_guard: &mut PageExclusiveGuard<Page>,
+        err: Error,
+    ) {
+        let page_id = page_guard.page_id();
+        let completion = {
+            let mut g = self.map.lock();
+            let mut status = g.remove(&page_id).unwrap_or_else(|| {
+                panic!(
+                    "inflight write entry missing during submitted failure cleanup: page_id={}",
+                    page_id
+                )
+            });
+            match status.kind {
+                IOKind::Write => {
+                    self.writes.fetch_sub(1, Ordering::Relaxed);
+                    let frame_kind = page_guard.bf().kind();
+                    assert!(
+                        frame_kind == FrameKind::Evicting,
+                        "evictable submitted write failure expected evicting frame: page_id={page_id}, actual_kind={frame_kind:?}"
+                    );
+                    page_guard.bf_mut().set_kind(FrameKind::Hot);
+                    stats.add_completed_writes(1);
+                    stats.add_write_errors(1);
+                    status.completion.take()
+                }
+                other => {
+                    panic!(
+                        "inflight write entry has invalid kind during submitted failure cleanup: page_id={page_id}, kind={other:?}"
+                    )
+                }
+            }
+        };
+        if let Some(completion) = completion {
+            completion.complete(Err(CompletionErrorKind::report_error(
+                err,
+                format!("fail submitted evict pool writeback: page_id={page_id}"),
             )));
         }
     }

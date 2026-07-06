@@ -42,9 +42,10 @@ alternate `libaio`. The backend-neutral `IOBackend` trait currently models
 `submit_batch` and `wait_at_least` as infallible. That forces unexpected
 backend syscall errors into `panic!` paths in both backend implementations.
 Known transient syscall conditions already have local policy: `EINTR` is
-retried, `io_uring` submit pressure from `EAGAIN` or `EBUSY` falls back through
-`submit_and_wait`, and `libaio` `io_submit` `EAGAIN` returns zero submitted
-work for later retry.
+retried, while `io_uring` submit pressure from `EAGAIN` or `EBUSY` and
+`libaio` `io_submit` `EAGAIN` are reported as explicit `SubmitAttempt::Retry`
+outcomes. Schedulers wait on already-accepted work when possible and otherwise
+use bounded no-progress backoff before retrying staged submissions.
 
 Per-operation completion errors already have usable paths. Negative completion
 results become `std::io::Error`; table-file, readonly-cache, evictable-pool,
@@ -74,7 +75,9 @@ owning the poison state.
 - Make `IOBackend::submit_batch` and `IOBackend::wait_at_least` fallible with a
   backend-specific typed error instead of panicking on non-transient syscall
   failures.
-- Preserve current transient handling for `EINTR`, `EAGAIN`, and `EBUSY`.
+- Preserve current transient handling for `EINTR`, `EAGAIN`, and `EBUSY`:
+  retry interrupted backend syscalls immediately, and surface submit pressure
+  as explicit retry outcomes rather than backend-progress failures.
 - Treat unsupported native async sync, such as `libaio` sync opcode rejection
   on unsupported kernels, as a known backend error with a clear message.
 - Keep IO invariants as explicit panics: invalid or stale completion tokens,
@@ -167,7 +170,7 @@ owning the poison state.
 
 4. Make `IOBackend` submit/wait fallible.
    - Change the trait to:
-     - `submit_batch(...) -> BackendResult<usize>`;
+     - `submit_batch(...) -> BackendResult<SubmitAttempt>`;
      - `wait_at_least(...) -> BackendResult<Vec<(BackendToken,
        StdIoResult<usize>)>>`.
    - Update `SubmissionDriver::submit_ready` and
@@ -182,9 +185,12 @@ owning the poison state.
      results.
    - Preserve:
      - retry on `EINTR`;
-     - fallback to `submit_and_wait(1)` on `EAGAIN` or `EBUSY`;
+     - `SubmitAttempt::Retry` on `EAGAIN` or `EBUSY`, including backend name,
+       retry reason, and submit call count;
      - partial-submit suffix retention;
      - assertions for impossible accepted counts.
+   - Keep blocking submit-and-wait as the wait-path primitive; submit pressure
+     must leave staged work queued for scheduler retry.
    - Replace unexpected submit, blocking-submit, and wait panics with
      `IOBackendError` carrying current pending SQEs, limit, and staged length.
    - Continue recording submit/wait stats for attempted calls that return a
@@ -194,7 +200,8 @@ owning the poison state.
    - Make `submit_limit` and `wait_at_least_with_attempts` return backend
      results.
    - Preserve:
-     - `io_submit` `EAGAIN` returning zero submitted;
+     - `SubmitAttempt::Retry` on `io_submit` `EAGAIN`, including backend name,
+       retry reason, and submit call count;
      - `io_getevents` retry on `EINTR`;
      - assertion that blocking wait with `min_nr = 1` must not return zero.
    - Replace other negative `io_submit` and `io_getevents` results with
@@ -338,11 +345,16 @@ owning the poison state.
   `TransactionSystem` only delegates.
 - Existing transaction-system poison tests pass through the delegated
   `EnginePoisoner` helpers.
-- `io_uring` submit helper retries `EINTR`, preserves `EAGAIN`/`EBUSY`
-  fallback, and returns typed errors for unexpected submit, blocking-submit,
-  and wait failures.
-- `libaio` submit helper returns zero on `EAGAIN`, wait helper retries
-  `EINTR`, and both return typed errors for non-transient syscall failures.
+- `io_uring` submit helper retries `EINTR`, returns `SubmitAttempt::Retry` for
+  `EAGAIN`/`EBUSY` with backend context, preserves staged SQEs for retry, and
+  returns typed errors for unexpected submit, blocking-submit, and wait
+  failures.
+- `libaio` submit helper returns `SubmitAttempt::Retry` on `EAGAIN`, wait
+  helper retries `EINTR`, and both return typed errors for non-transient
+  syscall failures.
+- Submit retry backoff defaults to 5 seconds, supports shorter low-level test
+  configuration, and converts no-submitted retry pressure past the configured
+  timeout into a backend progress error.
 - `libaio` sync-op rejection reports a clear unsupported-native-sync context.
 - `SubmissionDriver` with a fake backend returns submit/wait errors without
   corrupting staged, submitted, or completed counters.

@@ -1607,7 +1607,7 @@ where
             Ok(SubmitAttempt::Retry(reason)) => {
                 if self.write_driver.submitted_len() == 0 {
                     obs::debug!(
-                        "event=redo_backend_submit_retry component=redo_log reason={} errno={} submitted={} pending={} action=backoff",
+                        "event=redo_backend_submit_retry component=redo_log reason={} errno={:?} submitted={} pending={} action=backoff",
                         reason,
                         reason.raw_errno(),
                         self.write_driver.submitted_len(),
@@ -1623,7 +1623,7 @@ where
                     }
                 } else {
                     obs::debug!(
-                        "event=redo_backend_submit_retry component=redo_log reason={} errno={} submitted={} pending={} action=wait",
+                        "event=redo_backend_submit_retry component=redo_log reason={} errno={:?} submitted={} pending={} action=wait",
                         reason,
                         reason.raw_errno(),
                         self.write_driver.submitted_len(),
@@ -2384,7 +2384,7 @@ mod tests {
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
         BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState,
-        IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
+        IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook, SubmittedIoCleanup,
         install_storage_backend_test_hook,
     };
     use crate::log::format::{
@@ -3504,6 +3504,10 @@ mod tests {
                     IOBackendQueueState::wait_with_completions(0),
                 )),
             }
+        }
+
+        fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
+            SubmittedIoCleanup::DropAfterBackend
         }
     }
 

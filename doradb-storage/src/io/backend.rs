@@ -2,7 +2,7 @@ use crate::error::IoError;
 use error_stack::Report;
 use libc::{EAGAIN, EBUSY};
 use std::fmt;
-use std::io::Error as StdIoError;
+use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
 use std::num::NonZeroUsize;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -26,6 +26,12 @@ pub(crate) enum SubmitRetryReason {
     Eagain,
     /// Kernel submit returned `EBUSY`.
     Ebusy,
+    /// The backend submission queue was full before entering a submit syscall.
+    #[cfg_attr(
+        not(feature = "iouring"),
+        allow(dead_code, reason = "io_uring-only submit pressure reason")
+    )]
+    FullQueue,
 }
 
 impl SubmitRetryReason {
@@ -39,12 +45,13 @@ impl SubmitRetryReason {
         }
     }
 
-    /// Return the raw errno represented by this retry reason.
+    /// Return the raw errno represented by this retry reason, if any.
     #[inline]
-    pub(crate) const fn raw_errno(self) -> i32 {
+    pub(crate) const fn raw_errno(self) -> Option<i32> {
         match self {
-            Self::Eagain => EAGAIN,
-            Self::Ebusy => EBUSY,
+            Self::Eagain => Some(EAGAIN),
+            Self::Ebusy => Some(EBUSY),
+            Self::FullQueue => None,
         }
     }
 }
@@ -55,6 +62,7 @@ impl fmt::Display for SubmitRetryReason {
         match self {
             Self::Eagain => f.write_str("EAGAIN"),
             Self::Ebusy => f.write_str("EBUSY"),
+            Self::FullQueue => f.write_str("FULL_QUEUE"),
         }
     }
 }
@@ -96,10 +104,18 @@ impl SubmitRetry {
         self.reason
     }
 
-    /// Raw errno represented by this retry.
+    /// Raw errno represented by this retry, if any.
     #[inline]
-    pub(crate) const fn raw_errno(self) -> i32 {
+    pub(crate) const fn raw_errno(self) -> Option<i32> {
         self.reason.raw_errno()
+    }
+
+    #[inline]
+    fn io_error(self) -> StdIoError {
+        match self.raw_errno() {
+            Some(errno) => StdIoError::from_raw_os_error(errno),
+            None => StdIoError::new(StdIoErrorKind::WouldBlock, self.reason.to_string()),
+        }
     }
 
     /// Syscall attempt count from the backend submit call.
@@ -120,7 +136,7 @@ impl SubmitRetry {
         IOBackendFailure::report(
             self.backend,
             IOBackendErrorPhase::Submit,
-            StdIoError::from_raw_os_error(self.raw_errno()),
+            self.io_error(),
             self.call_count,
             queue_state,
         )
@@ -251,6 +267,22 @@ impl fmt::Display for IOBackendErrorPhase {
             Self::Wait => f.write_str("wait"),
         }
     }
+}
+
+/// Backend-specific decision after storage has woken submitted waiters on a
+/// fatal backend progress failure.
+pub(crate) enum SubmittedIoCleanup {
+    /// Submitted state can be dropped after the backend owner is dropped.
+    DropAfterBackend,
+    /// The backend could not prove submitted user memory is no longer in use.
+    #[cfg_attr(
+        not(feature = "iouring"),
+        allow(dead_code, reason = "io_uring-only submitted cleanup disposition")
+    )]
+    LeakAfterBackend {
+        backend: &'static str,
+        reason: String,
+    },
 }
 
 /// Queue state observed at one backend progress failure boundary.
@@ -477,15 +509,6 @@ pub(crate) fn backend_operation_kind(report: &Report<IoError>) -> Option<IOBacke
     report.downcast_ref::<IOBackendOperationKind>().copied()
 }
 
-/// Build a fresh standard IO error carrying backend progress context.
-#[inline]
-pub(crate) fn backend_report_to_io_error(report: &Report<IoError>) -> StdIoError {
-    StdIoError::new(
-        report.current_context().kind(),
-        backend_report_summary(report),
-    )
-}
-
 /// Format backend progress context for logs and poison diagnostics.
 pub(crate) fn backend_report_summary(report: &Report<IoError>) -> String {
     let mut summary = report.current_context().to_string();
@@ -690,6 +713,9 @@ pub(crate) trait IOBackend {
         events: &mut Self::Events,
         min_nr: usize,
     ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>>;
+    /// Best-effort backend cleanup for already-submitted IO after a fatal
+    /// progress failure.
+    fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup;
 }
 
 #[cfg(test)]

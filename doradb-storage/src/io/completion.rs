@@ -4,11 +4,11 @@
 //! fanout paths can move detailed domain reports across thread boundaries
 //! without promoting them to the public `Error` type too early. A completion
 //! report is not cloneable, so each waiter receives a propagated report with
-//! the same top-level `CompletionErrorKind` and a propagation attachment. The
-//! original stored report keeps the precise attachments at the producer side.
+//! the same top-level `CompletionErrorKind`, structured backend attachments
+//! when present, and a propagation attachment. The original stored report keeps
+//! any remaining producer-side detail.
 
-use crate::error::CompletionResult;
-use error_stack::Report;
+use crate::error::{CompletionResult, propagate_completion_report};
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
 
@@ -94,7 +94,7 @@ impl<T> Default for Completion<T> {
 fn propagate_result<T: Clone>(value: &CompletionResult<T>) -> CompletionResult<T> {
     match value {
         Ok(value) => Ok(value.clone()),
-        Err(report) => Err(Report::new(*report.current_context()).attach(PROPAGATE_ATTACHMENT)),
+        Err(report) => Err(propagate_completion_report(report, PROPAGATE_ATTACHMENT)),
     }
 }
 
@@ -102,6 +102,10 @@ fn propagate_result<T: Clone>(value: &CompletionResult<T>) -> CompletionResult<T
 mod tests {
     use super::Completion;
     use crate::error::{CompletionErrorKind, IoError};
+    use crate::io::{
+        IOBackendErrorPhase, IOBackendFailure, IOBackendOperationKind, IOBackendQueueState, IOKind,
+        attach_backend_operation_kind,
+    };
     use error_stack::Report;
     use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 
@@ -135,6 +139,31 @@ mod tests {
         let output = format!("{report:?}");
         assert!(output.contains("propagate from other threads"));
         assert!(!output.contains("original detail"));
+    }
+
+    #[test]
+    fn test_completion_error_propagates_backend_attachments() {
+        let completion = Completion::<usize>::new();
+        let backend_report = IOBackendFailure::report(
+            "test_backend",
+            IOBackendErrorPhase::Submit,
+            StdIoError::from_raw_os_error(libc::EIO),
+            2,
+            IOBackendQueueState::submit(1, 1),
+        );
+        let backend_report = attach_backend_operation_kind(backend_report, Some(IOKind::Write));
+        completion.complete(Err(CompletionErrorKind::report_backend_io(
+            &backend_report,
+            "original backend context",
+        )));
+
+        let report = completion.completed_result().unwrap().unwrap_err();
+        assert!(report.downcast_ref::<IOBackendFailure>().is_some());
+        assert!(report.downcast_ref::<IOBackendOperationKind>().is_some());
+        let output = format!("{report:?}");
+        assert!(output.contains("backend=test_backend"), "{output}");
+        assert!(output.contains("propagate from other threads"), "{output}");
+        assert!(!output.contains("original backend context"), "{output}");
     }
 
     #[test]

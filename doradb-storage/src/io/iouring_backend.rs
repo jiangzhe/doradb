@@ -1,7 +1,7 @@
 use super::{
     BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
     IOBackendQueueState, IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult,
-    SubmitAttempt, SubmitRetry, SubmitRetryReason, backend_call_count,
+    SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
 };
 use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
 use error_stack::Report;
@@ -12,7 +12,9 @@ use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
 use std::io::Error as StdIoError;
 use std::num::NonZeroUsize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const IOURING_SYNC_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Concrete io_uring context used by the storage-engine backend.
 pub(crate) struct IouringBackend {
@@ -61,10 +63,10 @@ impl IouringBackend {
     }
 
     #[inline]
-    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) {
+    fn stage_pending_sqes(&mut self, batch: &mut IouringSubmitBatch, limit: usize) -> bool {
         let target = limit.min(batch.staged.len());
         if target == 0 {
-            return;
+            return false;
         }
 
         while batch.pending_sqes < target {
@@ -79,10 +81,11 @@ impl IouringBackend {
                 unsafe { sq.push(entry) }
             };
             if push_res.is_err() {
-                break;
+                return true;
             }
             batch.pending_sqes += 1;
         }
+        false
     }
 
     #[inline]
@@ -221,9 +224,16 @@ impl IOBackend for IouringBackend {
         limit: usize,
     ) -> BackendResult<SubmitAttempt> {
         let start = Instant::now();
-        self.stage_pending_sqes(batch, limit);
+        let sq_full = self.stage_pending_sqes(batch, limit);
 
         if batch.pending_sqes == 0 {
+            if sq_full {
+                return Ok(SubmitAttempt::Retry(SubmitRetry::new(
+                    "io_uring",
+                    SubmitRetryReason::FullQueue,
+                    0,
+                )));
+            }
             return Ok(SubmitAttempt::Noop);
         }
 
@@ -278,6 +288,25 @@ impl IOBackend for IouringBackend {
             }
         }
         Ok(self.take_completions())
+    }
+
+    #[inline]
+    fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup {
+        if submitted == 0 {
+            return SubmittedIoCleanup::DropAfterBackend;
+        }
+        let timeout = types::Timespec::from(IOURING_SYNC_CANCEL_TIMEOUT);
+        match self
+            .ring
+            .submitter()
+            .register_sync_cancel(Some(timeout), types::CancelBuilder::any().all())
+        {
+            Ok(()) => SubmittedIoCleanup::DropAfterBackend,
+            Err(err) => SubmittedIoCleanup::LeakAfterBackend {
+                backend: "io_uring",
+                reason: format!("sync cancel failed for {submitted} submitted ops: {err}"),
+            },
+        }
     }
 }
 
@@ -402,6 +431,7 @@ mod tests {
             Some(SubmitRetryReason::Ebusy)
         );
         assert_eq!(SubmitRetryReason::from_raw_errno(EINTR), None);
+        assert_eq!(SubmitRetryReason::FullQueue.raw_errno(), None);
     }
 
     #[test]
@@ -412,9 +442,37 @@ mod tests {
         };
         assert_eq!(retry.backend(), "io_uring");
         assert_eq!(retry.reason(), SubmitRetryReason::Ebusy);
-        assert_eq!(retry.raw_errno(), EBUSY);
+        assert_eq!(retry.raw_errno(), Some(EBUSY));
         assert_eq!(retry.call_count(), 3);
         assert_eq!(outcome.call_count, 3);
+    }
+
+    #[test]
+    fn test_submit_batch_reports_full_queue_retry() {
+        let mut backend = IouringBackend::new(1).unwrap();
+        {
+            let mut sq = backend.ring.submission();
+            loop {
+                let entry = nop_entry();
+                // SAFETY: this test intentionally fills the SQ with copied NOP
+                // SQEs to make the next staged push observe SQ-full.
+                if unsafe { sq.push(&entry) }.is_err() {
+                    break;
+                }
+            }
+        }
+        let mut batch = submit_batch_with_pending(1, 0);
+
+        let submit_result = backend.submit_batch(&mut batch, 1).unwrap();
+
+        let SubmitAttempt::Retry(retry) = submit_result else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.reason(), SubmitRetryReason::FullQueue);
+        assert_eq!(retry.raw_errno(), None);
+        assert_eq!(retry.call_count(), 0);
+        assert_eq!(batch.pending_sqes, 0);
+        assert_eq!(batch.staged.len(), 1);
     }
 
     #[test]

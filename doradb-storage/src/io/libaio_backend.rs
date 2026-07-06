@@ -4,7 +4,7 @@ use super::libaio_abi::{
 use super::{
     BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
     IOBackendQueueState, IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt,
-    SubmitRetry, SubmitRetryReason, backend_call_count,
+    SubmitRetry, SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
 };
 use crate::error::{ConfigError, IoError, Result, StorageOp};
 use error_stack::Report;
@@ -274,6 +274,11 @@ impl IOBackend for LibaioBackend {
             })?;
         Ok(completed)
     }
+
+    #[inline]
+    fn cleanup_submitted_io(&mut self, _submitted: usize) -> SubmittedIoCleanup {
+        SubmittedIoCleanup::DropAfterBackend
+    }
 }
 
 /// Backend-owned libaio staging buffer for one worker.
@@ -442,7 +447,7 @@ pub(crate) mod tests {
         };
         assert_eq!(retry.backend(), "libaio");
         assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
-        assert_eq!(retry.raw_errno(), EAGAIN);
+        assert_eq!(retry.raw_errno(), Some(EAGAIN));
         assert_eq!(retry.call_count(), 1);
     }
 
