@@ -50,7 +50,10 @@ pub enum Command {
     /// Prepare an empty benchmark storage root and manifest.
     Prepare(PrepareArgs),
     /// Run a measured workload and write benchmark results.
-    Run(LoadArgs),
+    Run {
+        #[command(subcommand)]
+        workload: WorkloadArgs,
+    },
     /// Remove the prepared benchmark storage root.
     Cleanup,
 }
@@ -63,6 +66,9 @@ pub(super) enum IndexMode {
     #[serde(rename = "unique")]
     #[value(name = "unique")]
     Unique,
+    #[serde(rename = "non-unique")]
+    #[value(name = "non-unique")]
+    NonUnique,
 }
 
 impl fmt::Display for IndexMode {
@@ -70,6 +76,7 @@ impl fmt::Display for IndexMode {
         match self {
             Self::None => f.write_str("none"),
             Self::Unique => f.write_str("unique"),
+            Self::NonUnique => f.write_str("non-unique"),
         }
     }
 }
@@ -110,13 +117,23 @@ impl fmt::Display for LogSyncMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Workload {
-    Insert,
+    InsertSeq,
+    InsertRand,
+    LookupSeq,
+    LookupRand,
+    TableScan,
+    IndexScan,
 }
 
 impl fmt::Display for Workload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Insert => f.write_str("insert"),
+            Self::InsertSeq => f.write_str("insert-seq"),
+            Self::InsertRand => f.write_str("insert-rand"),
+            Self::LookupSeq => f.write_str("lookup-seq"),
+            Self::LookupRand => f.write_str("lookup-rand"),
+            Self::TableScan => f.write_str("table-scan"),
+            Self::IndexScan => f.write_str("index-scan"),
         }
     }
 }
@@ -125,44 +142,88 @@ impl fmt::Display for Workload {
 #[derive(Clone, Debug, Args)]
 pub struct PrepareArgs {
     /// Benchmark table index shape.
-    #[arg(long, short = 'i', value_enum, default_value_t = IndexMode::None)]
+    #[arg(long, short = 'i', value_enum)]
     pub(super) index: IndexMode,
+    /// Default operating-system worker threads for later runs.
+    #[arg(long, short = 't', default_value = "1")]
+    pub(super) threads: NonZeroUsize,
+    /// Default independent DoraDB public sessions for later runs.
+    #[arg(long, short = 's')]
+    pub(super) sessions: Option<NonZeroUsize>,
 }
 
-/// Arguments for measured benchmark runs.
-#[derive(Clone, Debug, Args)]
-pub struct LoadArgs {
-    #[command(subcommand)]
-    workload: LoadWorkload,
+/// Arguments for measured benchmark workloads.
+#[derive(Clone, Debug, Subcommand)]
+pub enum WorkloadArgs {
+    /// Insert generated rows with sequential logical keys.
+    InsertSeq(InsertArgs),
+    /// Insert generated rows with pseudo-random logical keys.
+    InsertRand(InsertArgs),
+    /// Run unique-index point lookups over loaded keys in sequential order.
+    LookupSeq(ReadCountArgs),
+    /// Run unique-index point lookups over loaded keys in seeded random order.
+    LookupRand(SeededReadArgs),
+    /// Run full table-scan iterations over visible rows.
+    TableScan(TableScanArgs),
+    /// Run exact-key non-unique secondary-index scans over loaded keys.
+    IndexScan(SeededReadArgs),
 }
 
-impl LoadArgs {
+impl WorkloadArgs {
     pub(super) fn resolve(
         &self,
         storage_root: PathBuf,
         manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
     ) -> Result<LoadConfig> {
-        match &self.workload {
-            LoadWorkload::Insert(args) => args.resolve(storage_root, manifest_index),
+        match self {
+            WorkloadArgs::InsertSeq(args) => args.resolve_insert_seq(
+                storage_root,
+                manifest_index,
+                default_threads,
+                default_sessions,
+            ),
+            WorkloadArgs::InsertRand(args) => args.resolve_insert_rand(
+                storage_root,
+                manifest_index,
+                default_threads,
+                default_sessions,
+            ),
+            WorkloadArgs::LookupSeq(args) => args.resolve(
+                storage_root,
+                manifest_index,
+                default_threads,
+                default_sessions,
+            ),
+            WorkloadArgs::LookupRand(args) => args.resolve_lookup_rand(
+                storage_root,
+                manifest_index,
+                default_threads,
+                default_sessions,
+            ),
+            WorkloadArgs::TableScan(args) => args.resolve(
+                storage_root,
+                manifest_index,
+                default_threads,
+                default_sessions,
+            ),
+            WorkloadArgs::IndexScan(args) => args.resolve_index_scan(
+                storage_root,
+                manifest_index,
+                default_threads,
+                default_sessions,
+            ),
         }
     }
 }
 
-#[derive(Clone, Debug, Subcommand)]
-enum LoadWorkload {
-    /// Insert generated rows into the prepared benchmark table.
-    Insert(InsertArgs),
-}
-
 #[derive(Clone, Debug, Args)]
 struct LoadCommonArgs {
-    /// Validate the prepared benchmark index shape.
-    #[arg(long, short = 'i', value_enum)]
-    index: Option<IndexMode>,
     /// Operating-system worker threads.
-    #[arg(long, short = 't', default_value = "1")]
-    threads: NonZeroUsize,
-    /// Independent DoraDB public sessions; defaults to --threads.
+    #[arg(long, short = 't')]
+    threads: Option<NonZeroUsize>,
+    /// Independent DoraDB public sessions.
     #[arg(long, short = 's')]
     sessions: Option<NonZeroUsize>,
     /// Redo-log durability sync method.
@@ -171,7 +232,7 @@ struct LoadCommonArgs {
 }
 
 #[derive(Clone, Debug, Args)]
-struct InsertArgs {
+pub struct InsertArgs {
     #[command(flatten)]
     common: LoadCommonArgs,
     /// Total rows inserted across all sessions.
@@ -183,58 +244,287 @@ struct InsertArgs {
     /// Rows per transaction commit.
     #[arg(long, short = 'b', default_value = "1")]
     batch_size: NonZeroU64,
-    /// Generate logical keys in pseudo-random order.
-    #[arg(long)]
-    rand: bool,
     /// Reproducibility seed.
     #[arg(long, default_value_t = 0)]
     seed: u64,
 }
 
 impl InsertArgs {
-    fn resolve(&self, storage_root: PathBuf, manifest_index: IndexMode) -> Result<LoadConfig> {
-        let index = self.common.index.unwrap_or(manifest_index);
-        if index != manifest_index {
-            return Err(BenchError::message(format!(
-                "--index {index} does not match prepared benchmark index {manifest_index}"
-            )));
-        }
-        let threads = self.common.threads.get();
-        let sessions = self.common.sessions.unwrap_or(self.common.threads).get();
-        if threads > sessions {
-            return Err(BenchError::message(format!(
-                "--threads ({threads}) must not exceed --sessions ({sessions})"
-            )));
-        }
-        Ok(LoadConfig {
+    fn resolve_insert_seq(
+        &self,
+        storage_root: PathBuf,
+        manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
+    ) -> Result<LoadConfig> {
+        self.resolve_insert(
             storage_root,
-            workload: Workload::Insert,
+            manifest_index,
+            default_threads,
+            default_sessions,
+            false,
+        )
+    }
+
+    fn resolve_insert_rand(
+        &self,
+        storage_root: PathBuf,
+        manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
+    ) -> Result<LoadConfig> {
+        self.resolve_insert(
+            storage_root,
+            manifest_index,
+            default_threads,
+            default_sessions,
+            true,
+        )
+    }
+
+    fn resolve_insert(
+        &self,
+        storage_root: PathBuf,
+        manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
+        random: bool,
+    ) -> Result<LoadConfig> {
+        let workers = resolve_workers(&self.common, default_threads, default_sessions)?;
+        let insert = InsertConfig {
             num: self.num.get(),
             value_size: self.value_size.get(),
             batch_size: self.batch_size.get(),
-            rand: self.rand,
             seed: self.seed,
-            index,
-            threads,
-            sessions,
+        };
+        let workload = if random {
+            WorkloadConfig::InsertRand(insert)
+        } else {
+            WorkloadConfig::InsertSeq(insert)
+        };
+        Ok(LoadConfig {
+            storage_root,
+            index: manifest_index,
+            threads: workers.threads,
+            sessions: workers.sessions,
             log_sync: self.common.log_sync,
+            workload,
         })
     }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ReadCountArgs {
+    #[command(flatten)]
+    common: LoadCommonArgs,
+    /// Total read requests across all sessions.
+    #[arg(long, short = 'n')]
+    num: NonZeroU64,
+}
+
+impl ReadCountArgs {
+    fn resolve(
+        &self,
+        storage_root: PathBuf,
+        manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
+    ) -> Result<LoadConfig> {
+        let workers = resolve_workers(&self.common, default_threads, default_sessions)?;
+        Ok(LoadConfig {
+            storage_root,
+            index: manifest_index,
+            threads: workers.threads,
+            sessions: workers.sessions,
+            log_sync: self.common.log_sync,
+            workload: WorkloadConfig::LookupSeq {
+                num: self.num.get(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SeededReadArgs {
+    #[command(flatten)]
+    common: LoadCommonArgs,
+    /// Total read requests across all sessions.
+    #[arg(long, short = 'n')]
+    num: NonZeroU64,
+    /// Reproducibility seed.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
+impl SeededReadArgs {
+    fn resolve_lookup_rand(
+        &self,
+        storage_root: PathBuf,
+        manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
+    ) -> Result<LoadConfig> {
+        let workers = resolve_workers(&self.common, default_threads, default_sessions)?;
+        Ok(LoadConfig {
+            storage_root,
+            index: manifest_index,
+            threads: workers.threads,
+            sessions: workers.sessions,
+            log_sync: self.common.log_sync,
+            workload: WorkloadConfig::LookupRand {
+                num: self.num.get(),
+                seed: self.seed,
+            },
+        })
+    }
+
+    fn resolve_index_scan(
+        &self,
+        storage_root: PathBuf,
+        manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
+    ) -> Result<LoadConfig> {
+        let workers = resolve_workers(&self.common, default_threads, default_sessions)?;
+        Ok(LoadConfig {
+            storage_root,
+            index: manifest_index,
+            threads: workers.threads,
+            sessions: workers.sessions,
+            log_sync: self.common.log_sync,
+            workload: WorkloadConfig::IndexScan {
+                num: self.num.get(),
+                seed: self.seed,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct TableScanArgs {
+    #[command(flatten)]
+    common: LoadCommonArgs,
+    /// Full table-scan iterations across all sessions.
+    #[arg(long, short = 'n', default_value = "1")]
+    num: NonZeroU64,
+}
+
+impl TableScanArgs {
+    fn resolve(
+        &self,
+        storage_root: PathBuf,
+        manifest_index: IndexMode,
+        default_threads: usize,
+        default_sessions: usize,
+    ) -> Result<LoadConfig> {
+        let workers = resolve_workers(&self.common, default_threads, default_sessions)?;
+        Ok(LoadConfig {
+            storage_root,
+            index: manifest_index,
+            threads: workers.threads,
+            sessions: workers.sessions,
+            log_sync: self.common.log_sync,
+            workload: WorkloadConfig::TableScan {
+                num: self.num.get(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerSettings {
+    threads: usize,
+    sessions: usize,
+}
+
+fn resolve_workers(
+    common: &LoadCommonArgs,
+    default_threads: usize,
+    default_sessions: usize,
+) -> Result<WorkerSettings> {
+    let threads = common.threads.map_or(default_threads, NonZeroUsize::get);
+    let sessions = match (common.threads, common.sessions) {
+        (_, Some(sessions)) => sessions.get(),
+        (Some(threads), None) => threads.get(),
+        (None, None) => default_sessions,
+    };
+    validate_workers(threads, sessions)?;
+    Ok(WorkerSettings { threads, sessions })
+}
+
+pub(super) fn validate_workers(threads: usize, sessions: usize) -> Result<()> {
+    if threads == 0 || sessions == 0 {
+        return Err(BenchError::message(
+            "threads and sessions must both be positive",
+        ));
+    }
+    if threads > sessions {
+        return Err(BenchError::message(format!(
+            "--threads ({threads}) must not exceed --sessions ({sessions})"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct LoadConfig {
     pub(super) storage_root: PathBuf,
-    pub(super) workload: Workload,
-    pub(super) num: u64,
-    pub(super) value_size: usize,
-    pub(super) batch_size: u64,
-    pub(super) rand: bool,
-    pub(super) seed: u64,
     pub(super) index: IndexMode,
     pub(super) threads: usize,
     pub(super) sessions: usize,
     pub(super) log_sync: LogSyncMode,
+    pub(super) workload: WorkloadConfig,
+}
+
+impl LoadConfig {
+    pub(super) fn workload(&self) -> Workload {
+        self.workload.workload()
+    }
+
+    pub(super) fn operation_count(&self) -> u64 {
+        self.workload.operation_count()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum WorkloadConfig {
+    InsertSeq(InsertConfig),
+    InsertRand(InsertConfig),
+    LookupSeq { num: u64 },
+    LookupRand { num: u64, seed: u64 },
+    TableScan { num: u64 },
+    IndexScan { num: u64, seed: u64 },
+}
+
+impl WorkloadConfig {
+    fn workload(&self) -> Workload {
+        match self {
+            Self::InsertSeq(_) => Workload::InsertSeq,
+            Self::InsertRand(_) => Workload::InsertRand,
+            Self::LookupSeq { .. } => Workload::LookupSeq,
+            Self::LookupRand { .. } => Workload::LookupRand,
+            Self::TableScan { .. } => Workload::TableScan,
+            Self::IndexScan { .. } => Workload::IndexScan,
+        }
+    }
+
+    fn operation_count(&self) -> u64 {
+        match self {
+            Self::InsertSeq(config) | Self::InsertRand(config) => config.num,
+            Self::LookupSeq { num }
+            | Self::LookupRand { num, .. }
+            | Self::TableScan { num }
+            | Self::IndexScan { num, .. } => *num,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct InsertConfig {
+    pub(super) num: u64,
+    pub(super) value_size: usize,
+    pub(super) batch_size: u64,
+    pub(super) seed: u64,
 }
 
 #[cfg(test)]
@@ -243,18 +533,18 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn parse_insert_workload_subcommand() {
+    fn parse_insert_seq_workload_subcommand() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
             "--root",
             "root",
             "run",
-            "insert",
+            "insert-seq",
             "--num",
             "1",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Command::Run(_)));
+        assert!(matches!(cli.command, Command::Run { .. }));
         assert_eq!(
             cli.resolve_root_with_env(None).unwrap(),
             PathBuf::from("root")
@@ -266,14 +556,14 @@ mod tests {
         let cli = Cli::try_parse_from([
             "doradb-bench",
             "run",
-            "insert",
+            "insert-seq",
             "--root",
             "root",
             "--num",
             "1",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Command::Run(_)));
+        assert!(matches!(cli.command, Command::Run { .. }));
         assert_eq!(
             cli.resolve_root_with_env(None).unwrap(),
             PathBuf::from("root")
@@ -285,7 +575,7 @@ mod tests {
         let err = Cli::try_parse_from([
             "doradb-bench",
             "warmup",
-            "insert",
+            "insert-seq",
             "--root",
             "root",
             "--num",
@@ -321,81 +611,130 @@ mod tests {
 
     #[test]
     fn resolve_sessions_default_and_thread_limit() {
-        let args = LoadArgs {
-            workload: LoadWorkload::Insert(InsertArgs {
-                common: LoadCommonArgs {
-                    index: None,
-                    threads: NonZeroUsize::new(2).unwrap(),
-                    sessions: None,
-                    log_sync: LogSyncMode::Fsync,
-                },
-                num: NonZeroU64::new(1).unwrap(),
-                value_size: NonZeroUsize::new(128).unwrap(),
-                batch_size: NonZeroU64::new(1).unwrap(),
-                rand: false,
-                seed: 0,
-            }),
-        };
+        let args = WorkloadArgs::InsertSeq(InsertArgs {
+            common: LoadCommonArgs {
+                threads: Some(NonZeroUsize::new(2).unwrap()),
+                sessions: None,
+                log_sync: LogSyncMode::Fsync,
+            },
+            num: NonZeroU64::new(1).unwrap(),
+            value_size: NonZeroUsize::new(128).unwrap(),
+            batch_size: NonZeroU64::new(1).unwrap(),
+            seed: 0,
+        });
         let config = args
-            .resolve(PathBuf::from("root"), IndexMode::None)
+            .resolve(PathBuf::from("root"), IndexMode::None, 1, 1)
             .unwrap();
         assert_eq!(config.sessions, 2);
 
-        let LoadWorkload::Insert(mut insert) = args.workload;
+        let WorkloadArgs::InsertSeq(mut insert) = args else {
+            panic!("expected insert-seq workload");
+        };
         insert.common.sessions = Some(NonZeroUsize::new(1).unwrap());
         assert!(
-            LoadArgs {
-                workload: LoadWorkload::Insert(insert),
-            }
-            .resolve(PathBuf::from("root"), IndexMode::None)
-            .is_err()
+            WorkloadArgs::InsertSeq(insert)
+                .resolve(PathBuf::from("root"), IndexMode::None, 1, 1)
+                .is_err()
         );
     }
 
     #[test]
-    fn resolve_insert_defaults_to_single_row_batches() {
+    fn resolve_run_worker_defaults_from_manifest() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
             "run",
-            "insert",
+            "insert-seq",
             "--root",
             "root",
             "--num",
             "1",
         ])
         .unwrap();
-        let Command::Run(args) = cli.command else {
+        let Command::Run { workload } = cli.command else {
             panic!("expected run command");
         };
-        let config = args
-            .resolve(PathBuf::from("root"), IndexMode::None)
+        let config = workload
+            .resolve(PathBuf::from("root"), IndexMode::None, 2, 4)
             .unwrap();
-        assert_eq!(config.workload, Workload::Insert);
-        assert_eq!(config.batch_size, 1);
-        assert_eq!(config.log_sync, LogSyncMode::Fsync);
-        assert!(!config.rand);
+        assert_eq!(config.threads, 2);
+        assert_eq!(config.sessions, 4);
     }
 
     #[test]
-    fn parse_insert_random_flag() {
+    fn resolve_run_sessions_only_uses_manifest_threads() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
             "run",
-            "insert",
+            "insert-seq",
             "--root",
             "root",
             "--num",
             "1",
-            "--rand",
+            "--sessions",
+            "3",
         ])
         .unwrap();
-        let Command::Run(args) = cli.command else {
+        let Command::Run { workload } = cli.command else {
             panic!("expected run command");
         };
-        let config = args
-            .resolve(PathBuf::from("root"), IndexMode::None)
+        let config = workload
+            .resolve(PathBuf::from("root"), IndexMode::None, 2, 4)
             .unwrap();
-        assert!(config.rand);
+        assert_eq!(config.threads, 2);
+        assert_eq!(config.sessions, 3);
+    }
+
+    #[test]
+    fn resolve_insert_seq_defaults_to_single_row_batches() {
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "insert-seq",
+            "--root",
+            "root",
+            "--num",
+            "1",
+        ])
+        .unwrap();
+        let Command::Run { workload } = cli.command else {
+            panic!("expected run command");
+        };
+        let config = workload
+            .resolve(PathBuf::from("root"), IndexMode::None, 1, 1)
+            .unwrap();
+        assert_eq!(config.workload(), Workload::InsertSeq);
+        let WorkloadConfig::InsertSeq(insert) = config.workload else {
+            panic!("expected insert-seq workload");
+        };
+        assert_eq!(insert.batch_size, 1);
+        assert_eq!(config.log_sync, LogSyncMode::Fsync);
+    }
+
+    #[test]
+    fn resolve_insert_rand_workload() {
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "insert-rand",
+            "--root",
+            "root",
+            "--num",
+            "1",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        let Command::Run { workload } = cli.command else {
+            panic!("expected run command");
+        };
+        let config = workload
+            .resolve(PathBuf::from("root"), IndexMode::None, 1, 1)
+            .unwrap();
+        assert_eq!(config.workload(), Workload::InsertRand);
+        let WorkloadConfig::InsertRand(insert) = config.workload else {
+            panic!("expected insert-rand workload");
+        };
+        assert_eq!(insert.seed, 7);
     }
 
     #[test]
@@ -403,7 +742,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "doradb-bench",
             "run",
-            "insert",
+            "insert-rand",
             "-r",
             "root",
             "-n",
@@ -412,8 +751,6 @@ mod tests {
             "32",
             "-b",
             "4",
-            "-i",
-            "unique",
             "-t",
             "2",
             "-s",
@@ -422,16 +759,19 @@ mod tests {
             "fdatasync",
         ])
         .unwrap();
-        let Command::Run(args) = cli.command else {
+        let Command::Run { workload } = cli.command else {
             panic!("expected run command");
         };
-        let config = args
-            .resolve(PathBuf::from("root"), IndexMode::Unique)
+        let config = workload
+            .resolve(PathBuf::from("root"), IndexMode::Unique, 1, 1)
             .unwrap();
         assert_eq!(config.storage_root, PathBuf::from("root"));
-        assert_eq!(config.num, 10);
-        assert_eq!(config.value_size, 32);
-        assert_eq!(config.batch_size, 4);
+        let WorkloadConfig::InsertRand(insert) = config.workload else {
+            panic!("expected insert-rand workload");
+        };
+        assert_eq!(insert.num, 10);
+        assert_eq!(insert.value_size, 32);
+        assert_eq!(insert.batch_size, 4);
         assert_eq!(config.index, IndexMode::Unique);
         assert_eq!(config.threads, 2);
         assert_eq!(config.sessions, 4);
@@ -439,8 +779,139 @@ mod tests {
     }
 
     #[test]
+    fn prepare_requires_index_and_parses_worker_defaults() {
+        let err = Cli::try_parse_from(["doradb-bench", "--root", "root", "prepare"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "--root",
+            "root",
+            "prepare",
+            "--index",
+            "non-unique",
+            "--threads",
+            "2",
+            "--sessions",
+            "4",
+        ])
+        .unwrap();
+        let Command::Prepare(args) = cli.command else {
+            panic!("expected prepare command");
+        };
+        assert_eq!(args.index, IndexMode::NonUnique);
+        assert_eq!(args.threads.get(), 2);
+        assert_eq!(args.sessions.unwrap().get(), 4);
+    }
+
+    #[test]
+    fn parse_read_workloads() {
+        let cases = vec![
+            (
+                vec![
+                    "doradb-bench",
+                    "run",
+                    "lookup-seq",
+                    "--root",
+                    "root",
+                    "--num",
+                    "3",
+                ],
+                Workload::LookupSeq,
+            ),
+            (
+                vec![
+                    "doradb-bench",
+                    "run",
+                    "lookup-rand",
+                    "--root",
+                    "root",
+                    "--num",
+                    "3",
+                    "--seed",
+                    "7",
+                ],
+                Workload::LookupRand,
+            ),
+            (
+                vec!["doradb-bench", "run", "table-scan", "--root", "root"],
+                Workload::TableScan,
+            ),
+            (
+                vec![
+                    "doradb-bench",
+                    "run",
+                    "index-scan",
+                    "--root",
+                    "root",
+                    "--num",
+                    "3",
+                ],
+                Workload::IndexScan,
+            ),
+        ];
+
+        for (args, workload) in cases {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Run { workload: load } = cli.command else {
+                panic!("expected run command");
+            };
+            let config = load
+                .resolve(PathBuf::from("root"), IndexMode::Unique, 1, 1)
+                .unwrap();
+            assert_eq!(config.workload(), workload);
+            assert!(config.operation_count() > 0);
+        }
+    }
+
+    #[test]
+    fn reject_run_level_index_option() {
+        let err = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "insert-seq",
+            "--root",
+            "root",
+            "--num",
+            "1",
+            "--index",
+            "unique",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn reject_removed_insert_workload_and_rand_flag() {
+        let err = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "insert",
+            "--root",
+            "root",
+            "--num",
+            "1",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+
+        let err = Cli::try_parse_from([
+            "doradb-bench",
+            "run",
+            "insert-seq",
+            "--root",
+            "root",
+            "--num",
+            "1",
+            "--rand",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
     fn resolve_root_uses_env_fallback() {
-        let cli = Cli::try_parse_from(["doradb-bench", "run", "insert", "--num", "1"]).unwrap();
+        let cli = Cli::try_parse_from(["doradb-bench", "run", "insert-seq", "--num", "1"]).unwrap();
         assert_eq!(
             cli.resolve_root_with_env(Some(PathBuf::from("env-root")))
                 .unwrap(),
@@ -455,7 +926,7 @@ mod tests {
             "--root",
             "cli-root",
             "run",
-            "insert",
+            "insert-seq",
             "--num",
             "1",
         ])
@@ -469,7 +940,7 @@ mod tests {
 
     #[test]
     fn resolve_root_rejects_missing_root_and_empty_env() {
-        let cli = Cli::try_parse_from(["doradb-bench", "run", "insert", "--num", "1"]).unwrap();
+        let cli = Cli::try_parse_from(["doradb-bench", "run", "insert-seq", "--num", "1"]).unwrap();
         assert!(cli.resolve_root_with_env(None).is_err());
         assert!(cli.resolve_root_with_env(Some(PathBuf::new())).is_err());
     }

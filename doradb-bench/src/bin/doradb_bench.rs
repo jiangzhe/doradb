@@ -1,7 +1,7 @@
 use clap::Parser;
 use doradb_bench::cli::{Cli, Command};
 use doradb_bench::error::Result;
-use doradb_bench::runner::{cleanup, prepare, run_load};
+use doradb_bench::runner::{cleanup, prepare, run_workload};
 use std::env::args_os;
 use std::process::exit;
 
@@ -21,7 +21,9 @@ fn execute(cli: Cli) -> Result<()> {
     smol::block_on(async {
         match cli.command {
             Command::Prepare(args) => prepare(storage_root, args).await,
-            Command::Run(args) => run_load(storage_root, args, &command_context).await,
+            Command::Run { workload } => {
+                run_workload(storage_root, workload, &command_context).await
+            }
             Command::Cleanup => cleanup(storage_root).await,
         }
     })

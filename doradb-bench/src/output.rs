@@ -42,6 +42,8 @@ pub(super) struct OutputConfig {
     pub(super) rand: bool,
     pub(super) seed: u64,
     pub(super) index: IndexMode,
+    pub(super) loaded_key_start: u64,
+    pub(super) loaded_key_end: u64,
     pub(super) threads: usize,
     pub(super) sessions: usize,
     pub(super) log_sync: LogSyncMode,
@@ -51,6 +53,10 @@ pub(super) struct OutputConfig {
 #[derive(Clone, Debug)]
 pub(super) struct BenchmarkResult {
     operations: u64,
+    inserted_rows: u64,
+    found: u64,
+    not_found: u64,
+    rows_returned: u64,
     elapsed: Duration,
     operations_per_second: f64,
     average_nanos_per_operation: f64,
@@ -58,12 +64,24 @@ pub(super) struct BenchmarkResult {
 }
 
 impl BenchmarkResult {
-    pub(super) fn new(operations: u64, elapsed: Duration, failures: u64) -> Self {
+    pub(super) fn new(
+        operations: u64,
+        inserted_rows: u64,
+        found: u64,
+        not_found: u64,
+        rows_returned: u64,
+        elapsed: Duration,
+        failures: u64,
+    ) -> Self {
         let elapsed_seconds = elapsed.as_secs_f64();
         let elapsed_nanos = elapsed.as_nanos() as f64;
         let operations_f64 = operations as f64;
         Self {
             operations,
+            inserted_rows,
+            found,
+            not_found,
+            rows_returned,
             elapsed,
             operations_per_second: if elapsed_seconds > 0.0 {
                 operations_f64 / elapsed_seconds
@@ -185,6 +203,10 @@ fn print_stdout(config: &OutputConfig, metrics: &[Metric], result: &BenchmarkRes
     println!();
     println!("Final Result");
     println!("operations: {}", result.operations);
+    println!("inserted_rows: {}", result.inserted_rows);
+    println!("found: {}", result.found);
+    println!("not_found: {}", result.not_found);
+    println!("rows_returned: {}", result.rows_returned);
     println!("elapsed_nanos: {}", result.elapsed.as_nanos());
     println!("operations_per_second: {:.3}", result.operations_per_second);
     println!(
@@ -220,8 +242,12 @@ fn render_markdown(
     }
     out.push_str("\n## Final Result\n\n");
     out.push_str(&format!(
-        "- `operations`: {}\n- `elapsed_nanos`: {}\n- `operations_per_second`: {:.3}\n- `average_nanos_per_operation`: {:.3}\n- `failures`: {}\n",
+        "- `operations`: {}\n- `inserted_rows`: {}\n- `found`: {}\n- `not_found`: {}\n- `rows_returned`: {}\n- `elapsed_nanos`: {}\n- `operations_per_second`: {:.3}\n- `average_nanos_per_operation`: {:.3}\n- `failures`: {}\n",
         result.operations,
+        result.inserted_rows,
+        result.found,
+        result.not_found,
+        result.rows_returned,
         result.elapsed.as_nanos(),
         result.operations_per_second,
         result.average_nanos_per_operation,
@@ -250,12 +276,18 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         "value_size",
         "batch_size",
         "seed",
-        "index",
+        "prepared_index",
+        "loaded_key_start",
+        "loaded_key_end",
         "threads",
         "sessions",
         "log_sync",
         "table_id",
         "operations",
+        "inserted_rows",
+        "found",
+        "not_found",
+        "rows_returned",
         "elapsed_nanos",
         "operations_per_second",
         "average_nanos_per_operation",
@@ -270,11 +302,17 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         config.batch_size.to_string(),
         config.seed.to_string(),
         config.index.to_string(),
+        config.loaded_key_start.to_string(),
+        config.loaded_key_end.to_string(),
         config.threads.to_string(),
         config.sessions.to_string(),
         config.log_sync.to_string(),
         config.table_id.to_string(),
         result.operations.to_string(),
+        result.inserted_rows.to_string(),
+        result.found.to_string(),
+        result.not_found.to_string(),
+        result.rows_returned.to_string(),
         result.elapsed.as_nanos().to_string(),
         format!("{:.3}", result.operations_per_second),
         format!("{:.3}", result.average_nanos_per_operation),
@@ -299,7 +337,11 @@ fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
         ("value_size".to_owned(), config.value_size.to_string()),
         ("batch_size".to_owned(), config.batch_size.to_string()),
         ("seed".to_owned(), config.seed.to_string()),
-        ("index".to_owned(), config.index.to_string()),
+        ("prepared_index".to_owned(), config.index.to_string()),
+        (
+            "loaded_key_range".to_owned(),
+            format!("[{}, {})", config.loaded_key_start, config.loaded_key_end),
+        ),
         ("threads".to_owned(), config.threads.to_string()),
         ("sessions".to_owned(), config.sessions.to_string()),
         ("log_sync".to_owned(), config.log_sync.to_string()),
@@ -562,7 +604,7 @@ mod tests {
 
     fn sample_config(root: &Path) -> OutputConfig {
         OutputConfig {
-            workload: Workload::Insert,
+            workload: Workload::InsertSeq,
             storage_root: root.to_path_buf(),
             num: 10,
             value_size: 16,
@@ -570,6 +612,8 @@ mod tests {
             rand: false,
             seed: 0,
             index: IndexMode::None,
+            loaded_key_start: 0,
+            loaded_key_end: 10,
             threads: 1,
             sessions: 1,
             log_sync: LogSyncMode::Fsync,
@@ -587,12 +631,16 @@ mod tests {
 
     #[test]
     fn benchmark_result_handles_zero_denominators() {
-        let zero_elapsed = BenchmarkResult::new(4, Duration::ZERO, 1);
+        let zero_elapsed = BenchmarkResult::new(4, 1, 2, 1, 2, Duration::ZERO, 1);
         assert_eq!(zero_elapsed.operations_per_second, 0.0);
         assert_eq!(zero_elapsed.average_nanos_per_operation, 0.0);
+        assert_eq!(zero_elapsed.inserted_rows, 1);
+        assert_eq!(zero_elapsed.found, 2);
+        assert_eq!(zero_elapsed.not_found, 1);
+        assert_eq!(zero_elapsed.rows_returned, 2);
         assert_eq!(zero_elapsed.failures, 1);
 
-        let zero_operations = BenchmarkResult::new(0, Duration::from_nanos(100), 0);
+        let zero_operations = BenchmarkResult::new(0, 0, 0, 0, 0, Duration::from_nanos(100), 0);
         assert_eq!(zero_operations.operations_per_second, 0.0);
         assert_eq!(zero_operations.average_nanos_per_operation, 0.0);
     }
@@ -710,7 +758,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let csv = render_result_csv(
             &sample_config(temp.path()),
-            &BenchmarkResult::new(10, Duration::from_nanos(100), 0),
+            &BenchmarkResult::new(10, 10, 0, 0, 0, Duration::from_nanos(100), 0),
         );
         assert_eq!(csv.lines().count(), 2);
         assert!(csv.lines().next().unwrap().starts_with("workload,rand"));
@@ -735,6 +783,11 @@ mod tests {
         assert!(
             pairs
                 .iter()
+                .any(|(name, value)| name == "loaded_key_range" && value == "[0, 10)")
+        );
+        assert!(
+            pairs
+                .iter()
                 .any(|(name, value)| name == "log_sync" && value == "fsync")
         );
     }
@@ -750,7 +803,7 @@ mod tests {
         write_benchmark_outputs(
             &config,
             &metrics,
-            &BenchmarkResult::new(10, Duration::from_nanos(100), 0),
+            &BenchmarkResult::new(10, 10, 0, 0, 0, Duration::from_nanos(100), 0),
             "doradb-bench run",
         )
         .unwrap();
@@ -775,7 +828,7 @@ mod tests {
         let result = write_benchmark_outputs(
             &config,
             &metrics,
-            &BenchmarkResult::new(10, Duration::from_nanos(100), 0),
+            &BenchmarkResult::new(10, 10, 0, 0, 0, Duration::from_nanos(100), 0),
             "doradb-bench run",
         );
 

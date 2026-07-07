@@ -3,6 +3,9 @@ use crate::error::{BenchError, Result};
 use crate::manifest::KeyRange;
 
 mod insert;
+mod read;
+
+const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SessionPlan {
@@ -40,6 +43,21 @@ pub(super) fn generate_keys(
     insert::generate_keys(rand, index, seed, plan)
 }
 
+pub(super) fn generate_sequential_read_keys(
+    loaded_range: KeyRange,
+    plan: &SessionPlan,
+) -> Result<Vec<u64>> {
+    read::generate_sequential_keys(loaded_range, plan)
+}
+
+pub(super) fn generate_random_read_keys(
+    seed: u64,
+    loaded_range: KeyRange,
+    plan: &SessionPlan,
+) -> Result<Vec<u64>> {
+    read::generate_random_keys(seed, loaded_range, plan)
+}
+
 pub(super) fn payload_bytes(key: u64, seed: u64, value_size: usize) -> Vec<u8> {
     insert::payload_bytes(key, seed, value_size)
 }
@@ -49,6 +67,24 @@ fn partition_count(total: u64, parts: usize, index: usize) -> u64 {
     let base = total / parts_u64;
     let remainder = total % parts_u64;
     base + u64::from((index as u64) < remainder)
+}
+
+fn bounded_random(state: &mut u64, upper: usize) -> usize {
+    debug_assert!(upper > 0);
+    (splitmix64(state) % upper as u64) as usize
+}
+
+fn seed_state(seed: u64, first: u64, second: u64, salt: u64) -> u64 {
+    let mut state = seed ^ first.rotate_left(17) ^ second.rotate_left(31) ^ salt;
+    splitmix64(&mut state)
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(SPLITMIX_GAMMA);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]

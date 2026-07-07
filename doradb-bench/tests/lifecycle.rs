@@ -44,7 +44,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
 
-        let prepare_stdout = assert_success(run_bench(&root, &["prepare"]));
+        let prepare_stdout = assert_success(run_bench(&root, &["prepare", "--index", "none"]));
         assert!(prepare_stdout.contains("prepared storage_root="));
         assert!(root.join("benchmark-manifest.toml").exists());
 
@@ -52,7 +52,7 @@ mod tests {
             &root,
             &[
                 "run",
-                "insert",
+                "insert-seq",
                 "--num",
                 "3",
                 "--batch-size",
@@ -71,6 +71,7 @@ mod tests {
 
         let manifest = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
         assert!(manifest.contains("next_key = 3"));
+        assert!(manifest.contains("rows_inserted = 3"));
 
         let result_md = fs::read_to_string(root.join("benchmark-result.md")).unwrap();
         assert!(result_md.contains("# DoraDB Benchmark Result"));
@@ -88,13 +89,16 @@ mod tests {
         assert!(result_lines.next().is_none());
         assert!(header.starts_with("workload,rand,storage_root,num"));
         let columns: Vec<_> = row.split(',').collect();
-        assert_eq!(columns[0], "insert");
+        assert_eq!(columns[0], "insert-seq");
         assert_eq!(columns[1], "false");
         assert_eq!(columns[3], "3");
         assert_eq!(columns[5], "2");
-        assert_eq!(columns[10], "fsync");
-        assert_eq!(columns[12], "3");
-        assert_eq!(columns[16], "0");
+        assert_eq!(columns[7], "none");
+        assert_eq!(columns[9], "3");
+        assert_eq!(columns[12], "fsync");
+        assert_eq!(columns[14], "3");
+        assert_eq!(columns[15], "3");
+        assert_eq!(columns[22], "0");
 
         let cleanup_stdout = assert_success(run_bench(&root, &["cleanup"]));
         assert!(cleanup_stdout.contains("removed storage_root="));
@@ -107,7 +111,7 @@ mod tests {
         let root = temp.path().join("bench");
         fs::create_dir(&root).unwrap();
 
-        let stderr = assert_failure(run_bench(&root, &["prepare"]));
+        let stderr = assert_failure(run_bench(&root, &["prepare", "--index", "none"]));
         assert!(stderr.contains("must not exist for prepare"));
         assert!(root.exists());
     }
@@ -117,14 +121,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
 
-        assert_success(run_bench(&root, &["prepare"]));
+        assert_success(run_bench(&root, &["prepare", "--index", "none"]));
         fs::create_dir(root.join("benchmark-result.csv")).unwrap();
 
         let stderr = assert_failure(run_bench(
             &root,
             &[
                 "run",
-                "insert",
+                "insert-seq",
                 "--num",
                 "1",
                 "--batch-size",
@@ -139,5 +143,119 @@ mod tests {
 
         let manifest = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
         assert!(manifest.contains("next_key = 0"));
+        assert!(manifest.contains("rows_inserted = 0"));
+    }
+
+    #[test]
+    fn lifecycle_unique_lookup_read_workloads() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+
+        assert_success(run_bench(&root, &["prepare", "--index", "unique"]));
+        assert_success(run_bench(
+            &root,
+            &[
+                "run",
+                "insert-rand",
+                "--num",
+                "5",
+                "--value-size",
+                "16",
+                "--seed",
+                "1",
+            ],
+        ));
+
+        let seq_stdout = assert_success(run_bench(&root, &["run", "lookup-seq", "--num", "7"]));
+        assert!(seq_stdout.contains("workload: lookup-seq"));
+        assert!(seq_stdout.contains("operations: 7"));
+        assert!(seq_stdout.contains("found: 7"));
+        assert!(seq_stdout.contains("not_found: 0"));
+
+        let rand_stdout = assert_success(run_bench(
+            &root,
+            &["run", "lookup-rand", "--num", "7", "--seed", "2"],
+        ));
+        assert!(rand_stdout.contains("workload: lookup-rand"));
+        assert!(rand_stdout.contains("operations: 7"));
+        assert!(rand_stdout.contains("found: 7"));
+        assert!(rand_stdout.contains("not_found: 0"));
+
+        assert_success(run_bench(&root, &["cleanup"]));
+    }
+
+    #[test]
+    fn lifecycle_table_scan_without_secondary_index() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+
+        assert_success(run_bench(&root, &["prepare", "--index", "none"]));
+        assert_success(run_bench(
+            &root,
+            &["run", "insert-seq", "--num", "4", "--value-size", "16"],
+        ));
+
+        let scan_stdout = assert_success(run_bench(&root, &["run", "table-scan"]));
+        assert!(scan_stdout.contains("workload: table-scan"));
+        assert!(scan_stdout.contains("operations: 1"));
+        assert!(scan_stdout.contains("rows_returned: 4"));
+
+        assert_success(run_bench(&root, &["cleanup"]));
+    }
+
+    #[test]
+    fn lifecycle_non_unique_index_scan() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+
+        assert_success(run_bench(&root, &["prepare", "--index", "non-unique"]));
+        assert_success(run_bench(
+            &root,
+            &["run", "insert-seq", "--num", "4", "--value-size", "16"],
+        ));
+
+        let scan_stdout = assert_success(run_bench(
+            &root,
+            &["run", "index-scan", "--num", "6", "--seed", "3"],
+        ));
+        assert!(scan_stdout.contains("workload: index-scan"));
+        assert!(scan_stdout.contains("operations: 6"));
+        assert!(scan_stdout.contains("not_found: 0"));
+        assert!(scan_stdout.contains("failures: 0"));
+
+        assert_success(run_bench(&root, &["cleanup"]));
+    }
+
+    #[test]
+    fn read_workloads_fail_before_measurement_when_incompatible() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+
+        assert_success(run_bench(&root, &["prepare", "--index", "none"]));
+        assert_success(run_bench(
+            &root,
+            &["run", "insert-seq", "--num", "2", "--value-size", "16"],
+        ));
+
+        let stderr = assert_failure(run_bench(&root, &["run", "lookup-seq", "--num", "1"]));
+        assert!(stderr.contains("lookup-seq workload requires prepared index mode unique"));
+
+        let stderr = assert_failure(run_bench(&root, &["run", "index-scan", "--num", "1"]));
+        assert!(stderr.contains("index-scan workload requires prepared index mode non-unique"));
+
+        assert_success(run_bench(&root, &["cleanup"]));
+    }
+
+    #[test]
+    fn read_workloads_fail_before_measurement_without_loaded_data() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("bench");
+
+        assert_success(run_bench(&root, &["prepare", "--index", "unique"]));
+
+        let stderr = assert_failure(run_bench(&root, &["run", "lookup-seq", "--num", "1"]));
+        assert!(stderr.contains("read workload requires loaded benchmark data"));
+
+        assert_success(run_bench(&root, &["cleanup"]));
     }
 }
