@@ -1,7 +1,7 @@
 ---
 id: 000214
 title: Add doradb-bench Read Workloads
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-06
 github_issue: 821
 ---
@@ -396,6 +396,36 @@ Related Backlogs:
       that need separate planning, add or link backlog items during resolve.
 
 ## Implementation Notes
+
+- Implemented schema-only `prepare` with required index selection and persisted
+  run defaults for threads, sessions, value size, and batch size.
+- Split explicit load workloads into `run insert-seq` and `run insert-rand`,
+  removed the old run-level index selection path, and routed run configuration
+  through workload-neutral args/config structs.
+- Added `lookup-seq`, `lookup-rand`, `table-scan`, and `index-scan` workloads
+  using public storage session/statement APIs, deterministic read key
+  generation, manifest compatibility checks, and bounded read transactions
+  controlled by the resolved batch size.
+- Extended manifest runtime state with loaded-row tracking and backwards
+  defaults for older usable manifests.
+- Added `--include-stats` to all run workloads. Internal stats capture,
+  stdout/markdown stats rendering, and `benchmark-internal-stats.csv` are now
+  opt-in; stats-disabled runs remove stale stats CSV output from prior runs.
+- Updated result output with workload-neutral counters and stable CSV fields,
+  including inserted rows, found, not found, rows returned, failures, and the
+  resolved stats mode.
+- Updated `docs/benchmark-tool.md` and lifecycle coverage for the actual
+  `insert-seq`/`insert-rand` CLI, read workloads, manifest defaults, batch
+  sizing, and opt-in stats behavior.
+- Closed source backlog
+  `docs/backlogs/000145-doradb-bench-read-workloads.md` as implemented.
+- Verification completed:
+  - `tools/style_audit.rs --diff-base origin/main`
+  - `cargo check -p doradb-bench`
+  - `cargo nextest run -p doradb-bench`
+  - `cargo clippy -p doradb-bench --all-targets -- -D warnings`
+  - `cargo nextest run --workspace`
+  - `git diff --check`
 
 ## Impacts
 
