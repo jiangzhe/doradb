@@ -1,5 +1,6 @@
 use crate::cli::{
     IndexMode, InsertConfig, LoadConfig, LogSyncMode, PrepareArgs, WorkloadArgs, WorkloadConfig,
+    validate_batch_size, validate_value_size,
 };
 use crate::error::{BenchError, Result};
 use crate::manifest::{
@@ -22,8 +23,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const MAX_VALUE_SIZE: usize = u16::MAX as usize;
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct WorkerSummary {
     operations: u64,
@@ -34,11 +33,27 @@ struct WorkerSummary {
     failures: u64,
 }
 
+impl WorkerSummary {
+    fn merge(&mut self, other: Self) {
+        self.operations += other.operations;
+        self.inserted_rows += other.inserted_rows;
+        self.found += other.found;
+        self.not_found += other.not_found;
+        self.rows_returned += other.rows_returned;
+        self.failures += other.failures;
+    }
+}
+
 /// Prepare a benchmark storage root and manifest.
 pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
     prepare_storage_root(&storage_root)?;
     let default_sessions = args.sessions.unwrap_or(args.threads).get();
-    let defaults = DefaultsManifest::new(args.threads.get(), default_sessions)?;
+    let defaults = DefaultsManifest::new(
+        args.threads.get(),
+        default_sessions,
+        args.value_size.get(),
+        args.batch_size.get(),
+    )?;
 
     let engine = open_engine(&storage_root, LogSyncMode::Fsync).await?;
     let mut session = engine.new_session()?;
@@ -51,12 +66,14 @@ pub async fn prepare(storage_root: PathBuf, args: PrepareArgs) -> Result<()> {
     let manifest = Manifest::new_with_defaults(table_id.as_u64(), args.index, defaults);
     write_manifest_exclusive(&storage_root, &manifest)?;
     println!(
-        "prepared storage_root={} table_id={} index={} threads={} sessions={}",
+        "prepared storage_root={} table_id={} index={} threads={} sessions={} value_size={} batch_size={}",
         storage_root.display(),
         table_id,
         args.index,
         manifest.defaults.threads,
-        manifest.defaults.sessions
+        manifest.defaults.sessions,
+        manifest.defaults.value_size,
+        manifest.defaults.batch_size
     );
     Ok(())
 }
@@ -71,8 +88,7 @@ pub async fn run_workload(
     let config = args.resolve(
         storage_root,
         manifest.index,
-        manifest.defaults.threads,
-        manifest.defaults.sessions,
+        manifest.defaults.run_defaults(),
     )?;
     validate_load_config(&config)?;
     manifest.validate_workload_compatible(config.workload())?;
@@ -81,18 +97,27 @@ pub async fn run_workload(
     let table_id = TableID::new(manifest.table_id);
 
     let engine = open_engine(&config.storage_root, config.log_sync).await?;
-    let mut stats_session = engine.new_session()?;
-    let before = InternalStatsSnapshot::capture(&stats_session)?;
+    let stats_state = if config.include_stats {
+        let stats_session = engine.new_session()?;
+        let before = InternalStatsSnapshot::capture(&stats_session)?;
+        Some((stats_session, before))
+    } else {
+        None
+    };
     let started = Instant::now();
     let worker_result = run_workers(&engine, &config, table_id, execution_range, loaded_range);
     let elapsed = started.elapsed();
-    let after = InternalStatsSnapshot::capture(&stats_session)?;
-    stats_session.close().await?;
+    let metrics = if let Some((mut stats_session, before)) = stats_state {
+        let after = InternalStatsSnapshot::capture(&stats_session)?;
+        stats_session.close().await?;
+        internal_metrics(&before, &after)
+    } else {
+        Vec::new()
+    };
     engine.shutdown()?;
 
     let summary = worker_result?;
 
-    let metrics = internal_metrics(&before, &after);
     let result = BenchmarkResult::new(
         summary.operations,
         summary.inserted_rows,
@@ -106,8 +131,8 @@ pub async fn run_workload(
         workload: config.workload(),
         storage_root: config.storage_root.clone(),
         num: config.operation_count(),
-        value_size: output_value_size(&config),
-        batch_size: output_batch_size(&config),
+        value_size: config.value_size,
+        batch_size: config.batch_size,
         rand: output_rand(&config),
         seed: output_seed(&config),
         index: config.index,
@@ -116,6 +141,7 @@ pub async fn run_workload(
         threads: config.threads,
         sessions: config.sessions,
         log_sync: config.log_sync,
+        include_stats: config.include_stats,
         table_id: manifest.table_id,
     };
     write_benchmark_outputs(&output_config, &metrics, &result, command_context)?;
@@ -197,24 +223,8 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
             config.threads, config.sessions
         )));
     }
-    if let WorkloadConfig::InsertSeq(insert) | WorkloadConfig::InsertRand(insert) = &config.workload
-    {
-        validate_insert_config(insert)?;
-    }
-    Ok(())
-}
-
-fn validate_insert_config(config: &InsertConfig) -> Result<()> {
-    if config.value_size > MAX_VALUE_SIZE {
-        return Err(BenchError::message(format!(
-            "--value-size must not exceed {MAX_VALUE_SIZE} bytes"
-        )));
-    }
-    if config.batch_size > usize::MAX as u64 {
-        return Err(BenchError::message(
-            "--batch-size exceeds addressable memory on this platform",
-        ));
-    }
+    validate_value_size(config.value_size)?;
+    validate_batch_size(config.batch_size)?;
     Ok(())
 }
 
@@ -243,26 +253,6 @@ fn output_loaded_range(manifest: &Manifest, config: &LoadConfig) -> Result<KeyRa
         | WorkloadConfig::LookupRand { .. }
         | WorkloadConfig::TableScan { .. }
         | WorkloadConfig::IndexScan { .. } => manifest.loaded_key_range(),
-    }
-}
-
-fn output_value_size(config: &LoadConfig) -> usize {
-    match &config.workload {
-        WorkloadConfig::InsertSeq(insert) | WorkloadConfig::InsertRand(insert) => insert.value_size,
-        WorkloadConfig::LookupSeq { .. }
-        | WorkloadConfig::LookupRand { .. }
-        | WorkloadConfig::TableScan { .. }
-        | WorkloadConfig::IndexScan { .. } => 0,
-    }
-}
-
-fn output_batch_size(config: &LoadConfig) -> u64 {
-    match &config.workload {
-        WorkloadConfig::InsertSeq(insert) | WorkloadConfig::InsertRand(insert) => insert.batch_size,
-        WorkloadConfig::LookupSeq { .. }
-        | WorkloadConfig::LookupRand { .. }
-        | WorkloadConfig::TableScan { .. }
-        | WorkloadConfig::IndexScan { .. } => 0,
     }
 }
 
@@ -326,14 +316,7 @@ async fn collect_session_tasks(
     let mut first_error = None;
     for task in tasks {
         match task.await {
-            Ok(session) => {
-                summary.operations += session.operations;
-                summary.inserted_rows += session.inserted_rows;
-                summary.found += session.found;
-                summary.not_found += session.not_found;
-                summary.rows_returned += session.rows_returned;
-                summary.failures += session.failures;
-            }
+            Ok(session) => summary.merge(session),
             Err(err) => {
                 if first_error.is_none() {
                     first_error = Some(err);
@@ -375,43 +358,44 @@ async fn execute_session_workload(
     match &config.workload {
         WorkloadConfig::InsertSeq(insert) => {
             let keys = generate_keys(false, config.index, insert.seed, plan)?;
-            insert_keys(session, insert, table_id, &keys).await
+            insert_keys(session, config, insert, table_id, &keys).await
         }
         WorkloadConfig::InsertRand(insert) => {
             let keys = generate_keys(true, config.index, insert.seed, plan)?;
-            insert_keys(session, insert, table_id, &keys).await
+            insert_keys(session, config, insert, table_id, &keys).await
         }
         WorkloadConfig::LookupSeq { .. } => {
             let keys = generate_sequential_read_keys(loaded_range, plan)?;
-            lookup_keys(session, table_id, &keys).await
+            lookup_keys(session, config.batch_size, table_id, &keys).await
         }
         WorkloadConfig::LookupRand { seed, .. } => {
             let keys = generate_random_read_keys(*seed, loaded_range, plan)?;
-            lookup_keys(session, table_id, &keys).await
+            lookup_keys(session, config.batch_size, table_id, &keys).await
         }
         WorkloadConfig::TableScan { .. } => {
-            table_scan_iterations(session, table_id, plan.rows).await
+            table_scan_iterations(session, config.batch_size, table_id, plan.rows).await
         }
         WorkloadConfig::IndexScan { seed, .. } => {
             let keys = generate_random_read_keys(*seed, loaded_range, plan)?;
-            index_scan_keys(session, table_id, &keys).await
+            index_scan_keys(session, config.batch_size, table_id, &keys).await
         }
     }
 }
 
 async fn insert_keys(
     session: &mut Session,
-    config: &InsertConfig,
+    config: &LoadConfig,
+    insert: &InsertConfig,
     table_id: TableID,
     keys: &[u64],
 ) -> Result<WorkerSummary> {
     if keys.is_empty() {
         return Ok(WorkerSummary::default());
     }
-    let batch_size = effective_batch_size(config, keys.len() as u64)?;
+    let batch_size = effective_batch_size(config.batch_size, keys.len() as u64)?;
     let mut inserted = 0u64;
     for batch in keys.chunks(batch_size) {
-        insert_batch(session, table_id, batch, config.seed, config.value_size).await?;
+        insert_batch(session, table_id, batch, insert.seed, config.value_size).await?;
         inserted += batch.len() as u64;
     }
     Ok(WorkerSummary {
@@ -449,12 +433,26 @@ async fn insert_batch(
 
 async fn lookup_keys(
     session: &mut Session,
+    batch_size: u64,
     table_id: TableID,
     keys: &[u64],
 ) -> Result<WorkerSummary> {
     if keys.is_empty() {
         return Ok(WorkerSummary::default());
     }
+    let batch_size = effective_batch_size(batch_size, keys.len() as u64)?;
+    let mut summary = WorkerSummary::default();
+    for batch in keys.chunks(batch_size) {
+        summary.merge(lookup_key_batch(session, table_id, batch).await?);
+    }
+    Ok(summary)
+}
+
+async fn lookup_key_batch(
+    session: &mut Session,
+    table_id: TableID,
+    keys: &[u64],
+) -> Result<WorkerSummary> {
     let mut trx = session.begin_trx()?;
     let mut summary = WorkerSummary::default();
     for key in keys {
@@ -487,12 +485,29 @@ async fn lookup_keys(
 
 async fn table_scan_iterations(
     session: &mut Session,
+    batch_size: u64,
     table_id: TableID,
     iterations: u64,
 ) -> Result<WorkerSummary> {
+    validate_batch_size(batch_size)?;
     if iterations == 0 {
         return Ok(WorkerSummary::default());
     }
+    let mut remaining = iterations;
+    let mut summary = WorkerSummary::default();
+    while remaining > 0 {
+        let batch_iterations = batch_size.min(remaining);
+        summary.merge(table_scan_batch(session, table_id, batch_iterations).await?);
+        remaining -= batch_iterations;
+    }
+    Ok(summary)
+}
+
+async fn table_scan_batch(
+    session: &mut Session,
+    table_id: TableID,
+    iterations: u64,
+) -> Result<WorkerSummary> {
     let mut trx = session.begin_trx()?;
     let mut summary = WorkerSummary::default();
     for _ in 0..iterations {
@@ -524,12 +539,26 @@ async fn table_scan_iterations(
 
 async fn index_scan_keys(
     session: &mut Session,
+    batch_size: u64,
     table_id: TableID,
     keys: &[u64],
 ) -> Result<WorkerSummary> {
     if keys.is_empty() {
         return Ok(WorkerSummary::default());
     }
+    let batch_size = effective_batch_size(batch_size, keys.len() as u64)?;
+    let mut summary = WorkerSummary::default();
+    for batch in keys.chunks(batch_size) {
+        summary.merge(index_scan_key_batch(session, table_id, batch).await?);
+    }
+    Ok(summary)
+}
+
+async fn index_scan_key_batch(
+    session: &mut Session,
+    table_id: TableID,
+    keys: &[u64],
+) -> Result<WorkerSummary> {
     let mut trx = session.begin_trx()?;
     let mut summary = WorkerSummary::default();
     for key in keys {
@@ -561,8 +590,9 @@ async fn index_scan_keys(
     Ok(summary)
 }
 
-fn effective_batch_size(config: &InsertConfig, row_count: u64) -> Result<usize> {
-    let bounded = config.batch_size.min(row_count.max(1));
+fn effective_batch_size(batch_size: u64, operation_count: u64) -> Result<usize> {
+    validate_batch_size(batch_size)?;
+    let bounded = batch_size.min(operation_count.max(1));
     usize::try_from(bounded)
         .map_err(|_| BenchError::message("effective batch size exceeds addressable memory"))
 }
@@ -633,17 +663,21 @@ mod tests {
 
     #[test]
     fn effective_batch_size_defaults_to_configured_insert_batch_size() {
-        let config = test_insert_config();
-        assert_eq!(effective_batch_size(&config, 10).unwrap(), 1);
+        let config = test_load_config();
+        assert_eq!(effective_batch_size(config.batch_size, 10).unwrap(), 1);
     }
 
     #[test]
     fn validate_load_config_rejects_value_size_above_row_payload_limit() {
         let mut config = test_load_config();
-        let WorkloadConfig::InsertSeq(insert) = &mut config.workload else {
-            panic!("expected insert-seq workload");
-        };
-        insert.value_size = MAX_VALUE_SIZE + 1;
+        config.value_size = crate::cli::MAX_VALUE_SIZE + 1;
+        assert!(validate_load_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_load_config_rejects_invalid_batch_size() {
+        let mut config = test_load_config();
+        config.batch_size = 0;
         assert!(validate_load_config(&config).is_err());
     }
 
@@ -725,17 +759,15 @@ mod tests {
             index: IndexMode::None,
             threads: 1,
             sessions: 1,
+            value_size: 16,
+            batch_size: 1,
             log_sync: LogSyncMode::Fsync,
+            include_stats: false,
             workload: WorkloadConfig::InsertSeq(test_insert_config()),
         }
     }
 
     fn test_insert_config() -> InsertConfig {
-        InsertConfig {
-            num: 10,
-            value_size: 16,
-            batch_size: 1,
-            seed: 0,
-        }
+        InsertConfig { num: 10, seed: 0 }
     }
 }

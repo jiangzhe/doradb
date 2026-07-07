@@ -42,7 +42,9 @@ is persisted in the manifest and is the source of truth for later workload
 compatibility checks. `prepare --threads/-t` and `prepare --sessions/-s` persist
 default worker settings for later `run` commands. Both counts must be positive,
 and `threads` must not exceed `sessions`. If `--sessions` is omitted, it
-defaults to the resolved prepare thread count.
+defaults to the resolved prepare thread count. `prepare --value-size/-v` and
+`prepare --batch-size/-b` persist default payload and transaction sizing for
+later `run` commands.
 
 `run insert-seq` and `run insert-rand` explicitly load data into the prepared
 benchmark table. Repeated insert runs allocate fresh logical key ranges from
@@ -85,9 +87,11 @@ non-unique secondary index on `logical_key`, using deterministic seeded
 replacement key selection over the loaded logical key range. It requires
 `prepare --index non-unique`.
 
-`--batch-size` sets the number of rows per transaction commit for insert
-workloads. It defaults to `1` and is applied per session. `--num` remains the
-aggregate row or request count across all sessions.
+`--batch-size` sets the number of operations per transaction. For insert
+workloads it means rows per commit. For read workloads it means lookup requests,
+index-scan requests, or full table-scan iterations per read transaction. It is
+applied per session. `--num` remains the aggregate row or request count across
+all sessions.
 
 ## Controls
 
@@ -99,18 +103,21 @@ aggregate row or request count across all sessions.
 | `--sessions`, `-s` | `prepare`, `run ...` | `prepare`: resolved threads; `run`: manifest default or run threads | Number of independent DoraDB public sessions, meaning logical benchmark clients scheduled on the worker threads. Both values must be positive, and `threads > sessions` is rejected. |
 | `--num`, `-n` | `run insert-seq`, `insert-rand`, `lookup-seq`, `lookup-rand`, `index-scan` | Required | Aggregate row, lookup, or scan request count across all sessions. |
 | `--num`, `-n` | `run table-scan` | `1` | Aggregate full table-scan iterations across all sessions. |
-| `--value-size`, `-v` | `run insert-seq`, `insert-rand` | `128` | Generated payload size in bytes. |
-| `--batch-size`, `-b` | `run insert-seq`, `insert-rand` | `1` | Rows per transaction commit for insert workloads. |
+| `--value-size`, `-v` | `prepare`, `run insert-seq`, `insert-rand` | `prepare`: `128`; `run`: manifest default | Generated payload size in bytes. Run overrides apply only to insert workloads. |
+| `--batch-size`, `-b` | `prepare`, `run ...` | `prepare`: `1`; `run`: manifest default | Operations per transaction. For inserts this means rows per commit; for reads this means lookup/index-scan requests or table-scan iterations per read transaction. |
 | `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, or randomized read key selection. |
 | `--log-sync` | `run ...` | `fsync` | Redo-log durability sync method. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
+| `--include-stats` | `run ...` | `false` | Captures and prints internal transaction-system, storage-IO, and buffer-pool stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
 
-Run worker defaults resolve as follows:
+Run defaults resolve as follows:
 
 - If a run omits both `--threads` and `--sessions`, it uses the manifest
   defaults from `prepare`.
 - If a run provides `--threads` but omits `--sessions`, sessions default to the
   run thread count.
 - If a run provides only `--sessions`, threads come from the manifest default.
+- If a run omits `--value-size` or `--batch-size`, it uses the manifest defaults
+  from `prepare`.
 
 ## Key Ranges
 
@@ -140,13 +147,14 @@ serialize other ready sessions.
 Normal lifecycle and benchmark output is written to stdout. Diagnostics and
 errors are written to stderr.
 
-`run` prints three stdout sections in this order:
+`run` prints these stdout sections in this order:
 
 - `Configuration`: workload, randomized-key-selection mode, storage root,
-  row/request count, value size, batch size, seed, prepared index mode, loaded
-  key range, threads, sessions, log sync mode, and table id.
-- `Internal Stats`: public transaction-system, storage-IO, and buffer-pool
-  stats deltas when available.
+  internal-stats mode, row/request count, value size, batch size, seed,
+  prepared index mode, loaded key range, threads, sessions, log sync mode, and
+  table id.
+- `Internal Stats`, only with `--include-stats`: public transaction-system,
+  storage-IO, and buffer-pool stats deltas when available.
 - `Final Result`: operation count, inserted rows, found count, not-found count,
   returned rows, elapsed time, throughput, average nanoseconds per operation,
   and failures.
@@ -154,9 +162,10 @@ errors are written to stderr.
 `run` also overwrites these files in the storage root:
 
 - `benchmark-result.md`: user-friendly markdown snapshot with configuration,
-  internal stats, final result, and command context.
-- `benchmark-internal-stats.csv`: two columns, `metric-name` and
-  `metric-value`.
+  optional internal stats, final result, and command context.
+- `benchmark-internal-stats.csv`, only with `--include-stats`: two columns,
+  `metric-name` and `metric-value`. A later run without `--include-stats`
+  removes stale stats output from the previous run.
 - `benchmark-result.csv`: one header row and one latest-result summary row.
 
 ## Examples

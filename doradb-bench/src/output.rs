@@ -6,6 +6,7 @@ use doradb_storage::{
     TransactionSystemStats,
 };
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -47,6 +48,7 @@ pub(super) struct OutputConfig {
     pub(super) threads: usize,
     pub(super) sessions: usize,
     pub(super) log_sync: LogSyncMode,
+    pub(super) include_stats: bool,
     pub(super) table_id: u64,
 }
 
@@ -133,21 +135,33 @@ pub(super) fn write_benchmark_outputs(
     command_context: &str,
 ) -> Result<()> {
     print_stdout(config, metrics, result);
-    let artifacts = [
-        OutputArtifact::new(
-            result_markdown_path(&config.storage_root),
-            render_markdown(config, metrics, result, command_context),
-        ),
-        OutputArtifact::new(
-            internal_stats_csv_path(&config.storage_root),
+    let stats_path = internal_stats_csv_path(&config.storage_root);
+    let staged_stats_path = staged_output_path(&stats_path);
+    if !config.include_stats {
+        remove_file_if_exists(&staged_stats_path)?;
+    }
+
+    let mut artifacts = vec![OutputArtifact::new(
+        result_markdown_path(&config.storage_root),
+        render_markdown(config, metrics, result, command_context),
+    )];
+    if config.include_stats {
+        artifacts.push(OutputArtifact::new(
+            stats_path.clone(),
             render_internal_stats_csv(metrics),
-        ),
-        OutputArtifact::new(
-            result_csv_path(&config.storage_root),
-            render_result_csv(config, result),
-        ),
-    ];
-    write_staged_outputs(&artifacts)
+        ));
+    }
+    artifacts.push(OutputArtifact::new(
+        result_csv_path(&config.storage_root),
+        render_result_csv(config, result),
+    ));
+
+    write_staged_outputs(&artifacts)?;
+    if !config.include_stats {
+        remove_file_if_exists(&stats_path)?;
+        remove_file_if_exists(&staged_stats_path)?;
+    }
+    Ok(())
 }
 
 fn write_staged_outputs(artifacts: &[OutputArtifact]) -> Result<()> {
@@ -182,6 +196,17 @@ fn cleanup_staged_outputs(artifacts: &[OutputArtifact]) {
     }
 }
 
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(BenchError::message(format!(
+            "failed to remove benchmark output {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
 fn staged_output_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -196,11 +221,13 @@ fn print_stdout(config: &OutputConfig, metrics: &[Metric], result: &BenchmarkRes
         println!("{name}: {value}");
     }
     println!();
-    println!("Internal Stats");
-    for metric in metrics {
-        println!("{}: {}", metric.name, metric.value);
+    if config.include_stats {
+        println!("Internal Stats");
+        for metric in metrics {
+            println!("{}: {}", metric.name, metric.value);
+        }
+        println!();
     }
-    println!();
     println!("Final Result");
     println!("operations: {}", result.operations);
     println!("inserted_rows: {}", result.inserted_rows);
@@ -232,13 +259,16 @@ fn render_markdown(
     }
     out.push_str("- `command`: `");
     out.push_str(command_context);
-    out.push_str("`\n\n## Internal Stats\n\n");
-    for metric in metrics {
-        out.push_str("- `");
-        out.push_str(&metric.name);
-        out.push_str("`: ");
-        out.push_str(&metric.value.to_string());
-        out.push('\n');
+    out.push('`');
+    if config.include_stats {
+        out.push_str("\n\n## Internal Stats\n\n");
+        for metric in metrics {
+            out.push_str("- `");
+            out.push_str(&metric.name);
+            out.push_str("`: ");
+            out.push_str(&metric.value.to_string());
+            out.push('\n');
+        }
     }
     out.push_str("\n## Final Result\n\n");
     out.push_str(&format!(
@@ -271,6 +301,7 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
     let header = [
         "workload",
         "rand",
+        "include_stats",
         "storage_root",
         "num",
         "value_size",
@@ -296,6 +327,7 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
     let row = [
         config.workload.to_string(),
         config.rand.to_string(),
+        config.include_stats.to_string(),
         config.storage_root.display().to_string(),
         config.num.to_string(),
         config.value_size.to_string(),
@@ -329,6 +361,7 @@ fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
     vec![
         ("workload".to_owned(), config.workload.to_string()),
         ("rand".to_owned(), config.rand.to_string()),
+        ("include_stats".to_owned(), config.include_stats.to_string()),
         (
             "storage_root".to_owned(),
             config.storage_root.display().to_string(),
@@ -617,6 +650,7 @@ mod tests {
             threads: 1,
             sessions: 1,
             log_sync: LogSyncMode::Fsync,
+            include_stats: false,
             table_id: 7,
         }
     }
@@ -762,6 +796,7 @@ mod tests {
         );
         assert_eq!(csv.lines().count(), 2);
         assert!(csv.lines().next().unwrap().starts_with("workload,rand"));
+        assert!(csv.contains("include_stats"));
         assert!(!csv.contains("manifest_schema_version"));
     }
 
@@ -783,6 +818,11 @@ mod tests {
         assert!(
             pairs
                 .iter()
+                .any(|(name, value)| name == "include_stats" && value == "false")
+        );
+        assert!(
+            pairs
+                .iter()
                 .any(|(name, value)| name == "loaded_key_range" && value == "[0, 10)")
         );
         assert!(
@@ -793,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_fixed_result_files() {
+    fn writes_result_files_without_stats_by_default() {
         let temp = TempDir::new().unwrap();
         let config = sample_config(temp.path());
         let metrics = vec![Metric {
@@ -808,17 +848,64 @@ mod tests {
         )
         .unwrap();
         assert!(result_markdown_path(temp.path()).exists());
-        assert!(internal_stats_csv_path(temp.path()).exists());
+        assert!(!internal_stats_csv_path(temp.path()).exists());
         assert!(result_csv_path(temp.path()).exists());
+        let markdown = fs::read_to_string(result_markdown_path(temp.path())).unwrap();
+        assert!(!markdown.contains("## Internal Stats"));
         assert!(!staged_output_path(&result_markdown_path(temp.path())).exists());
         assert!(!staged_output_path(&internal_stats_csv_path(temp.path())).exists());
         assert!(!staged_output_path(&result_csv_path(temp.path())).exists());
     }
 
     #[test]
+    fn writes_internal_stats_when_enabled() {
+        let temp = TempDir::new().unwrap();
+        let mut config = sample_config(temp.path());
+        config.include_stats = true;
+        let metrics = vec![Metric {
+            name: "transaction.commit_count".to_owned(),
+            value: 3,
+        }];
+        write_benchmark_outputs(
+            &config,
+            &metrics,
+            &BenchmarkResult::new(10, 10, 0, 0, 0, Duration::from_nanos(100), 0),
+            "doradb-bench run --include-stats",
+        )
+        .unwrap();
+        assert!(result_markdown_path(temp.path()).exists());
+        assert!(internal_stats_csv_path(temp.path()).exists());
+        assert!(result_csv_path(temp.path()).exists());
+        let markdown = fs::read_to_string(result_markdown_path(temp.path())).unwrap();
+        assert!(markdown.contains("## Internal Stats"));
+        assert!(markdown.contains("transaction.commit_count"));
+    }
+
+    #[test]
+    fn disabled_stats_removes_stale_stats_files() {
+        let temp = TempDir::new().unwrap();
+        let stats_path = internal_stats_csv_path(temp.path());
+        let staged_stats_path = staged_output_path(&stats_path);
+        fs::write(&stats_path, "stale\n").unwrap();
+        fs::write(&staged_stats_path, "stale staged\n").unwrap();
+
+        write_benchmark_outputs(
+            &sample_config(temp.path()),
+            &[],
+            &BenchmarkResult::new(10, 10, 0, 0, 0, Duration::from_nanos(100), 0),
+            "doradb-bench run",
+        )
+        .unwrap();
+
+        assert!(!stats_path.exists());
+        assert!(!staged_stats_path.exists());
+    }
+
+    #[test]
     fn removes_staged_result_files_after_output_failure() {
         let temp = TempDir::new().unwrap();
-        let config = sample_config(temp.path());
+        let mut config = sample_config(temp.path());
+        config.include_stats = true;
         let metrics = vec![Metric {
             name: "transaction.commit_count".to_owned(),
             value: 3,

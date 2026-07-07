@@ -10,15 +10,15 @@ github_issue: 821
 
 ## Summary
 
-Extend `doradb-bench` beyond the initial `insert` workload by adding explicit
-read workloads while keeping data loading as an ordinary `run insert`
-operation.
+Extend `doradb-bench` beyond the initial insert capability by adding explicit
+read workloads while keeping data loading as ordinary `run insert-seq` or
+`run insert-rand` operations.
 
 `prepare` should remain schema-only. It must create the benchmark table,
 persist the selected index shape and default worker settings in
 `benchmark-manifest.toml`, and not load data. Users load data explicitly with
-`run insert`; later read workloads run against the rows already loaded by prior
-insert runs.
+`run insert-seq` or `run insert-rand`; later read workloads run against the
+rows already loaded by prior insert runs.
 
 Add these read workload subcommands:
 
@@ -34,16 +34,16 @@ section starts.
 ## Context
 
 The first `doradb-bench` task intentionally created only the benchmark crate,
-lifecycle, manifest, fixed output artifacts, and `insert` load workload. Read
+lifecycle, manifest, fixed output artifacts, and insert load capability. Read
 workloads were deferred until those harness semantics settled.
 
 The current implementation is insert-centric:
 
 - `prepare` creates the benchmark table and writes a manifest with table id,
   index mode, schema names, and `runtime.next_key`.
-- `run insert` allocates a fresh logical key range from `runtime.next_key`,
-  writes generated rows, emits result artifacts, and advances the manifest only
-  after output succeeds.
+- `run insert-seq` and `run insert-rand` allocate fresh logical key ranges from
+  `runtime.next_key`, write generated rows, emit result artifacts, and advance
+  the manifest only after output succeeds.
 - CLI run arguments currently own most worker and insert settings.
 
 This task should evolve the harness without making `prepare` a data-loading
@@ -51,7 +51,7 @@ phase. The user should choose the sequence explicitly:
 
 ```bash
 doradb-bench --root target/doradb-bench/read prepare --index unique
-doradb-bench --root target/doradb-bench/read run insert --num 100000
+doradb-bench --root target/doradb-bench/read run insert-seq --num 100000
 doradb-bench --root target/doradb-bench/read run lookup-rand --num 100000
 ```
 
@@ -85,7 +85,8 @@ Related Backlogs:
 
 1. Keep `prepare` schema-only.
    - `prepare` must not insert benchmark rows.
-   - Users must continue to load data explicitly with `run insert`.
+   - Users must continue to load data explicitly with `run insert-seq` or
+     `run insert-rand`.
 
 2. Make prepared index shape explicit.
    - Change `prepare` to require `--index <none|unique|non-unique>`.
@@ -95,19 +96,27 @@ Related Backlogs:
    - The manifest's prepared index mode is authoritative for all later
      workload compatibility checks.
 
-3. Persist default worker settings in the manifest.
-   - Add a manifest defaults section with `threads` and `sessions`.
+3. Persist default run settings in the manifest.
+   - Add a manifest defaults section with `threads`, `sessions`,
+     `value_size`, and `batch_size`.
    - Add `prepare --threads/-t`, defaulting to `1`.
    - Add `prepare --sessions/-s`, defaulting to the resolved prepare thread
      count.
+   - Add `prepare --value-size/-v`, defaulting to `128`.
+   - Add `prepare --batch-size/-b`, defaulting to `1`.
    - Reject `threads == 0`, `sessions == 0`, and `threads > sessions`.
+   - Reject zero or too-large default `value_size` and `batch_size`.
 
-4. Let `run` workloads inherit and override worker defaults.
+4. Let `run` workloads inherit and override run defaults.
    - If a run omits both `--threads` and `--sessions`, use manifest defaults.
    - If a run provides `--threads` but omits `--sessions`, default sessions to
      the run thread count, preserving the existing run-time behavior.
    - If a run provides only `--sessions`, use manifest default threads and the
      run sessions value.
+   - If an insert run omits `--value-size` or `--batch-size`, use manifest
+     defaults.
+   - Read workloads accept `--batch-size` but not `--value-size`; omitted read
+     batch size uses the manifest default.
    - Validate the resolved run values with the same positive-count and
      `threads <= sessions` rules.
 
@@ -129,7 +138,7 @@ Related Backlogs:
      accepted.
 
 7. Enforce workload compatibility from manifest state.
-   - `insert` works with all prepared index modes.
+   - `insert-seq` and `insert-rand` work with all prepared index modes.
    - `lookup-seq` and `lookup-rand` require `index = "unique"`.
    - `index-scan` requires `index = "non-unique"`.
    - `table-scan` works with all prepared index modes.
@@ -144,10 +153,11 @@ Related Backlogs:
      successful inserted row count across completed insert runs.
    - Advance runtime state only after benchmark outputs are successfully
      written, preserving the current no-advance-on-output-failure behavior.
-   - For old manifests missing worker defaults or row counters, either provide
+   - For old manifests missing defaults or row counters, either provide
      conservative defaults with tests or reject them with a clear error. Prefer
-     defaults for `threads = 1`, `sessions = 1`, and `rows_inserted = next_key`
-     when the older manifest shape is otherwise usable.
+     defaults for `threads = 1`, `sessions = 1`, `value_size = 128`,
+     `batch_size = 1`, and `rows_inserted = next_key` when the older manifest
+     shape is otherwise usable.
 
 9. Define deterministic read key selection.
    - Read workloads draw candidate keys from the loaded logical range
@@ -165,14 +175,14 @@ Related Backlogs:
      per-session plans.
 
 10. Implement read execution through public statement APIs.
-    - For `lookup-*`, begin a transaction per session or per bounded batch,
-      call `stmt.table_lookup_unique_mvcc(table_id, &key, &[0, 1])`, and count
-      found versus not-found results.
+    - For `lookup-*`, begin a transaction per bounded batch, call
+      `stmt.table_lookup_unique_mvcc(table_id, &key, &[0, 1])`, and count found
+      versus not-found results.
     - For `table-scan`, call `stmt.table_scan_mvcc(table_id, &[0, 1], ...)` for
       each scan iteration and count visible rows returned through the callback.
     - For `index-scan`, call
       `stmt.table_index_scan_mvcc(table_id, &key, &[0, 1])` and count scan
-      requests plus returned row count.
+      requests plus returned row count in bounded read transaction batches.
     - Commit read transactions normally so session and transaction lifecycle
       behavior is measured consistently; rollback only on errors.
 
@@ -190,10 +200,13 @@ Related Backlogs:
 12. Extend result output without breaking fixed artifact locations.
     - Keep writing:
       - `benchmark-result.md`
-      - `benchmark-internal-stats.csv`
       - `benchmark-result.csv`
-    - Continue printing `Configuration`, `Internal Stats`, and `Final Result`
-      sections to stdout in that order.
+    - Write `benchmark-internal-stats.csv` only when a run uses
+      `--include-stats`; a later run without `--include-stats` removes stale
+      internal-stats output from the previous run.
+    - Continue printing `Configuration` and `Final Result` sections to stdout
+      in that order, with an `Internal Stats` section between them only when a
+      run uses `--include-stats`.
     - Include workload-relevant fields in configuration, including resolved
       threads/sessions, prepared index mode, table id, and loaded key range.
     - Include result counters for attempted operations, inserted rows, rows
@@ -203,7 +216,7 @@ Related Backlogs:
 
 13. Update user documentation.
     - Update `docs/benchmark-tool.md` for schema-only prepare behavior,
-      required `prepare --index`, manifest worker defaults, run overrides,
+      required `prepare --index`, manifest run defaults, run overrides,
       workload compatibility, and read workload examples.
     - Keep deferred cold/checkpoint, missing-key, batched-read, update/delete,
       mixed, and richer-index notes linked to existing backlogs.
@@ -241,11 +254,14 @@ Related Backlogs:
    - Add `PrepareArgs.threads` and `PrepareArgs.sessions`.
    - Replace the insert-only `LoadConfig` shape with:
      - common resolved run settings: storage root, workload, threads, sessions,
-       log sync, table id, prepared index mode, loaded key range;
+       value size, batch size, log sync, table id, prepared index mode, loaded
+       key range;
      - workload-specific config for insert, lookup sequential, lookup random,
        table scan, and index scan.
-   - Add `LoadWorkload` variants for `LookupSeq`, `LookupRand`,
-     `TableScan`, and `IndexScan`.
+   - Add `WorkloadArgs` and `WorkloadConfig` variants for `LookupSeq`,
+     `LookupRand`, `TableScan`, and `IndexScan`.
+   - Merge unseeded read count/table-scan argument parsing into a shared
+     `ReadArgs` shape, with `table-scan` defaulting missing `--num` to `1`.
    - Remove run-level `--index` from documented run workload arguments. If a
      transitional parser is kept, it must only verify equality with the manifest
      and must be covered by tests.
@@ -256,6 +272,8 @@ Related Backlogs:
      [defaults]
      threads = 1
      sessions = 1
+     value_size = 128
+     batch_size = 1
      ```
    - Add a runtime inserted-row counter:
      ```toml
@@ -272,11 +290,11 @@ Related Backlogs:
    - Add serde defaults or clear decode-time errors for older manifests.
 
 3. Update prepare path in `doradb-bench/src/runner.rs`.
-   - Resolve and validate prepare worker defaults.
+   - Resolve and validate prepare run defaults.
    - Create the table with `benchmark_index_specs(args.index)`.
-   - Write the new manifest shape with index mode and worker defaults.
+   - Write the new manifest shape with index mode and run defaults.
    - Keep prepare output concise and include storage root, table id, index mode,
-     threads, and sessions.
+     threads, sessions, value size, and batch size.
 
 4. Add non-unique schema generation.
    - Update `benchmark_index_specs`:
@@ -304,7 +322,7 @@ Related Backlogs:
    - Route each session plan to the selected workload executor.
    - Keep session close handling strict: return the workload error first, or
      return close error when workload execution succeeded.
-   - Keep stats capture outside the measured worker tasks as it is today.
+   - Keep optional stats capture outside the measured worker tasks.
 
 7. Implement insert execution as one workload executor.
    - Reuse existing batch insert behavior.
@@ -313,6 +331,8 @@ Related Backlogs:
 
 8. Implement `lookup-seq` and `lookup-rand`.
    - Require `index = "unique"`.
+   - Chunk generated lookup keys by resolved `batch_size`; each chunk uses one
+     read transaction.
    - Build `SelectKey::new(0, vec![Val::from(key)])`.
    - Use read set `[0, 1]` so the benchmark verifies the returned logical key
      and payload are reachable through the public API.
@@ -324,6 +344,8 @@ Related Backlogs:
    - Allow all index modes.
    - Default `--num` to one full scan iteration.
    - For each scan iteration, call `table_scan_mvcc(table_id, &[0, 1], ...)`.
+   - Chunk scan iterations by resolved `batch_size`; each chunk uses one read
+     transaction.
    - Count rows observed through the callback.
    - Do not try to force checkpoint, cache eviction, restart, or persisted-only
      state.
@@ -331,7 +353,9 @@ Related Backlogs:
 10. Implement `index-scan`.
     - Require `index = "non-unique"`.
     - Build exact logical-key `SelectKey::new(0, vec![Val::from(key)])`.
-    - Call `table_index_scan_mvcc(table_id, &key, &[0, 1])`.
+   - Call `table_index_scan_mvcc(table_id, &key, &[0, 1])`.
+   - Chunk generated scan keys by resolved `batch_size`; each chunk uses one
+     read transaction.
     - Count scan requests and returned rows via `ScanMvcc::unwrap_rows()`.
     - Do not implement range scans or partial-key scans.
 
@@ -351,7 +375,8 @@ Related Backlogs:
 12. Update docs in `docs/benchmark-tool.md`.
     - Document schema-only `prepare`.
     - Document required `prepare --index`.
-    - Document worker defaults in manifest and run overrides.
+    - Document worker, value-size, and batch-size defaults in manifest and run
+      overrides.
     - Document insert behavior for `none`, `unique`, and `non-unique`.
     - Document read workload compatibility:
       - `lookup-seq` and `lookup-rand`: unique only;
@@ -377,11 +402,11 @@ Related Backlogs:
 - `doradb-bench/src/cli.rs`
   - prepare index requirement;
   - `non-unique` index mode;
-  - prepare worker defaults;
+  - prepare run defaults;
   - read workload subcommands;
   - run override resolution.
 - `doradb-bench/src/manifest.rs`
-  - persisted worker defaults;
+  - persisted run defaults;
   - inserted-row/load-state tracking;
   - workload compatibility helpers.
 - `doradb-bench/src/runner.rs`
@@ -415,11 +440,15 @@ Related Backlogs:
    - `prepare --index none`, `unique`, and `non-unique` parse.
    - invalid prepare index values are rejected.
    - prepare `--threads` and `--sessions` parse and validate.
+   - prepare `--value-size` and `--batch-size` parse and validate.
    - prepare rejects `--threads 2 --sessions 1`.
    - `run lookup-seq`, `lookup-rand`, `table-scan`, and `index-scan` parse.
    - read workloads reject zero or missing required `--num` values, except
      `table-scan` defaulting to one scan.
    - run defaults inherit manifest threads/sessions.
+   - insert runs inherit and may override manifest value size and batch size.
+   - read runs inherit and may override manifest batch size.
+   - read runs reject `--value-size`.
    - run `--threads` without `--sessions` defaults sessions to the run thread
      count.
    - run `--sessions` without `--threads` uses manifest default threads.
@@ -430,7 +459,9 @@ Related Backlogs:
 2. Manifest tests:
    - new manifest roundtrips `index`, schema names, defaults, `next_key`, and
      inserted-row count.
-   - old manifests without defaults are handled according to the plan.
+   - old manifests without defaults, or with worker-only defaults, are handled
+     according to the plan.
+   - invalid value-size or batch-size defaults are rejected.
    - loaded key range rejects empty `next_key`.
    - insert success advances both `next_key` and inserted-row count.
    - overflow in `next_key` or inserted-row count is rejected.
@@ -452,15 +483,18 @@ Related Backlogs:
    - `lookup-rand` changes order for different seeds.
    - multi-session read plans partition aggregate request count
      deterministically.
-   - `insert --rand --index non-unique` allows duplicate generated logical keys.
-   - `insert --rand --index unique` remains duplicate-free.
+   - `insert-rand` with `--index non-unique` allows duplicate generated logical
+     keys.
+   - `insert-rand` with `--index unique` remains duplicate-free.
 
 5. Output tests:
-   - stdout still contains `Configuration`, `Internal Stats`, and `Final Result`
-     in order for insert and read workloads.
+   - stdout contains `Configuration` and `Final Result` in order for insert and
+     read workloads, and contains `Internal Stats` between them only with
+     `--include-stats`.
    - markdown output includes workload, prepared index, loaded range, resolved
-     threads/sessions, and final counters.
-   - internal stats CSV remains `metric-name,metric-value`.
+     threads/sessions, value size, batch size, and final counters.
+   - internal stats CSV remains `metric-name,metric-value` when
+     `--include-stats` is enabled, and is absent after stats-disabled runs.
    - result CSV still has one header row and one result row.
    - result CSV includes stable columns for inserted rows, found, not found,
      rows returned, and failures.
@@ -470,28 +504,28 @@ Related Backlogs:
    - unique lookup sequence:
      ```bash
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-seq prepare --index unique
-     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-seq run insert --num 10 --value-size 16
+     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-seq run insert-seq --num 10 --value-size 16
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-seq run lookup-seq --num 10
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-seq cleanup
      ```
    - unique random lookup:
      ```bash
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-rand prepare --index unique
-     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-rand run insert --num 10 --value-size 16 --rand --seed 1
+     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-rand run insert-rand --num 10 --value-size 16 --seed 1
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-rand run lookup-rand --num 10 --seed 2
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/lookup-rand cleanup
      ```
    - table scan with no secondary index:
      ```bash
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/table-scan prepare --index none
-     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/table-scan run insert --num 10 --value-size 16
+     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/table-scan run insert-seq --num 10 --value-size 16
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/table-scan run table-scan
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/table-scan cleanup
      ```
    - non-unique index scan:
      ```bash
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/index-scan prepare --index non-unique
-     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/index-scan run insert --num 10 --value-size 16
+     cargo run -p doradb-bench -- --root target/doradb-bench-smoke/index-scan run insert-seq --num 10 --value-size 16
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/index-scan run index-scan --num 10 --seed 3
      cargo run -p doradb-bench -- --root target/doradb-bench-smoke/index-scan cleanup
      ```
@@ -527,10 +561,10 @@ Resolved decisions retained for implementation clarity:
 
 - `prepare` is schema-only and must not load data.
 - Index shape is selected at prepare time and persisted in the manifest.
-- `threads` and `sessions` defaults are selected at prepare time and persisted
-  in the manifest.
-- Run workloads may override worker defaults, but they do not change prepared
-  schema.
+- `threads`, `sessions`, `value_size`, and `batch_size` defaults are selected
+  at prepare time and persisted in the manifest.
+- Run workloads may override relevant defaults, but they do not change prepared
+  schema or manifest defaults.
 - `lookup-seq` and `lookup-rand` require a unique secondary index.
 - `index-scan` means exact-key scan through a non-unique secondary index.
 - Other read shapes are deferred.

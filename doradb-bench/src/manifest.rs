@@ -1,4 +1,7 @@
-use crate::cli::{IndexMode, Workload, validate_workers};
+use crate::cli::{
+    DEFAULT_BATCH_SIZE, DEFAULT_VALUE_SIZE, IndexMode, RunDefaults, Workload, validate_batch_size,
+    validate_value_size, validate_workers,
+};
 use crate::error::{BenchError, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs::{self, OpenOptions};
@@ -28,16 +31,41 @@ impl KeyRange {
 pub(super) struct DefaultsManifest {
     pub(super) threads: usize,
     pub(super) sessions: usize,
+    #[serde(default = "default_value_size")]
+    pub(super) value_size: usize,
+    #[serde(default = "default_batch_size")]
+    pub(super) batch_size: u64,
 }
 
 impl DefaultsManifest {
-    pub(super) fn new(threads: usize, sessions: usize) -> Result<Self> {
-        validate_workers(threads, sessions)?;
-        Ok(Self { threads, sessions })
+    pub(super) fn new(
+        threads: usize,
+        sessions: usize,
+        value_size: usize,
+        batch_size: u64,
+    ) -> Result<Self> {
+        RunDefaults::new(threads, sessions, value_size, batch_size)?;
+        Ok(Self {
+            threads,
+            sessions,
+            value_size,
+            batch_size,
+        })
     }
 
     fn validate(&self) -> Result<()> {
-        validate_workers(self.threads, self.sessions)
+        validate_workers(self.threads, self.sessions)?;
+        validate_value_size(self.value_size)?;
+        validate_batch_size(self.batch_size)
+    }
+
+    pub(super) fn run_defaults(&self) -> RunDefaults {
+        RunDefaults {
+            threads: self.threads,
+            sessions: self.sessions,
+            value_size: self.value_size,
+            batch_size: self.batch_size,
+        }
     }
 }
 
@@ -46,8 +74,18 @@ impl Default for DefaultsManifest {
         Self {
             threads: 1,
             sessions: 1,
+            value_size: DEFAULT_VALUE_SIZE,
+            batch_size: DEFAULT_BATCH_SIZE,
         }
     }
+}
+
+fn default_value_size() -> usize {
+    DEFAULT_VALUE_SIZE
+}
+
+fn default_batch_size() -> u64 {
+    DEFAULT_BATCH_SIZE
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -278,6 +316,8 @@ mod tests {
         assert_eq!(loaded.table_id, 42);
         assert_eq!(loaded.index, IndexMode::Unique);
         assert_eq!(loaded.defaults, DefaultsManifest::default());
+        assert_eq!(loaded.defaults.value_size, DEFAULT_VALUE_SIZE);
+        assert_eq!(loaded.defaults.batch_size, DEFAULT_BATCH_SIZE);
         assert_eq!(loaded.runtime.rows_inserted, 0);
     }
 
@@ -287,7 +327,7 @@ mod tests {
         let mut manifest = Manifest::new_with_defaults(
             42,
             IndexMode::NonUnique,
-            DefaultsManifest::new(2, 4).unwrap(),
+            DefaultsManifest::new(2, 4, 256, 8).unwrap(),
         );
         manifest.record_insert_success(7).unwrap();
 
@@ -296,6 +336,8 @@ mod tests {
         assert_eq!(loaded.index, IndexMode::NonUnique);
         assert_eq!(loaded.defaults.threads, 2);
         assert_eq!(loaded.defaults.sessions, 4);
+        assert_eq!(loaded.defaults.value_size, 256);
+        assert_eq!(loaded.defaults.batch_size, 8);
         assert_eq!(loaded.runtime.next_key, 7);
         assert_eq!(loaded.runtime.rows_inserted, 7);
     }
@@ -353,6 +395,67 @@ next_key = 11
         assert_eq!(loaded.runtime.next_key, 11);
         assert_eq!(loaded.runtime.rows_inserted, 11);
         assert_eq!(loaded.defaults, DefaultsManifest::default());
+    }
+
+    #[test]
+    fn read_manifest_defaults_missing_sizing_fields() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            manifest_path(temp.path()),
+            r#"
+table_id = 42
+index = "unique"
+
+[defaults]
+threads = 2
+sessions = 4
+
+[schema]
+logical_key_column = "logical_key"
+payload_column = "payload"
+
+[runtime]
+next_key = 0
+rows_inserted = 0
+"#,
+        )
+        .unwrap();
+
+        let loaded = read_manifest(temp.path()).unwrap();
+
+        assert_eq!(loaded.defaults.threads, 2);
+        assert_eq!(loaded.defaults.sessions, 4);
+        assert_eq!(loaded.defaults.value_size, DEFAULT_VALUE_SIZE);
+        assert_eq!(loaded.defaults.batch_size, DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn read_manifest_rejects_invalid_sizing_defaults() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            manifest_path(temp.path()),
+            r#"
+table_id = 42
+index = "unique"
+
+[defaults]
+threads = 1
+sessions = 1
+value_size = 0
+batch_size = 1
+
+[schema]
+logical_key_column = "logical_key"
+payload_column = "payload"
+
+[runtime]
+next_key = 0
+rows_inserted = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(read_manifest(temp.path()).is_err());
     }
 
     #[test]

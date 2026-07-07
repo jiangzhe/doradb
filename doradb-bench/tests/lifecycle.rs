@@ -44,8 +44,21 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
 
-        let prepare_stdout = assert_success(run_bench(&root, &["prepare", "--index", "none"]));
+        let prepare_stdout = assert_success(run_bench(
+            &root,
+            &[
+                "prepare",
+                "--index",
+                "none",
+                "--value-size",
+                "64",
+                "--batch-size",
+                "5",
+            ],
+        ));
         assert!(prepare_stdout.contains("prepared storage_root="));
+        assert!(prepare_stdout.contains("value_size=64"));
+        assert!(prepare_stdout.contains("batch_size=5"));
         assert!(root.join("benchmark-manifest.toml").exists());
 
         let run_stdout = assert_success(run_bench(
@@ -64,41 +77,44 @@ mod tests {
             ],
         ));
         assert!(run_stdout.contains("Configuration"));
-        assert!(run_stdout.contains("Internal Stats"));
+        assert!(!run_stdout.contains("Internal Stats"));
         assert!(run_stdout.contains("Final Result"));
+        assert!(run_stdout.contains("include_stats: false"));
         assert!(run_stdout.contains("operations: 3"));
         assert!(run_stdout.contains("failures: 0"));
 
         let manifest = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
+        assert!(manifest.contains("value_size = 64"));
+        assert!(manifest.contains("batch_size = 5"));
         assert!(manifest.contains("next_key = 3"));
         assert!(manifest.contains("rows_inserted = 3"));
 
         let result_md = fs::read_to_string(root.join("benchmark-result.md")).unwrap();
         assert!(result_md.contains("# DoraDB Benchmark Result"));
+        assert!(!result_md.contains("## Internal Stats"));
         assert!(result_md.contains("## Final Result"));
 
-        let internal_stats = fs::read_to_string(root.join("benchmark-internal-stats.csv")).unwrap();
-        assert!(internal_stats.starts_with("metric-name,metric-value\n"));
-        assert!(internal_stats.contains("transaction.commit_count,"));
-        assert!(internal_stats.contains("buffer.mem.cache_hits,"));
+        assert!(!root.join("benchmark-internal-stats.csv").exists());
 
         let result_csv = fs::read_to_string(root.join("benchmark-result.csv")).unwrap();
         let mut result_lines = result_csv.lines();
         let header = result_lines.next().unwrap();
         let row = result_lines.next().unwrap();
         assert!(result_lines.next().is_none());
-        assert!(header.starts_with("workload,rand,storage_root,num"));
+        assert!(header.starts_with("workload,rand,include_stats,storage_root,num"));
         let columns: Vec<_> = row.split(',').collect();
         assert_eq!(columns[0], "insert-seq");
         assert_eq!(columns[1], "false");
-        assert_eq!(columns[3], "3");
-        assert_eq!(columns[5], "2");
-        assert_eq!(columns[7], "none");
-        assert_eq!(columns[9], "3");
-        assert_eq!(columns[12], "fsync");
-        assert_eq!(columns[14], "3");
+        assert_eq!(columns[2], "false");
+        assert_eq!(columns[4], "3");
+        assert_eq!(columns[5], "64");
+        assert_eq!(columns[6], "2");
+        assert_eq!(columns[8], "none");
+        assert_eq!(columns[10], "3");
+        assert_eq!(columns[13], "fsync");
         assert_eq!(columns[15], "3");
-        assert_eq!(columns[22], "0");
+        assert_eq!(columns[16], "3");
+        assert_eq!(columns[23], "0");
 
         let cleanup_stdout = assert_success(run_bench(&root, &["cleanup"]));
         assert!(cleanup_stdout.contains("removed storage_root="));
@@ -166,20 +182,41 @@ mod tests {
             ],
         ));
 
-        let seq_stdout = assert_success(run_bench(&root, &["run", "lookup-seq", "--num", "7"]));
+        let seq_stdout = assert_success(run_bench(
+            &root,
+            &[
+                "run",
+                "lookup-seq",
+                "--num",
+                "7",
+                "--batch-size",
+                "2",
+                "--include-stats",
+            ],
+        ));
         assert!(seq_stdout.contains("workload: lookup-seq"));
+        assert!(seq_stdout.contains("include_stats: true"));
+        assert!(seq_stdout.contains("batch_size: 2"));
+        assert!(seq_stdout.contains("Internal Stats"));
         assert!(seq_stdout.contains("operations: 7"));
         assert!(seq_stdout.contains("found: 7"));
         assert!(seq_stdout.contains("not_found: 0"));
+        let internal_stats = fs::read_to_string(root.join("benchmark-internal-stats.csv")).unwrap();
+        assert!(internal_stats.starts_with("metric-name,metric-value\n"));
+        assert!(internal_stats.contains("transaction.commit_count,"));
+        assert!(internal_stats.contains("buffer.mem.cache_hits,"));
 
         let rand_stdout = assert_success(run_bench(
             &root,
             &["run", "lookup-rand", "--num", "7", "--seed", "2"],
         ));
         assert!(rand_stdout.contains("workload: lookup-rand"));
+        assert!(rand_stdout.contains("include_stats: false"));
+        assert!(!rand_stdout.contains("Internal Stats"));
         assert!(rand_stdout.contains("operations: 7"));
         assert!(rand_stdout.contains("found: 7"));
         assert!(rand_stdout.contains("not_found: 0"));
+        assert!(!root.join("benchmark-internal-stats.csv").exists());
 
         assert_success(run_bench(&root, &["cleanup"]));
     }
