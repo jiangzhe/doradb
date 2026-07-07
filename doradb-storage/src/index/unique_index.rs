@@ -19,12 +19,8 @@ use std::future::Future;
 pub(crate) trait UniqueIndex: Send + Sync {
     /// Lookup unique key in this index.
     /// Return associated value and delete flag.
-    fn lookup(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        ts: TrxID,
-    ) -> impl Future<Output = Result<Option<(RowID, bool)>>>;
+    fn lookup(&self, key: &[Val], ts: TrxID)
+    -> impl Future<Output = Result<Option<(RowID, bool)>>>;
 
     /// Insert new key value pair into this index.
     /// If same key exists, return old key and its delete flag.
@@ -32,7 +28,6 @@ pub(crate) trait UniqueIndex: Send + Sync {
     /// In this case, we can directly unset the delete flag to finish the insert.
     fn insert_if_not_exists(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
         row_id: RowID,
         merge_if_match_deleted: bool,
@@ -49,7 +44,6 @@ pub(crate) trait UniqueIndex: Send + Sync {
     /// to support minimal cost of index GC.
     fn compare_delete(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
         old_row_id: RowID,
         ignore_del_mask: bool,
@@ -60,14 +54,13 @@ pub(crate) trait UniqueIndex: Send + Sync {
     #[inline]
     fn mask_as_deleted(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
     ) -> impl Future<Output = Result<bool>> {
         debug_assert!(!row_id.is_deleted());
         let new_row_id = row_id.deleted();
-        self.compare_exchange(pool_guard, key, row_id, new_row_id, ts)
+        self.compare_exchange(key, row_id, new_row_id, ts)
             .map(|res| {
                 res.map(|res| match res {
                     IndexCompareExchange::Ok => true,
@@ -80,7 +73,6 @@ pub(crate) trait UniqueIndex: Send + Sync {
     /// if not exists, returns specified bool value.
     fn compare_exchange(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
         old_row_id: RowID,
         new_row_id: RowID,
@@ -89,12 +81,7 @@ pub(crate) trait UniqueIndex: Send + Sync {
 
     /// Scan values into given collection.
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
-    fn scan_values(
-        &self,
-        pool_guard: &PoolGuard,
-        values: &mut Vec<RowID>,
-        ts: TrxID,
-    ) -> impl Future<Output = Result<()>>;
+    fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = Result<()>>;
 }
 
 /// Generic unique-index implementation backed by a generic B-Tree.
@@ -129,6 +116,15 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     #[inline]
     pub(crate) fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         UniqueMemIndex { tree, encoder }
+    }
+
+    /// Bind this index to one pool guard for trait-based operations.
+    #[inline]
+    pub(crate) fn bind<'g>(&self, pool_guard: &'g PoolGuard) -> GuardedUniqueMemIndex<'_, 'g, P> {
+        GuardedUniqueMemIndex {
+            index: self,
+            pool_guard,
+        }
     }
 
     /// Destroy this unique index and reclaim all backing tree pages.
@@ -244,18 +240,42 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     }
 }
 
-impl<P: BufferPool> UniqueIndex for UniqueMemIndex<P> {
+/// Unique MemIndex view bound to one index-pool guard.
+#[derive(Clone, Copy)]
+pub(crate) struct GuardedUniqueMemIndex<'a, 'g, P: 'static> {
+    index: &'a UniqueMemIndex<P>,
+    pool_guard: &'g PoolGuard,
+}
+
+impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
+    /// Insert a live or delete-shadow overlay when the logical key is absent.
     #[inline]
-    async fn lookup(
+    pub(crate) async fn insert_overlay_if_absent(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
-        _ts: TrxID,
-    ) -> Result<Option<(RowID, bool)>> {
-        let k = self.encoder.encode(key);
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        self.index
+            .insert_overlay_if_absent(self.pool_guard, key, row_id, ts)
+            .await
+    }
+
+    /// Scan MemIndex entries with encoded logical keys and delete state.
+    #[inline]
+    pub(crate) async fn scan_encoded_entries(&self) -> Result<Vec<UniqueMemIndexEntry>> {
+        self.index.scan_encoded_entries(self.pool_guard).await
+    }
+}
+
+impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
+    #[inline]
+    async fn lookup(&self, key: &[Val], _ts: TrxID) -> Result<Option<(RowID, bool)>> {
+        let k = self.index.encoder.encode(key);
         Ok(self
+            .index
             .tree
-            .lookup_optimistic::<BTreeU64>(pool_guard, k.as_bytes())
+            .lookup_optimistic::<BTreeU64>(self.pool_guard, k.as_bytes())
             .await?
             .map(|res| (res.value().to_row_id(), res.is_deleted())))
     }
@@ -263,19 +283,19 @@ impl<P: BufferPool> UniqueIndex for UniqueMemIndex<P> {
     #[inline]
     async fn insert_if_not_exists(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
     ) -> Result<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
-        let k = self.encoder.encode(key);
+        let k = self.index.encoder.encode(key);
         Ok(
             match self
+                .index
                 .tree
                 .insert::<BTreeU64>(
-                    pool_guard,
+                    self.pool_guard,
                     k.as_bytes(),
                     BTreeU64::from(row_id),
                     merge_if_match_deleted,
@@ -294,19 +314,19 @@ impl<P: BufferPool> UniqueIndex for UniqueMemIndex<P> {
     #[inline]
     async fn compare_delete(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
         debug_assert!(!row_id.is_deleted());
-        let k = self.encoder.encode(key);
+        let k = self.index.encoder.encode(key);
         Ok(
             match self
+                .index
                 .tree
                 .delete(
-                    pool_guard,
+                    self.pool_guard,
                     k.as_bytes(),
                     BTreeU64::from(row_id),
                     ignore_del_mask,
@@ -324,18 +344,18 @@ impl<P: BufferPool> UniqueIndex for UniqueMemIndex<P> {
     #[inline]
     async fn compare_exchange(
         &self,
-        pool_guard: &PoolGuard,
         key: &[Val],
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
     ) -> Result<IndexCompareExchange> {
-        let k = self.encoder.encode(key);
+        let k = self.index.encoder.encode(key);
         Ok(
             match self
+                .index
                 .tree
                 .update(
-                    pool_guard,
+                    self.pool_guard,
                     k.as_bytes(),
                     BTreeU64::from(old_row_id),
                     BTreeU64::from(new_row_id),
@@ -354,13 +374,8 @@ impl<P: BufferPool> UniqueIndex for UniqueMemIndex<P> {
     }
 
     #[inline]
-    async fn scan_values(
-        &self,
-        pool_guard: &PoolGuard,
-        values: &mut Vec<RowID>,
-        _ts: TrxID,
-    ) -> Result<()> {
-        let mut cursor = self.tree.cursor(pool_guard, 0);
+    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
+        let mut cursor = self.index.tree.cursor(self.pool_guard, 0);
         cursor.seek(&[]).await?;
         while let Some(g) = cursor.next().await? {
             g.page().values(values, BTreeU64::to_row_id);
@@ -484,7 +499,7 @@ mod tests {
                         nullable: false,
                     }]),
                 };
-                run_test_suit_for_single_key_unique_index(&index, &pool_guard).await;
+                run_test_suit_for_single_key_unique_index(index.bind(&pool_guard)).await;
             }
         });
     }
@@ -512,7 +527,7 @@ mod tests {
                         },
                     ]),
                 };
-                run_test_suit_for_multi_key_unique_index(&index, &pool_guard).await;
+                run_test_suit_for_multi_key_unique_index(index.bind(&pool_guard)).await;
             }
         });
     }
@@ -535,15 +550,10 @@ mod tests {
             };
             let key = vec![Val::from(42i32)];
             let row_id = 100u64;
+            let guarded = index.bind(&pool_guard);
             assert!(
-                index
-                    .insert_if_not_exists(
-                        &pool_guard,
-                        &key,
-                        RowID::new(row_id),
-                        false,
-                        TrxID::new(100)
-                    )
+                guarded
+                    .insert_if_not_exists(&key, RowID::new(row_id), false, TrxID::new(100))
                     .await
                     .unwrap()
                     .is_ok()
@@ -569,16 +579,13 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(
-                index
-                    .lookup(&pool_guard, &key, TrxID::new(101))
-                    .await
-                    .unwrap(),
+                guarded.lookup(&key, TrxID::new(101)).await.unwrap(),
                 Some((RowID::new(row_id), false))
             );
 
             assert!(
-                index
-                    .mask_as_deleted(&pool_guard, &key, RowID::new(row_id), TrxID::new(102))
+                guarded
+                    .mask_as_deleted(&key, RowID::new(row_id), TrxID::new(102))
                     .await
                     .unwrap()
             );
@@ -602,10 +609,7 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(
-                index
-                    .lookup(&pool_guard, &key, TrxID::new(103))
-                    .await
-                    .unwrap(),
+                guarded.lookup(&key, TrxID::new(103)).await.unwrap(),
                 Some((RowID::new(row_id), true))
             );
             assert!(
@@ -620,13 +624,7 @@ mod tests {
                     .await
                     .unwrap()
             );
-            assert_eq!(
-                index
-                    .lookup(&pool_guard, &key, TrxID::new(104))
-                    .await
-                    .unwrap(),
-                None
-            );
+            assert_eq!(guarded.lookup(&key, TrxID::new(104)).await.unwrap(), None);
         });
     }
 
@@ -646,70 +644,37 @@ mod tests {
                     nullable: false,
                 }]),
             };
+            let guarded = index.bind(&pool_guard);
 
             let cold_live_key = vec![Val::from(1i32)];
             let hot_live_key = vec![Val::from(2i32)];
             let cold_deleted_key = vec![Val::from(3i32)];
             let hot_deleted_key = vec![Val::from(4i32)];
-            index
-                .insert_if_not_exists(
-                    &pool_guard,
-                    &cold_live_key,
-                    RowID::new(10),
-                    false,
-                    TrxID::new(100),
-                )
+            guarded
+                .insert_if_not_exists(&cold_live_key, RowID::new(10), false, TrxID::new(100))
                 .await
                 .unwrap();
-            index
-                .insert_if_not_exists(
-                    &pool_guard,
-                    &hot_live_key,
-                    RowID::new(200),
-                    false,
-                    TrxID::new(100),
-                )
+            guarded
+                .insert_if_not_exists(&hot_live_key, RowID::new(200), false, TrxID::new(100))
                 .await
                 .unwrap();
-            index
-                .insert_if_not_exists(
-                    &pool_guard,
-                    &cold_deleted_key,
-                    RowID::new(30),
-                    false,
-                    TrxID::new(100),
-                )
+            guarded
+                .insert_if_not_exists(&cold_deleted_key, RowID::new(30), false, TrxID::new(100))
                 .await
                 .unwrap();
             assert!(
-                index
-                    .mask_as_deleted(
-                        &pool_guard,
-                        &cold_deleted_key,
-                        RowID::new(30),
-                        TrxID::new(101)
-                    )
+                guarded
+                    .mask_as_deleted(&cold_deleted_key, RowID::new(30), TrxID::new(101))
                     .await
                     .unwrap()
             );
-            index
-                .insert_if_not_exists(
-                    &pool_guard,
-                    &hot_deleted_key,
-                    RowID::new(300),
-                    false,
-                    TrxID::new(100),
-                )
+            guarded
+                .insert_if_not_exists(&hot_deleted_key, RowID::new(300), false, TrxID::new(100))
                 .await
                 .unwrap();
             assert!(
-                index
-                    .mask_as_deleted(
-                        &pool_guard,
-                        &hot_deleted_key,
-                        RowID::new(300),
-                        TrxID::new(101)
-                    )
+                guarded
+                    .mask_as_deleted(&hot_deleted_key, RowID::new(300), TrxID::new(101))
                     .await
                     .unwrap()
             );
@@ -733,10 +698,7 @@ mod tests {
         });
     }
 
-    async fn run_test_suit_for_single_key_unique_index<T: UniqueIndex>(
-        index: &T,
-        pool_guard: &PoolGuard,
-    ) {
+    async fn run_test_suit_for_single_key_unique_index<T: UniqueIndex>(index: T) {
         // 测试用例1：基本插入和查找操作
         let key = vec![Val::from(42i32)];
         let row_id = 100u64;
@@ -744,7 +706,7 @@ mod tests {
         // 测试插入
         assert!(
             index
-                .insert_if_not_exists(pool_guard, &key, RowID::new(row_id), false, TrxID::new(100))
+                .insert_if_not_exists(&key, RowID::new(row_id), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
@@ -752,10 +714,7 @@ mod tests {
 
         // 测试查找
         assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id), false))
         );
 
@@ -763,7 +722,7 @@ mod tests {
         let non_existent_key = vec![Val::from(43i32)];
         assert_eq!(
             index
-                .lookup(pool_guard, &non_existent_key, TrxID::new(100))
+                .lookup(&non_existent_key, TrxID::new(100))
                 .await
                 .unwrap(),
             None
@@ -772,13 +731,7 @@ mod tests {
         // 测试用例2：重复插入
         let new_row_id = 200u64;
         let old_row_id = index
-            .insert_if_not_exists(
-                pool_guard,
-                &key,
-                RowID::new(new_row_id),
-                false,
-                TrxID::new(100),
-            )
+            .insert_if_not_exists(&key, RowID::new(new_row_id), false, TrxID::new(100))
             .await
             .unwrap();
         assert_eq!(
@@ -786,38 +739,23 @@ mod tests {
             IndexInsert::DuplicateKey(RowID::new(row_id), false)
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id), false))
         );
 
         // 测试用例3：删除操作
         assert!(
             index
-                .compare_delete(pool_guard, &key, RowID::new(row_id), true, TrxID::new(100))
+                .compare_delete(&key, RowID::new(row_id), true, TrxID::new(100))
                 .await
                 .unwrap()
         );
-        assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(index.lookup(&key, TrxID::new(100)).await.unwrap(), None);
 
         // 测试删除不存在的键 still ok
         assert!(
             index
-                .compare_delete(
-                    pool_guard,
-                    &key,
-                    RowID::new(new_row_id),
-                    false,
-                    TrxID::new(100)
-                )
+                .compare_delete(&key, RowID::new(new_row_id), false, TrxID::new(100))
                 .await
                 .unwrap()
         );
@@ -830,13 +768,7 @@ mod tests {
         // 先插入一个值
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key,
-                    RowID::new(row_id1),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key, RowID::new(row_id1), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok(),
@@ -846,7 +778,6 @@ mod tests {
         assert!(
             index
                 .compare_exchange(
-                    pool_guard,
                     &key,
                     RowID::new(row_id1),
                     RowID::new(row_id2),
@@ -857,10 +788,7 @@ mod tests {
                 == IndexCompareExchange::Ok
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id2), false))
         );
 
@@ -868,7 +796,6 @@ mod tests {
         assert!(
             index
                 .compare_exchange(
-                    pool_guard,
                     &key,
                     RowID::new(row_id1),
                     RowID::new(row_id2),
@@ -882,7 +809,7 @@ mod tests {
         // 测试用例5：scan_values 操作
         let mut values = Vec::new();
         index
-            .scan_values(pool_guard, &mut values, TrxID::new(100))
+            .scan_values(&mut values, TrxID::new(100))
             .await
             .unwrap();
         assert_eq!(values.len(), 1);
@@ -900,39 +827,21 @@ mod tests {
         // 插入多个键值对
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key1,
-                    RowID::new(row_id1),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key1, RowID::new(row_id1), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
         );
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key2,
-                    RowID::new(row_id2),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key2, RowID::new(row_id2), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
         );
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key3,
-                    RowID::new(row_id3),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key3, RowID::new(row_id3), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
@@ -940,40 +849,28 @@ mod tests {
 
         // 验证所有键都能正确查找
         assert_eq!(
-            index
-                .lookup(pool_guard, &key1, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key1, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id1), false))
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key2, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key2, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id2), false))
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key3, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key3, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id3), false))
         );
 
         // 验证 scan_values 包含所有值
         let mut values = Vec::new();
         index
-            .scan_values(pool_guard, &mut values, TrxID::new(100))
+            .scan_values(&mut values, TrxID::new(100))
             .await
             .unwrap();
         assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
     }
 
-    async fn run_test_suit_for_multi_key_unique_index<T: UniqueIndex>(
-        index: &T,
-        pool_guard: &PoolGuard,
-    ) {
+    async fn run_test_suit_for_multi_key_unique_index<T: UniqueIndex>(index: T) {
         // 测试用例1：基本插入和查找操作
         let key = vec![Val::from("hello"), Val::from(42i32)];
         let row_id = 100u64;
@@ -981,7 +878,7 @@ mod tests {
         // 测试插入
         assert!(
             index
-                .insert_if_not_exists(pool_guard, &key, RowID::new(row_id), false, TrxID::new(100))
+                .insert_if_not_exists(&key, RowID::new(row_id), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
@@ -989,10 +886,7 @@ mod tests {
 
         // 测试查找
         assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id), false))
         );
 
@@ -1000,7 +894,7 @@ mod tests {
         let non_existent_key = vec![Val::from("hello"), Val::from(43i32)];
         assert_eq!(
             index
-                .lookup(pool_guard, &non_existent_key, TrxID::new(100))
+                .lookup(&non_existent_key, TrxID::new(100))
                 .await
                 .unwrap(),
             None
@@ -1009,13 +903,7 @@ mod tests {
         // 测试用例2：重复插入
         let new_row_id = 200u64;
         let old_row_id = index
-            .insert_if_not_exists(
-                pool_guard,
-                &key,
-                RowID::new(new_row_id),
-                false,
-                TrxID::new(100),
-            )
+            .insert_if_not_exists(&key, RowID::new(new_row_id), false, TrxID::new(100))
             .await
             .unwrap();
         assert_eq!(
@@ -1023,38 +911,23 @@ mod tests {
             IndexInsert::DuplicateKey(RowID::new(row_id), false)
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id), false))
         );
 
         // 测试用例3：删除操作
         assert!(
             index
-                .compare_delete(pool_guard, &key, RowID::new(row_id), true, TrxID::new(100))
+                .compare_delete(&key, RowID::new(row_id), true, TrxID::new(100))
                 .await
                 .unwrap()
         );
-        assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(index.lookup(&key, TrxID::new(100)).await.unwrap(), None);
 
         // 测试删除不存在的键 still ok
         assert!(
             index
-                .compare_delete(
-                    pool_guard,
-                    &key,
-                    RowID::new(new_row_id),
-                    false,
-                    TrxID::new(100)
-                )
+                .compare_delete(&key, RowID::new(new_row_id), false, TrxID::new(100))
                 .await
                 .unwrap()
         );
@@ -1067,13 +940,7 @@ mod tests {
         // 先插入一个值
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key,
-                    RowID::new(row_id1),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key, RowID::new(row_id1), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
@@ -1083,7 +950,6 @@ mod tests {
         assert!(
             index
                 .compare_exchange(
-                    pool_guard,
                     &key,
                     RowID::new(row_id1),
                     RowID::new(row_id2),
@@ -1094,10 +960,7 @@ mod tests {
                 == IndexCompareExchange::Ok
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id2), false))
         );
 
@@ -1105,7 +968,6 @@ mod tests {
         assert!(
             index
                 .compare_exchange(
-                    pool_guard,
                     &key,
                     RowID::new(row_id1),
                     RowID::new(row_id2),
@@ -1119,7 +981,7 @@ mod tests {
         // 测试用例5：scan_values 操作
         let mut values = Vec::new();
         index
-            .scan_values(pool_guard, &mut values, TrxID::new(100))
+            .scan_values(&mut values, TrxID::new(100))
             .await
             .unwrap();
         assert_eq!(values.len(), 1);
@@ -1137,39 +999,21 @@ mod tests {
         // 插入多个键值对
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key1,
-                    RowID::new(row_id1),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key1, RowID::new(row_id1), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
         );
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key2,
-                    RowID::new(row_id2),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key2, RowID::new(row_id2), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
         );
         assert!(
             index
-                .insert_if_not_exists(
-                    pool_guard,
-                    &key3,
-                    RowID::new(row_id3),
-                    false,
-                    TrxID::new(100)
-                )
+                .insert_if_not_exists(&key3, RowID::new(row_id3), false, TrxID::new(100))
                 .await
                 .unwrap()
                 .is_ok()
@@ -1177,31 +1021,22 @@ mod tests {
 
         // 验证所有键都能正确查找
         assert_eq!(
-            index
-                .lookup(pool_guard, &key1, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key1, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id1), false))
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key2, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key2, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id2), false))
         );
         assert_eq!(
-            index
-                .lookup(pool_guard, &key3, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key3, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id3), false))
         );
 
         // 验证 scan_values 包含所有值
         let mut values = Vec::new();
         index
-            .scan_values(pool_guard, &mut values, TrxID::new(100))
+            .scan_values(&mut values, TrxID::new(100))
             .await
             .unwrap();
         assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
@@ -1210,38 +1045,23 @@ mod tests {
         let key4 = vec![Val::from("rust"), Val::from(97i32)];
         let row_id4 = 800u64;
         let inserted = index
-            .insert_if_not_exists(
-                pool_guard,
-                &key4,
-                RowID::new(row_id4),
-                false,
-                TrxID::new(100),
-            )
+            .insert_if_not_exists(&key4, RowID::new(row_id4), false, TrxID::new(100))
             .await
             .unwrap();
         assert!(inserted.is_ok());
         let masked = index
-            .mask_as_deleted(pool_guard, &key4, RowID::new(row_id4), TrxID::new(100))
+            .mask_as_deleted(&key4, RowID::new(row_id4), TrxID::new(100))
             .await
             .unwrap();
         assert!(masked);
         let inserted = index
-            .insert_if_not_exists(
-                pool_guard,
-                &key4,
-                RowID::new(row_id4),
-                true,
-                TrxID::new(100),
-            )
+            .insert_if_not_exists(&key4, RowID::new(row_id4), true, TrxID::new(100))
             .await
             .unwrap();
         assert!(inserted.is_ok());
         assert!(matches!(inserted, IndexInsert::Ok(true)));
         assert_eq!(
-            index
-                .lookup(pool_guard, &key4, TrxID::new(100))
-                .await
-                .unwrap(),
+            index.lookup(&key4, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id4), false))
         );
     }

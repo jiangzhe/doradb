@@ -1225,7 +1225,8 @@ async fn insert_create_index_unique_hot_rows(
 ) -> Result<()> {
     for row in hot_rows {
         match mem
-            .insert_if_not_exists(index_guard, &row.key, row.row_id, false, build_ts)
+            .bind(index_guard)
+            .insert_if_not_exists(&row.key, row.row_id, false, build_ts)
             .await?
         {
             IndexInsert::Ok(_) => (),
@@ -1248,7 +1249,8 @@ async fn insert_create_index_non_unique_hot_rows(
 ) -> Result<()> {
     for row in hot_rows {
         match mem
-            .insert_if_not_exists(index_guard, &row.key, row.row_id, false, build_ts)
+            .bind(index_guard)
+            .insert_if_not_exists(&row.key, row.row_id, false, build_ts)
             .await?
         {
             IndexInsert::Ok(_) => (),
@@ -2316,12 +2318,9 @@ mod tests {
         let index = layout
             .secondary_index(index_no)
             .unwrap()
-            .bind_unique(root)
+            .bind_unique(guards, root)
             .unwrap();
-        index
-            .lookup(guards.index_guard(), key, MAX_SNAPSHOT_TS)
-            .await
-            .unwrap()
+        index.lookup(key, MAX_SNAPSHOT_TS).await.unwrap()
     }
 
     async fn non_unique_runtime_lookup(
@@ -2334,13 +2333,10 @@ mod tests {
         let index = layout
             .secondary_index(index_no)
             .unwrap()
-            .bind_non_unique(root)
+            .bind_non_unique(guards, root)
             .unwrap();
         let mut rows = Vec::new();
-        index
-            .lookup(guards.index_guard(), key, &mut rows, MAX_SNAPSHOT_TS)
-            .await
-            .unwrap();
+        index.lookup(key, &mut rows, MAX_SNAPSHOT_TS).await.unwrap();
         rows
     }
 

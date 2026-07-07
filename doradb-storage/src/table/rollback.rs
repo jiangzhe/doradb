@@ -206,7 +206,8 @@ impl IndexRollback for UserTableRollback<'_> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .unique_mem()?
-            .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
+            .bind(index_pool_guard)
+            .mask_as_deleted(&key.vals, row_id, ts)
             .await
     }
 
@@ -222,7 +223,8 @@ impl IndexRollback for UserTableRollback<'_> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .unique_mem()?
-            .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
+            .bind(index_pool_guard)
+            .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
     }
 
@@ -238,7 +240,8 @@ impl IndexRollback for UserTableRollback<'_> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .unique_mem()?
-            .compare_exchange(index_pool_guard, &key.vals, old_row_id, new_row_id, ts)
+            .bind(index_pool_guard)
+            .compare_exchange(&key.vals, old_row_id, new_row_id, ts)
             .await
     }
 
@@ -253,7 +256,8 @@ impl IndexRollback for UserTableRollback<'_> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .non_unique_mem()?
-            .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
+            .bind(index_pool_guard)
+            .mask_as_deleted(&key.vals, row_id, ts)
             .await
     }
 
@@ -268,7 +272,8 @@ impl IndexRollback for UserTableRollback<'_> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .non_unique_mem()?
-            .mask_as_active(index_pool_guard, &key.vals, row_id, ts)
+            .bind(index_pool_guard)
+            .mask_as_active(&key.vals, row_id, ts)
             .await
     }
 
@@ -284,7 +289,8 @@ impl IndexRollback for UserTableRollback<'_> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .non_unique_mem()?
-            .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
+            .bind(index_pool_guard)
+            .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
     }
 }
@@ -329,7 +335,8 @@ impl IndexRollback for CatalogTable {
             .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| secondary_index_kind_mismatch("rollback unique mask deleted", "unique"))?
-            .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
+            .bind(index_pool_guard)
+            .mask_as_deleted(&key.vals, row_id, ts)
             .await
     }
 
@@ -348,7 +355,8 @@ impl IndexRollback for CatalogTable {
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback unique compare delete", "unique")
             })?
-            .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
+            .bind(index_pool_guard)
+            .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
     }
 
@@ -367,7 +375,8 @@ impl IndexRollback for CatalogTable {
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback unique compare exchange", "unique")
             })?
-            .compare_exchange(index_pool_guard, &key.vals, old_row_id, new_row_id, ts)
+            .bind(index_pool_guard)
+            .compare_exchange(&key.vals, old_row_id, new_row_id, ts)
             .await
     }
 
@@ -385,7 +394,8 @@ impl IndexRollback for CatalogTable {
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback non-unique mask deleted", "non-unique")
             })?
-            .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
+            .bind(index_pool_guard)
+            .mask_as_deleted(&key.vals, row_id, ts)
             .await
     }
 
@@ -403,7 +413,8 @@ impl IndexRollback for CatalogTable {
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback non-unique mask active", "non-unique")
             })?
-            .mask_as_active(index_pool_guard, &key.vals, row_id, ts)
+            .bind(index_pool_guard)
+            .mask_as_active(&key.vals, row_id, ts)
             .await
     }
 
@@ -422,7 +433,8 @@ impl IndexRollback for CatalogTable {
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback non-unique compare delete", "non-unique")
             })?
-            .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
+            .bind(index_pool_guard)
+            .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
     }
 }
@@ -573,14 +585,15 @@ mod tests {
                 RowLocation::NotFound
             ));
 
+            let pool_guards = session.pool_guards();
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 key.index_no,
             );
             assert!(
                 index
                     .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
                         &key.vals,
                         RowID::new(stale_row_id),
                         false,
@@ -592,12 +605,7 @@ mod tests {
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        RowID::new(stale_row_id),
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&key.vals, RowID::new(stale_row_id), MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -682,15 +690,13 @@ mod tests {
             .await;
 
             let reader = session.begin_trx().unwrap();
+            let pool_guards = session.pool_guards();
             let old_row_id = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 live_key.index_no,
             )
-            .lookup(
-                session.pool_guards().index_guard(),
-                &live_key.vals,
-                reader.sts(),
-            )
+            .lookup(&live_key.vals, reader.sts())
             .await
             .unwrap()
             .unwrap()
@@ -706,29 +712,19 @@ mod tests {
 
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 stale_key.index_no,
             );
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        old_row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, old_row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        old_row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, old_row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );

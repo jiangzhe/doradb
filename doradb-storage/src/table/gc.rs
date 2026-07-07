@@ -652,7 +652,12 @@ mod tests {
             session.freeze_table(table_id, usize::MAX).await.unwrap();
             checkpoint_published(table_id, &mut session).await;
 
-            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let pool_guards = session.pool_guards();
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            );
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
@@ -671,20 +676,13 @@ mod tests {
                 let key = single_key(key_value);
                 let disk_row_id = unique_disk_tree_lookup(
                     &table_for_internal_assertion(&engine, table_id),
-                    &session.pool_guards(),
+                    &pool_guards,
                     &key,
                 )
                 .await
                 .unwrap();
                 assert_eq!(
-                    index
-                        .lookup(
-                            session.pool_guards().index_guard(),
-                            &key.vals,
-                            MAX_SNAPSHOT_TS,
-                        )
-                        .await
-                        .unwrap(),
+                    index.lookup(&key.vals, MAX_SNAPSHOT_TS,).await.unwrap(),
                     Some((disk_row_id, false))
                 );
             }
@@ -729,8 +727,12 @@ mod tests {
             session.freeze_table(table_id, usize::MAX).await.unwrap();
             checkpoint_published(table_id, &mut session).await;
 
-            let index =
-                bound_non_unique_index_no(&table_for_internal_assertion(&engine, table_id), 1);
+            let pool_guards = session.pool_guards();
+            let index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                1,
+            );
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
@@ -747,19 +749,14 @@ mod tests {
             let key = name_key("same-name");
             let disk_rows = non_unique_disk_tree_prefix_scan(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &key,
             )
             .await;
             assert_eq!(disk_rows.len(), row_count as usize);
             let mut lookup_rows = Vec::new();
             index
-                .lookup(
-                    session.pool_guards().index_guard(),
-                    &key.vals,
-                    &mut lookup_rows,
-                    MAX_SNAPSHOT_TS,
-                )
+                .lookup(&key.vals, &mut lookup_rows, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert_eq!(lookup_rows, disk_rows);
@@ -807,10 +804,17 @@ mod tests {
             session.freeze_table(table_id, usize::MAX).await.unwrap();
             checkpoint_published(table_id, &mut session).await;
 
-            let unique_index =
-                bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
-            let non_unique_index =
-                bound_non_unique_index_no(&table_for_internal_assertion(&engine, table_id), 1);
+            let pool_guards = session.pool_guards();
+            let unique_index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            );
+            let non_unique_index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                1,
+            );
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, false)
                 .await
@@ -827,18 +831,14 @@ mod tests {
             let unique_key = single_key(0i32);
             let unique_row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &unique_key,
             )
             .await
             .unwrap();
             assert_eq!(
                 unique_index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &unique_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&unique_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((unique_row_id, false))
@@ -847,18 +847,13 @@ mod tests {
             let name_key = name_key("same-name");
             let disk_rows = non_unique_disk_tree_prefix_scan(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &name_key,
             )
             .await;
             let mut lookup_rows = Vec::new();
             non_unique_index
-                .lookup(
-                    session.pool_guards().index_guard(),
-                    &name_key.vals,
-                    &mut lookup_rows,
-                    MAX_SNAPSHOT_TS,
-                )
+                .lookup(&name_key.vals, &mut lookup_rows, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert_eq!(lookup_rows, disk_rows);
@@ -877,38 +872,28 @@ mod tests {
 
             let current_key = single_key(0i32);
             let stale_key = single_key(-1i32);
-            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let pool_guards = session.pool_guards();
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            );
             let row_id = index
-                .lookup(
-                    session.pool_guards().index_guard(),
-                    &current_key.vals,
-                    MAX_SNAPSHOT_TS,
-                )
+                .lookup(&current_key.vals, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
                 .unwrap()
                 .0;
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -924,22 +909,14 @@ mod tests {
             assert_eq!(stats.indexes[0].skipped_hot_deleted, 1);
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, true))
             );
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&current_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, false))
@@ -961,35 +938,29 @@ mod tests {
 
             let current_key = single_key(0i32);
             let stale_key = single_key(-1i32);
+            let pool_guards = session.pool_guards();
             let row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &current_key,
             )
             .await
             .unwrap();
-            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            );
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1009,11 +980,7 @@ mod tests {
             assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 None
@@ -1035,35 +1002,29 @@ mod tests {
 
             let current_key = single_key(0i32);
             let stale_key = single_key(-1i32);
+            let pool_guards = session.pool_guards();
             let row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &current_key,
             )
             .await
             .unwrap();
-            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            );
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1083,22 +1044,14 @@ mod tests {
             assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 None
             );
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&current_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, false))
@@ -1119,22 +1072,22 @@ mod tests {
             checkpoint_published(table_id, &mut session).await;
 
             let current_key = single_key(0i32);
+            let pool_guards = session.pool_guards();
             let row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &current_key,
             )
             .await
             .unwrap();
-            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1150,11 +1103,7 @@ mod tests {
             assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&current_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, true))
@@ -1175,11 +1124,7 @@ mod tests {
             assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&current_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, false))
@@ -1202,9 +1147,10 @@ mod tests {
 
             let current_key = single_key(0i32);
             let stale_key = single_key(-1i32);
+            let pool_guards = session.pool_guards();
             let row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &current_key,
             )
             .await
@@ -1212,55 +1158,40 @@ mod tests {
             assert_eq!(
                 unique_disk_tree_lookup(
                     &table_for_internal_assertion(&engine, table_id),
-                    &session.pool_guards(),
+                    &pool_guards,
                     &stale_key
                 )
                 .await,
                 None
             );
-            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            );
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, true))
             );
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&current_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, false))
@@ -1277,22 +1208,14 @@ mod tests {
             assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 None
             );
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&current_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, false))
@@ -1316,11 +1239,11 @@ mod tests {
             let current_key = single_key(0i32);
             let stale_key = single_key(-1i32);
             let table = table_for_internal_assertion(&engine, table_id);
-            let row_id = unique_disk_tree_lookup(&table, &session.pool_guards(), &current_key)
+            let pool_guards = session.pool_guards();
+            let row_id = unique_disk_tree_lookup(&table, &pool_guards, &current_key)
                 .await
                 .unwrap();
             let block_id = {
-                let pool_guards = session.pool_guards();
                 let snapshot = column_block_index_snapshot(&engine, table_id);
                 let column_index = snapshot.index(pool_guards.disk_guard());
                 column_index
@@ -1330,28 +1253,17 @@ mod tests {
                     .unwrap()
                     .block_id()
             };
-            let index = bound_unique_index_no(&table, 0);
+            let index = bound_unique_index_no(&table, &pool_guards, 0);
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1374,11 +1286,7 @@ mod tests {
             );
             assert_eq!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some((row_id, true))
@@ -1398,42 +1306,33 @@ mod tests {
             insert_rows(table_id, &mut session, 0, 1, "current").await;
 
             let pk = single_key(0i32);
-            let row_id = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0)
-                .lookup(
-                    session.pool_guards().index_guard(),
-                    &pk.vals,
-                    MAX_SNAPSHOT_TS,
-                )
-                .await
-                .unwrap()
-                .unwrap()
-                .0;
+            let pool_guards = session.pool_guards();
+            let row_id = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                0,
+            )
+            .lookup(&pk.vals, MAX_SNAPSHOT_TS)
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
             let stale_key = name_key("stale");
             let index = bound_non_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 stale_key.index_no,
             );
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1449,12 +1348,7 @@ mod tests {
             assert_eq!(stats.indexes[1].skipped_hot_deleted, 1);
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(false)
@@ -1476,9 +1370,10 @@ mod tests {
             checkpoint_published(table_id, &mut session).await;
 
             let pk = single_key(0i32);
+            let pool_guards = session.pool_guards();
             let row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &pk,
             )
             .await
@@ -1486,29 +1381,19 @@ mod tests {
             let stale_key = name_key("stale");
             let index = bound_non_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 stale_key.index_no,
             );
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1528,12 +1413,7 @@ mod tests {
             assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 None
@@ -1555,9 +1435,10 @@ mod tests {
             checkpoint_published(table_id, &mut session).await;
 
             let pk = single_key(0i32);
+            let pool_guards = session.pool_guards();
             let row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &pk,
             )
             .await
@@ -1565,16 +1446,12 @@ mod tests {
             let current_key = name_key("current");
             let index = bound_non_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 current_key.index_no,
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1590,12 +1467,7 @@ mod tests {
             assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(false)
@@ -1616,12 +1488,7 @@ mod tests {
             assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(true)
@@ -1646,9 +1513,10 @@ mod tests {
             let pk = single_key(0i32);
             let current_key = name_key("current");
             let stale_key = name_key("stale");
+            let pool_guards = session.pool_guards();
             let row_id = unique_disk_tree_lookup(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &pk,
             )
             .await
@@ -1656,7 +1524,7 @@ mod tests {
             assert!(
                 non_unique_disk_tree_prefix_scan(
                     &table_for_internal_assertion(&engine, table_id),
-                    &session.pool_guards(),
+                    &pool_guards,
                     &stale_key
                 )
                 .await
@@ -1665,7 +1533,7 @@ mod tests {
             assert_eq!(
                 non_unique_disk_tree_prefix_scan(
                     &table_for_internal_assertion(&engine, table_id),
-                    &session.pool_guards(),
+                    &pool_guards,
                     &current_key
                 )
                 .await,
@@ -1673,52 +1541,32 @@ mod tests {
             );
             let index = bound_non_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 stale_key.index_no,
             );
             assert!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        false,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(false)
             );
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(true)
@@ -1735,24 +1583,14 @@ mod tests {
             assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 None
             );
             assert_eq!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(true)
@@ -1774,9 +1612,10 @@ mod tests {
 
             let key = single_key(0i32);
             let reader = session.begin_trx().unwrap();
+            let pool_guards = session.pool_guards();
             let row_id = assert_row_in_lwc(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &key,
                 reader.sts(),
             )
@@ -1785,16 +1624,12 @@ mod tests {
 
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 key.index_no,
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1807,7 +1642,7 @@ mod tests {
 
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&session.pool_guards(), &key, row_id, true, TrxID::new(11))
+                .delete_index(&pool_guards, &key, row_id, true, TrxID::new(11))
                 .await
                 .unwrap();
             assert!(deleted);
@@ -1815,13 +1650,7 @@ mod tests {
             // after purge it falls through to the immutable cold root instead.
             assert_eq!(
                 index
-                    .insert_if_not_exists(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        row_id,
-                        true,
-                        TrxID::new(11),
-                    )
+                    .insert_if_not_exists(&key.vals, row_id, true, TrxID::new(11),)
                     .await
                     .unwrap(),
                 IndexInsert::DuplicateKey(row_id, false)
@@ -1844,9 +1673,10 @@ mod tests {
             let current_key = single_key(0i32);
             let stale_key = single_key(-1i32);
             let reader = session.begin_trx().unwrap();
+            let pool_guards = session.pool_guards();
             let row_id = assert_row_in_lwc(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &current_key,
                 reader.sts(),
             )
@@ -1855,49 +1685,29 @@ mod tests {
 
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 current_key.index_no,
             );
             let _ = index
-                .insert_if_not_exists(
-                    session.pool_guards().index_guard(),
-                    &stale_key.vals,
-                    row_id,
-                    false,
-                    MAX_SNAPSHOT_TS,
-                )
+                .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(
-                    &session.pool_guards(),
-                    &stale_key,
-                    row_id,
-                    true,
-                    MAX_SNAPSHOT_TS,
-                )
+                .delete_index(&pool_guards, &stale_key, row_id, true, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert!(deleted);
             assert!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_none()
@@ -1905,12 +1715,7 @@ mod tests {
 
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1921,21 +1726,13 @@ mod tests {
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(
-                    &session.pool_guards(),
-                    &current_key,
-                    row_id,
-                    true,
-                    TrxID::new(100),
-                )
+                .delete_index(&pool_guards, &current_key, row_id, true, TrxID::new(100))
                 .await
                 .unwrap();
             assert!(!deleted);
             assert!(matches!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
+                    .lookup(&current_key.vals,
                         MAX_SNAPSHOT_TS,
                     )
                     .await
@@ -1962,9 +1759,10 @@ mod tests {
             let current_key = name_key("current");
             let stale_key = name_key("stale");
             let reader = session.begin_trx().unwrap();
+            let pool_guards = session.pool_guards();
             let row_id = assert_row_in_lwc(
                 &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
+                &pool_guards,
                 &pk,
                 reader.sts(),
             )
@@ -1973,50 +1771,29 @@ mod tests {
 
             let index = bound_non_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 current_key.index_no,
             );
             let _ = index
-                .insert_if_not_exists(
-                    session.pool_guards().index_guard(),
-                    &stale_key.vals,
-                    row_id,
-                    false,
-                    MAX_SNAPSHOT_TS,
-                )
+                .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(
-                    &session.pool_guards(),
-                    &stale_key,
-                    row_id,
-                    false,
-                    MAX_SNAPSHOT_TS,
-                )
+                .delete_index(&pool_guards, &stale_key, row_id, false, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert!(deleted);
             assert!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &stale_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_none()
@@ -2024,12 +1801,7 @@ mod tests {
 
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -2040,24 +1812,13 @@ mod tests {
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(
-                    &session.pool_guards(),
-                    &current_key,
-                    row_id,
-                    false,
-                    TrxID::new(200),
-                )
+                .delete_index(&pool_guards, &current_key, row_id, false, TrxID::new(200))
                 .await
                 .unwrap();
             assert!(!deleted);
             assert!(matches!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &current_key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(false)
@@ -2075,28 +1836,19 @@ mod tests {
             let session = engine.new_session().unwrap();
             let key = single_key(9999i32);
             let row_id = 9999;
+            let pool_guards = session.pool_guards();
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 key.index_no,
             );
             let _ = index
-                .insert_if_not_exists(
-                    session.pool_guards().index_guard(),
-                    &key.vals,
-                    RowID::new(row_id),
-                    false,
-                    MAX_SNAPSHOT_TS,
-                )
+                .insert_if_not_exists(&key.vals, RowID::new(row_id), false, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        RowID::new(row_id),
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&key.vals, RowID::new(row_id), MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -2106,7 +1858,7 @@ mod tests {
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
                 .delete_index(
-                    &session.pool_guards(),
+                    &pool_guards,
                     &key,
                     RowID::new(row_id),
                     true,
@@ -2117,11 +1869,7 @@ mod tests {
             assert!(deleted);
             assert!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup(&key.vals, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_none()
@@ -2154,15 +1902,15 @@ mod tests {
                     .get(row_id)
                     .unwrap(),
             ) + 1;
+            let pool_guards = session.pool_guards();
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 key.index_no,
             );
             assert!(matches!(
                 index
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
+                    .lookup(&key.vals,
                         MAX_SNAPSHOT_TS,
                     )
                     .await
@@ -2176,7 +1924,7 @@ mod tests {
 
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&session.pool_guards(), &key, row_id, true, min_active_sts)
+                .delete_index(&pool_guards, &key, row_id, true, min_active_sts)
                 .await
                 .unwrap();
             assert!(!deleted);
@@ -2212,18 +1960,15 @@ mod tests {
                     .get(row_id)
                     .unwrap(),
             ) + 1;
+            let pool_guards = session.pool_guards();
             let index = bound_non_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 key.index_no,
             );
             assert!(matches!(
                 index
-                    .lookup_unique(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .lookup_unique(&key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap(),
                 Some(false)
@@ -2238,7 +1983,7 @@ mod tests {
 
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&session.pool_guards(), &key, row_id, false, min_active_sts)
+                .delete_index(&pool_guards, &key, row_id, false, min_active_sts)
                 .await
                 .unwrap();
             assert!(!deleted);

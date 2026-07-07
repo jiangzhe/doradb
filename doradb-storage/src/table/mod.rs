@@ -2342,31 +2342,26 @@ pub(crate) mod tests {
         table.file().active_root_unchecked().secondary_index_roots[index_no]
     }
 
-    pub(crate) struct BoundUniqueIndexNo {
+    pub(crate) struct BoundUniqueIndexNo<'a> {
         layout: Arc<TableRuntimeLayout>,
+        guards: &'a PoolGuards,
         index_no: usize,
         root: BlockID,
     }
 
-    impl UniqueIndex for BoundUniqueIndexNo {
+    impl UniqueIndex for BoundUniqueIndexNo<'_> {
         #[inline]
-        async fn lookup(
-            &self,
-            pool_guard: &PoolGuard,
-            key: &[Val],
-            ts: TrxID,
-        ) -> Result<Option<(RowID, bool)>> {
+        async fn lookup(&self, key: &[Val], ts: TrxID) -> Result<Option<(RowID, bool)>> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.root)?
-                .lookup(pool_guard, key, ts)
+                .bind_unique(self.guards, self.root)?
+                .lookup(key, ts)
                 .await
         }
 
         #[inline]
         async fn insert_if_not_exists(
             &self,
-            pool_guard: &PoolGuard,
             key: &[Val],
             row_id: RowID,
             merge_if_match_deleted: bool,
@@ -2374,15 +2369,14 @@ pub(crate) mod tests {
         ) -> Result<IndexInsert> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.root)?
-                .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+                .bind_unique(self.guards, self.root)?
+                .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
                 .await
         }
 
         #[inline]
         async fn compare_delete(
             &self,
-            pool_guard: &PoolGuard,
             key: &[Val],
             old_row_id: RowID,
             ignore_del_mask: bool,
@@ -2390,15 +2384,14 @@ pub(crate) mod tests {
         ) -> Result<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.root)?
-                .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
+                .bind_unique(self.guards, self.root)?
+                .compare_delete(key, old_row_id, ignore_del_mask, ts)
                 .await
         }
 
         #[inline]
         async fn compare_exchange(
             &self,
-            pool_guard: &PoolGuard,
             key: &[Val],
             old_row_id: RowID,
             new_row_id: RowID,
@@ -2406,67 +2399,55 @@ pub(crate) mod tests {
         ) -> Result<IndexCompareExchange> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.root)?
-                .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+                .bind_unique(self.guards, self.root)?
+                .compare_exchange(key, old_row_id, new_row_id, ts)
                 .await
         }
 
         #[inline]
-        async fn scan_values(
-            &self,
-            pool_guard: &PoolGuard,
-            values: &mut Vec<RowID>,
-            ts: TrxID,
-        ) -> Result<()> {
+        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.root)?
-                .scan_values(pool_guard, values, ts)
+                .bind_unique(self.guards, self.root)?
+                .scan_values(values, ts)
                 .await
         }
     }
 
-    pub(crate) struct BoundNonUniqueIndexNo {
+    pub(crate) struct BoundNonUniqueIndexNo<'a> {
         layout: Arc<TableRuntimeLayout>,
+        guards: &'a PoolGuards,
         index_no: usize,
         root: BlockID,
     }
 
-    impl NonUniqueIndex for BoundNonUniqueIndexNo {
+    impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         #[inline]
-        async fn lookup(
-            &self,
-            pool_guard: &PoolGuard,
-            key: &[Val],
-            res: &mut Vec<RowID>,
-            ts: TrxID,
-        ) -> Result<()> {
+        async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.root)?
-                .lookup(pool_guard, key, res, ts)
+                .bind_non_unique(self.guards, self.root)?
+                .lookup(key, res, ts)
                 .await
         }
 
         #[inline]
         async fn lookup_unique(
             &self,
-            pool_guard: &PoolGuard,
             key: &[Val],
             row_id: RowID,
             ts: TrxID,
         ) -> Result<Option<bool>> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.root)?
-                .lookup_unique(pool_guard, key, row_id, ts)
+                .bind_non_unique(self.guards, self.root)?
+                .lookup_unique(key, row_id, ts)
                 .await
         }
 
         #[inline]
         async fn insert_if_not_exists(
             &self,
-            pool_guard: &PoolGuard,
             key: &[Val],
             row_id: RowID,
             merge_if_match_deleted: bool,
@@ -2474,45 +2455,32 @@ pub(crate) mod tests {
         ) -> Result<IndexInsert> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.root)?
-                .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+                .bind_non_unique(self.guards, self.root)?
+                .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
                 .await
         }
 
         #[inline]
-        async fn mask_as_deleted(
-            &self,
-            pool_guard: &PoolGuard,
-            key: &[Val],
-            row_id: RowID,
-            ts: TrxID,
-        ) -> Result<bool> {
+        async fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.root)?
-                .mask_as_deleted(pool_guard, key, row_id, ts)
+                .bind_non_unique(self.guards, self.root)?
+                .mask_as_deleted(key, row_id, ts)
                 .await
         }
 
         #[inline]
-        async fn mask_as_active(
-            &self,
-            pool_guard: &PoolGuard,
-            key: &[Val],
-            row_id: RowID,
-            ts: TrxID,
-        ) -> Result<bool> {
+        async fn mask_as_active(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.root)?
-                .mask_as_active(pool_guard, key, row_id, ts)
+                .bind_non_unique(self.guards, self.root)?
+                .mask_as_active(key, row_id, ts)
                 .await
         }
 
         #[inline]
         async fn compare_delete(
             &self,
-            pool_guard: &PoolGuard,
             key: &[Val],
             row_id: RowID,
             ignore_del_mask: bool,
@@ -2520,42 +2488,44 @@ pub(crate) mod tests {
         ) -> Result<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.root)?
-                .compare_delete(pool_guard, key, row_id, ignore_del_mask, ts)
+                .bind_non_unique(self.guards, self.root)?
+                .compare_delete(key, row_id, ignore_del_mask, ts)
                 .await
         }
 
         #[inline]
-        async fn scan_values(
-            &self,
-            pool_guard: &PoolGuard,
-            values: &mut Vec<RowID>,
-            ts: TrxID,
-        ) -> Result<()> {
+        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.root)?
-                .scan_values(pool_guard, values, ts)
+                .bind_non_unique(self.guards, self.root)?
+                .scan_values(values, ts)
                 .await
         }
     }
 
-    pub(crate) fn bound_unique_index_no(table: &Table, index_no: usize) -> BoundUniqueIndexNo {
+    pub(crate) fn bound_unique_index_no<'a>(
+        table: &Table,
+        guards: &'a PoolGuards,
+        index_no: usize,
+    ) -> BoundUniqueIndexNo<'a> {
         let layout = table.layout_snapshot();
         BoundUniqueIndexNo {
             layout,
+            guards,
             index_no,
             root: active_secondary_root(table, index_no),
         }
     }
 
-    pub(crate) fn bound_non_unique_index_no(
+    pub(crate) fn bound_non_unique_index_no<'a>(
         table: &Table,
+        guards: &'a PoolGuards,
         index_no: usize,
-    ) -> BoundNonUniqueIndexNo {
+    ) -> BoundNonUniqueIndexNo<'a> {
         let layout = table.layout_snapshot();
         BoundNonUniqueIndexNo {
             layout,
+            guards,
             index_no,
             root: active_secondary_root(table, index_no),
         }
@@ -2567,9 +2537,9 @@ pub(crate) mod tests {
         key: &SelectKey,
         sts: TrxID,
     ) -> RowID {
-        let index = bound_unique_index_no(table, key.index_no);
+        let index = bound_unique_index_no(table, guards, key.index_no);
         let Some((row_id, _)) = index
-            .lookup(guards.index_guard(), &key.vals, sts)
+            .lookup(&key.vals, sts)
             .await
             .expect("index lookup should succeed")
         else {
@@ -2627,9 +2597,9 @@ pub(crate) mod tests {
         expected_row_id: RowID,
         expected_deleted: bool,
     ) {
-        let index = bound_unique_index_no(table, key.index_no);
+        let index = bound_unique_index_no(table, guards, key.index_no);
         let Some((row_id, deleted)) = index
-            .lookup(guards.index_guard(), &key.vals, sts)
+            .lookup(&key.vals, sts)
             .await
             .expect("index lookup should succeed")
         else {
