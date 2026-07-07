@@ -2,30 +2,28 @@
 
 `doradb-bench` is the standalone benchmark binary for DoraDB storage. It is a
 DoraDB-native harness: it uses the public storage facade, creates ordinary
-tables and sessions, and reports repeatable load-workload measurements without
+tables and sessions, and reports repeatable workload measurements without
 depending on storage internals.
 
-The first version supports only the `insert` load workload.
-
-Read, update, delete, mixed, checkpoint, cold-read, and backend-comparison
-benchmarks are deferred to separate backlog or task work.
+The tool currently supports explicit data loading with `run insert-seq` or
+`run insert-rand` plus read workloads over rows already loaded by earlier insert
+runs.
 
 Deferred benchmark coverage is tracked in:
 
-- `docs/backlogs/000145-doradb-bench-read-workloads.md` for read workloads such
-  as sequential reads, random point lookups, missing-key lookups, index scans,
-  and future batched read equivalents.
+- `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md` for
+  checkpoint, cold-storage, persisted lookup, and broader runtime lookup
+  scenarios.
 - `docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md` for
   overwrite/upsert, update, delete, mixed read/write, and read-while-writing
   workloads.
-- `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md` and
-  `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md` for
-  checkpoint, cold-storage, and persisted lookup scenarios.
-- `docs/backlogs/000148-doradb-bench-richer-index-controls.md` for non-unique
-  indexes, multiple indexes, composite index controls, and richer key
+- `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md` for
+  checkpoint lifecycle scenarios.
+- `docs/backlogs/000148-doradb-bench-richer-index-controls.md` for multiple
+  indexes, composite index controls, alternate indexed columns, and richer key
   distributions.
 - `docs/backlogs/000072-add-batch-io-backend-efficiency-benchmark-baseline.md`
-  for backend-comparison benchmarking beyond this load benchmark crate.
+  for backend-comparison benchmarking beyond this crate.
 
 ## Lifecycle
 
@@ -36,12 +34,25 @@ placed before the lifecycle command, or supplied through `DORADB_BENCH_ROOT`.
 
 `prepare` requires the benchmark storage root to be a non-existing path. It
 creates that root, creates the benchmark table, and writes
-`benchmark-manifest.toml` directly under the storage root. The manifest records
-the created table id, selected index mode, schema column names, and mutable
-runtime state such as the next generated logical key.
+`benchmark-manifest.toml` directly under the storage root. `prepare` is
+schema-only: it never inserts benchmark rows.
 
-`run insert` runs the insert workload and reports row throughput and latency. A
-run inserts new rows into the benchmark table; it is not a read-only command.
+`prepare --index <none|unique|non-unique>` is required. The selected index mode
+is persisted in the manifest and is the source of truth for later workload
+compatibility checks. `prepare --threads/-t` and `prepare --sessions/-s` persist
+default worker settings for later `run` commands. Both counts must be positive,
+and `threads` must not exceed `sessions`. If `--sessions` is omitted, it
+defaults to the resolved prepare thread count. `prepare --value-size/-v` and
+`prepare --batch-size/-b` persist default payload and transaction sizing for
+later `run` commands.
+
+`run insert-seq` and `run insert-rand` explicitly load data into the prepared
+benchmark table. Repeated insert runs allocate fresh logical key ranges from
+`[runtime].next_key`.
+
+Read workloads run against rows already loaded by previous successful insert
+runs. They fail before measurement if the manifest has no loaded logical key
+range or if the prepared index mode is incompatible.
 
 `cleanup` requires `benchmark-manifest.toml` to exist under the storage root,
 then removes the entire benchmark storage root. There is no force mode; manifest
@@ -49,20 +60,37 @@ presence is the cleanup safety marker.
 
 ## Workloads
 
-`insert` inserts generated rows into the prepared benchmark table. By default,
-it generates logical keys in increasing order. With multiple sessions, each
-session receives an increasing disjoint key range. Concurrent commits may
-interleave, so default insert order promises sequential per-session key
-generation, not a single global commit-order sequence.
+`insert-seq` inserts generated rows with logical keys in increasing order. With
+multiple sessions, each session receives an increasing disjoint key range.
+Concurrent commits may interleave, so insert order promises sequential
+per-session key generation, not a single global commit-order sequence.
 
-`insert --rand` inserts generated rows with pseudo-random logical key values.
-With `--index none`, keys are drawn with replacement from the allocated key
-range, so duplicate logical key values are allowed. With `--index unique`, keys
-are a seeded permutation of the allocated key range, so duplicate logical key
-values are not generated.
+`insert-rand` inserts generated rows with pseudo-random logical key values.
+With `--index unique`, keys are a seeded permutation of the allocated key range,
+so duplicate logical key values are not generated. With `--index none` or
+`--index non-unique`, keys are drawn with replacement from the allocated key
+range, so duplicate logical key values are allowed.
 
-`--batch-size` sets the number of rows per transaction commit. It defaults to
-`1` and is applied per session. `--num` remains the aggregate row count across
+`lookup-seq --num N` runs unique-index point lookups over the loaded logical key
+range in increasing order, wrapping modulo the loaded range when `N` exceeds the
+loaded key count. It requires `prepare --index unique`.
+
+`lookup-rand --num N [--seed SEED]` runs unique-index point lookups over the
+loaded logical key range with deterministic seeded replacement selection. It
+requires `prepare --index unique`.
+
+`table-scan [--num N]` runs full visible-row table scans. `--num` defaults to
+`1` and means full scan iterations. It works with all prepared index modes.
+
+`index-scan --num N [--seed SEED]` runs exact-key scans through the single
+non-unique secondary index on `logical_key`, using deterministic seeded
+replacement key selection over the loaded logical key range. It requires
+`prepare --index non-unique`.
+
+`--batch-size` sets the number of operations per transaction. For insert
+workloads it means rows per commit. For read workloads it means lookup requests,
+index-scan requests, or full table-scan iterations per read transaction. It is
+applied per session. `--num` remains the aggregate row or request count across
 all sessions.
 
 ## Controls
@@ -70,35 +98,44 @@ all sessions.
 | Flag | Commands | Default | Usage |
 | --- | --- | --- | --- |
 | `--root`, `-r` | Global | `DORADB_BENCH_ROOT` when set | Selects the DoraDB storage root. An explicit CLI value overrides the environment variable. For `prepare`, the path must not exist. `benchmark-manifest.toml` is always stored directly under this root, and `cleanup` requires it before deleting the root. |
-| `--num`, `-n` | `run insert` | Required | Total rows inserted by one invocation across all sessions. For example, `--num 1000 --sessions 4` inserts 1000 total rows, not 4000 rows. |
-| `--value-size`, `-v` | `run insert` | `128` | Generated payload size in bytes. The generated schema has a logical key column and a payload column large enough for this payload. |
-| `--batch-size`, `-b` | `run insert` | `1` | Rows per transaction commit for `insert`. The value is applied per session while `--num` remains the aggregate row count. |
-| `--seed` | `run insert` | `0` | `u64` reproducibility input. It affects generated payload bytes for all insert runs and, with `--rand`, also affects pseudo-random key order. |
-| `--rand` | `run insert` | Disabled | Enables pseudo-random logical key generation. Without `--rand`, `insert` uses increasing logical key order. |
-| `--index`, `-i` | `prepare`, `run insert` | `prepare`: `none`; `run insert`: prepared index | Controls or validates the benchmark table's index shape. `none` creates no secondary indexes and allows duplicate logical key values. `unique` creates one unique secondary index on the logical key column. |
-| `--threads`, `-t` | `run insert` | `1` | Number of operating-system worker threads that drive the benchmark executor. It is not an async task count. |
-| `--sessions`, `-s` | `run insert` | `--threads` | Number of independent DoraDB public sessions, meaning logical benchmark clients scheduled on the worker threads. Both values must be positive, and `--threads > --sessions` is rejected. |
-| `--log-sync` | `run insert` | `fsync` | Redo-log durability sync method. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
-Non-unique indexes and multiple indexes are deferred to later work.
+| `--index`, `-i` | `prepare` | Required | Selects the benchmark table index shape. `none` creates no secondary index. `unique` creates one unique secondary index on `logical_key`. `non-unique` creates one non-unique secondary index on `logical_key`. Run commands never change this shape. |
+| `--threads`, `-t` | `prepare`, `run ...` | `prepare`: `1`; `run`: manifest default | Number of operating-system worker threads that drive the benchmark executor. It is not an async task count. |
+| `--sessions`, `-s` | `prepare`, `run ...` | `prepare`: resolved threads; `run`: manifest default or run threads | Number of independent DoraDB public sessions, meaning logical benchmark clients scheduled on the worker threads. Both values must be positive, and `threads > sessions` is rejected. |
+| `--num`, `-n` | `run insert-seq`, `insert-rand`, `lookup-seq`, `lookup-rand`, `index-scan` | Required | Aggregate row, lookup, or scan request count across all sessions. |
+| `--num`, `-n` | `run table-scan` | `1` | Aggregate full table-scan iterations across all sessions. |
+| `--value-size`, `-v` | `prepare`, `run insert-seq`, `insert-rand` | `prepare`: `128`; `run`: manifest default | Generated payload size in bytes. Run overrides apply only to insert workloads. |
+| `--batch-size`, `-b` | `prepare`, `run ...` | `prepare`: `1`; `run`: manifest default | Operations per transaction. For inserts this means rows per commit; for reads this means lookup/index-scan requests or table-scan iterations per read transaction. |
+| `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, or randomized read key selection. |
+| `--log-sync` | `run ...` | `fsync` | Redo-log durability sync method. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
+| `--include-stats` | `run ...` | `false` | Captures and prints internal transaction-system, storage-IO, and buffer-pool stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
+
+Run defaults resolve as follows:
+
+- If a run omits both `--threads` and `--sessions`, it uses the manifest
+  defaults from `prepare`.
+- If a run provides `--threads` but omits `--sessions`, sessions default to the
+  run thread count.
+- If a run provides only `--sessions`, threads come from the manifest default.
+- If a run omits `--value-size` or `--batch-size`, it uses the manifest defaults
+  from `prepare`.
 
 ## Key Ranges
 
-Benchmark rows are generated from logical `u64` key ids. Runs allocate disjoint
-key ranges from `[runtime].next_key` in `benchmark-manifest.toml`, so repeated
-`run insert` invocations draw keys from one shared monotonically increasing
-sequence. The aggregate range for a run is partitioned deterministically across
-sessions. If `--num` does not divide evenly by `--sessions`, the remainder is
-assigned deterministically by session index.
+Benchmark rows are generated from logical `u64` key ids. Insert runs allocate
+disjoint key ranges from `[runtime].next_key` in `benchmark-manifest.toml`, so
+repeated `run insert-seq` or `run insert-rand` invocations draw keys from one
+shared monotonically increasing sequence. Successful insert runs advance both
+`[runtime].next_key` and `[runtime].rows_inserted` only after output artifacts
+are written.
 
-For a fresh storage root and the same command sequence, `--rand`, `--seed`,
-`--index`, session count, row count, and value size, generated keys and
-payloads should be reproducible.
+Read workloads draw candidate keys from the loaded logical range
+`[0, runtime.next_key)`. The full-run visit order is guaranteed only for
+`--threads 1 --sessions 1`; multi-session or multi-threaded runs guarantee
+deterministic per-session plans.
 
-For `insert --rand`, the full key visit order is guaranteed deterministic only
-for `--threads 1 --sessions 1`. With multiple sessions or threads, the
-benchmark still uses deterministic per-session key ranges and seeded local
-generation, but it does not promise one deterministic whole-run operation or
-commit order.
+For a fresh storage root and the same command sequence, `--seed`, prepared index
+mode, session count, row count, and value size, generated keys and payloads
+should be reproducible.
 
 When `--sessions` is greater than `--threads`, each session still runs as an
 independent async benchmark client. The requested worker threads drive those
@@ -110,40 +147,53 @@ serialize other ready sessions.
 Normal lifecycle and benchmark output is written to stdout. Diagnostics and
 errors are written to stderr.
 
-`run` prints three stdout sections in this order:
+`run` prints these stdout sections in this order:
 
-- `Configuration`: workload, random-key mode, storage root, row count, value
-  size, batch size, seed, index mode, threads, sessions, log sync mode, and
+- `Configuration`: workload, randomized-key-selection mode, storage root,
+  internal-stats mode, row/request count, value size, batch size, seed,
+  prepared index mode, loaded key range, threads, sessions, log sync mode, and
   table id.
-- `Internal Stats`: public transaction-system, storage-IO, and buffer-pool stats
-  deltas when available.
-- `Final Result`: operation count, elapsed time, operations per second, average
-  nanoseconds per operation, and any failure counts.
+- `Internal Stats`, only with `--include-stats`: public transaction-system,
+  storage-IO, and buffer-pool stats deltas when available.
+- `Final Result`: operation count, inserted rows, found count, not-found count,
+  returned rows, elapsed time, throughput, average nanoseconds per operation,
+  and failures.
 
 `run` also overwrites these files in the storage root:
 
 - `benchmark-result.md`: user-friendly markdown snapshot with configuration,
-  internal stats, final result, and command context.
-- `benchmark-internal-stats.csv`: two columns, `metric-name` and `metric-value`.
+  optional internal stats, final result, and command context.
+- `benchmark-internal-stats.csv`, only with `--include-stats`: two columns,
+  `metric-name` and `metric-value`. A later run without `--include-stats`
+  removes stale stats output from the previous run.
 - `benchmark-result.csv`: one header row and one latest-result summary row.
 
 ## Examples
 
 ```bash
-doradb-bench --root target/doradb-bench/insert prepare
-doradb-bench --root target/doradb-bench/insert run insert --num 10000 --value-size 128
-doradb-bench --root target/doradb-bench/insert cleanup
+doradb-bench --root target/doradb-bench/lookup-seq prepare --index unique
+doradb-bench --root target/doradb-bench/lookup-seq run insert-seq --num 10000 --value-size 128
+doradb-bench --root target/doradb-bench/lookup-seq run lookup-seq --num 10000
+doradb-bench --root target/doradb-bench/lookup-seq cleanup
 ```
 
 ```bash
-doradb-bench --root target/doradb-bench/insert-rand prepare --index unique
-doradb-bench --root target/doradb-bench/insert-rand run insert --num 10000 --value-size 128 --rand --seed 1
-doradb-bench --root target/doradb-bench/insert-rand cleanup
+doradb-bench --root target/doradb-bench/lookup-rand prepare --index unique
+doradb-bench --root target/doradb-bench/lookup-rand run insert-rand --num 10000 --value-size 128 --seed 1
+doradb-bench --root target/doradb-bench/lookup-rand run lookup-rand --num 10000 --seed 2
+doradb-bench --root target/doradb-bench/lookup-rand cleanup
 ```
 
 ```bash
-export DORADB_BENCH_ROOT=target/doradb-bench/insert-batch
-doradb-bench prepare
-doradb-bench run insert --num 10000 --batch-size 100 --threads 2 --sessions 8
-doradb-bench cleanup
+doradb-bench --root target/doradb-bench/table-scan prepare --index none
+doradb-bench --root target/doradb-bench/table-scan run insert-seq --num 10000 --value-size 128
+doradb-bench --root target/doradb-bench/table-scan run table-scan
+doradb-bench --root target/doradb-bench/table-scan cleanup
+```
+
+```bash
+doradb-bench --root target/doradb-bench/index-scan prepare --index non-unique
+doradb-bench --root target/doradb-bench/index-scan run insert-seq --num 10000 --value-size 128
+doradb-bench --root target/doradb-bench/index-scan run index-scan --num 10000 --seed 3
+doradb-bench --root target/doradb-bench/index-scan cleanup
 ```
