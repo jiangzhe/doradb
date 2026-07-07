@@ -19,6 +19,7 @@ use doradb_storage::{
     SelectKey, SelectMvcc, Session, TableSpec, TrxSysConfig, Val, ValKind,
 };
 use easy_parallel::Parallel;
+use smol::{Executor, channel};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -281,7 +282,7 @@ fn run_workers(
     loaded_range: KeyRange,
 ) -> Result<WorkerSummary> {
     let session_plans = build_session_plans(execution_range, config.sessions)?;
-    let executor = smol::Executor::new();
+    let executor = Executor::new();
     let tasks = session_plans
         .into_iter()
         .map(|plan| {
@@ -294,7 +295,7 @@ fn run_workers(
             ))
         })
         .collect();
-    let (signal, shutdown) = smol::channel::unbounded::<()>();
+    let (signal, shutdown) = channel::unbounded::<()>();
     let executor_ref = &executor;
     let shutdown_receiver = shutdown.clone();
 
@@ -600,6 +601,7 @@ fn effective_batch_size(batch_size: u64, operation_count: u64) -> Result<usize> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::MAX_VALUE_SIZE;
     use std::fs::File;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -670,7 +672,7 @@ mod tests {
     #[test]
     fn validate_load_config_rejects_value_size_above_row_payload_limit() {
         let mut config = test_load_config();
-        config.value_size = crate::cli::MAX_VALUE_SIZE + 1;
+        config.value_size = MAX_VALUE_SIZE + 1;
         assert!(validate_load_config(&config).is_err());
     }
 
@@ -695,7 +697,7 @@ mod tests {
 
     #[test]
     fn collect_session_tasks_sums_successes() {
-        let executor = smol::Executor::new();
+        let executor = Executor::new();
         let tasks = vec![
             executor.spawn(async {
                 Ok(WorkerSummary {
@@ -736,7 +738,7 @@ mod tests {
 
     #[test]
     fn collect_session_tasks_returns_first_error_after_draining_tasks() {
-        let executor = smol::Executor::new();
+        let executor = Executor::new();
         let drained = Arc::new(AtomicUsize::new(0));
         let drained_task = Arc::clone(&drained);
         let tasks = vec![

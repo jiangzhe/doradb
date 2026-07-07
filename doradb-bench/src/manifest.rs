@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::result::Result as StdResult;
 
 pub(super) const MANIFEST_FILE_NAME: &str = "benchmark-manifest.toml";
 pub(super) const RESULT_MARKDOWN_FILE_NAME: &str = "benchmark-result.md";
@@ -80,14 +81,6 @@ impl Default for DefaultsManifest {
     }
 }
 
-fn default_value_size() -> usize {
-    DEFAULT_VALUE_SIZE
-}
-
-fn default_batch_size() -> u64 {
-    DEFAULT_BATCH_SIZE
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct SchemaManifest {
     pub(super) logical_key_column: String,
@@ -101,7 +94,7 @@ pub(super) struct RuntimeManifest {
 }
 
 impl<'de> Deserialize<'de> for RuntimeManifest {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -277,6 +270,14 @@ fn next_key_after(start: u64, rows: u64) -> Result<u64> {
     start.checked_add(rows).ok_or_else(|| {
         BenchError::message(format!("key range exhausted for requested --num {rows}"))
     })
+}
+
+fn default_value_size() -> usize {
+    DEFAULT_VALUE_SIZE
+}
+
+fn default_batch_size() -> u64 {
+    DEFAULT_BATCH_SIZE
 }
 
 #[cfg(test)]

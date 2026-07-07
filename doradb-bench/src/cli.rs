@@ -224,6 +224,16 @@ struct WorkerArgs {
     include_stats: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedCommon {
+    threads: usize,
+    sessions: usize,
+    value_size: usize,
+    batch_size: u64,
+    log_sync: LogSyncMode,
+    include_stats: bool,
+}
+
 #[derive(Clone, Debug, Args)]
 struct LoadCommonArgs {
     #[command(flatten)]
@@ -236,6 +246,22 @@ struct LoadCommonArgs {
     batch_size: Option<NonZeroU64>,
 }
 
+impl LoadCommonArgs {
+    fn resolve(&self, defaults: RunDefaults) -> Result<ResolvedCommon> {
+        let workers = resolve_workers(&self.worker, defaults)?;
+        Ok(ResolvedCommon {
+            threads: workers.threads,
+            sessions: workers.sessions,
+            value_size: self
+                .value_size
+                .map_or(defaults.value_size, NonZeroUsize::get),
+            batch_size: self.batch_size.map_or(defaults.batch_size, NonZeroU64::get),
+            log_sync: self.worker.log_sync,
+            include_stats: self.worker.include_stats,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Args)]
 struct ReadCommonArgs {
     #[command(flatten)]
@@ -245,6 +271,21 @@ struct ReadCommonArgs {
     batch_size: Option<NonZeroU64>,
 }
 
+impl ReadCommonArgs {
+    fn resolve(&self, defaults: RunDefaults) -> Result<ResolvedCommon> {
+        let workers = resolve_workers(&self.worker, defaults)?;
+        Ok(ResolvedCommon {
+            threads: workers.threads,
+            sessions: workers.sessions,
+            value_size: defaults.value_size,
+            batch_size: self.batch_size.map_or(defaults.batch_size, NonZeroU64::get),
+            log_sync: self.worker.log_sync,
+            include_stats: self.worker.include_stats,
+        })
+    }
+}
+
+/// Arguments for insert workloads.
 #[derive(Clone, Debug, Args)]
 pub struct InsertArgs {
     #[command(flatten)]
@@ -307,6 +348,7 @@ impl InsertArgs {
     }
 }
 
+/// Arguments shared by read workloads.
 #[derive(Clone, Debug, Args)]
 pub struct ReadArgs {
     #[command(flatten)]
@@ -368,6 +410,7 @@ impl ReadArgs {
     }
 }
 
+/// Arguments for seeded read workloads.
 #[derive(Clone, Debug, Args)]
 pub struct SeededReadArgs {
     #[command(flatten)]
@@ -426,61 +469,6 @@ impl SeededReadArgs {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkerSettings {
-    threads: usize,
-    sessions: usize,
-}
-
-fn resolve_workers(worker: &WorkerArgs, defaults: RunDefaults) -> Result<WorkerSettings> {
-    let threads = worker.threads.map_or(defaults.threads, NonZeroUsize::get);
-    let sessions = match (worker.threads, worker.sessions) {
-        (_, Some(sessions)) => sessions.get(),
-        (Some(threads), None) => threads.get(),
-        (None, None) => defaults.sessions,
-    };
-    validate_workers(threads, sessions)?;
-    Ok(WorkerSettings { threads, sessions })
-}
-
-pub(super) fn validate_workers(threads: usize, sessions: usize) -> Result<()> {
-    if threads == 0 || sessions == 0 {
-        return Err(BenchError::message(
-            "threads and sessions must both be positive",
-        ));
-    }
-    if threads > sessions {
-        return Err(BenchError::message(format!(
-            "--threads ({threads}) must not exceed --sessions ({sessions})"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_value_size(value_size: usize) -> Result<()> {
-    if value_size == 0 {
-        return Err(BenchError::message("--value-size must be positive"));
-    }
-    if value_size > MAX_VALUE_SIZE {
-        return Err(BenchError::message(format!(
-            "--value-size must not exceed {MAX_VALUE_SIZE} bytes"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_batch_size(batch_size: u64) -> Result<()> {
-    if batch_size == 0 {
-        return Err(BenchError::message("--batch-size must be positive"));
-    }
-    if batch_size > usize::MAX as u64 {
-        return Err(BenchError::message(
-            "--batch-size exceeds addressable memory on this platform",
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RunDefaults {
     pub(super) threads: usize,
     pub(super) sessions: usize,
@@ -515,46 +503,6 @@ impl Default for RunDefaults {
             value_size: DEFAULT_VALUE_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ResolvedCommon {
-    threads: usize,
-    sessions: usize,
-    value_size: usize,
-    batch_size: u64,
-    log_sync: LogSyncMode,
-    include_stats: bool,
-}
-
-impl LoadCommonArgs {
-    fn resolve(&self, defaults: RunDefaults) -> Result<ResolvedCommon> {
-        let workers = resolve_workers(&self.worker, defaults)?;
-        Ok(ResolvedCommon {
-            threads: workers.threads,
-            sessions: workers.sessions,
-            value_size: self
-                .value_size
-                .map_or(defaults.value_size, NonZeroUsize::get),
-            batch_size: self.batch_size.map_or(defaults.batch_size, NonZeroU64::get),
-            log_sync: self.worker.log_sync,
-            include_stats: self.worker.include_stats,
-        })
-    }
-}
-
-impl ReadCommonArgs {
-    fn resolve(&self, defaults: RunDefaults) -> Result<ResolvedCommon> {
-        let workers = resolve_workers(&self.worker, defaults)?;
-        Ok(ResolvedCommon {
-            threads: workers.threads,
-            sessions: workers.sessions,
-            value_size: defaults.value_size,
-            batch_size: self.batch_size.map_or(defaults.batch_size, NonZeroU64::get),
-            log_sync: self.worker.log_sync,
-            include_stats: self.worker.include_stats,
-        })
     }
 }
 
@@ -618,6 +566,61 @@ impl WorkloadConfig {
 pub(super) struct InsertConfig {
     pub(super) num: u64,
     pub(super) seed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerSettings {
+    threads: usize,
+    sessions: usize,
+}
+
+fn resolve_workers(worker: &WorkerArgs, defaults: RunDefaults) -> Result<WorkerSettings> {
+    let threads = worker.threads.map_or(defaults.threads, NonZeroUsize::get);
+    let sessions = match (worker.threads, worker.sessions) {
+        (_, Some(sessions)) => sessions.get(),
+        (Some(threads), None) => threads.get(),
+        (None, None) => defaults.sessions,
+    };
+    validate_workers(threads, sessions)?;
+    Ok(WorkerSettings { threads, sessions })
+}
+
+pub(super) fn validate_workers(threads: usize, sessions: usize) -> Result<()> {
+    if threads == 0 || sessions == 0 {
+        return Err(BenchError::message(
+            "threads and sessions must both be positive",
+        ));
+    }
+    if threads > sessions {
+        return Err(BenchError::message(format!(
+            "--threads ({threads}) must not exceed --sessions ({sessions})"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_value_size(value_size: usize) -> Result<()> {
+    if value_size == 0 {
+        return Err(BenchError::message("--value-size must be positive"));
+    }
+    if value_size > MAX_VALUE_SIZE {
+        return Err(BenchError::message(format!(
+            "--value-size must not exceed {MAX_VALUE_SIZE} bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_batch_size(batch_size: u64) -> Result<()> {
+    if batch_size == 0 {
+        return Err(BenchError::message("--batch-size must be positive"));
+    }
+    if batch_size > usize::MAX as u64 {
+        return Err(BenchError::message(
+            "--batch-size exceeds addressable memory on this platform",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
