@@ -141,25 +141,15 @@ impl Table {
                         if index_spec.unique() {
                             let index = sec_idx.unique_mem()?;
                             let res = index
-                                .insert_if_not_exists(
-                                    index_pool_guard,
-                                    &vals,
-                                    row_id,
-                                    false,
-                                    MIN_SNAPSHOT_TS,
-                                )
+                                .bind(index_pool_guard)
+                                .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await?;
                             ensure_recovery_index_insert(sec_idx.index_no(), res)?;
                         } else {
                             let index = sec_idx.non_unique_mem()?;
                             let res = index
-                                .insert_if_not_exists(
-                                    index_pool_guard,
-                                    &vals,
-                                    row_id,
-                                    false,
-                                    MIN_SNAPSHOT_TS,
-                                )
+                                .bind(index_pool_guard)
+                                .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await?;
                             ensure_recovery_index_insert(sec_idx.index_no(), res)?;
                         }

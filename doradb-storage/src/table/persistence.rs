@@ -1958,9 +1958,10 @@ mod tests {
             let key = single_key(0i32);
             let reader = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let index = bound_unique_index_no(&table, key.index_no);
+            let pool_guards = session.pool_guards();
+            let index = bound_unique_index_no(&table, &pool_guards, key.index_no);
             let (row_id, _) = index
-                .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts())
+                .lookup(&key.vals, reader.sts())
                 .await
                 .unwrap()
                 .expect("row should exist before delete");

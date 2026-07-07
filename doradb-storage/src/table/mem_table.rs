@@ -178,7 +178,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| secondary_index_kind_mismatch("unique lookup", "unique"))?
-            .lookup(self.index_pool_guard(guards)?, &key.vals, sts)
+            .bind(self.index_pool_guard(guards)?)
+            .lookup(&key.vals, sts)
             .await
     }
 
@@ -194,13 +195,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| secondary_index_kind_mismatch("unique insert", "unique"))?
-            .insert_if_not_exists(
-                self.index_pool_guard(guards)?,
-                &key.vals,
-                row_id,
-                merge_if_match_deleted,
-                sts,
-            )
+            .bind(self.index_pool_guard(guards)?)
+            .insert_if_not_exists(&key.vals, row_id, merge_if_match_deleted, sts)
             .await
     }
 
@@ -216,13 +212,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| secondary_index_kind_mismatch("unique compare delete", "unique"))?
-            .compare_delete(
-                self.index_pool_guard(guards)?,
-                &key.vals,
-                old_row_id,
-                ignore_del_mask,
-                ts,
-            )
+            .bind(self.index_pool_guard(guards)?)
+            .compare_delete(&key.vals, old_row_id, ignore_del_mask, ts)
             .await
     }
 
@@ -237,7 +228,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| secondary_index_kind_mismatch("unique mask deleted", "unique"))?
-            .mask_as_deleted(self.index_pool_guard(guards)?, &key.vals, row_id, sts)
+            .bind(self.index_pool_guard(guards)?)
+            .mask_as_deleted(&key.vals, row_id, sts)
             .await
     }
 
@@ -253,13 +245,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| secondary_index_kind_mismatch("unique compare exchange", "unique"))?
-            .compare_exchange(
-                self.index_pool_guard(guards)?,
-                &key.vals,
-                old_row_id,
-                new_row_id,
-                sts,
-            )
+            .bind(self.index_pool_guard(guards)?)
+            .compare_exchange(&key.vals, old_row_id, new_row_id, sts)
             .await
     }
 
@@ -274,7 +261,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| secondary_index_kind_mismatch("non-unique lookup unique", "non-unique"))?
-            .lookup_unique(self.index_pool_guard(guards)?, &key.vals, row_id, sts)
+            .bind(self.index_pool_guard(guards)?)
+            .lookup_unique(&key.vals, row_id, sts)
             .await
     }
 
@@ -290,13 +278,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| secondary_index_kind_mismatch("non-unique insert", "non-unique"))?
-            .insert_if_not_exists(
-                self.index_pool_guard(guards)?,
-                &key.vals,
-                row_id,
-                merge_if_match_deleted,
-                sts,
-            )
+            .bind(self.index_pool_guard(guards)?)
+            .insert_if_not_exists(&key.vals, row_id, merge_if_match_deleted, sts)
             .await
     }
 
@@ -311,7 +294,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| secondary_index_kind_mismatch("non-unique mask deleted", "non-unique"))?
-            .mask_as_deleted(self.index_pool_guard(guards)?, &key.vals, row_id, sts)
+            .bind(self.index_pool_guard(guards)?)
+            .mask_as_deleted(&key.vals, row_id, sts)
             .await
     }
 
@@ -329,13 +313,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("non-unique compare delete", "non-unique")
             })?
-            .compare_delete(
-                self.index_pool_guard(guards)?,
-                &key.vals,
-                row_id,
-                ignore_del_mask,
-                ts,
-            )
+            .bind(self.index_pool_guard(guards)?)
+            .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
     }
 

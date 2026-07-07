@@ -3133,19 +3133,18 @@ mod tests {
                     .unwrap();
                 assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
             }
-            assert_eq!(
-                index
-                    .bind_unique(root)
-                    .unwrap()
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        MIN_SNAPSHOT_TS
-                    )
-                    .await
-                    .unwrap(),
-                Some((cold_row_id, false))
-            );
+            {
+                let pool_guards = session.pool_guards();
+                assert_eq!(
+                    index
+                        .bind_unique(&pool_guards, root)
+                        .unwrap()
+                        .lookup(&key.vals, MIN_SNAPSHOT_TS)
+                        .await
+                        .unwrap(),
+                    Some((cold_row_id, false))
+                );
+            }
             let mut trx = session.begin_trx().unwrap();
             let row = trx_select_row_mvcc(&mut trx, &table, &key, &[0, 1]).await;
             assert_eq!(
@@ -3270,19 +3269,18 @@ mod tests {
                     .unwrap();
                 assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
             }
-            assert_eq!(
-                index
-                    .bind_unique(root)
-                    .unwrap()
-                    .lookup(
-                        session.pool_guards().index_guard(),
-                        &key.vals,
-                        MIN_SNAPSHOT_TS
-                    )
-                    .await
-                    .unwrap(),
-                Some((hot_row_id, false))
-            );
+            {
+                let pool_guards = session.pool_guards();
+                assert_eq!(
+                    index
+                        .bind_unique(&pool_guards, root)
+                        .unwrap()
+                        .lookup(&key.vals, MIN_SNAPSHOT_TS)
+                        .await
+                        .unwrap(),
+                    Some((hot_row_id, false))
+                );
+            }
 
             let mut trx = session.begin_trx().unwrap();
             let row = trx_select_row_mvcc(&mut trx, &table, &key, &[0, 1]).await;

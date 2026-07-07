@@ -158,21 +158,24 @@ impl<'a> UserTableAccessor<'a> {
     }
 
     #[inline]
-    fn unique_user_index(
+    fn unique_user_index<'g>(
         &self,
-        key: &SelectKey,
+        guards: &'g PoolGuards,
+        index_no: usize,
         root: BlockID,
-    ) -> Result<UniqueSecondaryIndex<'_, EvictableBufferPool>> {
-        self.require_sec_idx(key.index_no)?.bind_unique(root)
+    ) -> Result<UniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
+        self.require_sec_idx(index_no)?.bind_unique(guards, root)
     }
 
     #[inline]
-    fn non_unique_user_index(
+    fn non_unique_user_index<'g>(
         &self,
-        key: &SelectKey,
+        guards: &'g PoolGuards,
+        index_no: usize,
         root: BlockID,
-    ) -> Result<NonUniqueSecondaryIndex<'_, EvictableBufferPool>> {
-        self.require_sec_idx(key.index_no)?.bind_non_unique(root)
+    ) -> Result<NonUniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
+        self.require_sec_idx(index_no)?
+            .bind_non_unique(guards, root)
     }
 
     #[inline]
@@ -228,180 +231,6 @@ impl<'a> UserTableAccessor<'a> {
         index_no: usize,
     ) -> Result<BlockID> {
         snapshot.secondary_index_root(index_no)
-    }
-
-    #[inline]
-    async fn unique_lookup(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<Option<(RowID, bool)>> {
-        self.unique_user_index(key, root)?
-            .lookup(self.mem().index_pool_guard(guards)?, &key.vals, sts)
-            .await
-    }
-
-    #[inline]
-    async fn unique_insert_if_not_exists(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.unique_user_index(key, root)?
-            .insert_if_not_exists(
-                self.mem().index_pool_guard(guards)?,
-                &key.vals,
-                row_id,
-                merge_if_match_deleted,
-                sts,
-            )
-            .await
-    }
-
-    #[inline]
-    async fn unique_compare_delete(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        old_row_id: RowID,
-        ignore_del_mask: bool,
-        ts: TrxID,
-    ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
-            .unique_mem()?
-            .compare_delete(
-                self.mem().index_pool_guard(guards)?,
-                &key.vals,
-                old_row_id,
-                ignore_del_mask,
-                ts,
-            )
-            .await
-    }
-
-    #[inline]
-    async fn unique_mask_as_deleted(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<bool> {
-        self.unique_user_index(key, root)?
-            .mask_as_deleted(self.mem().index_pool_guard(guards)?, &key.vals, row_id, sts)
-            .await
-    }
-
-    #[inline]
-    async fn unique_compare_exchange(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        old_row_id: RowID,
-        new_row_id: RowID,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<IndexCompareExchange> {
-        self.unique_user_index(key, root)?
-            .compare_exchange(
-                self.mem().index_pool_guard(guards)?,
-                &key.vals,
-                old_row_id,
-                new_row_id,
-                sts,
-            )
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_lookup(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        res: &mut Vec<RowID>,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<()> {
-        self.non_unique_user_index(key, root)?
-            .lookup(self.mem().index_pool_guard(guards)?, &key.vals, res, sts)
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_lookup_unique(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<Option<bool>> {
-        self.non_unique_user_index(key, root)?
-            .lookup_unique(self.mem().index_pool_guard(guards)?, &key.vals, row_id, sts)
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_insert_if_not_exists(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.non_unique_user_index(key, root)?
-            .insert_if_not_exists(
-                self.mem().index_pool_guard(guards)?,
-                &key.vals,
-                row_id,
-                merge_if_match_deleted,
-                sts,
-            )
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_mask_as_deleted(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        root: BlockID,
-        sts: TrxID,
-    ) -> Result<bool> {
-        self.non_unique_user_index(key, root)?
-            .mask_as_deleted(self.mem().index_pool_guard(guards)?, &key.vals, row_id, sts)
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_compare_delete(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        ignore_del_mask: bool,
-        ts: TrxID,
-    ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
-            .non_unique_mem()?
-            .compare_delete(
-                self.mem().index_pool_guard(guards)?,
-                &key.vals,
-                row_id,
-                ignore_del_mask,
-                ts,
-            )
-            .await
     }
 
     #[inline]
@@ -1330,12 +1159,10 @@ impl<'a> UserTableAccessor<'a> {
         row_id: RowID,
         min_active_sts: TrxID,
     ) -> Result<bool> {
-        let (page_guard, row_id) = loop {
+        let (page_guard, row_id, index) = loop {
             let root = self.unchecked_secondary_root(key.index_no)?;
-            match self
-                .unique_lookup(guards, key, root, MIN_SNAPSHOT_TS)
-                .await?
-            {
+            let index = self.unique_user_index(guards, key.index_no, root)?;
+            match index.lookup(&key.vals, MIN_SNAPSHOT_TS).await? {
                 None => return Ok(false), // Another thread deleted this entry.
                 Some((index_row_id, deleted)) => {
                     if !deleted || index_row_id != row_id {
@@ -1351,8 +1178,8 @@ impl<'a> UserTableAccessor<'a> {
                         .await?
                     {
                         IndexPurgeDecision::Delete => {
-                            return self
-                                .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
+                            return index
+                                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
                         }
                         IndexPurgeDecision::Keep => return Ok(false),
@@ -1364,7 +1191,7 @@ impl<'a> UserTableAccessor<'a> {
                             else {
                                 continue;
                             };
-                            break (page_guard, row_id);
+                            break (page_guard, row_id, index);
                         }
                     }
                 }
@@ -1377,8 +1204,8 @@ impl<'a> UserTableAccessor<'a> {
         // data or version chain. Hot row pages still have undo chains, unlike
         // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), key) {
-            return self
-                .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
+            return index
+                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -1392,10 +1219,11 @@ impl<'a> UserTableAccessor<'a> {
         row_id: RowID,
         min_active_sts: TrxID,
     ) -> Result<bool> {
-        let (page_guard, row_id) = loop {
+        let (page_guard, row_id, index) = loop {
             let root = self.unchecked_secondary_root(key.index_no)?;
-            match self
-                .non_unique_lookup_unique(guards, key, row_id, root, MIN_SNAPSHOT_TS)
+            let index = self.non_unique_user_index(guards, key.index_no, root)?;
+            match index
+                .lookup_unique(&key.vals, row_id, MIN_SNAPSHOT_TS)
                 .await?
             {
                 None => return Ok(false), // Another thread deleted this entry.
@@ -1413,14 +1241,8 @@ impl<'a> UserTableAccessor<'a> {
                         .await?
                     {
                         IndexPurgeDecision::Delete => {
-                            return self
-                                .non_unique_compare_delete(
-                                    guards,
-                                    key,
-                                    row_id,
-                                    false,
-                                    MIN_SNAPSHOT_TS,
-                                )
+                            return index
+                                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
                         }
                         IndexPurgeDecision::Keep => return Ok(false),
@@ -1432,7 +1254,7 @@ impl<'a> UserTableAccessor<'a> {
                             else {
                                 continue;
                             };
-                            break (page_guard, row_id);
+                            break (page_guard, row_id, index);
                         }
                     }
                 }
@@ -1445,8 +1267,8 @@ impl<'a> UserTableAccessor<'a> {
         // data or version chain. Hot row pages still have undo chains, unlike
         // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), key) {
-            return self
-                .non_unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
+            return index
+                .compare_delete(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -1667,9 +1489,10 @@ impl<'a> UserTableAccessor<'a> {
     ) -> Result<InsertIndex> {
         let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
         let sts = rt.sts();
+        let index = self.unique_user_index(rt.pool_guards(), key.index_no, root)?;
         loop {
-            match self
-                .unique_insert_if_not_exists(rt.pool_guards(), &key, row_id, false, root, sts)
+            match index
+                .insert_if_not_exists(&key.vals, row_id, false, sts)
                 .await?
             {
                 IndexInsert::Ok(merged) => {
@@ -1707,15 +1530,8 @@ impl<'a> UserTableAccessor<'a> {
                             } else {
                                 old_row_id
                             };
-                            match self
-                                .unique_compare_exchange(
-                                    rt.pool_guards(),
-                                    &key,
-                                    index_old_row_id,
-                                    row_id,
-                                    root,
-                                    sts,
-                                )
+                            match index
+                                .compare_exchange(&key.vals, index_old_row_id, row_id, sts)
                                 .await?
                             {
                                 IndexCompareExchange::Ok => {
@@ -1747,9 +1563,10 @@ impl<'a> UserTableAccessor<'a> {
     ) -> Result<InsertIndex> {
         let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
         let sts = rt.sts();
+        let index = self.non_unique_user_index(rt.pool_guards(), key.index_no, root)?;
         // For non-unique index, it's guaranteed to be success.
-        match self
-            .non_unique_insert_if_not_exists(rt.pool_guards(), &key, row_id, false, root, sts)
+        match index
+            .insert_if_not_exists(&key.vals, row_id, false, sts)
             .await?
         {
             IndexInsert::Ok(merged) => {
@@ -1775,7 +1592,8 @@ impl<'a> UserTableAccessor<'a> {
         // of physically removing it. The row id is retained so older snapshots
         // and rollback can still recover the previous owner.
         let res = self
-            .unique_mask_as_deleted(rt.pool_guards(), &key, row_id, root, rt.sts())
+            .unique_user_index(rt.pool_guards(), key.index_no, root)?
+            .mask_as_deleted(&key.vals, row_id, rt.sts())
             .await?;
         debug_assert!(res); // should always succeed.
         self.push_delete_index_undo(rt, effects, row_id, key, true);
@@ -1795,7 +1613,8 @@ impl<'a> UserTableAccessor<'a> {
         // Non-unique entries are exact `(key, row_id)` claims, so masking this
         // pair shadows the old hot version while preserving rollback state.
         let res = self
-            .non_unique_mask_as_deleted(rt.pool_guards(), &key, row_id, root, rt.sts())
+            .non_unique_user_index(rt.pool_guards(), key.index_no, root)?
+            .mask_as_deleted(&key.vals, row_id, rt.sts())
             .await?;
         debug_assert!(res);
         self.push_delete_index_undo(rt, effects, row_id, key, false);
@@ -1818,20 +1637,14 @@ impl<'a> UserTableAccessor<'a> {
         debug_assert!(old_row_id != new_row_id);
         let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
         let sts = rt.sts();
+        let index = self.unique_user_index(rt.pool_guards(), new_key.index_no, root)?;
         loop {
             // Move update with a unique-key change. The new RowID cannot
             // already be in the index; duplicate handling below decides
             // whether an existing logical-key owner is visible, stale, or
             // should be linked for older snapshots.
-            match self
-                .unique_insert_if_not_exists(
-                    rt.pool_guards(),
-                    &new_key,
-                    new_row_id,
-                    false,
-                    root,
-                    sts,
-                )
+            match index
+                .insert_if_not_exists(&new_key.vals, new_row_id, false, sts)
                 .await?
             {
                 IndexInsert::Ok(merged) => {
@@ -1877,15 +1690,8 @@ impl<'a> UserTableAccessor<'a> {
                         // There can be an optimization to combine the update into insert.
                         // e.g. add a new method BTree::insert_if_not_exists_or_merge_match_value().
                         // But I think the case is rare so keep as is.
-                        match self
-                            .unique_compare_exchange(
-                                rt.pool_guards(),
-                                &new_key,
-                                old_row_id.deleted(),
-                                new_row_id,
-                                root,
-                                sts,
-                            )
+                        match index
+                            .compare_exchange(&new_key.vals, old_row_id.deleted(), new_row_id, sts)
                             .await?
                         {
                             IndexCompareExchange::Ok => {
@@ -1933,15 +1739,8 @@ impl<'a> UserTableAccessor<'a> {
                             } else {
                                 index_row_id
                             };
-                            match self
-                                .unique_compare_exchange(
-                                    rt.pool_guards(),
-                                    &new_key,
-                                    index_old_row_id,
-                                    new_row_id,
-                                    root,
-                                    sts,
-                                )
+                            match index
+                                .compare_exchange(&new_key.vals, index_old_row_id, new_row_id, sts)
                                 .await?
                             {
                                 IndexCompareExchange::Ok => {
@@ -1984,15 +1783,8 @@ impl<'a> UserTableAccessor<'a> {
                             } else {
                                 index_row_id
                             };
-                            match self
-                                .unique_compare_exchange(
-                                    rt.pool_guards(),
-                                    &new_key,
-                                    index_old_row_id,
-                                    new_row_id,
-                                    root,
-                                    sts,
-                                )
+                            match index
+                                .compare_exchange(&new_key.vals, index_old_row_id, new_row_id, sts)
                                 .await?
                             {
                                 IndexCompareExchange::Ok => {
@@ -2042,17 +1834,11 @@ impl<'a> UserTableAccessor<'a> {
         debug_assert!(old_row_id != new_row_id);
         let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
         let sts = rt.sts();
+        let index = self.non_unique_user_index(rt.pool_guards(), new_key.index_no, root)?;
         // Non-unique indexes store exact `(key, row_id)` entries, so a move
         // update inserts the new exact entry and masks the old one.
-        match self
-            .non_unique_insert_if_not_exists(
-                rt.pool_guards(),
-                &new_key,
-                new_row_id,
-                false,
-                root,
-                sts,
-            )
+        match index
+            .insert_if_not_exists(&new_key.vals, new_row_id, false, sts)
             .await?
         {
             IndexInsert::Ok(merged) => {
@@ -2080,18 +1866,12 @@ impl<'a> UserTableAccessor<'a> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let index = self.unique_user_index(rt.pool_guards(), key.index_no, root)?;
         // Move update where the unique key is unchanged. The logical key keeps
         // one latest mapping, so atomically replace the old RowID with the new
         // hot RowID and record undo to restore it on rollback.
-        match self
-            .unique_compare_exchange(
-                rt.pool_guards(),
-                &key,
-                old_row_id,
-                new_row_id,
-                root,
-                rt.sts(),
-            )
+        match index
+            .compare_exchange(&key.vals, old_row_id, new_row_id, rt.sts())
             .await?
         {
             IndexCompareExchange::Ok => {
@@ -2116,17 +1896,11 @@ impl<'a> UserTableAccessor<'a> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let index = self.non_unique_user_index(rt.pool_guards(), key.index_no, root)?;
         // Non-unique key unchanged but RowID changed: publish the replacement
         // exact entry, then mask the old exact entry for rollback/GC.
-        let res = self
-            .non_unique_insert_if_not_exists(
-                rt.pool_guards(),
-                &key,
-                new_row_id,
-                false,
-                root,
-                rt.sts(),
-            )
+        let res = index
+            .insert_if_not_exists(&key.vals, new_row_id, false, rt.sts())
             .await?;
         debug_assert!(res.is_ok());
         self.push_insert_non_unique_index_undo(rt, effects, new_row_id, key.clone(), false);
@@ -2153,6 +1927,7 @@ impl<'a> UserTableAccessor<'a> {
     ) -> Result<UpdateIndex> {
         let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
         let sts = rt.sts();
+        let index = self.unique_user_index(rt.pool_guards(), new_key.index_no, root)?;
         loop {
             // In-place unique-key change keeps the same RowID. Repeated key
             // changes in the same transaction can encounter this RowID already
@@ -2169,8 +1944,8 @@ impl<'a> UserTableAccessor<'a> {
             // That mean we can just merge the new index entry into the deleted entry(flip
             // the delete flag) if key and row id all match.
             // So we set merge_if_match_deleted to true.
-            match self
-                .unique_insert_if_not_exists(rt.pool_guards(), &new_key, row_id, true, root, sts)
+            match index
+                .insert_if_not_exists(&new_key.vals, row_id, true, sts)
                 .await?
             {
                 IndexInsert::Ok(merged) => {
@@ -2210,15 +1985,8 @@ impl<'a> UserTableAccessor<'a> {
                             } else {
                                 index_row_id
                             };
-                            match self
-                                .unique_compare_exchange(
-                                    rt.pool_guards(),
-                                    &new_key,
-                                    index_old_row_id,
-                                    row_id,
-                                    root,
-                                    sts,
-                                )
+                            match index
+                                .compare_exchange(&new_key.vals, index_old_row_id, row_id, sts)
                                 .await?
                             {
                                 IndexCompareExchange::Ok => {
@@ -2264,6 +2032,7 @@ impl<'a> UserTableAccessor<'a> {
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let index = self.non_unique_user_index(rt.pool_guards(), new_key.index_no, root)?;
         // This is case for one transaction or multiple transactions to update
         // key of the same row back and forth.
         // e.g. update k=1 to k=2, then update k=2 to k=1, ...
@@ -2274,15 +2043,8 @@ impl<'a> UserTableAccessor<'a> {
         // That mean we can just merge the new index entry into the deleted entry(flip
         // the delete flag) if key and row id all match.
         // So we set merge_if_match_deleted to true.
-        match self
-            .non_unique_insert_if_not_exists(
-                rt.pool_guards(),
-                &new_key,
-                row_id,
-                true,
-                root,
-                rt.sts(),
-            )
+        match index
+            .insert_if_not_exists(&new_key.vals, row_id, true, rt.sts())
             .await?
         {
             IndexInsert::Ok(merged) => {
@@ -2394,10 +2156,8 @@ impl<'a> UserTableAccessor<'a> {
                     .all(|(l, r)| l < r)
         });
         let root = self.read_proof_secondary_root(rt, key.index_no)?;
-        match self
-            .unique_lookup(rt.pool_guards(), key, root, rt.sts())
-            .await?
-        {
+        let index = self.unique_user_index(rt.pool_guards(), key.index_no, root)?;
+        match index.lookup(&key.vals, rt.sts()).await? {
             None => Ok(SelectMvcc::NotFound),
             Some((row_id, _)) => {
                 self.index_lookup_unique_row_mvcc(rt, key, user_read_set, row_id)
@@ -2439,7 +2199,8 @@ impl<'a> UserTableAccessor<'a> {
         // todo: support batching, streaming and sorting.
         let mut row_ids = vec![];
         let root = self.read_proof_secondary_root(rt, key.index_no)?;
-        self.non_unique_lookup(rt.pool_guards(), key, &mut row_ids, root, rt.sts())
+        self.non_unique_user_index(rt.pool_guards(), key.index_no, root)?
+            .lookup(&key.vals, &mut row_ids, rt.sts())
             .await?;
         let mut res = vec![];
         for row_id in row_ids {
@@ -2583,10 +2344,8 @@ impl<'a> UserTableAccessor<'a> {
         loop {
             let root_snapshot = self.root_snapshot(rt.ctx())?;
             let lookup_root = self.snapshot_secondary_root(&root_snapshot, key.index_no)?;
-            let (page_guard, row_id) = match self
-                .unique_lookup(rt.pool_guards(), key, lookup_root, rt.sts())
-                .await?
-            {
+            let index = self.unique_user_index(rt.pool_guards(), key.index_no, lookup_root)?;
+            let (page_guard, row_id) = match index.lookup(&key.vals, rt.sts()).await? {
                 None => return Ok(UpdateUniqueMvcc::NotFound(input)),
                 Some((row_id, _)) => {
                     match self.find_row_location(rt.pool_guards(), row_id).await {
@@ -2859,10 +2618,8 @@ impl<'a> UserTableAccessor<'a> {
         loop {
             let root_snapshot = self.root_snapshot(rt.ctx())?;
             let lookup_root = self.snapshot_secondary_root(&root_snapshot, key.index_no)?;
-            let (page_guard, row_id) = match self
-                .unique_lookup(rt.pool_guards(), key, lookup_root, rt.sts())
-                .await?
-            {
+            let index = self.unique_user_index(rt.pool_guards(), key.index_no, lookup_root)?;
+            let (page_guard, row_id) = match index.lookup(&key.vals, rt.sts()).await? {
                 None => return Ok(DeleteMvcc::NotFound),
                 Some((row_id, _)) => {
                     match self.find_row_location(rt.pool_guards(), row_id).await {
@@ -3648,14 +3405,10 @@ mod tests {
             let key = single_key(1i32);
             let trx = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let index = bound_unique_index_no(&table, key.index_no);
-            let (row_id, _) = index
-                .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
-                .await
-                .unwrap()
-                .unwrap();
-
             let pool_guards = session.pool_guards();
+            let index = bound_unique_index_no(&table, &pool_guards, key.index_no);
+            let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
+
             let snapshot = column_block_index_snapshot(&engine, table_id);
             let column_index = snapshot.index(pool_guards.disk_guard());
             let resolved = column_index
@@ -4567,18 +4320,15 @@ mod tests {
             .await;
             reader.commit().await.unwrap();
 
+            let pool_guards = session.pool_guards();
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 claimed_key.index_no,
             );
             assert!(
                 index
-                    .mask_as_deleted(
-                        session.pool_guards().index_guard(),
-                        &claimed_key.vals,
-                        claimed_row_id,
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .mask_as_deleted(&claimed_key.vals, claimed_row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -4686,15 +4436,13 @@ mod tests {
             }
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
+            let pool_guards = session.pool_guards();
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 key.index_no,
             );
-            let (row_id, _) = index
-                .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
-                .await
-                .unwrap()
-                .unwrap();
+            let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
             let page_id = match table_for_internal_assertion(&engine, table_id)
                 .find_row(&session.pool_guards(), row_id)
                 .await
@@ -5575,15 +5323,13 @@ mod tests {
 
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
+            let pool_guards = session.pool_guards();
             let index = bound_unique_index_no(
                 &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
                 key.index_no,
             );
-            let (row_id, _) = index
-                .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
-                .await
-                .unwrap()
-                .unwrap();
+            let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
             let page_id = match table_for_internal_assertion(&engine, table_id)
                 .find_row(&session.pool_guards(), row_id)
                 .await
