@@ -1,9 +1,10 @@
 use super::{
-    DeleteInternal, DmlValidationDomain, InsertRowIntoPage, UpdateRowInplace, UpdateUniqueMvcc,
+    DeleteInternal, DmlValidationDomain, DmlValidator, InsertRowIntoPage, UpdateRowInplace,
+    UpdateUniqueMvcc,
     hot::{HotRowDeleter, HotRowUpdater, RowInserter},
     index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
-    row_len, secondary_index_kind_mismatch, unique_key_from_full_row,
-    update_index_result_to_update_unique_mvcc, validate_dml_full_row, validate_page_row_range,
+    row_len, unique_key_from_full_row, update_index_result_to_update_unique_mvcc,
+    validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
@@ -15,8 +16,8 @@ use crate::error::{
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    BlockIndex, InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex,
-    RowLocation, UniqueIndex,
+    BlockIndex, GuardedNonUniqueMemIndex, GuardedUniqueMemIndex, InMemorySecondaryIndex,
+    IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
 use crate::map::FastHashMap;
@@ -168,154 +169,36 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .is_unique()
     }
 
+    /// Return a guarded unique MemIndex by stable index number.
     #[inline]
-    async fn unique_lookup(
+    pub(crate) fn require_unique_index<'g>(
         &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        sts: TrxID,
-    ) -> Result<Option<(RowID, bool)>> {
-        self.require_sec_idx(key.index_no)?
-            .unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("unique lookup", "unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .lookup(&key.vals, sts)
-            .await
+        guards: &'g PoolGuards,
+        index_no: usize,
+    ) -> Result<GuardedUniqueMemIndex<'_, 'g, I>> {
+        match self.require_sec_idx(index_no)? {
+            InMemorySecondaryIndex::Unique(index) => Ok(index.bind(self.index_pool_guard(guards)?)),
+            InMemorySecondaryIndex::NonUnique(_) => {
+                Err(Error::wrong_secondary_index_binding("unique", "non-unique"))
+            }
+        }
     }
 
+    /// Return a guarded non-unique MemIndex by stable index number.
     #[inline]
-    async fn unique_insert_if_not_exists(
+    pub(crate) fn require_non_unique_index<'g>(
         &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        sts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.require_sec_idx(key.index_no)?
-            .unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("unique insert", "unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .insert_if_not_exists(&key.vals, row_id, merge_if_match_deleted, sts)
-            .await
-    }
-
-    #[inline]
-    async fn unique_compare_delete(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        old_row_id: RowID,
-        ignore_del_mask: bool,
-        ts: TrxID,
-    ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
-            .unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("unique compare delete", "unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .compare_delete(&key.vals, old_row_id, ignore_del_mask, ts)
-            .await
-    }
-
-    #[inline]
-    async fn unique_mask_as_deleted(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        sts: TrxID,
-    ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
-            .unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("unique mask deleted", "unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .mask_as_deleted(&key.vals, row_id, sts)
-            .await
-    }
-
-    #[inline]
-    async fn unique_compare_exchange(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        old_row_id: RowID,
-        new_row_id: RowID,
-        sts: TrxID,
-    ) -> Result<IndexCompareExchange> {
-        self.require_sec_idx(key.index_no)?
-            .unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("unique compare exchange", "unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .compare_exchange(&key.vals, old_row_id, new_row_id, sts)
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_lookup_unique(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        sts: TrxID,
-    ) -> Result<Option<bool>> {
-        self.require_sec_idx(key.index_no)?
-            .non_unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("non-unique lookup unique", "non-unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .lookup_unique(&key.vals, row_id, sts)
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_insert_if_not_exists(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        sts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.require_sec_idx(key.index_no)?
-            .non_unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("non-unique insert", "non-unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .insert_if_not_exists(&key.vals, row_id, merge_if_match_deleted, sts)
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_mask_as_deleted(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        sts: TrxID,
-    ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
-            .non_unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("non-unique mask deleted", "non-unique"))?
-            .bind(self.index_pool_guard(guards)?)
-            .mask_as_deleted(&key.vals, row_id, sts)
-            .await
-    }
-
-    #[inline]
-    async fn non_unique_compare_delete(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        ignore_del_mask: bool,
-        ts: TrxID,
-    ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
-            .non_unique()
-            .ok_or_else(|| {
-                secondary_index_kind_mismatch("non-unique compare delete", "non-unique")
-            })?
-            .bind(self.index_pool_guard(guards)?)
-            .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
-            .await
+        guards: &'g PoolGuards,
+        index_no: usize,
+    ) -> Result<GuardedNonUniqueMemIndex<'_, 'g, I>> {
+        match self.require_sec_idx(index_no)? {
+            InMemorySecondaryIndex::Unique(_) => {
+                Err(Error::wrong_secondary_index_binding("non-unique", "unique"))
+            }
+            InMemorySecondaryIndex::NonUnique(index) => {
+                Ok(index.bind(self.index_pool_guard(guards)?))
+            }
+        }
     }
 
     /// Returns the row-id boundary between persisted and in-memory rows.
@@ -791,12 +674,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .unique()
         {
             let res = self
-                .unique_insert_if_not_exists(guards, &key, row_id, false, MIN_SNAPSHOT_TS)
+                .require_unique_index(guards, key.index_no)?
+                .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await?;
             ensure_no_trx_index_insert(key.index_no, res)?;
         } else {
             let res = self
-                .non_unique_insert_if_not_exists(guards, &key, row_id, false, MIN_SNAPSHOT_TS)
+                .require_non_unique_index(guards, key.index_no)?
+                .insert_if_not_exists(&key.vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await?;
             ensure_no_trx_index_insert(key.index_no, res)?;
         }
@@ -807,15 +692,18 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     async fn delete_index_directly(
         &self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         row_id: RowID,
     ) -> Result<bool> {
-        let spec = self.metadata().idx.require_index_spec(key.index_no)?;
+        let spec = self.metadata().idx.require_index_spec(index_no)?;
         if spec.unique() {
-            self.unique_compare_delete(guards, key, row_id, true, MIN_SNAPSHOT_TS)
+            self.require_unique_index(guards, index_no)?
+                .compare_delete(key_vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         } else {
-            self.non_unique_compare_delete(guards, key, row_id, true, MIN_SNAPSHOT_TS)
+            self.require_non_unique_index(guards, index_no)?
+                .compare_delete(key_vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await
         }
     }
@@ -847,7 +735,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             }
             self.insert_index_no_trx(guards, new_key.clone(), row_id)
                 .await?;
-            if !self.delete_index_directly(guards, old_key, row_id).await? {
+            if !self
+                .delete_index_directly(guards, old_key.index_no, &old_key.vals, row_id)
+                .await?
+            {
                 return Err(catalog_primary_key_payload_error(format!(
                     "update primary key no-trx index refresh missing old key: index_no={}, row_id={row_id}",
                     old_key.index_no
@@ -935,7 +826,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         rt: TrxRuntime<'_>,
         old_id: RowID,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         new_id: RowID,
         new_guard: &PageSharedGuard<RowPage>,
     ) -> Result<LinkForUniqueIndex> {
@@ -962,7 +854,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let metadata = self.metadata();
         let (page_ctx, page) = old_guard.ctx_and_page();
         let old_access = RowReadAccess::new(page, page_ctx, page.row_idx(old_id));
-        match old_access.find_old_version_for_unique_key(metadata, key, rt.ctx()) {
+        match old_access.find_old_version_for_unique_key(metadata, index_no, key_vals, rt.ctx()) {
             FindOldVersion::None => Ok(LinkForUniqueIndex::NotNeeded),
             FindOldVersion::DuplicateKey => Ok(LinkForUniqueIndex::DuplicateKey),
             FindOldVersion::WriteConflict => Ok(LinkForUniqueIndex::WriteConflict),
@@ -976,7 +868,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     false,
                 );
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
-                new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
+                new_access.link_for_unique_index(
+                    SelectKey::new(index_no, key_vals.to_vec()),
+                    cts,
+                    old_entry,
+                    undo_vals,
+                );
                 Ok(LinkForUniqueIndex::Linked)
             }
         }
@@ -993,9 +890,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<InsertIndex> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
+        let index = self.require_unique_index(guards, key.index_no)?;
         loop {
-            match self
-                .unique_insert_if_not_exists(guards, &key, row_id, false, sts)
+            match index
+                .insert_if_not_exists(&key.vals, row_id, false, sts)
                 .await?
             {
                 IndexInsert::Ok(merged) => {
@@ -1008,7 +906,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         return Ok(InsertIndex::DuplicateKey);
                     }
                     match self
-                        .link_for_unique_index(rt, old_row_id, &key, row_id, page_guard)
+                        .link_for_unique_index(
+                            rt,
+                            old_row_id,
+                            key.index_no,
+                            &key.vals,
+                            row_id,
+                            page_guard,
+                        )
                         .await?
                     {
                         LinkForUniqueIndex::DuplicateKey => return Ok(InsertIndex::DuplicateKey),
@@ -1021,14 +926,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             } else {
                                 old_row_id
                             };
-                            match self
-                                .unique_compare_exchange(
-                                    guards,
-                                    &key,
-                                    index_old_row_id,
-                                    row_id,
-                                    sts,
-                                )
+                            match index
+                                .compare_exchange(&key.vals, index_old_row_id, row_id, sts)
                                 .await?
                             {
                                 IndexCompareExchange::Ok => {
@@ -1060,7 +959,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
         match self
-            .non_unique_insert_if_not_exists(guards, &key, row_id, false, sts)
+            .require_non_unique_index(guards, key.index_no)?
+            .insert_if_not_exists(&key.vals, row_id, false, sts)
             .await?
         {
             IndexInsert::Ok(merged) => {
@@ -1122,7 +1022,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
         let res = self
-            .unique_mask_as_deleted(guards, &key, row_id, sts)
+            .require_unique_index(guards, key.index_no)?
+            .mask_as_deleted(&key.vals, row_id, sts)
             .await?;
         debug_assert!(res);
         self.push_delete_index_undo(rt, effects, row_id, key, true);
@@ -1140,7 +1041,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
         let res = self
-            .non_unique_mask_as_deleted(guards, &key, row_id, sts)
+            .require_non_unique_index(guards, key.index_no)?
+            .mask_as_deleted(&key.vals, row_id, sts)
             .await?;
         debug_assert!(res);
         self.push_delete_index_undo(rt, effects, row_id, key, false);
@@ -1181,21 +1083,23 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     async fn delete_unique_index(
         &self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         row_id: RowID,
         _min_active_sts: TrxID,
     ) -> Result<bool> {
+        let index = self.require_unique_index(guards, index_no)?;
         let (page_guard, row_id) = loop {
             let sts = MIN_SNAPSHOT_TS;
-            match self.unique_lookup(guards, key, sts).await? {
+            match index.lookup(key_vals, sts).await? {
                 None => return Ok(false),
                 Some((index_row_id, deleted)) => {
                     if !deleted || index_row_id != row_id {
                         return Ok(false);
                     }
                     let Some(page_id) = self.index_purge_decision(guards, row_id).await? else {
-                        return self
-                            .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
+                        return index
+                            .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                             .await;
                     };
                     let Some(page_guard) = self
@@ -1210,9 +1114,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         };
         let (ctx, page) = page_guard.ctx_and_page();
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
-        if !access.any_version_matches_key(self.metadata(), key) {
-            return self
-                .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
+        if !access.any_version_matches_key(self.metadata(), index_no, key_vals) {
+            return index
+                .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -1222,24 +1126,23 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     async fn delete_non_unique_index(
         &self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         row_id: RowID,
         _min_active_sts: TrxID,
     ) -> Result<bool> {
+        let index = self.require_non_unique_index(guards, index_no)?;
         let (page_guard, row_id) = loop {
             let sts = MIN_SNAPSHOT_TS;
-            match self
-                .non_unique_lookup_unique(guards, key, row_id, sts)
-                .await?
-            {
+            match index.lookup_unique(key_vals, row_id, sts).await? {
                 None => return Ok(false),
                 Some(active) => {
                     if active {
                         return Ok(false);
                     }
                     let Some(page_id) = self.index_purge_decision(guards, row_id).await? else {
-                        return self
-                            .non_unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
+                        return index
+                            .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                             .await;
                     };
                     let Some(page_guard) = self
@@ -1254,9 +1157,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         };
         let (ctx, page) = page_guard.ctx_and_page();
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
-        if !access.any_version_matches_key(self.metadata(), key) {
-            return self
-                .non_unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
+        if !access.any_version_matches_key(self.metadata(), index_no, key_vals) {
+            return index
+                .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -1272,13 +1175,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<()> {
         let metadata = self.metadata();
         if !disable_dml_validation {
-            validate_dml_full_row(
+            DmlValidator::new(
                 metadata,
-                Some(self.table_id()),
+                self.table_id(),
                 "insert_no_trx",
-                cols,
                 DmlValidationDomain::Recovery,
-            )?;
+            )
+            .validate_full_row(cols)?;
         }
         debug_assert!(cols.len() == self.metadata().col.col_count());
         debug_assert!({
@@ -1323,21 +1226,28 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     pub(crate) async fn delete_primary_key_no_trx(
         &self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         disable_dml_validation: bool,
     ) -> Result<()> {
         let metadata = self.metadata();
         let index_spec = if disable_dml_validation {
-            metadata.idx.require_index_spec(key.index_no)?
+            metadata.idx.require_index_spec(index_no)?
         } else {
-            validate_primary_key_no_trx_key(metadata, key, "delete primary key no-trx")?
+            validate_primary_key_no_trx_key(
+                metadata,
+                index_no,
+                key_vals,
+                "delete primary key no-trx",
+            )?
         };
+        let index = self.require_unique_index(guards, index_no)?;
         let sts = MIN_SNAPSHOT_TS;
-        let (mut page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
+        let (mut page_guard, row_id) = match index.lookup(key_vals, sts).await? {
             None => {
                 return Err(catalog_primary_key_payload_error(format!(
                     "delete primary key no-trx missing catalog row: index_no={}, key_vals={:?}",
-                    key.index_no, key.vals
+                    index_no, key_vals
                 )));
             }
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
@@ -1363,10 +1273,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             )));
         }
         let row = page.row(row_idx);
-        if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+        if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
             return Err(catalog_primary_key_payload_error(format!(
                 "delete primary key no-trx row key mismatch: row_id={row_id}, index_no={}",
-                key.index_no
+                index_no
             )));
         }
         let keys = self
@@ -1374,7 +1284,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .idx
             .keys_for_delete(self.metadata().col.as_ref(), row);
         for key in keys {
-            let res = self.delete_index_directly(guards, &key, row_id).await?;
+            let res = self
+                .delete_index_directly(guards, key.index_no, &key.vals, row_id)
+                .await?;
             assert!(res);
         }
         page.set_deleted_exclusive(row_idx, true);
@@ -1396,15 +1308,21 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     pub(crate) async fn update_primary_key_no_trx(
         &self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         update: &[UpdateCol],
         disable_dml_validation: bool,
     ) -> Result<()> {
         let metadata = self.metadata();
         let index_spec = if disable_dml_validation {
-            metadata.idx.require_index_spec(key.index_no)?
+            metadata.idx.require_index_spec(index_no)?
         } else {
-            validate_primary_key_no_trx_key(metadata, key, "update primary key no-trx")?
+            validate_primary_key_no_trx_key(
+                metadata,
+                index_no,
+                key_vals,
+                "update primary key no-trx",
+            )?
         };
         // Validation opt-out is an unchecked/prevalidated recovery path. When
         // validation is enabled, keep primary-key column changes rejected
@@ -1413,12 +1331,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             validate_update_primary_key_no_trx_cols(metadata, update)?;
         }
 
+        let index = self.require_unique_index(guards, index_no)?;
         let sts = MIN_SNAPSHOT_TS;
-        let (mut page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
+        let (mut page_guard, row_id) = match index.lookup(key_vals, sts).await? {
             None => {
                 return Err(catalog_primary_key_payload_error(format!(
                     "update primary key no-trx missing catalog row: index_no={}, key_vals={:?}",
-                    key.index_no, key.vals
+                    index_no, key_vals
                 )));
             }
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
@@ -1449,10 +1368,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 "update primary key no-trx row is deleted: row_id={row_id}"
             )));
         }
-        if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+        if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
             return Err(catalog_primary_key_payload_error(format!(
                 "update primary key no-trx row key mismatch: row_id={row_id}, index_no={}",
-                key.index_no
+                index_no
             )));
         }
         let var_len = page.var_len_for_update(row_idx, RowUpdateView::Sparse(update));
@@ -1495,7 +1414,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     row_vals[update_col.idx] = update_col.val.clone();
                 }
                 drop(page_guard);
-                self.delete_primary_key_no_trx(guards, key, disable_dml_validation)
+                self.delete_primary_key_no_trx(guards, index_no, key_vals, disable_dml_validation)
                     .await?;
                 self.insert_no_trx(guards, &row_vals, disable_dml_validation)
                     .await
@@ -1538,27 +1457,29 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     pub(crate) async fn index_lookup_unique_uncommitted<R, F>(
         &self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         row_action: F,
     ) -> Result<Option<R>>
     where
         for<'m, 'p> F: FnOnce(&'m TableColumnLayout, Row<'p>) -> R,
     {
-        debug_assert!(key.index_no < self.sec_idx_len());
+        debug_assert!(index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
                 .idx
-                .require_index_spec(key.index_no)
+                .require_index_spec(index_no)
                 .unwrap()
                 .unique()
         );
         debug_assert!(self.metadata().idx.index_type_match(
             self.metadata().col.as_ref(),
-            key.index_no,
-            &key.vals
+            index_no,
+            key_vals
         ));
+        let index = self.require_unique_index(guards, index_no)?;
         let sts = MIN_SNAPSHOT_TS;
-        let (page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
+        let (page_guard, row_id) = match index.lookup(key_vals, sts).await? {
             None => return Ok(None),
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
                 RowLocation::NotFound => return Ok(None),
@@ -1582,10 +1503,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             return Ok(None);
         }
         let metadata = self.metadata();
-        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
             return Ok(None);
         };
-        if row.is_key_different(row_layout, index_spec, key) {
+        if row.is_key_different(row_layout, index_spec, key_vals) {
             return Ok(None);
         }
         Ok(Some(row_action(row_layout, row)))
@@ -1650,7 +1571,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         )?;
         let input = RowUpdateInput::FullRow(cols);
         match self
-            .update_unique_mvcc_input(rt, effects, &key, input, log_by_key)
+            .update_unique_mvcc_input(rt, effects, key.index_no, &key.vals, input, log_by_key)
             .await?
         {
             UpdateUniqueMvcc::Updated(row_id) => Ok(UpsertMvcc::Updated(row_id)),
@@ -1671,13 +1592,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         update: Vec<UpdateCol>,
         log_by_key: bool,
     ) -> Result<UpdateMvcc> {
         let input = RowUpdateInput::Sparse(update);
         match self
-            .update_unique_mvcc_input(rt, effects, key, input, log_by_key)
+            .update_unique_mvcc_input(rt, effects, index_no, key_vals, input, log_by_key)
             .await?
         {
             UpdateUniqueMvcc::Updated(row_id) => Ok(UpdateMvcc::Updated(row_id)),
@@ -1690,31 +1612,33 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         input: RowUpdateInput,
         log_by_key: bool,
     ) -> Result<UpdateUniqueMvcc> {
-        debug_assert!(key.index_no < self.sec_idx_len());
+        debug_assert!(index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
                 .idx
-                .require_index_spec(key.index_no)
+                .require_index_spec(index_no)
                 .unwrap()
                 .unique()
         );
         debug_assert!(self.metadata().idx.index_type_match(
             self.metadata().col.as_ref(),
-            key.index_no,
-            &key.vals
+            index_no,
+            key_vals
         ));
         debug_assert!(
             input.as_view().is_valid_for(self.metadata().col.as_ref()),
             "row update values must be ordered, in range, and type-compatible"
         );
         let guards = rt.pool_guards();
+        let index = self.require_unique_index(guards, index_no)?;
         loop {
             let lookup_sts = rt.sts();
-            let (page_guard, row_id) = match self.unique_lookup(guards, key, lookup_sts).await? {
+            let (page_guard, row_id) = match index.lookup(key_vals, lookup_sts).await? {
                 None => return Ok(UpdateUniqueMvcc::NotFound(input)),
                 Some((row_id, _)) => match self.find_row(guards, row_id).await {
                     Ok(RowLocation::NotFound) => {
@@ -1736,7 +1660,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 },
             };
             let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-                .update_inplace(effects, page_guard, key, row_id, input, log_by_key)
+                .update_inplace(
+                    effects, page_guard, index_no, key_vals, row_id, input, log_by_key,
+                )
                 .await;
             match res {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
@@ -1993,9 +1919,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         debug_assert!(old_row_id != new_row_id);
         let sts = rt.sts();
         let guards = rt.pool_guards();
+        let index = self.require_unique_index(guards, new_key.index_no)?;
         loop {
-            match self
-                .unique_insert_if_not_exists(guards, &new_key, new_row_id, false, sts)
+            match index
+                .insert_if_not_exists(&new_key.vals, new_row_id, false, sts)
                 .await?
             {
                 IndexInsert::Ok(merged) => {
@@ -2011,14 +1938,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         return Ok(UpdateIndex::DuplicateKey);
                     }
                     if index_row_id == old_row_id {
-                        match self
-                            .unique_compare_exchange(
-                                guards,
-                                &new_key,
-                                old_row_id.deleted(),
-                                new_row_id,
-                                sts,
-                            )
+                        match index
+                            .compare_exchange(&new_key.vals, old_row_id.deleted(), new_row_id, sts)
                             .await?
                         {
                             IndexCompareExchange::Ok => {
@@ -2034,7 +1955,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         }
                     }
                     match self
-                        .link_for_unique_index(rt, index_row_id, &new_key, new_row_id, new_guard)
+                        .link_for_unique_index(
+                            rt,
+                            index_row_id,
+                            new_key.index_no,
+                            &new_key.vals,
+                            new_row_id,
+                            new_guard,
+                        )
                         .await?
                     {
                         LinkForUniqueIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
@@ -2043,14 +1971,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         }
                         LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
                             let index_old_row_id = index_row_id.deleted();
-                            match self
-                                .unique_compare_exchange(
-                                    guards,
-                                    &new_key,
-                                    index_old_row_id,
-                                    new_row_id,
-                                    sts,
-                                )
+                            match index
+                                .compare_exchange(&new_key.vals, index_old_row_id, new_row_id, sts)
                                 .await?
                             {
                                 IndexCompareExchange::Ok => {
@@ -2092,13 +2014,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         match self
-            .non_unique_insert_if_not_exists(
-                rt.pool_guards(),
-                &new_key,
-                new_row_id,
-                false,
-                rt.sts(),
-            )
+            .require_non_unique_index(rt.pool_guards(), new_key.index_no)?
+            .insert_if_not_exists(&new_key.vals, new_row_id, false, rt.sts())
             .await?
         {
             IndexInsert::Ok(merged) => {
@@ -2123,7 +2040,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         match self
-            .unique_compare_exchange(rt.pool_guards(), &key, old_row_id, new_row_id, rt.sts())
+            .require_unique_index(rt.pool_guards(), key.index_no)?
+            .compare_exchange(&key.vals, old_row_id, new_row_id, rt.sts())
             .await?
         {
             IndexCompareExchange::Ok => {
@@ -2145,7 +2063,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let res = self
-            .non_unique_insert_if_not_exists(rt.pool_guards(), &key, new_row_id, false, rt.sts())
+            .require_non_unique_index(rt.pool_guards(), key.index_no)?
+            .insert_if_not_exists(&key.vals, new_row_id, false, rt.sts())
             .await?;
         debug_assert!(res.is_ok());
         self.push_insert_non_unique_index_undo(rt, effects, new_row_id, key.clone(), false);
@@ -2166,9 +2085,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<UpdateIndex> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
+        let index = self.require_unique_index(guards, new_key.index_no)?;
         loop {
-            match self
-                .unique_insert_if_not_exists(guards, &new_key, row_id, true, sts)
+            match index
+                .insert_if_not_exists(&new_key.vals, row_id, true, sts)
                 .await?
             {
                 IndexInsert::Ok(merged) => {
@@ -2182,7 +2102,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         return Ok(UpdateIndex::DuplicateKey);
                     }
                     match self
-                        .link_for_unique_index(rt, index_row_id, &new_key, row_id, page_guard)
+                        .link_for_unique_index(
+                            rt,
+                            index_row_id,
+                            new_key.index_no,
+                            &new_key.vals,
+                            row_id,
+                            page_guard,
+                        )
                         .await?
                     {
                         LinkForUniqueIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
@@ -2190,10 +2117,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             return Ok(UpdateIndex::WriteConflict);
                         }
                         LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
-                            match self
-                                .unique_compare_exchange(
-                                    guards,
-                                    &new_key,
+                            match index
+                                .compare_exchange(
+                                    &new_key.vals,
                                     index_row_id.deleted(),
                                     row_id,
                                     sts,
@@ -2235,7 +2161,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_id: RowID,
     ) -> Result<UpdateIndex> {
         match self
-            .non_unique_insert_if_not_exists(rt.pool_guards(), &new_key, row_id, true, rt.sts())
+            .require_non_unique_index(rt.pool_guards(), new_key.index_no)?
+            .insert_if_not_exists(&new_key.vals, row_id, true, rt.sts())
             .await?
         {
             IndexInsert::Ok(merged) => {
@@ -2258,26 +2185,28 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
-        debug_assert!(key.index_no < self.sec_idx_len());
+        debug_assert!(index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
                 .idx
-                .require_index_spec(key.index_no)
+                .require_index_spec(index_no)
                 .unwrap()
                 .unique()
         );
         debug_assert!(self.metadata().idx.index_type_match(
             self.metadata().col.as_ref(),
-            key.index_no,
-            &key.vals
+            index_no,
+            key_vals
         ));
         let guards = rt.pool_guards();
+        let index = self.require_unique_index(guards, index_no)?;
         loop {
             let lookup_sts = rt.sts();
-            let (page_guard, row_id) = match self.unique_lookup(guards, key, lookup_sts).await? {
+            let (page_guard, row_id) = match index.lookup(key_vals, lookup_sts).await? {
                 None => return Ok(DeleteMvcc::NotFound),
                 Some((row_id, _)) => match self.find_row(guards, row_id).await {
                     Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
@@ -2297,7 +2226,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 },
             };
             match HotRowDeleter::new(self.table_id(), self.metadata(), rt)
-                .delete(effects, page_guard, row_id, key, log_by_key)
+                .delete(effects, page_guard, row_id, index_no, key_vals, log_by_key)
                 .await
             {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
@@ -2325,23 +2254,24 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     pub(crate) async fn delete_index(
         &self,
         guards: &PoolGuards,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
     ) -> Result<bool> {
-        let Some(index_schema) = self.metadata().idx.index_spec(key.index_no) else {
+        let Some(index_schema) = self.metadata().idx.index_spec(index_no) else {
             return Ok(false);
         };
-        if !self.sec_idx_is_active(key.index_no) {
+        if !self.sec_idx_is_active(index_no) {
             return Ok(false);
         }
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
-            self.delete_unique_index(guards, key, row_id, min_active_sts)
+            self.delete_unique_index(guards, index_no, key_vals, row_id, min_active_sts)
                 .await
         } else {
-            self.delete_non_unique_index(guards, key, row_id, min_active_sts)
+            self.delete_non_unique_index(guards, index_no, key_vals, row_id, min_active_sts)
                 .await
         }
     }
@@ -2546,7 +2476,8 @@ fn validate_update_primary_key_no_trx_primary_key_cols(
 #[inline]
 fn validate_primary_key_no_trx_key<'a>(
     metadata: &'a TableMetadata,
-    key: &SelectKey,
+    index_no: usize,
+    key_vals: &[Val],
     operation: &'static str,
 ) -> Result<&'a IndexSpec> {
     let Some(primary_key) = metadata.primary_key() else {
@@ -2554,7 +2485,7 @@ fn validate_primary_key_no_trx_key<'a>(
             "{operation} primary key not found"
         )));
     };
-    match primary_key.validate_key(key) {
+    match primary_key.validate_key(index_no, key_vals) {
         Ok(()) => Ok(primary_key.spec()),
         Err(PrimaryKeyMatchError::IndexNo { actual, expected }) => {
             Err(catalog_primary_key_payload_error(format!(
@@ -2603,7 +2534,7 @@ mod tests {
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{RowID, TableID, TrxID};
-    use crate::index::{BlockIndex, RowLocation};
+    use crate::index::{BlockIndex, NonUniqueIndex, RowLocation, UniqueIndex};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc};
     use crate::session::{Session, tests::SessionTestExt};
@@ -2736,7 +2667,7 @@ mod tests {
         session: &mut Session,
         table_id: TableID,
         mem_table: &TestMemTable,
-        key: &SelectKey,
+        key: SelectKey,
         update: Vec<UpdateCol>,
     ) -> UpdateMvcc {
         let mut trx = session.begin_trx().unwrap();
@@ -2746,7 +2677,7 @@ mod tests {
                 stmt.acquire_table_write_data_lock(table_id).await?;
                 let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                 mem_table
-                    .update_unique_mvcc(rt, effects, key, update, false)
+                    .update_unique_mvcc(rt, effects, key.index_no, &key.vals, update, false)
                     .await
             })
             .await
@@ -2758,11 +2689,13 @@ mod tests {
     async fn assert_unique_index_entry(
         mem_table: &TestMemTable,
         guards: &PoolGuards,
-        key: &SelectKey,
+        key: SelectKey,
         expected: Option<(RowID, bool)>,
     ) {
         let entry = mem_table
-            .unique_lookup(guards, key, MIN_SNAPSHOT_TS)
+            .require_unique_index(guards, key.index_no)
+            .unwrap()
+            .lookup(&key.vals, MIN_SNAPSHOT_TS)
             .await
             .unwrap();
         assert_eq!(entry, expected);
@@ -2771,12 +2704,14 @@ mod tests {
     async fn assert_non_unique_index_entry(
         mem_table: &TestMemTable,
         guards: &PoolGuards,
-        key: &SelectKey,
+        key: SelectKey,
         row_id: RowID,
         expected: Option<bool>,
     ) {
         let entry = mem_table
-            .non_unique_lookup_unique(guards, key, row_id, MIN_SNAPSHOT_TS)
+            .require_non_unique_index(guards, key.index_no)
+            .unwrap()
+            .lookup_unique(&key.vals, row_id, MIN_SNAPSHOT_TS)
             .await
             .unwrap();
         assert_eq!(entry, expected);
@@ -2785,12 +2720,12 @@ mod tests {
     async fn assert_unique_row(
         mem_table: &TestMemTable,
         guards: &PoolGuards,
-        key: &SelectKey,
+        key: SelectKey,
         expected: Option<Vec<Val>>,
     ) {
         let col_count = mem_table.metadata().col.col_count();
         let row = mem_table
-            .index_lookup_unique_uncommitted(guards, key, |layout, row| {
+            .index_lookup_unique_uncommitted(guards, key.index_no, &key.vals, |layout, row| {
                 (0..col_count)
                     .map(|col_idx| row.val(layout, col_idx))
                     .collect::<Vec<_>>()
@@ -2882,10 +2817,12 @@ mod tests {
             assert_eq!(updated, UpsertMvcc::Updated(inserted_row_id));
             trx.commit().await.unwrap();
 
+            let key = single_key(1i32);
             let row = mem_table
                 .index_lookup_unique_uncommitted(
                     &session.pool_guards(),
-                    &single_key(1i32),
+                    key.index_no,
+                    &key.vals,
                     |layout, row| vec![row.val(layout, 0), row.val(layout, 1)],
                 )
                 .await
@@ -2973,31 +2910,37 @@ mod tests {
                 .await
                 .unwrap();
 
+            let key1 = single_key(1i32);
             let (row1, row1_deleted) = mem_table
-                .unique_lookup(&guards, &single_key(1i32), MIN_SNAPSHOT_TS)
+                .require_unique_index(&guards, key1.index_no)
+                .unwrap()
+                .lookup(&key1.vals, MIN_SNAPSHOT_TS)
                 .await
                 .unwrap()
                 .expect("first unique index entry should exist");
+            let key2 = single_key(2i32);
             let (row2, row2_deleted) = mem_table
-                .unique_lookup(&guards, &single_key(2i32), MIN_SNAPSHOT_TS)
+                .require_unique_index(&guards, key2.index_no)
+                .unwrap()
+                .lookup(&key2.vals, MIN_SNAPSHOT_TS)
                 .await
                 .unwrap()
                 .expect("second unique index entry should exist");
             assert!(!row1_deleted);
             assert!(!row2_deleted);
-            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row1, Some(true))
+            assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row1, Some(true))
                 .await;
-            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row2, Some(true))
+            assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row2, Some(true))
                 .await;
 
             mem_table
-                .delete_primary_key_no_trx(&guards, &single_key(1i32), false)
+                .delete_primary_key_no_trx(&guards, key1.index_no, &key1.vals, false)
                 .await
                 .unwrap();
 
-            assert_unique_index_entry(&mem_table, &guards, &single_key(1i32), None).await;
-            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row1, None).await;
-            assert_non_unique_index_entry(&mem_table, &guards, &name_key("same"), row2, Some(true))
+            assert_unique_index_entry(&mem_table, &guards, single_key(1i32), None).await;
+            assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row1, None).await;
+            assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row2, Some(true))
                 .await;
         });
     }
@@ -3019,8 +2962,9 @@ mod tests {
                 .insert_no_trx(&guards, &indexed_payload_row(1, "same", b"payload"), false)
                 .await
                 .unwrap();
+            let key = name_key("same");
             let err = mem_table
-                .delete_primary_key_no_trx(&guards, &name_key("same"), false)
+                .delete_primary_key_no_trx(&guards, key.index_no, &key.vals, false)
                 .await
                 .unwrap_err();
 
@@ -3055,8 +2999,9 @@ mod tests {
                 .await
                 .unwrap();
 
+            let key = name_key("unique");
             let err = mem_table
-                .delete_primary_key_no_trx(&guards, &name_key("unique"), false)
+                .delete_primary_key_no_trx(&guards, key.index_no, &key.vals, false)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3065,12 +3010,12 @@ mod tests {
             );
 
             mem_table
-                .delete_primary_key_no_trx(&guards, &name_key("unique"), true)
+                .delete_primary_key_no_trx(&guards, key.index_no, &key.vals, true)
                 .await
                 .unwrap();
 
-            assert_unique_index_entry(&mem_table, &guards, &single_key(1i32), None).await;
-            assert_unique_index_entry(&mem_table, &guards, &name_key("unique"), None).await;
+            assert_unique_index_entry(&mem_table, &guards, single_key(1i32), None).await;
+            assert_unique_index_entry(&mem_table, &guards, name_key("unique"), None).await;
         });
     }
 
@@ -3120,10 +3065,12 @@ mod tests {
                 .insert_no_trx(&guards, &indexed_payload_row(1, "same", b"old"), false)
                 .await
                 .unwrap();
+            let key = single_key(1i32);
             mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &single_key(1i32),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 2,
                         val: Val::from(&b"new"[..]),
@@ -3135,7 +3082,7 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &guards,
-                &single_key(1i32),
+                key.clone(),
                 Some(indexed_payload_row(1, "same", b"new")),
             )
             .await;
@@ -3143,7 +3090,8 @@ mod tests {
             let err = mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &single_key(1i32),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 0,
                         val: Val::from(1i32),
@@ -3176,8 +3124,11 @@ mod tests {
                 .insert_no_trx(&guards, &indexed_payload_row(1, "old", b"payload"), false)
                 .await
                 .unwrap();
+            let key = single_key(1i32);
             let (row_id, deleted) = mem_table
-                .unique_lookup(&guards, &single_key(1i32), MIN_SNAPSHOT_TS)
+                .require_unique_index(&guards, key.index_no)
+                .unwrap()
+                .lookup(&key.vals, MIN_SNAPSHOT_TS)
                 .await
                 .unwrap()
                 .expect("inserted primary key should be indexed");
@@ -3186,7 +3137,8 @@ mod tests {
             mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &single_key(1i32),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 1,
                         val: Val::from("new"),
@@ -3196,20 +3148,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_non_unique_index_entry(&mem_table, &guards, &name_key("old"), row_id, None)
+            assert_non_unique_index_entry(&mem_table, &guards, name_key("old"), row_id, None).await;
+            assert_non_unique_index_entry(&mem_table, &guards, name_key("new"), row_id, Some(true))
                 .await;
-            assert_non_unique_index_entry(
-                &mem_table,
-                &guards,
-                &name_key("new"),
-                row_id,
-                Some(true),
-            )
-            .await;
             assert_unique_row(
                 &mem_table,
                 &guards,
-                &single_key(1i32),
+                key,
                 Some(indexed_payload_row(1, "new", b"payload")),
             )
             .await;
@@ -3233,10 +3178,12 @@ mod tests {
                 .insert_no_trx(&guards, &indexed_payload_row(1, "old", b"payload"), false)
                 .await
                 .unwrap();
+            let key = single_key(1i32);
             mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &single_key(1i32),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 1,
                         val: Val::from("new"),
@@ -3249,7 +3196,7 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &guards,
-                &single_key(1i32),
+                single_key(1i32),
                 Some(indexed_payload_row(1, "new", b"payload")),
             )
             .await;
@@ -3273,11 +3220,13 @@ mod tests {
                 .insert_no_trx(&guards, &indexed_payload_row(1, "unique", b"old"), false)
                 .await
                 .unwrap();
+            let key = name_key("unique");
 
             let err = mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &name_key("unique"),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 2,
                         val: Val::from(&b"new"[..]),
@@ -3294,7 +3243,8 @@ mod tests {
             mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &name_key("unique"),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 2,
                         val: Val::from(&b"new"[..]),
@@ -3306,7 +3256,7 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &guards,
-                &single_key(1i32),
+                single_key(1i32),
                 Some(indexed_payload_row(1, "unique", b"new")),
             )
             .await;
@@ -3314,7 +3264,8 @@ mod tests {
             mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &name_key("unique"),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 1,
                         val: Val::from("changed"),
@@ -3326,15 +3277,15 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &guards,
-                &single_key(1i32),
+                single_key(1i32),
                 Some(indexed_payload_row(1, "changed", b"new")),
             )
             .await;
-            assert_unique_row(&mem_table, &guards, &name_key("unique"), None).await;
+            assert_unique_row(&mem_table, &guards, name_key("unique"), None).await;
             assert_unique_row(
                 &mem_table,
                 &guards,
-                &name_key("changed"),
+                name_key("changed"),
                 Some(indexed_payload_row(1, "changed", b"new")),
             )
             .await;
@@ -3362,11 +3313,13 @@ mod tests {
                 .insert_no_trx(&guards, &indexed_payload_row(2, "two", b"payload"), false)
                 .await
                 .unwrap();
+            let key = single_key(1i32);
 
             let err = mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &single_key(1i32),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 1,
                         val: Val::from("two"),
@@ -3411,8 +3364,11 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                let key = single_key(id);
                 let (row_id, deleted) = mem_table
-                    .unique_lookup(&guards, &single_key(id), MIN_SNAPSHOT_TS)
+                    .require_unique_index(&guards, key.index_no)
+                    .unwrap()
+                    .lookup(&key.vals, MIN_SNAPSHOT_TS)
                     .await
                     .unwrap()
                     .expect("inserted primary key should be indexed");
@@ -3422,10 +3378,12 @@ mod tests {
 
             let old_row0 = row_ids[0];
             let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
+            let key = single_key(0i32);
             mem_table
                 .update_primary_key_no_trx(
                     &guards,
-                    &single_key(0i32),
+                    key.index_no,
+                    &key.vals,
                     &[UpdateCol {
                         idx: 2,
                         val: Val::from(&large_payload[..]),
@@ -3436,18 +3394,20 @@ mod tests {
                 .unwrap();
 
             let (new_row0, deleted) = mem_table
-                .unique_lookup(&guards, &single_key(0i32), MIN_SNAPSHOT_TS)
+                .require_unique_index(&guards, key.index_no)
+                .unwrap()
+                .lookup(&key.vals, MIN_SNAPSHOT_TS)
                 .await
                 .unwrap()
                 .expect("relocated primary key should be indexed");
             assert!(!deleted);
             assert_ne!(new_row0, old_row0);
-            assert_non_unique_index_entry(&mem_table, &guards, &name_key("name0"), old_row0, None)
+            assert_non_unique_index_entry(&mem_table, &guards, name_key("name0"), old_row0, None)
                 .await;
             assert_non_unique_index_entry(
                 &mem_table,
                 &guards,
-                &name_key("name0"),
+                name_key("name0"),
                 new_row0,
                 Some(true),
             )
@@ -3455,7 +3415,7 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &guards,
-                &single_key(0i32),
+                single_key(0i32),
                 Some(indexed_payload_row(0, "name0", &large_payload)),
             )
             .await;
@@ -3484,7 +3444,7 @@ mod tests {
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("delete"),
+                name_key("delete"),
                 row_id,
                 Some(true),
             )
@@ -3496,8 +3456,9 @@ mod tests {
                     stmt.acquire_table_write_metadata_lock(mem_table_id).await?;
                     stmt.acquire_table_write_data_lock(mem_table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    let key = single_key(10i32);
                     mem_table
-                        .delete_unique_mvcc(rt, effects, &single_key(10i32), false)
+                        .delete_unique_mvcc(rt, effects, key.index_no, &key.vals, false)
                         .await
                 })
                 .await
@@ -3508,24 +3469,26 @@ mod tests {
             assert_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(10i32),
+                single_key(10i32),
                 Some((row_id, true)),
             )
             .await;
-            assert_unique_row(&mem_table, &session.pool_guards(), &single_key(10i32), None).await;
+            assert_unique_row(&mem_table, &session.pool_guards(), single_key(10i32), None).await;
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("delete"),
+                name_key("delete"),
                 row_id,
                 Some(false),
             )
             .await;
 
+            let key = name_key("delete");
             let removed = mem_table
                 .delete_index(
                     &session.pool_guards(),
-                    &name_key("delete"),
+                    key.index_no,
+                    &key.vals,
                     row_id,
                     false,
                     MIN_SNAPSHOT_TS,
@@ -3567,7 +3530,7 @@ mod tests {
                 &mut session,
                 mem_table_id,
                 &mem_table,
-                &single_key(1i32),
+                single_key(1i32),
                 vec![
                     UpdateCol {
                         idx: 0,
@@ -3584,21 +3547,21 @@ mod tests {
             assert_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(1i32),
+                single_key(1i32),
                 Some((row_id, true)),
             )
             .await;
             assert_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(10i32),
+                single_key(10i32),
                 Some((row_id, false)),
             )
             .await;
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("old"),
+                name_key("old"),
                 row_id,
                 Some(false),
             )
@@ -3606,7 +3569,7 @@ mod tests {
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("new"),
+                name_key("new"),
                 row_id,
                 Some(true),
             )
@@ -3614,7 +3577,7 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(10i32),
+                single_key(10i32),
                 Some(indexed_payload_row(10, "new", b"payload")),
             )
             .await;
@@ -3654,7 +3617,7 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(10i32),
+                single_key(10i32),
                 Some(indexed_payload_row(10, "new", b"payload")),
             )
             .await;
@@ -3696,7 +3659,7 @@ mod tests {
                 &mut session,
                 mem_table_id,
                 &mem_table,
-                &single_key(0i32),
+                single_key(0i32),
                 vec![UpdateCol {
                     idx: 2,
                     val: Val::from(&large_payload[..]),
@@ -3711,14 +3674,14 @@ mod tests {
             assert_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(0i32),
+                single_key(0i32),
                 Some((new_row0, false)),
             )
             .await;
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("name0"),
+                name_key("name0"),
                 old_row0,
                 Some(false),
             )
@@ -3726,7 +3689,7 @@ mod tests {
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("name0"),
+                name_key("name0"),
                 new_row0,
                 Some(true),
             )
@@ -3734,7 +3697,7 @@ mod tests {
             assert_unique_row(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(0i32),
+                single_key(0i32),
                 Some(indexed_payload_row(0, "name0", &large_payload)),
             )
             .await;
@@ -3745,7 +3708,7 @@ mod tests {
                 &mut session,
                 mem_table_id,
                 &mem_table,
-                &single_key(1i32),
+                single_key(1i32),
                 vec![
                     UpdateCol {
                         idx: 0,
@@ -3770,21 +3733,21 @@ mod tests {
             assert_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(1i32),
+                single_key(1i32),
                 Some((old_row1, true)),
             )
             .await;
             assert_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(101i32),
+                single_key(101i32),
                 Some((new_row1, false)),
             )
             .await;
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("name1"),
+                name_key("name1"),
                 old_row1,
                 Some(false),
             )
@@ -3792,16 +3755,16 @@ mod tests {
             assert_non_unique_index_entry(
                 &mem_table,
                 &session.pool_guards(),
-                &name_key("moved"),
+                name_key("moved"),
                 new_row1,
                 Some(true),
             )
             .await;
-            assert_unique_row(&mem_table, &session.pool_guards(), &single_key(1i32), None).await;
+            assert_unique_row(&mem_table, &session.pool_guards(), single_key(1i32), None).await;
             assert_unique_row(
                 &mem_table,
                 &session.pool_guards(),
-                &single_key(101i32),
+                single_key(101i32),
                 Some(indexed_payload_row(101, "moved", &changed_payload)),
             )
             .await;
@@ -3888,7 +3851,8 @@ mod tests {
                         .update_unique_mvcc(
                             rt,
                             effects,
-                            &key,
+                            key.index_no,
+                            &key.vals,
                             vec![UpdateCol {
                                 idx: 1,
                                 val: Val::from("updated"),
@@ -3908,7 +3872,9 @@ mod tests {
                     stmt.acquire_table_write_metadata_lock(mem_table_id).await?;
                     stmt.acquire_table_write_data_lock(mem_table_id).await?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    mem_table.delete_unique_mvcc(rt, effects, &key, false).await
+                    mem_table
+                        .delete_unique_mvcc(rt, effects, key.index_no, &key.vals, false)
+                        .await
                 })
                 .await
                 .unwrap_err();

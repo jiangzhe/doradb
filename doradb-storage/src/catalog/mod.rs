@@ -890,7 +890,14 @@ impl UserTableCacheEntry {
             .get_or_insert_with(|| table.layout_snapshot());
         table
             .accessor_with_layout(layout.as_ref())
-            .delete_index(guards, key, row_id, unique, min_active_sts)
+            .delete_index(
+                guards,
+                key.index_no,
+                &key.vals,
+                row_id,
+                unique,
+                min_active_sts,
+            )
             .await
     }
 }

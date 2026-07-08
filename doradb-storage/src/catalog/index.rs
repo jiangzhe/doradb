@@ -2279,7 +2279,7 @@ mod tests {
         let mut trx = session.begin_trx().unwrap();
         let delete = trx
             .exec(async |stmt| {
-                stmt.table_delete_unique_mvcc(table.table_id(), key, false)
+                stmt.table_delete_unique_mvcc(table.table_id(), key.index_no, &key.vals, false)
                     .await
             })
             .await;

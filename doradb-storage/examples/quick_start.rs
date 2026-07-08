@@ -4,14 +4,16 @@ use doradb_storage::{
 };
 use futures::executor;
 use std::error::Error;
+use std::process::exit;
+use std::result::Result as StdResult;
 use tempfile::TempDir;
 
-type ExampleResult<T> = std::result::Result<T, Box<dyn Error>>;
+type ExampleResult<T> = StdResult<T, Box<dyn Error>>;
 
 fn main() {
     if let Err(err) = executor::block_on(run()) {
         eprintln!("{err}");
-        std::process::exit(1);
+        exit(1);
     }
 }
 
@@ -57,7 +59,8 @@ async fn run() -> ExampleResult<()> {
             let res = stmt
                 .table_update_unique_mvcc(
                     table_id,
-                    &id_one,
+                    id_one.index_no,
+                    &id_one.vals,
                     vec![UpdateCol {
                         idx: 1,
                         val: Val::from("ada"),
@@ -74,7 +77,7 @@ async fn run() -> ExampleResult<()> {
     write_trx
         .exec(async |stmt| {
             let res = stmt
-                .table_delete_unique_mvcc(table_id, &id_two, false)
+                .table_delete_unique_mvcc(table_id, id_two.index_no, &id_two.vals, false)
                 .await?;
             assert!(res.is_deleted());
             Ok(())
@@ -101,7 +104,7 @@ async fn run() -> ExampleResult<()> {
     // Lookup one row through the unique id index.
     let found = read_trx
         .exec(async |stmt| {
-            stmt.table_lookup_unique_mvcc(table_id, &id_one, &[0, 1])
+            stmt.table_lookup_unique_mvcc(table_id, id_one.index_no, &id_one.vals, &[0, 1])
                 .await
         })
         .await?
@@ -112,7 +115,7 @@ async fn run() -> ExampleResult<()> {
     // Scan rows that match one secondary-index key.
     let mut matching_rows = read_trx
         .exec(async |stmt| {
-            stmt.table_index_scan_mvcc(table_id, &name_key, &[0, 1])
+            stmt.table_index_scan_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
                 .await
         })
         .await?

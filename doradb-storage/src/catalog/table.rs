@@ -739,13 +739,15 @@ impl TableIndexLayout {
 
     /// Returns whether key matches given row.
     #[inline]
-    pub(crate) fn match_key(&self, key: &SelectKey, row: &[Val]) -> bool {
-        let Some(keys) = self.index_spec(key.index_no).map(|spec| &spec.cols) else {
+    pub(crate) fn match_key(&self, index_no: usize, key_vals: &[Val], row: &[Val]) -> bool {
+        let Some(keys) = self.index_spec(index_no).map(|spec| &spec.cols) else {
             return false;
         };
-        debug_assert!(keys.len() == key.vals.len());
+        if keys.len() != key_vals.len() {
+            return false;
+        }
         keys.iter()
-            .zip(&key.vals)
+            .zip(key_vals)
             .all(|(key, val)| &row[key.col_no as usize] == val)
     }
 }
@@ -774,16 +776,20 @@ impl<'a> PrimaryKeySpec<'a> {
     /// Validates that the input key targets this primary key and matches its
     /// column shape.
     #[inline]
-    pub(crate) fn validate_key(&self, key: &SelectKey) -> StdResult<(), PrimaryKeyMatchError> {
-        if key.index_no != self.index_no {
+    pub(crate) fn validate_key(
+        &self,
+        index_no: usize,
+        key_vals: &[Val],
+    ) -> StdResult<(), PrimaryKeyMatchError> {
+        if index_no != self.index_no {
             return Err(PrimaryKeyMatchError::IndexNo {
-                actual: key.index_no,
+                actual: index_no,
                 expected: self.index_no,
             });
         }
-        if key.vals.len() != self.index_spec.cols.len() {
+        if key_vals.len() != self.index_spec.cols.len() {
             return Err(PrimaryKeyMatchError::ValueCount {
-                actual: key.vals.len(),
+                actual: key_vals.len(),
                 expected: self.index_spec.cols.len(),
             });
         }
@@ -791,15 +797,13 @@ impl<'a> PrimaryKeySpec<'a> {
             .index_spec
             .cols
             .iter()
-            .zip(&key.vals)
+            .zip(key_vals)
             .all(|(index_key, val)| {
                 self.column_layout
                     .col_type_match(usize::from(index_key.col_no), val)
             })
         {
-            return Err(PrimaryKeyMatchError::Type {
-                index_no: key.index_no,
-            });
+            return Err(PrimaryKeyMatchError::Type { index_no });
         }
         Ok(())
     }
@@ -1813,31 +1817,27 @@ mod tests {
         .expect("valid table metadata");
         let primary_key = metadata.primary_key().unwrap();
 
-        assert!(
-            primary_key
-                .validate_key(&SelectKey::new(0, vec![Val::from(42u32)]))
-                .is_ok()
-        );
+        assert!(primary_key.validate_key(0, &[Val::from(42u32)]).is_ok());
         assert_eq!(
-            primary_key.validate_key(&SelectKey::new(1, vec![Val::from(42u32)])),
+            primary_key.validate_key(1, &[Val::from(42u32)]),
             Err(PrimaryKeyMatchError::IndexNo {
                 actual: 1,
                 expected: 0
             })
         );
         assert_eq!(
-            primary_key.validate_key(&SelectKey::new(0, vec![Val::from(42u32), Val::from(99u64)])),
+            primary_key.validate_key(0, &[Val::from(42u32), Val::from(99u64)]),
             Err(PrimaryKeyMatchError::ValueCount {
                 actual: 2,
                 expected: 1
             })
         );
         assert_eq!(
-            primary_key.validate_key(&SelectKey::new(0, vec![Val::from(42u64)])),
+            primary_key.validate_key(0, &[Val::from(42u64)]),
             Err(PrimaryKeyMatchError::Type { index_no: 0 })
         );
         assert_eq!(
-            primary_key.validate_key(&SelectKey::new(0, vec![Val::Null])),
+            primary_key.validate_key(0, &[Val::Null]),
             Err(PrimaryKeyMatchError::Type { index_no: 0 })
         );
         assert!(
@@ -2256,12 +2256,13 @@ mod tests {
             trx.exec(async |stmt| {
                 let owner = stmt_tests::lock_owner(stmt);
                 stmt_owner.set(Some(owner));
+                let key = single_key(0i32);
                 let selected = stmt
-                    .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
+                    .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                     .await?;
                 assert!(selected.is_found());
                 let repeated = stmt
-                    .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
+                    .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                     .await?;
                 assert!(repeated.is_found());
                 assert_eq!(lock_entry_count(&engine, owner), 1);
@@ -2743,8 +2744,9 @@ mod tests {
             let mut read_trx = session.begin_trx().unwrap();
             read_trx
                 .exec(async |stmt| {
+                    let key = single_key(0i32);
                     let selected = stmt
-                        .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
+                        .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                         .await?;
                     assert!(selected.is_found());
                     Ok(())
@@ -3565,7 +3567,8 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let err = trx
                 .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(table_id, &single_key(11), &[0, 1])
+                    let key = single_key(11);
+                    stmt.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                         .await
                 })
                 .await

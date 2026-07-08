@@ -79,18 +79,18 @@ impl<'a> RowReadAccess<'a> {
         &self,
         metadata: &TableMetadata,
         read_set: &[usize],
-        key: Option<&SelectKey>,
+        key: Option<(usize, &[Val])>,
     ) -> ReadRow {
         let row = self.row();
         // latest version in row page.
         if row.is_deleted() {
             return ReadRow::NotFound;
         }
-        if let Some(key) = key {
-            let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+        if let Some((index_no, key_vals)) = key {
+            let Some(index_spec) = metadata.idx.index_spec(index_no) else {
                 return ReadRow::InvalidIndex;
             };
-            if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+            if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
                 return ReadRow::InvalidIndex;
             }
         }
@@ -105,7 +105,7 @@ impl<'a> RowReadAccess<'a> {
         ctx: &TrxContext,
         metadata: &TableMetadata,
         read_set: &[usize],
-        key: Option<&SelectKey>,
+        key: Option<(usize, &[Val])>,
     ) -> ReadRow {
         match &self.state {
             RowReadState::RowVer(undo) => match &**undo {
@@ -137,14 +137,17 @@ impl<'a> RowReadAccess<'a> {
                     // visible version is reconstructed.
                     let mut next = &undo_head.next;
                     let read_set: BTreeSet<usize> = read_set.iter().copied().collect();
-                    let key_tracker = if let Some(key) = key {
+                    let key_tracker = if let Some((index_no, key_vals)) = key {
                         // Index lookups may route through a latest row whose
                         // current key no longer matches the lookup key. Track
                         // enough key columns to validate older reconstructed
                         // versions, even when the user read set omitted them.
-                        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+                        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
                             return ReadRow::InvalidIndex;
                         };
+                        if index_spec.cols.len() != key_vals.len() {
+                            return ReadRow::InvalidIndex;
+                        }
                         let user_key_idx_map: FastHashMap<usize, usize> = index_spec
                             .cols
                             .iter()
@@ -164,10 +167,7 @@ impl<'a> RowReadAccess<'a> {
                                     self.row().val(metadata.col.as_ref(), key.col_no as usize)
                                 })
                                 .collect();
-                            Some(SelectKey {
-                                index_no: key.index_no,
-                                vals,
-                            })
+                            Some(SelectKey { index_no, vals })
                         };
                         Some(IndexKeyTracker {
                             user_key_idx_map,
@@ -304,21 +304,22 @@ impl<'a> RowReadAccess<'a> {
     pub(crate) fn find_old_version_for_unique_key(
         &self,
         metadata: &TableMetadata,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         ctx: &TrxContext,
     ) -> FindOldVersion {
         let undo = match &self.state {
             RowReadState::Recover(_) => unreachable!(),
             RowReadState::RowVer(undo) => undo,
         };
-        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
             return FindOldVersion::None;
         };
 
         match &**undo {
             None => {
                 let row = self.row();
-                if !row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+                if !row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
                     if !row.is_deleted() {
                         // Scenario #2
                         return FindOldVersion::DuplicateKey;
@@ -337,7 +338,7 @@ impl<'a> RowReadAccess<'a> {
                 }
                 let row = self.row();
                 // Old row matches key.
-                if !row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+                if !row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
                     if !row.is_deleted() {
                         // Scenario #2
                         return FindOldVersion::DuplicateKey;
@@ -384,7 +385,7 @@ impl<'a> RowReadAccess<'a> {
                         }
                     }
                     // Here we check if current version matches input key
-                    if !deleted && metadata.idx.match_key(key, &vals) {
+                    if !deleted && metadata.idx.match_key(index_no, key_vals, &vals) {
                         return FindOldVersion::Ok(vals, cts, entry);
                     }
                     // We only need to go through main branch, because Index
@@ -417,15 +418,16 @@ impl<'a> RowReadAccess<'a> {
     pub(crate) fn any_version_matches_key(
         &self,
         metadata: &TableMetadata,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
     ) -> bool {
-        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
             return false;
         };
         // Check page data first.
         let row = self.row();
         let deleted = row.is_deleted();
-        if !row.is_key_different(metadata.col.as_ref(), index_spec, key) && !deleted {
+        if !row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) && !deleted {
             return true; // matched key found in page.
         }
         // Page data does not match, check version chain.
@@ -442,7 +444,7 @@ impl<'a> RowReadAccess<'a> {
                         .iter()
                         .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
                         .collect();
-                    let mvcc_key = SelectKey::new(key.index_no, vals);
+                    let mvcc_key = SelectKey::new(index_no, vals);
                     let mapping: FastHashMap<usize, usize> = index_spec
                         .cols
                         .iter()
@@ -472,7 +474,10 @@ impl<'a> RowReadAccess<'a> {
                             }
                         }
                         // Here we check if current version matches input key
-                        if !ver.deleted && &ver.mvcc_key == key {
+                        if !ver.deleted
+                            && ver.mvcc_key.index_no == index_no
+                            && ver.mvcc_key.vals.as_slice() == key_vals
+                        {
                             return true;
                         }
                         // We only need to go through main branch, because Index
@@ -576,13 +581,13 @@ impl RowVersion {
         mut self,
         metadata: &TableMetadata,
         row: Row<'_>,
-        search_key: Option<&SelectKey>,
+        search_key: Option<(usize, &[Val])>,
     ) -> ReadRow {
-        if let Some(search_key) = search_key {
-            let Some(index_spec) = metadata.idx.index_spec(search_key.index_no) else {
+        if let Some((index_no, key_vals)) = search_key {
+            let Some(index_spec) = metadata.idx.index_spec(index_no) else {
                 return ReadRow::InvalidIndex;
             };
-            if index_spec.cols.len() != search_key.vals.len() {
+            if index_spec.cols.len() != key_vals.len() {
                 return ReadRow::InvalidIndex;
             }
             // If search key is provided, we need to validate key before
@@ -591,17 +596,12 @@ impl RowVersion {
                 && let Some(undo_key) = tracker.undo_key.as_ref()
             {
                 // compare key directly
-                if search_key
-                    .vals
-                    .iter()
-                    .zip(&undo_key.vals)
-                    .any(|(v1, v2)| v1 != v2)
-                {
+                if key_vals.iter().zip(&undo_key.vals).any(|(v1, v2)| v1 != v2) {
                     return ReadRow::InvalidIndex;
                 }
             } else {
                 // compare key using read set and latest row page
-                let key_different = search_key.vals.iter().enumerate().any(|(pos, search_val)| {
+                let key_different = key_vals.iter().enumerate().any(|(pos, search_val)| {
                     let user_col_idx = index_spec.cols[pos].col_no as usize;
                     if let Some(undo_val) = self.undo_vals.get(&user_col_idx) {
                         search_val != undo_val
@@ -776,7 +776,7 @@ impl<'a> RowWriteAccess<'a> {
         table_id: TableID,
         page_id: VersionedPageID,
         row_id: RowID,
-        key: Option<&SelectKey>,
+        key: Option<(usize, &[Val])>,
     ) -> LockUndo {
         rt.debug_assert_table_write_lock_held(table_id);
         let ctx = rt.ctx();
@@ -857,11 +857,11 @@ impl<'a> RowWriteAccess<'a> {
                     // todo: A further optimization for this scenario is to traverse through
                     // undo chain and check whether the same key exists in any old versions.
                     // If not exists, we do not need to build the version chain.
-                    if let Some(key) = key {
-                        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+                    if let Some((index_no, key_vals)) = key {
+                        let Some(index_spec) = metadata.idx.index_spec(index_no) else {
                             return LockUndo::InvalidIndex;
                         };
-                        if row.is_key_different(metadata.col.as_ref(), index_spec, key) {
+                        if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
                             return LockUndo::InvalidIndex;
                         }
                     }
@@ -1152,7 +1152,7 @@ mod tests {
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
-        let res = access.read_row_latest(&metadata, &[0], Some(&key));
+        let res = access.read_row_latest(&metadata, &[0], Some((key.index_no, &key.vals)));
 
         assert!(matches!(res, ReadRow::InvalidIndex));
     }
@@ -1181,7 +1181,7 @@ mod tests {
         let trx_ctx = test_trx_context(TrxID::new(1));
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
-        let res = access.read_row_mvcc(&trx_ctx, &metadata, &[0], Some(&key));
+        let res = access.read_row_mvcc(&trx_ctx, &metadata, &[0], Some((key.index_no, &key.vals)));
 
         assert!(matches!(res, ReadRow::InvalidIndex));
     }
@@ -1194,7 +1194,7 @@ mod tests {
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
-        assert!(!access.any_version_matches_key(&metadata, &key));
+        assert!(!access.any_version_matches_key(&metadata, key.index_no, &key.vals));
     }
 
     #[test]
@@ -1205,7 +1205,7 @@ mod tests {
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(0, vec![Val::from(10i32)]);
 
-        assert!(access.any_version_matches_key(&metadata, &key));
+        assert!(access.any_version_matches_key(&metadata, key.index_no, &key.vals));
     }
 
     #[test]
@@ -1220,7 +1220,7 @@ mod tests {
         };
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
-        let res = ver.get_visible_vals(&metadata, page.row(0), Some(&key));
+        let res = ver.get_visible_vals(&metadata, page.row(0), Some((key.index_no, &key.vals)));
 
         assert!(matches!(res, ReadRow::InvalidIndex));
     }
@@ -1235,7 +1235,8 @@ mod tests {
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
-        let res = access.find_old_version_for_unique_key(&metadata, &key, &trx_ctx);
+        let res =
+            access.find_old_version_for_unique_key(&metadata, key.index_no, &key.vals, &trx_ctx);
 
         assert!(matches!(res, FindOldVersion::None));
     }

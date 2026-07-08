@@ -1642,7 +1642,14 @@ mod tests {
 
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&pool_guards, &key, row_id, true, TrxID::new(11))
+                .delete_index(
+                    &pool_guards,
+                    key.index_no,
+                    &key.vals,
+                    row_id,
+                    true,
+                    TrxID::new(11),
+                )
                 .await
                 .unwrap();
             assert!(deleted);
@@ -1701,7 +1708,14 @@ mod tests {
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&pool_guards, &stale_key, row_id, true, MAX_SNAPSHOT_TS)
+                .delete_index(
+                    &pool_guards,
+                    stale_key.index_no,
+                    &stale_key.vals,
+                    row_id,
+                    true,
+                    MAX_SNAPSHOT_TS,
+                )
                 .await
                 .unwrap();
             assert!(deleted);
@@ -1726,7 +1740,14 @@ mod tests {
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&pool_guards, &current_key, row_id, true, TrxID::new(100))
+                .delete_index(
+                    &pool_guards,
+                    current_key.index_no,
+                    &current_key.vals,
+                    row_id,
+                    true,
+                    TrxID::new(100),
+                )
                 .await
                 .unwrap();
             assert!(!deleted);
@@ -1787,7 +1808,14 @@ mod tests {
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&pool_guards, &stale_key, row_id, false, MAX_SNAPSHOT_TS)
+                .delete_index(
+                    &pool_guards,
+                    stale_key.index_no,
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
                 .await
                 .unwrap();
             assert!(deleted);
@@ -1812,7 +1840,14 @@ mod tests {
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&pool_guards, &current_key, row_id, false, TrxID::new(200))
+                .delete_index(
+                    &pool_guards,
+                    current_key.index_no,
+                    &current_key.vals,
+                    row_id,
+                    false,
+                    TrxID::new(200),
+                )
                 .await
                 .unwrap();
             assert!(!deleted);
@@ -1859,7 +1894,8 @@ mod tests {
                 .accessor_with_layout(&layout)
                 .delete_index(
                     &pool_guards,
-                    &key,
+                    key.index_no,
+                    &key.vals,
                     RowID::new(row_id),
                     true,
                     MAX_SNAPSHOT_TS,
@@ -1924,7 +1960,14 @@ mod tests {
 
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&pool_guards, &key, row_id, true, min_active_sts)
+                .delete_index(
+                    &pool_guards,
+                    key.index_no,
+                    &key.vals,
+                    row_id,
+                    true,
+                    min_active_sts,
+                )
                 .await
                 .unwrap();
             assert!(!deleted);
@@ -1983,7 +2026,14 @@ mod tests {
 
             let deleted = table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
-                .delete_index(&pool_guards, &key, row_id, false, min_active_sts)
+                .delete_index(
+                    &pool_guards,
+                    key.index_no,
+                    &key.vals,
+                    row_id,
+                    false,
+                    min_active_sts,
+                )
                 .await
                 .unwrap();
             assert!(!deleted);

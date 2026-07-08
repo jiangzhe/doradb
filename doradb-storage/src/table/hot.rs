@@ -153,7 +153,8 @@ impl<'m, 'r> HotRowDeleter<'m, 'r> {
         effects: &mut StmtEffects,
         page_guard: PageSharedGuard<RowPage>,
         row_id: RowID,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         log_by_key: bool,
     ) -> DeleteInternal {
         let page_id = page_guard.page_id();
@@ -165,7 +166,7 @@ impl<'m, 'r> HotRowDeleter<'m, 'r> {
         // lock is owned, the row-page delete bit becomes the latest image and
         // the same undo entry is rewritten to `Delete`.
         let mut lock_row = HotRowUpdater::new(self.table_id, self.metadata, self.rt)
-            .lock_for_write(effects, &page_guard, row_id, Some(key))
+            .lock_for_write(effects, &page_guard, row_id, Some((index_no, key_vals)))
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
@@ -189,7 +190,7 @@ impl<'m, 'r> HotRowDeleter<'m, 'r> {
                     page_id,
                     row_id,
                     kind: if log_by_key {
-                        RowRedoKind::DeleteByPrimaryKey(key.clone())
+                        RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
                     } else {
                         RowRedoKind::Delete
                     },
@@ -237,7 +238,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         effects: &mut StmtEffects,
         page_guard: &'b PageSharedGuard<RowPage>,
         row_id: RowID,
-        key: Option<&SelectKey>,
+        key: Option<(usize, &[Val])>,
     ) -> LockRowForWrite<'b> {
         let (page_ctx, page) = page_guard.ctx_and_page();
         let ver_map = page_ctx
@@ -291,12 +292,17 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
     }
 
     /// Update a locked hot row in place, or report move-update state.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "hot row updates require row, key, update, and logging context"
+    )]
     #[inline]
     pub(super) async fn update_inplace(
         &self,
         effects: &mut StmtEffects,
         page_guard: PageSharedGuard<RowPage>,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         row_id: RowID,
         update: RowUpdateInput,
         log_by_key: bool,
@@ -316,7 +322,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         // installed. The lock path also rejects stale index candidates whose
         // latest hot-row key no longer matches the lookup key.
         let mut lock_row = self
-            .lock_for_write(effects, &page_guard, row_id, Some(key))
+            .lock_for_write(effects, &page_guard, row_id, Some((index_no, key_vals)))
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound(update),
@@ -356,7 +362,10 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                             row_id,
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
                             kind: if log_by_key {
-                                RowRedoKind::DeleteByPrimaryKey(key.clone())
+                                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
+                                    index_no,
+                                    key_vals.to_vec(),
+                                ))
                             } else {
                                 RowRedoKind::Delete
                             },
@@ -405,7 +414,10 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                                 page_id,
                                 row_id,
                                 kind: if log_by_key {
-                                    RowRedoKind::UpdateByPrimaryKey(key.clone(), redo_cols)
+                                    RowRedoKind::UpdateByPrimaryKey(
+                                        SelectKey::new(index_no, key_vals.to_vec()),
+                                        redo_cols,
+                                    )
                                 } else {
                                     RowRedoKind::Update(redo_cols)
                                 },
@@ -515,7 +527,7 @@ pub(super) fn read_hot_row_mvcc(
     metadata: &TableMetadata,
     page_guard: &PageSharedGuard<RowPage>,
     row_id: RowID,
-    key: Option<&SelectKey>,
+    key: Option<(usize, &[Val])>,
     read_set: &[usize],
 ) -> SelectMvcc {
     let (page_ctx, page) = page_guard.ctx_and_page();
