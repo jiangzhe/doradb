@@ -11,7 +11,7 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    ColumnBlockIndex, ColumnLeafEntry, IndexCompareExchange, IndexInsert, IndexRowIdStream,
+    ColumnBlockIndex, ColumnLeafEntry, IndexBatchStream, IndexCompareExchange, IndexInsert,
     NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex,
     UniqueSecondaryIndex,
 };

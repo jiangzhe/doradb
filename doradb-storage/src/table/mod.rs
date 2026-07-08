@@ -1502,7 +1502,7 @@ pub(crate) mod tests {
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex,
-        IndexCompareExchange, IndexInsert, IndexRowIdStream, NonUniqueIndex, RowLocation,
+        IndexBatchStream, IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation,
         UniqueIndex,
     };
     use crate::io::{
@@ -2395,7 +2395,7 @@ pub(crate) mod tests {
         Equal(Vec<Val>),
     }
 
-    pub(crate) struct BoundUniqueIndexRowIdStream<'a> {
+    pub(crate) struct BoundUniqueIndexBatchStream<'a> {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
         index_no: usize,
@@ -2405,7 +2405,7 @@ pub(crate) mod tests {
         done: bool,
     }
 
-    impl IndexRowIdStream for BoundUniqueIndexRowIdStream<'_> {
+    impl IndexBatchStream<RowID> for BoundUniqueIndexBatchStream<'_> {
         #[inline]
         async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
             if self.done {
@@ -2423,7 +2423,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) struct BoundNonUniqueIndexRowIdStream<'a> {
+    pub(crate) struct BoundNonUniqueIndexBatchStream<'a> {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
         index_no: usize,
@@ -2433,7 +2433,7 @@ pub(crate) mod tests {
         done: bool,
     }
 
-    impl IndexRowIdStream for BoundNonUniqueIndexRowIdStream<'_> {
+    impl IndexBatchStream<RowID> for BoundNonUniqueIndexBatchStream<'_> {
         #[inline]
         async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
             if self.done {
@@ -2465,7 +2465,7 @@ pub(crate) mod tests {
 
     impl UniqueIndex for BoundUniqueIndexNo<'_> {
         type RowIdStream<'a>
-            = BoundUniqueIndexRowIdStream<'a>
+            = BoundUniqueIndexBatchStream<'a>
         where
             Self: 'a;
 
@@ -2528,7 +2528,7 @@ pub(crate) mod tests {
         where
             R: RangeBounds<&'r [Val]> + Clone,
         {
-            Ok(BoundUniqueIndexRowIdStream {
+            Ok(BoundUniqueIndexBatchStream {
                 layout: Arc::clone(&self.layout),
                 guards: self.guards,
                 index_no: self.index_no,
@@ -2558,7 +2558,7 @@ pub(crate) mod tests {
 
     impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         type RowIdStream<'a>
-            = BoundNonUniqueIndexRowIdStream<'a>
+            = BoundNonUniqueIndexBatchStream<'a>
         where
             Self: 'a;
 
@@ -2638,7 +2638,7 @@ pub(crate) mod tests {
         where
             R: RangeBounds<&'r [Val]> + Clone,
         {
-            Ok(BoundNonUniqueIndexRowIdStream {
+            Ok(BoundNonUniqueIndexBatchStream {
                 layout: Arc::clone(&self.layout),
                 guards: self.guards,
                 index_no: self.index_no,
@@ -2655,7 +2655,7 @@ pub(crate) mod tests {
             key: &[Val],
             ts: TrxID,
         ) -> Result<Self::RowIdStream<'a>> {
-            Ok(BoundNonUniqueIndexRowIdStream {
+            Ok(BoundNonUniqueIndexBatchStream {
                 layout: Arc::clone(&self.layout),
                 guards: self.guards,
                 index_no: self.index_no,

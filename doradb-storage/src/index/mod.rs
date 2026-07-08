@@ -4,15 +4,13 @@ mod btree;
 mod column_block_index;
 mod column_deletion_blob;
 pub(crate) mod disk_tree;
+mod index_stream;
+mod mem_index;
 mod non_unique_index;
 mod row_page_index;
 mod secondary_index;
 mod unique_index;
 pub(crate) mod util;
-
-use crate::error::Result;
-use crate::id::RowID;
-use std::future::Future;
 
 pub(crate) use block_index::BlockIndex;
 #[cfg(test)]
@@ -31,9 +29,9 @@ pub(crate) use column_block_index::{
 pub(crate) use column_deletion_blob::{
     COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, validate_persisted_blob_page,
 };
-pub(crate) use non_unique_index::{
-    GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry,
-};
+pub(crate) use index_stream::IndexBatchStream;
+pub(crate) use mem_index::MemIndexEntry;
+pub(crate) use non_unique_index::{GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqueMemIndex};
 pub(crate) use row_page_index::RowLocation;
 #[cfg(test)]
 pub(crate) use row_page_index::RowPageIndexNode;
@@ -41,12 +39,4 @@ pub(crate) use secondary_index::{
     InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueSecondaryIndex,
     SecondaryDiskTreeRuntime, SecondaryIndex, UniqueSecondaryIndex,
 };
-pub(crate) use unique_index::{
-    GuardedUniqueMemIndex, UniqueIndex, UniqueMemIndex, UniqueMemIndexEntry,
-};
-
-/// Async candidate row-id stream returned by secondary indexes.
-pub(crate) trait IndexRowIdStream {
-    /// Return the next non-empty row-id batch, or `None` when exhausted.
-    fn next_batch(&mut self) -> impl Future<Output = Result<Option<Vec<RowID>>>>;
-}
+pub(crate) use unique_index::{GuardedUniqueMemIndex, UniqueIndex, UniqueMemIndex};

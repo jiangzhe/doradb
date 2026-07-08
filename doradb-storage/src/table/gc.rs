@@ -5,8 +5,8 @@ use crate::error::{DataIntegrityError, Error, FileKind, InternalError, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::{
-    ColumnBlockIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry, ResolvedColumnRow, SecondaryIndex,
-    UniqueMemIndex, UniqueMemIndexEntry,
+    ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
+    UniqueMemIndex,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::session::SessionPin;
@@ -469,7 +469,7 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &UniqueMemIndex<EvictableBufferPool>,
-        entry: &UniqueMemIndexEntry,
+        entry: &MemIndexEntry,
     ) -> Result<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
@@ -489,7 +489,7 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &NonUniqueMemIndex<EvictableBufferPool>,
-        entry: &NonUniqueMemIndexEntry,
+        entry: &MemIndexEntry,
     ) -> Result<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
@@ -586,7 +586,7 @@ impl Table {
 async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
     index: &UniqueMemIndex<P>,
     index_pool_guard: &PoolGuard,
-    entry: &UniqueMemIndexEntry,
+    entry: &MemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index
@@ -609,7 +609,7 @@ async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
 async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
     index: &NonUniqueMemIndex<P>,
     index_pool_guard: &PoolGuard,
-    entry: &NonUniqueMemIndexEntry,
+    entry: &MemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index

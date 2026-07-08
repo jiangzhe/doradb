@@ -6,23 +6,22 @@
 //! cold DiskTree layer.
 
 use super::disk_tree::{
-    DiskTreeRowIdEntry, NonUniqueDiskTree, NonUniqueDiskTreeEntryStream, NonUniqueDiskTreeRuntime,
-    UniqueDiskTree, UniqueDiskTreeEntryStream, UniqueDiskTreeRuntime,
+    DiskTreeEntry, NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree,
+    UniqueDiskTreeRuntime,
 };
-use super::non_unique_index::{
-    GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry,
-    NonUniqueMemIndexEntryStream,
-};
-use super::unique_index::{
-    GuardedUniqueMemIndex, UniqueIndex, UniqueMemIndex, UniqueMemIndexEntry,
+use super::index_stream::{
+    NonUniqueDiskTreeEntryStream, NonUniqueMemIndexEntryStream, UniqueDiskTreeEntryStream,
     UniqueMemIndexEntryStream,
 };
+use super::mem_index::MemIndexEntry;
+use super::non_unique_index::{GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqueMemIndex};
+use super::unique_index::{GuardedUniqueMemIndex, UniqueIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{Error, InternalError, Result};
 use crate::file::table_file::TableFile;
 use crate::id::{BlockID, RowID, TrxID};
-use crate::index::IndexRowIdStream;
+use crate::index::IndexBatchStream;
 use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
@@ -406,7 +405,7 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
 
 impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
     type RowIdStream<'a>
-        = UniqueSecondaryIndexRowIdStream<'a, P>
+        = SecondaryIndexBatchStream<UniqueMemIndexEntryStream<'a, P>, UniqueDiskTreeEntryStream<'a>>
     where
         Self: 'a;
 
@@ -497,7 +496,7 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
     {
         let mem = self.mem.scan_encoded_entry_stream(range.clone())?;
         let disk = self.open()?.scan_entry_stream(range);
-        Ok(UniqueSecondaryIndexRowIdStream::new(mem, disk))
+        Ok(SecondaryIndexBatchStream::unique(mem, disk))
     }
 
     #[inline]
@@ -545,7 +544,10 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
 
 impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     type RowIdStream<'a>
-        = NonUniqueSecondaryIndexRowIdStream<'a, P>
+        = SecondaryIndexBatchStream<
+        NonUniqueMemIndexEntryStream<'a, P>,
+        NonUniqueDiskTreeEntryStream<'a>,
+    >
     where
         Self: 'a;
 
@@ -638,14 +640,14 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     {
         let mem = self.mem.scan_encoded_entry_stream(range.clone())?;
         let disk = self.open()?.scan_entry_stream(range);
-        Ok(NonUniqueSecondaryIndexRowIdStream::new(mem, disk))
+        Ok(SecondaryIndexBatchStream::non_unique(mem, disk))
     }
 
     #[inline]
     fn equal_scan_row_ids<'a>(&'a self, key: &[Val], _ts: TrxID) -> Result<Self::RowIdStream<'a>> {
         let mem = self.mem.equal_scan_encoded_entry_stream(key)?;
         let disk = self.open()?.equal_scan_entry_stream(key);
-        Ok(NonUniqueSecondaryIndexRowIdStream::new(mem, disk))
+        Ok(SecondaryIndexBatchStream::non_unique(mem, disk))
     }
 
     #[inline]
@@ -658,24 +660,46 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 }
 
-/// Incremental row-id stream over a unique MemIndex/DiskTree pair.
-pub(crate) struct UniqueSecondaryIndexRowIdStream<'a, P: 'static> {
-    mem: UniqueMemIndexEntryStream<'a, P>,
-    disk: UniqueDiskTreeEntryStream<'a>,
-    mem_buf: Vec<UniqueMemIndexEntry>,
+#[derive(Clone, Copy)]
+enum SecondaryIndexBatchMode {
+    Unique,
+    NonUnique,
+}
+
+/// Incremental row-id stream over a MemIndex/DiskTree pair.
+pub(crate) struct SecondaryIndexBatchStream<M, D> {
+    mem: M,
+    disk: D,
+    mode: SecondaryIndexBatchMode,
+    mem_buf: Vec<MemIndexEntry>,
     mem_idx: usize,
     mem_done: bool,
-    disk_buf: Vec<DiskTreeRowIdEntry>,
+    disk_buf: Vec<DiskTreeEntry>,
     disk_idx: usize,
     disk_done: bool,
 }
 
-impl<'a, P: BufferPool> UniqueSecondaryIndexRowIdStream<'a, P> {
+impl<M, D> SecondaryIndexBatchStream<M, D>
+where
+    M: IndexBatchStream<MemIndexEntry>,
+    D: IndexBatchStream<DiskTreeEntry>,
+{
     #[inline]
-    fn new(mem: UniqueMemIndexEntryStream<'a, P>, disk: UniqueDiskTreeEntryStream<'a>) -> Self {
+    fn unique(mem: M, disk: D) -> Self {
+        Self::new(mem, disk, SecondaryIndexBatchMode::Unique)
+    }
+
+    #[inline]
+    fn non_unique(mem: M, disk: D) -> Self {
+        Self::new(mem, disk, SecondaryIndexBatchMode::NonUnique)
+    }
+
+    #[inline]
+    fn new(mem: M, disk: D, mode: SecondaryIndexBatchMode) -> Self {
         Self {
             mem,
             disk,
+            mode,
             mem_buf: Vec::new(),
             mem_idx: 0,
             mem_done: false,
@@ -734,9 +758,41 @@ impl<'a, P: BufferPool> UniqueSecondaryIndexRowIdStream<'a, P> {
             }
         }
     }
+
+    #[inline]
+    fn push_mem(&mut self, out: &mut Vec<RowID>) {
+        match self.mode {
+            SecondaryIndexBatchMode::Unique => {
+                out.push(self.mem_buf[self.mem_idx].row_id);
+            }
+            SecondaryIndexBatchMode::NonUnique => {
+                let mem = &self.mem_buf[self.mem_idx];
+                if !mem.deleted {
+                    out.push(mem.row_id);
+                }
+            }
+        }
+        self.mem_idx += 1;
+    }
+
+    #[inline]
+    fn push_disk(&mut self, out: &mut Vec<RowID>) {
+        out.push(self.disk_buf[self.disk_idx].row_id);
+        self.disk_idx += 1;
+    }
+
+    #[inline]
+    fn push_equal(&mut self, out: &mut Vec<RowID>) {
+        self.push_mem(out);
+        self.disk_idx += 1;
+    }
 }
 
-impl<P: BufferPool> IndexRowIdStream for UniqueSecondaryIndexRowIdStream<'_, P> {
+impl<M, D> IndexBatchStream<RowID> for SecondaryIndexBatchStream<M, D>
+where
+    M: IndexBatchStream<MemIndexEntry>,
+    D: IndexBatchStream<DiskTreeEntry>,
+{
     async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
         let mut out = Vec::new();
         loop {
@@ -750,178 +806,23 @@ impl<P: BufferPool> IndexRowIdStream for UniqueSecondaryIndexRowIdStream<'_, P> 
                     return Ok((!out.is_empty()).then_some(out));
                 }
                 (true, false) => {
-                    out.push(self.mem_buf[self.mem_idx].row_id);
-                    self.mem_idx += 1;
+                    self.push_mem(&mut out);
                 }
                 (false, true) => {
-                    out.push(self.disk_buf[self.disk_idx].row_id);
-                    self.disk_idx += 1;
+                    self.push_disk(&mut out);
                 }
                 (true, true) => {
                     let mem = &self.mem_buf[self.mem_idx];
                     let disk = &self.disk_buf[self.disk_idx];
                     match mem.encoded_key.as_slice().cmp(disk.encoded_key.as_slice()) {
                         Ordering::Less => {
-                            out.push(mem.row_id);
-                            self.mem_idx += 1;
+                            self.push_mem(&mut out);
                         }
                         Ordering::Equal => {
-                            out.push(mem.row_id);
-                            self.mem_idx += 1;
-                            self.disk_idx += 1;
+                            self.push_equal(&mut out);
                         }
                         Ordering::Greater => {
-                            out.push(disk.row_id);
-                            self.disk_idx += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Incremental row-id stream over a non-unique MemIndex/DiskTree pair.
-pub(crate) struct NonUniqueSecondaryIndexRowIdStream<'a, P: 'static> {
-    mem: NonUniqueMemIndexEntryStream<'a, P>,
-    disk: NonUniqueDiskTreeEntryStream<'a>,
-    mem_buf: Vec<NonUniqueMemIndexEntry>,
-    mem_idx: usize,
-    mem_done: bool,
-    disk_buf: Vec<DiskTreeRowIdEntry>,
-    disk_idx: usize,
-    disk_done: bool,
-    last_emitted_key: Option<Vec<u8>>,
-}
-
-impl<'a, P: BufferPool> NonUniqueSecondaryIndexRowIdStream<'a, P> {
-    #[inline]
-    fn new(
-        mem: NonUniqueMemIndexEntryStream<'a, P>,
-        disk: NonUniqueDiskTreeEntryStream<'a>,
-    ) -> Self {
-        Self {
-            mem,
-            disk,
-            mem_buf: Vec::new(),
-            mem_idx: 0,
-            mem_done: false,
-            disk_buf: Vec::new(),
-            disk_idx: 0,
-            disk_done: false,
-            last_emitted_key: None,
-        }
-    }
-
-    #[inline]
-    fn mem_needs_refill(&self) -> bool {
-        self.mem_idx == self.mem_buf.len() && !self.mem_done
-    }
-
-    #[inline]
-    fn disk_needs_refill(&self) -> bool {
-        self.disk_idx == self.disk_buf.len() && !self.disk_done
-    }
-
-    async fn ensure_mem(&mut self) -> Result<bool> {
-        if self.mem_idx < self.mem_buf.len() {
-            return Ok(true);
-        }
-        if self.mem_done {
-            return Ok(false);
-        }
-        match self.mem.next_batch().await? {
-            Some(entries) => {
-                self.mem_buf = entries;
-                self.mem_idx = 0;
-                Ok(true)
-            }
-            None => {
-                self.mem_done = true;
-                Ok(false)
-            }
-        }
-    }
-
-    async fn ensure_disk(&mut self) -> Result<bool> {
-        if self.disk_idx < self.disk_buf.len() {
-            return Ok(true);
-        }
-        if self.disk_done {
-            return Ok(false);
-        }
-        match self.disk.next_batch().await? {
-            Some(entries) => {
-                self.disk_buf = entries;
-                self.disk_idx = 0;
-                Ok(true)
-            }
-            None => {
-                self.disk_done = true;
-                Ok(false)
-            }
-        }
-    }
-
-    #[inline]
-    fn push_row_once(&mut self, encoded_key: &[u8], row_id: RowID, out: &mut Vec<RowID>) {
-        if self.last_emitted_key.as_deref() != Some(encoded_key) {
-            out.push(row_id);
-            self.last_emitted_key = Some(encoded_key.to_vec());
-        }
-    }
-}
-
-impl<P: BufferPool> IndexRowIdStream for NonUniqueSecondaryIndexRowIdStream<'_, P> {
-    async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
-        let mut out = Vec::new();
-        loop {
-            if !out.is_empty() && (self.mem_needs_refill() || self.disk_needs_refill()) {
-                return Ok(Some(out));
-            }
-            let mem_has = self.ensure_mem().await?;
-            let disk_has = self.ensure_disk().await?;
-            match (mem_has, disk_has) {
-                (false, false) => {
-                    return Ok((!out.is_empty()).then_some(out));
-                }
-                (true, false) => {
-                    let mem = &self.mem_buf[self.mem_idx];
-                    if !mem.deleted {
-                        let encoded_key = mem.encoded_key.clone();
-                        self.push_row_once(&encoded_key, mem.row_id, &mut out);
-                    }
-                    self.mem_idx += 1;
-                }
-                (false, true) => {
-                    let disk = &self.disk_buf[self.disk_idx];
-                    let encoded_key = disk.encoded_key.clone();
-                    self.push_row_once(&encoded_key, disk.row_id, &mut out);
-                    self.disk_idx += 1;
-                }
-                (true, true) => {
-                    let mem = &self.mem_buf[self.mem_idx];
-                    let disk = &self.disk_buf[self.disk_idx];
-                    match mem.encoded_key.as_slice().cmp(disk.encoded_key.as_slice()) {
-                        Ordering::Less => {
-                            if !mem.deleted {
-                                let encoded_key = mem.encoded_key.clone();
-                                self.push_row_once(&encoded_key, mem.row_id, &mut out);
-                            }
-                            self.mem_idx += 1;
-                        }
-                        Ordering::Equal => {
-                            if !mem.deleted {
-                                let encoded_key = mem.encoded_key.clone();
-                                self.push_row_once(&encoded_key, mem.row_id, &mut out);
-                            }
-                            self.mem_idx += 1;
-                            self.disk_idx += 1;
-                        }
-                        Ordering::Greater => {
-                            let encoded_key = disk.encoded_key.clone();
-                            self.push_row_once(&encoded_key, disk.row_id, &mut out);
-                            self.disk_idx += 1;
+                            self.push_disk(&mut out);
                         }
                     }
                 }
@@ -932,7 +833,7 @@ impl<P: BufferPool> IndexRowIdStream for NonUniqueSecondaryIndexRowIdStream<'_, 
 
 #[inline]
 fn merge_unique_entries(
-    mem_entries: &[UniqueMemIndexEntry],
+    mem_entries: &[MemIndexEntry],
     disk_entries: &[(Vec<u8>, RowID)],
     values: &mut Vec<RowID>,
 ) {
@@ -979,63 +880,44 @@ fn merge_unique_entries(
 
 #[inline]
 fn merge_non_unique_entries(
-    mem_entries: &[NonUniqueMemIndexEntry],
+    mem_entries: &[MemIndexEntry],
     disk_entries: &[(Vec<u8>, RowID)],
     values: &mut Vec<RowID>,
 ) {
     let mut mem_idx = 0;
     let mut disk_idx = 0;
-    let mut last_emitted_key: Option<Vec<u8>> = None;
+    // Both inputs are sorted and exact-key unique, so a hot/cold duplicate can
+    // only appear when the two current heads compare equal.
     while mem_idx < mem_entries.len() && disk_idx < disk_entries.len() {
         let mem = &mem_entries[mem_idx];
         let (disk_key, disk_row_id) = &disk_entries[disk_idx];
         match mem.encoded_key.as_slice().cmp(disk_key.as_slice()) {
             Ordering::Less => {
-                push_active_mem_entry(mem, values, &mut last_emitted_key);
+                if !mem.deleted {
+                    values.push(mem.row_id);
+                }
                 mem_idx += 1;
             }
             Ordering::Equal => {
                 if !mem.deleted {
-                    push_row_once(&mem.encoded_key, mem.row_id, values, &mut last_emitted_key);
+                    values.push(mem.row_id);
                 }
                 mem_idx += 1;
                 disk_idx += 1;
             }
             Ordering::Greater => {
-                push_row_once(disk_key, *disk_row_id, values, &mut last_emitted_key);
+                values.push(*disk_row_id);
                 disk_idx += 1;
             }
         }
     }
     for mem in &mem_entries[mem_idx..] {
-        push_active_mem_entry(mem, values, &mut last_emitted_key);
+        if !mem.deleted {
+            values.push(mem.row_id);
+        }
     }
-    for (disk_key, row_id) in &disk_entries[disk_idx..] {
-        push_row_once(disk_key, *row_id, values, &mut last_emitted_key);
-    }
-}
-
-#[inline]
-fn push_active_mem_entry(
-    entry: &NonUniqueMemIndexEntry,
-    values: &mut Vec<RowID>,
-    last_emitted_key: &mut Option<Vec<u8>>,
-) {
-    if !entry.deleted {
-        push_row_once(&entry.encoded_key, entry.row_id, values, last_emitted_key);
-    }
-}
-
-#[inline]
-fn push_row_once(
-    encoded_key: &[u8],
-    row_id: RowID,
-    values: &mut Vec<RowID>,
-    last_emitted_key: &mut Option<Vec<u8>>,
-) {
-    if last_emitted_key.as_deref() != Some(encoded_key) {
-        values.push(row_id);
-        *last_emitted_key = Some(encoded_key.to_vec());
+    for (_, row_id) in &disk_entries[disk_idx..] {
+        values.push(*row_id);
     }
 }
 
@@ -1063,7 +945,7 @@ mod tests {
         values.into_iter().map(RowID::new).collect()
     }
 
-    async fn drain_row_ids<S: IndexRowIdStream>(stream: &mut S) -> Vec<RowID> {
+    async fn drain_row_ids<S: IndexBatchStream<RowID>>(stream: &mut S) -> Vec<RowID> {
         let mut row_ids = Vec::new();
         while let Some(batch) = stream.next_batch().await.unwrap() {
             row_ids.extend(batch);

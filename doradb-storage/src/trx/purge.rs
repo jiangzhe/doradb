@@ -1115,7 +1115,7 @@ mod tests {
     use crate::error::{FatalError, Result};
     use crate::id::{BlockID, RowID, TableID};
     use crate::index::{
-        IndexCompareExchange, IndexInsert, IndexRowIdStream, RowLocation, UniqueIndex,
+        IndexBatchStream, IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex,
     };
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
@@ -1190,7 +1190,7 @@ mod tests {
         (owned_bound_as_ref(&range.0), owned_bound_as_ref(&range.1))
     }
 
-    struct BoundUniqueIndexRowIdStream<'a> {
+    struct BoundUniqueIndexBatchStream<'a> {
         table: &'a Table,
         guards: &'a PoolGuards,
         index_no: usize,
@@ -1200,7 +1200,7 @@ mod tests {
         done: bool,
     }
 
-    impl IndexRowIdStream for BoundUniqueIndexRowIdStream<'_> {
+    impl IndexBatchStream<RowID> for BoundUniqueIndexBatchStream<'_> {
         #[inline]
         async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
             if self.done {
@@ -1228,7 +1228,7 @@ mod tests {
 
     impl UniqueIndex for BoundUniqueIndexNo<'_> {
         type RowIdStream<'a>
-            = BoundUniqueIndexRowIdStream<'a>
+            = BoundUniqueIndexBatchStream<'a>
         where
             Self: 'a;
 
@@ -1295,7 +1295,7 @@ mod tests {
         where
             R: RangeBounds<&'r [Val]> + Clone,
         {
-            Ok(BoundUniqueIndexRowIdStream {
+            Ok(BoundUniqueIndexBatchStream {
                 table: self.table,
                 guards: self.guards,
                 index_no: self.index_no,

@@ -1,25 +1,31 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
-use crate::error::{Error, InternalError, Result};
+use crate::error::Result;
 use crate::id::{RowID, TrxID};
+#[cfg(test)]
+use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::BTreeU64;
-use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
-use crate::index::btree::{BTreeKeyEncoder, BTreeNode, BTreeNodeCursor, KeyRange};
+#[cfg(test)]
+use crate::index::btree::GenericBTree;
+use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate};
+use crate::index::index_stream::{UniqueMemIndexBatchStream, UniqueMemIndexEntryStream};
+use crate::index::mem_index::{
+    MemIndex, MemIndexCleanupScan, MemIndexEntry, UniqueMemIndexCleanupSpec,
+    UniqueMemIndexEntryScanSpec,
+};
 use crate::index::util::Maskable;
-use crate::index::{IndexCompareExchange, IndexInsert, IndexRowIdStream};
+use crate::index::{IndexBatchStream, IndexCompareExchange, IndexInsert};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
-use error_stack::Report;
 use futures::FutureExt;
 use std::future::Future;
-use std::marker::PhantomData;
-use std::ops::RangeBounds;
+use std::ops::{Deref, RangeBounds};
 
 /// Abstraction of unique index.
 pub(crate) trait UniqueIndex: Send + Sync {
     /// Row-id stream returned by bounded unique-index scans.
-    type RowIdStream<'a>: IndexRowIdStream + 'a
+    type RowIdStream<'a>: IndexBatchStream<RowID> + 'a
     where
         Self: 'a;
 
@@ -97,9 +103,15 @@ pub(crate) trait UniqueIndex: Send + Sync {
 }
 
 /// Generic unique-index implementation backed by a generic B-Tree.
-pub(crate) struct UniqueMemIndex<P: 'static> {
-    tree: GenericBTree<P>,
-    encoder: BTreeKeyEncoder,
+pub(crate) struct UniqueMemIndex<P: 'static>(MemIndex<P>);
+
+impl<P: 'static> Deref for UniqueMemIndex<P> {
+    type Target = MemIndex<P>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl<P: BufferPool> UniqueMemIndex<P> {
@@ -119,15 +131,16 @@ impl<P: BufferPool> UniqueMemIndex<P> {
             .iter()
             .map(|key| ty_infer(key.col_no as usize))
             .collect();
-        let encoder = BTreeKeyEncoder::new(types);
-        let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
-        Ok(Self::with_encoder(tree, encoder))
+        Ok(Self(
+            MemIndex::new_with_types(index_pool, index_pool_guard, types, ts).await?,
+        ))
     }
 
     /// Wrap an already-created BTree with a key encoder.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
-        UniqueMemIndex { tree, encoder }
+        Self(MemIndex::with_encoder(tree, encoder))
     }
 
     /// Bind this index to one pool guard for trait-based operations.
@@ -142,7 +155,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     /// Destroy this unique index and reclaim all backing tree pages.
     #[inline]
     pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
-        self.tree.destory(pool_guard).await
+        self.0.destroy(pool_guard).await
     }
 
     /// Insert a live or delete-shadow overlay when the logical key is absent.
@@ -158,10 +171,10 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        let key = self.encoder.encode(key);
+        let key = self.encoder().encode(key);
         Ok(
             match self
-                .tree
+                .tree()
                 .insert::<BTreeU64>(
                     pool_guard,
                     key.as_bytes(),
@@ -185,28 +198,10 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     pub(crate) async fn scan_encoded_entries(
         &self,
         pool_guard: &PoolGuard,
-    ) -> Result<Vec<UniqueMemIndexEntry>> {
-        let mut entries = Vec::new();
-        let mut cursor = self.tree.cursor(pool_guard, 0);
-        cursor.seek(&[]).await?;
-        while let Some(guard) = cursor.next().await? {
-            let node = guard.page();
-            for idx in 0..node.count() {
-                let encoded_key = node.key_checked(idx).ok_or_else(|| {
-                    Error::from(
-                        Report::new(InternalError::IndexKeyMissing)
-                            .attach(format!("slot_idx={idx}")),
-                    )
-                })?;
-                let value = node.value::<BTreeU64>(idx);
-                entries.push(UniqueMemIndexEntry {
-                    encoded_key,
-                    row_id: value.value().to_row_id(),
-                    deleted: value.is_deleted(),
-                });
-            }
-        }
-        Ok(entries)
+    ) -> Result<Vec<MemIndexEntry>> {
+        self.0
+            .scan_encoded_entries::<UniqueMemIndexEntryScanSpec>(pool_guard)
+            .await
     }
 
     /// Create a leaf-bounded scanner for cleanup candidates.
@@ -216,15 +211,19 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         pool_guard: &'a PoolGuard,
         pivot_row_id: RowID,
         clean_live_entries: bool,
-    ) -> UniqueMemIndexCleanupScan<'a, P> {
-        UniqueMemIndexCleanupScan::new(&self.tree, pool_guard, pivot_row_id, clean_live_entries)
+    ) -> MemIndexCleanupScan<'a, P, UniqueMemIndexCleanupSpec> {
+        self.0.cleanup_scan::<UniqueMemIndexCleanupSpec>(
+            pool_guard,
+            pivot_row_id,
+            clean_live_entries,
+        )
     }
 
     /// Return whether `key` encodes to the same MemIndex key bytes captured by
     /// a cleanup scan.
     #[inline]
     pub(crate) fn encoded_key_matches(&self, key: &[Val], encoded_key: &[u8]) -> bool {
-        self.encoder.encode(key).as_bytes() == encoded_key
+        self.encoder().encode(key).as_bytes() == encoded_key
     }
 
     /// Remove an encoded MemIndex entry only when row id and delete state still
@@ -244,7 +243,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     ) -> Result<bool> {
         debug_assert!(!row_id.is_deleted());
         Ok(matches!(
-            self.tree
+            self.tree()
                 .delete_exact(pool_guard, encoded_key, BTreeU64::from(row_id), deleted, ts,)
                 .await?,
             BTreeDelete::Ok
@@ -275,7 +274,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
 
     /// Scan MemIndex entries with encoded logical keys and delete state.
     #[inline]
-    pub(crate) async fn scan_encoded_entries(&self) -> Result<Vec<UniqueMemIndexEntry>> {
+    pub(crate) async fn scan_encoded_entries(&self) -> Result<Vec<MemIndexEntry>> {
         self.index.scan_encoded_entries(self.pool_guard).await
     }
 
@@ -288,10 +287,9 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
     where
         R: RangeBounds<&'r [Val]>,
     {
-        let range = self.index.encoder.encode_range(range);
+        let range = self.index.encoder().encode_range(range);
         Ok(UniqueMemIndexEntryStream::new(
-            &self.index.tree,
-            self.pool_guard,
+            self.index.tree().cursor(self.pool_guard, 0),
             range,
         ))
     }
@@ -299,16 +297,16 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
 
 impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
     type RowIdStream<'a>
-        = UniqueMemIndexRowIdStream<'a, P>
+        = UniqueMemIndexBatchStream<'a, P>
     where
         Self: 'a;
 
     #[inline]
     async fn lookup(&self, key: &[Val], _ts: TrxID) -> Result<Option<(RowID, bool)>> {
-        let k = self.index.encoder.encode(key);
+        let k = self.index.encoder().encode(key);
         Ok(self
             .index
-            .tree
+            .tree()
             .lookup_optimistic::<BTreeU64>(self.pool_guard, k.as_bytes())
             .await?
             .map(|res| (res.value().to_row_id(), res.is_deleted())))
@@ -323,11 +321,11 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
         ts: TrxID,
     ) -> Result<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
-        let k = self.index.encoder.encode(key);
+        let k = self.index.encoder().encode(key);
         Ok(
             match self
                 .index
-                .tree
+                .tree()
                 .insert::<BTreeU64>(
                     self.pool_guard,
                     k.as_bytes(),
@@ -354,11 +352,11 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
         ts: TrxID,
     ) -> Result<bool> {
         debug_assert!(!row_id.is_deleted());
-        let k = self.index.encoder.encode(key);
+        let k = self.index.encoder().encode(key);
         Ok(
             match self
                 .index
-                .tree
+                .tree()
                 .delete(
                     self.pool_guard,
                     k.as_bytes(),
@@ -383,11 +381,11 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
         new_row_id: RowID,
         ts: TrxID,
     ) -> Result<IndexCompareExchange> {
-        let k = self.index.encoder.encode(key);
+        let k = self.index.encoder().encode(key);
         Ok(
             match self
                 .index
-                .tree
+                .tree()
                 .update(
                     self.pool_guard,
                     k.as_bytes(),
@@ -412,245 +410,21 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
     where
         R: RangeBounds<&'r [Val]> + Clone,
     {
-        let range = self.index.encoder.encode_range(range);
-        Ok(UniqueMemIndexRowIdStream::new(
-            &self.index.tree,
-            self.pool_guard,
+        let range = self.index.encoder().encode_range(range);
+        Ok(UniqueMemIndexBatchStream::new(
+            self.index.tree().cursor(self.pool_guard, 0),
             range,
         ))
     }
 
     #[inline]
     async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
-        let mut cursor = self.index.tree.cursor(self.pool_guard, 0);
+        let mut cursor = self.index.tree().cursor(self.pool_guard, 0);
         cursor.seek(&[]).await?;
         while let Some(g) = cursor.next().await? {
             g.page().values(values, BTreeU64::to_row_id);
         }
         Ok(())
-    }
-}
-
-/// Encoded MemIndex state for one unique secondary-index entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UniqueMemIndexEntry {
-    /// Encoded logical secondary key in BTree order.
-    pub(crate) encoded_key: Vec<u8>,
-    /// Row id stored in the MemIndex entry with the delete bit stripped.
-    pub(crate) row_id: RowID,
-    /// Whether the MemIndex entry is a delete-shadow.
-    pub(crate) deleted: bool,
-}
-
-/// Projector used by unique MemIndex scan streams.
-pub(crate) trait UniqueMemIndexScanProjector {
-    /// Output item produced for each accepted slot.
-    type Output;
-
-    /// Project one accepted slot into an output item.
-    fn project(
-        node: &BTreeNode,
-        slot_idx: usize,
-        encoded_key: Vec<u8>,
-    ) -> Result<Option<Self::Output>>;
-}
-
-/// Project accepted unique MemIndex slots into encoded entries.
-pub(crate) struct UniqueEntryProjector;
-
-impl UniqueMemIndexScanProjector for UniqueEntryProjector {
-    type Output = UniqueMemIndexEntry;
-
-    #[inline]
-    fn project(
-        node: &BTreeNode,
-        slot_idx: usize,
-        encoded_key: Vec<u8>,
-    ) -> Result<Option<Self::Output>> {
-        let value = node.value::<BTreeU64>(slot_idx);
-        Ok(Some(UniqueMemIndexEntry {
-            encoded_key,
-            row_id: value.value().to_row_id(),
-            deleted: value.is_deleted(),
-        }))
-    }
-}
-
-/// Project accepted unique MemIndex slots into row ids.
-pub(crate) struct UniqueRowIdProjector;
-
-impl UniqueMemIndexScanProjector for UniqueRowIdProjector {
-    type Output = RowID;
-
-    #[inline]
-    fn project(
-        node: &BTreeNode,
-        slot_idx: usize,
-        _encoded_key: Vec<u8>,
-    ) -> Result<Option<Self::Output>> {
-        let value = node.value::<BTreeU64>(slot_idx);
-        Ok(Some(value.value().to_row_id()))
-    }
-}
-
-/// Generic leaf-bounded stream over unique MemIndex slots.
-pub(crate) struct UniqueMemIndexScanStream<'a, P: 'static, F> {
-    cursor: BTreeNodeCursor<'a, P>,
-    range: KeyRange,
-    started: bool,
-    exhausted: bool,
-    _projector: PhantomData<F>,
-}
-
-impl<'a, P, F> UniqueMemIndexScanStream<'a, P, F>
-where
-    P: BufferPool,
-    F: UniqueMemIndexScanProjector,
-{
-    #[inline]
-    fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, range: KeyRange) -> Self {
-        Self {
-            cursor: tree.cursor(pool_guard, 0),
-            range,
-            started: false,
-            exhausted: false,
-            _projector: PhantomData,
-        }
-    }
-
-    /// Return the next leaf-bounded projected batch.
-    pub(crate) async fn next_batch(&mut self) -> Result<Option<Vec<F::Output>>> {
-        if self.exhausted {
-            return Ok(None);
-        }
-        if !self.started {
-            self.cursor.seek(self.range.lower_seek_key()).await?;
-            self.started = true;
-        }
-        while let Some(guard) = self.cursor.next().await? {
-            let node = guard.page();
-            let mut outputs = Vec::new();
-            for idx in node.lower_bound_slot_idx(self.range.lower_seek_key())..node.count() {
-                let encoded_key = node.key_checked(idx).ok_or_else(|| {
-                    Error::from(
-                        Report::new(InternalError::IndexKeyMissing)
-                            .attach(format!("slot_idx={idx}")),
-                    )
-                })?;
-                if !self.range.lower_accepts(&encoded_key) {
-                    continue;
-                }
-                if !self.range.upper_accepts(&encoded_key) {
-                    self.exhausted = true;
-                    break;
-                }
-                if let Some(output) = F::project(node, idx, encoded_key)? {
-                    outputs.push(output);
-                }
-            }
-            if !outputs.is_empty() {
-                return Ok(Some(outputs));
-            }
-            if self.exhausted {
-                return Ok(None);
-            }
-        }
-        self.exhausted = true;
-        Ok(None)
-    }
-}
-
-/// Leaf-bounded stream of encoded unique MemIndex entries.
-pub(crate) type UniqueMemIndexEntryStream<'a, P> =
-    UniqueMemIndexScanStream<'a, P, UniqueEntryProjector>;
-
-/// Row-id stream over unique MemIndex entries.
-pub(crate) type UniqueMemIndexRowIdStream<'a, P> =
-    UniqueMemIndexScanStream<'a, P, UniqueRowIdProjector>;
-
-impl<P: BufferPool> IndexRowIdStream for UniqueMemIndexScanStream<'_, P, UniqueRowIdProjector> {
-    #[inline]
-    async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
-        UniqueMemIndexScanStream::next_batch(self).await
-    }
-}
-
-/// Bounded batch of unique MemIndex entries selected for cleanup processing.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct UniqueMemIndexCleanupBatch {
-    /// Cleanup candidates copied out of one MemIndex leaf.
-    pub(crate) entries: Vec<UniqueMemIndexEntry>,
-    /// Live entries skipped before encoded-key allocation.
-    pub(crate) skipped_live: usize,
-    /// Hot delete overlays skipped before encoded-key allocation.
-    pub(crate) skipped_hot_deleted: usize,
-}
-
-/// Leaf-bounded cleanup scanner for unique MemIndex entries.
-pub(crate) struct UniqueMemIndexCleanupScan<'a, P: 'static> {
-    cursor: BTreeNodeCursor<'a, P>,
-    pivot_row_id: RowID,
-    clean_live_entries: bool,
-    started: bool,
-}
-
-impl<'a, P: BufferPool> UniqueMemIndexCleanupScan<'a, P> {
-    #[inline]
-    fn new(
-        tree: &'a GenericBTree<P>,
-        pool_guard: &'a PoolGuard,
-        pivot_row_id: RowID,
-        clean_live_entries: bool,
-    ) -> Self {
-        Self {
-            cursor: tree.cursor(pool_guard, 0),
-            pivot_row_id,
-            clean_live_entries,
-            started: false,
-        }
-    }
-
-    /// Return the next leaf-bounded cleanup candidate batch.
-    #[inline]
-    pub(crate) async fn next_batch(&mut self) -> Result<Option<UniqueMemIndexCleanupBatch>> {
-        if !self.started {
-            self.cursor.seek(&[]).await?;
-            self.started = true;
-        }
-        let Some(guard) = self.cursor.next().await? else {
-            return Ok(None);
-        };
-
-        let node = guard.page();
-        let mut batch = UniqueMemIndexCleanupBatch::default();
-        for idx in 0..node.count() {
-            let value = node.value::<BTreeU64>(idx);
-            let row_id = value.value().to_row_id();
-            let deleted = value.is_deleted();
-            if row_id >= self.pivot_row_id {
-                if deleted {
-                    batch.skipped_hot_deleted += 1;
-                } else {
-                    batch.skipped_live += 1;
-                }
-                continue;
-            }
-            if !deleted && !self.clean_live_entries {
-                batch.skipped_live += 1;
-                continue;
-            }
-            let encoded_key = node.key_checked(idx).ok_or_else(|| {
-                Error::from(
-                    Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={idx}")),
-                )
-            })?;
-            batch.entries.push(UniqueMemIndexEntry {
-                encoded_key,
-                row_id,
-                deleted,
-            });
-        }
-        Ok(Some(batch))
     }
 }
 
@@ -662,7 +436,7 @@ mod tests {
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
 
-    async fn drain_row_ids<S: IndexRowIdStream>(stream: &mut S) -> Vec<RowID> {
+    async fn drain_row_ids<S: IndexBatchStream<RowID>>(stream: &mut S) -> Vec<RowID> {
         let mut row_ids = Vec::new();
         while let Some(batch) = stream.next_batch().await.unwrap() {
             row_ids.extend(batch);
@@ -678,15 +452,15 @@ mod tests {
             );
             {
                 let pool_guard = (*pool).pool_guard();
-                let index = UniqueMemIndex {
-                    tree: BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
+                let index = UniqueMemIndex::with_encoder(
+                    BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
                         .await
                         .expect("test btree construction should succeed"),
-                    encoder: BTreeKeyEncoder::new(vec![ValType {
+                    BTreeKeyEncoder::new(vec![ValType {
                         kind: ValKind::I32,
                         nullable: false,
                     }]),
-                };
+                );
                 run_test_suit_for_single_key_unique_index(index.bind(&pool_guard)).await;
             }
         });
@@ -700,11 +474,11 @@ mod tests {
             );
             {
                 let pool_guard = (*pool).pool_guard();
-                let index = UniqueMemIndex {
-                    tree: BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
+                let index = UniqueMemIndex::with_encoder(
+                    BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
                         .await
                         .expect("test btree construction should succeed"),
-                    encoder: BTreeKeyEncoder::new(vec![
+                    BTreeKeyEncoder::new(vec![
                         ValType {
                             kind: ValKind::VarByte,
                             nullable: false,
@@ -714,7 +488,7 @@ mod tests {
                             nullable: false,
                         },
                     ]),
-                };
+                );
                 run_test_suit_for_multi_key_unique_index(index.bind(&pool_guard)).await;
             }
         });
@@ -727,15 +501,15 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let index = UniqueMemIndex {
-                tree: BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
+            let index = UniqueMemIndex::with_encoder(
+                BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
                     .await
                     .expect("test btree construction should succeed"),
-                encoder: BTreeKeyEncoder::new(vec![ValType {
+                BTreeKeyEncoder::new(vec![ValType {
                     kind: ValKind::I32,
                     nullable: false,
                 }]),
-            };
+            );
             let guarded = index.bind(&pool_guard);
             for key in 1..=5 {
                 assert!(
@@ -783,15 +557,15 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let index = UniqueMemIndex {
-                tree: BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
+            let index = UniqueMemIndex::with_encoder(
+                BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
                     .await
                     .expect("test btree construction should succeed"),
-                encoder: BTreeKeyEncoder::new(vec![ValType {
+                BTreeKeyEncoder::new(vec![ValType {
                     kind: ValKind::I32,
                     nullable: false,
                 }]),
-            };
+            );
             let key = vec![Val::from(42i32)];
             let row_id = 100u64;
             let guarded = index.bind(&pool_guard);
@@ -879,15 +653,15 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let index = UniqueMemIndex {
-                tree: BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
+            let index = UniqueMemIndex::with_encoder(
+                BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
                     .await
                     .expect("test btree construction should succeed"),
-                encoder: BTreeKeyEncoder::new(vec![ValType {
+                BTreeKeyEncoder::new(vec![ValType {
                     kind: ValKind::I32,
                     nullable: false,
                 }]),
-            };
+            );
             let guarded = index.bind(&pool_guard);
 
             let cold_live_key = vec![Val::from(1i32)];
