@@ -11,8 +11,9 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    ColumnBlockIndex, ColumnLeafEntry, IndexCompareExchange, IndexInsert, NonUniqueIndex,
-    NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
+    ColumnBlockIndex, ColumnLeafEntry, IndexCompareExchange, IndexInsert, IndexRowIdStream,
+    NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex,
+    UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::PersistedLwcBlock;
@@ -2237,21 +2238,20 @@ impl<'a> UserTableAccessor<'a> {
                     .zip(user_read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        // todo: support batching, streaming and sorting.
-        let mut row_ids = vec![];
         let root = self.read_proof_secondary_root(rt, index_no)?;
-        self.require_non_unique_index(rt.pool_guards(), index_no, root)?
-            .lookup(key_vals, &mut row_ids, rt.sts())
-            .await?;
         let mut res = vec![];
-        for row_id in row_ids {
-            match self
-                .index_lookup_unique_row_mvcc(rt, index_no, key_vals, user_read_set, row_id)
-                .await?
-            {
-                SelectMvcc::NotFound => (),
-                SelectMvcc::Found(vals) => {
-                    res.push(vals);
+        let index = self.require_non_unique_index(rt.pool_guards(), index_no, root)?;
+        let mut stream = index.equal_scan_row_ids(key_vals, rt.sts())?;
+        while let Some(row_ids) = stream.next_batch().await? {
+            for row_id in row_ids {
+                match self
+                    .index_lookup_unique_row_mvcc(rt, index_no, key_vals, user_read_set, row_id)
+                    .await?
+                {
+                    SelectMvcc::NotFound => (),
+                    SelectMvcc::Found(vals) => {
+                        res.push(vals);
+                    }
                 }
             }
         }

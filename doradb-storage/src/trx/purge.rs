@@ -1114,7 +1114,9 @@ mod tests {
     use crate::engine::Engine;
     use crate::error::{FatalError, Result};
     use crate::id::{BlockID, RowID, TableID};
-    use crate::index::{IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex};
+    use crate::index::{
+        IndexCompareExchange, IndexInsert, IndexRowIdStream, RowLocation, UniqueIndex,
+    };
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::{DeleteMvcc, SelectKey};
@@ -1125,6 +1127,7 @@ mod tests {
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus};
     use crate::value::Val;
     use smol::Timer;
+    use std::ops::{Bound, RangeBounds};
     use std::sync::Arc;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
@@ -1145,6 +1148,77 @@ mod tests {
         table.file().active_root_unchecked().secondary_index_roots[index_no]
     }
 
+    type OwnedValueBound = Bound<Vec<Val>>;
+    type OwnedValueRange = (OwnedValueBound, OwnedValueBound);
+
+    #[inline]
+    fn owned_bound_from_ref(bound: Bound<&[Val]>) -> OwnedValueBound {
+        match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(vals) => Bound::Included(vals.to_vec()),
+            Bound::Excluded(vals) => Bound::Excluded(vals.to_vec()),
+        }
+    }
+
+    #[inline]
+    fn owned_bound_as_ref(bound: &OwnedValueBound) -> Bound<&[Val]> {
+        match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(vals) => Bound::Included(vals.as_slice()),
+            Bound::Excluded(vals) => Bound::Excluded(vals.as_slice()),
+        }
+    }
+
+    #[inline]
+    fn value_slice_bound<'r>(bound: Bound<&&'r [Val]>) -> Bound<&'r [Val]> {
+        bound.map(|vals| *vals)
+    }
+
+    #[inline]
+    fn owned_range_from_ref<'r, R>(range: &R) -> OwnedValueRange
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        (
+            owned_bound_from_ref(value_slice_bound(range.start_bound())),
+            owned_bound_from_ref(value_slice_bound(range.end_bound())),
+        )
+    }
+
+    #[inline]
+    fn owned_range_as_ref(range: &OwnedValueRange) -> (Bound<&[Val]>, Bound<&[Val]>) {
+        (owned_bound_as_ref(&range.0), owned_bound_as_ref(&range.1))
+    }
+
+    struct BoundUniqueIndexRowIdStream<'a> {
+        table: &'a Table,
+        guards: &'a PoolGuards,
+        index_no: usize,
+        root: BlockID,
+        range: OwnedValueRange,
+        ts: TrxID,
+        done: bool,
+    }
+
+    impl IndexRowIdStream for BoundUniqueIndexRowIdStream<'_> {
+        #[inline]
+        async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
+            if self.done {
+                return Ok(None);
+            }
+            self.done = true;
+            let layout = self.table.layout_snapshot();
+            let index = layout.secondary_index(self.index_no)?;
+            let bound = index.bind_unique(self.guards, self.root)?;
+            let mut stream = bound.scan_row_ids(owned_range_as_ref(&self.range), self.ts)?;
+            let mut row_ids = Vec::new();
+            while let Some(batch) = stream.next_batch().await? {
+                row_ids.extend(batch);
+            }
+            Ok((!row_ids.is_empty()).then_some(row_ids))
+        }
+    }
+
     struct BoundUniqueIndexNo<'a> {
         table: &'a Table,
         guards: &'a PoolGuards,
@@ -1153,6 +1227,11 @@ mod tests {
     }
 
     impl UniqueIndex for BoundUniqueIndexNo<'_> {
+        type RowIdStream<'a>
+            = BoundUniqueIndexRowIdStream<'a>
+        where
+            Self: 'a;
+
         #[inline]
         async fn lookup(&self, key: &[Val], ts: TrxID) -> Result<Option<(RowID, bool)>> {
             let layout = self.table.layout_snapshot();
@@ -1209,6 +1288,22 @@ mod tests {
                 .bind_unique(self.guards, self.root)?
                 .compare_exchange(key, old_row_id, new_row_id, ts)
                 .await
+        }
+
+        #[inline]
+        fn scan_row_ids<'a, 'r, R>(&'a self, range: R, ts: TrxID) -> Result<Self::RowIdStream<'a>>
+        where
+            R: RangeBounds<&'r [Val]> + Clone,
+        {
+            Ok(BoundUniqueIndexRowIdStream {
+                table: self.table,
+                guards: self.guards,
+                index_no: self.index_no,
+                root: self.root,
+                range: owned_range_from_ref(&range),
+                ts,
+                done: false,
+            })
         }
 
         #[inline]

@@ -1,11 +1,58 @@
+use crate::id::RowID;
+use crate::index::util::Maskable;
 use crate::memcmp::{
     MemCmpFormat, MemCmpKey, NormalBytes, Null, Nullable, NullableMemCmpFormat, SegmentedBytes,
 };
 use crate::value::{Val, ValKind, ValType};
 use std::borrow::Borrow;
+use std::ops::{Bound, RangeBounds};
 
 /// Memory-comparable encoded key used by B-tree nodes.
 pub(crate) type BTreeKey = MemCmpKey;
+
+/// Owned encoded key range used by B-tree scan streams.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct KeyRange {
+    lower: Bound<BTreeKey>,
+    upper: Bound<BTreeKey>,
+}
+
+impl KeyRange {
+    /// Create an encoded range from owned lower and upper bounds.
+    #[inline]
+    pub(crate) fn new(lower: Bound<BTreeKey>, upper: Bound<BTreeKey>) -> Self {
+        Self { lower, upper }
+    }
+
+    /// Key bytes to seek before testing entries against the full range.
+    #[inline]
+    pub(crate) fn lower_seek_key(&self) -> &[u8] {
+        match &self.lower {
+            Bound::Unbounded => &[],
+            Bound::Included(key) | Bound::Excluded(key) => key.as_bytes(),
+        }
+    }
+
+    /// Return whether an encoded entry key satisfies the lower bound.
+    #[inline]
+    pub(crate) fn lower_accepts(&self, key: &[u8]) -> bool {
+        match &self.lower {
+            Bound::Unbounded => true,
+            Bound::Included(bound) => key >= bound.as_bytes(),
+            Bound::Excluded(bound) => key > bound.as_bytes(),
+        }
+    }
+
+    /// Return whether an encoded entry key satisfies the upper bound.
+    #[inline]
+    pub(crate) fn upper_accepts(&self, key: &[u8]) -> bool {
+        match &self.upper {
+            Bound::Unbounded => true,
+            Bound::Included(bound) => key <= bound.as_bytes(),
+            Bound::Excluded(bound) => key < bound.as_bytes(),
+        }
+    }
+}
 
 trait KeyEncoder {
     /// Returns estimated encoded length.
@@ -243,6 +290,18 @@ impl BTreeKeyEncoder {
         }
     }
 
+    /// Encode a logical-key range into an owned B-tree key range.
+    #[inline]
+    pub(crate) fn encode_range<'r, R>(&self, range: R) -> KeyRange
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        KeyRange::new(
+            range.start_bound().map(|key| self.encode(key)),
+            range.end_bound().map(|key| self.encode(key)),
+        )
+    }
+
     /// Encode partial key as a prefix.
     /// An optional suffix key length is provided to speed up the
     /// encoding.
@@ -276,6 +335,61 @@ impl BTreeKeyEncoder {
             BTreeKeyEncoder::Multi(e) => e.encode_pair(prefix_key, suffix_key),
         }
     }
+
+    /// Encode a non-unique logical-key range into owned exact-key bounds.
+    #[inline]
+    pub(crate) fn encode_non_unique_range<'r, R>(&self, range: R) -> KeyRange
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        let lower = match range.start_bound() {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(key) => Bound::Included(self.encode_non_unique_lower_bound(key, true)),
+            Bound::Excluded(key) => Bound::Excluded(self.encode_non_unique_lower_bound(key, false)),
+        };
+        let upper = match range.end_bound() {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(key) => Bound::Included(self.encode_non_unique_upper_bound(key, true)),
+            Bound::Excluded(key) => Bound::Excluded(self.encode_non_unique_upper_bound(key, false)),
+        };
+        KeyRange::new(lower, upper)
+    }
+
+    /// Encode a non-unique logical-key equality scan into owned exact-key bounds.
+    #[inline]
+    pub(crate) fn encode_non_unique_equal_range(&self, key: &[Val]) -> KeyRange {
+        self.encode_non_unique_range(key..=key)
+    }
+
+    #[inline]
+    fn encode_non_unique_lower_bound(&self, key: &[Val], included: bool) -> BTreeKey {
+        let row_id = if included {
+            min_row_id_sentinel()
+        } else {
+            max_row_id_sentinel()
+        };
+        self.encode_pair(key, Val::from(row_id))
+    }
+
+    #[inline]
+    fn encode_non_unique_upper_bound(&self, key: &[Val], included: bool) -> BTreeKey {
+        let row_id = if included {
+            max_row_id_sentinel()
+        } else {
+            min_row_id_sentinel()
+        };
+        self.encode_pair(key, Val::from(row_id))
+    }
+}
+
+#[inline]
+fn min_row_id_sentinel() -> RowID {
+    RowID::new(0)
+}
+
+#[inline]
+fn max_row_id_sentinel() -> RowID {
+    RowID::MAX.value()
 }
 
 /// Encoder for composite memory-comparable keys.

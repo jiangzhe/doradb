@@ -3,23 +3,34 @@ use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
 use crate::error::{Error, InternalError, Result};
 use crate::id::{RowID, TrxID};
-use crate::index::IndexInsert;
-use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::BTreeNodeCursor;
 use crate::index::btree::BTreeSlotCallback;
 use crate::index::btree::{BTREE_BYTE_ZERO, BTreeByte, BTreeU64};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
+use crate::index::btree::{BTreeKeyEncoder, KeyRange};
 use crate::index::btree::{BTreeNode, BTreeSlot};
 use crate::index::util::Maskable;
+use crate::index::{IndexInsert, IndexRowIdStream};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::mem;
+use std::ops::RangeBounds;
 
 /// Abstraction of non-unique index.
 pub(crate) trait NonUniqueIndex: Send + Sync {
+    /// Row-id stream returned by bounded non-unique-index scans.
+    type RowIdStream<'a>: IndexRowIdStream + 'a
+    where
+        Self: 'a;
+
     /// Lookup key and put associated values into given collection.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "legacy eager non-unique lookup")
+    )]
     fn lookup(
         &self,
         key: &[Val],
@@ -76,6 +87,18 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
     /// Scan values into given collection.
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
     fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = Result<()>>;
+
+    /// Scan candidate row ids over a bounded logical-key range.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved non-unique row-id range stream")
+    )]
+    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    where
+        R: RangeBounds<&'r [Val]> + Clone;
+
+    /// Scan candidate row ids equal to one logical secondary key.
+    fn equal_scan_row_ids<'a>(&'a self, key: &[Val], ts: TrxID) -> Result<Self::RowIdStream<'a>>;
 }
 
 /// Generic non-unique-index implementation backed by a generic B-Tree.
@@ -291,9 +314,45 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
     pub(crate) async fn scan_encoded_entries(&self) -> Result<Vec<NonUniqueMemIndexEntry>> {
         self.index.scan_encoded_entries(self.pool_guard).await
     }
+
+    /// Create a bounded encoded-entry stream over this MemIndex view.
+    #[inline]
+    pub(crate) fn scan_encoded_entry_stream<'a, 'r, R>(
+        &'a self,
+        range: R,
+    ) -> Result<NonUniqueMemIndexEntryStream<'a, P>>
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        let range = self.index.encoder.encode_non_unique_range(range);
+        Ok(NonUniqueMemIndexEntryStream::new(
+            &self.index.tree,
+            self.pool_guard,
+            range,
+        ))
+    }
+
+    /// Create an equality encoded-entry stream over this MemIndex view.
+    #[inline]
+    pub(crate) fn equal_scan_encoded_entry_stream<'a>(
+        &'a self,
+        key: &[Val],
+    ) -> Result<NonUniqueMemIndexEntryStream<'a, P>> {
+        let range = self.index.encoder.encode_non_unique_equal_range(key);
+        Ok(NonUniqueMemIndexEntryStream::new(
+            &self.index.tree,
+            self.pool_guard,
+            range,
+        ))
+    }
 }
 
 impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
+    type RowIdStream<'a>
+        = NonUniqueMemIndexRowIdStream<'a, P>
+    where
+        Self: 'a;
+
     #[inline]
     async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
         let k = self
@@ -423,6 +482,29 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
+    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, _ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    where
+        R: RangeBounds<&'r [Val]> + Clone,
+    {
+        let range = self.index.encoder.encode_non_unique_range(range);
+        Ok(NonUniqueMemIndexRowIdStream::new(
+            &self.index.tree,
+            self.pool_guard,
+            range,
+        ))
+    }
+
+    #[inline]
+    fn equal_scan_row_ids<'a>(&'a self, key: &[Val], _ts: TrxID) -> Result<Self::RowIdStream<'a>> {
+        let range = self.index.encoder.encode_non_unique_equal_range(key);
+        Ok(NonUniqueMemIndexRowIdStream::new(
+            &self.index.tree,
+            self.pool_guard,
+            range,
+        ))
+    }
+
+    #[inline]
     async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
         let mut cursor = self.index.tree.cursor(self.pool_guard, 0);
         cursor.seek(&[]).await?;
@@ -446,6 +528,154 @@ pub(crate) struct NonUniqueMemIndexEntry {
     pub(crate) row_id: RowID,
     /// Whether the exact entry is delete-marked in MemIndex.
     pub(crate) deleted: bool,
+}
+
+/// Projector used by non-unique MemIndex scan streams.
+pub(crate) trait NonUniqueMemIndexScanProjector {
+    /// Output item produced for each accepted slot.
+    type Output;
+
+    /// Project one accepted slot into an output item.
+    fn project(
+        node: &BTreeNode,
+        slot: &BTreeSlot,
+        slot_idx: usize,
+        encoded_key: Vec<u8>,
+    ) -> Result<Option<Self::Output>>;
+}
+
+/// Project accepted non-unique MemIndex slots into encoded exact entries.
+pub(crate) struct NonUniqueEntryProjector;
+
+impl NonUniqueMemIndexScanProjector for NonUniqueEntryProjector {
+    type Output = NonUniqueMemIndexEntry;
+
+    #[inline]
+    fn project(
+        node: &BTreeNode,
+        slot: &BTreeSlot,
+        _slot_idx: usize,
+        encoded_key: Vec<u8>,
+    ) -> Result<Option<Self::Output>> {
+        let value = node.value_for_slot::<BTreeByte>(slot);
+        let row_id = node.unpack_value::<BTreeU64>(slot).to_row_id();
+        Ok(Some(NonUniqueMemIndexEntry {
+            encoded_key,
+            row_id,
+            deleted: value.is_deleted(),
+        }))
+    }
+}
+
+/// Project accepted non-unique MemIndex slots into live row ids.
+pub(crate) struct NonUniqueRowIdProjector;
+
+impl NonUniqueMemIndexScanProjector for NonUniqueRowIdProjector {
+    type Output = RowID;
+
+    #[inline]
+    fn project(
+        node: &BTreeNode,
+        slot: &BTreeSlot,
+        _slot_idx: usize,
+        _encoded_key: Vec<u8>,
+    ) -> Result<Option<Self::Output>> {
+        let value = node.value_for_slot::<BTreeByte>(slot);
+        if value.is_deleted() {
+            return Ok(None);
+        }
+        Ok(Some(node.unpack_value::<BTreeU64>(slot).to_row_id()))
+    }
+}
+
+/// Generic leaf-bounded stream over non-unique MemIndex slots.
+pub(crate) struct NonUniqueMemIndexScanStream<'a, P: 'static, F> {
+    cursor: BTreeNodeCursor<'a, P>,
+    range: KeyRange,
+    started: bool,
+    exhausted: bool,
+    _projector: PhantomData<F>,
+}
+
+impl<'a, P, F> NonUniqueMemIndexScanStream<'a, P, F>
+where
+    P: BufferPool,
+    F: NonUniqueMemIndexScanProjector,
+{
+    #[inline]
+    fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, range: KeyRange) -> Self {
+        Self {
+            cursor: tree.cursor(pool_guard, 0),
+            range,
+            started: false,
+            exhausted: false,
+            _projector: PhantomData,
+        }
+    }
+
+    /// Return the next leaf-bounded projected batch.
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<Vec<F::Output>>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        if !self.started {
+            self.cursor.seek(self.range.lower_seek_key()).await?;
+            self.started = true;
+        }
+        while let Some(guard) = self.cursor.next().await? {
+            let node = guard.page();
+            let mut outputs = Vec::new();
+            for idx in node.lower_bound_slot_idx(self.range.lower_seek_key())..node.count() {
+                let slot = node.slot(idx);
+                let encoded_key = node.key_checked(idx).ok_or_else(|| {
+                    Error::from(
+                        Report::new(InternalError::IndexKeyMissing)
+                            .attach(format!("slot_idx={idx}")),
+                    )
+                })?;
+                if !self.range.lower_accepts(&encoded_key) {
+                    continue;
+                }
+                if !self.range.upper_accepts(&encoded_key) {
+                    self.exhausted = true;
+                    break;
+                }
+                if encoded_key.len() < mem::size_of::<RowID>() {
+                    return Err(Report::new(InternalError::MemIndexKeyMalformed)
+                        .attach(format!("slot_idx={idx}, key_len={}", encoded_key.len()))
+                        .into());
+                }
+                if let Some(output) = F::project(node, slot, idx, encoded_key)? {
+                    outputs.push(output);
+                }
+            }
+            if !outputs.is_empty() {
+                return Ok(Some(outputs));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+        }
+        self.exhausted = true;
+        Ok(None)
+    }
+}
+
+/// Leaf-bounded stream of encoded non-unique MemIndex entries.
+pub(crate) type NonUniqueMemIndexEntryStream<'a, P> =
+    NonUniqueMemIndexScanStream<'a, P, NonUniqueEntryProjector>;
+
+/// Row-id stream over live non-unique MemIndex entries.
+pub(crate) type NonUniqueMemIndexRowIdStream<'a, P> =
+    NonUniqueMemIndexScanStream<'a, P, NonUniqueRowIdProjector>;
+
+impl<P: BufferPool> IndexRowIdStream
+    for NonUniqueMemIndexScanStream<'_, P, NonUniqueRowIdProjector>
+{
+    #[inline]
+    async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
+        NonUniqueMemIndexScanStream::next_batch(self).await
+    }
 }
 
 /// Bounded batch of non-unique MemIndex entries selected for cleanup.
@@ -590,6 +820,14 @@ mod tests {
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
 
+    async fn drain_row_ids<S: IndexRowIdStream>(stream: &mut S) -> Vec<RowID> {
+        let mut row_ids = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            row_ids.extend(batch);
+        }
+        row_ids
+    }
+
     #[test]
     fn test_non_unique_index() {
         smol::block_on(async {
@@ -616,6 +854,66 @@ mod tests {
                 };
                 run_test_suit_for_non_unique_index(index.bind(&pool_guard)).await;
             }
+        })
+    }
+
+    #[test]
+    fn test_non_unique_mem_index_row_id_stream_prefix_and_range() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let index = NonUniqueMemIndex {
+                tree: BTree::new(pool.guard(), &pool_guard, true, TrxID::new(100))
+                    .await
+                    .expect("test btree construction should succeed"),
+                encoder: BTreeKeyEncoder::new(vec![
+                    ValType {
+                        kind: ValKind::I32,
+                        nullable: false,
+                    },
+                    ValType {
+                        kind: ValKind::U64,
+                        nullable: false,
+                    },
+                ]),
+            };
+            let guarded = index.bind(&pool_guard);
+            let key1 = [Val::from(1i32)];
+            let key2 = [Val::from(2i32)];
+            let key3 = [Val::from(3i32)];
+            for (key, row_id) in [
+                (&key1[..], RowID::new(10)),
+                (&key1[..], RowID::new(11)),
+                (&key2[..], RowID::new(20)),
+                (&key3[..], RowID::new(30)),
+            ] {
+                assert!(
+                    guarded
+                        .insert_if_not_exists(key, row_id, false, TrxID::new(100))
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+            }
+            assert!(
+                guarded
+                    .mask_as_deleted(&key1, RowID::new(11), TrxID::new(101))
+                    .await
+                    .unwrap()
+            );
+
+            let mut equal = guarded.equal_scan_row_ids(&key1, TrxID::new(102)).unwrap();
+            assert_eq!(drain_row_ids(&mut equal).await, vec![RowID::new(10)]);
+
+            let mut range = guarded
+                .scan_row_ids(&key1[..]..&key3[..], TrxID::new(103))
+                .unwrap();
+            assert_eq!(
+                drain_row_ids(&mut range).await,
+                vec![RowID::new(10), RowID::new(20)]
+            );
         })
     }
 

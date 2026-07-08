@@ -10,18 +10,43 @@ mod secondary_index;
 mod unique_index;
 pub(crate) mod util;
 
-pub(crate) use block_index::*;
-pub(crate) use btree::*;
-pub(crate) use column_block_index::*;
+use crate::error::Result;
+use crate::id::RowID;
+use std::future::Future;
+
+pub(crate) use block_index::BlockIndex;
+#[cfg(test)]
+pub(crate) use btree::BTreeNode;
+pub(crate) use btree::{BTreeKey, BTreeKeyEncoder};
+#[cfg(test)]
+pub(crate) use column_block_index::{
+    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
+    ColumnBlockNodeHeader, validate_persisted_column_block_index_page,
+};
+pub(crate) use column_block_index::{
+    ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry,
+    ResolvedColumnRow,
+};
 #[cfg(test)]
 pub(crate) use column_deletion_blob::{
     COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, validate_persisted_blob_page,
 };
-pub(crate) use non_unique_index::*;
-pub(crate) use row_page_index::*;
-pub(crate) use secondary_index::{
-    InMemorySecondaryIndex, SecondaryDiskTreeRuntime, SecondaryIndex,
+pub(crate) use non_unique_index::{
+    GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry,
 };
-pub(crate) use secondary_index::{IndexCompareExchange, IndexInsert};
-pub(crate) use secondary_index::{NonUniqueSecondaryIndex, UniqueSecondaryIndex};
-pub(crate) use unique_index::*;
+pub(crate) use row_page_index::RowLocation;
+#[cfg(test)]
+pub(crate) use row_page_index::RowPageIndexNode;
+pub(crate) use secondary_index::{
+    InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueSecondaryIndex,
+    SecondaryDiskTreeRuntime, SecondaryIndex, UniqueSecondaryIndex,
+};
+pub(crate) use unique_index::{
+    GuardedUniqueMemIndex, UniqueIndex, UniqueMemIndex, UniqueMemIndexEntry,
+};
+
+/// Async candidate row-id stream returned by secondary indexes.
+pub(crate) trait IndexRowIdStream {
+    /// Return the next non-empty row-id batch, or `None` when exhausted.
+    fn next_batch(&mut self) -> impl Future<Output = Result<Option<Vec<RowID>>>>;
+}
