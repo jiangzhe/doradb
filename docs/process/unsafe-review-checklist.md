@@ -17,7 +17,7 @@ git config core.hooksPath .githooks
 Hook behavior (`.githooks/pre-commit`):
 - Always run:
   - `cargo fmt` (commit blocked if it changes files)
-  - `cargo clippy -p doradb-storage --all-targets -- -D warnings` (commit blocked on any warning; production crate roots carry `clippy::undocumented_unsafe_blocks` via crate-level lint attributes)
+  - `cargo clippy --workspace --all-targets -- -D warnings` (commit blocked on any warning; production crate roots carry `clippy::undocumented_unsafe_blocks` via crate-level lint attributes)
 - Precondition: staged files include any path in
   `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}`,
   `tools/unsafe_inventory.rs`, or `docs/unsafe-usage-baseline.md`.
@@ -49,6 +49,6 @@ Hook behavior (`.githooks/pre-commit`):
 
 5. Validation
    - [ ] Clippy safety-comment enforcement passes:
-         `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+         `cargo clippy --workspace --all-targets -- -D warnings`
    - [ ] Behavior-preserving tests pass:
-         `cargo nextest run -p doradb-storage`
+         `cargo nextest run --workspace`

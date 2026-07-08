@@ -8,7 +8,7 @@ For the storage-engine owner/runtime split, component registration order,
 shutdown sequencing, and guard-lifetime rules, see
 [Engine Component Lifetime](./engine-component-lifetime.md).
 
-The storage has three data formats:
+The storage has two data formats:
 
 1. In-memory row pages.
 
@@ -21,13 +21,10 @@ LWC(LightWeight Columnar) blocks on disk store warm data for persistence.
 This kind of blocks apply lightweight columnar compression, such as bitpacking and dict, to support both fast scan and random access. 
 Updates are converted to delete mask + insert. So there are also delete bitmaps stored accordingly.
 
-3. Column blocks on disk(optional).
+It has two indexes:
 
-Column blocks on disk store cold data with columnar encoding.
-They are transformed by background task to speed up analytical queries.
-If the engine is used as a local storage, columnar encoding is preferred.
-If the engine is used as an ingestion and query node, integration with object store is preferred.
-So let's see what it can be in future.
+1. Block index: Maps logical **RowID** to physical location.
+2. B+Tree index: Maps user key to **RowID**.
 
 ![doradb-storage-architecture](./images/doradb-storage-architecture.png)
 
@@ -154,104 +151,3 @@ tables' `heap_redo_start_ts` values, and loaded tables' `deletion_cutoff_ts`
 values.
 
 For more details, see [Checkpoint and Recovery](./checkpoint-and-recovery.md).
-
-## Process Flow
-
-### Point Select
-
-```mermaid
----
-title: Point Select
----
-flowchart TD
-    A[Begin]
-    A --> B[Lookup secondary index to get row id]
-    B --> C[Lookup block index to get row location]
-    C --> D[Read row page or LWC block]
-    D --> E[Visibility check]
-    E --> F[Return]
-```
-
-### Analytical Scan
-
-```mermaid
----
-title: Analytical Scan
----
-flowchart TD
-    A[Begin]
-    A --> B[Scan block index]
-    B --> C[Scan row pages]
-    C --> D[Version chain check]
-    B --> E[Scan LWC pages on disk]
-    E --> F[Merge delete bitmap and version]
-    B --> G[Pre-filter on column statistics]
-    G --> H[Scan column pages on disk]
-    H --> I[Merge delete bitmap and version]
-    D --> J[Aggregate and return]
-    F --> J
-    I --> J
-```
-
-### Point Insert
-
-```mermaid
----
-title: Insert
----
-flowchart TD
-    A[Begin]
-    A --> B[Acquire free row page]
-    B --> C[Write row]
-    C --> D[Insert secondary index]
-    D --> E[Return]
-```
-
-### Update Hot
-
-```mermaid
----
-title: Update Hot
----
-flowchart TD
-    A[Begin]
-    A --> B[Lookup secondary index]
-    B --> C[Lookup block index to get row location]
-    C --> D[Modify row page and append version chain]
-    D --> E[Update secondary index if needed]
-    E --> F[Return]
-```
-
-### Update Cold
-
-```mermaid
----
-title: Update Cold
----
-flowchart TD
-    A[Begin]
-    A --> B[Lookup secondary index]
-    B --> C[Lookup block index to get row location]
-    C --> D[Read bitmap page, LWC/column page]
-    D --> E[Apply mark and version to bitmap page]
-    E --> F[Copy old row and modify]
-    F --> G[Acquire free row page]
-    G --> H[Insert new row to row page]
-    H --> I[Update or insert secondary index]
-    I --> J[Return]
-```
-
-### Batch Insert
-
-```mermaid
----
-title: Batch Insert
----
-flowchart TD
-    A[Begin transaction]
-    A --> B[Lock table]
-    B --> C[Convert all row pages to LWC pages]
-    C --> D[Insert new data to LWC pages, bypass version chain]
-    D --> E[Insert secondary index]
-    E --> F[Commit transaction]
-```

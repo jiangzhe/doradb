@@ -8,7 +8,7 @@ document is the source of truth for intended behavior when one exists.
 - [ ] Compare the tests against the task document and confirm the specified
       behavior, edge cases, and failure modes are covered.
 - [ ] Run the normal validation pass:
-      `cargo nextest run -p doradb-storage`.
+      `cargo nextest run --workspace`.
 - [ ] Run focused coverage for changed code with:
       `tools/coverage_focus.rs --path <path/to/file/or/dir>` or repeated
       `--path` flags for multiple changed paths.

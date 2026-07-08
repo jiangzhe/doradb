@@ -18,7 +18,7 @@ The storage engine is designed as a hybrid engine managing both in-memory row st
 
 The snippets below assume an async function returning `doradb_storage::Result<()>`.
 DoraDB is runtime agnostic, so you can run these futures on whichever async runtime your application already uses.
-For a complete runnable version, see [quick_start.rs](./doradb-storage/examples/quick_start.rs) or run `cargo run -p doradb-storage --example quick_start`.
+For a complete runnable version, see [quick_start.rs](./doradb-storage/examples/quick_start.rs) or run `cargo run --example quick_start`.
 
 Create a table with a schema and indexes, then drop it from an idle session.
 

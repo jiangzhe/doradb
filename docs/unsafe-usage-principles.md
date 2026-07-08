@@ -37,7 +37,7 @@ enforced in active production crate roots with:
 Routine validation uses:
 
 ```bash
-cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Any new production target crate that should carry the same policy must add the
@@ -59,8 +59,8 @@ For unsafe-touching changes:
 2. refresh baseline inventory:
    - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
 3. run behavior-preserving tests:
-   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
-   - `cargo nextest run -p doradb-storage`
+   - `cargo clippy --workspace --all-targets -- -D warnings`
+   - `cargo nextest run --workspace`
 
 ## 5. Planning Compliance
 
