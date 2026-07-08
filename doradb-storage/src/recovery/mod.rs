@@ -1219,7 +1219,7 @@ mod tests {
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
         IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
-        USER_OBJ_ID_START,
+        USER_TABLE_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1966,7 +1966,7 @@ mod tests {
             deletion_cutoff_ts: TrxID::new(9),
         };
         validate_create_table_reloaded_root_ts(
-            USER_OBJ_ID_START,
+            USER_TABLE_ID_START,
             TrxID::new(10),
             root_before_create,
             false,
@@ -1979,7 +1979,7 @@ mod tests {
             deletion_cutoff_ts: TrxID::new(10),
         };
         let err = validate_create_table_reloaded_root_ts(
-            USER_OBJ_ID_START,
+            USER_TABLE_ID_START,
             TrxID::new(10),
             pending_without_later_root,
             true,
@@ -1999,7 +1999,7 @@ mod tests {
             deletion_cutoff_ts: TrxID::new(10),
         };
         validate_create_table_reloaded_root_ts(
-            USER_OBJ_ID_START,
+            USER_TABLE_ID_START,
             TrxID::new(10),
             pending_with_later_root,
             true,
@@ -2018,7 +2018,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-            let unknown_table_id = USER_OBJ_ID_START + 142;
+            let unknown_table_id = USER_TABLE_ID_START + 142;
             let mut recovery = log_recovery_for_engine(&engine, TrxID::new(10));
 
             recovery
@@ -2058,7 +2058,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-            let unknown_table_id = USER_OBJ_ID_START + 143;
+            let unknown_table_id = USER_TABLE_ID_START + 143;
 
             let mut dml_recovery = log_recovery_for_engine(&engine, TrxID::new(10));
             let err = dml_recovery

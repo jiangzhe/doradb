@@ -1358,7 +1358,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::page::Page;
     use crate::buffer::test_page_id;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_TABLE_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{CompletionErrorKind, Error, FileKind, LifecycleError, ResourceError};
     use crate::file::block_integrity::{
@@ -2278,7 +2278,7 @@ pub(crate) mod tests {
         let global = owned_global_pool(64 * 1024 * 1024);
         let global_guard = (*global).pool_guard();
         let catalog_key = BlockKey::new(CATALOG_MTB_FILE_ID, test_block_id(42));
-        let user_key = BlockKey::new(FileID::from(USER_OBJ_ID_START), test_block_id(42));
+        let user_key = BlockKey::new(FileID::from(USER_TABLE_ID_START), test_block_id(42));
 
         let mut catalog_frame = global
             .try_lock_page_exclusive(&global_guard, test_page_id(1))

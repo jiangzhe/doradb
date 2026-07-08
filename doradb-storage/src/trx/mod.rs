@@ -2518,7 +2518,7 @@ pub(crate) mod tests {
     /// Add one redo log entry for tests that need a non-readonly transaction.
     #[inline]
     pub(crate) fn add_pseudo_redo_log_entry(trx: &mut Transaction) {
-        use crate::catalog::USER_OBJ_ID_START;
+        use crate::catalog::USER_TABLE_ID_START;
 
         static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
         static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
@@ -2527,7 +2527,7 @@ pub(crate) mod tests {
             // Simulate one sysbench record:
             // uint64 + int32 + int32 + char(60) + char(120)
             inner.redo_mut().insert_dml(
-                USER_OBJ_ID_START,
+                USER_TABLE_ID_START,
                 RowRedo {
                     page_id: PageID::new(0),
                     row_id: RowID::new(0),

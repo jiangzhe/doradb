@@ -271,7 +271,7 @@ checkpointed cold secondary-index state.
 Startup also removes leftover deterministic user-table files when all of these
 conditions are true:
 
-- the file name decodes to a user table id
+- the file name decodes to a low-half user table id
 - the id is below checkpointed `next_table_id`
 - the id is absent from the checkpointed catalog table list
 

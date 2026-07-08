@@ -1681,6 +1681,7 @@ fn validate_primary_key_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::{
         CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
         IndexSpec, TableSpec,
@@ -1689,7 +1690,7 @@ mod tests {
         CompletionErrorKind, ConfigError, Error, ErrorKind, FatalError, InternalError,
         OperationError,
     };
-    use crate::id::{SessionID, TableID, TrxID};
+    use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
     use crate::lock::tests::{LockDebugEntryState, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockOwnerGroup, LockResource};
@@ -3124,7 +3125,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
 
-            let err = session.drop_table(TableID::new(0)).await.unwrap_err();
+            let err = session.drop_table(TABLE_ID_TABLES).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
 
             let missing_user_table_id = table_id + 1000;

@@ -703,6 +703,7 @@ impl Drop for Statement<'_> {
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::PoolRole;
+    use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, InternalError, OperationError};
@@ -890,7 +891,7 @@ pub(crate) mod tests {
             let catalog_table = engine
                 .catalog()
                 .storage
-                .get_catalog_table(TableID::new(0))
+                .get_catalog_table(TABLE_ID_TABLES)
                 .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();

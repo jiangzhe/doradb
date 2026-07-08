@@ -1487,7 +1487,7 @@ pub(crate) mod tests {
     use crate::catalog::tests::table2;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
-        USER_OBJ_ID_START,
+        USER_TABLE_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1549,7 +1549,7 @@ pub(crate) mod tests {
 
     #[inline]
     pub(crate) fn test_user_table_id(offset: u64) -> TableID {
-        USER_OBJ_ID_START
+        USER_TABLE_ID_START
             .checked_add(offset)
             .expect("test user table id offset overflow")
     }
