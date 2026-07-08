@@ -200,7 +200,7 @@ impl Deser for MultiTableMetaBlockData {
         let (idx, next_table_id) = TableID::deser(input, start_idx)?;
         if next_table_id > USER_TABLE_ID_LIMIT {
             return Err(invalid_payload(format!(
-                "next_table_id {next_table_id} exceeds user table id limit {USER_TABLE_ID_LIMIT}"
+                "next_table_id {next_table_id} is out of user table id range (limit: {USER_TABLE_ID_LIMIT})"
             )));
         }
         let (idx, table_count) = input.deser_u32(idx)?;
