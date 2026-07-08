@@ -6,7 +6,7 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
 use crate::error::Result;
 use crate::id::TableID;
-use crate::row::ops::{DeleteMvcc, SelectKey};
+use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
 use crate::value::Val;
@@ -79,11 +79,8 @@ impl Columns<'_> {
         table_id: TableID,
         column_no: u16,
     ) -> bool {
-        let key = SelectKey::new(
-            PK_NO_COLUMNS,
-            vec![Val::from(table_id), Val::from(column_no)],
-        );
-        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
+        let key_vals = [Val::from(table_id), Val::from(column_no)];
+        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_COLUMNS, &key_vals, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }

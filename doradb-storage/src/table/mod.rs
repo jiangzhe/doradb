@@ -1,6 +1,6 @@
 mod access;
 mod deletion_buffer;
-mod dml;
+mod dml_validator;
 mod gc;
 mod hot;
 mod layout;
@@ -12,7 +12,7 @@ mod rollback;
 mod storage;
 pub(crate) use access::*;
 pub(crate) use deletion_buffer::*;
-pub(crate) use dml::*;
+pub(crate) use dml_validator::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
@@ -1600,7 +1600,8 @@ pub(crate) mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        stmt.table_delete_unique_mvcc(table_id, key, false).await
+        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+            .await
     }
 
     pub(crate) async fn stmt_update_row_by_id(
@@ -1609,7 +1610,8 @@ pub(crate) mod tests {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
-        stmt.table_update_unique_mvcc(table_id, key, update).await
+        stmt.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
+            .await
     }
 
     pub(crate) async fn stmt_select_row_mvcc_by_id(
@@ -1618,7 +1620,7 @@ pub(crate) mod tests {
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
-        stmt.table_lookup_unique_mvcc(table_id, key, user_read_set)
+        stmt.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, user_read_set)
             .await
     }
 
@@ -1974,7 +1976,8 @@ pub(crate) mod tests {
                     let key = SelectKey::new(0, vec![Val::from(1i32)]);
                     stmt.table_update_unique_mvcc(
                         table_id,
-                        &key,
+                        key.index_no,
+                        &key.vals,
                         vec![
                             UpdateCol {
                                 idx: 1,
@@ -1998,7 +2001,8 @@ pub(crate) mod tests {
             let err = trx
                 .exec(async |stmt| {
                     let key = SelectKey::new(1, vec![Val::from("old")]);
-                    stmt.table_delete_unique_mvcc(table_id, &key, false).await?;
+                    stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+                        .await?;
                     Ok(())
                 })
                 .await

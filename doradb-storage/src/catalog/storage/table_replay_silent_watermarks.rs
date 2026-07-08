@@ -6,7 +6,7 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
 use crate::error::{DataIntegrityError, Error, Result};
 use crate::id::{TableID, TrxID};
-use crate::row::ops::{DeleteMvcc, SelectKey};
+use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
 use crate::value::Val;
@@ -63,14 +63,12 @@ impl TableReplaySilentWatermarks<'_> {
         guards: &PoolGuards,
         table_id: TableID,
     ) -> Result<Option<SilentWatermarkObject>> {
-        let key = SelectKey::new(
-            PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
-            vec![Val::from(table_id)],
-        );
+        let key_vals = [Val::from(table_id)];
         self.table
             .index_lookup_unique_uncommitted(
                 guards,
-                &key,
+                PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
+                &key_vals,
                 row_to_table_replay_silent_watermark_object,
             )
             .await
@@ -105,12 +103,14 @@ impl TableReplaySilentWatermarks<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
     ) -> Result<bool> {
-        let key = SelectKey::new(
-            PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
-            vec![Val::from(table_id)],
-        );
+        let key_vals = [Val::from(table_id)];
         let res = stmt
-            .catalog_delete_primary_key_mvcc(self.table, &key, true)
+            .catalog_delete_primary_key_mvcc(
+                self.table,
+                PK_NO_TABLE_REPLAY_SILENT_WATERMARKS,
+                &key_vals,
+                true,
+            )
             .await?;
         Ok(matches!(res, DeleteMvcc::Deleted))
     }

@@ -346,7 +346,14 @@ impl TransactionSystem {
                                 continue;
                             };
                             if table
-                                .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                                .delete_index(
+                                    guards,
+                                    ip.key.index_no,
+                                    &ip.key.vals,
+                                    ip.row_id,
+                                    ip.unique,
+                                    min_active_sts,
+                                )
                                 .await?
                             {
                                 purge_index_count += 1;
@@ -1242,7 +1249,8 @@ mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        stmt.table_delete_unique_mvcc(table_id, key, false).await
+        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+            .await
     }
 
     #[inline]

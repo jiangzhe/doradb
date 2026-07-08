@@ -61,12 +61,9 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let selected = trx
                 .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(
-                        table_id,
-                        &SelectKey::new(0, vec![Val::I32(1)]),
-                        &[0, 1],
-                    )
-                    .await
+                    let key = SelectKey::new(0, vec![Val::I32(1)]);
+                    stmt.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                        .await
                 })
                 .await
                 .unwrap();
@@ -79,9 +76,11 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let updated = trx
                 .exec(async |stmt| {
+                    let key = SelectKey::new(0, vec![Val::I32(1)]);
                     stmt.table_update_unique_mvcc(
                         table_id,
-                        &SelectKey::new(0, vec![Val::I32(1)]),
+                        key.index_no,
+                        &key.vals,
                         vec![UpdateCol {
                             idx: 1,
                             val: Val::from("bob"),
@@ -111,12 +110,9 @@ mod tests {
 
             let scanned = trx
                 .exec(async |stmt| {
-                    stmt.table_index_scan_mvcc(
-                        table_id,
-                        &SelectKey::new(1, vec![Val::from("bob")]),
-                        &[0, 1],
-                    )
-                    .await
+                    let key = SelectKey::new(1, vec![Val::from("bob")]);
+                    stmt.table_index_scan_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                        .await
                 })
                 .await
                 .unwrap();
@@ -129,12 +125,9 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let deleted = trx
                 .exec(async |stmt| {
-                    stmt.table_delete_unique_mvcc(
-                        table_id,
-                        &SelectKey::new(0, vec![Val::I32(1)]),
-                        false,
-                    )
-                    .await
+                    let key = SelectKey::new(0, vec![Val::I32(1)]);
+                    stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+                        .await
                 })
                 .await
                 .unwrap();
@@ -144,12 +137,9 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let selected = trx
                 .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(
-                        table_id,
-                        &SelectKey::new(0, vec![Val::I32(1)]),
-                        &[0, 1],
-                    )
-                    .await
+                    let key = SelectKey::new(0, vec![Val::I32(1)]);
+                    stmt.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                        .await
                 })
                 .await
                 .unwrap();

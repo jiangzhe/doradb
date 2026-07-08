@@ -481,7 +481,10 @@ async fn measure_point_lookup(
     for _ in 0..iterations {
         let start = Instant::now();
         let res = trx
-            .exec(async |stmt| stmt.table_lookup_unique_mvcc(table_id, &key, &[0, 1]).await)
+            .exec(async |stmt| {
+                stmt.table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                    .await
+            })
             .await?;
         elapsed += start.elapsed();
         assert!(res.is_found(), "baseline point lookup key must exist");
@@ -539,7 +542,10 @@ async fn measure_update(
         }];
         let start = Instant::now();
         let res = trx
-            .exec(async |stmt| stmt.table_update_unique_mvcc(table_id, &key, update).await)
+            .exec(async |stmt| {
+                stmt.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
+                    .await
+            })
             .await?;
         elapsed += start.elapsed();
         assert!(res.is_updated(), "baseline update key must exist");
@@ -565,8 +571,11 @@ async fn measure_delete(
         let id = 30_000_000 + offset as i32;
         let key = SelectKey::new(0, vec![Val::from(id)]);
         let start = Instant::now();
-        trx.exec(async |stmt| stmt.table_delete_unique_mvcc(table_id, &key, false).await)
-            .await?;
+        trx.exec(async |stmt| {
+            stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+                .await
+        })
+        .await?;
         elapsed += start.elapsed();
     }
     trx.commit().await?;

@@ -1059,7 +1059,8 @@ impl<'a> RecoveryCoordinator<'a> {
                     table
                         .delete_primary_key_no_trx(
                             &self.resources.pool_guards,
-                            key,
+                            key.index_no,
+                            &key.vals,
                             self.recovery_disable_dml_validation,
                         )
                         .await?;
@@ -1068,7 +1069,8 @@ impl<'a> RecoveryCoordinator<'a> {
                     table
                         .update_primary_key_no_trx(
                             &self.resources.pool_guards,
-                            key,
+                            key.index_no,
+                            &key.vals,
                             cols,
                             self.recovery_disable_dml_validation,
                         )
@@ -1661,8 +1663,11 @@ mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        trx.exec(async |stmt| stmt.table_delete_unique_mvcc(table_id, key, false).await)
-            .await
+        trx.exec(async |stmt| {
+            stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+                .await
+        })
+        .await
     }
 
     async fn trx_update_row_by_id(
@@ -1671,8 +1676,11 @@ mod tests {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
-        trx.exec(async |stmt| stmt.table_update_unique_mvcc(table_id, key, update).await)
-            .await
+        trx.exec(async |stmt| {
+            stmt.table_update_unique_mvcc(table_id, key.index_no, &key.vals, update)
+                .await
+        })
+        .await
     }
 
     async fn trx_select_row_mvcc(
@@ -1682,7 +1690,7 @@ mod tests {
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         trx.exec(async |stmt| {
-            stmt.table_lookup_unique_mvcc(table.table_id(), key, user_read_set)
+            stmt.table_lookup_unique_mvcc(table.table_id(), key.index_no, &key.vals, user_read_set)
                 .await
         })
         .await
@@ -3406,7 +3414,12 @@ mod tests {
             let rows = trx
                 .exec(async |stmt| {
                     Ok(stmt
-                        .table_index_scan_mvcc(table.table_id(), &name_key, &[0, 1])
+                        .table_index_scan_mvcc(
+                            table.table_id(),
+                            name_key.index_no,
+                            &name_key.vals,
+                            &[0, 1],
+                        )
                         .await?
                         .unwrap_rows())
                 })

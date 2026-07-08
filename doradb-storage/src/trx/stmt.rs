@@ -9,10 +9,7 @@ use crate::row::ops::{
     DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 use crate::session::TrxAttachment;
-use crate::table::{
-    DmlValidationDomain, Table, validate_dml_full_row, validate_dml_primary_key,
-    validate_dml_sparse_update, validate_dml_unique_index, validate_dml_unique_key,
-};
+use crate::table::{DmlValidationDomain, DmlValidator, Table};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
@@ -397,7 +394,8 @@ impl<'stmt> Statement<'stmt> {
     pub async fn table_lookup_unique_mvcc(
         &mut self,
         table_id: TableID,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         let table = self.resolve_user_table(table_id, "table_lookup_unique_mvcc")?;
@@ -407,7 +405,7 @@ impl<'stmt> Statement<'stmt> {
         let rt = self.runtime();
         table
             .accessor_with_layout(&layout)
-            .index_lookup_unique_mvcc(rt, key, user_read_set)
+            .index_lookup_unique_mvcc(rt, index_no, key_vals, user_read_set)
             .await
     }
 
@@ -418,7 +416,8 @@ impl<'stmt> Statement<'stmt> {
     pub async fn table_index_scan_mvcc(
         &mut self,
         table_id: TableID,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
         let table = self.resolve_user_table(table_id, "table_index_scan_mvcc")?;
@@ -428,7 +427,7 @@ impl<'stmt> Statement<'stmt> {
         let rt = self.runtime();
         table
             .accessor_with_layout(&layout)
-            .index_scan_mvcc(rt, key, user_read_set)
+            .index_scan_mvcc(rt, index_no, key_vals, user_read_set)
             .await
     }
 
@@ -442,13 +441,13 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_insert_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            validate_dml_full_row(
+            DmlValidator::new(
                 layout.metadata(),
-                Some(table_id),
+                table_id,
                 "table_insert_mvcc",
-                &cols,
                 DmlValidationDomain::Foreground,
-            )?;
+            )
+            .validate_full_row(&cols)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -473,21 +472,14 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_upsert_unique_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            let metadata = layout.metadata();
-            validate_dml_full_row(
-                metadata,
-                Some(table_id),
+            let validator = DmlValidator::new(
+                layout.metadata(),
+                table_id,
                 "table_upsert_unique_mvcc",
-                &cols,
                 DmlValidationDomain::Foreground,
-            )?;
-            validate_dml_unique_index(
-                metadata,
-                Some(table_id),
-                "table_upsert_unique_mvcc",
-                unique_index_no,
-                DmlValidationDomain::Foreground,
-            )?;
+            );
+            validator.validate_full_row(&cols)?;
+            validator.validate_unique_index(unique_index_no)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -504,7 +496,8 @@ impl<'stmt> Statement<'stmt> {
     pub async fn table_update_unique_mvcc(
         &mut self,
         table_id: TableID,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         let table = self.resolve_user_table(table_id, "table_update_unique_mvcc")?;
@@ -512,27 +505,20 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_update_unique_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            let metadata = layout.metadata();
-            validate_dml_unique_key(
-                metadata,
-                Some(table_id),
+            let validator = DmlValidator::new(
+                layout.metadata(),
+                table_id,
                 "table_update_unique_mvcc",
-                key,
                 DmlValidationDomain::Foreground,
-            )?;
-            validate_dml_sparse_update(
-                metadata,
-                Some(table_id),
-                "table_update_unique_mvcc",
-                &update,
-                DmlValidationDomain::Foreground,
-            )?;
+            );
+            validator.validate_unique_key(index_no, key_vals)?;
+            validator.validate_sparse_update(&update)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .update_unique_mvcc(rt, effects, key, update, false)
+            .update_unique_mvcc(rt, effects, index_no, key_vals, update, false)
             .await
     }
 
@@ -543,7 +529,8 @@ impl<'stmt> Statement<'stmt> {
     pub async fn table_delete_unique_mvcc(
         &mut self,
         table_id: TableID,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
         let table = self.resolve_user_table(table_id, "table_delete_unique_mvcc")?;
@@ -551,19 +538,19 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_delete_unique_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            validate_dml_unique_key(
+            DmlValidator::new(
                 layout.metadata(),
-                Some(table_id),
+                table_id,
                 "table_delete_unique_mvcc",
-                key,
                 DmlValidationDomain::Foreground,
-            )?;
+            )
+            .validate_unique_key(index_no, key_vals)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .delete_unique_mvcc(rt, effects, key, log_by_key)
+            .delete_unique_mvcc(rt, effects, index_no, key_vals, log_by_key)
             .await
     }
 
@@ -577,13 +564,13 @@ impl<'stmt> Statement<'stmt> {
         self.acquire_table_write_metadata_lock(table.table_id())
             .await?;
         if !self.disable_dml_validation {
-            validate_dml_full_row(
+            DmlValidator::new(
                 table.metadata(),
-                Some(table.table_id()),
+                table.table_id(),
                 "catalog_insert_mvcc",
-                &cols,
                 DmlValidationDomain::Foreground,
-            )?;
+            )
+            .validate_full_row(&cols)?;
         }
         self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -612,20 +599,14 @@ impl<'stmt> Statement<'stmt> {
             })?
             .index_no();
         if !self.disable_dml_validation {
-            validate_dml_full_row(
+            let validator = DmlValidator::new(
                 table.metadata(),
-                Some(table.table_id()),
+                table.table_id(),
                 "catalog_upsert_primary_key_mvcc",
-                &cols,
                 DmlValidationDomain::Foreground,
-            )?;
-            validate_dml_unique_index(
-                table.metadata(),
-                Some(table.table_id()),
-                "catalog_upsert_primary_key_mvcc",
-                primary_key_index_no,
-                DmlValidationDomain::Foreground,
-            )?;
+            );
+            validator.validate_full_row(&cols)?;
+            validator.validate_unique_index(primary_key_index_no)?;
         }
         self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -639,23 +620,26 @@ impl<'stmt> Statement<'stmt> {
     pub(crate) async fn catalog_delete_primary_key_mvcc(
         &mut self,
         table: &CatalogTable,
-        key: &SelectKey,
+        index_no: usize,
+        key_vals: &[Val],
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
         self.acquire_table_write_metadata_lock(table.table_id())
             .await?;
         if !self.disable_dml_validation {
-            validate_dml_primary_key(
+            DmlValidator::new(
                 table.metadata(),
-                Some(table.table_id()),
+                table.table_id(),
                 "catalog_delete_primary_key_mvcc",
-                key,
                 DmlValidationDomain::Foreground,
-            )?;
+            )
+            .validate_primary_key(index_no, key_vals)?;
         }
         self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
-        table.delete_unique_mvcc(rt, effects, key, log_by_key).await
+        table
+            .delete_unique_mvcc(rt, effects, index_no, key_vals, log_by_key)
+            .await
     }
 
     /// Moves successful statement effects into transaction effects.
@@ -914,8 +898,13 @@ pub(crate) mod tests {
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     let key = SelectKey::new(1, vec![Val::from(TableID::new(42))]);
-                    stmt.catalog_delete_primary_key_mvcc(catalog_table.as_ref(), &key, true)
-                        .await?;
+                    stmt.catalog_delete_primary_key_mvcc(
+                        catalog_table.as_ref(),
+                        key.index_no,
+                        &key.vals,
+                        true,
+                    )
+                    .await?;
                     Ok(())
                 })
                 .await;

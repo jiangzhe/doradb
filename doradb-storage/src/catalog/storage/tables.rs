@@ -6,7 +6,7 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
 use crate::error::Result;
 use crate::id::TableID;
-use crate::row::ops::{DeleteMvcc, SelectKey};
+use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
 use crate::value::Val;
@@ -50,9 +50,9 @@ impl Tables<'_> {
         guards: &PoolGuards,
         table_id: TableID,
     ) -> Result<Option<TableObject>> {
-        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
+        let key_vals = [Val::from(table_id)];
         self.table
-            .index_lookup_unique_uncommitted(guards, &key, row_to_table_object)
+            .index_lookup_unique_uncommitted(guards, PK_NO_TABLES, &key_vals, row_to_table_object)
             .await
     }
 
@@ -64,8 +64,8 @@ impl Tables<'_> {
 
     /// Delete a table by id.
     pub(crate) async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
-        let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
-        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
+        let key_vals = [Val::from(id)];
+        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_TABLES, &key_vals, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }

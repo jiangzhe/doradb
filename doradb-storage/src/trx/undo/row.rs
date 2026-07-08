@@ -5,6 +5,7 @@ use crate::error::Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
+use crate::value::Val;
 use event_listener::EventListener;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -322,8 +323,12 @@ impl NextRowUndo {
 
     /// Returns next index branch.
     #[inline]
-    pub(crate) fn index_branch(&self, key: Option<&SelectKey>) -> Option<&IndexBranch> {
-        key.and_then(|k| self.indexes.iter().find(|&ib| &ib.key == k))
+    pub(crate) fn index_branch(&self, key: Option<(usize, &[Val])>) -> Option<&IndexBranch> {
+        key.and_then(|(index_no, key_vals)| {
+            self.indexes
+                .iter()
+                .find(|&ib| ib.key.index_no == index_no && ib.key.vals.as_slice() == key_vals)
+        })
     }
 }
 

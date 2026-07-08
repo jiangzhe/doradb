@@ -1451,16 +1451,16 @@ pub(crate) trait RowRead {
         &self,
         col_layout: &TableColumnLayout,
         index_spec: &IndexSpec,
-        key: &SelectKey,
+        key_vals: &[Val],
     ) -> bool {
-        debug_assert!(!key.vals.is_empty());
-        if index_spec.cols.len() != key.vals.len() {
+        debug_assert!(!key_vals.is_empty());
+        if index_spec.cols.len() != key_vals.len() {
             return true;
         }
         index_spec
             .cols
             .iter()
-            .zip(&key.vals)
+            .zip(key_vals)
             .any(|(key, val)| self.is_different(col_layout, key.col_no as usize, val))
     }
 

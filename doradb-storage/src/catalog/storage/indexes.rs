@@ -8,7 +8,7 @@ use crate::catalog::{
 };
 use crate::error::Result;
 use crate::id::TableID;
-use crate::row::ops::{DeleteMvcc, SelectKey};
+use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
 use crate::value::Val;
@@ -66,11 +66,8 @@ impl Indexes<'_> {
         table_id: TableID,
         index_no: u16,
     ) -> bool {
-        let key = SelectKey::new(
-            PK_NO_INDEXES,
-            vec![Val::from(table_id), Val::from(index_no)],
-        );
-        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
+        let key_vals = [Val::from(table_id), Val::from(index_no)];
+        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEXES, &key_vals, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
@@ -146,15 +143,12 @@ impl IndexColumns<'_> {
         index_no: u16,
         index_column_no: u16,
     ) -> bool {
-        let key = SelectKey::new(
-            PK_NO_INDEX_COLUMNS,
-            vec![
-                Val::from(table_id),
-                Val::from(index_no),
-                Val::from(index_column_no),
-            ],
-        );
-        stmt.catalog_delete_primary_key_mvcc(self.table, &key, true)
+        let key_vals = [
+            Val::from(table_id),
+            Val::from(index_no),
+            Val::from(index_column_no),
+        ];
+        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEX_COLUMNS, &key_vals, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
