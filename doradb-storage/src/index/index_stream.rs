@@ -12,7 +12,7 @@ use crate::buffer::BufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::error::{Error, InternalError, Result};
 use crate::id::RowID;
-use crate::index::btree::{BTreeByte, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange};
+use crate::index::btree::{BTreeByte, BTreeKey, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange};
 use crate::index::util::Maskable;
 use error_stack::Report;
 use std::future::Future;
@@ -34,7 +34,7 @@ pub(crate) trait IndexScanLeaf {
     fn start_slot_idx(&self, lower_seek_key: &[u8]) -> usize;
 
     /// Copy one slot key out of this leaf, preserving source-specific errors.
-    fn key_checked(&self, slot_idx: usize) -> Result<Vec<u8>>;
+    fn key_checked(&self, slot_idx: usize) -> Result<BTreeKey>;
 }
 
 impl IndexScanLeaf for PageSharedGuard<BTreeNode> {
@@ -49,8 +49,8 @@ impl IndexScanLeaf for PageSharedGuard<BTreeNode> {
     }
 
     #[inline]
-    fn key_checked(&self, slot_idx: usize) -> Result<Vec<u8>> {
-        self.node().key_checked(slot_idx).ok_or_else(|| {
+    fn key_checked(&self, slot_idx: usize) -> Result<BTreeKey> {
+        self.node().btree_key_checked(slot_idx).ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={slot_idx}")),
             )
@@ -70,9 +70,9 @@ impl<F: DiskTreeSpec> IndexScanLeaf for DiskTreeLeaf<F> {
     }
 
     #[inline]
-    fn key_checked(&self, slot_idx: usize) -> Result<Vec<u8>> {
+    fn key_checked(&self, slot_idx: usize) -> Result<BTreeKey> {
         self.node()
-            .key_checked(slot_idx)
+            .btree_key_checked(slot_idx)
             .ok_or_else(|| invalid_node_payload(self.file_kind, self.block_id))
     }
 }
@@ -130,7 +130,7 @@ pub(crate) trait IndexScanSpec {
     fn project(
         leaf: &Self::Leaf,
         slot_idx: usize,
-        encoded_key: Vec<u8>,
+        encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>>;
 }
 
@@ -148,7 +148,7 @@ impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexEntryScanSpec<'a, P> {
     fn project(
         leaf: &PageSharedGuard<BTreeNode>,
         slot_idx: usize,
-        encoded_key: Vec<u8>,
+        encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
         let value = leaf.node().value::<BTreeU64>(slot_idx);
         Ok(Some(MemIndexEntry {
@@ -173,7 +173,7 @@ impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexRowIdScanSpec<'a, P> {
     fn project(
         leaf: &PageSharedGuard<BTreeNode>,
         slot_idx: usize,
-        _encoded_key: Vec<u8>,
+        _encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
         let value = leaf.node().value::<BTreeU64>(slot_idx);
         Ok(Some(value.value().to_row_id()))
@@ -194,9 +194,9 @@ impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexEntryScanSpec<'a, P> 
     fn project(
         leaf: &PageSharedGuard<BTreeNode>,
         slot_idx: usize,
-        encoded_key: Vec<u8>,
+        encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
-        validate_non_unique_exact_key(&encoded_key, slot_idx)?;
+        validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx)?;
         let node = leaf.node();
         let slot = node.slot(slot_idx);
         let value = node.value_for_slot::<BTreeByte>(slot);
@@ -223,9 +223,9 @@ impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexRowIdScanSpec<'a, P> 
     fn project(
         leaf: &PageSharedGuard<BTreeNode>,
         slot_idx: usize,
-        encoded_key: Vec<u8>,
+        encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
-        validate_non_unique_exact_key(&encoded_key, slot_idx)?;
+        validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx)?;
         let node = leaf.node();
         let slot = node.slot(slot_idx);
         let value = node.value_for_slot::<BTreeByte>(slot);
@@ -234,19 +234,6 @@ impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexRowIdScanSpec<'a, P> 
         }
         Ok(Some(node.unpack_value::<BTreeU64>(slot).to_row_id()))
     }
-}
-
-#[inline]
-fn validate_non_unique_exact_key(encoded_key: &[u8], slot_idx: usize) -> Result<()> {
-    if encoded_key.len() < mem::size_of::<RowID>() {
-        return Err(Report::new(InternalError::MemIndexKeyMalformed)
-            .attach(format!(
-                "slot_idx={slot_idx}, key_len={}",
-                encoded_key.len()
-            ))
-            .into());
-    }
-    Ok(())
 }
 
 /// Stream specification for unique DiskTree entries.
@@ -263,7 +250,7 @@ impl<'a> IndexScanSpec for UniqueDiskTreeEntryScanSpec<'a> {
     fn project(
         leaf: &Self::Leaf,
         slot_idx: usize,
-        encoded_key: Vec<u8>,
+        encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
         let row_id = leaf.node().value::<BTreeU64>(slot_idx);
         if row_id.is_deleted() {
@@ -290,9 +277,9 @@ impl<'a> IndexScanSpec for NonUniqueDiskTreeEntryScanSpec<'a> {
     fn project(
         _leaf: &Self::Leaf,
         _slot_idx: usize,
-        encoded_key: Vec<u8>,
+        encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
-        let row_id = unpack_row_id_from_exact_key(&encoded_key)?;
+        let row_id = unpack_row_id_from_exact_key(encoded_key.as_bytes())?;
         Ok(Some(DiskTreeEntry {
             encoded_key,
             row_id,
@@ -339,10 +326,10 @@ where
             let mut outputs = Vec::new();
             for idx in leaf.start_slot_idx(self.range.lower_seek_key())..node.count() {
                 let encoded_key = leaf.key_checked(idx)?;
-                if !self.range.lower_accepts(&encoded_key) {
+                if !self.range.lower_accepts(encoded_key.as_bytes()) {
                     continue;
                 }
-                if !self.range.upper_accepts(&encoded_key) {
+                if !self.range.upper_accepts(encoded_key.as_bytes()) {
                     self.exhausted = true;
                     break;
                 }
@@ -394,3 +381,16 @@ pub(crate) type UniqueDiskTreeEntryStream<'a> = IndexScanStream<UniqueDiskTreeEn
 /// Bounded stream of non-unique DiskTree entries copied leaf by leaf.
 pub(crate) type NonUniqueDiskTreeEntryStream<'a> =
     IndexScanStream<NonUniqueDiskTreeEntryScanSpec<'a>>;
+
+#[inline]
+fn validate_non_unique_exact_key(encoded_key: &[u8], slot_idx: usize) -> Result<()> {
+    if encoded_key.len() < mem::size_of::<RowID>() {
+        return Err(Report::new(InternalError::MemIndexKeyMalformed)
+            .attach(format!(
+                "slot_idx={slot_idx}, key_len={}",
+                encoded_key.len()
+            ))
+            .into());
+    }
+    Ok(())
+}

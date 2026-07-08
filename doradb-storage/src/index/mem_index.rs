@@ -3,9 +3,10 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::error::{Error, InternalError, Result};
-use crate::id::RowID;
+use crate::id::{RowID, TrxID};
 use crate::index::btree::{
-    BTreeByte, BTreeKeyEncoder, BTreeNode, BTreeNodeCursor, BTreeSlot, BTreeU64, GenericBTree,
+    BTreeByte, BTreeKey, BTreeKeyEncoder, BTreeNode, BTreeNodeCursor, BTreeSlot, BTreeU64,
+    GenericBTree,
 };
 use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
@@ -27,7 +28,7 @@ impl<P: BufferPool> MemIndex<P> {
         index_pool: QuiescentGuard<P>,
         index_pool_guard: &PoolGuard,
         types: Vec<ValType>,
-        ts: crate::id::TrxID,
+        ts: TrxID,
     ) -> Result<Self> {
         let encoder = BTreeKeyEncoder::new(types);
         let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
@@ -98,7 +99,7 @@ impl<P: BufferPool> MemIndex<P> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MemIndexEntry {
     /// Encoded MemIndex key in BTree order.
-    pub(crate) encoded_key: Vec<u8>,
+    pub(crate) encoded_key: BTreeKey,
     /// Row id stored by the entry, with any delete bit stripped.
     pub(crate) row_id: RowID,
     /// Whether the MemIndex entry is delete-marked.
@@ -125,7 +126,7 @@ impl MemIndexEntryScanSpec for UniqueMemIndexEntryScanSpec {
         slot_idx: usize,
         entries: &mut Vec<MemIndexEntry>,
     ) -> Result<()> {
-        let encoded_key = node.key_checked(slot_idx).ok_or_else(|| {
+        let encoded_key = node.btree_key_checked(slot_idx).ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={slot_idx}")),
             )
@@ -152,30 +153,6 @@ impl MemIndexEntryScanSpec for NonUniqueMemIndexEntryScanSpec {
     ) -> Result<()> {
         push_non_unique_encoded_entry(node, node.slot(slot_idx), entries)
     }
-}
-
-/// Push one encoded non-unique exact MemIndex entry.
-#[inline]
-pub(crate) fn push_non_unique_encoded_entry(
-    node: &BTreeNode,
-    slot: &BTreeSlot,
-    entries: &mut Vec<MemIndexEntry>,
-) -> Result<()> {
-    let mut encoded_key = Vec::new();
-    node.extend_slot_key(slot, &mut encoded_key);
-    if encoded_key.len() < mem::size_of::<RowID>() {
-        return Err(Report::new(InternalError::MemIndexKeyMalformed)
-            .attach(format!("key_len={}", encoded_key.len()))
-            .into());
-    }
-    let row_id = node.unpack_value::<BTreeU64>(slot).to_row_id();
-    let value = node.value_for_slot::<BTreeByte>(slot);
-    entries.push(MemIndexEntry {
-        encoded_key,
-        row_id,
-        deleted: value.is_deleted(),
-    });
-    Ok(())
 }
 
 /// Bounded batch of MemIndex entries selected for cleanup processing.
@@ -294,7 +271,7 @@ where
                 batch.skipped_live += 1;
                 continue;
             }
-            let encoded_key = node.key_checked(idx).ok_or_else(|| {
+            let encoded_key = node.btree_key_checked(idx).ok_or_else(|| {
                 Error::from(
                     Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={idx}")),
                 )
@@ -307,4 +284,31 @@ where
         }
         Ok(Some(batch))
     }
+}
+
+/// Push one encoded non-unique exact MemIndex entry.
+#[inline]
+pub(crate) fn push_non_unique_encoded_entry(
+    node: &BTreeNode,
+    slot: &BTreeSlot,
+    entries: &mut Vec<MemIndexEntry>,
+) -> Result<()> {
+    let key_len = node.slot_key_len(slot);
+    if key_len < mem::size_of::<RowID>() {
+        return Err(Report::new(InternalError::MemIndexKeyMalformed)
+            .attach(format!("key_len={key_len}"))
+            .into());
+    }
+    let mut encoded_key = BTreeKey::arbitrary(key_len);
+    let mut buf = encoded_key.modify_inplace();
+    node.copy_slot_key(slot, &mut buf);
+    drop(buf);
+    let row_id = node.unpack_value::<BTreeU64>(slot).to_row_id();
+    let value = node.value_for_slot::<BTreeByte>(slot);
+    entries.push(MemIndexEntry {
+        encoded_key,
+        row_id,
+        deleted: value.is_deleted(),
+    });
+    Ok(())
 }

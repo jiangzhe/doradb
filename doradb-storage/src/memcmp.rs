@@ -492,6 +492,13 @@ impl From<Null> for MemCmpKey {
     }
 }
 
+impl Clone for MemCmpKey {
+    #[inline]
+    fn clone(&self) -> Self {
+        MemCmpKey::from(self.as_bytes())
+    }
+}
+
 impl Deref for MemCmpKey {
     type Target = [u8];
     #[inline]

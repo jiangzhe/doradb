@@ -814,7 +814,7 @@ where
                 (true, true) => {
                     let mem = &self.mem_buf[self.mem_idx];
                     let disk = &self.disk_buf[self.disk_idx];
-                    match mem.encoded_key.as_slice().cmp(disk.encoded_key.as_slice()) {
+                    match mem.encoded_key.as_bytes().cmp(disk.encoded_key.as_bytes()) {
                         Ordering::Less => {
                             self.push_mem(&mut out);
                         }
@@ -842,7 +842,7 @@ fn merge_unique_entries(
     while mem_idx < mem_entries.len() && disk_idx < disk_entries.len() {
         let mem = &mem_entries[mem_idx];
         let (disk_key, disk_row_id) = &disk_entries[disk_idx];
-        match mem.encoded_key.as_slice().cmp(disk_key.as_slice()) {
+        match mem.encoded_key.as_bytes().cmp(disk_key.as_slice()) {
             Ordering::Less => {
                 values.push(if mem.deleted {
                     mem.row_id.deleted()
@@ -891,7 +891,7 @@ fn merge_non_unique_entries(
     while mem_idx < mem_entries.len() && disk_idx < disk_entries.len() {
         let mem = &mem_entries[mem_idx];
         let (disk_key, disk_row_id) = &disk_entries[disk_idx];
-        match mem.encoded_key.as_slice().cmp(disk_key.as_slice()) {
+        match mem.encoded_key.as_bytes().cmp(disk_key.as_slice()) {
             Ordering::Less => {
                 if !mem.deleted {
                     values.push(mem.row_id);

@@ -18,11 +18,11 @@ use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::id::{BlockID, RowID, TrxID};
-use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::algo::{
     KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
     plan_sibling_node,
 };
+use crate::index::btree::{BTreeKey, BTreeKeyEncoder};
 use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::btree::{BTreeNode, LookupChild};
 use crate::index::util::Maskable;
@@ -71,7 +71,7 @@ pub(crate) struct NonUniqueDiskTreeEncodedExact<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiskTreeEntry {
     /// Encoded DiskTree key.
-    pub(crate) encoded_key: Vec<u8>,
+    pub(crate) encoded_key: BTreeKey,
     /// Row id associated with the encoded key.
     pub(crate) row_id: RowID,
 }
