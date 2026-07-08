@@ -5,6 +5,7 @@ use crate::catalog::storage::object::{IndexColumnObject, IndexObject};
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
+    catalog_table_id_from_slot,
 };
 use crate::error::Result;
 use crate::id::TableID;
@@ -18,7 +19,7 @@ use std::sync::OnceLock;
 
 /* Indexes table */
 
-pub(super) const TABLE_ID_INDEXES: TableID = TableID::new(2);
+pub(super) const TABLE_ID_INDEXES: TableID = catalog_table_id_from_slot(2);
 const COL_NO_INDEXES_TABLE_ID: usize = 0;
 const COL_NAME_INDEXES_TABLE_ID: &str = "table_id";
 const COL_NO_INDEXES_INDEX_NO: usize = 1;
@@ -29,7 +30,7 @@ const PK_NO_INDEXES: usize = 0;
 
 /* Index columns table */
 
-pub(super) const TABLE_ID_INDEX_COLUMNS: TableID = TableID::new(3);
+pub(super) const TABLE_ID_INDEX_COLUMNS: TableID = catalog_table_id_from_slot(3);
 const COL_NO_INDEX_COLUMNS_TABLE_ID: usize = 0;
 const COL_NAME_INDEX_COLUMNS_TABLE_ID: &str = "table_id";
 const COL_NO_INDEX_COLUMNS_INDEX_NO: usize = 1;

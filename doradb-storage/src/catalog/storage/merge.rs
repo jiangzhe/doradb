@@ -405,7 +405,7 @@ mod tests {
     use super::super::columns::catalog_definition_of_columns;
     use super::super::tables::catalog_definition_of_tables;
     use super::*;
-    use crate::catalog::USER_OBJ_ID_START;
+    use crate::catalog::USER_TABLE_ID_START;
     use crate::error::DataIntegrityError;
     use crate::id::{RowID, TableID};
     use crate::value::ValKind;
@@ -414,7 +414,7 @@ mod tests {
     fn test_catalog_merge_key_builder_encodes_single_and_composite_keys() {
         let tables_metadata = &catalog_definition_of_tables().metadata;
         let tables_key_builder = CatalogMergeKeyBuilder::new(tables_metadata).unwrap();
-        let tables_table_id = USER_OBJ_ID_START + 1;
+        let tables_table_id = USER_TABLE_ID_START + 1;
         let tables_key = tables_key_builder
             .key_from_row(&catalog_table_vals(tables_table_id, 0))
             .unwrap();
@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(tables_key, tables_select_key);
 
         let columns_metadata = &catalog_definition_of_columns().metadata;
-        let columns_table_id = USER_OBJ_ID_START + 2;
+        let columns_table_id = USER_TABLE_ID_START + 2;
         let columns_no = 7u16;
         let columns_vals = catalog_column_vals(columns_table_id, columns_no, 8);
         let columns_key_builder = CatalogMergeKeyBuilder::new(columns_metadata).unwrap();
@@ -441,8 +441,8 @@ mod tests {
     #[test]
     fn test_catalog_fold_valid_state_transitions() {
         let metadata = &catalog_definition_of_tables().metadata;
-        let base_table_id = USER_OBJ_ID_START + 1;
-        let new_table_id = USER_OBJ_ID_START + 2;
+        let base_table_id = USER_TABLE_ID_START + 1;
+        let new_table_id = USER_TABLE_ID_START + 2;
         let base_key = SelectKey::new(0, vec![Val::from(base_table_id)]);
         let new_key = SelectKey::new(0, vec![Val::from(new_table_id)]);
 
@@ -499,9 +499,9 @@ mod tests {
     #[test]
     fn test_catalog_fold_materializes_primary_key_order() {
         let metadata = &catalog_definition_of_tables().metadata;
-        let table1_id = USER_OBJ_ID_START + 21;
-        let table2_id = USER_OBJ_ID_START + 22;
-        let table3_id = USER_OBJ_ID_START + 23;
+        let table1_id = USER_TABLE_ID_START + 21;
+        let table2_id = USER_TABLE_ID_START + 22;
+        let table3_id = USER_TABLE_ID_START + 23;
         let mut folded = folded_tables_with_base(vec![(table3_id, 3), (table1_id, 1)]);
 
         folded
@@ -521,8 +521,8 @@ mod tests {
     #[test]
     fn test_catalog_fold_should_rewrite_tracks_final_root_change() {
         let metadata = &catalog_definition_of_tables().metadata;
-        let base_table_id = USER_OBJ_ID_START + 31;
-        let new_table_id = USER_OBJ_ID_START + 32;
+        let base_table_id = USER_TABLE_ID_START + 31;
+        let new_table_id = USER_TABLE_ID_START + 32;
         let base_key = SelectKey::new(0, vec![Val::from(base_table_id)]);
         let new_key = SelectKey::new(0, vec![Val::from(new_table_id)]);
 
@@ -554,8 +554,8 @@ mod tests {
     #[test]
     fn test_catalog_fold_rejects_invalid_state_transitions() {
         let metadata = &catalog_definition_of_tables().metadata;
-        let base_table_id = USER_OBJ_ID_START + 11;
-        let new_table_id = USER_OBJ_ID_START + 12;
+        let base_table_id = USER_TABLE_ID_START + 11;
+        let new_table_id = USER_TABLE_ID_START + 12;
         let base_key = SelectKey::new(0, vec![Val::from(base_table_id)]);
         let new_key = SelectKey::new(0, vec![Val::from(new_table_id)]);
 

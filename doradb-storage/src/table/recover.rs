@@ -183,7 +183,7 @@ mod tests {
     use super::ensure_recovery_index_insert;
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::PAGE_SIZE;
-    use crate::catalog::{TableMetadata, USER_OBJ_ID_START};
+    use crate::catalog::{TableMetadata, USER_TABLE_ID_START};
     use crate::error::{DataIntegrityError, Error, RecoveryDuplicateKey};
     use crate::id::RowID;
     use crate::id::{PageID, TrxID};
@@ -494,7 +494,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let table_id = USER_OBJ_ID_START + 99;
+            let table_id = USER_TABLE_ID_START + 99;
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
             let metadata =

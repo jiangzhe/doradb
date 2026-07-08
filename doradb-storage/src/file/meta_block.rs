@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::catalog::USER_OBJ_ID_START;
+use crate::catalog::USER_TABLE_ID_LIMIT;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
 use crate::error::{DataIntegrityError, Error, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -198,9 +198,9 @@ impl Deser for MultiTableMetaBlockData {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, next_table_id) = TableID::deser(input, start_idx)?;
-        if next_table_id < USER_OBJ_ID_START {
+        if next_table_id > USER_TABLE_ID_LIMIT {
             return Err(invalid_payload(format!(
-                "next_table_id {next_table_id} is below user table id start {USER_OBJ_ID_START}"
+                "next_table_id {next_table_id} is out of user table id range (limit: {USER_TABLE_ID_LIMIT})"
             )));
         }
         let (idx, table_count) = input.deser_u32(idx)?;
@@ -362,6 +362,7 @@ mod tests {
     use super::*;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+        USER_TABLE_ID_START, catalog_table_id_from_slot,
     };
     use crate::file::multi_table_file::CATALOG_TABLE_ROOT_DESC_COUNT;
     use crate::file::table_file::ActiveRoot;
@@ -644,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_multi_table_meta_block_serde_none_root_block_id() {
-        let mut meta = MultiTableMetaBlock::new(USER_OBJ_ID_START + 9);
+        let mut meta = MultiTableMetaBlock::new(USER_TABLE_ID_START + 9);
         meta.first_redo_log_seq = 7;
         meta.table_roots[0].root_block_id = None;
         meta.table_roots[0].pivot_row_id = RowID::new(0);
@@ -662,9 +663,16 @@ mod tests {
         let (_, decoded) = MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
         assert_eq!(decoded.next_table_id, meta.next_table_id);
         assert_eq!(decoded.first_redo_log_seq, 7);
-        assert_eq!(decoded.table_roots[0].table_id, TableID::new(0));
+        assert_eq!(
+            decoded.table_roots[0].table_id,
+            catalog_table_id_from_slot(0)
+        );
         assert_eq!(decoded.table_roots[0].root_block_id, None);
         assert_eq!(decoded.table_roots[0].pivot_row_id, RowID::new(0));
+        assert_eq!(
+            decoded.table_roots[1].table_id,
+            catalog_table_id_from_slot(1)
+        );
         assert_eq!(decoded.table_roots[1].root_block_id, NonZeroU64::new(42));
         assert_eq!(decoded.table_roots[1].pivot_row_id, RowID::new(128));
         assert_eq!(decoded.table_roots.len(), CATALOG_TABLE_ROOT_DESC_COUNT);

@@ -3,7 +3,9 @@ use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
-use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+use crate::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
+};
 use crate::error::Result;
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
@@ -14,7 +16,7 @@ use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
-pub(super) const TABLE_ID_COLUMNS: TableID = TableID::new(1);
+pub(super) const TABLE_ID_COLUMNS: TableID = catalog_table_id_from_slot(1);
 const COL_NO_COLUMNS_TABLE_ID: usize = 0;
 const COL_NAME_COLUMNS_TABLE_ID: &str = "table_id";
 const COL_NO_COLUMNS_COLUMN_NO: usize = 1;

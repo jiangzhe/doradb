@@ -4,7 +4,7 @@ use crate::buffer::{
     EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
     PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
-use crate::catalog::USER_OBJ_ID_START;
+use crate::catalog::is_user_table;
 use crate::catalog::table::TableMetadata;
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
@@ -1924,7 +1924,7 @@ impl FileSystem {
     /// Delete one deterministic user-table file.
     #[inline]
     pub(crate) fn delete_user_table_file(&self, table_id: TableID) -> Result<()> {
-        debug_assert!(table_id >= USER_OBJ_ID_START);
+        debug_assert!(is_user_table(table_id));
         match fs::remove_file(self.data_dir.join(user_table_file_name(table_id))) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == IoErrorKind::NotFound => Ok(()),
@@ -1983,7 +1983,7 @@ impl FileSystem {
             let Some(table_id) = parse_user_table_file_name(&entry.file_name()) else {
                 continue;
             };
-            if table_id < USER_OBJ_ID_START {
+            if !is_user_table(table_id) {
                 continue;
             }
             if recovered_user_table_ids.contains(&table_id)
@@ -2126,7 +2126,7 @@ fn path_to_string(path: &Path, field: &str) -> String {
 
 #[inline]
 fn user_table_file_name(table_id: TableID) -> String {
-    debug_assert!(table_id >= USER_OBJ_ID_START);
+    debug_assert!(is_user_table(table_id));
     format!("{table_id:016x}.tbl")
 }
 
@@ -2138,7 +2138,7 @@ fn parse_user_table_file_name(file_name: &OsStr) -> Option<TableID> {
         return None;
     }
     let table_id = TableID::from_str_radix(table_id_hex, 16).ok()?;
-    (table_id >= USER_OBJ_ID_START).then_some(table_id)
+    is_user_table(table_id).then_some(table_id)
 }
 
 #[cfg(test)]
@@ -2152,7 +2152,7 @@ pub(crate) mod tests {
         test_persist_and_evict_page,
     };
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
@@ -2999,7 +2999,7 @@ pub(crate) mod tests {
                 .unwrap();
             let snapshot = mtb.load_snapshot().unwrap();
             assert_eq!(snapshot.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
-            assert_eq!(snapshot.meta.next_table_id, USER_OBJ_ID_START);
+            assert_eq!(snapshot.meta.next_table_id, USER_TABLE_ID_START);
             assert!(mtb.active_root_unchecked().meta_block_id > BlockID::new(0));
         });
     }
@@ -3008,7 +3008,7 @@ pub(crate) mod tests {
     fn test_user_table_commit_submits_backend_fsync_after_root_writes() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_id = USER_OBJ_ID_START + 201;
+            let table_id = USER_TABLE_ID_START + 201;
             let mutable = fs
                 .create_table_file(table_id, make_metadata(), false)
                 .unwrap();
@@ -3036,7 +3036,7 @@ pub(crate) mod tests {
     fn test_user_table_commit_fsync_failure_keeps_active_root() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_id = USER_OBJ_ID_START + 202;
+            let table_id = USER_TABLE_ID_START + 202;
             let mutable = fs
                 .create_table_file(table_id, make_metadata(), false)
                 .unwrap();
@@ -3115,7 +3115,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-            let table_id = USER_OBJ_ID_START + 130;
+            let table_id = USER_TABLE_ID_START + 130;
             let table_file = fs
                 .create_table_file(table_id, make_metadata(), false)
                 .unwrap();
@@ -3276,14 +3276,14 @@ pub(crate) mod tests {
                 .expect("valid table metadata"),
             );
             let mutable = fs
-                .create_table_file(USER_OBJ_ID_START, Arc::clone(&metadata), false)
+                .create_table_file(USER_TABLE_ID_START, Arc::clone(&metadata), false)
                 .unwrap();
             let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
-            let path = fs.user_table_file_path(USER_OBJ_ID_START);
+            let path = fs.user_table_file_path(USER_TABLE_ID_START);
             assert!(
-                path.ends_with("0001000000000000.tbl"),
+                path.ends_with("0000000000000000.tbl"),
                 "unexpected user table file path: {path}"
             );
             assert!(Path::new(&path).exists());
@@ -3297,7 +3297,7 @@ pub(crate) mod tests {
     fn test_delete_user_table_file_is_idempotent() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_id = USER_OBJ_ID_START + 9;
+            let table_id = USER_TABLE_ID_START + 9;
             let metadata = Arc::new(
                 TableMetadata::try_new(
                     vec![ColumnSpec::new(
@@ -3327,10 +3327,10 @@ pub(crate) mod tests {
     #[test]
     fn test_cleanup_checkpoint_absent_user_table_files_filters_catalog_and_future_ids() {
         let (_temp_dir, fs) = build_test_fs();
-        let present_id = USER_OBJ_ID_START + 1;
-        let absent_id = USER_OBJ_ID_START + 2;
-        let future_id = USER_OBJ_ID_START + 5;
-        let catalog_path = fs.data_dir.join("1.tbl");
+        let present_id = USER_TABLE_ID_START + 1;
+        let absent_id = USER_TABLE_ID_START + 2;
+        let future_id = USER_TABLE_ID_START + 5;
+        let catalog_path = fs.data_dir.join("8000000000000000.tbl");
         let present_path = fs.data_dir.join(user_table_file_name(present_id));
         let absent_path = fs.data_dir.join(user_table_file_name(absent_id));
         let future_path = fs.data_dir.join(user_table_file_name(future_id));
@@ -3340,8 +3340,11 @@ pub(crate) mod tests {
         write(&future_path, b"future").unwrap();
 
         let checkpointed_tables = [present_id].into_iter().collect::<FastHashSet<_>>();
-        fs.cleanup_checkpoint_absent_user_table_files(USER_OBJ_ID_START + 4, &checkpointed_tables)
-            .unwrap();
+        fs.cleanup_checkpoint_absent_user_table_files(
+            USER_TABLE_ID_START + 4,
+            &checkpointed_tables,
+        )
+        .unwrap();
 
         assert!(catalog_path.exists());
         assert!(present_path.exists());
@@ -3352,15 +3355,15 @@ pub(crate) mod tests {
     #[test]
     fn test_cleanup_checkpoint_absent_user_table_files_skips_non_files() {
         let (_temp_dir, fs) = build_test_fs();
-        let dir_id = USER_OBJ_ID_START + 1;
-        let absent_id = USER_OBJ_ID_START + 2;
+        let dir_id = USER_TABLE_ID_START + 1;
+        let absent_id = USER_TABLE_ID_START + 2;
         let dir_path = fs.data_dir.join(user_table_file_name(dir_id));
         let absent_path = fs.data_dir.join(user_table_file_name(absent_id));
         create_dir(&dir_path).unwrap();
         write(&absent_path, b"absent").unwrap();
 
         fs.cleanup_checkpoint_absent_user_table_files(
-            USER_OBJ_ID_START + 4,
+            USER_TABLE_ID_START + 4,
             &FastHashSet::default(),
         )
         .unwrap();
@@ -3372,10 +3375,10 @@ pub(crate) mod tests {
     #[test]
     fn test_cleanup_recovery_absent_user_table_files_keeps_recovered_and_deferred_drop_files() {
         let (_temp_dir, fs) = build_test_fs();
-        let recovered_id = USER_OBJ_ID_START + 1;
-        let deferred_drop_id = USER_OBJ_ID_START + 2;
-        let orphan_id = USER_OBJ_ID_START + 7;
-        let catalog_path = fs.data_dir.join("2.tbl");
+        let recovered_id = USER_TABLE_ID_START + 1;
+        let deferred_drop_id = USER_TABLE_ID_START + 2;
+        let orphan_id = USER_TABLE_ID_START + 7;
+        let catalog_path = fs.data_dir.join("8000000000000000.tbl");
         let recovered_path = fs.data_dir.join(user_table_file_name(recovered_id));
         let deferred_drop_path = fs.data_dir.join(user_table_file_name(deferred_drop_id));
         let orphan_path = fs.data_dir.join(user_table_file_name(orphan_id));

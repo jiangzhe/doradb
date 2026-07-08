@@ -42,8 +42,14 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// First table id reserved for user-managed objects.
-pub(crate) const USER_OBJ_ID_START: TableID = TableID::new(0x0001_0000_0000_0000);
+/// First table id allocated to user-managed tables.
+pub(crate) const USER_TABLE_ID_START: TableID = TableID::new(0);
+
+/// First table id reserved for built-in catalog tables.
+pub(crate) const CATALOG_TABLE_ID_START: TableID = TableID::new(1u64 << 63);
+
+/// Exclusive upper bound of the user table-id range.
+pub(crate) const USER_TABLE_ID_LIMIT: TableID = CATALOG_TABLE_ID_START;
 
 /// Dedicated runtime wrapper for catalog logical tables.
 pub(crate) struct CatalogTable {
@@ -140,7 +146,12 @@ impl Catalog {
     /// Allocate and return the next table id.
     #[inline]
     pub(crate) fn next_table_id(&self) -> TableID {
-        TableID::new(self.next_table_id.fetch_add(1, Ordering::SeqCst))
+        let table_id = TableID::new(self.next_table_id.fetch_add(1, Ordering::SeqCst));
+        assert!(
+            table_id < USER_TABLE_ID_LIMIT,
+            "user table id allocator overflowed into catalog table range: table_id={table_id}, limit={USER_TABLE_ID_LIMIT}"
+        );
+        table_id
     }
 
     #[inline]
@@ -220,7 +231,7 @@ impl Catalog {
             .await?;
 
         // Phase 2 allocator semantics: only table ids consume the global allocator.
-        self.try_update_next_table_id(table.table_id.saturating_add(1).max(USER_OBJ_ID_START));
+        self.try_update_next_table_id(table.table_id.saturating_add(1));
 
         let table_file = table_fs
             .open_table_file(table.table_id, disk_pool.clone())
@@ -1037,13 +1048,29 @@ impl<'a> TableCache<'a> {
 /// Return whether a table id belongs to user-managed catalog space.
 #[inline]
 pub(crate) const fn is_user_table(table_id: TableID) -> bool {
-    table_id.as_u64() >= USER_OBJ_ID_START.as_u64()
+    table_id.as_u64() < USER_TABLE_ID_LIMIT.as_u64()
 }
 
 /// Return whether a table id belongs to built-in catalog table space.
 #[inline]
 pub(crate) const fn is_catalog_table(table_id: TableID) -> bool {
-    !is_user_table(table_id)
+    table_id.as_u64() >= CATALOG_TABLE_ID_START.as_u64()
+}
+
+/// Build a built-in catalog table id from its dense root slot.
+#[inline]
+pub(crate) const fn catalog_table_id_from_slot(slot: usize) -> TableID {
+    TableID::new(CATALOG_TABLE_ID_START.as_u64() + slot as u64)
+}
+
+/// Return the dense root slot for a built-in catalog table id.
+#[inline]
+pub(crate) const fn catalog_table_slot(table_id: TableID) -> Option<usize> {
+    if is_catalog_table(table_id) {
+        Some((table_id.as_u64() - CATALOG_TABLE_ID_START.as_u64()) as usize)
+    } else {
+        None
+    }
 }
 
 /// Combine table-root replay bounds with a checkpoint-durable silent overlay.
@@ -1360,11 +1387,34 @@ pub(crate) mod tests {
 
     #[test]
     fn test_catalog_table_id_boundary_predicates() {
-        let before_user = TableID::new(USER_OBJ_ID_START.as_u64() - 1);
-        assert!(is_catalog_table(before_user));
-        assert!(!is_catalog_table(USER_OBJ_ID_START));
-        assert!(!is_user_table(before_user));
-        assert!(is_user_table(USER_OBJ_ID_START));
+        let last_user = TableID::new(USER_TABLE_ID_LIMIT.as_u64() - 1);
+        assert!(is_user_table(USER_TABLE_ID_START));
+        assert!(!is_catalog_table(USER_TABLE_ID_START));
+        assert!(is_user_table(last_user));
+        assert!(!is_catalog_table(last_user));
+        assert!(!is_user_table(CATALOG_TABLE_ID_START));
+        assert!(is_catalog_table(CATALOG_TABLE_ID_START));
+        assert_eq!(catalog_table_id_from_slot(0), CATALOG_TABLE_ID_START);
+        assert_eq!(catalog_table_slot(CATALOG_TABLE_ID_START), Some(0));
+        assert_eq!(catalog_table_slot(catalog_table_id_from_slot(4)), Some(4));
+    }
+
+    #[test]
+    #[should_panic(expected = "user table id allocator overflowed into catalog table range")]
+    fn test_next_table_id_panics_at_catalog_boundary() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = open_catalog_test_engine(
+                temp_dir.path().to_path_buf(),
+                Some("catalog-allocator-overflow"),
+            )
+            .await;
+            engine
+                .catalog()
+                .next_table_id
+                .store(USER_TABLE_ID_LIMIT.as_u64(), Ordering::SeqCst);
+            let _ = engine.catalog().next_table_id();
+        });
     }
 
     #[test]
@@ -1550,7 +1600,7 @@ pub(crate) mod tests {
 
             let engine =
                 open_catalog_test_engine(main_dir.clone(), Some("catalog-allocator")).await;
-            assert_eq!(engine.catalog().curr_next_table_id(), USER_OBJ_ID_START);
+            assert_eq!(engine.catalog().curr_next_table_id(), USER_TABLE_ID_START);
             let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec::new(vec![
                 ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
@@ -1572,7 +1622,7 @@ pub(crate) mod tests {
             let engine = open_catalog_test_engine(main_dir, Some("catalog-allocator")).await;
             assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
             let table_id2 = table1(&engine).await;
-            assert!(table_id1 >= USER_OBJ_ID_START);
+            assert!(table_id1 >= USER_TABLE_ID_START);
             assert_eq!(table_id2, table_id1 + 1);
             drop(engine);
         });

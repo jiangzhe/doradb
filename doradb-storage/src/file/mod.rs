@@ -14,7 +14,6 @@ pub(crate) use self::tests::{test_block_id, test_file_id};
 use crate::id::{BlockID, FileID};
 
 use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
-use crate::catalog::USER_OBJ_ID_START;
 use crate::error::{
     CompletionErrorKind, ConfigError, Error, IoError, ResourceError, Result, StorageOp,
 };
@@ -42,13 +41,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) const UNTRACKED_FILE_ID: FileID = FileID::MAX;
 
 /// Reserved persisted-file identity of the shared index-pool swap file.
-pub(crate) const INDEX_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START.as_u64() - 3);
+pub(crate) const INDEX_POOL_SWAP_FILE_ID: FileID = FileID::new(u64::MAX - 3);
 
 /// Reserved persisted-file identity of the shared mem-pool swap file.
-pub(crate) const MEM_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START.as_u64() - 2);
+pub(crate) const MEM_POOL_SWAP_FILE_ID: FileID = FileID::new(u64::MAX - 2);
 
 /// Reserved persisted-file identity of `catalog.mtb`.
-pub(crate) const CATALOG_MTB_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START.as_u64() - 1);
+pub(crate) const CATALOG_MTB_FILE_ID: FileID = FileID::new(u64::MAX - 1);
 
 /// Physical persisted-block identity for cache lookup and shared-storage IO.
 ///
@@ -826,7 +825,7 @@ mod tests {
     use super::*;
     use crate::catalog::table::TableMetadata;
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::compression::BitPackable;
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
@@ -870,7 +869,7 @@ mod tests {
     async fn committed_test_table_file() -> (TempDir, TestFileSystem, Arc<TableFile>) {
         let (temp_dir, fs) = build_test_fs();
         let mutable = fs
-            .create_table_file(USER_OBJ_ID_START + 801, build_test_metadata(), false)
+            .create_table_file(USER_TABLE_ID_START + 801, build_test_metadata(), false)
             .unwrap();
         let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
         drop(old_root);

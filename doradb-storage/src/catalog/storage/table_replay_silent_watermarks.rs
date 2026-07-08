@@ -3,7 +3,9 @@ use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::SilentWatermarkObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
-use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+use crate::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
+};
 use crate::error::{DataIntegrityError, Error, Result};
 use crate::id::{TableID, TrxID};
 use crate::row::ops::DeleteMvcc;
@@ -16,7 +18,7 @@ use semistr::SemiStr;
 use std::sync::OnceLock;
 
 /// Catalog table id for `catalog.table_replay_silent_watermarks`.
-pub(crate) const TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS: TableID = TableID::new(4);
+pub(crate) const TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS: TableID = catalog_table_id_from_slot(4);
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID: usize = 0;
 const COL_NAME_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID: &str = "table_id";
 const COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS: usize = 1;

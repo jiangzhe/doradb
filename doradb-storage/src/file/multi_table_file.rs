@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
-use crate::catalog::USER_OBJ_ID_START;
+use crate::catalog::{USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot};
 use crate::error::{
     DataIntegrityError, Error, FileKind, InternalError, IoError, ResourceError, Result,
 };
@@ -40,7 +40,7 @@ pub(crate) use crate::file::CATALOG_MTB_FILE_ID;
 pub(crate) use tests::publish_first_redo_log_seq_for_test;
 
 /// On-disk format version of `catalog.mtb`.
-pub(crate) const CATALOG_MTB_VERSION: u64 = 4;
+pub(crate) const CATALOG_MTB_VERSION: u64 = 5;
 /// Reserved number of catalog logical-table root descriptors.
 pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 5;
 /// Initial sparse-file size for `catalog.mtb`.
@@ -94,10 +94,10 @@ impl MultiTableMetaBlock {
     pub(crate) fn new(next_table_id: TableID) -> Self {
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
         for (idx, root) in table_roots.iter_mut().enumerate() {
-            root.table_id = TableID::from(idx);
+            root.table_id = catalog_table_id_from_slot(idx);
         }
         MultiTableMetaBlock {
-            next_table_id: next_table_id.max(USER_OBJ_ID_START),
+            next_table_id,
             first_redo_log_seq: 0,
             table_roots,
         }
@@ -121,7 +121,7 @@ impl MultiTableActiveRoot {
             MIN_SNAPSHOT_TS,
             SUPER_BLOCK_ID,
             alloc_map,
-            MultiTableMetaBlock::new(USER_OBJ_ID_START),
+            MultiTableMetaBlock::new(USER_TABLE_ID_START),
         )
     }
 
@@ -334,9 +334,9 @@ impl MutableMultiTableFile {
                 root.root_ts
             )));
         }
-        if next_table_id < USER_OBJ_ID_START {
+        if next_table_id > USER_TABLE_ID_LIMIT {
             return Err(catalog_root_descriptor_invariant(format!(
-                "next_table_id={next_table_id}, minimum={USER_OBJ_ID_START}"
+                "next_table_id={next_table_id}, user_table_id_limit={USER_TABLE_ID_LIMIT}"
             )));
         }
         for root in &table_roots {
@@ -709,14 +709,14 @@ mod tests {
                 .unwrap();
             let s0 = mtb.load_snapshot().unwrap();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
-            assert_eq!(s0.meta.next_table_id, USER_OBJ_ID_START);
+            assert_eq!(s0.meta.next_table_id, USER_TABLE_ID_START);
             assert_eq!(s0.meta.first_redo_log_seq, 0);
             let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
             assert!(meta_block_id_0 > test_block_id(0));
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
-                root.table_id = TableID::new(idx as u64);
+                root.table_id = catalog_table_id_from_slot(idx);
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = RowID::new((idx * 100) as u64);
             }
@@ -724,7 +724,7 @@ mod tests {
                 &mtb,
                 background_writes,
                 TrxID::new(7),
-                USER_OBJ_ID_START + 16,
+                USER_TABLE_ID_START + 16,
                 roots,
             )
             .await;
@@ -738,7 +738,7 @@ mod tests {
                 .unwrap();
             let s1 = mtb2.load_snapshot().unwrap();
             assert_eq!(s1.catalog_replay_start_ts, TrxID::new(7));
-            assert_eq!(s1.meta.next_table_id, USER_OBJ_ID_START + 16);
+            assert_eq!(s1.meta.next_table_id, USER_TABLE_ID_START + 16);
             assert_eq!(s1.meta.first_redo_log_seq, 0);
             assert_eq!(s1.meta.table_roots, roots);
 
@@ -767,13 +767,13 @@ mod tests {
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
-                root.table_id = TableID::new(idx as u64);
+                root.table_id = catalog_table_id_from_slot(idx);
             }
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
                 TrxID::new(8),
-                USER_OBJ_ID_START + 5,
+                USER_TABLE_ID_START + 5,
                 roots,
             )
             .await;
@@ -807,7 +807,7 @@ mod tests {
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
-                root.table_id = TableID::new(idx as u64);
+                root.table_id = catalog_table_id_from_slot(idx);
             }
 
             let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
@@ -815,7 +815,7 @@ mod tests {
                 &mtb,
                 background_writes,
                 TrxID::new(3),
-                USER_OBJ_ID_START + 1,
+                USER_TABLE_ID_START + 1,
                 roots,
             )
             .await;
@@ -824,7 +824,7 @@ mod tests {
                 &mtb,
                 background_writes,
                 TrxID::new(4),
-                USER_OBJ_ID_START + 2,
+                USER_TABLE_ID_START + 2,
                 roots,
             )
             .await;
@@ -957,7 +957,7 @@ mod tests {
 
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
-                root.table_id = TableID::new(idx as u64);
+                root.table_id = catalog_table_id_from_slot(idx);
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = RowID::new((idx as u64) + 1);
             }
@@ -965,7 +965,7 @@ mod tests {
                 &mtb,
                 background_writes,
                 TrxID::new(3),
-                USER_OBJ_ID_START + 1,
+                USER_TABLE_ID_START + 1,
                 roots_v1,
             )
             .await;
@@ -978,7 +978,7 @@ mod tests {
                 &mtb,
                 background_writes,
                 TrxID::new(4),
-                USER_OBJ_ID_START + 2,
+                USER_TABLE_ID_START + 2,
                 roots_v2,
             )
             .await;
@@ -1018,7 +1018,7 @@ mod tests {
 
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
-                root.table_id = TableID::new(idx as u64);
+                root.table_id = catalog_table_id_from_slot(idx);
                 root.root_block_id = NonZeroU64::new((idx + 20) as u64);
                 root.pivot_row_id = RowID::new((idx as u64) + 10);
             }
@@ -1026,7 +1026,7 @@ mod tests {
                 &mtb,
                 background_writes,
                 TrxID::new(5),
-                USER_OBJ_ID_START + 10,
+                USER_TABLE_ID_START + 10,
                 roots_v1,
             )
             .await;
@@ -1038,7 +1038,7 @@ mod tests {
                 &mtb,
                 background_writes,
                 TrxID::new(6),
-                USER_OBJ_ID_START + 11,
+                USER_TABLE_ID_START + 11,
                 roots_v2,
             )
             .await;
