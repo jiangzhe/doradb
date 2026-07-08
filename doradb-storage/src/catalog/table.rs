@@ -743,7 +743,9 @@ impl TableIndexLayout {
         let Some(keys) = self.index_spec(index_no).map(|spec| &spec.cols) else {
             return false;
         };
-        debug_assert!(keys.len() == key_vals.len());
+        if keys.len() != key_vals.len() {
+            return false;
+        }
         keys.iter()
             .zip(key_vals)
             .all(|(key, val)| &row[key.col_no as usize] == val)
