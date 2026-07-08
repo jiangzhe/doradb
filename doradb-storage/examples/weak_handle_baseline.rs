@@ -105,7 +105,7 @@ impl BenchRow {
 }
 
 fn usage() -> &'static str {
-    "Usage: cargo run -p doradb-storage --example weak_handle_baseline -- [--iterations <n>] [--scan-rows <n>] [--out-dir <path>] [--only <operation>]\n\
+    "Usage: cargo run --example weak_handle_baseline -- [--iterations <n>] [--scan-rows <n>] [--out-dir <path>] [--only <operation>]\n\
 \n\
 Measures current public operation boundaries that RFC-0019 weak-handle phases may affect.\n\
 Defaults: --iterations 1000 --scan-rows 10000 --out-dir target/weak-handle-baseline\n\

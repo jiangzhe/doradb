@@ -4,11 +4,11 @@ This document defines lint usage and enforcement for this repository.
 
 ## Scope
 
-- Primary target: Rust workspace code (current active member: `doradb-storage`).
+- Primary target: Rust workspace code.
 - Lint gate command:
 
 ```bash
-cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Local Development
@@ -24,7 +24,7 @@ cargo fmt
 2. Run strict clippy:
 
 ```bash
-cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 3. Audit branch Rust style:
@@ -54,7 +54,7 @@ Directory targets check only direct `.rs` children and do not recurse.
 4. Run tests:
 
 ```bash
-cargo nextest run -p doradb-storage
+cargo nextest run --workspace
 ```
 
 ## Pre-commit Enforcement
@@ -62,7 +62,7 @@ cargo nextest run -p doradb-storage
 Repository hook (`.githooks/pre-commit`) enforces:
 
 1. `cargo fmt`
-2. `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo deny check`
 
 If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe baseline docs.
@@ -72,14 +72,18 @@ If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe b
 CI build workflow runs the same strict clippy command:
 
 ```bash
-cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 This keeps local and CI lint behavior aligned.
 
 Do not use `--all-features` for `doradb-storage`: the `iouring` and `libaio`
 backend features are mutually exclusive. Validate the alternate backend with a
-separate explicit feature command when needed.
+separate explicit feature command when needed:
+
+```bash
+cargo nextest run -p doradb-storage --no-default-features --features libaio
+```
 
 The undocumented-unsafe-block policy is enabled in the workspace lint manifest
 with `undocumented_unsafe_blocks = "warn"`, and `-D warnings` turns any
@@ -95,10 +99,10 @@ inherit the workspace lint policy if they should carry the same gate.
 ## Pedantic Lints
 
 `clippy::pedantic` is enabled in the workspace lint manifest and inherited by
-`doradb-storage`, so it is covered by the standard strict clippy gate:
+workspace crates, so it is covered by the standard strict clippy gate:
 
 ```bash
-cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 The workspace lint manifest carries a concrete `allow` list for pedantic lint

@@ -1,14 +1,14 @@
 # Unit Testing
 
 `cargo-nextest` is the supported runner for routine local and CI validation of
-`doradb-storage`.
+workspace crates.
 
 ## Running Tests
 
 Run the standard validation pass:
 
 ```bash
-cargo nextest run -p doradb-storage
+cargo nextest run --workspace
 ```
 
 When changing storage backend code or backend-neutral I/O paths, also run the
@@ -20,7 +20,7 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Doc Tests
 
-Doctests are not part of routine validation for `doradb-storage`.
+Doctests are not part of routine validation.
 
 ## Test Policy
 

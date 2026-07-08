@@ -94,7 +94,7 @@ Two compile-time backends are supported:
 - `io_uring`
   - repository default;
   - selected by the default Cargo feature set;
-  - validated by `cargo nextest run -p doradb-storage`.
+  - validated by `cargo nextest run --workspace`.
 - `libaio`
   - explicitly supported alternate backend for older Linux kernels that cannot
     use `io_uring`;

@@ -17,7 +17,7 @@ We follow a strict priority order for all engineering decisions:
 We rely on tooling to enforce style.
 
 *   **Formatting**: `cargo fmt` is the authority.
-*   **Linting**: `cargo clippy -p doradb-storage --all-targets -- -D warnings` must pass.
+*   **Linting**: `cargo clippy --workspace --all-targets -- -D warnings` must pass.
 *   **Imports & Type Names**: Prefer `use` imports plus short type names to keep code concise and readable. Use fully qualified type names only when they are actually needed, such as resolving name conflicts or clarifying ambiguous paths.
 *   **Public API Documentation**: Every public `struct`, `trait`, `enum`, `const`, and `method/function` **MUST** have a descriptive `///` doc comment.
 *   **Doc Placement**: Documentation comments (`///` or `//!`) must always be placed **above** any attributes (e.g., `#[derive(...)]`, `#[must_use]`).
@@ -54,7 +54,7 @@ We rely on tooling to enforce style.
 *   **Unit Test Dedup Patterns**: Extract helper functions for repeated object construction, round-trip flows such as `encode -> decode -> verify`, and common assertion sequences. Use table-driven tests with a case struct or array plus loop when cases share logic and differ only by input or expected output.
 *   **Concurrent Tests**: Do not use `sleep` to wait for events in tests, because it makes tests flaky. Use explicit synchronization points or predicate-based signaling to coordinate thread progress.
 *   **Randomized Tests**: Prefer randomized tests over exhaustive parameter permutations when broad input variation is useful. Keep deterministic edge-case tests separate from randomized tests, especially for error paths, boundary conditions, and format verification.
-*   **Routine Validation**: Run `cargo nextest run -p doradb-storage`.
+*   **Routine Validation**: Run `cargo nextest run --workspace`.
 *   **Alternate Backend Validation**: Run `cargo nextest run -p doradb-storage --no-default-features --features libaio` manually when you need to validate the legacy-kernel alternate backend path.
 *   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
 
@@ -62,7 +62,7 @@ We rely on tooling to enforce style.
 
 *   **Unsafe Blocks and Impls**: Every `unsafe` block and `unsafe impl` **MUST** have a preceding `// SAFETY:` comment explaining the concrete invariants.
 *   **Public Unsafe Functions**: Every public `unsafe fn` **MUST** document its caller contract in a `/// # Safety` section. Do not replace that function-level contract with an adjacent `// SAFETY:` comment on the signature itself.
-*   **Mechanical Gate**: The active production crate root enables `#![warn(clippy::undocumented_unsafe_blocks)]`, and `cargo clippy -p doradb-storage --all-targets -- -D warnings` turns violations there into hard failures. Any new production target crate should add the same crate-level lint.
+*   **Mechanical Gate**: Production crate roots enable `#![warn(clippy::undocumented_unsafe_blocks)]`, and `cargo clippy --workspace --all-targets -- -D warnings` turns violations there into hard failures. Any new production target crate should add the same crate-level lint.
 *   **Inventory**: Update the unsafe baseline if usage changes.
 
 ## 6. Development Checklist

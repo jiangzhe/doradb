@@ -1,17 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `doradb-storage/` is the active Rust workspace member and primary focus.
+- `doradb-storage/` is the storage engine crate and primary implementation focus.
+- `doradb-bench/` is the standalone storage benchmark crate.
 - `doradb-storage/src/` holds the storage engine (buffer, catalog, file, index, row, trx, etc.).
 - `docs/` contains design notes (architecture, transactions, index, recovery).
-- `doradb-storage/examples/` has runnable benchmarks and demos (e.g., `bench_btree.rs`).
+- `doradb-storage/examples/` has runnable storage demos (e.g., `quick_start.rs`).
 - `target/` is the build output directory.
 
 ## Build, Test, and Development Commands
-- `cargo build -p doradb-storage` builds the storage engine crate.
-- `cargo nextest run -p doradb-storage` runs the standard unit/integration validation pass in the active crate.
-- `cargo nextest run --workspace` runs tests across workspace members (currently just storage).
-- `cargo run -p doradb-storage --example bench_btree` runs a specific example/benchmark.
+- `cargo build --workspace` builds all workspace crates.
+- `cargo nextest run --workspace` runs the standard unit/integration validation pass across workspace members.
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio` validates the alternate storage I/O backend.
+- `cargo run --example quick_start` runs the quick-start storage example.
+- `cargo run -p doradb-bench -- --help` shows the standalone benchmark tool commands.
 - Linux development environments must provide `libaio1` and `libaio-dev`.
 
 ## Coding Style & Naming Conventions

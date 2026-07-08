@@ -24,8 +24,7 @@ use syn::{
 const FMT_COMMAND: &[&str] = &["fmt", "--all", "--", "--check"];
 const CLIPPY_COMMAND: &[&str] = &[
     "clippy",
-    "-p",
-    "doradb-storage",
+    "--workspace",
     "--all-targets",
     "--",
     "-D",
@@ -247,7 +246,7 @@ fn run_branch_diff_audit(repo_root: &Path, diff_base: &str) -> Result<i32, Strin
 
     if let Some(result) = run_cargo_gate(repo_root, CLIPPY_COMMAND)? {
         print_gate_failure(
-            "cargo clippy -p doradb-storage --all-targets -- -D warnings",
+            "cargo clippy --workspace --all-targets -- -D warnings",
             &result,
         );
         return Ok(1);
@@ -271,7 +270,7 @@ fn run_forced_audit(repo_root: &Path, force_paths: &[PathBuf]) -> Result<i32, St
 
     if let Some(result) = run_cargo_gate(repo_root, CLIPPY_COMMAND)? {
         print_gate_failure(
-            "cargo clippy -p doradb-storage --all-targets -- -D warnings",
+            "cargo clippy --workspace --all-targets -- -D warnings",
             &result,
         );
         return Ok(1);
