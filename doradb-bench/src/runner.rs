@@ -460,8 +460,13 @@ async fn lookup_key_batch(
         let select_key = SelectKey::new(0, vec![Val::from(*key)]);
         let lookup = trx
             .exec(async |stmt| {
-                stmt.table_lookup_unique_mvcc(table_id, &select_key, &[0, 1])
-                    .await
+                stmt.table_lookup_unique_mvcc(
+                    table_id,
+                    select_key.index_no,
+                    &select_key.vals,
+                    &[0, 1],
+                )
+                .await
             })
             .await;
         match lookup {
@@ -566,7 +571,7 @@ async fn index_scan_key_batch(
         let select_key = SelectKey::new(0, vec![Val::from(*key)]);
         let scan = trx
             .exec(async |stmt| {
-                stmt.table_index_scan_mvcc(table_id, &select_key, &[0, 1])
+                stmt.table_index_scan_mvcc(table_id, select_key.index_no, &select_key.vals, &[0, 1])
                     .await
             })
             .await;
