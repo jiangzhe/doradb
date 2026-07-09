@@ -17,6 +17,7 @@ use crate::trx::{FatalRollbackRetention, TrxEffects, TrxInner, TrxRuntime};
 use crate::value::Val;
 use error_stack::Report;
 use std::mem;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 /// Mutable effects accumulated by one statement before success or rollback.
@@ -245,8 +246,8 @@ impl<'stmt> Statement<'stmt> {
         })
     }
 
-    /// Disable default DML shape, type, nullability, sparse-update, and key
-    /// validation for this statement.
+    /// Disable default DML shape, type, nullability, sparse-update, key, and
+    /// index-scan validation for this statement.
     ///
     /// Validation is enabled by default. Disable it only when the caller has
     /// already validated full-row payload shape, value types, nullability,
@@ -409,25 +410,59 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Scans one secondary-index key in a catalog-owned user table by table id.
+    /// Looks up one secondary-index key in a catalog-owned user table by table id.
     ///
     /// Strong table-runtime access is internal and operation-local.
     #[inline]
-    pub async fn table_index_scan_mvcc(
+    pub async fn table_index_lookup_mvcc(
         &mut self,
         table_id: TableID,
         index_no: usize,
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
-        let table = self.resolve_user_table(table_id, "table_index_scan_mvcc")?;
+        let table = self.resolve_user_table(table_id, "table_index_lookup_mvcc")?;
         self.acquire_table_read_lock(table_id).await?;
-        table.check_foreground_live("table_index_scan_mvcc")?;
+        table.check_foreground_live("table_index_lookup_mvcc")?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
         table
             .accessor_with_layout(&layout)
-            .index_scan_mvcc(rt, index_no, key_vals, user_read_set)
+            .index_lookup_mvcc(rt, index_no, key_vals, user_read_set)
+            .await
+    }
+
+    /// Scans one secondary-index range in a catalog-owned user table by table id.
+    ///
+    /// Strong table-runtime access is internal and operation-local.
+    #[inline]
+    pub async fn table_index_scan_mvcc<'r, R>(
+        &mut self,
+        table_id: TableID,
+        index_no: usize,
+        range: R,
+        read_set: &[usize],
+    ) -> Result<ScanMvcc>
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        let table = self.resolve_user_table(table_id, "table_index_scan_mvcc")?;
+        self.acquire_table_read_lock(table_id).await?;
+        table.check_foreground_live("table_index_scan_mvcc")?;
+        let layout = table.layout_snapshot();
+        if !self.disable_dml_validation {
+            DmlValidator::new(
+                layout.metadata(),
+                table_id,
+                "table_index_scan_mvcc",
+                DmlValidationDomain::Foreground,
+            )
+            .validate_index_scan(index_no, &range, read_set)?;
+        }
+        let rt = self.runtime();
+        table
+            .accessor_with_layout(&layout)
+            .index_scan_mvcc(rt, index_no, range, read_set)
             .await
     }
 

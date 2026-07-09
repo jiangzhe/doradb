@@ -111,7 +111,7 @@ mod tests {
             let scanned = trx
                 .exec(async |stmt| {
                     let key = SelectKey::new(1, vec![Val::from("bob")]);
-                    stmt.table_index_scan_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
+                    stmt.table_index_lookup_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                         .await
                 })
                 .await

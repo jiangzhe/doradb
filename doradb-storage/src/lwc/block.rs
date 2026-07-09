@@ -1,7 +1,7 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
-use crate::catalog::TableColumnLayout;
+use crate::catalog::{IndexSpec, TableColumnLayout};
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -9,6 +9,7 @@ use crate::file::block_integrity::{
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::id::BlockID;
+use crate::index::{BTreeKeyEncoder, IndexLookupCandidate};
 use crate::layout;
 use crate::lwc::{LwcData, LwcNullBitmap};
 use crate::quiescent::QuiescentGuard;
@@ -372,6 +373,35 @@ impl PersistedLwcBlock {
             self.file_kind,
             self.block_id,
         )
+    }
+
+    /// Validate a secondary-index scan candidate and decode projected row values.
+    #[inline]
+    pub(crate) fn read_index_candidate_row_values(
+        &self,
+        col_layout: &TableColumnLayout,
+        index_spec: &IndexSpec,
+        row_idx: usize,
+        encoder: &BTreeKeyEncoder,
+        candidate: &IndexLookupCandidate,
+        read_set: &[usize],
+    ) -> Result<Option<Vec<Val>>> {
+        let index_read_set = index_spec
+            .cols
+            .iter()
+            .map(|key| key.col_no as usize)
+            .collect::<Vec<_>>();
+        let key_vals = self.decode_row_values(col_layout, row_idx, &index_read_set)?;
+        let encoded = if index_spec.unique() {
+            encoder.encode(&key_vals)
+        } else {
+            encoder.encode_pair(&key_vals, Val::from(candidate.row_id))
+        };
+        if encoded.as_bytes() != candidate.encoded_key.as_bytes() {
+            return Ok(None);
+        }
+        self.decode_row_values(col_layout, row_idx, read_set)
+            .map(Some)
     }
 }
 

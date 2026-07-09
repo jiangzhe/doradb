@@ -57,5 +57,5 @@ pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness,
     SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats,
 };
-pub use trx::{Statement, Transaction};
+pub use trx::{IndexScanMvccStream, Statement, StreamStmt, Transaction};
 pub use value::{MemVar, Val, ValKind, ValType};

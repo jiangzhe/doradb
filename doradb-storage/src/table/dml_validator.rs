@@ -4,6 +4,7 @@ use crate::id::TableID;
 use crate::row::ops::{RowUpdateView, UpdateCol};
 use crate::value::Val;
 use error_stack::Report;
+use std::ops::{Bound, RangeBounds};
 
 /// Error domain used for DML shape/type/nullability validation.
 #[derive(Clone, Copy)]
@@ -37,6 +38,7 @@ pub(crate) struct DmlValidator<'m> {
 }
 
 impl<'m> DmlValidator<'m> {
+    /// Creates a validator for one table and foreground or recovery operation.
     #[inline]
     pub(crate) fn new(
         metadata: &'m TableMetadata,
@@ -144,6 +146,74 @@ impl<'m> DmlValidator<'m> {
             )));
         }
         Ok(index_spec)
+    }
+
+    /// Validates a secondary-index scan request against table metadata.
+    #[inline]
+    pub(crate) fn validate_index_scan<'r, R>(
+        &self,
+        index_no: usize,
+        range: &R,
+        read_set: &[usize],
+    ) -> Result<()>
+    where
+        R: RangeBounds<&'r [Val]> + ?Sized,
+    {
+        let Some(index_spec) = self.metadata.idx.index_spec(index_no) else {
+            return Err(self.domain.error(format!(
+                "{} index not found: index_no={}, index_slot_count={}",
+                self.context(),
+                index_no,
+                self.metadata.idx.index_slot_count()
+            )));
+        };
+        self.validate_index_bound(index_no, index_spec, range.start_bound())?;
+        self.validate_index_bound(index_no, index_spec, range.end_bound())?;
+        self.validate_read_set(read_set)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_index_bound(
+        &self,
+        index_no: usize,
+        index_spec: &IndexSpec,
+        bound: Bound<&&[Val]>,
+    ) -> Result<()> {
+        match bound {
+            Bound::Unbounded => Ok(()),
+            Bound::Included(vals) | Bound::Excluded(vals) => {
+                self.validate_index_values(index_no, index_spec, vals)
+            }
+        }
+    }
+
+    #[inline]
+    fn validate_read_set(&self, read_set: &[usize]) -> Result<()> {
+        if read_set.is_empty() {
+            return Err(self
+                .domain
+                .error(format!("{} read set must not be empty", self.context())));
+        }
+        let mut last = None;
+        for col_no in read_set {
+            if *col_no >= self.metadata.col.col_count() {
+                return Err(self.domain.error(format!(
+                    "{} read column out of range: column_no={}, column_count={}",
+                    self.context(),
+                    col_no,
+                    self.metadata.col.col_count()
+                )));
+            }
+            if last.is_some_and(|last| *col_no <= last) {
+                return Err(self.domain.error(format!(
+                    "{} read columns not strictly ordered: column_no={col_no}",
+                    self.context()
+                )));
+            }
+            last = Some(*col_no);
+        }
+        Ok(())
     }
 
     /// Validates a primary-key DML key against table metadata.

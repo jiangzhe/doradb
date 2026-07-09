@@ -3414,7 +3414,7 @@ mod tests {
             let rows = trx
                 .exec(async |stmt| {
                     Ok(stmt
-                        .table_index_scan_mvcc(
+                        .table_index_lookup_mvcc(
                             table.table_id(),
                             name_key.index_no,
                             &name_key.vals,

@@ -17,8 +17,8 @@ use std::process::{Command, Stdio, exit};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Fields, ImplItem, Item, ItemImpl, ItemMod, ItemTrait, ItemUse, Path as SynPath,
-    TraitItem, Type, UseTree, Visibility,
+    Attribute, Fields, GenericParam, Generics, ImplItem, Item, ItemImpl, ItemMod, ItemTrait,
+    ItemUse, Path as SynPath, TraitItem, Type, UseTree, Visibility,
 };
 
 const FMT_COMMAND: &[&str] = &["fmt", "--all", "--", "--check"];
@@ -125,13 +125,76 @@ impl<'ast> Visit<'ast> for TestImportScopeVisitor<'_> {
 struct QualifiedPathVisitor<'a> {
     file_path: &'a str,
     seen: BTreeSet<(usize, String)>,
+    generic_type_params: Vec<BTreeSet<String>>,
     violations: Vec<Violation>,
 }
 
+impl QualifiedPathVisitor<'_> {
+    fn with_generic_type_params<F>(&mut self, generics: &Generics, visit: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let params = generics
+            .params
+            .iter()
+            .filter_map(|param| match param {
+                GenericParam::Type(type_param) => Some(type_param.ident.to_string()),
+                GenericParam::Const(_) | GenericParam::Lifetime(_) => None,
+            })
+            .collect();
+        self.generic_type_params.push(params);
+        visit(self);
+        self.generic_type_params.pop();
+    }
+
+    fn path_is_associated_type_rooted(&self, path: &SynPath) -> bool {
+        let Some(root) = path.segments.first().map(|segment| segment.ident.to_string()) else {
+            return false;
+        };
+        root == "Self"
+            || self
+                .generic_type_params
+                .iter()
+                .rev()
+                .any(|params| params.contains(&root))
+            || root.chars().next().is_some_and(char::is_uppercase)
+    }
+}
+
 impl<'ast> Visit<'ast> for QualifiedPathVisitor<'_> {
+    fn visit_item_fn(&mut self, item_fn: &'ast syn::ItemFn) {
+        self.with_generic_type_params(&item_fn.sig.generics, |this| {
+            visit::visit_item_fn(this, item_fn);
+        });
+    }
+
+    fn visit_item_impl(&mut self, item_impl: &'ast ItemImpl) {
+        self.with_generic_type_params(&item_impl.generics, |this| {
+            visit::visit_item_impl(this, item_impl);
+        });
+    }
+
+    fn visit_item_trait(&mut self, item_trait: &'ast ItemTrait) {
+        self.with_generic_type_params(&item_trait.generics, |this| {
+            visit::visit_item_trait(this, item_trait);
+        });
+    }
+
+    fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+        self.with_generic_type_params(&method.sig.generics, |this| {
+            visit::visit_impl_item_fn(this, method);
+        });
+    }
+
+    fn visit_trait_item_fn(&mut self, method: &'ast syn::TraitItemFn) {
+        self.with_generic_type_params(&method.sig.generics, |this| {
+            visit::visit_trait_item_fn(this, method);
+        });
+    }
+
     fn visit_path(&mut self, path: &'ast SynPath) {
         let separators = path.segments.len().saturating_sub(1);
-        if separators > 1 {
+        if separators > 1 && !self.path_is_associated_type_rooted(path) {
             let line = span_line(path.span());
             let path_text = path
                 .segments
@@ -1131,6 +1194,7 @@ fn check_qualified_paths(path: &str, items: &[Item], out: &mut Vec<Violation>) {
     let mut visitor = QualifiedPathVisitor {
         file_path: path,
         seen: BTreeSet::new(),
+        generic_type_params: Vec::new(),
         violations: Vec::new(),
     };
     for item in items {

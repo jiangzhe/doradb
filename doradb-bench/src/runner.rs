@@ -571,8 +571,13 @@ async fn index_scan_key_batch(
         let select_key = SelectKey::new(0, vec![Val::from(*key)]);
         let scan = trx
             .exec(async |stmt| {
-                stmt.table_index_scan_mvcc(table_id, select_key.index_no, &select_key.vals, &[0, 1])
-                    .await
+                stmt.table_index_lookup_mvcc(
+                    table_id,
+                    select_key.index_no,
+                    &select_key.vals,
+                    &[0, 1],
+                )
+                .await
             })
             .await;
         match scan {
