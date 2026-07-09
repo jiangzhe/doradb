@@ -2241,7 +2241,7 @@ impl<'a> UserTableAccessor<'a> {
         let root = self.read_proof_secondary_root(rt, index_no)?;
         let mut res = vec![];
         let index = self.require_non_unique_index(rt.pool_guards(), index_no, root)?;
-        let mut stream = index.equal_scan_row_ids(key_vals, rt.sts())?;
+        let mut stream = index.equal_scan_row_id_candidates(key_vals, rt.sts())?;
         while let Some(row_ids) = stream.next_batch().await? {
             for row_id in row_ids {
                 match self
@@ -3460,7 +3460,7 @@ mod tests {
             let trx = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(&table, &pool_guards, key.index_no);
+            let index = bound_unique_index(&table, &pool_guards, key.index_no);
             let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
 
             let snapshot = column_block_index_snapshot(&engine, table_id);
@@ -4375,7 +4375,7 @@ mod tests {
             reader.commit().await.unwrap();
 
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 claimed_key.index_no,
@@ -4492,7 +4492,7 @@ mod tests {
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,
@@ -5380,7 +5380,7 @@ mod tests {
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,

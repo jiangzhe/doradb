@@ -26,8 +26,8 @@ use std::ops::{Deref, RangeBounds};
 
 /// Abstraction of non-unique index.
 pub(crate) trait NonUniqueIndex: Send + Sync {
-    /// Row-id stream returned by bounded non-unique-index scans.
-    type RowIdStream<'a>: IndexBatchStream<RowID> + 'a
+    /// Candidate row-id stream returned by bounded non-unique-index scans.
+    type RowIdCandidateStream<'a>: IndexBatchStream<RowID> + 'a
     where
         Self: 'a;
 
@@ -93,17 +93,34 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
     fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = Result<()>>;
 
-    /// Scan candidate row ids over a bounded logical-key range.
+    /// Scan row-id candidates over a bounded logical-key range.
+    ///
+    /// Returned row ids are index-derived candidates for MVCC lookup, not
+    /// visibility-confirmed rows. The stream must return unmasked row ids even
+    /// when an in-memory delete-shadow entry is encountered; row-version and
+    /// column-deletion-buffer checks decide whether a candidate is visible.
+    /// Hot in-memory entries shadow equal cold DiskTree entries.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "reserved non-unique row-id range stream")
+        expect(
+            dead_code,
+            reason = "reserved non-unique row-id candidate range stream"
+        )
     )]
-    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    fn scan_row_id_candidates<'a, 'r, R>(
+        &'a self,
+        range: R,
+        ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>>
     where
         R: RangeBounds<&'r [Val]> + Clone;
 
-    /// Scan candidate row ids equal to one logical secondary key.
-    fn equal_scan_row_ids<'a>(&'a self, key: &[Val], ts: TrxID) -> Result<Self::RowIdStream<'a>>;
+    /// Scan row-id candidates equal to one logical secondary key.
+    fn equal_scan_row_id_candidates<'a>(
+        &'a self,
+        key: &[Val],
+        ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>>;
 }
 
 /// Generic non-unique-index implementation backed by a generic B-Tree.
@@ -354,7 +371,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
 }
 
 impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
-    type RowIdStream<'a>
+    type RowIdCandidateStream<'a>
         = NonUniqueMemIndexBatchStream<'a, P>
     where
         Self: 'a;
@@ -488,7 +505,11 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, _ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    fn scan_row_id_candidates<'a, 'r, R>(
+        &'a self,
+        range: R,
+        _ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>>
     where
         R: RangeBounds<&'r [Val]> + Clone,
     {
@@ -500,7 +521,11 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn equal_scan_row_ids<'a>(&'a self, key: &[Val], _ts: TrxID) -> Result<Self::RowIdStream<'a>> {
+    fn equal_scan_row_id_candidates<'a>(
+        &'a self,
+        key: &[Val],
+        _ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>> {
         let range = self.index.encoder().encode_non_unique_equal_range(key);
         Ok(NonUniqueMemIndexBatchStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
@@ -528,9 +553,9 @@ struct CollectRowID<'a>(&'a mut Vec<RowID>);
 impl BTreeSlotCallback for CollectRowID<'_> {
     #[inline]
     fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool> {
-        // todo: with covering index support, we may further skip deleted row ids.
+        // todo: with covering index support, we may skip deleted entries.
         let value = node.unpack_value::<BTreeU64>(slot);
-        // The result collection may contains deleted row id.
+        // The result collection may contain row ids from deleted entries.
         self.0.push(value.to_row_id());
         Ok(true)
     }
@@ -640,15 +665,20 @@ mod tests {
                     .unwrap()
             );
 
-            let mut equal = guarded.equal_scan_row_ids(&key1, TrxID::new(102)).unwrap();
-            assert_eq!(drain_row_ids(&mut equal).await, vec![RowID::new(10)]);
+            let mut equal = guarded
+                .equal_scan_row_id_candidates(&key1, TrxID::new(102))
+                .unwrap();
+            assert_eq!(
+                drain_row_ids(&mut equal).await,
+                vec![RowID::new(10), RowID::new(11)]
+            );
 
             let mut range = guarded
-                .scan_row_ids(&key1[..]..&key3[..], TrxID::new(103))
+                .scan_row_id_candidates(&key1[..]..&key3[..], TrxID::new(103))
                 .unwrap();
             assert_eq!(
                 drain_row_ids(&mut range).await,
-                vec![RowID::new(10), RowID::new(20)]
+                vec![RowID::new(10), RowID::new(11), RowID::new(20)]
             );
         })
     }

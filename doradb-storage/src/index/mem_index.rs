@@ -126,11 +126,9 @@ impl MemIndexEntryScanSpec for UniqueMemIndexEntryScanSpec {
         slot_idx: usize,
         entries: &mut Vec<MemIndexEntry>,
     ) -> Result<()> {
-        let encoded_key = node.btree_key_checked(slot_idx).ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={slot_idx}")),
-            )
-        })?;
+        let encoded_key = node
+            .btree_key_checked(slot_idx)
+            .ok_or_else(|| index_key_missing(slot_idx))?;
         let value = node.value::<BTreeU64>(slot_idx);
         entries.push(MemIndexEntry {
             encoded_key,
@@ -271,11 +269,9 @@ where
                 batch.skipped_live += 1;
                 continue;
             }
-            let encoded_key = node.btree_key_checked(idx).ok_or_else(|| {
-                Error::from(
-                    Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={idx}")),
-                )
-            })?;
+            let encoded_key = node
+                .btree_key_checked(idx)
+                .ok_or_else(|| index_key_missing(idx))?;
             batch.entries.push(MemIndexEntry {
                 encoded_key,
                 row_id: slot.row_id,
@@ -311,4 +307,9 @@ pub(crate) fn push_non_unique_encoded_entry(
         deleted: value.is_deleted(),
     });
     Ok(())
+}
+
+#[inline]
+fn index_key_missing(slot_idx: usize) -> Error {
+    Error::from(Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={slot_idx}")))
 }

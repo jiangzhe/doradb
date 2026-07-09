@@ -586,7 +586,7 @@ mod tests {
             ));
 
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,
@@ -691,7 +691,7 @@ mod tests {
 
             let reader = session.begin_trx().unwrap();
             let pool_guards = session.pool_guards();
-            let old_row_id = bound_unique_index_no(
+            let old_row_id = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 live_key.index_no,
@@ -710,7 +710,7 @@ mod tests {
                 RowLocation::RowPage(_)
             ));
 
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 stale_key.index_no,

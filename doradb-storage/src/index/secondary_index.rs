@@ -404,7 +404,7 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
 }
 
 impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
-    type RowIdStream<'a>
+    type RowIdCandidateStream<'a>
         = SecondaryIndexBatchStream<UniqueMemIndexEntryStream<'a, P>, UniqueDiskTreeEntryStream<'a>>
     where
         Self: 'a;
@@ -490,13 +490,17 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, _ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    fn scan_row_id_candidates<'a, 'r, R>(
+        &'a self,
+        range: R,
+        _ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>>
     where
         R: RangeBounds<&'r [Val]> + Clone,
     {
         let mem = self.mem.scan_encoded_entry_stream(range.clone())?;
         let disk = self.open()?.scan_entry_stream(range);
-        Ok(SecondaryIndexBatchStream::unique(mem, disk))
+        Ok(SecondaryIndexBatchStream::new(mem, disk))
     }
 
     #[inline]
@@ -543,7 +547,7 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
 }
 
 impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
-    type RowIdStream<'a>
+    type RowIdCandidateStream<'a>
         = SecondaryIndexBatchStream<
         NonUniqueMemIndexEntryStream<'a, P>,
         NonUniqueDiskTreeEntryStream<'a>,
@@ -634,20 +638,28 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, _ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    fn scan_row_id_candidates<'a, 'r, R>(
+        &'a self,
+        range: R,
+        _ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>>
     where
         R: RangeBounds<&'r [Val]> + Clone,
     {
         let mem = self.mem.scan_encoded_entry_stream(range.clone())?;
         let disk = self.open()?.scan_entry_stream(range);
-        Ok(SecondaryIndexBatchStream::non_unique(mem, disk))
+        Ok(SecondaryIndexBatchStream::new(mem, disk))
     }
 
     #[inline]
-    fn equal_scan_row_ids<'a>(&'a self, key: &[Val], _ts: TrxID) -> Result<Self::RowIdStream<'a>> {
+    fn equal_scan_row_id_candidates<'a>(
+        &'a self,
+        key: &[Val],
+        _ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>> {
         let mem = self.mem.equal_scan_encoded_entry_stream(key)?;
         let disk = self.open()?.equal_scan_entry_stream(key);
-        Ok(SecondaryIndexBatchStream::non_unique(mem, disk))
+        Ok(SecondaryIndexBatchStream::new(mem, disk))
     }
 
     #[inline]
@@ -660,17 +672,10 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SecondaryIndexBatchMode {
-    Unique,
-    NonUnique,
-}
-
-/// Incremental row-id stream over a MemIndex/DiskTree pair.
+/// Incremental row-id candidate stream over a MemIndex/DiskTree pair.
 pub(crate) struct SecondaryIndexBatchStream<M, D> {
     mem: M,
     disk: D,
-    mode: SecondaryIndexBatchMode,
     mem_buf: Vec<MemIndexEntry>,
     mem_idx: usize,
     mem_done: bool,
@@ -685,21 +690,10 @@ where
     D: IndexBatchStream<DiskTreeEntry>,
 {
     #[inline]
-    fn unique(mem: M, disk: D) -> Self {
-        Self::new(mem, disk, SecondaryIndexBatchMode::Unique)
-    }
-
-    #[inline]
-    fn non_unique(mem: M, disk: D) -> Self {
-        Self::new(mem, disk, SecondaryIndexBatchMode::NonUnique)
-    }
-
-    #[inline]
-    fn new(mem: M, disk: D, mode: SecondaryIndexBatchMode) -> Self {
+    fn new(mem: M, disk: D) -> Self {
         Self {
             mem,
             disk,
-            mode,
             mem_buf: Vec::new(),
             mem_idx: 0,
             mem_done: false,
@@ -761,17 +755,7 @@ where
 
     #[inline]
     fn push_mem(&mut self, out: &mut Vec<RowID>) {
-        match self.mode {
-            SecondaryIndexBatchMode::Unique => {
-                out.push(self.mem_buf[self.mem_idx].row_id);
-            }
-            SecondaryIndexBatchMode::NonUnique => {
-                let mem = &self.mem_buf[self.mem_idx];
-                if !mem.deleted {
-                    out.push(mem.row_id);
-                }
-            }
-        }
+        out.push(self.mem_buf[self.mem_idx].row_id.value());
         self.mem_idx += 1;
     }
 
@@ -1287,7 +1271,7 @@ mod tests {
                 ]
             );
             let mut stream = bound
-                .scan_row_ids(&key2[..]..=&key5[..], TrxID::new(8))
+                .scan_row_id_candidates(&key2[..]..=&key5[..], TrxID::new(8))
                 .unwrap();
             assert_eq!(
                 drain_row_ids(&mut stream).await,
@@ -1549,19 +1533,23 @@ mod tests {
             let mut values = Vec::new();
             bound.scan_values(&mut values, TrxID::new(8)).await.unwrap();
             assert_eq!(values, test_row_ids([10, 11, 12, 13, 30]));
-            let mut key1_stream = bound.equal_scan_row_ids(&key1, TrxID::new(8)).unwrap();
+            let mut key1_stream = bound
+                .equal_scan_row_id_candidates(&key1, TrxID::new(8))
+                .unwrap();
             assert_eq!(
                 drain_row_ids(&mut key1_stream).await,
                 test_row_ids([10, 11, 12, 13])
             );
-            let mut key2_stream = bound.equal_scan_row_ids(&key2, TrxID::new(8)).unwrap();
-            assert!(drain_row_ids(&mut key2_stream).await.is_empty());
+            let mut key2_stream = bound
+                .equal_scan_row_id_candidates(&key2, TrxID::new(8))
+                .unwrap();
+            assert_eq!(drain_row_ids(&mut key2_stream).await, test_row_ids([20]));
             let mut range_stream = bound
-                .scan_row_ids(&key1[..]..=&key3[..], TrxID::new(8))
+                .scan_row_id_candidates(&key1[..]..=&key3[..], TrxID::new(8))
                 .unwrap();
             assert_eq!(
                 drain_row_ids(&mut range_stream).await,
-                test_row_ids([10, 11, 12, 13, 30])
+                test_row_ids([10, 11, 12, 13, 20, 30])
             );
 
             let unchanged_disk = disk_runtime.open(root, &disk_guard);
@@ -1577,6 +1565,211 @@ mod tests {
                     .unwrap(),
                 test_row_ids([20])
             );
+        });
+    }
+
+    #[test]
+    fn test_secondary_index_batch_stream_early_drop_releases_sources() {
+        smol::block_on(async {
+            {
+                let (_temp_dir, fs) = build_test_fs();
+                let metadata = metadata_with_indexes();
+                let table = fs
+                    .create_table_file(test_user_table_id(615), Arc::clone(&metadata), false)
+                    .unwrap();
+                let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+                drop(old_root);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, test_user_table_id(615), &table);
+                let disk_guard = disk_pool.pool_guard();
+                let mut mutable = MutableTableFile::fork(
+                    &table,
+                    fs.background_writes(),
+                    disk_pool.global_pool().clone(),
+                );
+                let disk_runtime = unique_runtime!(metadata, disk_pool);
+                let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+                let key1 = [Val::from(1u32)];
+                let key2 = [Val::from(2u32)];
+                let key3 = [Val::from(3u32)];
+                let key4 = [Val::from(4u32)];
+                let key5 = [Val::from(5u32)];
+                let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));
+                let puts = [
+                    UniqueDiskTreePut {
+                        key: &key1,
+                        row_id: RowID::new(10),
+                    },
+                    UniqueDiskTreePut {
+                        key: &key2,
+                        row_id: RowID::new(20),
+                    },
+                    UniqueDiskTreePut {
+                        key: &key3,
+                        row_id: RowID::new(30),
+                    },
+                    UniqueDiskTreePut {
+                        key: &key4,
+                        row_id: RowID::new(40),
+                    },
+                ];
+                let encoded_puts = encode_unique_puts(&puts);
+                writer
+                    .batch_put_encoded(&unique_put_refs(&encoded_puts))
+                    .unwrap();
+                let root = writer.finish().await.unwrap();
+                let table = publish_secondary_root(mutable, 0, root, TrxID::new(2)).await;
+
+                let index_pool = QuiescentBox::new(
+                    FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
+                );
+                let index_guard = (*index_pool).pool_guard();
+                let mem = unique_mem_index(&index_pool, &index_guard).await;
+                assert!(
+                    mem.bind(&index_guard)
+                        .insert_if_not_exists(&key1, RowID::new(100), false, TrxID::new(3))
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                let runtime = SecondaryDiskTreeRuntime::new(
+                    0,
+                    Arc::clone(&metadata),
+                    Arc::clone(&table),
+                    disk_pool.global_pool().clone(),
+                )
+                .unwrap();
+                let index = SecondaryIndex::Unique { mem, disk: runtime };
+                let pool_guards = PoolGuards::builder()
+                    .push(PoolRole::Index, (*index_pool).pool_guard())
+                    .push(PoolRole::Disk, disk_pool.pool_guard())
+                    .build();
+                let bound = index.bind_unique(&pool_guards, root).unwrap();
+
+                let mut stream = bound
+                    .scan_row_id_candidates(&key1[..]..=&key4[..], TrxID::new(4))
+                    .unwrap();
+                assert_eq!(
+                    stream.next_batch().await.unwrap(),
+                    Some(test_row_ids([100]))
+                );
+                drop(stream);
+
+                assert_eq!(
+                    bound.lookup(&key2, TrxID::new(5)).await.unwrap(),
+                    Some((RowID::new(20), false))
+                );
+                assert!(
+                    bound
+                        .insert_if_not_exists(&key5, RowID::new(50), false, TrxID::new(6))
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                let mut fresh = bound
+                    .scan_row_id_candidates(&key1[..]..=&key5[..], TrxID::new(7))
+                    .unwrap();
+                assert_eq!(
+                    drain_row_ids(&mut fresh).await,
+                    test_row_ids([100, 20, 30, 40, 50])
+                );
+            }
+
+            {
+                let (_temp_dir, fs) = build_test_fs();
+                let metadata = metadata_with_indexes();
+                let table = fs
+                    .create_table_file(test_user_table_id(616), Arc::clone(&metadata), false)
+                    .unwrap();
+                let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+                drop(old_root);
+                let global = global_readonly_pool_scope(64 * 1024 * 1024);
+                let disk_pool = table_readonly_pool(&global, test_user_table_id(616), &table);
+                let disk_guard = disk_pool.pool_guard();
+                let mut mutable = MutableTableFile::fork(
+                    &table,
+                    fs.background_writes(),
+                    disk_pool.global_pool().clone(),
+                );
+                let disk_runtime = non_unique_runtime!(metadata, disk_pool);
+                let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+                let key1 = [Val::from(1u32)];
+                let key2 = [Val::from(2u32)];
+                let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));
+                let entries = [
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: RowID::new(10),
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: RowID::new(11),
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key2,
+                        row_id: RowID::new(20),
+                    },
+                ];
+                let encoded_entries = encode_non_unique_exact(&entries);
+                writer
+                    .batch_insert_encoded(&non_unique_exact_refs(&encoded_entries))
+                    .unwrap();
+                let root = writer.finish().await.unwrap();
+                let table = publish_secondary_root(mutable, 1, root, TrxID::new(2)).await;
+
+                let index_pool = QuiescentBox::new(
+                    FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
+                );
+                let index_guard = (*index_pool).pool_guard();
+                let mem = non_unique_mem_index(&index_pool, &index_guard).await;
+                assert!(
+                    mem.bind(&index_guard)
+                        .insert_if_not_exists(&key1, RowID::new(12), false, TrxID::new(3))
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                let runtime = SecondaryDiskTreeRuntime::new(
+                    1,
+                    Arc::clone(&metadata),
+                    Arc::clone(&table),
+                    disk_pool.global_pool().clone(),
+                )
+                .unwrap();
+                let index = SecondaryIndex::NonUnique { mem, disk: runtime };
+                let pool_guards = PoolGuards::builder()
+                    .push(PoolRole::Index, (*index_pool).pool_guard())
+                    .push(PoolRole::Disk, disk_pool.pool_guard())
+                    .build();
+                let bound = index.bind_non_unique(&pool_guards, root).unwrap();
+
+                let mut stream = bound
+                    .equal_scan_row_id_candidates(&key1, TrxID::new(4))
+                    .unwrap();
+                assert_eq!(
+                    stream.next_batch().await.unwrap(),
+                    Some(test_row_ids([10, 11]))
+                );
+                drop(stream);
+
+                assert!(
+                    bound
+                        .insert_if_not_exists(&key1, RowID::new(13), false, TrxID::new(5))
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                let mut rows = Vec::new();
+                bound.lookup(&key1, &mut rows, TrxID::new(6)).await.unwrap();
+                assert_eq!(rows, test_row_ids([10, 11, 12, 13]));
+                let mut fresh = bound
+                    .equal_scan_row_id_candidates(&key1, TrxID::new(7))
+                    .unwrap();
+                assert_eq!(
+                    drain_row_ids(&mut fresh).await,
+                    test_row_ids([10, 11, 12, 13])
+                );
+            }
         });
     }
 

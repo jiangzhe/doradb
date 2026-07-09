@@ -1113,21 +1113,19 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, Result};
-    use crate::id::{BlockID, RowID, TableID};
-    use crate::index::{
-        IndexBatchStream, IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex,
-    };
+    use crate::id::{RowID, TableID};
+    use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::{DeleteMvcc, SelectKey};
-    use crate::table::{DeleteMarker, Table, TableRedoReplayFloor};
+    use crate::table::tests::bound_unique_index;
+    use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::row::RowReadAccess;
     use crate::trx::stmt::Statement;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus};
     use crate::value::Val;
     use smol::Timer;
-    use std::ops::{Bound, RangeBounds};
     use std::sync::Arc;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
@@ -1141,194 +1139,6 @@ mod tests {
             .push(PoolRole::Mem, engine.inner().mem_pool.pool_guard())
             .push(PoolRole::Disk, engine.inner().disk_pool.pool_guard())
             .build()
-    }
-
-    #[inline]
-    fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
-        table.file().active_root_unchecked().secondary_index_roots[index_no]
-    }
-
-    type OwnedValueBound = Bound<Vec<Val>>;
-    type OwnedValueRange = (OwnedValueBound, OwnedValueBound);
-
-    #[inline]
-    fn owned_bound_from_ref(bound: Bound<&[Val]>) -> OwnedValueBound {
-        match bound {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(vals) => Bound::Included(vals.to_vec()),
-            Bound::Excluded(vals) => Bound::Excluded(vals.to_vec()),
-        }
-    }
-
-    #[inline]
-    fn owned_bound_as_ref(bound: &OwnedValueBound) -> Bound<&[Val]> {
-        match bound {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(vals) => Bound::Included(vals.as_slice()),
-            Bound::Excluded(vals) => Bound::Excluded(vals.as_slice()),
-        }
-    }
-
-    #[inline]
-    fn value_slice_bound<'r>(bound: Bound<&&'r [Val]>) -> Bound<&'r [Val]> {
-        bound.map(|vals| *vals)
-    }
-
-    #[inline]
-    fn owned_range_from_ref<'r, R>(range: &R) -> OwnedValueRange
-    where
-        R: RangeBounds<&'r [Val]>,
-    {
-        (
-            owned_bound_from_ref(value_slice_bound(range.start_bound())),
-            owned_bound_from_ref(value_slice_bound(range.end_bound())),
-        )
-    }
-
-    #[inline]
-    fn owned_range_as_ref(range: &OwnedValueRange) -> (Bound<&[Val]>, Bound<&[Val]>) {
-        (owned_bound_as_ref(&range.0), owned_bound_as_ref(&range.1))
-    }
-
-    struct BoundUniqueIndexBatchStream<'a> {
-        table: &'a Table,
-        guards: &'a PoolGuards,
-        index_no: usize,
-        root: BlockID,
-        range: OwnedValueRange,
-        ts: TrxID,
-        done: bool,
-    }
-
-    impl IndexBatchStream<RowID> for BoundUniqueIndexBatchStream<'_> {
-        #[inline]
-        async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
-            if self.done {
-                return Ok(None);
-            }
-            self.done = true;
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            let bound = index.bind_unique(self.guards, self.root)?;
-            let mut stream = bound.scan_row_ids(owned_range_as_ref(&self.range), self.ts)?;
-            let mut row_ids = Vec::new();
-            while let Some(batch) = stream.next_batch().await? {
-                row_ids.extend(batch);
-            }
-            Ok((!row_ids.is_empty()).then_some(row_ids))
-        }
-    }
-
-    struct BoundUniqueIndexNo<'a> {
-        table: &'a Table,
-        guards: &'a PoolGuards,
-        index_no: usize,
-        root: BlockID,
-    }
-
-    impl UniqueIndex for BoundUniqueIndexNo<'_> {
-        type RowIdStream<'a>
-            = BoundUniqueIndexBatchStream<'a>
-        where
-            Self: 'a;
-
-        #[inline]
-        async fn lookup(&self, key: &[Val], ts: TrxID) -> Result<Option<(RowID, bool)>> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .lookup(key, ts)
-                .await
-        }
-
-        #[inline]
-        async fn insert_if_not_exists(
-            &self,
-            key: &[Val],
-            row_id: RowID,
-            merge_if_match_deleted: bool,
-            ts: TrxID,
-        ) -> Result<IndexInsert> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
-                .await
-        }
-
-        #[inline]
-        async fn compare_delete(
-            &self,
-            key: &[Val],
-            old_row_id: RowID,
-            ignore_del_mask: bool,
-            ts: TrxID,
-        ) -> Result<bool> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .compare_delete(key, old_row_id, ignore_del_mask, ts)
-                .await
-        }
-
-        #[inline]
-        async fn compare_exchange(
-            &self,
-            key: &[Val],
-            old_row_id: RowID,
-            new_row_id: RowID,
-            ts: TrxID,
-        ) -> Result<IndexCompareExchange> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .compare_exchange(key, old_row_id, new_row_id, ts)
-                .await
-        }
-
-        #[inline]
-        fn scan_row_ids<'a, 'r, R>(&'a self, range: R, ts: TrxID) -> Result<Self::RowIdStream<'a>>
-        where
-            R: RangeBounds<&'r [Val]> + Clone,
-        {
-            Ok(BoundUniqueIndexBatchStream {
-                table: self.table,
-                guards: self.guards,
-                index_no: self.index_no,
-                root: self.root,
-                range: owned_range_from_ref(&range),
-                ts,
-                done: false,
-            })
-        }
-
-        #[inline]
-        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .scan_values(values, ts)
-                .await
-        }
-    }
-
-    #[inline]
-    fn bound_unique_index_no<'a>(
-        table: &'a Table,
-        guards: &'a PoolGuards,
-        index_no: usize,
-    ) -> BoundUniqueIndexNo<'a> {
-        BoundUniqueIndexNo {
-            table,
-            guards,
-            index_no,
-            root: active_secondary_root(table, index_no),
-        }
     }
 
     async fn stmt_insert_row(
@@ -1737,7 +1547,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1001i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -1821,7 +1631,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1002i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -1909,7 +1719,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1003i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -2016,7 +1826,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1004i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -2270,7 +2080,7 @@ mod tests {
                 // see which one is not purged, and its cts.
                 let table = engine.catalog().get_table(table_id).await.unwrap();
                 let pool_guards = full_pool_guards(&engine);
-                let index = bound_unique_index_no(&table, &pool_guards, 0);
+                let index = bound_unique_index(&table, &pool_guards, 0);
                 let mut remained_row_ids = vec![];
                 index
                     .scan_values(&mut remained_row_ids, TrxID::new(100))

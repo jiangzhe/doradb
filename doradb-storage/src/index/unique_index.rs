@@ -24,8 +24,8 @@ use std::ops::{Deref, RangeBounds};
 
 /// Abstraction of unique index.
 pub(crate) trait UniqueIndex: Send + Sync {
-    /// Row-id stream returned by bounded unique-index scans.
-    type RowIdStream<'a>: IndexBatchStream<RowID> + 'a
+    /// Candidate row-id stream returned by bounded unique-index scans.
+    type RowIdCandidateStream<'a>: IndexBatchStream<RowID> + 'a
     where
         Self: 'a;
 
@@ -34,9 +34,22 @@ pub(crate) trait UniqueIndex: Send + Sync {
     fn lookup(&self, key: &[Val], ts: TrxID)
     -> impl Future<Output = Result<Option<(RowID, bool)>>>;
 
-    /// Scan candidate row ids over a bounded logical-key range.
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved unique row-id stream"))]
-    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    /// Scan row-id candidates over a bounded logical-key range.
+    ///
+    /// Returned row ids are index-derived candidates for MVCC lookup, not
+    /// visibility-confirmed rows. The stream must return unmasked row ids even
+    /// when an in-memory delete-shadow entry is encountered; row-version and
+    /// column-deletion-buffer checks decide whether a candidate is visible.
+    /// Hot in-memory entries shadow equal cold DiskTree entries.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved unique row-id candidate stream")
+    )]
+    fn scan_row_id_candidates<'a, 'r, R>(
+        &'a self,
+        range: R,
+        ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>>
     where
         R: RangeBounds<&'r [Val]> + Clone;
 
@@ -296,7 +309,7 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
 }
 
 impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
-    type RowIdStream<'a>
+    type RowIdCandidateStream<'a>
         = UniqueMemIndexBatchStream<'a, P>
     where
         Self: 'a;
@@ -406,7 +419,11 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_ids<'a, 'r, R>(&'a self, range: R, _ts: TrxID) -> Result<Self::RowIdStream<'a>>
+    fn scan_row_id_candidates<'a, 'r, R>(
+        &'a self,
+        range: R,
+        _ts: TrxID,
+    ) -> Result<Self::RowIdCandidateStream<'a>>
     where
         R: RangeBounds<&'r [Val]> + Clone,
     {
@@ -527,7 +544,7 @@ mod tests {
             }
 
             let mut stream = guarded
-                .scan_row_ids(
+                .scan_row_id_candidates(
                     &[Val::from(2i32)][..]..&[Val::from(4i32)][..],
                     TrxID::new(101),
                 )
@@ -537,7 +554,7 @@ mod tests {
                 vec![RowID::new(20), RowID::new(30)]
             );
 
-            let mut stream = guarded.scan_row_ids(.., TrxID::new(102)).unwrap();
+            let mut stream = guarded.scan_row_id_candidates(.., TrxID::new(102)).unwrap();
             assert!(stream.next_batch().await.unwrap().is_some());
             drop(stream);
             assert_eq!(

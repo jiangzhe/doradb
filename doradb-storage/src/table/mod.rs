@@ -2390,7 +2390,7 @@ pub(crate) mod tests {
         (owned_bound_as_ref(&range.0), owned_bound_as_ref(&range.1))
     }
 
-    enum OwnedNonUniqueRowIdScan {
+    enum OwnedNonUniqueRowIdCandidateScan {
         Range(OwnedValueRange),
         Equal(Vec<Val>),
     }
@@ -2414,7 +2414,8 @@ pub(crate) mod tests {
             self.done = true;
             let index = self.layout.secondary_index(self.index_no)?;
             let bound = index.bind_unique(self.guards, self.root)?;
-            let mut stream = bound.scan_row_ids(owned_range_as_ref(&self.range), self.ts)?;
+            let mut stream =
+                bound.scan_row_id_candidates(owned_range_as_ref(&self.range), self.ts)?;
             let mut row_ids = Vec::new();
             while let Some(batch) = stream.next_batch().await? {
                 row_ids.extend(batch);
@@ -2428,7 +2429,7 @@ pub(crate) mod tests {
         guards: &'a PoolGuards,
         index_no: usize,
         root: BlockID,
-        scan: OwnedNonUniqueRowIdScan,
+        scan: OwnedNonUniqueRowIdCandidateScan,
         ts: TrxID,
         done: bool,
     }
@@ -2443,10 +2444,12 @@ pub(crate) mod tests {
             let index = self.layout.secondary_index(self.index_no)?;
             let bound = index.bind_non_unique(self.guards, self.root)?;
             let mut stream = match &self.scan {
-                OwnedNonUniqueRowIdScan::Range(range) => {
-                    bound.scan_row_ids(owned_range_as_ref(range), self.ts)?
+                OwnedNonUniqueRowIdCandidateScan::Range(range) => {
+                    bound.scan_row_id_candidates(owned_range_as_ref(range), self.ts)?
                 }
-                OwnedNonUniqueRowIdScan::Equal(key) => bound.equal_scan_row_ids(key, self.ts)?,
+                OwnedNonUniqueRowIdCandidateScan::Equal(key) => {
+                    bound.equal_scan_row_id_candidates(key, self.ts)?
+                }
             };
             let mut row_ids = Vec::new();
             while let Some(batch) = stream.next_batch().await? {
@@ -2456,15 +2459,15 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) struct BoundUniqueIndexNo<'a> {
+    pub(crate) struct BoundUniqueIndex<'a> {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
         index_no: usize,
         root: BlockID,
     }
 
-    impl UniqueIndex for BoundUniqueIndexNo<'_> {
-        type RowIdStream<'a>
+    impl UniqueIndex for BoundUniqueIndex<'_> {
+        type RowIdCandidateStream<'a>
             = BoundUniqueIndexBatchStream<'a>
         where
             Self: 'a;
@@ -2524,7 +2527,11 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        fn scan_row_ids<'a, 'r, R>(&'a self, range: R, ts: TrxID) -> Result<Self::RowIdStream<'a>>
+        fn scan_row_id_candidates<'a, 'r, R>(
+            &'a self,
+            range: R,
+            ts: TrxID,
+        ) -> Result<Self::RowIdCandidateStream<'a>>
         where
             R: RangeBounds<&'r [Val]> + Clone,
         {
@@ -2557,7 +2564,7 @@ pub(crate) mod tests {
     }
 
     impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
-        type RowIdStream<'a>
+        type RowIdCandidateStream<'a>
             = BoundNonUniqueIndexBatchStream<'a>
         where
             Self: 'a;
@@ -2634,7 +2641,11 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        fn scan_row_ids<'a, 'r, R>(&'a self, range: R, ts: TrxID) -> Result<Self::RowIdStream<'a>>
+        fn scan_row_id_candidates<'a, 'r, R>(
+            &'a self,
+            range: R,
+            ts: TrxID,
+        ) -> Result<Self::RowIdCandidateStream<'a>>
         where
             R: RangeBounds<&'r [Val]> + Clone,
         {
@@ -2643,24 +2654,24 @@ pub(crate) mod tests {
                 guards: self.guards,
                 index_no: self.index_no,
                 root: self.root,
-                scan: OwnedNonUniqueRowIdScan::Range(owned_range_from_ref(&range)),
+                scan: OwnedNonUniqueRowIdCandidateScan::Range(owned_range_from_ref(&range)),
                 ts,
                 done: false,
             })
         }
 
         #[inline]
-        fn equal_scan_row_ids<'a>(
+        fn equal_scan_row_id_candidates<'a>(
             &'a self,
             key: &[Val],
             ts: TrxID,
-        ) -> Result<Self::RowIdStream<'a>> {
+        ) -> Result<Self::RowIdCandidateStream<'a>> {
             Ok(BoundNonUniqueIndexBatchStream {
                 layout: Arc::clone(&self.layout),
                 guards: self.guards,
                 index_no: self.index_no,
                 root: self.root,
-                scan: OwnedNonUniqueRowIdScan::Equal(key.to_vec()),
+                scan: OwnedNonUniqueRowIdCandidateScan::Equal(key.to_vec()),
                 ts,
                 done: false,
             })
@@ -2676,13 +2687,13 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn bound_unique_index_no<'a>(
+    pub(crate) fn bound_unique_index<'a>(
         table: &Table,
         guards: &'a PoolGuards,
         index_no: usize,
-    ) -> BoundUniqueIndexNo<'a> {
+    ) -> BoundUniqueIndex<'a> {
         let layout = table.layout_snapshot();
-        BoundUniqueIndexNo {
+        BoundUniqueIndex {
             layout,
             guards,
             index_no,
@@ -2710,7 +2721,7 @@ pub(crate) mod tests {
         key: &SelectKey,
         sts: TrxID,
     ) -> RowID {
-        let index = bound_unique_index_no(table, guards, key.index_no);
+        let index = bound_unique_index(table, guards, key.index_no);
         let Some((row_id, _)) = index
             .lookup(&key.vals, sts)
             .await
@@ -2770,7 +2781,7 @@ pub(crate) mod tests {
         expected_row_id: RowID,
         expected_deleted: bool,
     ) {
-        let index = bound_unique_index_no(table, guards, key.index_no);
+        let index = bound_unique_index(table, guards, key.index_no);
         let Some((row_id, deleted)) = index
             .lookup(&key.vals, sts)
             .await

@@ -159,12 +159,12 @@ impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexEntryScanSpec<'a, P> {
     }
 }
 
-/// Stream specification for unique MemIndex row ids.
-pub(crate) struct UniqueMemIndexRowIdScanSpec<'a, P: 'static> {
+/// Stream specification for unique MemIndex row-id candidates.
+pub(crate) struct UniqueMemIndexRowIdCandidateScanSpec<'a, P: 'static> {
     _marker: PhantomData<&'a P>,
 }
 
-impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexRowIdScanSpec<'a, P> {
+impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexRowIdCandidateScanSpec<'a, P> {
     type Cursor = BTreeNodeCursor<'a, P>;
     type Leaf = PageSharedGuard<BTreeNode>;
     type Output = RowID;
@@ -209,12 +209,12 @@ impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexEntryScanSpec<'a, P> 
     }
 }
 
-/// Stream specification for live non-unique MemIndex row ids.
-pub(crate) struct NonUniqueMemIndexRowIdScanSpec<'a, P: 'static> {
+/// Stream specification for non-unique MemIndex row-id candidates.
+pub(crate) struct NonUniqueMemIndexRowIdCandidateScanSpec<'a, P: 'static> {
     _marker: PhantomData<&'a P>,
 }
 
-impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexRowIdScanSpec<'a, P> {
+impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexRowIdCandidateScanSpec<'a, P> {
     type Cursor = BTreeNodeCursor<'a, P>;
     type Leaf = PageSharedGuard<BTreeNode>;
     type Output = RowID;
@@ -228,10 +228,6 @@ impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexRowIdScanSpec<'a, P> 
         validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx)?;
         let node = leaf.node();
         let slot = node.slot(slot_idx);
-        let value = node.value_for_slot::<BTreeByte>(slot);
-        if value.is_deleted() {
-            return Ok(None);
-        }
         Ok(Some(node.unpack_value::<BTreeU64>(slot).to_row_id()))
     }
 }
@@ -363,17 +359,17 @@ where
 pub(crate) type UniqueMemIndexEntryStream<'a, P> =
     IndexScanStream<UniqueMemIndexEntryScanSpec<'a, P>>;
 
-/// Row-id stream over unique MemIndex entries.
+/// Row-id candidate stream over unique MemIndex entries.
 pub(crate) type UniqueMemIndexBatchStream<'a, P> =
-    IndexScanStream<UniqueMemIndexRowIdScanSpec<'a, P>>;
+    IndexScanStream<UniqueMemIndexRowIdCandidateScanSpec<'a, P>>;
 
 /// Leaf-bounded stream of encoded non-unique MemIndex entries.
 pub(crate) type NonUniqueMemIndexEntryStream<'a, P> =
     IndexScanStream<NonUniqueMemIndexEntryScanSpec<'a, P>>;
 
-/// Row-id stream over live non-unique MemIndex entries.
+/// Row-id candidate stream over non-unique MemIndex entries.
 pub(crate) type NonUniqueMemIndexBatchStream<'a, P> =
-    IndexScanStream<NonUniqueMemIndexRowIdScanSpec<'a, P>>;
+    IndexScanStream<NonUniqueMemIndexRowIdCandidateScanSpec<'a, P>>;
 
 /// Bounded stream of unique DiskTree entries copied leaf by leaf.
 pub(crate) type UniqueDiskTreeEntryStream<'a> = IndexScanStream<UniqueDiskTreeEntryScanSpec<'a>>;

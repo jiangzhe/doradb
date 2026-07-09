@@ -1616,6 +1616,7 @@ pub(crate) struct DiskTreeNodeCursor<'a, F: DiskTreeSpec> {
     disk_pool_guard: &'a PoolGuard,
     stack: Vec<BlockID>,
     seek_key: Vec<u8>,
+    seek_pending: bool,
 }
 
 impl<'a, F: DiskTreeSpec> DiskTreeNodeCursor<'a, F> {
@@ -1627,6 +1628,7 @@ impl<'a, F: DiskTreeSpec> DiskTreeNodeCursor<'a, F> {
             disk_pool_guard: tree.disk_pool_guard,
             stack: Vec::new(),
             seek_key: Vec::new(),
+            seek_pending: false,
         }
     }
 
@@ -1641,6 +1643,7 @@ impl<'a, F: DiskTreeSpec> DiskTreeNodeCursor<'a, F> {
         self.stack.clear();
         self.seek_key.clear();
         self.seek_key.extend_from_slice(key);
+        self.seek_pending = true;
         if self.root_block_id != SUPER_BLOCK_ID {
             self.stack.push(self.root_block_id);
         }
@@ -1653,7 +1656,12 @@ impl<'a, F: DiskTreeSpec> DiskTreeNodeCursor<'a, F> {
             let guard = self.read_node(block_id).await?;
             let node = guard.node();
             if node.is_leaf() {
-                let start_idx = node.lower_bound_slot_idx(&self.seek_key);
+                let start_idx = if self.seek_pending {
+                    self.seek_pending = false;
+                    node.lower_bound_slot_idx(&self.seek_key)
+                } else {
+                    0
+                };
                 return Ok(Some(DiskTreeLeaf {
                     file_kind: self.file_kind(),
                     block_id,
@@ -1661,9 +1669,17 @@ impl<'a, F: DiskTreeSpec> DiskTreeNodeCursor<'a, F> {
                     start_idx,
                 }));
             }
-            let start_idx = node
-                .lower_bound_child_entry_idx(&self.seek_key)
-                .ok_or_else(|| invalid_node_payload(self.file_kind(), block_id))?;
+            let start_idx = if self.seek_pending {
+                node.lower_bound_child_entry_idx(&self.seek_key)
+                    .ok_or_else(|| invalid_node_payload(self.file_kind(), block_id))?
+            } else {
+                if node.lower_fence_value().is_deleted() {
+                    return Err(invalid_node_payload(self.file_kind(), block_id));
+                }
+                // After the first leaf, remaining stack entries are right
+                // sibling subtrees and can be scanned from their lower fence.
+                0
+            };
             let branch_entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
             if start_idx >= branch_entries.len() {
                 return Err(invalid_node_payload(self.file_kind(), block_id));
@@ -2339,10 +2355,12 @@ mod tests {
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
+    use crate::index::btree::KeyRange;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
+    use std::ops::Bound;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3029,6 +3047,24 @@ mod tests {
             let scanned = tree.scan_entries().await.unwrap();
             assert_eq!(scanned.len(), ENTRY_COUNT);
             assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+            let mut stream = UniqueDiskTreeEntryStream::new(
+                tree.node_cursor(),
+                KeyRange::new(
+                    Bound::Included(BTreeKey::from(keys[129].as_slice())),
+                    Bound::Excluded(BTreeKey::from(keys[275].as_slice())),
+                ),
+            );
+            let mut streamed = Vec::new();
+            while let Some(batch) = stream.next_batch().await.unwrap() {
+                streamed.extend(batch.into_iter().map(|entry| entry.row_id));
+            }
+            assert_eq!(
+                streamed,
+                (129usize..275)
+                    .map(|idx| RowID::from(idx) + 5_000)
+                    .collect::<Vec<_>>()
+            );
         });
     }
 
