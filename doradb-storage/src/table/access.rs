@@ -11,8 +11,9 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    ColumnBlockIndex, ColumnLeafEntry, IndexCompareExchange, IndexInsert, NonUniqueIndex,
-    NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
+    ColumnBlockIndex, ColumnLeafEntry, IndexBatchStream, IndexCompareExchange, IndexInsert,
+    NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex,
+    UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::PersistedLwcBlock;
@@ -2237,21 +2238,20 @@ impl<'a> UserTableAccessor<'a> {
                     .zip(user_read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        // todo: support batching, streaming and sorting.
-        let mut row_ids = vec![];
         let root = self.read_proof_secondary_root(rt, index_no)?;
-        self.require_non_unique_index(rt.pool_guards(), index_no, root)?
-            .lookup(key_vals, &mut row_ids, rt.sts())
-            .await?;
         let mut res = vec![];
-        for row_id in row_ids {
-            match self
-                .index_lookup_unique_row_mvcc(rt, index_no, key_vals, user_read_set, row_id)
-                .await?
-            {
-                SelectMvcc::NotFound => (),
-                SelectMvcc::Found(vals) => {
-                    res.push(vals);
+        let index = self.require_non_unique_index(rt.pool_guards(), index_no, root)?;
+        let mut stream = index.equal_scan_row_id_candidates(key_vals, rt.sts())?;
+        while let Some(row_ids) = stream.next_batch().await? {
+            for row_id in row_ids {
+                match self
+                    .index_lookup_unique_row_mvcc(rt, index_no, key_vals, user_read_set, row_id)
+                    .await?
+                {
+                    SelectMvcc::NotFound => (),
+                    SelectMvcc::Found(vals) => {
+                        res.push(vals);
+                    }
                 }
             }
         }
@@ -3460,7 +3460,7 @@ mod tests {
             let trx = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(&table, &pool_guards, key.index_no);
+            let index = bound_unique_index(&table, &pool_guards, key.index_no);
             let (row_id, _) = index.lookup(&key.vals, trx.sts()).await.unwrap().unwrap();
 
             let snapshot = column_block_index_snapshot(&engine, table_id);
@@ -4375,7 +4375,7 @@ mod tests {
             reader.commit().await.unwrap();
 
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 claimed_key.index_no,
@@ -4492,7 +4492,7 @@ mod tests {
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,
@@ -5380,7 +5380,7 @@ mod tests {
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,

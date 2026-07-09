@@ -5,8 +5,8 @@ use crate::error::{DataIntegrityError, Error, FileKind, InternalError, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::{
-    ColumnBlockIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry, ResolvedColumnRow, SecondaryIndex,
-    UniqueMemIndex, UniqueMemIndexEntry,
+    ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
+    UniqueMemIndex,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::session::SessionPin;
@@ -469,7 +469,7 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &UniqueMemIndex<EvictableBufferPool>,
-        entry: &UniqueMemIndexEntry,
+        entry: &MemIndexEntry,
     ) -> Result<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
@@ -489,7 +489,7 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &NonUniqueMemIndex<EvictableBufferPool>,
-        entry: &NonUniqueMemIndexEntry,
+        entry: &MemIndexEntry,
     ) -> Result<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
@@ -586,7 +586,7 @@ impl Table {
 async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
     index: &UniqueMemIndex<P>,
     index_pool_guard: &PoolGuard,
-    entry: &UniqueMemIndexEntry,
+    entry: &MemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index
@@ -609,7 +609,7 @@ async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
 async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
     index: &NonUniqueMemIndex<P>,
     index_pool_guard: &PoolGuard,
-    entry: &NonUniqueMemIndexEntry,
+    entry: &MemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index
@@ -653,7 +653,7 @@ mod tests {
             checkpoint_published(table_id, &mut session).await;
 
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -805,7 +805,7 @@ mod tests {
             checkpoint_published(table_id, &mut session).await;
 
             let pool_guards = session.pool_guards();
-            let unique_index = bound_unique_index_no(
+            let unique_index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -873,7 +873,7 @@ mod tests {
             let current_key = single_key(0i32);
             let stale_key = single_key(-1i32);
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -946,7 +946,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -1010,7 +1010,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -1080,7 +1080,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -1164,7 +1164,7 @@ mod tests {
                 .await,
                 None
             );
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -1253,7 +1253,7 @@ mod tests {
                     .unwrap()
                     .block_id()
             };
-            let index = bound_unique_index_no(&table, &pool_guards, 0);
+            let index = bound_unique_index(&table, &pool_guards, 0);
             assert!(
                 index
                     .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
@@ -1307,7 +1307,7 @@ mod tests {
 
             let pk = single_key(0i32);
             let pool_guards = session.pool_guards();
-            let row_id = bound_unique_index_no(
+            let row_id = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 0,
@@ -1622,7 +1622,7 @@ mod tests {
             .await;
             reader.commit().await.unwrap();
 
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,
@@ -1690,7 +1690,7 @@ mod tests {
             .await;
             reader.commit().await.unwrap();
 
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 current_key.index_no,
@@ -1872,7 +1872,7 @@ mod tests {
             let key = single_key(9999i32);
             let row_id = 9999;
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,
@@ -1939,7 +1939,7 @@ mod tests {
                     .unwrap(),
             ) + 1;
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(
+            let index = bound_unique_index(
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
                 key.index_no,

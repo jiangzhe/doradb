@@ -1113,12 +1113,13 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, Result};
-    use crate::id::{BlockID, RowID, TableID};
-    use crate::index::{IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex};
+    use crate::id::{RowID, TableID};
+    use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::{DeleteMvcc, SelectKey};
-    use crate::table::{DeleteMarker, Table, TableRedoReplayFloor};
+    use crate::table::tests::bound_unique_index;
+    use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::row::RowReadAccess;
     use crate::trx::stmt::Statement;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
@@ -1138,102 +1139,6 @@ mod tests {
             .push(PoolRole::Mem, engine.inner().mem_pool.pool_guard())
             .push(PoolRole::Disk, engine.inner().disk_pool.pool_guard())
             .build()
-    }
-
-    #[inline]
-    fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
-        table.file().active_root_unchecked().secondary_index_roots[index_no]
-    }
-
-    struct BoundUniqueIndexNo<'a> {
-        table: &'a Table,
-        guards: &'a PoolGuards,
-        index_no: usize,
-        root: BlockID,
-    }
-
-    impl UniqueIndex for BoundUniqueIndexNo<'_> {
-        #[inline]
-        async fn lookup(&self, key: &[Val], ts: TrxID) -> Result<Option<(RowID, bool)>> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .lookup(key, ts)
-                .await
-        }
-
-        #[inline]
-        async fn insert_if_not_exists(
-            &self,
-            key: &[Val],
-            row_id: RowID,
-            merge_if_match_deleted: bool,
-            ts: TrxID,
-        ) -> Result<IndexInsert> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
-                .await
-        }
-
-        #[inline]
-        async fn compare_delete(
-            &self,
-            key: &[Val],
-            old_row_id: RowID,
-            ignore_del_mask: bool,
-            ts: TrxID,
-        ) -> Result<bool> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .compare_delete(key, old_row_id, ignore_del_mask, ts)
-                .await
-        }
-
-        #[inline]
-        async fn compare_exchange(
-            &self,
-            key: &[Val],
-            old_row_id: RowID,
-            new_row_id: RowID,
-            ts: TrxID,
-        ) -> Result<IndexCompareExchange> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .compare_exchange(key, old_row_id, new_row_id, ts)
-                .await
-        }
-
-        #[inline]
-        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
-            let layout = self.table.layout_snapshot();
-            let index = layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .scan_values(values, ts)
-                .await
-        }
-    }
-
-    #[inline]
-    fn bound_unique_index_no<'a>(
-        table: &'a Table,
-        guards: &'a PoolGuards,
-        index_no: usize,
-    ) -> BoundUniqueIndexNo<'a> {
-        BoundUniqueIndexNo {
-            table,
-            guards,
-            index_no,
-            root: active_secondary_root(table, index_no),
-        }
     }
 
     async fn stmt_insert_row(
@@ -1642,7 +1547,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1001i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -1726,7 +1631,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1002i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -1814,7 +1719,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1003i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -1921,7 +1826,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1004i32)];
-            let Some((row_id, _)) = bound_unique_index_no(&table, &pool_guards, 0)
+            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, 0)
                 .lookup(&key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -2175,7 +2080,7 @@ mod tests {
                 // see which one is not purged, and its cts.
                 let table = engine.catalog().get_table(table_id).await.unwrap();
                 let pool_guards = full_pool_guards(&engine);
-                let index = bound_unique_index_no(&table, &pool_guards, 0);
+                let index = bound_unique_index(&table, &pool_guards, 0);
                 let mut remained_row_ids = vec![];
                 index
                     .scan_values(&mut remained_row_ids, TrxID::new(100))

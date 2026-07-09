@@ -10,6 +10,7 @@
 //! trees store a key-only exact-entry set where the row id is appended to the
 //! encoded key and the leaf value is zero-width.
 
+use super::index_stream::{NonUniqueDiskTreeEntryStream, UniqueDiskTreeEntryStream};
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{ConfigError, DataIntegrityError, Error, FileKind, InternalError, Result};
@@ -17,11 +18,11 @@ use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::id::{BlockID, RowID, TrxID};
-use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::algo::{
     KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
     plan_sibling_node,
 };
+use crate::index::btree::{BTreeKey, BTreeKeyEncoder};
 use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::btree::{BTreeNode, LookupChild};
 use crate::index::util::Maskable;
@@ -34,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -65,14 +67,23 @@ pub(crate) struct NonUniqueDiskTreeEncodedExact<'a> {
     pub key: &'a [u8],
 }
 
+/// Encoded DiskTree entry copied out of a persisted leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiskTreeEntry {
+    /// Encoded DiskTree key.
+    pub(crate) encoded_key: BTreeKey,
+    /// Row id associated with the encoded key.
+    pub(crate) row_id: RowID,
+}
+
 /// Normalized logical entry used by the shared rewrite engine.
 ///
 /// Unique entries carry a row-id owner. Non-unique entries store only the
 /// encoded exact key, including the row-id suffix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LogicalEntry {
-    key: Vec<u8>,
-    row_id: Option<RowID>,
+    pub(super) key: Vec<u8>,
+    pub(super) row_id: Option<RowID>,
 }
 
 impl LogicalEntry {
@@ -506,14 +517,14 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
 ///
 /// Keeping the guard alive keeps the block resident and immutable while callers
 /// read the no-copy `BTreeNode` view.
-struct ValidatedDiskTreeNode<F: DiskTreeSpec> {
+pub(super) struct ValidatedDiskTreeNode<F: DiskTreeSpec> {
     guard: ReadonlyBlockGuard,
     _marker: PhantomData<F>,
 }
 
 impl<F: DiskTreeSpec> ValidatedDiskTreeNode<F> {
     #[inline]
-    fn node(&self) -> &BTreeNode {
+    pub(super) fn node(&self) -> &BTreeNode {
         btree_node_from_block(self.guard.page())
             .expect("validated DiskTree block must be a BTreeNode block")
     }
@@ -671,6 +682,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             guard,
             _marker: PhantomData,
         })
+    }
+
+    #[inline]
+    pub(super) fn node_cursor(&self) -> DiskTreeNodeCursor<'a, F> {
+        DiskTreeNodeCursor::new(self)
     }
 
     /// Search one encoded key from the current root snapshot.
@@ -1585,6 +1601,116 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     }
 }
 
+/// Persisted DiskTree leaf block with the first slot selected for a scan.
+pub(crate) struct DiskTreeLeaf<F: DiskTreeSpec> {
+    pub(super) file_kind: FileKind,
+    pub(super) block_id: BlockID,
+    pub(super) guard: ValidatedDiskTreeNode<F>,
+    pub(super) start_idx: usize,
+}
+
+/// Resumable root-snapshot cursor over persisted DiskTree leaf nodes.
+pub(crate) struct DiskTreeNodeCursor<'a, F: DiskTreeSpec> {
+    root_block_id: BlockID,
+    runtime: &'a DiskTreeRuntime<F>,
+    disk_pool_guard: &'a PoolGuard,
+    stack: Vec<BlockID>,
+    seek_key: Vec<u8>,
+    seek_pending: bool,
+}
+
+impl<'a, F: DiskTreeSpec> DiskTreeNodeCursor<'a, F> {
+    #[inline]
+    fn new(tree: &DiskTree<'a, F>) -> Self {
+        Self {
+            root_block_id: tree.root_block_id,
+            runtime: tree.runtime,
+            disk_pool_guard: tree.disk_pool_guard,
+            stack: Vec::new(),
+            seek_key: Vec::new(),
+            seek_pending: false,
+        }
+    }
+
+    #[inline]
+    fn file_kind(&self) -> FileKind {
+        self.runtime.file_kind
+    }
+
+    /// Seek to the first leaf that can contain `key`.
+    #[inline]
+    pub(super) async fn seek(&mut self, key: &[u8]) -> Result<()> {
+        self.stack.clear();
+        self.seek_key.clear();
+        self.seek_key.extend_from_slice(key);
+        self.seek_pending = true;
+        if self.root_block_id != SUPER_BLOCK_ID {
+            self.stack.push(self.root_block_id);
+        }
+        Ok(())
+    }
+
+    /// Return the next persisted leaf and first slot that may match the seek key.
+    pub(super) async fn next_leaf(&mut self) -> Result<Option<DiskTreeLeaf<F>>> {
+        while let Some(block_id) = self.stack.pop() {
+            let guard = self.read_node(block_id).await?;
+            let node = guard.node();
+            if node.is_leaf() {
+                let start_idx = if self.seek_pending {
+                    self.seek_pending = false;
+                    node.lower_bound_slot_idx(&self.seek_key)
+                } else {
+                    0
+                };
+                return Ok(Some(DiskTreeLeaf {
+                    file_kind: self.file_kind(),
+                    block_id,
+                    guard,
+                    start_idx,
+                }));
+            }
+            let start_idx = if self.seek_pending {
+                node.lower_bound_child_entry_idx(&self.seek_key)
+                    .ok_or_else(|| invalid_node_payload(self.file_kind(), block_id))?
+            } else {
+                if node.lower_fence_value().is_deleted() {
+                    return Err(invalid_node_payload(self.file_kind(), block_id));
+                }
+                // After the first leaf, remaining stack entries are right
+                // sibling subtrees and can be scanned from their lower fence.
+                0
+            };
+            let branch_entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
+            if start_idx >= branch_entries.len() {
+                return Err(invalid_node_payload(self.file_kind(), block_id));
+            }
+            for entry in branch_entries.into_iter().skip(start_idx).rev() {
+                self.stack.push(entry.block_id);
+            }
+        }
+        Ok(None)
+    }
+
+    #[inline]
+    async fn read_node(&self, block_id: BlockID) -> Result<ValidatedDiskTreeNode<F>> {
+        let guard = self
+            .runtime
+            .disk_pool
+            .read_validated_block(
+                self.runtime.file_kind,
+                &self.runtime.file,
+                self.disk_pool_guard,
+                block_id,
+                F::validate_persisted_block,
+            )
+            .await?;
+        Ok(ValidatedDiskTreeNode {
+            guard,
+            _marker: PhantomData,
+        })
+    }
+}
+
 /// Root-snapshot view for a persisted unique secondary index.
 ///
 /// Lookups read the immutable checkpoint root supplied at construction time.
@@ -1630,6 +1756,16 @@ impl<'a> UniqueDiskTree<'a> {
                 ))
             })
             .collect()
+    }
+
+    /// Open a bounded encoded-entry stream over this root snapshot.
+    #[inline]
+    pub(crate) fn scan_entry_stream<'r, R>(&self, range: R) -> UniqueDiskTreeEntryStream<'a>
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        let range = self.encoder().encode_range(range);
+        UniqueDiskTreeEntryStream::new(self.node_cursor(), range)
     }
 
     /// Open a copy-on-write batch writer for this unique DiskTree root.
@@ -1705,6 +1841,23 @@ impl<'a> NonUniqueDiskTree<'a> {
                 Ok((entry.key, row_id))
             })
             .collect()
+    }
+
+    /// Open a bounded encoded-entry stream over this root snapshot.
+    #[inline]
+    pub(crate) fn scan_entry_stream<'r, R>(&self, range: R) -> NonUniqueDiskTreeEntryStream<'a>
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        let range = self.encoder().encode_non_unique_range(range);
+        NonUniqueDiskTreeEntryStream::new(self.node_cursor(), range)
+    }
+
+    /// Open an equality encoded-entry stream over this root snapshot.
+    #[inline]
+    pub(crate) fn equal_scan_entry_stream(&self, key: &[Val]) -> NonUniqueDiskTreeEntryStream<'a> {
+        let range = self.encoder().encode_non_unique_equal_range(key);
+        NonUniqueDiskTreeEntryStream::new(self.node_cursor(), range)
     }
 
     /// Open a copy-on-write batch writer for this non-unique DiskTree root.
@@ -1879,14 +2032,14 @@ fn disk_tree_batch_order_invariant(message: impl Into<String>) -> Error {
 }
 
 #[inline]
-fn invalid_payload(message: impl Into<String>) -> Error {
+pub(super) fn invalid_payload(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(message.into())
         .into()
 }
 
 #[inline]
-fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Error {
+pub(super) fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(format!(
             "file={file_kind}, block=secondary-disk-tree, block_id={block_id}"
@@ -2034,7 +2187,7 @@ fn validate_sorted_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Result<
 
 /// Extract the row-id suffix from a non-unique exact key.
 #[inline]
-fn unpack_row_id_from_exact_key(key: &[u8]) -> Result<RowID> {
+pub(super) fn unpack_row_id_from_exact_key(key: &[u8]) -> Result<RowID> {
     if key.len() < ROW_ID_SIZE {
         return Err(invalid_payload(format!(
             "non-unique DiskTree exact key length {} is shorter than row id suffix size {ROW_ID_SIZE}",
@@ -2202,10 +2355,12 @@ mod tests {
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
+    use crate::index::btree::KeyRange;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
+    use std::ops::Bound;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2892,6 +3047,24 @@ mod tests {
             let scanned = tree.scan_entries().await.unwrap();
             assert_eq!(scanned.len(), ENTRY_COUNT);
             assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+            let mut stream = UniqueDiskTreeEntryStream::new(
+                tree.node_cursor(),
+                KeyRange::new(
+                    Bound::Included(BTreeKey::from(keys[129].as_slice())),
+                    Bound::Excluded(BTreeKey::from(keys[275].as_slice())),
+                ),
+            );
+            let mut streamed = Vec::new();
+            while let Some(batch) = stream.next_batch().await.unwrap() {
+                streamed.extend(batch.into_iter().map(|entry| entry.row_id));
+            }
+            assert_eq!(
+                streamed,
+                (129usize..275)
+                    .map(|idx| RowID::from(idx) + 5_000)
+                    .collect::<Vec<_>>()
+            );
         });
     }
 

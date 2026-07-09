@@ -1959,7 +1959,7 @@ mod tests {
             let reader = session.begin_trx().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let pool_guards = session.pool_guards();
-            let index = bound_unique_index_no(&table, &pool_guards, key.index_no);
+            let index = bound_unique_index(&table, &pool_guards, key.index_no);
             let (row_id, _) = index
                 .lookup(&key.vals, reader.sts())
                 .await

@@ -1041,6 +1041,14 @@ impl BTreeNode {
             .and_then(|slot| self.slot_key_checked(slot))
     }
 
+    /// Return a copied B-tree key at `idx` if the slot is currently valid.
+    #[inline]
+    pub(crate) fn btree_key_checked(&self, idx: usize) -> Option<BTreeKey> {
+        self.slots()
+            .get(idx)
+            .and_then(|slot| self.slot_btree_key_checked(slot))
+    }
+
     /// Validate persisted node offsets, ordering, fences, and payload ranges.
     pub(crate) fn validate_persisted_layout<V: BTreeValue>(&self) -> bool {
         if self.header.initialized != 1 || self.header.hints_enabled > 1 {
@@ -1066,28 +1074,27 @@ impl BTreeNode {
         }
 
         let mut ranges = Vec::new();
-        let prefix = match self.common_prefix_checked(&mut ranges) {
+        let prefix = match self.common_prefix_checked() {
             Some(prefix) => prefix,
             None => return false,
         };
-        let lower = match self.slot_key_checked_with_prefix(
-            &self.header.lower_fence,
-            prefix,
-            &mut ranges,
-            true,
-        ) {
+        if let Some(range) = self.common_prefix_range() {
+            ranges.push(range);
+        }
+        if !self.record_slot_long_key_range(&self.header.lower_fence, &mut ranges) {
+            return false;
+        }
+        let lower = match self.slot_key_checked_with_prefix(&self.header.lower_fence, prefix) {
             Some(key) => key,
             None => return false,
         };
         let upper = if self.header.upper_fence.is_empty() {
             None
         } else {
-            match self.slot_key_checked_with_prefix(
-                &self.header.upper_fence,
-                prefix,
-                &mut ranges,
-                true,
-            ) {
+            if !self.record_slot_long_key_range(&self.header.upper_fence, &mut ranges) {
+                return false;
+            }
+            match self.slot_key_checked_with_prefix(&self.header.upper_fence, prefix) {
                 Some(key) => Some(key),
                 None => return false,
             }
@@ -1101,7 +1108,7 @@ impl BTreeNode {
             if !self.entry_payload_range::<V>(slot, end_offset, &mut ranges) {
                 return false;
             }
-            let key = match self.slot_key_checked_with_prefix(slot, prefix, &mut ranges, false) {
+            let key = match self.slot_key_checked_with_prefix(slot, prefix) {
                 Some(key) => key,
                 None => return false,
             };
@@ -1125,7 +1132,7 @@ impl BTreeNode {
         true
     }
 
-    fn common_prefix_checked<'a>(&'a self, ranges: &mut Vec<Range<usize>>) -> Option<&'a [u8]> {
+    fn common_prefix_checked(&self) -> Option<&[u8]> {
         let len = self.header.prefix_len() as usize;
         if len == 0 {
             return Some(&[]);
@@ -1137,23 +1144,28 @@ impl BTreeNode {
             return None;
         }
         let start = BTREE_BODY_USABLE_LEN - len;
-        ranges.push(start..BTREE_BODY_USABLE_LEN);
         Some(&self.body[start..BTREE_BODY_USABLE_LEN])
     }
 
-    fn slot_key_checked(&self, slot: &BTreeSlot) -> Option<Vec<u8>> {
-        let mut ranges = Vec::new();
-        let prefix = self.common_prefix_checked(&mut ranges)?;
-        self.slot_key_checked_with_prefix(slot, prefix, &mut ranges, true)
+    fn common_prefix_range(&self) -> Option<Range<usize>> {
+        let len = self.header.prefix_len() as usize;
+        if len <= INLINE_PREFIX_LEN {
+            return None;
+        }
+        Some(BTREE_BODY_USABLE_LEN - len..BTREE_BODY_USABLE_LEN)
     }
 
-    fn slot_key_checked_with_prefix(
-        &self,
-        slot: &BTreeSlot,
-        prefix: &[u8],
-        ranges: &mut Vec<Range<usize>>,
-        track_key_range: bool,
-    ) -> Option<Vec<u8>> {
+    fn slot_key_checked(&self, slot: &BTreeSlot) -> Option<Vec<u8>> {
+        let prefix = self.common_prefix_checked()?;
+        self.slot_key_checked_with_prefix(slot, prefix)
+    }
+
+    fn slot_btree_key_checked(&self, slot: &BTreeSlot) -> Option<BTreeKey> {
+        let prefix = self.common_prefix_checked()?;
+        self.slot_btree_key_checked_with_prefix(slot, prefix)
+    }
+
+    fn slot_key_checked_with_prefix(&self, slot: &BTreeSlot, prefix: &[u8]) -> Option<Vec<u8>> {
         let len = slot.len() as usize;
         let mut key = Vec::with_capacity(prefix.len() + len);
         key.extend_from_slice(prefix);
@@ -1166,11 +1178,52 @@ impl BTreeNode {
         if end > BTREE_BODY_USABLE_LEN {
             return None;
         }
-        if track_key_range {
-            ranges.push(start..end);
-        }
         key.extend_from_slice(&self.body[start..end]);
         Some(key)
+    }
+
+    fn slot_btree_key_checked_with_prefix(
+        &self,
+        slot: &BTreeSlot,
+        prefix: &[u8],
+    ) -> Option<BTreeKey> {
+        let len = slot.len() as usize;
+        if len > KEY_HEAD_LEN {
+            let start = slot.offset() as usize;
+            let end = start.checked_add(len)?;
+            if end > BTREE_BODY_USABLE_LEN {
+                return None;
+            }
+        }
+
+        let mut key = BTreeKey::arbitrary(prefix.len() + len);
+        let mut buf = key.modify_inplace();
+        buf[..prefix.len()].copy_from_slice(prefix);
+        if len <= KEY_HEAD_LEN {
+            buf[prefix.len()..].copy_from_slice(&slot.head_bytes()[..len]);
+        } else {
+            let start = slot.offset() as usize;
+            let end = start + len;
+            buf[prefix.len()..].copy_from_slice(&self.body[start..end]);
+        }
+        drop(buf);
+        Some(key)
+    }
+
+    fn record_slot_long_key_range(&self, slot: &BTreeSlot, ranges: &mut Vec<Range<usize>>) -> bool {
+        let len = slot.len() as usize;
+        if len <= KEY_HEAD_LEN {
+            return true;
+        }
+        let start = slot.offset() as usize;
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if end > BTREE_BODY_USABLE_LEN {
+            return false;
+        }
+        ranges.push(start..end);
+        true
     }
 
     fn entry_payload_range<V: BTreeValue>(
