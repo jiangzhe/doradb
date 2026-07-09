@@ -2,6 +2,7 @@ use crate::buffer::frame::FrameContext;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::id::{RowID, TableID, TrxID};
+use crate::index::{BTreeKeyEncoder, IndexLookupCandidate};
 use crate::map::FastHashMap;
 use crate::recovery::RowRecoveryMap;
 use crate::row::ops::{ReadRow, RowUpdateView, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
@@ -93,6 +94,33 @@ impl<'a> RowReadAccess<'a> {
             if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
                 return ReadRow::InvalidIndex;
             }
+        }
+        let vals = row.vals_for_read_set(metadata.col.as_ref(), read_set);
+        ReadRow::Ok(vals)
+    }
+
+    /// Reads the latest row image and validates exact index candidate identity.
+    #[inline]
+    pub(crate) fn read_row_latest_index_candidate(
+        &self,
+        metadata: &TableMetadata,
+        read_set: &[usize],
+        recheck: &IndexCandidateRecheck<'_>,
+    ) -> ReadRow {
+        let row = self.row();
+        if row.is_deleted() {
+            return ReadRow::NotFound;
+        }
+        let Some(index_spec) = metadata.idx.index_spec(recheck.index_no) else {
+            return ReadRow::InvalidIndex;
+        };
+        let key_vals = index_spec
+            .cols
+            .iter()
+            .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
+            .collect::<Vec<_>>();
+        if !recheck.matches_key(&key_vals) {
+            return ReadRow::InvalidIndex;
         }
         let vals = row.vals_for_read_set(metadata.col.as_ref(), read_set);
         ReadRow::Ok(vals)
@@ -279,6 +307,143 @@ impl<'a> RowReadAccess<'a> {
             },
             RowReadState::Recover(_) => {
                 // no mvcc support for recovery mode.
+                unreachable!("no mvcc support for recovery mode")
+            }
+        }
+    }
+
+    /// Reads the row version visible to the transaction and validates exact
+    /// secondary-index candidate identity.
+    #[inline]
+    pub(crate) fn read_row_mvcc_index_candidate(
+        &self,
+        ctx: &TrxContext,
+        metadata: &TableMetadata,
+        read_set: &[usize],
+        recheck: &IndexCandidateRecheck<'_>,
+    ) -> ReadRow {
+        match &self.state {
+            RowReadState::RowVer(undo) => match &**undo {
+                None => self.read_row_latest_index_candidate(metadata, read_set, recheck),
+                Some(undo_head) => {
+                    let ts = undo_head.ts();
+                    if trx_is_committed(ts) {
+                        if ctx.sts() > ts {
+                            return self
+                                .read_row_latest_index_candidate(metadata, read_set, recheck);
+                        }
+                    } else if ctx.trx_id() == ts {
+                        return self.read_row_latest_index_candidate(metadata, read_set, recheck);
+                    }
+
+                    let Some(index_spec) = metadata.idx.index_spec(recheck.index_no) else {
+                        return ReadRow::InvalidIndex;
+                    };
+                    let mut next = &undo_head.next;
+                    let read_set: BTreeSet<usize> = read_set.iter().copied().collect();
+                    let user_key_idx_map: FastHashMap<usize, usize> = index_spec
+                        .cols
+                        .iter()
+                        .enumerate()
+                        .map(|(key_pos, key)| (key.col_no as usize, key_pos))
+                        .collect();
+                    let undo_key = SelectKey {
+                        index_no: recheck.index_no,
+                        vals: index_spec
+                            .cols
+                            .iter()
+                            .map(|key| self.row().val(metadata.col.as_ref(), key.col_no as usize))
+                            .collect(),
+                    };
+                    let mut ver = RowVersion {
+                        deleted: self.row().is_deleted(),
+                        read_set,
+                        key_tracker: Some(IndexKeyTracker {
+                            user_key_idx_map,
+                            undo_key: Some(undo_key),
+                        }),
+                        undo_vals: BTreeMap::new(),
+                    };
+                    loop {
+                        let entry;
+                        if let Some(ib) = next.indexes.iter().find(|ib| recheck.matches_branch(ib))
+                        {
+                            ver.undo_update(&ib.undo_vals);
+                            debug_assert!(!ver.deleted);
+                            match &ib.target {
+                                IndexBranchTarget::Hot {
+                                    cts,
+                                    entry: hot_entry,
+                                } => {
+                                    if ctx.sts() > *cts {
+                                        return ver.get_visible_vals_for_index_candidate(
+                                            metadata,
+                                            self.row(),
+                                            recheck,
+                                        );
+                                    }
+                                    entry = hot_entry.as_ref();
+                                }
+                                IndexBranchTarget::ColdTerminal { delete_cts } => {
+                                    if let Some(delete_cts) = delete_cts
+                                        && ctx.sts() > *delete_cts
+                                    {
+                                        return ReadRow::NotFound;
+                                    }
+                                    return ver.get_visible_vals_for_index_candidate(
+                                        metadata,
+                                        self.row(),
+                                        recheck,
+                                    );
+                                }
+                            }
+                        } else {
+                            entry = next.main.entry.as_ref();
+                        }
+                        match &entry.kind {
+                            RowUndoKind::Lock => (),
+                            RowUndoKind::Insert => {
+                                debug_assert!(!ver.deleted);
+                                ver.deleted = true;
+                            }
+                            RowUndoKind::Update(undo_vals) => {
+                                debug_assert!(!ver.deleted);
+                                ver.undo_update(undo_vals);
+                            }
+                            RowUndoKind::Delete => {
+                                ver.deleted = false;
+                            }
+                        }
+                        match entry.next.as_ref() {
+                            None => {
+                                if ver.deleted {
+                                    return ReadRow::NotFound;
+                                }
+                                return ver.get_visible_vals_for_index_candidate(
+                                    metadata,
+                                    self.row(),
+                                    recheck,
+                                );
+                            }
+                            Some(nx) => {
+                                let ts = nx.main.status.ts();
+                                if ctx.sts() > ts {
+                                    if ver.deleted {
+                                        return ReadRow::NotFound;
+                                    }
+                                    return ver.get_visible_vals_for_index_candidate(
+                                        metadata,
+                                        self.row(),
+                                        recheck,
+                                    );
+                                }
+                                next = nx;
+                            }
+                        }
+                    }
+                }
+            },
+            RowReadState::Recover(_) => {
                 unreachable!("no mvcc support for recovery mode")
             }
         }
@@ -516,6 +681,36 @@ impl<'a> RowReadState<'a> {
     }
 }
 
+/// Exact secondary-index candidate identity used during hot-row MVCC recheck.
+pub(crate) struct IndexCandidateRecheck<'a> {
+    /// Target secondary-index slot.
+    pub(crate) index_no: usize,
+    /// Whether the target index is unique.
+    pub(crate) unique: bool,
+    /// Candidate emitted by the secondary-index stream.
+    pub(crate) candidate: &'a IndexLookupCandidate,
+    /// Encoder for the target index identity.
+    pub(crate) encoder: &'a BTreeKeyEncoder,
+}
+
+impl IndexCandidateRecheck<'_> {
+    #[inline]
+    fn matches_key(&self, key_vals: &[Val]) -> bool {
+        let encoded = if self.unique {
+            self.encoder.encode(key_vals)
+        } else {
+            self.encoder
+                .encode_pair(key_vals, Val::from(self.candidate.row_id))
+        };
+        encoded.as_bytes() == self.candidate.encoded_key.as_bytes()
+    }
+
+    #[inline]
+    fn matches_branch(&self, branch: &IndexBranch) -> bool {
+        self.unique && branch.key.index_no == self.index_no && self.matches_key(&branch.key.vals)
+    }
+}
+
 /// Iterator over all rows in a row page using one frame context.
 pub(crate) struct ReadAllRows<'a> {
     ctx: &'a FrameContext,
@@ -602,11 +797,11 @@ impl RowVersion {
             } else {
                 // compare key using read set and latest row page
                 let key_different = key_vals.iter().enumerate().any(|(pos, search_val)| {
-                    let user_col_idx = index_spec.cols[pos].col_no as usize;
-                    if let Some(undo_val) = self.undo_vals.get(&user_col_idx) {
+                    let col_idx = index_spec.cols[pos].col_no as usize;
+                    if let Some(undo_val) = self.undo_vals.get(&col_idx) {
                         search_val != undo_val
                     } else {
-                        row.is_different(metadata.col.as_ref(), user_col_idx, search_val)
+                        row.is_different(metadata.col.as_ref(), col_idx, search_val)
                     }
                 });
                 if key_different {
@@ -615,11 +810,55 @@ impl RowVersion {
             }
         }
         let mut vals = Vec::with_capacity(self.read_set.len());
-        for user_col_idx in &self.read_set {
-            if let Some(v) = self.undo_vals.remove(user_col_idx) {
+        for col_idx in &self.read_set {
+            if let Some(v) = self.undo_vals.remove(col_idx) {
                 vals.push(v);
             } else {
-                vals.push(row.val(metadata.col.as_ref(), *user_col_idx))
+                vals.push(row.val(metadata.col.as_ref(), *col_idx))
+            }
+        }
+        ReadRow::Ok(vals)
+    }
+
+    #[inline]
+    fn get_visible_vals_for_index_candidate(
+        mut self,
+        metadata: &TableMetadata,
+        row: Row<'_>,
+        recheck: &IndexCandidateRecheck<'_>,
+    ) -> ReadRow {
+        let Some(index_spec) = metadata.idx.index_spec(recheck.index_no) else {
+            return ReadRow::InvalidIndex;
+        };
+        let matches_candidate = if let Some(undo_key) = self
+            .key_tracker
+            .as_ref()
+            .and_then(|tracker| tracker.undo_key.as_ref())
+        {
+            recheck.matches_key(&undo_key.vals)
+        } else {
+            let key_vals = index_spec
+                .cols
+                .iter()
+                .map(|key| {
+                    let col_no = key.col_no as usize;
+                    self.undo_vals
+                        .get(&col_no)
+                        .cloned()
+                        .unwrap_or_else(|| row.val(metadata.col.as_ref(), col_no))
+                })
+                .collect::<Vec<_>>();
+            recheck.matches_key(&key_vals)
+        };
+        if !matches_candidate {
+            return ReadRow::InvalidIndex;
+        }
+        let mut vals = Vec::with_capacity(self.read_set.len());
+        for col_idx in &self.read_set {
+            if let Some(v) = self.undo_vals.remove(col_idx) {
+                vals.push(v);
+            } else {
+                vals.push(row.val(metadata.col.as_ref(), *col_idx));
             }
         }
         ReadRow::Ok(vals)

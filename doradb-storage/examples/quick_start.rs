@@ -125,6 +125,24 @@ async fn run() -> ExampleResult<()> {
         .collect::<Vec<_>>();
     matching_rows.sort_unstable();
     assert_eq!(matching_rows, vec![(1, String::from("ada"))]);
+
+    // Stream the same secondary-index match one row at a time.
+    let mut stream = read_trx
+        .stream_stmt()
+        .table_index_scan_mvcc(
+            table_id,
+            name_key.index_no,
+            &name_key.vals[..]..=&name_key.vals[..],
+            &[0, 1],
+        )
+        .await?;
+    let mut streamed_rows = Vec::new();
+    while let Some(vals) = stream.next().await? {
+        streamed_rows.push(row_pair(vals));
+    }
+    drop(stream);
+    streamed_rows.sort_unstable();
+    assert_eq!(streamed_rows, vec![(1, String::from("ada"))]);
     read_trx.rollback().await?;
 
     // Drop the table after all transactions are finished.

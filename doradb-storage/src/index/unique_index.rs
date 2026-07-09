@@ -9,23 +9,25 @@ use crate::index::btree::BTreeU64;
 #[cfg(test)]
 use crate::index::btree::GenericBTree;
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate};
-use crate::index::index_stream::{UniqueMemIndexBatchStream, UniqueMemIndexEntryStream};
+use crate::index::index_stream::UniqueMemIndexCandidateStream;
 use crate::index::mem_index::{
     MemIndex, MemIndexCleanupScan, MemIndexEntry, UniqueMemIndexCleanupSpec,
     UniqueMemIndexEntryScanSpec,
 };
 use crate::index::util::Maskable;
-use crate::index::{IndexBatchStream, IndexCompareExchange, IndexInsert};
+use crate::index::{
+    IndexBatchStream, IndexCompareExchange, IndexInsert, IndexLookupCandidate, KeyRange,
+};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
 use futures::FutureExt;
 use std::future::Future;
-use std::ops::{Deref, RangeBounds};
+use std::ops::Deref;
 
 /// Abstraction of unique index.
 pub(crate) trait UniqueIndex: Send + Sync {
-    /// Candidate row-id stream returned by bounded unique-index scans.
-    type RowIdCandidateStream<'a>: IndexBatchStream<RowID> + 'a
+    /// Candidate stream returned by bounded unique-index scans.
+    type LookupCandidateStream<'a>: IndexBatchStream<IndexLookupCandidate> + 'a
     where
         Self: 'a;
 
@@ -34,24 +36,23 @@ pub(crate) trait UniqueIndex: Send + Sync {
     fn lookup(&self, key: &[Val], ts: TrxID)
     -> impl Future<Output = Result<Option<(RowID, bool)>>>;
 
-    /// Scan row-id candidates over a bounded logical-key range.
+    /// Scan lookup candidates over a bounded encoded-key range.
     ///
-    /// Returned row ids are index-derived candidates for MVCC lookup, not
-    /// visibility-confirmed rows. The stream must return unmasked row ids even
-    /// when an in-memory delete-shadow entry is encountered; row-version and
-    /// column-deletion-buffer checks decide whether a candidate is visible.
-    /// Hot in-memory entries shadow equal cold DiskTree entries.
+    /// Returned entries are index-derived candidates for MVCC lookup, not
+    /// visibility-confirmed rows. Unique candidates carry encoded logical keys.
+    /// The stream must return unmasked row ids even when an in-memory
+    /// delete-shadow entry is encountered; row-version and
+    /// column-deletion-buffer checks decide whether a candidate is visible. Hot
+    /// in-memory entries shadow equal cold DiskTree entries.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "reserved unique row-id candidate stream")
+        allow(dead_code, reason = "reserved borrowed candidate stream API")
     )]
-    fn scan_row_id_candidates<'a, 'r, R>(
+    fn index_scan_candidates<'a>(
         &'a self,
-        range: R,
+        range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>>
-    where
-        R: RangeBounds<&'r [Val]> + Clone;
+    ) -> Result<Self::LookupCandidateStream<'a>>;
 
     /// Insert new key value pair into this index.
     /// If same key exists, return old key and its delete flag.
@@ -290,27 +291,11 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
     pub(crate) async fn scan_encoded_entries(&self) -> Result<Vec<MemIndexEntry>> {
         self.index.scan_encoded_entries(self.pool_guard).await
     }
-
-    /// Create a bounded encoded-entry stream over this MemIndex view.
-    #[inline]
-    pub(crate) fn scan_encoded_entry_stream<'a, 'r, R>(
-        &'a self,
-        range: R,
-    ) -> Result<UniqueMemIndexEntryStream<'a, P>>
-    where
-        R: RangeBounds<&'r [Val]>,
-    {
-        let range = self.index.encoder().encode_range(range);
-        Ok(UniqueMemIndexEntryStream::new(
-            self.index.tree().cursor(self.pool_guard, 0),
-            range,
-        ))
-    }
 }
 
 impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
-    type RowIdCandidateStream<'a>
-        = UniqueMemIndexBatchStream<'a, P>
+    type LookupCandidateStream<'a>
+        = UniqueMemIndexCandidateStream<'a, P>
     where
         Self: 'a;
 
@@ -419,16 +404,12 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_id_candidates<'a, 'r, R>(
+    fn index_scan_candidates<'a>(
         &'a self,
-        range: R,
+        range: &'a KeyRange,
         _ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>>
-    where
-        R: RangeBounds<&'r [Val]> + Clone,
-    {
-        let range = self.index.encoder().encode_range(range);
-        Ok(UniqueMemIndexBatchStream::new(
+    ) -> Result<Self::LookupCandidateStream<'a>> {
+        Ok(UniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,
         ))
@@ -450,16 +431,9 @@ mod tests {
     use super::*;
     use crate::buffer::{FixedBufferPool, PoolRole};
     use crate::index::btree::BTree;
+    use crate::index::util::tests::drain_row_ids;
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
-
-    async fn drain_row_ids<S: IndexBatchStream<RowID>>(stream: &mut S) -> Vec<RowID> {
-        let mut row_ids = Vec::new();
-        while let Some(batch) = stream.next_batch().await.unwrap() {
-            row_ids.extend(batch);
-        }
-        row_ids
-    }
 
     #[test]
     fn test_single_key_btree_unique_index() {
@@ -543,18 +517,21 @@ mod tests {
                 );
             }
 
+            let range = index
+                .encoder()
+                .encode_range(&[Val::from(2i32)][..]..&[Val::from(4i32)][..]);
             let mut stream = guarded
-                .scan_row_id_candidates(
-                    &[Val::from(2i32)][..]..&[Val::from(4i32)][..],
-                    TrxID::new(101),
-                )
+                .index_scan_candidates(&range, TrxID::new(101))
                 .unwrap();
             assert_eq!(
                 drain_row_ids(&mut stream).await,
                 vec![RowID::new(20), RowID::new(30)]
             );
 
-            let mut stream = guarded.scan_row_id_candidates(.., TrxID::new(102)).unwrap();
+            let range = index.encoder().encode_range(..);
+            let mut stream = guarded
+                .index_scan_candidates(&range, TrxID::new(102))
+                .unwrap();
             assert!(stream.next_batch().await.unwrap().is_some());
             drop(stream);
             assert_eq!(

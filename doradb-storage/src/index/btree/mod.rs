@@ -1401,15 +1401,13 @@ impl SplitNode {
 /// the tree nodes.
 /// But it guarantees if a value(node) does not change during the traverse,
 /// it will be always visited.
-pub(crate) struct BTreeNodeCursor<'a, P: 'static> {
-    tree: &'a GenericBTree<P>,
-    pool_guard: &'a PoolGuard,
+pub(crate) struct BTreeNodeCursorState {
     height: usize,
     coupling: BTreeCoupling<SharedStrategy>,
     resume_key_buffer: Vec<u8>,
 }
 
-impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
+impl BTreeNodeCursorState {
     #[inline]
     fn resumed_same_parent(&self, exhausted_parent_page_id: PageID) -> bool {
         self.coupling
@@ -1421,10 +1419,8 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
 
     /// Create a new cursor.
     #[inline]
-    pub(crate) fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, height: usize) -> Self {
-        BTreeNodeCursor {
-            tree,
-            pool_guard,
+    pub(crate) fn new(height: usize) -> Self {
+        Self {
             height,
             coupling: BTreeCoupling::<SharedStrategy>::new(),
             resume_key_buffer: Vec::new(),
@@ -1433,15 +1429,24 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
 
     /// Seek to the first node at this cursor height that may contain `key`.
     #[inline]
-    pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) async fn seek<P: BufferPool>(
+        &mut self,
+        tree: &GenericBTree<P>,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+    ) -> Result<()> {
         self.coupling
-            .seek_and_lock(self.tree, self.pool_guard, self.height, key)
+            .seek_and_lock(tree, pool_guard, self.height, key)
             .await
     }
 
     /// Fetch next node.
     #[inline]
-    pub(crate) async fn next(&mut self) -> Result<Option<PageSharedGuard<BTreeNode>>> {
+    pub(crate) async fn next<P: BufferPool>(
+        &mut self,
+        tree: &GenericBTree<P>,
+        pool_guard: &PoolGuard,
+    ) -> Result<Option<PageSharedGuard<BTreeNode>>> {
         if let Some(g) = self.coupling.node.take() {
             return Ok(Some(g));
         }
@@ -1461,14 +1466,9 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
                 } else {
                     let c_page_id = p_node.value_as_page_id(next_idx);
                     self.coupling.parent.as_mut().unwrap().idx = next_idx as isize;
-                    let c_guard = self
-                        .tree
+                    let c_guard = tree
                         .pool
-                        .get_page::<BTreeNode>(
-                            self.pool_guard,
-                            c_page_id,
-                            LatchFallbackMode::Shared,
-                        )
+                        .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Shared)
                         .await?
                         .lock_shared_async()
                         .await
@@ -1477,29 +1477,49 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
                 }
             };
             self.coupling
-                .seek_and_lock(
-                    self.tree,
-                    self.pool_guard,
-                    self.height,
-                    &self.resume_key_buffer,
-                )
+                .seek_and_lock(tree, pool_guard, self.height, &self.resume_key_buffer)
                 .await?;
             if let Some(exhausted_parent_page_id) = exhausted_parent_page_id
                 && self.resumed_same_parent(exhausted_parent_page_id)
             {
                 make_strict_successor(&mut self.resume_key_buffer);
                 self.coupling
-                    .seek_and_lock(
-                        self.tree,
-                        self.pool_guard,
-                        self.height,
-                        &self.resume_key_buffer,
-                    )
+                    .seek_and_lock(tree, pool_guard, self.height, &self.resume_key_buffer)
                     .await?;
             }
             return Ok(self.coupling.node.take());
         }
         Ok(None)
+    }
+}
+
+pub(crate) struct BTreeNodeCursor<'a, P: 'static> {
+    tree: &'a GenericBTree<P>,
+    pool_guard: &'a PoolGuard,
+    state: BTreeNodeCursorState,
+}
+
+impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
+    /// Create a new cursor.
+    #[inline]
+    pub(crate) fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, height: usize) -> Self {
+        BTreeNodeCursor {
+            tree,
+            pool_guard,
+            state: BTreeNodeCursorState::new(height),
+        }
+    }
+
+    /// Seek to the first node at this cursor height that may contain `key`.
+    #[inline]
+    pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
+        self.state.seek(self.tree, self.pool_guard, key).await
+    }
+
+    /// Fetch next node.
+    #[inline]
+    pub(crate) async fn next(&mut self) -> Result<Option<PageSharedGuard<BTreeNode>>> {
+        self.state.next(self.tree, self.pool_guard).await
     }
 }
 

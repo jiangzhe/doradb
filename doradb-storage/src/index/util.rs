@@ -99,3 +99,29 @@ impl RowPageCreateRedoCtx<'_> {
         res
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::super::index_stream::{IndexBatchStream, IndexLookupCandidate};
+    use crate::id::RowID;
+
+    pub(crate) async fn drain_candidates<S: IndexBatchStream<IndexLookupCandidate>>(
+        stream: &mut S,
+    ) -> Vec<IndexLookupCandidate> {
+        let mut candidates = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            candidates.extend(batch);
+        }
+        candidates
+    }
+
+    pub(crate) async fn drain_row_ids<S: IndexBatchStream<IndexLookupCandidate>>(
+        stream: &mut S,
+    ) -> Vec<RowID> {
+        drain_candidates(stream)
+            .await
+            .into_iter()
+            .map(|candidate| candidate.row_id)
+            .collect()
+    }
+}

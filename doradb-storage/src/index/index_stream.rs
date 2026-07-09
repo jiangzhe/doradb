@@ -4,17 +4,17 @@
 //! composite streams merge hot/cold batches through secondary-index code.
 
 use super::disk_tree::{
-    DiskTreeEntry, DiskTreeLeaf, DiskTreeNodeCursor, DiskTreeSpec, NonUniqueDiskTreeSpec,
-    UniqueDiskTreeSpec, invalid_node_payload, unpack_row_id_from_exact_key,
+    DiskTreeLeaf, DiskTreeNodeCursor, DiskTreeSpec, NonUniqueDiskTreeSpec, UniqueDiskTreeSpec,
+    invalid_node_payload, unpack_row_id_from_exact_key,
 };
-use super::mem_index::MemIndexEntry;
 use crate::buffer::BufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::error::{Error, InternalError, Result};
 use crate::id::RowID;
-use crate::index::btree::{BTreeByte, BTreeKey, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange};
+use crate::index::btree::{BTreeKey, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange};
 use crate::index::util::Maskable;
 use error_stack::Report;
+use std::borrow::Borrow;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
@@ -23,6 +23,15 @@ use std::mem;
 pub(crate) trait IndexBatchStream<T> {
     /// Return the next non-empty batch, or `None` when exhausted.
     fn next_batch(&mut self) -> impl Future<Output = Result<Option<Vec<T>>>>;
+}
+
+/// Candidate emitted by a secondary-index scan before row MVCC visibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IndexLookupCandidate {
+    /// Encoded B-tree key that identified this candidate.
+    pub(crate) encoded_key: BTreeKey,
+    /// Row identifier referenced by the encoded index entry.
+    pub(crate) row_id: RowID,
 }
 
 /// Leaf item returned by an index scan cursor.
@@ -134,15 +143,15 @@ pub(crate) trait IndexScanSpec {
     ) -> Result<Option<Self::Output>>;
 }
 
-/// Stream specification for encoded unique MemIndex entries.
-pub(crate) struct UniqueMemIndexEntryScanSpec<'a, P: 'static> {
+/// Stream specification for unique MemIndex lookup candidates.
+pub(crate) struct UniqueMemIndexLookupCandidateScanSpec<'a, P: 'static> {
     _marker: PhantomData<&'a P>,
 }
 
-impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexEntryScanSpec<'a, P> {
+impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexLookupCandidateScanSpec<'a, P> {
     type Cursor = BTreeNodeCursor<'a, P>;
     type Leaf = PageSharedGuard<BTreeNode>;
-    type Output = MemIndexEntry;
+    type Output = IndexLookupCandidate;
 
     #[inline]
     fn project(
@@ -151,44 +160,22 @@ impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexEntryScanSpec<'a, P> {
         encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
         let value = leaf.node().value::<BTreeU64>(slot_idx);
-        Ok(Some(MemIndexEntry {
+        Ok(Some(IndexLookupCandidate {
             encoded_key,
             row_id: value.value().to_row_id(),
-            deleted: value.is_deleted(),
         }))
     }
 }
 
-/// Stream specification for unique MemIndex row-id candidates.
-pub(crate) struct UniqueMemIndexRowIdCandidateScanSpec<'a, P: 'static> {
+/// Stream specification for non-unique MemIndex lookup candidates.
+pub(crate) struct NonUniqueMemIndexLookupCandidateScanSpec<'a, P: 'static> {
     _marker: PhantomData<&'a P>,
 }
 
-impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexRowIdCandidateScanSpec<'a, P> {
+impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexLookupCandidateScanSpec<'a, P> {
     type Cursor = BTreeNodeCursor<'a, P>;
     type Leaf = PageSharedGuard<BTreeNode>;
-    type Output = RowID;
-
-    #[inline]
-    fn project(
-        leaf: &PageSharedGuard<BTreeNode>,
-        slot_idx: usize,
-        _encoded_key: BTreeKey,
-    ) -> Result<Option<Self::Output>> {
-        let value = leaf.node().value::<BTreeU64>(slot_idx);
-        Ok(Some(value.value().to_row_id()))
-    }
-}
-
-/// Stream specification for encoded non-unique MemIndex exact entries.
-pub(crate) struct NonUniqueMemIndexEntryScanSpec<'a, P: 'static> {
-    _marker: PhantomData<&'a P>,
-}
-
-impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexEntryScanSpec<'a, P> {
-    type Cursor = BTreeNodeCursor<'a, P>;
-    type Leaf = PageSharedGuard<BTreeNode>;
-    type Output = MemIndexEntry;
+    type Output = IndexLookupCandidate;
 
     #[inline]
     fn project(
@@ -199,48 +186,22 @@ impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexEntryScanSpec<'a, P> 
         validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx)?;
         let node = leaf.node();
         let slot = node.slot(slot_idx);
-        let value = node.value_for_slot::<BTreeByte>(slot);
-        let row_id = node.unpack_value::<BTreeU64>(slot).to_row_id();
-        Ok(Some(MemIndexEntry {
+        Ok(Some(IndexLookupCandidate {
             encoded_key,
-            row_id,
-            deleted: value.is_deleted(),
+            row_id: node.unpack_value::<BTreeU64>(slot).to_row_id(),
         }))
     }
 }
 
-/// Stream specification for non-unique MemIndex row-id candidates.
-pub(crate) struct NonUniqueMemIndexRowIdCandidateScanSpec<'a, P: 'static> {
-    _marker: PhantomData<&'a P>,
-}
-
-impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexRowIdCandidateScanSpec<'a, P> {
-    type Cursor = BTreeNodeCursor<'a, P>;
-    type Leaf = PageSharedGuard<BTreeNode>;
-    type Output = RowID;
-
-    #[inline]
-    fn project(
-        leaf: &PageSharedGuard<BTreeNode>,
-        slot_idx: usize,
-        encoded_key: BTreeKey,
-    ) -> Result<Option<Self::Output>> {
-        validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx)?;
-        let node = leaf.node();
-        let slot = node.slot(slot_idx);
-        Ok(Some(node.unpack_value::<BTreeU64>(slot).to_row_id()))
-    }
-}
-
-/// Stream specification for unique DiskTree entries.
-pub(crate) struct UniqueDiskTreeEntryScanSpec<'a> {
+/// Stream specification for unique DiskTree lookup candidates.
+pub(crate) struct UniqueDiskTreeCandidateScanSpec<'a> {
     _marker: PhantomData<&'a UniqueDiskTreeSpec>,
 }
 
-impl<'a> IndexScanSpec for UniqueDiskTreeEntryScanSpec<'a> {
+impl<'a> IndexScanSpec for UniqueDiskTreeCandidateScanSpec<'a> {
     type Cursor = DiskTreeNodeCursor<'a, UniqueDiskTreeSpec>;
     type Leaf = DiskTreeLeaf<UniqueDiskTreeSpec>;
-    type Output = DiskTreeEntry;
+    type Output = IndexLookupCandidate;
 
     #[inline]
     fn project(
@@ -252,22 +213,22 @@ impl<'a> IndexScanSpec for UniqueDiskTreeEntryScanSpec<'a> {
         if row_id.is_deleted() {
             return Err(invalid_node_payload(leaf.file_kind, leaf.block_id));
         }
-        Ok(Some(DiskTreeEntry {
+        Ok(Some(IndexLookupCandidate {
             encoded_key,
             row_id: row_id.to_row_id(),
         }))
     }
 }
 
-/// Stream specification for non-unique DiskTree exact entries.
-pub(crate) struct NonUniqueDiskTreeEntryScanSpec<'a> {
+/// Stream specification for non-unique DiskTree lookup candidates.
+pub(crate) struct NonUniqueDiskTreeCandidateScanSpec<'a> {
     _marker: PhantomData<&'a NonUniqueDiskTreeSpec>,
 }
 
-impl<'a> IndexScanSpec for NonUniqueDiskTreeEntryScanSpec<'a> {
+impl<'a> IndexScanSpec for NonUniqueDiskTreeCandidateScanSpec<'a> {
     type Cursor = DiskTreeNodeCursor<'a, NonUniqueDiskTreeSpec>;
     type Leaf = DiskTreeLeaf<NonUniqueDiskTreeSpec>;
-    type Output = DiskTreeEntry;
+    type Output = IndexLookupCandidate;
 
     #[inline]
     fn project(
@@ -276,7 +237,7 @@ impl<'a> IndexScanSpec for NonUniqueDiskTreeEntryScanSpec<'a> {
         encoded_key: BTreeKey,
     ) -> Result<Option<Self::Output>> {
         let row_id = unpack_row_id_from_exact_key(encoded_key.as_bytes())?;
-        Ok(Some(DiskTreeEntry {
+        Ok(Some(IndexLookupCandidate {
             encoded_key,
             row_id,
         }))
@@ -284,21 +245,22 @@ impl<'a> IndexScanSpec for NonUniqueDiskTreeEntryScanSpec<'a> {
 }
 
 /// Generic leaf-bounded stream over index slots.
-pub(crate) struct IndexScanStream<S: IndexScanSpec> {
+pub(crate) struct IndexScanStream<S: IndexScanSpec, R> {
     cursor: S::Cursor,
-    range: KeyRange,
+    range: R,
     started: bool,
     exhausted: bool,
     _spec: PhantomData<S>,
 }
 
-impl<S> IndexScanStream<S>
+impl<S, R> IndexScanStream<S, R>
 where
     S: IndexScanSpec,
+    R: Borrow<KeyRange>,
 {
     /// Create an index scan stream over an encoded key range.
     #[inline]
-    pub(super) fn new(cursor: S::Cursor, range: KeyRange) -> Self {
+    pub(super) fn new(cursor: S::Cursor, range: R) -> Self {
         Self {
             cursor,
             range,
@@ -314,18 +276,20 @@ where
             return Ok(None);
         }
         if !self.started {
-            self.cursor.seek(self.range.lower_seek_key()).await?;
+            let lower_seek_key = self.range.borrow().lower_seek_key().to_vec();
+            self.cursor.seek(&lower_seek_key).await?;
             self.started = true;
         }
         while let Some(leaf) = self.cursor.next_leaf().await? {
             let node = leaf.node();
             let mut outputs = Vec::new();
-            for idx in leaf.start_slot_idx(self.range.lower_seek_key())..node.count() {
+            let range = self.range.borrow();
+            for idx in leaf.start_slot_idx(range.lower_seek_key())..node.count() {
                 let encoded_key = leaf.key_checked(idx)?;
-                if !self.range.lower_accepts(encoded_key.as_bytes()) {
+                if !range.lower_accepts(encoded_key.as_bytes()) {
                     continue;
                 }
-                if !self.range.upper_accepts(encoded_key.as_bytes()) {
+                if !range.upper_accepts(encoded_key.as_bytes()) {
                     self.exhausted = true;
                     break;
                 }
@@ -345,9 +309,10 @@ where
     }
 }
 
-impl<S> IndexBatchStream<S::Output> for IndexScanStream<S>
+impl<S, R> IndexBatchStream<S::Output> for IndexScanStream<S, R>
 where
     S: IndexScanSpec,
+    R: Borrow<KeyRange>,
 {
     #[inline]
     async fn next_batch(&mut self) -> Result<Option<Vec<S::Output>>> {
@@ -355,31 +320,24 @@ where
     }
 }
 
-/// Leaf-bounded stream of encoded unique MemIndex entries.
-pub(crate) type UniqueMemIndexEntryStream<'a, P> =
-    IndexScanStream<UniqueMemIndexEntryScanSpec<'a, P>>;
+/// Lookup-candidate stream over unique MemIndex entries.
+pub(crate) type UniqueMemIndexCandidateStream<'a, P> =
+    IndexScanStream<UniqueMemIndexLookupCandidateScanSpec<'a, P>, &'a KeyRange>;
 
-/// Row-id candidate stream over unique MemIndex entries.
-pub(crate) type UniqueMemIndexBatchStream<'a, P> =
-    IndexScanStream<UniqueMemIndexRowIdCandidateScanSpec<'a, P>>;
+/// Lookup-candidate stream over non-unique MemIndex entries.
+pub(crate) type NonUniqueMemIndexCandidateStream<'a, P> =
+    IndexScanStream<NonUniqueMemIndexLookupCandidateScanSpec<'a, P>, &'a KeyRange>;
 
-/// Leaf-bounded stream of encoded non-unique MemIndex entries.
-pub(crate) type NonUniqueMemIndexEntryStream<'a, P> =
-    IndexScanStream<NonUniqueMemIndexEntryScanSpec<'a, P>>;
+/// Bounded stream of unique DiskTree lookup candidates copied leaf by leaf.
+pub(crate) type UniqueDiskTreeCandidateStream<'a, 'r> =
+    IndexScanStream<UniqueDiskTreeCandidateScanSpec<'a>, &'r KeyRange>;
 
-/// Row-id candidate stream over non-unique MemIndex entries.
-pub(crate) type NonUniqueMemIndexBatchStream<'a, P> =
-    IndexScanStream<NonUniqueMemIndexRowIdCandidateScanSpec<'a, P>>;
-
-/// Bounded stream of unique DiskTree entries copied leaf by leaf.
-pub(crate) type UniqueDiskTreeEntryStream<'a> = IndexScanStream<UniqueDiskTreeEntryScanSpec<'a>>;
-
-/// Bounded stream of non-unique DiskTree entries copied leaf by leaf.
-pub(crate) type NonUniqueDiskTreeEntryStream<'a> =
-    IndexScanStream<NonUniqueDiskTreeEntryScanSpec<'a>>;
+/// Bounded stream of non-unique DiskTree lookup candidates copied leaf by leaf.
+pub(crate) type NonUniqueDiskTreeCandidateStream<'a, 'r> =
+    IndexScanStream<NonUniqueDiskTreeCandidateScanSpec<'a>, &'r KeyRange>;
 
 #[inline]
-fn validate_non_unique_exact_key(encoded_key: &[u8], slot_idx: usize) -> Result<()> {
+pub(crate) fn validate_non_unique_exact_key(encoded_key: &[u8], slot_idx: usize) -> Result<()> {
     if encoded_key.len() < mem::size_of::<RowID>() {
         return Err(Report::new(InternalError::MemIndexKeyMalformed)
             .attach(format!(

@@ -20,6 +20,7 @@ pub(crate) mod purge;
 pub(crate) mod retention;
 pub(crate) mod row;
 pub(crate) mod stmt;
+mod stream_stmt;
 pub(crate) mod sys;
 mod sys_trx;
 pub(crate) mod undo;
@@ -58,6 +59,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 pub use stmt::Statement;
+pub use stream_stmt::{IndexScanMvccStream, StreamStmt};
 /// Minimum snapshot timestamp assigned by the transaction system.
 pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
 /// Exclusive upper bound for snapshot timestamps.
@@ -172,6 +174,12 @@ impl Transaction {
     pub async fn lock_table(&mut self, table_id: TableID, mode: LockMode) -> Result<()> {
         let mut checkout = self.checkout("lock explicit table")?;
         checkout.lock_table(table_id, mode).await
+    }
+
+    /// Creates a statement facade for public caller-driven transaction streams.
+    #[inline]
+    pub fn stream_stmt(&mut self) -> StreamStmt<'_> {
+        StreamStmt::new(self)
     }
 
     /// Executes one scoped statement callback inside this active transaction.
@@ -1018,12 +1026,18 @@ impl TrxCheckout {
 
     /// Returns mutable transaction state and the operation-local attachment.
     #[inline]
-    fn inner_and_attachment_mut(&mut self) -> (&mut TrxInner, &TrxAttachment) {
+    pub(crate) fn inner_and_attachment_mut(&mut self) -> (&mut TrxInner, &TrxAttachment) {
         let inner = self
             .inner
             .as_mut()
             .expect("TrxCheckout always owns an inner until fatal discard");
         (inner, &self.attachment)
+    }
+
+    /// Returns this checkout's operation-local attachment.
+    #[inline]
+    pub(crate) fn attachment(&self) -> &TrxAttachment {
+        &self.attachment
     }
 
     /// Acquires an explicit transaction-lifetime table lock.

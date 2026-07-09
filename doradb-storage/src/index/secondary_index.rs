@@ -6,12 +6,11 @@
 //! cold DiskTree layer.
 
 use super::disk_tree::{
-    DiskTreeEntry, NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree,
-    UniqueDiskTreeRuntime,
+    NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
 };
 use super::index_stream::{
-    NonUniqueDiskTreeEntryStream, NonUniqueMemIndexEntryStream, UniqueDiskTreeEntryStream,
-    UniqueMemIndexEntryStream,
+    NonUniqueDiskTreeCandidateStream, NonUniqueMemIndexCandidateStream,
+    UniqueDiskTreeCandidateStream, UniqueMemIndexCandidateStream,
 };
 use super::mem_index::MemIndexEntry;
 use super::non_unique_index::{GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqueMemIndex};
@@ -21,14 +20,13 @@ use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{Error, InternalError, Result};
 use crate::file::table_file::TableFile;
 use crate::id::{BlockID, RowID, TrxID};
-use crate::index::IndexBatchStream;
 use crate::index::util::Maskable;
+use crate::index::{BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, KeyRange};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
 use error_stack::Report;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
-use std::ops::RangeBounds;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 /// Result of attempting to insert a secondary-index entry.
@@ -198,6 +196,35 @@ impl SecondaryDiskTreeRuntime {
         }
     }
 
+    /// Returns the shared key encoder for this secondary index.
+    #[inline]
+    pub(crate) fn key_encoder(&self) -> Arc<BTreeKeyEncoder> {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => runtime.encoder(),
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => runtime.encoder(),
+        }
+    }
+
+    #[inline]
+    pub(super) fn unique_runtime(&self) -> &UniqueDiskTreeRuntime {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => runtime,
+            SecondaryDiskTreeRuntimeKind::NonUnique(_) => {
+                unreachable!("unique secondary index has non-unique DiskTree runtime")
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn non_unique_runtime(&self) -> &NonUniqueDiskTreeRuntime {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => runtime,
+            SecondaryDiskTreeRuntimeKind::Unique(_) => {
+                unreachable!("non-unique secondary index has unique DiskTree runtime")
+            }
+        }
+    }
+
     /// Open the unique secondary DiskTree at one captured root block id.
     #[inline]
     pub(crate) fn open_unique_at<'a>(
@@ -306,6 +333,12 @@ impl<P: BufferPool> SecondaryIndex<P> {
         }
     }
 
+    /// Returns the shared key encoder for this index.
+    #[inline]
+    pub(crate) fn key_encoder(&self) -> Arc<BTreeKeyEncoder> {
+        self.disk_runtime().key_encoder()
+    }
+
     /// Return the unique MemIndex when this slot is unique.
     #[inline]
     pub(crate) fn unique_mem(&self) -> Result<&UniqueMemIndex<P>> {
@@ -404,8 +437,11 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
 }
 
 impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
-    type RowIdCandidateStream<'a>
-        = SecondaryIndexBatchStream<UniqueMemIndexEntryStream<'a, P>, UniqueDiskTreeEntryStream<'a>>
+    type LookupCandidateStream<'a>
+        = SecondaryIndexCandidateStream<
+        UniqueMemIndexCandidateStream<'a, P>,
+        UniqueDiskTreeCandidateStream<'a, 'a>,
+    >
     where
         Self: 'a;
 
@@ -490,17 +526,14 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_id_candidates<'a, 'r, R>(
+    fn index_scan_candidates<'a>(
         &'a self,
-        range: R,
-        _ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>>
-    where
-        R: RangeBounds<&'r [Val]> + Clone,
-    {
-        let mem = self.mem.scan_encoded_entry_stream(range.clone())?;
-        let disk = self.open()?.scan_entry_stream(range);
-        Ok(SecondaryIndexBatchStream::new(mem, disk))
+        range: &'a KeyRange,
+        ts: TrxID,
+    ) -> Result<Self::LookupCandidateStream<'a>> {
+        let mem = self.mem.index_scan_candidates(range, ts)?;
+        let disk = self.open()?.scan_candidate_stream(range);
+        Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 
     #[inline]
@@ -547,10 +580,10 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
 }
 
 impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
-    type RowIdCandidateStream<'a>
-        = SecondaryIndexBatchStream<
-        NonUniqueMemIndexEntryStream<'a, P>,
-        NonUniqueDiskTreeEntryStream<'a>,
+    type LookupCandidateStream<'a>
+        = SecondaryIndexCandidateStream<
+        NonUniqueMemIndexCandidateStream<'a, P>,
+        NonUniqueDiskTreeCandidateStream<'a, 'a>,
     >
     where
         Self: 'a;
@@ -638,28 +671,25 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_id_candidates<'a, 'r, R>(
+    fn index_scan_candidates<'a>(
         &'a self,
-        range: R,
-        _ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>>
-    where
-        R: RangeBounds<&'r [Val]> + Clone,
-    {
-        let mem = self.mem.scan_encoded_entry_stream(range.clone())?;
-        let disk = self.open()?.scan_entry_stream(range);
-        Ok(SecondaryIndexBatchStream::new(mem, disk))
+        range: &'a KeyRange,
+        ts: TrxID,
+    ) -> Result<Self::LookupCandidateStream<'a>> {
+        let mem = self.mem.index_scan_candidates(range, ts)?;
+        let disk = self.open()?.scan_candidate_stream(range);
+        Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 
     #[inline]
-    fn equal_scan_row_id_candidates<'a>(
+    fn equal_scan_candidates<'a>(
         &'a self,
-        key: &[Val],
-        _ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>> {
-        let mem = self.mem.equal_scan_encoded_entry_stream(key)?;
-        let disk = self.open()?.equal_scan_entry_stream(key);
-        Ok(SecondaryIndexBatchStream::new(mem, disk))
+        range: &'a KeyRange,
+        ts: TrxID,
+    ) -> Result<Self::LookupCandidateStream<'a>> {
+        let mem = self.mem.equal_scan_candidates(range, ts)?;
+        let disk = self.open()?.scan_candidate_stream(range);
+        Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 
     #[inline]
@@ -672,117 +702,110 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 }
 
-/// Incremental row-id candidate stream over a MemIndex/DiskTree pair.
-pub(crate) struct SecondaryIndexBatchStream<M, D> {
+/// Incremental lookup-candidate stream over a MemIndex/DiskTree pair.
+pub(crate) struct SecondaryIndexCandidateStream<M, D> {
     mem: M,
     disk: D,
-    mem_buf: Vec<MemIndexEntry>,
-    mem_idx: usize,
+    mem_buf: VecDeque<IndexLookupCandidate>,
     mem_done: bool,
-    disk_buf: Vec<DiskTreeEntry>,
-    disk_idx: usize,
+    disk_buf: VecDeque<IndexLookupCandidate>,
     disk_done: bool,
 }
 
-impl<M, D> SecondaryIndexBatchStream<M, D>
+impl<M, D> SecondaryIndexCandidateStream<M, D>
 where
-    M: IndexBatchStream<MemIndexEntry>,
-    D: IndexBatchStream<DiskTreeEntry>,
+    M: IndexBatchStream<IndexLookupCandidate>,
+    D: IndexBatchStream<IndexLookupCandidate>,
 {
     #[inline]
-    fn new(mem: M, disk: D) -> Self {
+    pub(super) fn new(mem: M, disk: D) -> Self {
         Self {
             mem,
             disk,
-            mem_buf: Vec::new(),
-            mem_idx: 0,
+            mem_buf: VecDeque::new(),
             mem_done: false,
-            disk_buf: Vec::new(),
-            disk_idx: 0,
+            disk_buf: VecDeque::new(),
             disk_done: false,
         }
     }
 
-    #[inline]
-    fn mem_needs_refill(&self) -> bool {
-        self.mem_idx == self.mem_buf.len() && !self.mem_done
-    }
-
-    #[inline]
-    fn disk_needs_refill(&self) -> bool {
-        self.disk_idx == self.disk_buf.len() && !self.disk_done
-    }
-
     async fn ensure_mem(&mut self) -> Result<bool> {
-        if self.mem_idx < self.mem_buf.len() {
-            return Ok(true);
-        }
-        if self.mem_done {
-            return Ok(false);
-        }
-        match self.mem.next_batch().await? {
-            Some(entries) => {
-                self.mem_buf = entries;
-                self.mem_idx = 0;
-                Ok(true)
+        loop {
+            if !self.mem_buf.is_empty() {
+                return Ok(true);
             }
-            None => {
-                self.mem_done = true;
-                Ok(false)
+            if self.mem_done {
+                return Ok(false);
+            }
+            match self.mem.next_batch().await? {
+                Some(entries) => {
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    self.mem_buf = VecDeque::from(entries);
+                    return Ok(true);
+                }
+                None => {
+                    self.mem_done = true;
+                    return Ok(false);
+                }
             }
         }
     }
 
     async fn ensure_disk(&mut self) -> Result<bool> {
-        if self.disk_idx < self.disk_buf.len() {
-            return Ok(true);
-        }
-        if self.disk_done {
-            return Ok(false);
-        }
-        match self.disk.next_batch().await? {
-            Some(entries) => {
-                self.disk_buf = entries;
-                self.disk_idx = 0;
-                Ok(true)
+        loop {
+            if !self.disk_buf.is_empty() {
+                return Ok(true);
             }
-            None => {
-                self.disk_done = true;
-                Ok(false)
+            if self.disk_done {
+                return Ok(false);
+            }
+            match self.disk.next_batch().await? {
+                Some(entries) => {
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    self.disk_buf = VecDeque::from(entries);
+                    return Ok(true);
+                }
+                None => {
+                    self.disk_done = true;
+                    return Ok(false);
+                }
             }
         }
     }
 
     #[inline]
-    fn push_mem(&mut self, out: &mut Vec<RowID>) {
-        out.push(self.mem_buf[self.mem_idx].row_id.value());
-        self.mem_idx += 1;
+    fn push_mem(&mut self, out: &mut Vec<IndexLookupCandidate>) {
+        if let Some(mem) = self.mem_buf.pop_front() {
+            out.push(mem);
+        }
     }
 
     #[inline]
-    fn push_disk(&mut self, out: &mut Vec<RowID>) {
-        out.push(self.disk_buf[self.disk_idx].row_id);
-        self.disk_idx += 1;
+    fn push_disk(&mut self, out: &mut Vec<IndexLookupCandidate>) {
+        if let Some(disk) = self.disk_buf.pop_front() {
+            out.push(disk);
+        }
     }
 
     #[inline]
-    fn push_equal(&mut self, out: &mut Vec<RowID>) {
+    fn push_equal(&mut self, out: &mut Vec<IndexLookupCandidate>) {
         self.push_mem(out);
-        self.disk_idx += 1;
+        let _ = self.disk_buf.pop_front();
     }
 }
 
-impl<M, D> IndexBatchStream<RowID> for SecondaryIndexBatchStream<M, D>
+impl<M, D> IndexBatchStream<IndexLookupCandidate> for SecondaryIndexCandidateStream<M, D>
 where
-    M: IndexBatchStream<MemIndexEntry>,
-    D: IndexBatchStream<DiskTreeEntry>,
+    M: IndexBatchStream<IndexLookupCandidate>,
+    D: IndexBatchStream<IndexLookupCandidate>,
 {
-    async fn next_batch(&mut self) -> Result<Option<Vec<RowID>>> {
+    async fn next_batch(&mut self) -> Result<Option<Vec<IndexLookupCandidate>>> {
         let mut out = Vec::new();
         loop {
-            if !out.is_empty() && (self.mem_needs_refill() || self.disk_needs_refill()) {
-                return Ok(Some(out));
-            }
             let mem_has = self.ensure_mem().await?;
             let disk_has = self.ensure_disk().await?;
             match (mem_has, disk_has) {
@@ -796,8 +819,10 @@ where
                     self.push_disk(&mut out);
                 }
                 (true, true) => {
-                    let mem = &self.mem_buf[self.mem_idx];
-                    let disk = &self.disk_buf[self.disk_idx];
+                    let (Some(mem), Some(disk)) = (self.mem_buf.front(), self.disk_buf.front())
+                    else {
+                        continue;
+                    };
                     match mem.encoded_key.as_bytes().cmp(disk.encoded_key.as_bytes()) {
                         Ordering::Less => {
                             self.push_mem(&mut out);
@@ -810,6 +835,12 @@ where
                         }
                     }
                 }
+            }
+            if !out.is_empty()
+                && ((self.mem_buf.is_empty() && !self.mem_done)
+                    || (self.disk_buf.is_empty() && !self.disk_done))
+            {
+                return Ok(Some(out));
             }
         }
     }
@@ -921,20 +952,13 @@ mod tests {
     use crate::index::disk_tree::{
         NonUniqueDiskTree, NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut,
     };
+    use crate::index::util::tests::drain_row_ids;
     use crate::quiescent::QuiescentBox;
     use crate::table::test_user_table_id;
     use crate::value::{ValKind, ValType};
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()
-    }
-
-    async fn drain_row_ids<S: IndexBatchStream<RowID>>(stream: &mut S) -> Vec<RowID> {
-        let mut row_ids = Vec::new();
-        while let Some(batch) = stream.next_batch().await.unwrap() {
-            row_ids.extend(batch);
-        }
-        row_ids
     }
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
@@ -1270,9 +1294,8 @@ mod tests {
                     RowID::new(50)
                 ]
             );
-            let mut stream = bound
-                .scan_row_id_candidates(&key2[..]..=&key5[..], TrxID::new(8))
-                .unwrap();
+            let range = index.key_encoder().encode_range(&key2[..]..=&key5[..]);
+            let mut stream = bound.index_scan_candidates(&range, TrxID::new(8)).unwrap();
             assert_eq!(
                 drain_row_ids(&mut stream).await,
                 test_row_ids([200, 30, 40, 50])
@@ -1533,20 +1556,23 @@ mod tests {
             let mut values = Vec::new();
             bound.scan_values(&mut values, TrxID::new(8)).await.unwrap();
             assert_eq!(values, test_row_ids([10, 11, 12, 13, 30]));
+            let key1_range = index.key_encoder().encode_non_unique_equal_range(&key1);
             let mut key1_stream = bound
-                .equal_scan_row_id_candidates(&key1, TrxID::new(8))
+                .equal_scan_candidates(&key1_range, TrxID::new(8))
                 .unwrap();
             assert_eq!(
                 drain_row_ids(&mut key1_stream).await,
                 test_row_ids([10, 11, 12, 13])
             );
+            let key2_range = index.key_encoder().encode_non_unique_equal_range(&key2);
             let mut key2_stream = bound
-                .equal_scan_row_id_candidates(&key2, TrxID::new(8))
+                .equal_scan_candidates(&key2_range, TrxID::new(8))
                 .unwrap();
             assert_eq!(drain_row_ids(&mut key2_stream).await, test_row_ids([20]));
-            let mut range_stream = bound
-                .scan_row_id_candidates(&key1[..]..=&key3[..], TrxID::new(8))
-                .unwrap();
+            let range = index
+                .key_encoder()
+                .encode_non_unique_range(&key1[..]..=&key3[..]);
+            let mut range_stream = bound.index_scan_candidates(&range, TrxID::new(8)).unwrap();
             assert_eq!(
                 drain_row_ids(&mut range_stream).await,
                 test_row_ids([10, 11, 12, 13, 20, 30])
@@ -1646,11 +1672,15 @@ mod tests {
                     .build();
                 let bound = index.bind_unique(&pool_guards, root).unwrap();
 
-                let mut stream = bound
-                    .scan_row_id_candidates(&key1[..]..=&key4[..], TrxID::new(4))
-                    .unwrap();
+                let range = index.key_encoder().encode_range(&key1[..]..=&key4[..]);
+                let mut stream = bound.index_scan_candidates(&range, TrxID::new(4)).unwrap();
                 assert_eq!(
-                    stream.next_batch().await.unwrap(),
+                    stream.next_batch().await.unwrap().map(|batch| {
+                        batch
+                            .into_iter()
+                            .map(|candidate| candidate.row_id)
+                            .collect::<Vec<_>>()
+                    }),
                     Some(test_row_ids([100]))
                 );
                 drop(stream);
@@ -1666,8 +1696,9 @@ mod tests {
                         .unwrap()
                         .is_ok()
                 );
+                let fresh_range = index.key_encoder().encode_range(&key1[..]..=&key5[..]);
                 let mut fresh = bound
-                    .scan_row_id_candidates(&key1[..]..=&key5[..], TrxID::new(7))
+                    .index_scan_candidates(&fresh_range, TrxID::new(7))
                     .unwrap();
                 assert_eq!(
                     drain_row_ids(&mut fresh).await,
@@ -1743,11 +1774,15 @@ mod tests {
                     .build();
                 let bound = index.bind_non_unique(&pool_guards, root).unwrap();
 
-                let mut stream = bound
-                    .equal_scan_row_id_candidates(&key1, TrxID::new(4))
-                    .unwrap();
+                let range = index.key_encoder().encode_non_unique_equal_range(&key1);
+                let mut stream = bound.equal_scan_candidates(&range, TrxID::new(4)).unwrap();
                 assert_eq!(
-                    stream.next_batch().await.unwrap(),
+                    stream.next_batch().await.unwrap().map(|batch| {
+                        batch
+                            .into_iter()
+                            .map(|candidate| candidate.row_id)
+                            .collect::<Vec<_>>()
+                    }),
                     Some(test_row_ids([10, 11]))
                 );
                 drop(stream);
@@ -1762,8 +1797,9 @@ mod tests {
                 let mut rows = Vec::new();
                 bound.lookup(&key1, &mut rows, TrxID::new(6)).await.unwrap();
                 assert_eq!(rows, test_row_ids([10, 11, 12, 13]));
+                let fresh_range = index.key_encoder().encode_non_unique_equal_range(&key1);
                 let mut fresh = bound
-                    .equal_scan_row_id_candidates(&key1, TrxID::new(7))
+                    .equal_scan_candidates(&fresh_range, TrxID::new(7))
                     .unwrap();
                 assert_eq!(
                     drain_row_ids(&mut fresh).await,

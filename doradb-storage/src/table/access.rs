@@ -11,8 +11,9 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    ColumnBlockIndex, ColumnLeafEntry, IndexBatchStream, IndexCompareExchange, IndexInsert,
-    NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex,
+    BTreeKeyEncoder, ColumnBlockIndex, ColumnLeafEntry, IndexBatchStream, IndexCompareExchange,
+    IndexInsert, IndexLookupCandidate, KeyRange, NonUniqueIndex, NonUniqueSecondaryIndex,
+    OwnedSecondaryIndexCandidateStream, RowLocation, SecondaryIndex, UniqueIndex,
     UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
@@ -29,7 +30,9 @@ use crate::table::{
     UpdateUniqueMvcc, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
     unique_key_from_full_row, update_index_result_to_update_unique_mvcc, validate_page_row_range,
 };
-use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
+use crate::trx::row::{
+    FindOldVersion, IndexCandidateRecheck, ReadAllRows, RowReadAccess, RowWriteAccess,
+};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
@@ -167,6 +170,18 @@ impl<'a> UserTableAccessor<'a> {
         self.user_sec_idx()
             .get(index_no)
             .and_then(Option::as_deref)
+            .ok_or_else(|| missing_secondary_index(index_no, self.user_sec_idx().len()))
+    }
+
+    #[inline]
+    fn require_sec_idx_arc(
+        &self,
+        index_no: usize,
+    ) -> Result<Arc<SecondaryIndex<EvictableBufferPool>>> {
+        self.user_sec_idx()
+            .get(index_no)
+            .and_then(Option::as_ref)
+            .cloned()
             .ok_or_else(|| missing_secondary_index(index_no, self.user_sec_idx().len()))
     }
 
@@ -437,6 +452,131 @@ impl<'a> UserTableAccessor<'a> {
                 }
             }
         }
+    }
+
+    /// Resolves one index scan candidate through row MVCC and exact key recheck.
+    #[inline]
+    pub(crate) async fn index_lookup_candidate_row_mvcc(
+        &self,
+        rt: TrxRuntime<'_>,
+        index_no: usize,
+        unique: bool,
+        encoder: &BTreeKeyEncoder,
+        candidate: &IndexLookupCandidate,
+        read_set: &[usize],
+    ) -> Result<SelectMvcc> {
+        loop {
+            let location = self
+                .find_row_location(rt.pool_guards(), candidate.row_id)
+                .await?;
+            match location {
+                RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
+                RowLocation::LwcBlock {
+                    block_id,
+                    row_idx,
+                    row_shape_fingerprint,
+                } => {
+                    let deletion_buffer = self.lwc_deletion_buffer()?;
+                    if let Some(marker) = deletion_buffer.get(candidate.row_id) {
+                        match marker {
+                            DeleteMarker::Committed(ts) => {
+                                if ts <= rt.sts() {
+                                    return Ok(SelectMvcc::NotFound);
+                                }
+                            }
+                            DeleteMarker::Ref(status) => {
+                                let ts = status.ts();
+                                if trx_is_committed(ts) {
+                                    if ts <= rt.sts() {
+                                        return Ok(SelectMvcc::NotFound);
+                                    }
+                                } else if Arc::ptr_eq(&status, &rt.status()) {
+                                    return Ok(SelectMvcc::NotFound);
+                                }
+                            }
+                        }
+                    }
+                    let storage = self.column_storage()?;
+                    let block = PersistedLwcBlock::load(
+                        storage.file().file_kind(),
+                        storage.file().sparse_file(),
+                        storage.disk_pool(),
+                        rt.pool_guards().disk_guard(),
+                        block_id,
+                    )
+                    .await?;
+                    if block.row_shape_fingerprint() != row_shape_fingerprint {
+                        return Err(invalid_lwc_payload(
+                            FileKind::TableFile,
+                            block_id,
+                            "row shape fingerprint mismatch",
+                        ));
+                    }
+                    let index_spec = self.metadata().idx.require_index_spec(index_no)?;
+                    return match block.read_index_candidate_row_values(
+                        self.metadata().col.as_ref(),
+                        index_spec,
+                        row_idx,
+                        encoder,
+                        candidate,
+                        read_set,
+                    )? {
+                        Some(vals) => Ok(SelectMvcc::Found(vals)),
+                        None => Ok(SelectMvcc::NotFound),
+                    };
+                }
+                RowLocation::RowPage(page_id) => {
+                    let Some(page_guard) = self
+                        .mem()
+                        .try_get_validated_row_page_shared_result(
+                            rt.pool_guards(),
+                            page_id,
+                            candidate.row_id,
+                        )
+                        .await?
+                    else {
+                        continue;
+                    };
+                    let (page_ctx, page) = page_guard.ctx_and_page();
+                    let access = RowReadAccess::new(page, page_ctx, page.row_idx(candidate.row_id));
+                    let recheck = IndexCandidateRecheck {
+                        index_no,
+                        unique,
+                        candidate,
+                        encoder,
+                    };
+                    return Ok(
+                        match access.read_row_mvcc_index_candidate(
+                            rt.ctx(),
+                            self.metadata(),
+                            read_set,
+                            &recheck,
+                        ) {
+                            ReadRow::Ok(vals) => SelectMvcc::Found(vals),
+                            ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Create an index-derived candidate stream for a public scan range.
+    pub(crate) fn index_scan_candidates(
+        &self,
+        rt: TrxRuntime<'_>,
+        index_no: usize,
+        range: KeyRange,
+    ) -> Result<OwnedSecondaryIndexCandidateStream<EvictableBufferPool>> {
+        debug_assert!(index_no < self.sec_idx_len());
+        let root = self.read_proof_secondary_root(rt, index_no)?;
+        let index = self.require_sec_idx_arc(index_no)?;
+        Ok(OwnedSecondaryIndexCandidateStream::new(
+            index,
+            rt.pool_guards().clone(),
+            root,
+            range,
+        ))
     }
 
     #[inline]
@@ -2213,7 +2353,7 @@ impl<'a> UserTableAccessor<'a> {
         rt: TrxRuntime<'_>,
         index_no: usize,
         key_vals: &[Val],
-        user_read_set: &[usize],
+        read_set: &[usize],
     ) -> Result<ScanMvcc> {
         debug_assert!(index_no < self.sec_idx_len());
         // Index scan should be applied to non-unique index.
@@ -2232,26 +2372,32 @@ impl<'a> UserTableAccessor<'a> {
             key_vals
         ));
         debug_assert!({
-            !user_read_set.is_empty()
-                && user_read_set
+            !read_set.is_empty()
+                && read_set
                     .iter()
-                    .zip(user_read_set.iter().skip(1))
+                    .zip(read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        let root = self.read_proof_secondary_root(rt, index_no)?;
         let mut res = vec![];
+        let root = self.read_proof_secondary_root(rt, index_no)?;
+        let encoder = self.require_sec_idx(index_no)?.key_encoder();
         let index = self.require_non_unique_index(rt.pool_guards(), index_no, root)?;
-        let mut stream = index.equal_scan_row_id_candidates(key_vals, rt.sts())?;
-        while let Some(row_ids) = stream.next_batch().await? {
-            for row_id in row_ids {
-                match self
-                    .index_lookup_unique_row_mvcc(rt, index_no, key_vals, user_read_set, row_id)
-                    .await?
-                {
-                    SelectMvcc::NotFound => (),
-                    SelectMvcc::Found(vals) => {
-                        res.push(vals);
-                    }
+        let mut candidates = Vec::new();
+        let range = encoder.encode_non_unique_equal_range(key_vals);
+        let mut stream = index.equal_scan_candidates(&range, rt.sts())?;
+        while let Some(batch) = stream.next_batch().await? {
+            candidates.extend(batch);
+        }
+        for candidate in candidates {
+            match self
+                .index_lookup_candidate_row_mvcc(
+                    rt, index_no, false, &encoder, &candidate, read_set,
+                )
+                .await?
+            {
+                SelectMvcc::NotFound => (),
+                SelectMvcc::Found(vals) => {
+                    res.push(vals);
                 }
             }
         }
@@ -2882,7 +3028,7 @@ mod tests {
     use crate::error::{
         CompletionErrorKind, DataIntegrityError, FatalError, InternalError, OperationError, Result,
     };
-    use crate::id::TrxID;
+    use crate::id::{TableID, TrxID};
     use crate::index::{RowLocation, UniqueIndex};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::latch::LatchFallbackMode;
@@ -2895,11 +3041,11 @@ mod tests {
     use crate::table::hot::{HotRowDeleter, HotRowUpdater, RowInserter};
     use crate::table::tests::*;
     use crate::table::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
-    use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::row::LockRowForWrite;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::undo::RowUndoKind;
+    use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use error_stack::Report;
     use smol::Timer;
@@ -6121,6 +6267,159 @@ mod tests {
         });
     }
 
+    async fn secondary_index_scan_rows(
+        trx: &mut Transaction,
+        table_id: TableID,
+        key: i32,
+    ) -> Vec<Vec<Val>> {
+        let key_vals = [Val::from(key)];
+        let read_set = [0usize, 1];
+        trx.exec(async |stmt| {
+            stmt.table_index_scan_mvcc(table_id, 1, &key_vals, &read_set)
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap_rows()
+    }
+
+    async fn secondary_index_stream_rows(
+        trx: &mut Transaction,
+        table_id: TableID,
+        key: i32,
+    ) -> Vec<Vec<Val>> {
+        let key_vals = [Val::from(key)];
+        let read_set = [0usize, 1];
+        let mut stream = trx
+            .stream_stmt()
+            .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await.unwrap() {
+            rows.push(row);
+        }
+        rows
+    }
+
+    #[test]
+    fn test_secondary_index_scan_mvcc_reads_lwc_projection_without_index_column() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path())
+                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                .trx(TrxSysConfig::default().log_file_stem("redo_secidx_lwc_projection"))
+                .build()
+                .await
+                .unwrap();
+            let table_id = table4(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut insert = session.begin_trx().unwrap();
+            let res =
+                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
+                    .await;
+            assert!(res.is_ok());
+            insert.commit().await.unwrap();
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let key = SelectKey::new(0, vec![Val::from(10i32)]);
+            let reader = session.begin_trx().unwrap();
+            assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            let key_vals = [Val::from(7i32)];
+            let read_set = [0usize];
+            let expected = vec![vec![Val::from(10i32)]];
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_scan_mvcc(table_id, 1, &key_vals, &read_set)
+                        .await
+                })
+                .await
+                .unwrap()
+                .unwrap_rows();
+            trx.commit().await.unwrap();
+            assert_eq!(rows, expected);
+
+            let mut trx = session.begin_trx().unwrap();
+            let mut stream = trx
+                .stream_stmt()
+                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &read_set)
+                .await
+                .unwrap();
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next().await.unwrap() {
+                rows.push(row);
+            }
+            drop(stream);
+            trx.commit().await.unwrap();
+            assert_eq!(rows, expected);
+        });
+    }
+
+    #[test]
+    fn test_stream_stmt_validation_opt_out_is_stream_local() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path())
+                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                .trx(TrxSysConfig::default().log_file_stem("redo_stream_validation_opt_out"))
+                .build()
+                .await
+                .unwrap();
+            let table_id = table4(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut insert = session.begin_trx().unwrap();
+            let res =
+                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
+                    .await;
+            assert!(res.is_ok());
+            insert.commit().await.unwrap();
+
+            let key_vals = [Val::from(7i32)];
+            let mut trx = session.begin_trx().unwrap();
+            let err = match trx
+                .stream_stmt()
+                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .await
+            {
+                Ok(_) => panic!("empty read set should fail stream construction"),
+                Err(err) => err,
+            };
+            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+
+            let mut stream = trx
+                .stream_stmt()
+                .disable_validation()
+                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .await
+                .unwrap();
+            assert_eq!(stream.next().await.unwrap(), Some(Vec::new()));
+            assert_eq!(stream.next().await.unwrap(), None);
+            drop(stream);
+
+            let err = match trx
+                .stream_stmt()
+                .table_index_scan_mvcc(table_id, 1, &key_vals[..]..=&key_vals[..], &[])
+                .await
+            {
+                Ok(_) => panic!("empty read set should fail after opt-out stream"),
+                Err(err) => err,
+            };
+            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            trx.commit().await.unwrap();
+        });
+    }
+
     #[test]
     fn test_secondary_index_common() {
         smol::block_on(async {
@@ -6164,6 +6463,93 @@ mod tests {
                 assert!(res.unwrap().unwrap_rows().len() == 1);
 
                 let mut trx = session.begin_trx().unwrap();
+                let key_vals = [Val::from(1i32)];
+                let mut stream = trx
+                    .stream_stmt()
+                    .table_index_scan_mvcc(
+                        table_id,
+                        1,
+                        &key_vals[..]..=&key_vals[..],
+                        user_read_set,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stream.next().await.unwrap(),
+                    Some(vec![Val::from(1i32), Val::from(1i32)])
+                );
+                assert_eq!(stream.next().await.unwrap(), None);
+                assert_eq!(stream.next().await.unwrap(), None);
+                drop(stream);
+                trx.commit().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
+                let lower = [Val::from(1i32)];
+                let upper = [Val::from(4i32)];
+                let mut stream = trx
+                    .stream_stmt()
+                    .table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], user_read_set)
+                    .await
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(vals) = stream.next().await.unwrap() {
+                    rows.push(vals);
+                }
+                drop(stream);
+                trx.commit().await.unwrap();
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![Val::from(1i32), Val::from(1i32)],
+                        vec![Val::from(2i32), Val::from(2i32)],
+                        vec![Val::from(3i32), Val::from(3i32)]
+                    ]
+                );
+
+                let mut trx = session.begin_trx().unwrap();
+                let mut stream = trx
+                    .stream_stmt()
+                    .table_index_scan_mvcc(table_id, 1, .., user_read_set)
+                    .await
+                    .unwrap();
+                assert!(stream.next().await.unwrap().is_some());
+                drop(stream);
+                let key = SelectKey::new(0, vec![Val::from(2i32)]);
+                let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
+                trx.commit().await.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+
+                let mut trx = session.begin_trx().unwrap();
+                let err = match trx
+                    .stream_stmt()
+                    .table_index_scan_mvcc(table_id, 1, .., &[])
+                    .await
+                {
+                    Ok(_) => panic!("empty read set should fail stream construction"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+                trx.commit().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
+                let invalid_key_vals = [Val::from(1i32), Val::from(2i32)];
+                let err = match trx
+                    .stream_stmt()
+                    .table_index_scan_mvcc(
+                        table_id,
+                        1,
+                        &invalid_key_vals[..]..=&invalid_key_vals[..],
+                        user_read_set,
+                    )
+                    .await
+                {
+                    Ok(_) => panic!("invalid stream key shape should fail stream construction"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+                trx.commit().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(1i32)]);
                 let update = vec![UpdateCol {
                     idx: 1,
@@ -6185,6 +6571,28 @@ mod tests {
                 assert!(res.unwrap().unwrap_rows().len() == 2);
 
                 let mut trx = session.begin_trx().unwrap();
+                let lower = [Val::from(0i32)];
+                let upper = [Val::from(5i32)];
+                let mut stream = trx
+                    .stream_stmt()
+                    .table_index_scan_mvcc(table_id, 1, &lower[..]..&upper[..], user_read_set)
+                    .await
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(vals) = stream.next().await.unwrap() {
+                    rows.push(vals);
+                }
+                drop(stream);
+                trx.commit().await.unwrap();
+                assert_eq!(rows.len(), 5);
+                assert_eq!(
+                    rows.iter()
+                        .filter(|vals| vals[0] == Val::from(1i32))
+                        .count(),
+                    1
+                );
+
+                let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 trx.commit().await.unwrap();
@@ -6202,5 +6610,110 @@ mod tests {
                 assert!(res.unwrap().unwrap_rows().len() == 1);
             }
         })
+    }
+
+    #[test]
+    fn test_secondary_index_scan_mvcc_uncommitted_delete_candidate_visibility() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path())
+                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                .trx(TrxSysConfig::default().log_file_stem("redo_secidx_uncommitted_delete"))
+                .build()
+                .await
+                .unwrap();
+            let table_id = table4(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut insert = session.begin_trx().unwrap();
+            let res =
+                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
+                    .await;
+            assert!(res.is_ok());
+            insert.commit().await.unwrap();
+
+            let mut writer = session.begin_trx().unwrap();
+            let key = SelectKey::new(0, vec![Val::from(10i32)]);
+            let res = trx_delete_row_by_id(&mut writer, table_id, &key).await;
+            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+
+            assert_eq!(
+                secondary_index_scan_rows(&mut writer, table_id, 7).await,
+                Vec::<Vec<Val>>::new()
+            );
+            assert_eq!(
+                secondary_index_stream_rows(&mut writer, table_id, 7).await,
+                Vec::<Vec<Val>>::new()
+            );
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut reader = reader_session.begin_trx().unwrap();
+            let expected = vec![vec![Val::from(10i32), Val::from(7i32)]];
+            assert_eq!(
+                secondary_index_scan_rows(&mut reader, table_id, 7).await,
+                expected
+            );
+            assert_eq!(
+                secondary_index_stream_rows(&mut reader, table_id, 7).await,
+                expected
+            );
+            reader.commit().await.unwrap();
+            writer.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_secondary_index_scan_mvcc_delete_committed_after_snapshot() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path())
+                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                .trx(TrxSysConfig::default().log_file_stem("redo_secidx_late_delete"))
+                .build()
+                .await
+                .unwrap();
+            let table_id = table4(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut insert = session.begin_trx().unwrap();
+            let res =
+                trx_insert_row_by_id(&mut insert, table_id, vec![Val::from(10), Val::from(7)])
+                    .await;
+            assert!(res.is_ok());
+            insert.commit().await.unwrap();
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut old_reader = reader_session.begin_trx().unwrap();
+
+            let mut writer = session.begin_trx().unwrap();
+            let key = SelectKey::new(0, vec![Val::from(10i32)]);
+            let res = trx_delete_row_by_id(&mut writer, table_id, &key).await;
+            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+            writer.commit().await.unwrap();
+
+            let expected = vec![vec![Val::from(10i32), Val::from(7i32)]];
+            assert_eq!(
+                secondary_index_scan_rows(&mut old_reader, table_id, 7).await,
+                expected
+            );
+            assert_eq!(
+                secondary_index_stream_rows(&mut old_reader, table_id, 7).await,
+                expected
+            );
+            old_reader.commit().await.unwrap();
+
+            let mut fresh_reader = session.begin_trx().unwrap();
+            assert_eq!(
+                secondary_index_scan_rows(&mut fresh_reader, table_id, 7).await,
+                Vec::<Vec<Val>>::new()
+            );
+            assert_eq!(
+                secondary_index_stream_rows(&mut fresh_reader, table_id, 7).await,
+                Vec::<Vec<Val>>::new()
+            );
+            fresh_reader.commit().await.unwrap();
+        });
     }
 }

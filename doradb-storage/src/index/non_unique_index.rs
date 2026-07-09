@@ -11,23 +11,23 @@ use crate::index::btree::GenericBTree;
 use crate::index::btree::{BTREE_BYTE_ZERO, BTreeByte, BTreeU64};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate};
 use crate::index::btree::{BTreeNode, BTreeSlot};
-use crate::index::index_stream::{NonUniqueMemIndexBatchStream, NonUniqueMemIndexEntryStream};
+use crate::index::index_stream::NonUniqueMemIndexCandidateStream;
 use crate::index::mem_index::{
     MemIndex, MemIndexCleanupScan, MemIndexEntry, NonUniqueMemIndexCleanupSpec,
     NonUniqueMemIndexEntryScanSpec, push_non_unique_encoded_entry,
 };
 use crate::index::util::Maskable;
-use crate::index::{IndexBatchStream, IndexInsert};
+use crate::index::{IndexBatchStream, IndexInsert, IndexLookupCandidate, KeyRange};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValKind, ValType};
 use std::future::Future;
 use std::mem;
-use std::ops::{Deref, RangeBounds};
+use std::ops::Deref;
 
 /// Abstraction of non-unique index.
 pub(crate) trait NonUniqueIndex: Send + Sync {
-    /// Candidate row-id stream returned by bounded non-unique-index scans.
-    type RowIdCandidateStream<'a>: IndexBatchStream<RowID> + 'a
+    /// Candidate stream returned by bounded non-unique-index scans.
+    type LookupCandidateStream<'a>: IndexBatchStream<IndexLookupCandidate> + 'a
     where
         Self: 'a;
 
@@ -93,34 +93,29 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
     fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = Result<()>>;
 
-    /// Scan row-id candidates over a bounded logical-key range.
+    /// Scan lookup candidates over a bounded encoded-key range.
     ///
-    /// Returned row ids are index-derived candidates for MVCC lookup, not
-    /// visibility-confirmed rows. The stream must return unmasked row ids even
-    /// when an in-memory delete-shadow entry is encountered; row-version and
-    /// column-deletion-buffer checks decide whether a candidate is visible.
-    /// Hot in-memory entries shadow equal cold DiskTree entries.
+    /// Returned entries are index-derived candidates for MVCC lookup, not
+    /// visibility-confirmed rows. Non-unique candidates carry encoded exact
+    /// `(logical_key, row_id)` keys. Delete-marked in-memory entries are still
+    /// candidates; row-version and column-deletion-buffer checks decide whether
+    /// a candidate is visible.
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "reserved non-unique row-id candidate range stream"
-        )
+        allow(dead_code, reason = "reserved borrowed candidate stream API")
     )]
-    fn scan_row_id_candidates<'a, 'r, R>(
+    fn index_scan_candidates<'a>(
         &'a self,
-        range: R,
+        range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>>
-    where
-        R: RangeBounds<&'r [Val]> + Clone;
+    ) -> Result<Self::LookupCandidateStream<'a>>;
 
-    /// Scan row-id candidates equal to one logical secondary key.
-    fn equal_scan_row_id_candidates<'a>(
+    /// Scan lookup candidates equal to one encoded secondary-key range.
+    fn equal_scan_candidates<'a>(
         &'a self,
-        key: &[Val],
+        range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>>;
+    ) -> Result<Self::LookupCandidateStream<'a>>;
 }
 
 /// Generic non-unique-index implementation backed by a generic B-Tree.
@@ -339,40 +334,11 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
     pub(crate) async fn scan_encoded_entries(&self) -> Result<Vec<MemIndexEntry>> {
         self.index.scan_encoded_entries(self.pool_guard).await
     }
-
-    /// Create a bounded encoded-entry stream over this MemIndex view.
-    #[inline]
-    pub(crate) fn scan_encoded_entry_stream<'a, 'r, R>(
-        &'a self,
-        range: R,
-    ) -> Result<NonUniqueMemIndexEntryStream<'a, P>>
-    where
-        R: RangeBounds<&'r [Val]>,
-    {
-        let range = self.index.encoder().encode_non_unique_range(range);
-        Ok(NonUniqueMemIndexEntryStream::new(
-            self.index.tree().cursor(self.pool_guard, 0),
-            range,
-        ))
-    }
-
-    /// Create an equality encoded-entry stream over this MemIndex view.
-    #[inline]
-    pub(crate) fn equal_scan_encoded_entry_stream<'a>(
-        &'a self,
-        key: &[Val],
-    ) -> Result<NonUniqueMemIndexEntryStream<'a, P>> {
-        let range = self.index.encoder().encode_non_unique_equal_range(key);
-        Ok(NonUniqueMemIndexEntryStream::new(
-            self.index.tree().cursor(self.pool_guard, 0),
-            range,
-        ))
-    }
 }
 
 impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
-    type RowIdCandidateStream<'a>
-        = NonUniqueMemIndexBatchStream<'a, P>
+    type LookupCandidateStream<'a>
+        = NonUniqueMemIndexCandidateStream<'a, P>
     where
         Self: 'a;
 
@@ -505,29 +471,24 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    fn scan_row_id_candidates<'a, 'r, R>(
+    fn index_scan_candidates<'a>(
         &'a self,
-        range: R,
+        range: &'a KeyRange,
         _ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>>
-    where
-        R: RangeBounds<&'r [Val]> + Clone,
-    {
-        let range = self.index.encoder().encode_non_unique_range(range);
-        Ok(NonUniqueMemIndexBatchStream::new(
+    ) -> Result<Self::LookupCandidateStream<'a>> {
+        Ok(NonUniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,
         ))
     }
 
     #[inline]
-    fn equal_scan_row_id_candidates<'a>(
+    fn equal_scan_candidates<'a>(
         &'a self,
-        key: &[Val],
+        range: &'a KeyRange,
         _ts: TrxID,
-    ) -> Result<Self::RowIdCandidateStream<'a>> {
-        let range = self.index.encoder().encode_non_unique_equal_range(key);
-        Ok(NonUniqueMemIndexBatchStream::new(
+    ) -> Result<Self::LookupCandidateStream<'a>> {
+        Ok(NonUniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,
         ))
@@ -578,16 +539,9 @@ mod tests {
     use crate::buffer::{FixedBufferPool, PoolRole};
     use crate::error::InternalError;
     use crate::index::btree::BTree;
+    use crate::index::util::tests::drain_row_ids;
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
-
-    async fn drain_row_ids<S: IndexBatchStream<RowID>>(stream: &mut S) -> Vec<RowID> {
-        let mut row_ids = Vec::new();
-        while let Some(batch) = stream.next_batch().await.unwrap() {
-            row_ids.extend(batch);
-        }
-        row_ids
-    }
 
     #[test]
     fn test_non_unique_index() {
@@ -665,16 +619,20 @@ mod tests {
                     .unwrap()
             );
 
+            let equal_range = index.encoder().encode_non_unique_equal_range(&key1);
             let mut equal = guarded
-                .equal_scan_row_id_candidates(&key1, TrxID::new(102))
+                .equal_scan_candidates(&equal_range, TrxID::new(102))
                 .unwrap();
             assert_eq!(
                 drain_row_ids(&mut equal).await,
                 vec![RowID::new(10), RowID::new(11)]
             );
 
+            let scan_range = index
+                .encoder()
+                .encode_non_unique_range(&key1[..]..&key3[..]);
             let mut range = guarded
-                .scan_row_id_candidates(&key1[..]..&key3[..], TrxID::new(103))
+                .index_scan_candidates(&scan_range, TrxID::new(103))
                 .unwrap();
             assert_eq!(
                 drain_row_ids(&mut range).await,
