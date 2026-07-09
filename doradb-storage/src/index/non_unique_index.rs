@@ -100,10 +100,6 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
     /// `(logical_key, row_id)` keys. Delete-marked in-memory entries are still
     /// candidates; row-version and column-deletion-buffer checks decide whether
     /// a candidate is visible.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved borrowed candidate stream API")
-    )]
     fn index_scan_candidates<'a>(
         &'a self,
         range: &'a KeyRange,

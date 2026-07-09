@@ -44,10 +44,6 @@ pub(crate) trait UniqueIndex: Send + Sync {
     /// delete-shadow entry is encountered; row-version and
     /// column-deletion-buffer checks decide whether a candidate is visible. Hot
     /// in-memory entries shadow equal cold DiskTree entries.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved borrowed candidate stream API")
-    )]
     fn index_scan_candidates<'a>(
         &'a self,
         range: &'a KeyRange,

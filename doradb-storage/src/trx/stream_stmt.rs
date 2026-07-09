@@ -245,8 +245,17 @@ impl<'trx> StreamStmt<'trx> {
     /// Disable default DML shape, type, and read-set validation for this stream.
     ///
     /// Validation is enabled by default. Disable it only when the caller has
-    /// already validated index range shape, value types, and projected read-set
-    /// ordering/range against the target table metadata for this statement.
+    /// already validated every `table_index_scan_mvcc` argument against the
+    /// target table metadata for this statement:
+    ///
+    /// - `index_no` names an active secondary index on the target table.
+    /// - Every bounded range side has exactly the target index key column count.
+    /// - Every bounded range value matches the corresponding indexed column type.
+    /// - `read_set` is non-empty, strictly increasing, and contains only
+    ///   in-range table column numbers.
+    ///
+    /// Violating these preconditions may surface as debug assertions or
+    /// internal errors instead of `InvalidDmlInput`.
     #[inline]
     pub fn disable_validation(mut self) -> Self {
         self.disable_validation = true;

@@ -1801,10 +1801,6 @@ impl<'a> UniqueDiskTree<'a> {
 
     /// Open a bounded lookup-candidate stream over this root snapshot.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "reserved borrowed candidate stream API")
-    )]
     pub(crate) fn scan_candidate_stream<'r>(
         &self,
         range: &'r KeyRange,

@@ -115,7 +115,7 @@ async fn run() -> ExampleResult<()> {
     // Scan rows that match one secondary-index key.
     let mut matching_rows = read_trx
         .exec(async |stmt| {
-            stmt.table_index_scan_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
+            stmt.table_index_lookup_mvcc(table_id, name_key.index_no, &name_key.vals, &[0, 1])
                 .await
         })
         .await?

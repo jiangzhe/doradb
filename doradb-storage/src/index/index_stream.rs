@@ -134,6 +134,16 @@ pub(crate) trait IndexScanSpec {
     type Leaf: IndexScanLeaf;
     /// Output item produced by this stream.
     type Output;
+    /// Projector that turns accepted leaf slots into output items.
+    type Projector: IndexScanProjector<Leaf = Self::Leaf, Output = Self::Output>;
+}
+
+/// Projection strategy for accepted index scan slots.
+pub(crate) trait IndexScanProjector {
+    /// Leaf item consumed by the projector.
+    type Leaf: IndexScanLeaf;
+    /// Output item produced by this projector.
+    type Output;
 
     /// Project one accepted slot into an output item.
     fn project(
@@ -143,13 +153,10 @@ pub(crate) trait IndexScanSpec {
     ) -> Result<Option<Self::Output>>;
 }
 
-/// Stream specification for unique MemIndex lookup candidates.
-pub(crate) struct UniqueMemIndexLookupCandidateScanSpec<'a, P: 'static> {
-    _marker: PhantomData<&'a P>,
-}
+/// Projector for unique MemIndex lookup candidates.
+pub(crate) struct UniqueMemIndexLookupCandidateProjector;
 
-impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexLookupCandidateScanSpec<'a, P> {
-    type Cursor = BTreeNodeCursor<'a, P>;
+impl IndexScanProjector for UniqueMemIndexLookupCandidateProjector {
     type Leaf = PageSharedGuard<BTreeNode>;
     type Output = IndexLookupCandidate;
 
@@ -167,13 +174,10 @@ impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexLookupCandidateScanSpec<
     }
 }
 
-/// Stream specification for non-unique MemIndex lookup candidates.
-pub(crate) struct NonUniqueMemIndexLookupCandidateScanSpec<'a, P: 'static> {
-    _marker: PhantomData<&'a P>,
-}
+/// Projector for non-unique MemIndex lookup candidates.
+pub(crate) struct NonUniqueMemIndexLookupCandidateProjector;
 
-impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexLookupCandidateScanSpec<'a, P> {
-    type Cursor = BTreeNodeCursor<'a, P>;
+impl IndexScanProjector for NonUniqueMemIndexLookupCandidateProjector {
     type Leaf = PageSharedGuard<BTreeNode>;
     type Output = IndexLookupCandidate;
 
@@ -193,13 +197,10 @@ impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexLookupCandidateScanSp
     }
 }
 
-/// Stream specification for unique DiskTree lookup candidates.
-pub(crate) struct UniqueDiskTreeCandidateScanSpec<'a> {
-    _marker: PhantomData<&'a UniqueDiskTreeSpec>,
-}
+/// Projector for unique DiskTree lookup candidates.
+pub(crate) struct UniqueDiskTreeCandidateProjector;
 
-impl<'a> IndexScanSpec for UniqueDiskTreeCandidateScanSpec<'a> {
-    type Cursor = DiskTreeNodeCursor<'a, UniqueDiskTreeSpec>;
+impl IndexScanProjector for UniqueDiskTreeCandidateProjector {
     type Leaf = DiskTreeLeaf<UniqueDiskTreeSpec>;
     type Output = IndexLookupCandidate;
 
@@ -220,13 +221,10 @@ impl<'a> IndexScanSpec for UniqueDiskTreeCandidateScanSpec<'a> {
     }
 }
 
-/// Stream specification for non-unique DiskTree lookup candidates.
-pub(crate) struct NonUniqueDiskTreeCandidateScanSpec<'a> {
-    _marker: PhantomData<&'a NonUniqueDiskTreeSpec>,
-}
+/// Projector for non-unique DiskTree lookup candidates.
+pub(crate) struct NonUniqueDiskTreeCandidateProjector;
 
-impl<'a> IndexScanSpec for NonUniqueDiskTreeCandidateScanSpec<'a> {
-    type Cursor = DiskTreeNodeCursor<'a, NonUniqueDiskTreeSpec>;
+impl IndexScanProjector for NonUniqueDiskTreeCandidateProjector {
     type Leaf = DiskTreeLeaf<NonUniqueDiskTreeSpec>;
     type Output = IndexLookupCandidate;
 
@@ -242,6 +240,54 @@ impl<'a> IndexScanSpec for NonUniqueDiskTreeCandidateScanSpec<'a> {
             row_id,
         }))
     }
+}
+
+/// Stream specification for unique MemIndex lookup candidates.
+pub(crate) struct UniqueMemIndexLookupCandidateScanSpec<'a, P: 'static> {
+    _marker: PhantomData<&'a P>,
+}
+
+impl<'a, P: BufferPool> IndexScanSpec for UniqueMemIndexLookupCandidateScanSpec<'a, P> {
+    type Cursor = BTreeNodeCursor<'a, P>;
+    type Leaf = PageSharedGuard<BTreeNode>;
+    type Output = IndexLookupCandidate;
+    type Projector = UniqueMemIndexLookupCandidateProjector;
+}
+
+/// Stream specification for non-unique MemIndex lookup candidates.
+pub(crate) struct NonUniqueMemIndexLookupCandidateScanSpec<'a, P: 'static> {
+    _marker: PhantomData<&'a P>,
+}
+
+impl<'a, P: BufferPool> IndexScanSpec for NonUniqueMemIndexLookupCandidateScanSpec<'a, P> {
+    type Cursor = BTreeNodeCursor<'a, P>;
+    type Leaf = PageSharedGuard<BTreeNode>;
+    type Output = IndexLookupCandidate;
+    type Projector = NonUniqueMemIndexLookupCandidateProjector;
+}
+
+/// Stream specification for unique DiskTree lookup candidates.
+pub(crate) struct UniqueDiskTreeCandidateScanSpec<'a> {
+    _marker: PhantomData<&'a UniqueDiskTreeSpec>,
+}
+
+impl<'a> IndexScanSpec for UniqueDiskTreeCandidateScanSpec<'a> {
+    type Cursor = DiskTreeNodeCursor<'a, UniqueDiskTreeSpec>;
+    type Leaf = DiskTreeLeaf<UniqueDiskTreeSpec>;
+    type Output = IndexLookupCandidate;
+    type Projector = UniqueDiskTreeCandidateProjector;
+}
+
+/// Stream specification for non-unique DiskTree lookup candidates.
+pub(crate) struct NonUniqueDiskTreeCandidateScanSpec<'a> {
+    _marker: PhantomData<&'a NonUniqueDiskTreeSpec>,
+}
+
+impl<'a> IndexScanSpec for NonUniqueDiskTreeCandidateScanSpec<'a> {
+    type Cursor = DiskTreeNodeCursor<'a, NonUniqueDiskTreeSpec>;
+    type Leaf = DiskTreeLeaf<NonUniqueDiskTreeSpec>;
+    type Output = IndexLookupCandidate;
+    type Projector = NonUniqueDiskTreeCandidateProjector;
 }
 
 /// Generic leaf-bounded stream over index slots.
@@ -293,7 +339,7 @@ where
                     self.exhausted = true;
                     break;
                 }
-                if let Some(output) = S::project(&leaf, idx, encoded_key)? {
+                if let Some(output) = S::Projector::project(&leaf, idx, encoded_key)? {
                     outputs.push(output);
                 }
             }

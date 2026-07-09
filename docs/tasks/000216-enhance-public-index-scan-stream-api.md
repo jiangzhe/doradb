@@ -10,21 +10,25 @@ github_issue: 830
 
 ## Summary
 
-Add a public caller-driven MVCC index scan stream for user tables while keeping
-the existing eager `Statement::table_index_scan_mvcc` API unchanged.
+Add a public caller-driven MVCC index scan stream for user tables and align the
+eager statement API around the distinction between exact-key lookup and range
+scan.
 
-The new API should be exposed from `Transaction` as a direct
-`table_index_scan_mvcc_stream` method. Internally, it may use a
-stream-statement-like owned operation state, but callers should only see the
-transaction method and a row stream. The stream returns one visible projected
-row per `next().await`, while retaining internal candidate and row buffers for
-efficiency.
+Exact-key eager index access is exposed as
+`Statement::table_index_lookup_mvcc`. Eager range scans use
+`Statement::table_index_scan_mvcc` with a standard `RangeBounds<&[Val]>` input.
+Streaming range scans use `Transaction::stream_stmt()` followed by
+`StreamStmt::table_index_scan_mvcc`, returning an `IndexScanMvccStream` that
+yields one visible projected row per `next().await`.
 
 This task builds on `docs/tasks/000215-bounded-index-row-id-stream.md`, which
 introduced internal bounded secondary-index candidate streaming. The new work
 must refactor that internal RowID-only candidate stream into a key-carrying
 candidate stream so MVCC recheck can prove exact candidate identity and avoid
-duplicates from stale index entries.
+duplicates from stale index entries. Candidate consumers should process each
+candidate batch immediately through MVCC lookup and append visible rows directly
+to the result or stream buffer, instead of eagerly draining all candidates into
+an intermediate collection.
 
 ## Context
 
@@ -41,10 +45,12 @@ The previous task `000215` added internal bounded RowID candidate streams for
 unique and non-unique indexes over MemIndex/DiskTree. It intentionally kept the
 public `Statement` API unchanged and deferred public row-value streaming.
 
-The current public index scan method is eager and non-unique exact-key only:
-`Statement::table_index_scan_mvcc(table_id, index_no, key_vals, user_read_set)`
-drains internal candidates, resolves every visible row, and returns
-`ScanMvcc::Rows`.
+The current public eager exact-key method is
+`Statement::table_index_lookup_mvcc(table_id, index_no, key_vals,
+user_read_set)`. The public eager range method is
+`Statement::table_index_scan_mvcc(table_id, index_no, range, user_read_set)`,
+where `range` implements `RangeBounds<&[Val]>`; equality scans can be expressed
+with an inclusive same-key range.
 
 Public streaming needs different ownership from ordinary `Transaction::exec`.
 The current closure-based statement API is well suited for one-shot operations
@@ -60,16 +66,20 @@ Issue Labels:
 
 ## Goals
 
-1. Add a public transaction-level MVCC index scan stream API.
-   - Add `Transaction::table_index_scan_mvcc_stream(...)`.
+1. Add a public MVCC index scan stream API.
+   - Add `Transaction::stream_stmt()` as the entry point for streamed
+     statement operations.
+   - Add `StreamStmt::table_index_scan_mvcc(...)`.
    - Return a public row stream object with `next().await`.
    - The public stream returns one projected `Vec<Val>` row per call.
-   - The public method should not expose a separate `StreamStatement` type.
 
-2. Preserve existing public eager APIs.
-   - Keep `Statement::table_index_scan_mvcc(...) -> Result<ScanMvcc>` unchanged.
-   - Keep existing exact non-unique scan behavior and tests passing.
-   - The old eager API may drain the new internal stream implementation.
+2. Split eager exact-key lookup from eager range scan.
+   - Add `Statement::table_index_lookup_mvcc(...) -> Result<ScanMvcc>` for the
+     existing exact-key lookup behavior.
+   - Use `Statement::table_index_scan_mvcc(...) -> Result<ScanMvcc>` for eager
+     range scans over unique and non-unique secondary indexes.
+   - Both eager paths should reuse key-carrying candidates and exact MVCC
+     recheck.
 
 3. Support unique and non-unique user-table secondary indexes.
    - Unique scans use logical-key ordering.
@@ -77,9 +87,12 @@ Issue Labels:
    - Both index kinds must merge MemIndex and DiskTree candidates according to
      existing hot/cold overlay rules.
 
-4. Support exact and bounded logical-key ranges.
-   - Add public range-bound input types for equality, unbounded scans, and
-     inclusive/exclusive lower and upper bounds.
+4. Support exact and bounded logical-key ranges through standard Rust range
+   inputs.
+   - Accept `RangeBounds<&[Val]>` for public eager and streaming range scans.
+   - Support equality scans by passing an inclusive same-key range.
+   - Support unbounded scans and included/excluded lower and upper logical-key
+     bounds.
    - Reuse the existing encoded range semantics from the internal BTree key
      encoder.
    - Non-unique range encoding must continue using exact-key row-id sentinels.
@@ -120,10 +133,24 @@ Issue Labels:
      rollback, and other transaction operations cannot run while the stream is
      alive.
 
+9. Share candidate projection logic.
+   - Use a shared `IndexScanProjector` abstraction so borrowed candidate
+     streams and owned candidate streams do not duplicate leaf projection
+     logic.
+   - Keep projector implementations zero-sized and specific to the index source
+     and candidate payload they produce.
+
+10. Keep validation behavior explicit.
+   - Validate public scan inputs by default.
+   - Document `StreamStmt::disable_validation()` with the caller invariants it
+     relies on, including valid table/index metadata, bound counts and types,
+     and sorted in-range read sets.
+
 ## Non-Goals
 
-- Do not remove or change `Statement::table_index_scan_mvcc`.
-- Do not expose a public `StreamStatement` type.
+- Do not change the `ScanMvcc` return shape for eager statement APIs.
+- Do not expose lower-level stream operation internals beyond the public
+  `StreamStmt` facade and `IndexScanMvccStream`.
 - Do not implement covering index output.
 - Do not implement parallel index scan or parallel row lookup.
 - Do not change checkpoint, recovery, table-file format, or DiskTree durable
@@ -136,61 +163,60 @@ Issue Labels:
 
 ## Plan
 
-1. Add public scan range input types.
+1. Add public range scan APIs.
 
-   Define public, documented types in the row/table API surface, such as:
-
-   ```rust
-   pub enum IndexScanBound<'a> {
-       Unbounded,
-       Included(&'a [Val]),
-       Excluded(&'a [Val]),
-   }
-
-   pub struct IndexScanRange<'a> {
-       lower: IndexScanBound<'a>,
-       upper: IndexScanBound<'a>,
-   }
-   ```
-
-   The final names may differ, but the API must support:
-
-   - equality scans without forcing callers to hand-write two identical bounds;
-   - unbounded scans;
-   - included/excluded lower and upper logical-key bounds.
-   - borrowed logical-key values at the public API boundary.
-
-   Add public convenience constructors such as `IndexScanRange::all()`,
-   `IndexScanRange::eq(&[Val])`, and `IndexScanRange::new(lower, upper)`.
-   Stream construction must validate and encode/copy borrowed bounds into
-   owned internal scan state before returning, so the returned stream never
-   borrows caller-provided bound values.
-
-   Export the public types from `doradb-storage/src/lib.rs`.
-
-2. Add `Transaction::table_index_scan_mvcc_stream`.
-
-   Suggested public shape:
+   Use `RangeBounds<&[Val]>` directly at the public API boundary for both eager
+   and streaming range scans:
 
    ```rust
-   impl Transaction {
-       pub async fn table_index_scan_mvcc_stream<'trx>(
-           &'trx mut self,
+   impl Statement<'_> {
+       pub async fn table_index_lookup_mvcc(
+           &mut self,
            table_id: TableID,
            index_no: usize,
-           range: IndexScanRange<'_>,
+           key_vals: &[Val],
            user_read_set: &[usize],
-       ) -> Result<IndexScanMvccStream<'trx>>;
+       ) -> Result<ScanMvcc>;
+
+       pub async fn table_index_scan_mvcc<'r, R>(
+           &mut self,
+           table_id: TableID,
+           index_no: usize,
+           range: R,
+           user_read_set: &[usize],
+       ) -> Result<ScanMvcc>
+       where
+           R: RangeBounds<&'r [Val]>;
+   }
+
+   impl Transaction {
+       pub fn stream_stmt(&mut self) -> StreamStmt<'_>;
+   }
+
+   impl StreamStmt<'_> {
+       pub async fn table_index_scan_mvcc<'r, R>(
+           self,
+           table_id: TableID,
+           index_no: usize,
+           range: R,
+           user_read_set: &[usize],
+       ) -> Result<IndexScanMvccStream<'_>>
+       where
+           R: RangeBounds<&'r [Val]>;
    }
    ```
 
-   The returned stream should borrow the transaction mutably for its lifetime,
-   even if the internal implementation owns the checkout, so the type system
-   prevents concurrent transaction operations while streaming.
+   Public callers can express equality as `&key[..]..=&key[..]`, use ordinary
+   bounded ranges for included/excluded bounds, and use `..` for full scans.
+   Construction must validate and encode/copy borrowed bounds into owned
+   internal scan state before returning, so the returned stream never borrows
+   caller-provided bound values.
 
-3. Implement internal stream operation ownership.
+2. Implement stream statement ownership.
 
-   Internally, the transaction method should:
+   `Transaction::stream_stmt()` should return a public `StreamStmt` facade that
+   owns or retains the operation state needed to build streamed read-only
+   statements. Stream construction should:
 
    - resolve and check out the transaction core using existing checkout
      plumbing;
@@ -203,10 +229,7 @@ Issue Labels:
    - move the checkout, lock owner state, pinned table/layout/runtime read
      state, candidate stream, and row buffers into the public stream object.
 
-   The implementation may factor an internal `StreamStatementCore` or similar
-   helper, but that type must stay private.
-
-4. Define public stream behavior.
+3. Define public stream behavior.
 
    Add a public, documented `IndexScanMvccStream<'trx>` with:
 
@@ -230,7 +253,7 @@ Issue Labels:
    and let `TrxCheckout` return the mutable transaction core. The stream must
    not own statement-local row/index/redo effects because this API is read-only.
 
-5. Refactor internal index candidate traits and streams.
+4. Refactor internal index candidate traits and streams.
 
    Replace or supersede RowID-only APIs:
 
@@ -260,6 +283,13 @@ Issue Labels:
 
    Keep adapters or helper functions only where they avoid churn in tests
    without preserving a misleading RowID-only production contract.
+
+5. Share borrowed and owned stream projection logic.
+
+   Define an `IndexScanProjector` trait and zero-sized projector structs for
+   the candidate projections shared by borrowed streams in `index_stream.rs`
+   and owned streams in `owned_stream.rs`. Borrowed and owned stream specs
+   should select a projector instead of copying `project` method bodies.
 
 6. Correct unique and non-unique merge semantics for candidates.
 
@@ -315,20 +345,21 @@ Issue Labels:
    Prefer the option that avoids decoding BTree keys and avoids changing
    persisted/index formats.
 
-9. Keep eager API compatibility.
+9. Implement eager lookup and range scan without candidate pre-collection.
 
-   Keep `Statement::table_index_scan_mvcc(...)` exact-key and non-unique as it
-   is publicly. Internally, it may:
+   Keep exact-key eager lookup available through
+   `Statement::table_index_lookup_mvcc(...)`. Implement eager range scans
+   through `Statement::table_index_scan_mvcc(...)`.
 
-   - construct an equality `IndexScanRange`;
-   - use the new key-carrying candidate stream;
-   - drain the stream into `ScanMvcc::Rows`.
-
-   Do not require existing callers or examples to change.
+   Both eager paths should iterate candidate batches from the underlying
+   borrowed stream, perform MVCC lookup/recheck for each candidate in the
+   current batch, and append visible projected rows directly to
+   `ScanMvcc::Rows`. They should not eagerly drain all candidates into an
+   intermediate `Vec` before MVCC filtering.
 
 10. Add validation.
 
-   Public stream construction should validate:
+   Public eager and stream construction should validate:
 
    - table exists and is a user table;
    - index number is active;
@@ -338,37 +369,52 @@ Issue Labels:
 
    Reuse or extend `DmlValidator` carefully. If a scan validator is added,
    keep it focused on read/index-scan inputs rather than write-only DML rules.
+   Document `StreamStmt::disable_validation()` with the caller invariants
+   required when validation has already been performed externally.
 
 11. Update examples or public-facing tests.
 
-   Add a small use of `Transaction::table_index_scan_mvcc_stream` in
-   `quick_start.rs` or focused public API tests so callers can see the intended
-   row-at-a-time API.
+   Add a small use of `Transaction::stream_stmt().table_index_scan_mvcc(...)`
+   in `quick_start.rs` or focused public API tests so callers can see the
+   intended row-at-a-time API. Update exact-key examples to use
+   `Statement::table_index_lookup_mvcc(...)`.
 
 ## Implementation Notes
 
 ## Impacts
 
 - `doradb-storage/src/trx/mod.rs`
-  - add `Transaction::table_index_scan_mvcc_stream`;
-  - add private stream-operation checkout ownership plumbing or helper types.
+  - add `Transaction::stream_stmt`;
+  - export `StreamStmt` construction as the public streamed statement entry
+    point.
 
 - `doradb-storage/src/trx/stmt.rs`
-  - keep existing `Statement` API unchanged;
-  - optionally share validation/accessor setup helpers with stream
-    construction.
+  - add `Statement::table_index_lookup_mvcc` for exact-key eager lookup;
+  - add range-based `Statement::table_index_scan_mvcc`;
+  - share validation/accessor setup helpers with stream construction where
+    useful.
+
+- `doradb-storage/src/trx/stream_stmt.rs`
+  - add public `StreamStmt` and `IndexScanMvccStream`;
+  - own streamed read operation state and cleanup;
+  - document validation bypass invariants.
 
 - `doradb-storage/src/row/ops.rs`
-  - add public index scan range/bound types if this remains the public row API
-    module;
   - keep `ScanMvcc` unchanged.
 
 - `doradb-storage/src/lib.rs`
-  - export the new public range and stream types as needed.
+  - export `StreamStmt` and `IndexScanMvccStream` as needed.
 
 - `doradb-storage/src/index/index_stream.rs`
   - change source stream projections from RowID-only to key-carrying
-    `IndexLookupCandidate` where used for index scans.
+    `IndexLookupCandidate` where used for index scans;
+  - host shared `IndexScanProjector` implementations for borrowed and owned
+    stream specs.
+
+- `doradb-storage/src/index/owned_stream.rs`
+  - add owned candidate streams for the public stream API;
+  - reuse shared projector implementations instead of duplicating projection
+    logic.
 
 - `doradb-storage/src/index/unique_index.rs`
   - replace or supersede `scan_row_id_candidates` with
@@ -398,20 +444,20 @@ Issue Labels:
 - `doradb-storage/src/table/access.rs`
   - add stream row lookup/fill helpers;
   - add exact candidate identity recheck for hot and cold rows;
-  - keep old eager non-unique exact scan compatible.
+  - keep exact-key lookup behavior through `table_index_lookup_mvcc`;
+  - implement eager range scan with batch candidate processing.
 
 - `doradb-storage/src/table/mod.rs`
   - update test-only bound index wrappers for the new candidate stream API.
 
 - `doradb-storage/examples/quick_start.rs`
-  - optionally demonstrate the new streaming scan API while leaving existing
-    eager scan example intact.
+  - demonstrate exact-key lookup and streamed range scan with the public APIs.
 
 ## Test Cases
 
 1. Public stream basics.
    - Create a user table with a secondary index.
-   - Call `Transaction::table_index_scan_mvcc_stream`.
+   - Call `Transaction::stream_stmt().table_index_scan_mvcc(...)`.
    - Fetch rows with repeated `next().await`.
    - Verify one row per call and `None` after exhaustion.
    - Verify repeated `next()` after exhaustion remains `None`.
@@ -422,10 +468,13 @@ Issue Labels:
    - Run another operation on the same transaction, then commit successfully.
    - Verify statement locks and transaction checkout are not leaked.
 
-3. Existing eager API compatibility.
-   - Existing `Statement::table_index_scan_mvcc` tests continue to pass.
-   - Add a regression test that old exact non-unique scan returns the same rows
-     as draining the new stream with an equality range.
+3. Exact lookup and eager range APIs.
+   - Existing exact-key lookup behavior is covered through
+     `Statement::table_index_lookup_mvcc`.
+   - `Statement::table_index_scan_mvcc` supports equality ranges, bounded
+     ranges, and unbounded ranges.
+   - Add a regression test that exact lookup returns the same rows as eager and
+     streamed equality range scans.
 
 4. Unique exact and range scans.
    - Unique equality scan returns at most one visible row.
@@ -480,6 +529,7 @@ Issue Labels:
     - DiskTree-only streams emit encoded-key candidates.
     - Composite streams preserve order and hot/cold overlay semantics across
       batch boundaries.
+    - Borrowed and owned stream specs share projector behavior.
 
 Validation:
 
@@ -498,9 +548,9 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-- The exact public type names for `IndexScanBound<'a>`, `IndexScanRange<'a>`,
-  and `IndexScanMvccStream` may be adjusted during implementation to fit the
-  surrounding API style.
+- The stream API intentionally uses a public `StreamStmt` facade rather than a
+  direct transaction method so future streamed statement operations can share
+  checkout and cleanup ownership.
 - A future covering-index task can reuse key-carrying candidates, but covering
   output remains outside this task.
 - A future broader scan API may unify table scan streams and index scan streams;

@@ -5,18 +5,18 @@
 
 use super::disk_tree::{
     DiskTreeLeaf, DiskTreeNodeCursorState, NonUniqueDiskTreeSpec, UniqueDiskTreeSpec,
-    invalid_node_payload, unpack_row_id_from_exact_key,
 };
 use super::index_stream::{
-    IndexLeafCursor, IndexScanLeaf, IndexScanSpec, IndexScanStream, validate_non_unique_exact_key,
+    IndexLeafCursor, IndexScanSpec, IndexScanStream, NonUniqueDiskTreeCandidateProjector,
+    NonUniqueMemIndexLookupCandidateProjector, UniqueDiskTreeCandidateProjector,
+    UniqueMemIndexLookupCandidateProjector,
 };
 use super::secondary_index::{SecondaryIndex, SecondaryIndexCandidateStream};
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
 use crate::error::Result;
 use crate::id::BlockID;
-use crate::index::btree::{BTreeKey, BTreeNode, BTreeNodeCursorState, BTreeU64};
-use crate::index::util::Maskable;
+use crate::index::btree::{BTreeNode, BTreeNodeCursorState};
 use crate::index::{IndexBatchStream, IndexLookupCandidate, KeyRange};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -193,19 +193,7 @@ impl<P: BufferPool> IndexScanSpec for OwnedUniqueMemIndexLookupCandidateScanSpec
     type Cursor = OwnedUniqueMemIndexCursor<P>;
     type Leaf = PageSharedGuard<BTreeNode>;
     type Output = IndexLookupCandidate;
-
-    #[inline]
-    fn project(
-        leaf: &PageSharedGuard<BTreeNode>,
-        slot_idx: usize,
-        encoded_key: BTreeKey,
-    ) -> Result<Option<Self::Output>> {
-        let value = leaf.node().value::<BTreeU64>(slot_idx);
-        Ok(Some(IndexLookupCandidate {
-            encoded_key,
-            row_id: value.value().to_row_id(),
-        }))
-    }
+    type Projector = UniqueMemIndexLookupCandidateProjector;
 }
 
 struct OwnedNonUniqueMemIndexLookupCandidateScanSpec<P: 'static> {
@@ -216,21 +204,7 @@ impl<P: BufferPool> IndexScanSpec for OwnedNonUniqueMemIndexLookupCandidateScanS
     type Cursor = OwnedNonUniqueMemIndexCursor<P>;
     type Leaf = PageSharedGuard<BTreeNode>;
     type Output = IndexLookupCandidate;
-
-    #[inline]
-    fn project(
-        leaf: &PageSharedGuard<BTreeNode>,
-        slot_idx: usize,
-        encoded_key: BTreeKey,
-    ) -> Result<Option<Self::Output>> {
-        validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx)?;
-        let node = leaf.node();
-        let slot = node.slot(slot_idx);
-        Ok(Some(IndexLookupCandidate {
-            encoded_key,
-            row_id: node.unpack_value::<BTreeU64>(slot).to_row_id(),
-        }))
-    }
+    type Projector = NonUniqueMemIndexLookupCandidateProjector;
 }
 
 struct OwnedUniqueDiskTreeCandidateScanSpec<P: 'static> {
@@ -241,22 +215,7 @@ impl<P: BufferPool> IndexScanSpec for OwnedUniqueDiskTreeCandidateScanSpec<P> {
     type Cursor = OwnedUniqueDiskTreeCursor<P>;
     type Leaf = DiskTreeLeaf<UniqueDiskTreeSpec>;
     type Output = IndexLookupCandidate;
-
-    #[inline]
-    fn project(
-        leaf: &Self::Leaf,
-        slot_idx: usize,
-        encoded_key: BTreeKey,
-    ) -> Result<Option<Self::Output>> {
-        let row_id = leaf.node().value::<BTreeU64>(slot_idx);
-        if row_id.is_deleted() {
-            return Err(invalid_node_payload(leaf.file_kind, leaf.block_id));
-        }
-        Ok(Some(IndexLookupCandidate {
-            encoded_key,
-            row_id: row_id.to_row_id(),
-        }))
-    }
+    type Projector = UniqueDiskTreeCandidateProjector;
 }
 
 struct OwnedNonUniqueDiskTreeCandidateScanSpec<P: 'static> {
@@ -267,19 +226,7 @@ impl<P: BufferPool> IndexScanSpec for OwnedNonUniqueDiskTreeCandidateScanSpec<P>
     type Cursor = OwnedNonUniqueDiskTreeCursor<P>;
     type Leaf = DiskTreeLeaf<NonUniqueDiskTreeSpec>;
     type Output = IndexLookupCandidate;
-
-    #[inline]
-    fn project(
-        _leaf: &Self::Leaf,
-        _slot_idx: usize,
-        encoded_key: BTreeKey,
-    ) -> Result<Option<Self::Output>> {
-        let row_id = unpack_row_id_from_exact_key(encoded_key.as_bytes())?;
-        Ok(Some(IndexLookupCandidate {
-            encoded_key,
-            row_id,
-        }))
-    }
+    type Projector = NonUniqueDiskTreeCandidateProjector;
 }
 
 type OwnedUniqueMemIndexCandidateStream<P> =

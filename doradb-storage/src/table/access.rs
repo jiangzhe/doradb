@@ -40,6 +40,7 @@ use crate::value::Val;
 use error_stack::Report;
 use futures::FutureExt;
 use std::collections::BTreeSet;
+use std::ops::RangeBounds;
 use std::ptr::addr_eq;
 use std::sync::Arc;
 
@@ -2347,8 +2348,8 @@ impl<'a> UserTableAccessor<'a> {
         }
     }
 
-    /// Scan visible rows matching a non-unique secondary-index key.
-    pub(crate) async fn index_scan_mvcc(
+    /// Lookup visible rows matching one non-unique secondary-index key.
+    pub(crate) async fn index_lookup_mvcc(
         &self,
         rt: TrxRuntime<'_>,
         index_no: usize,
@@ -2382,22 +2383,89 @@ impl<'a> UserTableAccessor<'a> {
         let root = self.read_proof_secondary_root(rt, index_no)?;
         let encoder = self.require_sec_idx(index_no)?.key_encoder();
         let index = self.require_non_unique_index(rt.pool_guards(), index_no, root)?;
-        let mut candidates = Vec::new();
         let range = encoder.encode_non_unique_equal_range(key_vals);
         let mut stream = index.equal_scan_candidates(&range, rt.sts())?;
         while let Some(batch) = stream.next_batch().await? {
-            candidates.extend(batch);
+            for candidate in batch {
+                match self
+                    .index_lookup_candidate_row_mvcc(
+                        rt, index_no, false, &encoder, &candidate, read_set,
+                    )
+                    .await?
+                {
+                    SelectMvcc::NotFound => (),
+                    SelectMvcc::Found(vals) => {
+                        res.push(vals);
+                    }
+                }
+            }
         }
-        for candidate in candidates {
-            match self
-                .index_lookup_candidate_row_mvcc(
-                    rt, index_no, false, &encoder, &candidate, read_set,
-                )
-                .await?
-            {
-                SelectMvcc::NotFound => (),
-                SelectMvcc::Found(vals) => {
-                    res.push(vals);
+        Ok(ScanMvcc::Rows(res))
+    }
+
+    /// Scan visible rows matching a secondary-index key range.
+    pub(crate) async fn index_scan_mvcc<'r, R>(
+        &self,
+        rt: TrxRuntime<'_>,
+        index_no: usize,
+        range: R,
+        read_set: &[usize],
+    ) -> Result<ScanMvcc>
+    where
+        R: RangeBounds<&'r [Val]>,
+    {
+        debug_assert!(index_no < self.sec_idx_len());
+        debug_assert!({
+            !read_set.is_empty()
+                && read_set
+                    .iter()
+                    .zip(read_set.iter().skip(1))
+                    .all(|(l, r)| l < r)
+        });
+        let mut res = vec![];
+        let root = self.read_proof_secondary_root(rt, index_no)?;
+        let index = self.require_sec_idx(index_no)?;
+        let unique = index.is_unique();
+        let encoder = index.key_encoder();
+        let range = if unique {
+            encoder.encode_range(range)
+        } else {
+            encoder.encode_non_unique_range(range)
+        };
+        if unique {
+            let index = index.bind_unique(rt.pool_guards(), root)?;
+            let mut stream = index.index_scan_candidates(&range, rt.sts())?;
+            while let Some(batch) = stream.next_batch().await? {
+                for candidate in batch {
+                    match self
+                        .index_lookup_candidate_row_mvcc(
+                            rt, index_no, true, &encoder, &candidate, read_set,
+                        )
+                        .await?
+                    {
+                        SelectMvcc::NotFound => (),
+                        SelectMvcc::Found(vals) => {
+                            res.push(vals);
+                        }
+                    }
+                }
+            }
+        } else {
+            let index = index.bind_non_unique(rt.pool_guards(), root)?;
+            let mut stream = index.index_scan_candidates(&range, rt.sts())?;
+            while let Some(batch) = stream.next_batch().await? {
+                for candidate in batch {
+                    match self
+                        .index_lookup_candidate_row_mvcc(
+                            rt, index_no, false, &encoder, &candidate, read_set,
+                        )
+                        .await?
+                    {
+                        SelectMvcc::NotFound => (),
+                        SelectMvcc::Found(vals) => {
+                            res.push(vals);
+                        }
+                    }
                 }
             }
         }
@@ -6275,7 +6343,7 @@ mod tests {
         let key_vals = [Val::from(key)];
         let read_set = [0usize, 1];
         trx.exec(async |stmt| {
-            stmt.table_index_scan_mvcc(table_id, 1, &key_vals, &read_set)
+            stmt.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
                 .await
         })
         .await
@@ -6339,7 +6407,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .exec(async |stmt| {
-                    stmt.table_index_scan_mvcc(table_id, 1, &key_vals, &read_set)
+                    stmt.table_index_lookup_mvcc(table_id, 1, &key_vals, &read_set)
                         .await
                 })
                 .await
@@ -6455,8 +6523,13 @@ mod tests {
                 let key = SelectKey::new(1, vec![Val::from(1i32)]);
                 let res = trx
                     .exec(async |stmt| {
-                        stmt.table_index_scan_mvcc(table_id, key.index_no, &key.vals, user_read_set)
-                            .await
+                        stmt.table_index_lookup_mvcc(
+                            table_id,
+                            key.index_no,
+                            &key.vals,
+                            user_read_set,
+                        )
+                        .await
                     })
                     .await;
                 trx.commit().await.unwrap();
@@ -6464,6 +6537,23 @@ mod tests {
 
                 let mut trx = session.begin_trx().unwrap();
                 let key_vals = [Val::from(1i32)];
+                let rows = trx
+                    .exec(async |stmt| {
+                        stmt.table_index_scan_mvcc(
+                            table_id,
+                            1,
+                            &key_vals[..]..=&key_vals[..],
+                            user_read_set,
+                        )
+                        .await
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap_rows();
+                trx.commit().await.unwrap();
+                assert_eq!(rows, vec![vec![Val::from(1i32), Val::from(1i32)]]);
+
+                let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
                     .stream_stmt()
                     .table_index_scan_mvcc(
@@ -6497,14 +6587,29 @@ mod tests {
                 }
                 drop(stream);
                 trx.commit().await.unwrap();
-                assert_eq!(
-                    rows,
-                    vec![
-                        vec![Val::from(1i32), Val::from(1i32)],
-                        vec![Val::from(2i32), Val::from(2i32)],
-                        vec![Val::from(3i32), Val::from(3i32)]
-                    ]
-                );
+                let unique_range_expected = vec![
+                    vec![Val::from(1i32), Val::from(1i32)],
+                    vec![Val::from(2i32), Val::from(2i32)],
+                    vec![Val::from(3i32), Val::from(3i32)],
+                ];
+                assert_eq!(rows, unique_range_expected);
+
+                let mut trx = session.begin_trx().unwrap();
+                let rows = trx
+                    .exec(async |stmt| {
+                        stmt.table_index_scan_mvcc(
+                            table_id,
+                            0,
+                            &lower[..]..&upper[..],
+                            user_read_set,
+                        )
+                        .await
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap_rows();
+                trx.commit().await.unwrap();
+                assert_eq!(rows, unique_range_expected);
 
                 let mut trx = session.begin_trx().unwrap();
                 let mut stream = trx
@@ -6563,8 +6668,13 @@ mod tests {
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = trx
                     .exec(async |stmt| {
-                        stmt.table_index_scan_mvcc(table_id, key.index_no, &key.vals, user_read_set)
-                            .await
+                        stmt.table_index_lookup_mvcc(
+                            table_id,
+                            key.index_no,
+                            &key.vals,
+                            user_read_set,
+                        )
+                        .await
                     })
                     .await;
                 trx.commit().await.unwrap();
@@ -6593,6 +6703,29 @@ mod tests {
                 );
 
                 let mut trx = session.begin_trx().unwrap();
+                let rows = trx
+                    .exec(async |stmt| {
+                        stmt.table_index_scan_mvcc(
+                            table_id,
+                            1,
+                            &lower[..]..&upper[..],
+                            user_read_set,
+                        )
+                        .await
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap_rows();
+                trx.commit().await.unwrap();
+                assert_eq!(rows.len(), 5);
+                assert_eq!(
+                    rows.iter()
+                        .filter(|vals| vals[0] == Val::from(1i32))
+                        .count(),
+                    1
+                );
+
+                let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(0i32)]);
                 let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
                 trx.commit().await.unwrap();
@@ -6602,8 +6735,13 @@ mod tests {
                 let key = SelectKey::new(1, vec![Val::from(0i32)]);
                 let res = trx
                     .exec(async |stmt| {
-                        stmt.table_index_scan_mvcc(table_id, key.index_no, &key.vals, user_read_set)
-                            .await
+                        stmt.table_index_lookup_mvcc(
+                            table_id,
+                            key.index_no,
+                            &key.vals,
+                            user_read_set,
+                        )
+                        .await
                     })
                     .await;
                 _ = trx.commit().await.unwrap();
