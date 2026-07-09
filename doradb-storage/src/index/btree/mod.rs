@@ -1493,6 +1493,7 @@ impl BTreeNodeCursorState {
     }
 }
 
+/// Resumable cursor over B-tree nodes at one height.
 pub(crate) struct BTreeNodeCursor<'a, P: 'static> {
     tree: &'a GenericBTree<P>,
     pool_guard: &'a PoolGuard,

@@ -1,7 +1,7 @@
 ---
 id: 000216
 title: Enhance Public Index Scan Stream API
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-09
 github_issue: 830
 ---
@@ -381,6 +381,53 @@ Issue Labels:
 
 ## Implementation Notes
 
+- Implemented the public streamed index scan surface as
+  `Transaction::stream_stmt()` plus
+  `StreamStmt::table_index_scan_mvcc(...)`, returning
+  `IndexScanMvccStream::next()` row-at-a-time results. The stream owns the
+  read-only statement checkout, table metadata lock state, pinned layout/root
+  state, owned candidate stream, and row buffers, and releases statement
+  resources on exhaustion, error, or drop.
+- Split eager public access into exact-key lookup and range scan:
+  `Statement::table_index_lookup_mvcc(...)` preserves exact lookup behavior,
+  while `Statement::table_index_scan_mvcc(...)` accepts `RangeBounds<&[Val]>`
+  for equality, bounded, and unbounded range scans. The original direct
+  `Transaction::table_index_scan_mvcc_stream` and custom range-type direction
+  was intentionally replaced by the `StreamStmt` facade and standard range
+  inputs.
+- Replaced RowID-only scan plumbing with key-carrying `IndexLookupCandidate`
+  streams for unique and non-unique MemIndex/DiskTree sources. Borrowed and
+  owned streams share `IndexScanProjector` implementations, and eager scans now
+  process candidate batches through MVCC lookup/recheck immediately instead of
+  draining all candidates into an intermediate collection.
+- Added exact candidate identity recheck for hot and cold MVCC row lookup,
+  including support for projections that omit indexed columns and encoded-key
+  comparison for unique-index branch correctness. Composite secondary-index
+  candidate streams preserve hot/cold overlay semantics for unique and
+  non-unique indexes.
+- Added index scan validation through `DmlValidator::validate_index_scan` and
+  documented the caller invariants required by
+  `StreamStmt::disable_validation()`. Updated the quick-start example, public
+  API smoke test, benchmark/recovery call sites, and focused unit tests for
+  exact lookup, eager range scan, streaming scan, stale candidate filtering,
+  projection, cleanup, and validation behavior.
+- Review/style cleanup also updated `tools/style_audit.rs` so the
+  `qualified-path` rule no longer reports associated-type calls such as
+  `S::Projector::project`, while still flagging long module paths.
+
+Validation:
+
+```bash
+tools/style_audit.rs --diff-base origin/main
+cargo nextest run -p doradb-storage table::persistence::tests::test_checkpoint_error_rollback
+cargo nextest run --workspace --no-fail-fast
+```
+
+The first stable `cargo nextest run --workspace` attempt failed once in
+`table::persistence::tests::test_checkpoint_error_rollback` before fail-fast
+cancelled remaining tests; the targeted rerun passed, and the subsequent full
+workspace `--no-fail-fast` run completed with 1297 passed tests.
+
 ## Impacts
 
 - `doradb-storage/src/trx/mod.rs`
@@ -548,9 +595,9 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-- The stream API intentionally uses a public `StreamStmt` facade rather than a
-  direct transaction method so future streamed statement operations can share
-  checkout and cleanup ownership.
+- Standard `futures::Stream` integration for internal candidate streams and the
+  public row stream is deferred to
+  `docs/backlogs/000150-implement-futures-stream-for-index-and-public-scan-streams.md`.
 - A future covering-index task can reuse key-carrying candidates, but covering
   output remains outside this task.
 - A future broader scan API may unify table scan streams and index scan streams;

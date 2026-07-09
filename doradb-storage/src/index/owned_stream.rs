@@ -238,11 +238,6 @@ type OwnedUniqueDiskTreeCandidateStream<P> =
 type OwnedNonUniqueDiskTreeCandidateStream<P> =
     IndexScanStream<OwnedNonUniqueDiskTreeCandidateScanSpec<P>, Arc<KeyRange>>;
 
-/// Owned persistent lookup-candidate stream for user-table secondary scans.
-pub(crate) struct OwnedSecondaryIndexCandidateStream<P: BufferPool + 'static> {
-    inner: OwnedSecondaryIndexCandidateStreamKind<P>,
-}
-
 enum OwnedSecondaryIndexCandidateStreamKind<P: BufferPool + 'static> {
     Unique(
         SecondaryIndexCandidateStream<
@@ -256,6 +251,11 @@ enum OwnedSecondaryIndexCandidateStreamKind<P: BufferPool + 'static> {
             OwnedNonUniqueDiskTreeCandidateStream<P>,
         >,
     ),
+}
+
+/// Owned persistent lookup-candidate stream for user-table secondary scans.
+pub(crate) struct OwnedSecondaryIndexCandidateStream<P: BufferPool + 'static> {
+    inner: OwnedSecondaryIndexCandidateStreamKind<P>,
 }
 
 impl<P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<P> {

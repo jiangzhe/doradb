@@ -1624,6 +1624,7 @@ pub(crate) struct DiskTreeNodeCursorState {
 }
 
 impl DiskTreeNodeCursorState {
+    /// Create cursor state rooted at the given DiskTree root block.
     #[inline]
     pub(crate) fn new(root_block_id: BlockID) -> Self {
         Self {

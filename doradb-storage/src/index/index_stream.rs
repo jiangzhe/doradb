@@ -382,6 +382,7 @@ pub(crate) type UniqueDiskTreeCandidateStream<'a, 'r> =
 pub(crate) type NonUniqueDiskTreeCandidateStream<'a, 'r> =
     IndexScanStream<NonUniqueDiskTreeCandidateScanSpec<'a>, &'r KeyRange>;
 
+/// Validate that an encoded non-unique key contains a trailing row id.
 #[inline]
 pub(crate) fn validate_non_unique_exact_key(encoded_key: &[u8], slot_idx: usize) -> Result<()> {
     if encoded_key.len() < mem::size_of::<RowID>() {

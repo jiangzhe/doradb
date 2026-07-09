@@ -18,13 +18,6 @@ use std::sync::Arc;
 
 const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 
-#[inline]
-fn table_not_found(table_id: TableID, operation: &'static str) -> Error {
-    Report::new(OperationError::TableNotFound)
-        .attach(format!("operation={operation}, table_id={table_id}"))
-        .into()
-}
-
 struct StreamStmtState {
     checkout: TrxCheckout,
     stmt_locks: OwnerLockState,
@@ -311,4 +304,11 @@ impl<'trx> StreamStmt<'trx> {
         };
         Ok(IndexScanMvccStream::new(state))
     }
+}
+
+#[inline]
+fn table_not_found(table_id: TableID, operation: &'static str) -> Error {
+    Report::new(OperationError::TableNotFound)
+        .attach(format!("operation={operation}, table_id={table_id}"))
+        .into()
 }
