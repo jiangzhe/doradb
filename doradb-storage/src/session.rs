@@ -15,7 +15,9 @@ use crate::stats::{
     BufferPoolStats, StorageIoStats, TransactionSystemStats, buffer_pool_runtime_stats_snapshot,
     storage_io_stats_snapshot, transaction_system_stats_snapshot,
 };
-use crate::table::{CheckpointOutcome, CheckpointReadiness, SecondaryMemIndexCleanupStats, Table};
+use crate::table::{
+    CheckpointOutcome, CheckpointReadiness, FrozenPageBatch, SecondaryMemIndexCleanupStats, Table,
+};
 use crate::trx::{
     StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
     transaction_discarded_err,
@@ -370,12 +372,16 @@ impl Session {
         })
     }
 
-    /// Freeze row pages for an existing user table and return approximate non-deleted rows visited.
+    /// Freeze a row-page prefix for an existing user table and return its retryable batch.
     #[inline]
-    pub async fn freeze_table(&self, table_id: TableID, max_rows: usize) -> Result<usize> {
+    pub async fn freeze_table(
+        &self,
+        table_id: TableID,
+        max_rows: usize,
+    ) -> Result<FrozenPageBatch> {
         let session = self.pin("freeze table")?;
         let table = session.resolve_user_table(table_id, "freeze table").await?;
-        table.freeze(session, max_rows).await
+        table.freeze(&session, max_rows).await
     }
 
     /// Report whether an existing user table checkpoint can safely publish now.
@@ -388,14 +394,30 @@ impl Session {
         table.checkpoint_readiness(&session)
     }
 
-    /// Persist eligible row-store and cold-delete state for an existing user table.
+    /// Persist eligible state using a compatibility batch rebuilt from the frozen prefix.
+    ///
+    /// Call [`Session::checkpoint_frozen_pages`] to retain validation state
+    /// across delayed attempts.
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
         let session = self.pin("checkpoint table")?;
         let table = session
             .resolve_existing_user_table(table_id, "checkpoint table")
             .await?;
-        table.checkpoint(session).await
+        table.checkpoint_existing_frozen(session).await
+    }
+
+    /// Persist one explicit frozen-page batch plus eligible cold-delete state.
+    #[inline]
+    pub async fn checkpoint_frozen_pages(
+        &mut self,
+        batch: &mut FrozenPageBatch,
+    ) -> Result<CheckpointOutcome> {
+        let session = self.pin("checkpoint frozen pages")?;
+        let table = session
+            .resolve_existing_user_table(batch.table_id(), "checkpoint frozen pages")
+            .await?;
+        table.checkpoint(session, batch).await
     }
 
     /// Returns total number of hot row pages for an existing user table.

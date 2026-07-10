@@ -1099,7 +1099,7 @@ fn purge_undo_chain_from_page(
         return;
     }
     let row_idx = page.row_idx(undo.row_id);
-    let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
+    let mut access = RowWriteAccess::new(page, ctx, row_idx);
     access.purge_undo_chain(min_active_sts);
 }
 

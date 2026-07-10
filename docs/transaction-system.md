@@ -366,7 +366,10 @@ Instead:
 Heap persistence relies on the **Tuple Mover** and the durability of the commit log. Explicit flushing of raw RowPages to temporary files is **removed** in favor of relying on the commit log for recent data and the ColumnStore for archival data.
 
 1. **Tuple Mover**:
-   - Periodically selects frozen (immutable) RowStore pages.
+   - Freezes a contiguous RowStore-page prefix and retains the returned batch
+     across checkpoint retries.
+   - Validates image-producing undo CTS values against the purge-published
+     checkpoint cutoff before moving the whole batch to transition.
    - Converts them into **LWC** (lightweight compressed) ColumnStore blocks.
    - Updates the `Pivot_RowID` and persists metadata.
    - Publishes companion `DiskTree` updates for those checkpointed rows.

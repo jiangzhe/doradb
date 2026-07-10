@@ -127,15 +127,11 @@ impl RowUndoLogs {
         &mut self,
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
-        sts: TrxID,
     ) -> Result<()> {
         while let Some(entry) = self.0.pop() {
             if is_catalog_table(entry.table_id) {
                 let table = table_cache.must_get_catalog_table(entry.table_id);
-                if let Err((err, entry)) = table
-                    .mem
-                    .rollback_row_undo(entry, guards, sts, |_| {})
-                    .await
+                if let Err((err, entry)) = table.mem.rollback_row_undo(entry, guards, |_| {}).await
                 {
                     self.0.push(entry);
                     return Err(err);
@@ -144,7 +140,7 @@ impl RowUndoLogs {
                 let table = table_cache.must_get_user_table(entry.table_id).await;
                 if let Err((err, entry)) = table
                     .mem
-                    .rollback_row_undo(entry, guards, sts, |row_id| {
+                    .rollback_row_undo(entry, guards, |row_id| {
                         table.deletion_buffer().remove(row_id);
                     })
                     .await

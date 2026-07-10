@@ -32,31 +32,8 @@ pub(crate) struct RowVersionMap {
     /// Currently it should be same as the table-file column layout because we
     /// do not support physical column-layout changes.
     pub(crate) column_layout: Arc<TableColumnLayout>,
-    // Monotonically increasing version number.
-    // indicates whether the undo map is changed.
-    mod_counter: AtomicU64,
     // Commit timestamp when this row page is created.
     create_cts: AtomicU64,
-    // Maximum STS of transactions that have modified
-    // current page.
-    // This is used to bypass version chain traversal
-    // for fast table scan.
-    // map.len()==0 is more strict than trx.sts > max_sts,
-    // because it depends on efficient GC to remove undo
-    // logs as fast as possible.
-    //
-    // The implementation uses guard to automatically maintain
-    // this field. There might be some cases that this field
-    // does not reflect the actual status and precent fast scan
-    // by mistake, e.g. a transaction modifies one row, then
-    // rollback.
-    max_sts: AtomicU64,
-    // Maximum STS of transactions that has insertion or update
-    // on current page. This can speed up version check on
-    // frozen pages, if `global_min_active_sts > max_ins_sts`,
-    // we can make sure the content of row page can be safely
-    // transformed to LWC block.
-    max_ins_sts: AtomicU64,
     // Row page state indicates the write status of the page.
     // It is guarded by rwlock so that checkpointer can block incoming
     // writers when switching frozen page to transition state.
@@ -71,10 +48,7 @@ impl RowVersionMap {
         RowVersionMap {
             entries: vec.into_boxed_slice(),
             column_layout,
-            mod_counter: AtomicU64::new(0),
             create_cts: AtomicU64::new(0),
-            max_sts: AtomicU64::new(0),
-            max_ins_sts: AtomicU64::new(0),
             state: RwLock::new(RowPageState::Active),
         }
     }
@@ -91,8 +65,15 @@ impl RowVersionMap {
         self.state.read()
     }
 
+    /// Acquire exclusive access to the page state.
+    #[inline]
+    pub(crate) fn write_state(&self) -> RwLockWriteGuard<'_, RowPageState> {
+        self.state.write()
+    }
+
     /// Returns whether this page is frozen.
     #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by row-page state tests"))]
     pub(crate) fn is_frozen(&self) -> bool {
         matches!(
             self.state(),
@@ -118,6 +99,7 @@ impl RowVersionMap {
 
     /// Set current row page to transition.
     #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by transition-path tests"))]
     pub(crate) fn set_transition(&self) {
         let mut state = self.state.write();
         if *state == RowPageState::Frozen {
@@ -137,24 +119,6 @@ impl RowVersionMap {
         TrxID::new(self.create_cts.load(Ordering::Acquire))
     }
 
-    /// Returns modification counter.
-    #[inline]
-    pub(crate) fn mod_counter(&self) -> u64 {
-        self.mod_counter.load(Ordering::Acquire)
-    }
-
-    /// Returns maximum STS recorded in this map.
-    #[inline]
-    pub(crate) fn max_sts(&self) -> TrxID {
-        TrxID::new(self.max_sts.load(Ordering::Acquire))
-    }
-
-    /// Returns maximum STS of insert or update on this page.
-    #[inline]
-    pub(crate) fn max_ins_sts(&self) -> TrxID {
-        TrxID::new(self.max_ins_sts.load(Ordering::Acquire))
-    }
-
     /// Acquire a read latch on given row.
     #[inline]
     pub(crate) fn read_latch(&self, row_idx: usize) -> RowVersionReadGuard<'_> {
@@ -164,25 +128,9 @@ impl RowVersionMap {
 
     /// Acquire a write latch on given row.
     #[inline]
-    pub(crate) fn write_latch(
-        &self,
-        row_idx: usize,
-        sts: Option<TrxID>,
-        ins_or_update: bool,
-    ) -> RowVersionWriteGuard<'_> {
+    pub(crate) fn write_latch(&self, row_idx: usize) -> RowVersionWriteGuard<'_> {
         let g = self.entries[row_idx].write();
-        // If STS is not provided, there should be no modification
-        // on current page, so we don't need to bump the counter.
-        // Currently this is invoked for purge(GC) thread.
-        if sts.is_some() {
-            self.mod_counter.fetch_add(1, Ordering::AcqRel);
-        }
-        RowVersionWriteGuard {
-            m: self,
-            g,
-            sts,
-            ins_or_update,
-        }
+        RowVersionWriteGuard { g }
     }
 
     /// Acquire exclusive latch as self is exclusive.
@@ -208,36 +156,7 @@ impl<'a> Deref for RowVersionReadGuard<'a> {
 
 /// Exclusive guard over a row's undo head in the page version map.
 pub(crate) struct RowVersionWriteGuard<'a> {
-    m: &'a RowVersionMap,
     g: RwLockWriteGuard<'a, Option<Box<RowUndoHead>>>,
-    sts: Option<TrxID>,
-    ins_or_update: bool,
-}
-
-impl RowVersionWriteGuard<'_> {
-    /// Marks this guarded write as an insert or update for page-level tracking.
-    #[inline]
-    pub(crate) fn enable_ins_or_update(&mut self) {
-        self.ins_or_update = true;
-    }
-}
-
-impl<'a> Drop for RowVersionWriteGuard<'a> {
-    #[inline]
-    fn drop(&mut self) {
-        // Only update sts and counter for user transaction.
-        if let Some(sts) = self.sts {
-            // First we update max sts of this map.
-            self.m.max_sts.fetch_max(sts.as_u64(), Ordering::Relaxed);
-            // Then we bump the modification counter.
-            self.m.mod_counter.fetch_add(1, Ordering::AcqRel);
-            if self.ins_or_update {
-                self.m
-                    .max_ins_sts
-                    .fetch_max(sts.as_u64(), Ordering::Relaxed);
-            }
-        }
-    }
 }
 
 impl<'a> Deref for RowVersionWriteGuard<'a> {

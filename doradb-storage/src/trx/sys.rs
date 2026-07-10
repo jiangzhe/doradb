@@ -13,7 +13,6 @@ use crate::id::{SessionID, TrxID};
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
-use crate::notify::ChangeNotifier;
 use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
@@ -452,8 +451,6 @@ pub(crate) struct TransactionSystem {
     /// This advances as soon as purge observes active-bucket progress. Unlike
     /// `global_visible_sts`, it does not imply physical purge work has finished.
     published_gc_horizon: CachePadded<AtomicU64>,
-    /// Change notifier for active GC horizon publication.
-    gc_horizon_changed: CachePadded<ChangeNotifier>,
     /// Round-robin GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
     /// Active and completed transaction buckets used by purge.
@@ -522,7 +519,6 @@ impl TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             published_gc_horizon: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
-            gc_horizon_changed: CachePadded::new(ChangeNotifier::new()),
             rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
             gc_buckets: gc_buckets.into_boxed_slice(),
             redo_log,
@@ -925,6 +921,18 @@ impl TransactionSystem {
         StartedTransaction { handle, entry }
     }
 
+    /// Allocate a timestamp fence for a runtime state transition.
+    ///
+    /// Callers publish the protected state before allocating the fence. Any
+    /// transaction whose STS is at or after the returned value must therefore
+    /// observe that state before it can enter the protected operation.
+    #[inline]
+    pub(crate) fn allocate_snapshot_fence(&self) -> TrxID {
+        let fence = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
+        debug_assert!(fence < MAX_SNAPSHOT_TS);
+        fence
+    }
+
     /// Begin a sessionless system transaction.
     #[inline]
     pub(crate) fn begin_sys_trx(&self) -> SysTrx {
@@ -1078,7 +1086,7 @@ impl TransactionSystem {
         }
         if inner
             .row_undo_mut()
-            .rollback(&mut table_cache, &pool_guards, sts)
+            .rollback(&mut table_cache, &pool_guards)
             .await
             .is_err()
         {
@@ -1147,20 +1155,6 @@ impl TransactionSystem {
         TrxID::new(self.published_gc_horizon.load(Ordering::Acquire))
     }
 
-    /// Returns the current published-horizon notification epoch.
-    #[inline]
-    pub(crate) fn published_gc_horizon_epoch(&self) -> u64 {
-        self.gc_horizon_changed.epoch()
-    }
-
-    /// Wait asynchronously until purge publishes a newer active GC horizon.
-    #[inline]
-    pub(crate) async fn wait_published_gc_horizon_since(&self, observed_epoch: u64) {
-        self.gc_horizon_changed
-            .wait_since_async(observed_epoch)
-            .await;
-    }
-
     /// Publish active transaction horizon progress observed by purge.
     ///
     /// This is intentionally separate from `global_visible_sts`: frozen-page
@@ -1180,10 +1174,7 @@ impl TransactionSystem {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    self.gc_horizon_changed.notify();
-                    return true;
-                }
+                Ok(_) => return true,
                 Err(observed) => curr = observed,
             }
         }

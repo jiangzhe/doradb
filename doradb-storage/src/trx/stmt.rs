@@ -161,9 +161,8 @@ impl StmtEffects {
         &mut self,
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
-        sts: TrxID,
     ) -> Result<()> {
-        self.row_undo.rollback(table_cache, pool_guards, sts).await
+        self.row_undo.rollback(table_cache, pool_guards).await
     }
 
     /// Rolls back statement-local secondary-index effects in reverse effect order.
@@ -710,7 +709,7 @@ impl<'stmt> Statement<'stmt> {
         }
         if self
             .effects
-            .rollback_row(&mut table_cache, pool_guards, sts)
+            .rollback_row(&mut table_cache, pool_guards)
             .await
             .is_err()
         {

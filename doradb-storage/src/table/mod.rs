@@ -46,13 +46,11 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol, UpdateIndex};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
-use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxReadProof, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
-use futures::FutureExt;
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem::take;
@@ -556,70 +554,6 @@ impl Table {
         Ok((frozen_pages, heap_redo_start_ts))
     }
 
-    async fn wait_for_frozen_pages_stable(
-        &self,
-        guards: &PoolGuards,
-        trx_sys: &TransactionSystem,
-        frozen_pages: &[FrozenPage],
-    ) -> Result<()> {
-        // Resume from the first page that is not yet below the published GC
-        // horizon. The published horizon only advances, and these pages are
-        // already frozen so their row-version max insert/update STS cannot
-        // increase while checkpoint waits. Once a page satisfies the predicate,
-        // later horizon wakes cannot make it unstable again.
-        let mut next_unstable_idx = 0usize;
-        loop {
-            trx_sys.ensure_runtime_healthy()?;
-            let observed_epoch = trx_sys.published_gc_horizon_epoch();
-            let published_horizon = trx_sys.published_gc_horizon();
-            while let Some(page_info) = frozen_pages.get(next_unstable_idx) {
-                // A potential optimization is to check row version map without loading
-                // row page back. This requires interface change of buffer pool.
-                let page_guard = self
-                    .mem
-                    .must_get_row_page_shared(guards, page_info.page_id)
-                    .await?;
-                let (ctx, _) = page_guard.ctx_and_page();
-                let row_ver = ctx.row_ver().unwrap();
-                // Check whether all insert and updates on this page are committed.
-                // This may be blocked by a long-running irrelevant transaction
-                // but we accept it now.
-                if row_ver.max_ins_sts() >= published_horizon {
-                    break;
-                }
-                next_unstable_idx += 1;
-            }
-            if next_unstable_idx == frozen_pages.len() {
-                break;
-            }
-            // Horizon notifications are coalesced and predicate-based. Purge
-            // publishes active-horizon progress before physical GC completes;
-            // frozen-page stabilization only needs to know the relevant
-            // transactions are no longer active.
-            trx_sys.ensure_runtime_healthy()?;
-            if trx_sys.published_gc_horizon_epoch() == observed_epoch {
-                let poison_listener = trx_sys.poison_listener();
-                // Re-check after listener registration so poison that fired in
-                // the pre-registration gap is observed before sleeping.
-                trx_sys.ensure_runtime_healthy()?;
-                // Storage poison may stop future purge publications, so this
-                // wait must wake on either horizon progress or poison.
-                let horizon_wait = trx_sys
-                    .wait_published_gc_horizon_since(observed_epoch)
-                    .fuse();
-                let poison_wait = poison_listener.fuse();
-                futures::pin_mut!(horizon_wait);
-                futures::pin_mut!(poison_wait);
-                futures::select! {
-                    () = horizon_wait => (),
-                    () = poison_wait => (),
-                }
-            }
-            trx_sys.ensure_runtime_healthy()?;
-        }
-        Ok(())
-    }
-
     async fn load_frozen_pages_for_transition(
         &self,
         guards: &PoolGuards,
@@ -636,16 +570,104 @@ impl Table {
         Ok(page_guards)
     }
 
-    fn set_loaded_frozen_pages_to_transition(
+    fn validate_and_set_loaded_frozen_pages_to_transition<F>(
         &self,
         page_guards: &[PageSharedGuard<RowPage>],
+        batch: &mut FrozenPageBatch,
         cutoff_ts: TrxID,
-    ) {
+        arm_transition_guard: F,
+    ) -> Option<FrozenPageValidationDelay>
+    where
+        F: FnOnce(),
+    {
+        assert_eq!(
+            page_guards.len(),
+            batch.pages.len(),
+            "frozen page batch guard count mismatch: table_id={}",
+            batch.table_id
+        );
+        assert_eq!(
+            batch.validation.len(),
+            batch.pages.len(),
+            "frozen page batch validation count mismatch: table_id={}",
+            batch.table_id
+        );
+
+        // Holding every state write lock closes the validation-to-transition
+        // race for deletes, which remain allowed while a page is frozen.
+        let mut state_guards = Vec::with_capacity(page_guards.len());
+        for (page_guard, page_info) in page_guards.iter().zip(&batch.pages) {
+            let (ctx, page) = page_guard.ctx_and_page();
+            assert_eq!(
+                page_guard.page_id(),
+                page_info.page_id,
+                "frozen page batch page id mismatch: table_id={}",
+                batch.table_id
+            );
+            assert_eq!(
+                page.header.start_row_id, page_info.start_row_id,
+                "frozen page batch start row id mismatch: table_id={}, page_id={}",
+                batch.table_id, page_info.page_id
+            );
+            let state = ctx.row_ver().unwrap().write_state();
+            assert_eq!(
+                *state,
+                RowPageState::Frozen,
+                "frozen page batch state mismatch: table_id={}, page_id={}",
+                batch.table_id,
+                page_info.page_id
+            );
+            state_guards.push(state);
+        }
+
+        for (page_idx, page_guard) in page_guards.iter().enumerate() {
+            if matches!(
+                batch.validation[page_idx],
+                FrozenPageValidationState::Stable { .. }
+            ) {
+                continue;
+            }
+            let (ctx, page) = page_guard.ctx_and_page();
+            batch.validation[page_idx] = validate_frozen_page(page, ctx, batch.frozen_ts);
+        }
+
+        let mut stable_page_count = 0usize;
+        for (page_info, validation) in batch.pages.iter().zip(&batch.validation) {
+            match validation {
+                FrozenPageValidationState::Unchecked => unreachable!("page was not validated"),
+                FrozenPageValidationState::Blocked { required_cutoff_ts } => {
+                    return Some(FrozenPageValidationDelay {
+                        page_id: page_info.page_id,
+                        stable_page_count,
+                        required_cutoff_ts: *required_cutoff_ts,
+                        unresolved_status: true,
+                    });
+                }
+                FrozenPageValidationState::Stable { required_cutoff_ts }
+                    if required_cutoff_ts.is_some_and(|required| required > cutoff_ts) =>
+                {
+                    return Some(FrozenPageValidationDelay {
+                        page_id: page_info.page_id,
+                        stable_page_count,
+                        required_cutoff_ts: *required_cutoff_ts,
+                        unresolved_status: false,
+                    });
+                }
+                FrozenPageValidationState::Stable { .. } => {
+                    stable_page_count += 1;
+                }
+            }
+        }
+
+        arm_transition_guard();
+        for state in &mut state_guards {
+            **state = RowPageState::Transition;
+        }
         for page_guard in page_guards {
             let (ctx, page) = page_guard.ctx_and_page();
-            ctx.row_ver().unwrap().set_transition();
             self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
         }
+        None
     }
 
     async fn build_lwc_blocks<C>(
@@ -680,8 +702,12 @@ impl Table {
                     metadata.col.as_ref(),
                     ctx,
                     cutoff_ts,
-                    cutoff_ts,
-                );
+                ).map_err(|err| {
+                    Report::new(InternalError::LwcBuilderMisuse).attach(format!(
+                        "validated transition view became stale: page_id={}, row_idx={}, status_ts={}, cutoff_ts={cutoff_ts}",
+                        page_info.page_id, err.row_idx, err.status_ts
+                    ))
+                })?;
                 if view.rows_non_deleted() == 0 {
                     continue;
                 }
@@ -712,8 +738,12 @@ impl Table {
                         metadata.col.as_ref(),
                         ctx,
                         cutoff_ts,
-                        cutoff_ts,
-                    );
+                    ).map_err(|err| {
+                        Report::new(InternalError::LwcBuilderMisuse).attach(format!(
+                            "validated transition view became stale: page_id={}, row_idx={}, status_ts={}, cutoff_ts={cutoff_ts}",
+                            page_info.page_id, err.row_idx, err.status_ts
+                        ))
+                    })?;
                     if !builder.append_view(page, view)? {
                         return Err(Report::new(InternalError::LwcBuilderMisuse)
                             .attach(format!(
@@ -761,11 +791,13 @@ impl Table {
                 UndoStatus::Committed(_) => None,
             };
             let mut entry = head.next.main.entry.clone();
+            let mut marker_recorded = false;
             loop {
                 let row_id = page.row_id(row_idx);
                 match entry.as_ref().kind {
                     RowUndoKind::Lock => {
-                        if let Some(trx_status) = status.as_ref()
+                        if !marker_recorded
+                            && let Some(trx_status) = status.as_ref()
                             && !trx_is_committed(trx_status.ts())
                         {
                             let _ = self.deletion_buffer().put_ref(
@@ -773,32 +805,38 @@ impl Table {
                                 trx_status.clone(),
                                 MAX_SNAPSHOT_TS,
                             );
+                            marker_recorded = true;
                         }
                     }
                     RowUndoKind::Delete => {
-                        match status.as_ref() {
-                            Some(trx_status) => {
-                                let status_ts = trx_status.ts();
-                                if trx_is_committed(status_ts) {
-                                    if status_ts >= cutoff_ts {
-                                        let _ =
-                                            self.deletion_buffer().put_committed(row_id, status_ts);
+                        if !marker_recorded {
+                            match status.as_ref() {
+                                Some(trx_status) => {
+                                    let status_ts = trx_status.ts();
+                                    if trx_is_committed(status_ts) {
+                                        if status_ts >= cutoff_ts {
+                                            let _ = self
+                                                .deletion_buffer()
+                                                .put_committed(row_id, status_ts);
+                                            marker_recorded = true;
+                                        }
+                                    } else {
+                                        let _ = self.deletion_buffer().put_ref(
+                                            row_id,
+                                            trx_status.clone(),
+                                            MAX_SNAPSHOT_TS,
+                                        );
+                                        marker_recorded = true;
                                     }
-                                } else {
-                                    let _ = self.deletion_buffer().put_ref(
-                                        row_id,
-                                        trx_status.clone(),
-                                        MAX_SNAPSHOT_TS,
-                                    );
                                 }
-                            }
-                            None => {
-                                if ts >= cutoff_ts {
-                                    let _ = self.deletion_buffer().put_committed(row_id, ts);
+                                None => {
+                                    if ts >= cutoff_ts {
+                                        let _ = self.deletion_buffer().put_committed(row_id, ts);
+                                        marker_recorded = true;
+                                    }
                                 }
                             }
                         }
-                        break;
                     }
                     RowUndoKind::Insert | RowUndoKind::Update(_) => {
                         break;
@@ -1183,10 +1221,94 @@ impl<'ctx> TableRootSnapshot<'ctx> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrozenPage {
     page_id: PageID,
     start_row_id: RowID,
     end_row_id: RowID,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrozenPageValidationState {
+    Unchecked,
+    Blocked { required_cutoff_ts: Option<TrxID> },
+    Stable { required_cutoff_ts: Option<TrxID> },
+}
+
+/// Retryable set of frozen row pages selected for one user-table checkpoint.
+#[derive(Debug)]
+pub struct FrozenPageBatch {
+    table_id: TableID,
+    frozen_ts: TrxID,
+    approximate_rows: usize,
+    pages: Vec<FrozenPage>,
+    validation: Vec<FrozenPageValidationState>,
+}
+
+impl FrozenPageBatch {
+    #[inline]
+    fn new(
+        table_id: TableID,
+        frozen_ts: TrxID,
+        approximate_rows: usize,
+        pages: Vec<FrozenPage>,
+    ) -> Self {
+        let validation = vec![FrozenPageValidationState::Unchecked; pages.len()];
+        Self {
+            table_id,
+            frozen_ts,
+            approximate_rows,
+            pages,
+            validation,
+        }
+    }
+
+    /// Returns the table selected by this batch.
+    #[inline]
+    pub fn table_id(&self) -> TableID {
+        self.table_id
+    }
+
+    /// Returns the timestamp fence allocated after the pages were frozen.
+    #[inline]
+    pub fn frozen_ts(&self) -> TrxID {
+        self.frozen_ts
+    }
+
+    /// Returns the approximate number of non-deleted rows selected.
+    #[inline]
+    pub fn approximate_rows(&self) -> usize {
+        self.approximate_rows
+    }
+
+    /// Returns the number of selected row pages.
+    #[inline]
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Returns whether this batch contains no frozen pages.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// Returns the number of pages whose undo chains no longer need rescanning.
+    #[inline]
+    pub fn stable_page_count(&self) -> usize {
+        self.validation
+            .iter()
+            .filter(|state| matches!(state, FrozenPageValidationState::Stable { .. }))
+            .count()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrozenPageValidationDelay {
+    page_id: PageID,
+    stable_page_count: usize,
+    required_cutoff_ts: Option<TrxID>,
+    unresolved_status: bool,
 }
 
 /// Stages newly built dual-tree secondary indexes until the caller publishes them.
@@ -1321,6 +1443,67 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
         builder.push(index_no, index);
     }
     Ok(builder.publish())
+}
+
+fn validate_frozen_page(
+    page: &RowPage,
+    ctx: &FrameContext,
+    frozen_ts: TrxID,
+) -> FrozenPageValidationState {
+    let Some(map) = ctx.row_ver() else {
+        return FrozenPageValidationState::Stable {
+            required_cutoff_ts: None,
+        };
+    };
+    let mut required_cutoff_ts = None;
+    let mut blocked = false;
+    for row_idx in 0..page.header.row_count() {
+        let undo_guard = map.read_latch(row_idx);
+        let Some(head) = undo_guard.as_ref() else {
+            continue;
+        };
+        let mut status = &head.next.main.status;
+        let mut entry = head.next.main.entry.as_ref();
+        loop {
+            let ts = status.ts();
+            let committed = trx_is_committed(ts);
+            match entry.kind {
+                RowUndoKind::Lock | RowUndoKind::Delete => {
+                    if !committed && active_writer_sts(ts) < frozen_ts {
+                        blocked = true;
+                    }
+                }
+                RowUndoKind::Insert | RowUndoKind::Update(_) => {
+                    if committed {
+                        let required = ts.saturating_add(1);
+                        required_cutoff_ts = Some(
+                            required_cutoff_ts
+                                .map_or(required, |current: TrxID| current.max(required)),
+                        );
+                    } else {
+                        blocked = true;
+                    }
+                    break;
+                }
+            }
+            let Some(next) = entry.next.as_ref() else {
+                break;
+            };
+            status = &next.main.status;
+            entry = next.main.entry.as_ref();
+        }
+    }
+    if blocked {
+        FrozenPageValidationState::Blocked { required_cutoff_ts }
+    } else {
+        FrozenPageValidationState::Stable { required_cutoff_ts }
+    }
+}
+
+#[inline]
+fn active_writer_sts(trx_id: TrxID) -> TrxID {
+    debug_assert!(!trx_is_committed(trx_id));
+    TrxID::new(trx_id.as_u64() & (MAX_SNAPSHOT_TS.as_u64() - 1))
 }
 
 #[inline]
@@ -2741,12 +2924,12 @@ pub(crate) mod tests {
     pub(crate) async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
         let trx_sys = session.engine().trx_sys.clone();
         for _ in 0..50 {
-            if trx_sys.calc_min_active_sts_for_gc() > ts {
+            if trx_sys.published_gc_horizon() > ts {
                 return;
             }
             Timer::after(Duration::from_millis(20)).await;
         }
-        panic!("GC cutoff did not advance past {ts}");
+        panic!("published GC cutoff did not advance past {ts}");
     }
 
     pub(crate) async fn wait_checkpoint_ready(table_id: TableID, session: &Session) {

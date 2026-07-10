@@ -1,4 +1,5 @@
 use super::lifecycle::TableLifecycleState;
+use crate::buffer::PoolGuards;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
@@ -6,7 +7,7 @@ use crate::error::{
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
-use crate::id::{BlockID, PageID, RowID, TrxID};
+use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::BTreeKeyEncoder;
 use crate::index::disk_tree::{
     NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
@@ -17,10 +18,14 @@ use crate::lwc::PersistedLwcBlock;
 use crate::obs;
 use crate::row::RowPage;
 use crate::session::SessionPin;
-use crate::table::{CheckpointCancelReason, Table, TableRedoReplayFloor, TableRuntimeLayout};
+use crate::table::{
+    CheckpointCancelReason, FrozenPage, FrozenPageBatch, Table, TableRedoReplayFloor,
+    TableRuntimeLayout,
+};
 use crate::trx::sys::TransactionSystem;
 #[cfg(test)]
 use crate::trx::tests::discard_transaction_after_fatal_rollback;
+use crate::trx::ver_map::RowPageState;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use std::collections::BTreeSet;
@@ -87,7 +92,7 @@ impl CheckpointReadiness {
             Self::Ready
         } else {
             Self::Delayed {
-                reason: CheckpointDelayReason {
+                reason: CheckpointDelayReason::ActiveRoot {
                     effective_ts,
                     min_active_sts,
                 },
@@ -121,13 +126,31 @@ pub enum CheckpointOutcome {
     },
 }
 
-/// Diagnostic payload for normal checkpoint scheduling delay.
+/// Diagnostic payload for a normal, retryable checkpoint scheduling delay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CheckpointDelayReason {
-    /// Runtime post-publish root-observation boundary used by reclamation.
-    pub effective_ts: TrxID,
-    /// Current global minimum active snapshot timestamp used by GC.
-    pub min_active_sts: TrxID,
+pub enum CheckpointDelayReason {
+    /// The active root is still visible to an active transaction.
+    ActiveRoot {
+        /// Runtime post-publish root-observation boundary used by reclamation.
+        effective_ts: TrxID,
+        /// Current global minimum active snapshot timestamp used by GC.
+        min_active_sts: TrxID,
+    },
+    /// A frozen row page cannot be encoded at the selected cutoff yet.
+    FrozenPageCutoff {
+        /// Table whose frozen batch was validated.
+        table_id: TableID,
+        /// First selected page that is not ready for this attempt.
+        page_id: PageID,
+        /// Number of leading pages ready for this cutoff.
+        stable_page_count: usize,
+        /// Purge-published exclusive checkpoint cutoff.
+        cutoff_ts: TrxID,
+        /// Minimum exclusive cutoff required by committed row image state.
+        required_cutoff_ts: Option<TrxID>,
+        /// Whether an unresolved transaction status blocks the page.
+        unresolved_status: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -956,22 +979,95 @@ impl Table {
 }
 
 impl Table {
-    /// Mark hot row pages frozen up to the requested row budget.
-    pub(crate) async fn freeze(&self, session: SessionPin, max_rows: usize) -> Result<usize> {
+    /// Mark a contiguous hot-page prefix frozen up to the requested row budget.
+    pub(crate) async fn freeze(
+        &self,
+        session: &SessionPin,
+        max_rows: usize,
+    ) -> Result<FrozenPageBatch> {
         let guards = session.pool_guards();
         let mut rows = 0usize;
+        let mut pages = Vec::new();
         self.mem_scan(&guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
-            rows += page.header.approx_non_deleted();
-            if vmap.is_frozen() {
-                return rows < max_rows;
+            if vmap.state() == RowPageState::Transition {
+                return false;
             }
-            vmap.set_frozen();
+            rows += page.header.approx_non_deleted();
+            if vmap.state() == RowPageState::Active {
+                vmap.set_frozen();
+            }
+            pages.push(FrozenPage {
+                page_id: page_guard.page_id(),
+                start_row_id: page.header.start_row_id,
+                end_row_id: page.header.start_row_id + page.header.max_row_count as u64,
+            });
             rows < max_rows
         })
         .await?;
-        Ok(rows)
+        // The fence is allocated only after every selected page has published
+        // FROZEN under its state lock.
+        let frozen_ts = session.engine.trx_sys.allocate_snapshot_fence();
+        Ok(FrozenPageBatch::new(
+            self.table_id(),
+            frozen_ts,
+            rows,
+            pages,
+        ))
+    }
+
+    /// Reconstruct a compatibility batch from the current frozen prefix.
+    async fn existing_frozen_batch(&self, session: &SessionPin) -> Result<FrozenPageBatch> {
+        let guards = session.pool_guards();
+        let (pages, _) = self.collect_frozen_pages(&guards).await?;
+        let frozen_ts = session.engine.trx_sys.allocate_snapshot_fence();
+        Ok(FrozenPageBatch::new(self.table_id(), frozen_ts, 0, pages))
+    }
+
+    async fn heap_redo_start_after_batch(
+        &self,
+        guards: &PoolGuards,
+        batch: &FrozenPageBatch,
+    ) -> Result<Option<TrxID>> {
+        let mut page_idx = 0usize;
+        let mut next_heap_redo_start_ts = None;
+        let mut mismatch = None;
+        self.mem_scan(guards, |page_guard| {
+            let (ctx, page) = page_guard.ctx_and_page();
+            if let Some(expected) = batch.pages.get(page_idx) {
+                if page_guard.page_id() != expected.page_id
+                    || page.header.start_row_id != expected.start_row_id
+                {
+                    mismatch = Some((expected.page_id, page_guard.page_id()));
+                    return false;
+                }
+                page_idx += 1;
+                return true;
+            }
+            next_heap_redo_start_ts = Some(ctx.row_ver().unwrap().create_cts());
+            false
+        })
+        .await?;
+        if let Some((expected_page_id, actual_page_id)) = mismatch {
+            return Err(Report::new(InternalError::Generic)
+                .attach(format!(
+                    "frozen page batch is not the current hot prefix: table_id={}, expected_page_id={}, actual_page_id={}",
+                    batch.table_id, expected_page_id, actual_page_id
+                ))
+                .into());
+        }
+        if page_idx != batch.pages.len() {
+            return Err(Report::new(InternalError::Generic)
+                .attach(format!(
+                    "frozen page batch extends beyond current hot prefix: table_id={}, matched_pages={}, batch_pages={}",
+                    batch.table_id,
+                    page_idx,
+                    batch.pages.len()
+                ))
+                .into());
+        }
+        Ok(next_heap_redo_start_ts)
     }
 
     /// Return whether this table is ready for a checkpoint in the session.
@@ -983,10 +1079,22 @@ impl Table {
         }
     }
 
-    /// Execute one user-table checkpoint attempt.
-    pub(crate) async fn checkpoint(&self, session: SessionPin) -> Result<CheckpointOutcome> {
+    /// Execute one user-table checkpoint attempt for an explicit frozen-page batch.
+    pub(crate) async fn checkpoint(
+        &self,
+        session: SessionPin,
+        batch: &mut FrozenPageBatch,
+    ) -> Result<CheckpointOutcome> {
         let table_id = self.table_id();
-        self.checkpoint_inner(session)
+        if batch.table_id != table_id {
+            return Err(Report::new(OperationError::NotSupported)
+                .attach(format!(
+                    "checkpoint batch table mismatch: table_id={table_id}, batch_table_id={}",
+                    batch.table_id
+                ))
+                .into());
+        }
+        self.checkpoint_inner(session, batch)
             .await
             .inspect(|outcome| match outcome {
                 CheckpointOutcome::Published {
@@ -999,10 +1107,9 @@ impl Table {
                     silent
                 ),
                 CheckpointOutcome::Delayed { reason } => obs::warn!(
-                    "event=checkpoint_publish component=table table_id={} action=delay result=delayed effective_ts={} min_active_sts={}",
+                    "event=checkpoint_publish component=table table_id={} action=delay result=delayed reason={:?}",
                     table_id,
-                    reason.effective_ts,
-                    reason.min_active_sts
+                    reason
                 ),
                 CheckpointOutcome::Cancelled { reason } => obs::warn!(
                     "event=checkpoint_publish component=table table_id={} action=cancel result=cancelled reason={:?}",
@@ -1021,7 +1128,21 @@ impl Table {
             })
     }
 
-    async fn checkpoint_inner(&self, session: SessionPin) -> Result<CheckpointOutcome> {
+    /// Execute a compatibility checkpoint using the table's current frozen prefix.
+    pub(crate) async fn checkpoint_existing_frozen(
+        &self,
+        session: SessionPin,
+    ) -> Result<CheckpointOutcome> {
+        let mut batch = self.existing_frozen_batch(&session).await?;
+        self.checkpoint(session, &mut batch).await
+    }
+
+    async fn checkpoint_inner(
+        &self,
+        session: SessionPin,
+        batch: &mut FrozenPageBatch,
+    ) -> Result<CheckpointOutcome> {
+        let table_id = self.table_id();
         if session.in_trx(CHECKPOINT_REQUIRES_IDLE_SESSION)? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach(CHECKPOINT_REQUIRES_IDLE_SESSION)
@@ -1060,38 +1181,62 @@ impl Table {
         let pivot_row_id = mutable_file.root().pivot_row_id;
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)?;
 
-        // Step 2: collect frozen pages and refresh checkpoint cutoff after any
-        // stabilization wait. The post-lease readiness check is enough for root
-        // liveness because the GC horizon used by the check only moves forward.
-        let (frozen_pages, next_heap_redo_start_ts) =
-            self.collect_frozen_pages(&pool_guards).await?;
-        if !frozen_pages.is_empty() {
-            self.wait_for_frozen_pages_stable(&pool_guards, &trx_sys, &frozen_pages)
-                .await?;
-        }
-        let cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
+        // Step 2: derive replay and data cutoffs from the explicit batch. The
+        // purge-published horizon is the exclusive cutoff for both frozen row
+        // images and cold deletes.
+        let next_heap_redo_start_ts = self
+            .heap_redo_start_after_batch(&pool_guards, batch)
+            .await?;
+        let cutoff_ts = trx_sys.published_gc_horizon();
 
-        // Step 3: open a checkpoint transaction, then move frozen pages into
-        // transition state under the refreshed cutoff timestamp.
+        // Step 3: open a checkpoint transaction before final validation. The
+        // selected cutoff remains the purge-published horizon, not checkpoint STS.
         let mut trx = session.begin_trx("checkpoint table")?;
         let checkpoint_ts = trx.sts();
         #[cfg(test)]
         test_hooks::run_test_checkpoint_after_trx_start_hook().await;
         let mut transition_publication_guard = None;
-        if !frozen_pages.is_empty() {
-            let transition_pages = self
-                .load_frozen_pages_for_transition(&pool_guards, &frozen_pages)
-                .await?;
-            let guard = TransitionRoutePublicationGuard::arm(&trx_sys);
-            self.set_loaded_frozen_pages_to_transition(&transition_pages, cutoff_ts);
+        if !batch.pages.is_empty() {
+            let transition_pages = match self
+                .load_frozen_pages_for_transition(&pool_guards, &batch.pages)
+                .await
+            {
+                Ok(pages) => pages,
+                Err(err) => {
+                    trx.rollback().await?;
+                    return Err(err);
+                }
+            };
+            let validation_delay = self.validate_and_set_loaded_frozen_pages_to_transition(
+                &transition_pages,
+                batch,
+                cutoff_ts,
+                || {
+                    transition_publication_guard =
+                        Some(TransitionRoutePublicationGuard::arm(&trx_sys));
+                },
+            );
             drop(transition_pages);
-            transition_publication_guard = Some(guard);
+            if let Some(delay) = validation_delay {
+                trx.rollback().await?;
+                return Ok(CheckpointOutcome::Delayed {
+                    reason: CheckpointDelayReason::FrozenPageCutoff {
+                        table_id,
+                        page_id: delay.page_id,
+                        stable_page_count: delay.stable_page_count,
+                        cutoff_ts,
+                        required_cutoff_ts: delay.required_cutoff_ts,
+                        unresolved_status: delay.unresolved_status,
+                    },
+                });
+            }
         }
 
         // Step 4: build LWC blocks from transition pages using the cutoff
         // snapshot. The sidecar callback observes the same committed-visible
         // rows accepted by the LWC builder, independent of later block splits.
-        let new_pivot_row_id = frozen_pages
+        let new_pivot_row_id = batch
+            .pages
             .last()
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
@@ -1108,7 +1253,7 @@ impl Table {
                 metadata,
                 &pool_guards,
                 cutoff_ts,
-                &frozen_pages,
+                &batch.pages,
                 collect_visible_row,
             )
             .await
@@ -1128,7 +1273,7 @@ impl Table {
             last.shape.set_end_row_id(new_pivot_row_id)?;
         }
 
-        let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
+        let gc_pages: Vec<PageID> = batch.pages.iter().map(|page| page.page_id).collect();
         trx.extend_gc_row_pages(gc_pages)?;
 
         // Step 5: emit one checkpoint redo marker for recovery.
@@ -1426,7 +1571,7 @@ mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::io::install_storage_backend_test_hook;
-    use crate::row::ops::{SelectKey, SelectMvcc};
+    use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::DeleteMarker;
     use crate::table::persistence::test_hooks::{
@@ -1886,6 +2031,7 @@ mod tests {
                 .file()
                 .active_root_unchecked()
                 .clone();
+            wait_checkpoint_ready(table_id, &session).await;
 
             set_test_force_secondary_sidecar_error(true);
             let _reset = ResetSidecarHook;
@@ -2056,6 +2202,7 @@ mod tests {
                 .put_committed(RowID::new(0), marker_ts)
                 .unwrap();
             wait_gc_cutoff_after(&session, marker_ts).await;
+            wait_checkpoint_ready(table_id, &session).await;
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_eq!(
@@ -2111,6 +2258,7 @@ mod tests {
                 .put_committed(missing_row_id, marker_ts)
                 .unwrap();
             wait_gc_cutoff_after(&session, marker_ts).await;
+            wait_checkpoint_ready(table_id, &session).await;
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_eq!(
@@ -2288,6 +2436,7 @@ mod tests {
             let marker2 = table.deletion_buffer().get(row_id2).unwrap();
             let marker2_ts = delete_marker_ts(marker2);
             wait_gc_cutoff_after(&session, marker2_ts).await;
+            wait_checkpoint_ready(table_id, &session).await;
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_delete_codec(table_file_path, entry.leaf_block_id, 0);
@@ -2357,6 +2506,7 @@ mod tests {
             let marker2 = table.deletion_buffer().get(row_id2).unwrap();
             let marker2_ts = delete_marker_ts(marker2);
             wait_gc_cutoff_after(&session, marker2_ts).await;
+            wait_checkpoint_ready(table_id, &session).await;
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_block_id, 0);
@@ -2387,14 +2537,11 @@ mod tests {
 
             let table = table_for_internal_assertion(&engine, table_id);
             let old_root = table.file().active_root_unchecked().clone();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
-            let (frozen_pages, _) = table
-                .collect_frozen_pages(&session.pool_guards())
-                .await
-                .unwrap();
-            assert!(!frozen_pages.is_empty());
+            let mut batch = session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert!(!batch.is_empty());
+            wait_gc_cutoff_after(&session, session.last_cts()).await;
 
-            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            let outcome = session.checkpoint_frozen_pages(&mut batch).await.unwrap();
             assert!(
                 matches!(outcome, CheckpointOutcome::Published { silent: false, .. }),
                 "{outcome:?}"
@@ -2568,9 +2715,16 @@ mod tests {
             let CheckpointReadiness::Delayed { reason } = readiness else {
                 panic!("expected delayed checkpoint readiness, got {readiness:?}");
             };
-            assert_eq!(reason.effective_ts, active_root_effective_ts);
-            assert_eq!(reason.min_active_sts, reader.sts());
-            assert!(reason.effective_ts >= reason.min_active_sts);
+            let CheckpointDelayReason::ActiveRoot {
+                effective_ts,
+                min_active_sts,
+            } = reason
+            else {
+                panic!("expected active-root delay, got {reason:?}");
+            };
+            assert_eq!(effective_ts, active_root_effective_ts);
+            assert_eq!(min_active_sts, reader.sts());
+            assert!(effective_ts >= min_active_sts);
 
             reader.commit().await.unwrap();
             wait_gc_cutoff_after(&session, active_root_effective_ts).await;
@@ -2591,7 +2745,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 120, "effective-delay").await;
 
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut batch = session.freeze_table(table_id, usize::MAX).await.unwrap();
+            wait_gc_cutoff_after(&session, session.last_cts()).await;
             let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
                 Rc::new(RefCell::new(None));
             let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
@@ -2605,7 +2760,10 @@ mod tests {
                 *hook_reader_holder.borrow_mut() = Some((reader_session, reader));
             });
 
-            let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            let outcome = session.checkpoint_frozen_pages(&mut batch).await.unwrap();
+            let CheckpointOutcome::Published { checkpoint_ts, .. } = outcome else {
+                panic!("checkpoint should publish after the hook: {outcome:?}");
+            };
             let active_root = table_for_internal_assertion(&engine, table_id)
                 .file()
                 .active_root_unchecked()
@@ -2618,9 +2776,16 @@ mod tests {
             let CheckpointReadiness::Delayed { reason } = readiness else {
                 panic!("expected effective timestamp delay, got {readiness:?}");
             };
-            assert_eq!(reason.effective_ts, effective_ts);
-            assert!(reason.min_active_sts <= reader_sts.get());
-            assert!(reason.effective_ts >= reason.min_active_sts);
+            let CheckpointDelayReason::ActiveRoot {
+                effective_ts: delayed_effective_ts,
+                min_active_sts,
+            } = reason
+            else {
+                panic!("expected active-root delay, got {reason:?}");
+            };
+            assert_eq!(delayed_effective_ts, effective_ts);
+            assert!(min_active_sts <= reader_sts.get());
+            assert!(delayed_effective_ts >= min_active_sts);
 
             let (_, mut reader) = reader_holder
                 .borrow_mut()
@@ -2722,8 +2887,13 @@ mod tests {
             let CheckpointOutcome::Delayed { reason } = outcome else {
                 panic!("expected delayed checkpoint, got {outcome:?}");
             };
-            assert_eq!(reason.effective_ts, effective_ts_protected_by_reader);
-            assert_eq!(reason.min_active_sts, reader.sts());
+            assert_eq!(
+                reason,
+                CheckpointDelayReason::ActiveRoot {
+                    effective_ts: effective_ts_protected_by_reader,
+                    min_active_sts: reader.sts(),
+                }
+            );
             assert_root_metadata_unchanged(&root_before_delay, &table);
 
             let page_guard = table
@@ -2778,8 +2948,13 @@ mod tests {
             let CheckpointOutcome::Delayed { reason } = outcome else {
                 panic!("expected second checkpoint to wait, got {outcome:?}");
             };
-            assert_eq!(reason.effective_ts, first_effective_ts);
-            assert_eq!(reason.min_active_sts, reader.sts());
+            assert_eq!(
+                reason,
+                CheckpointDelayReason::ActiveRoot {
+                    effective_ts: first_effective_ts,
+                    min_active_sts: reader.sts(),
+                }
+            );
             assert_root_metadata_unchanged(
                 &root_before_second,
                 &table_for_internal_assertion(&engine, table_id),
@@ -2896,8 +3071,13 @@ mod tests {
                 .active_root_unchecked()
                 .clone();
             assert!(root_after.root_ts > root_before.root_ts);
-            assert_eq!(reason.effective_ts, root_after.effective_ts());
-            assert_eq!(reason.min_active_sts, reader.sts());
+            assert_eq!(
+                reason,
+                CheckpointDelayReason::ActiveRoot {
+                    effective_ts: root_after.effective_ts(),
+                    min_active_sts: reader.sts(),
+                }
+            );
 
             reader.commit().await.unwrap();
         });
@@ -3211,7 +3391,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_for_frozen_pages_stable_wakes_on_storage_poison() {
+    fn test_checkpoint_batch_delays_for_pre_fence_uncommitted_insert() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -3227,65 +3407,216 @@ mod tests {
             .await
             .unwrap();
 
-            let checkpoint_session = engine.new_session().unwrap();
-            checkpoint_session
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let mut batch = checkpoint_session
                 .freeze_table(table_id, usize::MAX)
                 .await
                 .unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let pool_guards = checkpoint_session.pool_guards();
-            let (frozen_pages, _) = table.collect_frozen_pages(&pool_guards).await.unwrap();
-            assert_eq!(frozen_pages.len(), 1);
-
-            let trx_sys = engine.inner().trx_sys.clone();
+            assert_eq!(batch.page_count(), 1);
+            let root_before = table.file().active_root_unchecked().clone();
+            let outcome = checkpoint_session
+                .checkpoint_frozen_pages(&mut batch)
+                .await
+                .unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("uncommitted insert should delay checkpoint: {outcome:?}");
+            };
+            let CheckpointDelayReason::FrozenPageCutoff {
+                table_id: delayed_table_id,
+                page_id,
+                stable_page_count,
+                cutoff_ts,
+                required_cutoff_ts,
+                unresolved_status,
+            } = reason
+            else {
+                panic!("expected frozen-page cutoff delay, got {reason:?}");
+            };
+            assert_eq!(delayed_table_id, table_id);
+            assert_eq!(page_id, batch.pages[0].page_id);
+            assert_eq!(stable_page_count, 0);
+            assert!(cutoff_ts <= trx.sts());
+            assert_eq!(required_cutoff_ts, None);
+            assert!(unresolved_status);
+            assert_root_metadata_unchanged(&root_before, &table);
             let page_guard = table
                 .mem
-                .must_get_row_page_shared(&pool_guards, frozen_pages[0].page_id)
+                .must_get_row_page_shared(&checkpoint_session.pool_guards(), batch.pages[0].page_id)
                 .await
                 .unwrap();
             let (ctx, _) = page_guard.ctx_and_page();
-            assert!(
-                ctx.row_ver().unwrap().max_ins_sts() >= trx_sys.published_gc_horizon(),
-                "test setup must block on the published GC horizon"
-            );
+            assert_eq!(ctx.row_ver().unwrap().state(), RowPageState::Frozen);
             drop(page_guard);
+            trx.rollback().await.unwrap();
+        });
+    }
 
-            let wait = table
-                .wait_for_frozen_pages_stable(&pool_guards, &trx_sys, &frozen_pages)
-                .fuse();
-            let poison_trx_sys = trx_sys.clone();
-            let poison = async move {
-                Timer::after(Duration::from_millis(20)).await;
-                let poison = poison_trx_sys.poison_engine(FatalError::CheckpointWrite);
-                assert_eq!(*poison.current_context(), FatalError::CheckpointWrite);
-            }
-            .fuse();
-            let timeout = Timer::after(Duration::from_secs(2)).fuse();
-            futures::pin_mut!(wait);
-            futures::pin_mut!(poison);
-            futures::pin_mut!(timeout);
+    #[test]
+    fn test_checkpoint_batch_retries_stale_committed_update_cutoff() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut setup = engine.new_session().unwrap();
+            insert_rows(table_id, &mut setup, 1, 1, "before").await;
 
-            let mut poison_done = false;
-            let res = loop {
-                futures::select! {
-                    res = wait => {
-                        assert!(poison_done, "wait returned before storage poison");
-                        break res;
-                    }
-                    () = poison => {
-                        poison_done = true;
-                    }
-                    _ = timeout => {
-                        panic!("frozen-page stability wait did not wake on storage poison");
-                    }
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let key = single_key(1i32);
+            let update = trx_update_row_by_id(
+                &mut writer,
+                table_id,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("after"),
+                }],
+            )
+            .await
+            .unwrap();
+            assert!(matches!(update, UpdateMvcc::Updated(_)));
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let mut batch = checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap();
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            let reader_sts = reader.sts();
+            let writer_cts = writer.commit().await.unwrap();
+            assert!(writer_cts >= reader_sts);
+
+            let trx_sys = &engine.inner().trx_sys;
+            for _ in 0..50 {
+                if trx_sys.published_gc_horizon() >= reader_sts {
+                    break;
                 }
+                Timer::after(Duration::from_millis(20)).await;
+            }
+            let cutoff_ts = trx_sys.published_gc_horizon();
+            assert!(cutoff_ts <= writer_cts);
+
+            let outcome = checkpoint_session
+                .checkpoint_frozen_pages(&mut batch)
+                .await
+                .unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("future committed update should delay checkpoint: {outcome:?}");
             };
-            let err = res.expect_err("storage poison should abort the wait");
             assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::CheckpointWrite)
+                reason,
+                CheckpointDelayReason::FrozenPageCutoff {
+                    table_id,
+                    page_id: batch.pages[0].page_id,
+                    stable_page_count: 0,
+                    cutoff_ts,
+                    required_cutoff_ts: Some(writer_cts + 1),
+                    unresolved_status: false,
+                }
             );
-            discard_transaction_after_fatal_rollback(&mut trx);
+            assert_eq!(batch.stable_page_count(), 1);
+
+            reader.commit().await.unwrap();
+            for _ in 0..50 {
+                if trx_sys.published_gc_horizon() > writer_cts {
+                    break;
+                }
+                Timer::after(Duration::from_millis(20)).await;
+            }
+            let retry = checkpoint_session
+                .checkpoint_frozen_pages(&mut batch)
+                .await
+                .unwrap();
+            assert!(matches!(
+                retry,
+                CheckpointOutcome::Published { silent: false, .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_batch_detects_future_update_behind_delete() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut setup = engine.new_session().unwrap();
+            insert_rows(table_id, &mut setup, 1, 1, "before").await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            let reader_sts = reader.sts();
+            let key = single_key(1i32);
+            let mut writer = engine.new_session().unwrap();
+            expect_update_committed(
+                table_id,
+                &mut writer,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("after"),
+                }],
+            )
+            .await;
+            let update_cts = writer.last_cts();
+            expect_delete_committed(table_id, &mut writer, &key).await;
+            let delete_cts = writer.last_cts();
+            assert!(delete_cts > update_cts);
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let mut batch = checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap();
+            let trx_sys = &engine.inner().trx_sys;
+            for _ in 0..50 {
+                if trx_sys.published_gc_horizon() >= reader_sts {
+                    break;
+                }
+                Timer::after(Duration::from_millis(20)).await;
+            }
+            let cutoff_ts = trx_sys.published_gc_horizon();
+            assert!(cutoff_ts <= update_cts);
+
+            let outcome = checkpoint_session
+                .checkpoint_frozen_pages(&mut batch)
+                .await
+                .unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("update hidden behind delete should delay checkpoint: {outcome:?}");
+            };
+            assert_eq!(
+                reason,
+                CheckpointDelayReason::FrozenPageCutoff {
+                    table_id,
+                    page_id: batch.pages[0].page_id,
+                    stable_page_count: 0,
+                    cutoff_ts,
+                    required_cutoff_ts: Some(update_cts + 1),
+                    unresolved_status: false,
+                }
+            );
+
+            reader.commit().await.unwrap();
+            wait_gc_cutoff_after(&checkpoint_session, delete_cts).await;
+            let retry = checkpoint_session
+                .checkpoint_frozen_pages(&mut batch)
+                .await
+                .unwrap();
+            assert!(matches!(
+                retry,
+                CheckpointOutcome::Published { silent: false, .. }
+            ));
+            assert!(
+                table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(RowID::new(0))
+                    .is_none()
+            );
         });
     }
 
@@ -3300,14 +3631,16 @@ mod tests {
             let name = "e".repeat(256);
             insert_rows(table_id, &mut session, 0, 80, &name).await;
 
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut batch = session.freeze_table(table_id, usize::MAX).await.unwrap();
             let root_before = table_for_internal_assertion(&engine, table_id)
                 .file()
                 .active_root_unchecked()
                 .clone();
+            wait_gc_cutoff_after(&session, session.last_cts()).await;
+            wait_checkpoint_ready(table_id, &session).await;
 
             set_test_force_lwc_build_error(true);
-            let res = session.checkpoint_table(table_id).await;
+            let res = session.checkpoint_frozen_pages(&mut batch).await;
             set_test_force_lwc_build_error(false);
             assert!(res.is_err());
             let poison = engine
