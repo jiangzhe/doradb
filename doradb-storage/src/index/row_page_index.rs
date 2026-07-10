@@ -433,13 +433,14 @@ impl<P: BufferPool> RowPageIndex<P> {
         self.root_page_id
     }
 
-    /// Destroy this row-page index and all in-memory row pages referenced by it.
+    /// Destroy this row-page index and its still-hot row pages at or above the pivot.
     #[inline]
     pub(crate) async fn destroy<B: BufferPool>(
         self,
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
+        pivot_row_id: RowID,
     ) -> Result<()> {
         let mut stack = vec![(self.root_page_id, false)];
         while let Some((page_id, visited_children)) = stack.pop() {
@@ -474,6 +475,11 @@ impl<P: BufferPool> RowPageIndex<P> {
                     .page()
                     .leaf_entries()
                     .iter()
+                    // Checkpoint GC may already have reclaimed entries below
+                    // the published pivot. The append-only row-page index keeps
+                    // those historical ids for routing bounds, so dropped-table
+                    // destruction must visit only the still-hot suffix.
+                    .filter(|entry| entry.row_id >= pivot_row_id)
                     .map(|entry| entry.page_id)
                     .collect::<Vec<_>>();
                 for row_page_id in row_page_ids {
@@ -1604,7 +1610,7 @@ mod tests {
             assert_eq!((*mem_pool).allocated(), 3);
 
             blk_idx
-                .destroy(&meta_guard, &*mem_pool, &mem_guard)
+                .destroy(&meta_guard, &*mem_pool, &mem_guard, RowID::new(0))
                 .await
                 .unwrap();
             assert_eq!((*meta_pool).allocated(), 0);

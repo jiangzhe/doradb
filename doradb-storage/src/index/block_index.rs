@@ -99,8 +99,9 @@ impl<P: BufferPool> BlockIndex<P> {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
     ) -> Result<()> {
+        let pivot_row_id = self.root.pivot_row_id();
         self.row
-            .destroy(meta_pool_guard, mem_pool, mem_pool_guard)
+            .destroy(meta_pool_guard, mem_pool, mem_pool_guard, pivot_row_id)
             .await
     }
 

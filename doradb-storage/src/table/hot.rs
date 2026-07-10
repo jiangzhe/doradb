@@ -238,6 +238,11 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
             .row_ver()
             .expect("hot-row writes require row-version metadata on page context");
         loop {
+            #[cfg(test)]
+            {
+                use super::test_hooks::run_test_hot_row_write_before_state_lock_hook;
+                run_test_hot_row_write_before_state_lock_hook();
+            }
             let state_guard = ver_map.read_state();
             if *state_guard == RowPageState::Transition {
                 return LockRowForWrite::RetryInTransition;

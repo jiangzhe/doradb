@@ -1386,7 +1386,7 @@ mod tests {
     fn test_read_row_mvcc_inactive_index_returns_invalid_index() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let mut row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let undo = OwnedRowUndo::new(
             TableID::new(1),
             None,
@@ -1397,7 +1397,7 @@ mod tests {
                 var_offset: None,
             }]),
         );
-        *row_ver.write_exclusive(0) = Some(Box::new(RowUndoHead::new(
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99)),
             undo.leak(),
         )));

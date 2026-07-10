@@ -1,4 +1,5 @@
 mod access;
+mod checkpoint_workflow;
 mod deletion_buffer;
 mod dml_validator;
 mod gc;
@@ -11,15 +12,19 @@ mod recover;
 mod rollback;
 mod storage;
 pub(crate) use access::*;
+use checkpoint_workflow::{
+    FreezeAttempt, FrozenPage, FrozenPageBatch, FrozenPageValidationState, TableCheckpointWorkflow,
+};
+pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
 pub(crate) use deletion_buffer::*;
 pub(crate) use dml_validator::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
-pub(crate) use lifecycle::TableLifecycleState;
+pub(crate) use lifecycle::TableTerminal;
 pub(crate) use lifecycle::{
-    CheckpointPublishLease, TableCheckpointRootMutationLease, TableLifecycle,
+    CheckpointPublishLease, TableCheckpointRootMutationLease, TableDropDrain, TableLifecycle,
     TableMetadataChangeLease,
 };
 pub(crate) use mem_table::MemTable;
@@ -93,6 +98,8 @@ pub(crate) struct Table {
     retired_secondary_indexes: Mutex<Vec<RetiredSecondaryIndex>>,
     /// Runtime lifecycle gates for foreground, checkpoint, and drop operations.
     pub(crate) lifecycle: TableLifecycle,
+    /// Canonical volatile freeze-to-checkpoint workflow state.
+    checkpoint_workflow: TableCheckpointWorkflow,
 }
 
 impl Table {
@@ -143,6 +150,7 @@ impl Table {
             layout: Mutex::new(Arc::new(layout)),
             retired_secondary_indexes: Mutex::new(Vec::new()),
             lifecycle: TableLifecycle::new(),
+            checkpoint_workflow: TableCheckpointWorkflow::new(),
         })
     }
 
@@ -159,14 +167,6 @@ impl Table {
             .check_foreground_live(self.table_id(), operation)
     }
 
-    /// Attempts to enter the checkpoint no-cancel publish section.
-    #[inline]
-    pub(crate) fn try_begin_checkpoint_publish(
-        &self,
-    ) -> StdResult<CheckpointPublishLease<'_>, CheckpointCancelReason> {
-        self.lifecycle.try_begin_checkpoint_publish()
-    }
-
     /// Acquires the reversible metadata-change gate for future index DDL.
     #[inline]
     pub(crate) async fn begin_metadata_change(&self) -> Result<TableMetadataChangeLease<'_>> {
@@ -181,16 +181,25 @@ impl Table {
         self.lifecycle.try_begin_checkpoint_root_mutation()
     }
 
-    /// Starts the irreversible drop lifecycle gate for this table.
+    /// Starts terminal drop admission and closes the checkpoint workflow.
     #[inline]
-    pub(crate) async fn begin_drop_lifecycle(&self) -> Result<()> {
-        self.lifecycle.begin_drop(self.table_id()).await
+    pub(crate) fn start_drop_lifecycle(&self) -> Result<TableDropDrain<'_>> {
+        let drain = self.lifecycle.start_drop(self.table_id())?;
+        self.checkpoint_workflow.close();
+        Ok(drain)
     }
 
     /// Marks this table lifecycle as fully dropped.
     #[inline]
     pub(crate) fn mark_dropped_lifecycle(&self) -> Result<()> {
+        self.checkpoint_workflow.assert_closed();
         self.lifecycle.mark_dropped(self.table_id())
+    }
+
+    /// Closes an idle workflow for offline recovery or staged-runtime cleanup.
+    #[inline]
+    pub(crate) fn close_checkpoint_workflow_offline(&self) {
+        self.checkpoint_workflow.close_offline();
     }
 
     /// Consume and destroy all in-memory runtime state for a dropped table.
@@ -209,7 +218,9 @@ impl Table {
             layout,
             retired_secondary_indexes,
             lifecycle: _lifecycle,
+            checkpoint_workflow,
         } = self;
+        checkpoint_workflow.assert_closed();
         let index_pool_guard = guards.index_guard();
         for retired in retired_secondary_indexes.into_inner() {
             let _retired_identity = (retired.index_no, retired.retired_generation);
@@ -511,49 +522,6 @@ impl Table {
             .ok_or_else(|| self.missing_pool_guard(operation, "meta"))
     }
 
-    async fn collect_frozen_pages(
-        &self,
-        guards: &PoolGuards,
-    ) -> Result<(Vec<FrozenPage>, Option<TrxID>)> {
-        let mut frozen_pages = Vec::new();
-        let pivot_row_id = self.mem.pivot_row_id();
-        let mut expected_row_id = pivot_row_id;
-        let mut heap_redo_start_ts = None;
-        let mut seen_first_page = false;
-        self.mem_scan(guards, |page_guard| {
-            let page = page_guard.page();
-            if !seen_first_page {
-                seen_first_page = true;
-                debug_assert_eq!(
-                    page.header.start_row_id, pivot_row_id,
-                    "first in-memory row page must start from pivot_row_id"
-                );
-            }
-            if page.header.start_row_id != expected_row_id {
-                return false;
-            }
-            let (ctx, _) = page_guard.ctx_and_page();
-            let row_ver = ctx.row_ver().unwrap();
-            if row_ver.state() != RowPageState::Frozen {
-                if row_ver.state() == RowPageState::Active {
-                    // heap redo start ts is creation cts of first remaining active page.
-                    heap_redo_start_ts = Some(row_ver.create_cts());
-                }
-                return false;
-            }
-            let end_row_id = page.header.start_row_id + page.header.max_row_count as u64;
-            frozen_pages.push(FrozenPage {
-                page_id: page_guard.page_id(),
-                start_row_id: page.header.start_row_id,
-                end_row_id,
-            });
-            expected_row_id = end_row_id;
-            true
-        })
-        .await?;
-        Ok((frozen_pages, heap_redo_start_ts))
-    }
-
     async fn load_frozen_pages_for_transition(
         &self,
         guards: &PoolGuards,
@@ -570,15 +538,79 @@ impl Table {
         Ok(page_guards)
     }
 
+    fn validate_and_publish_loaded_pages_frozen(
+        &self,
+        page_guards: &[PageSharedGuard<RowPage>],
+        pages: &[FrozenPage],
+        attempt: &mut FreezeAttempt<'_>,
+    ) -> bool {
+        assert_eq!(
+            page_guards.len(),
+            pages.len(),
+            "freeze page guard count mismatch: table_id={}",
+            self.table_id()
+        );
+
+        // Preflight is fully reversible. Workflow admission excludes another
+        // maintenance state transition, while foreground writers do not change
+        // page state or row-page identity.
+        for (page_guard, page_info) in page_guards.iter().zip(pages) {
+            let (ctx, page) = page_guard.ctx_and_page();
+            assert_eq!(
+                page_guard.page_id(),
+                page_info.page_id,
+                "freeze page id mismatch: table_id={}",
+                self.table_id()
+            );
+            assert_eq!(
+                page.header.start_row_id,
+                page_info.start_row_id,
+                "freeze page start row id mismatch: table_id={}, page_id={}",
+                self.table_id(),
+                page_info.page_id
+            );
+            let state = ctx.row_ver().unwrap().inspect_state();
+            assert_eq!(
+                state,
+                RowPageState::Active,
+                "admitted freeze requires ACTIVE page: table_id={}, page_id={}",
+                self.table_id(),
+                page_info.page_id
+            );
+        }
+
+        // No fallible operation or await is allowed after workflow publication
+        // admission. Each state critical section is independent so unrelated
+        // page writers are not held behind a batch-wide set of state locks.
+        if !attempt.begin_page_publication() {
+            return false;
+        }
+        for (page_guard, page_info) in page_guards.iter().zip(pages) {
+            let (ctx, _) = page_guard.ctx_and_page();
+            let mut state = ctx.row_ver().unwrap().write_state();
+            assert_eq!(
+                *state,
+                RowPageState::Active,
+                "freeze page state changed after preflight: table_id={}, page_id={}",
+                self.table_id(),
+                page_info.page_id
+            );
+            #[cfg(test)]
+            test_hooks::run_test_freeze_page_state_locked_hook(page_info.page_id);
+            *state = RowPageState::Frozen;
+        }
+        true
+    }
+
     fn validate_and_set_loaded_frozen_pages_to_transition<F>(
         &self,
         page_guards: &[PageSharedGuard<RowPage>],
         batch: &mut FrozenPageBatch,
         cutoff_ts: TrxID,
         arm_transition_guard: F,
-    ) -> Option<FrozenPageValidationDelay>
+    ) -> StdResult<Option<FrozenPageValidationDelay>, CheckpointCancelReason>
     where
-        F: FnOnce(),
+        F: FnOnce() -> StdResult<(), CheckpointCancelReason>,
     {
         assert_eq!(
             page_guards.len(),
@@ -636,22 +668,22 @@ impl Table {
             match validation {
                 FrozenPageValidationState::Unchecked => unreachable!("page was not validated"),
                 FrozenPageValidationState::Blocked { required_cutoff_ts } => {
-                    return Some(FrozenPageValidationDelay {
+                    return Ok(Some(FrozenPageValidationDelay {
                         page_id: page_info.page_id,
                         stable_page_count,
                         required_cutoff_ts: *required_cutoff_ts,
                         unresolved_status: true,
-                    });
+                    }));
                 }
                 FrozenPageValidationState::Stable { required_cutoff_ts }
                     if required_cutoff_ts.is_some_and(|required| required > cutoff_ts) =>
                 {
-                    return Some(FrozenPageValidationDelay {
+                    return Ok(Some(FrozenPageValidationDelay {
                         page_id: page_info.page_id,
                         stable_page_count,
                         required_cutoff_ts: *required_cutoff_ts,
                         unresolved_status: false,
-                    });
+                    }));
                 }
                 FrozenPageValidationState::Stable { .. } => {
                     stable_page_count += 1;
@@ -659,7 +691,7 @@ impl Table {
             }
         }
 
-        arm_transition_guard();
+        arm_transition_guard()?;
         for state in &mut state_guards {
             **state = RowPageState::Transition;
         }
@@ -667,7 +699,7 @@ impl Table {
             let (ctx, page) = page_guard.ctx_and_page();
             self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
         }
-        None
+        Ok(None)
     }
 
     async fn build_lwc_blocks<C>(
@@ -1222,88 +1254,6 @@ impl<'ctx> TableRootSnapshot<'ctx> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FrozenPage {
-    page_id: PageID,
-    start_row_id: RowID,
-    end_row_id: RowID,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FrozenPageValidationState {
-    Unchecked,
-    Blocked { required_cutoff_ts: Option<TrxID> },
-    Stable { required_cutoff_ts: Option<TrxID> },
-}
-
-/// Retryable set of frozen row pages selected for one user-table checkpoint.
-#[derive(Debug)]
-pub struct FrozenPageBatch {
-    table_id: TableID,
-    frozen_ts: TrxID,
-    approximate_rows: usize,
-    pages: Vec<FrozenPage>,
-    validation: Vec<FrozenPageValidationState>,
-}
-
-impl FrozenPageBatch {
-    #[inline]
-    fn new(
-        table_id: TableID,
-        frozen_ts: TrxID,
-        approximate_rows: usize,
-        pages: Vec<FrozenPage>,
-    ) -> Self {
-        let validation = vec![FrozenPageValidationState::Unchecked; pages.len()];
-        Self {
-            table_id,
-            frozen_ts,
-            approximate_rows,
-            pages,
-            validation,
-        }
-    }
-
-    /// Returns the table selected by this batch.
-    #[inline]
-    pub fn table_id(&self) -> TableID {
-        self.table_id
-    }
-
-    /// Returns the timestamp fence allocated after the pages were frozen.
-    #[inline]
-    pub fn frozen_ts(&self) -> TrxID {
-        self.frozen_ts
-    }
-
-    /// Returns the approximate number of non-deleted rows selected.
-    #[inline]
-    pub fn approximate_rows(&self) -> usize {
-        self.approximate_rows
-    }
-
-    /// Returns the number of selected row pages.
-    #[inline]
-    pub fn page_count(&self) -> usize {
-        self.pages.len()
-    }
-
-    /// Returns whether this batch contains no frozen pages.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
-    }
-
-    /// Returns the number of pages whose undo chains no longer need rescanning.
-    #[inline]
-    pub fn stable_page_count(&self) -> usize {
-        self.validation
-            .iter()
-            .filter(|state| matches!(state, FrozenPageValidationState::Stable { .. }))
-            .count()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrozenPageValidationDelay {
     page_id: PageID,
     stable_page_count: usize,
@@ -1697,7 +1647,8 @@ pub(crate) mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::{
-        CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table, TableRuntimeLayout,
+        CheckpointOutcome, CheckpointPublishLease, DeleteMarker, FreezeOutcome,
+        FrozenPageBatchInfo, Table, TableCheckpointRootMutationLease, TableRuntimeLayout,
     };
     use crate::trx::Transaction;
     use crate::trx::stmt::Statement;
@@ -1712,18 +1663,76 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     pub(crate) mod test_hooks {
-        use std::cell::Cell;
+        use crate::id::PageID;
+        use std::cell::{Cell, RefCell};
+
+        type FreezePageHook = Box<dyn FnOnce(PageID) + 'static>;
+        type HotRowWriteHook = Box<dyn FnOnce() + 'static>;
 
         thread_local! {
             static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+            static TEST_FREEZE_PAGE_STATE_LOCKED_HOOK: RefCell<Option<FreezePageHook>> =
+                const { RefCell::new(None) };
+            static TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK: RefCell<Option<HotRowWriteHook>> =
+                const { RefCell::new(None) };
         }
 
         pub(crate) fn set_test_force_lwc_build_error(enabled: bool) {
             TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
         }
 
+        pub(crate) struct ForceLwcBuildErrorGuard;
+
+        impl ForceLwcBuildErrorGuard {
+            pub(crate) fn new() -> Self {
+                set_test_force_lwc_build_error(true);
+                Self
+            }
+        }
+
+        impl Drop for ForceLwcBuildErrorGuard {
+            fn drop(&mut self) {
+                set_test_force_lwc_build_error(false);
+            }
+        }
+
         pub(crate) fn test_force_lwc_build_error_enabled() -> bool {
             TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get())
+        }
+
+        pub(crate) fn set_test_freeze_page_state_locked_hook<F>(hook: F)
+        where
+            F: FnOnce(PageID) + 'static,
+        {
+            TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "freeze page-state hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_freeze_page_state_locked_hook(page_id: PageID) {
+            let hook = TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn set_test_hot_row_write_before_state_lock_hook<F>(hook: F)
+        where
+            F: FnOnce() + 'static,
+        {
+            TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "hot-row state-lock hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_hot_row_write_before_state_lock_hook() {
+            let hook =
+                TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
         }
     }
 
@@ -1736,6 +1745,28 @@ pub(crate) mod tests {
         USER_TABLE_ID_START
             .checked_add(offset)
             .expect("test user table id offset overflow")
+    }
+
+    pub(crate) fn begin_checkpoint_publish_for_test(
+        table: &Table,
+    ) -> (
+        TableCheckpointRootMutationLease<'_>,
+        CheckpointPublishLease<'_>,
+    ) {
+        let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+        let publish_lease = table.lifecycle.try_begin_checkpoint_publish().unwrap();
+        (root_lease, publish_lease)
+    }
+
+    pub(crate) fn assert_checkpoint_workflow_closed(table: &Table) {
+        table.checkpoint_workflow.assert_closed();
+    }
+
+    pub(crate) fn assert_freeze_created(outcome: FreezeOutcome) -> FrozenPageBatchInfo {
+        let FreezeOutcome::Frozen { batch } = outcome else {
+            panic!("freeze should create a new frozen batch, got {outcome:?}");
+        };
+        batch
     }
 
     pub(crate) fn assert_table_data_integrity(
@@ -2935,17 +2966,21 @@ pub(crate) mod tests {
     pub(crate) async fn wait_checkpoint_ready(table_id: TableID, session: &Session) {
         let mut last_delay = None;
         for _ in 0..50 {
-            match session.table_checkpoint_readiness(table_id).unwrap() {
-                CheckpointReadiness::Ready => return,
-                CheckpointReadiness::Delayed { reason } => {
-                    last_delay = Some(reason);
-                    Timer::after(Duration::from_millis(20)).await;
-                }
-                readiness => panic!("checkpoint readiness is not retryable: {readiness:?}"),
+            let table = session
+                .engine()
+                .catalog()
+                .get_table_now(table_id)
+                .expect("test table should exist");
+            let effective_ts = table.file().active_root_unchecked().effective_ts();
+            let min_active_sts = session.engine().trx_sys.calc_min_active_sts_for_gc();
+            if effective_ts < min_active_sts {
+                return;
             }
+            last_delay = Some((effective_ts, min_active_sts));
+            Timer::after(Duration::from_millis(20)).await;
         }
         panic!(
-            "checkpoint readiness stayed delayed after retries by {:?}",
+            "checkpoint readiness stayed delayed after retries: {:?}",
             last_delay.unwrap()
         );
     }

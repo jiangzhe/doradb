@@ -105,9 +105,11 @@ Table checkpoint has two persistence responsibilities:
 2. persist committed cold-row deletes into delete bitmaps
 
 Secondary-index persistence happens as companion work of those same checkpoint
-operations. Freezing returns an explicit `FrozenPageBatch`, and the batch-aware
-checkpoint API runs eligible data and deletion work in one publication flow.
-The batch retains per-page validation state across delayed retries.
+operations. Each live user table owns one volatile freeze/checkpoint workflow,
+including the canonical frozen-page batch, its original post-freeze fence, and
+per-page validation cache. Freeze returns only a read-only summary; checkpoint
+claims the table-owned batch and restores it unchanged, including cached
+validation progress, when a reversible attempt is delayed or cancelled.
 
 ### 4.1 Data Checkpoint
 
@@ -127,8 +129,12 @@ Each RowPage moves through:
 
 #### Data Checkpoint Workflow
 
-1. Freeze a contiguous RowStore-page prefix and allocate `frozen_ts` after all
-   selected pages publish `FROZEN`.
+1. Claim the table workflow, asynchronously load a contiguous RowStore-page
+   prefix, preflight every selected page as `ACTIVE`, and then publish each page
+   as `FROZEN` in a separate short page-state critical section. Allocate
+   `frozen_ts` after the last page is frozen and install the canonical batch.
+   Repeated freeze returns the same fence and batch summary without extending
+   the prefix.
 2. Select the purge-published GC horizon as the exclusive checkpoint cutoff.
 3. Validate each unchecked page by walking row undo chains under page-state
    write locks. Leading `Lock` and `Delete` entries are traced to the first
@@ -137,9 +143,10 @@ Each RowPage moves through:
 4. Cache each unblocked page's required cutoff. If any page is unresolved or
    requires a newer cutoff, return a normal frozen-page cutoff delay without
    moving pages to `TRANSITION`.
-5. Move the whole validated batch to `TRANSITION` while the page-state locks
-   remain held, then capture future/uncommitted lock-delete overlay state in the
-   `ColumnDeletionBuffer`.
+5. While the validated page-state locks remain held, acquire lifecycle publish
+   admission and record the workflow's irreversible owner. Only then move the
+   whole batch to `TRANSITION` and capture future/uncommitted lock-delete
+   overlay state in the `ColumnDeletionBuffer`.
 6. Build LWC blocks from the checked committed-visible transition view.
 7. Insert matching `ColumnBlockIndex` entries.
 8. Build companion secondary-index entries from the same committed visible rows
@@ -204,6 +211,13 @@ When no checkpointed silent row exists, the table-root bounds are used
 unchanged. If a checkpoint also publishes real table-file state, the replay
 bounds remain part of the user-table root publication.
 
+Silent-watermark DML, deletion-only/root-only publication, and row-page
+transition all use the same lifecycle publish/drop gate. A no-transition
+attempt records the reversible `Publishing` workflow phase before catalog DML
+or root publication and retains publish admission through commit. A frozen
+checkpoint acquires the lease before the first page enters `TRANSITION` and
+retains it through route installation and commit.
+
 Before any user-table checkpoint publication, the active table-file root's
 runtime effective timestamp must be older than the GC horizon:
 
@@ -212,13 +226,17 @@ $$ \text{active\_root.effective\_ts} < \text{Global\_Min\_Active\_STS} $$
 The effective timestamp is allocated after the table-root pointer swap, so it
 captures the moment the newly published root can be observed by later
 transactions. If a long-running transaction pins the horizon at or below the
-active root effective timestamp, checkpoint returns an active-root delayed
+active root effective timestamp, the definitive checkpoint attempt returns an active-root delayed
 outcome. Frozen-page validation can separately return a cutoff delay with the
 page, selected cutoff, required cutoff when known, stable-prefix count, and
 unresolved-status flag. Either delay leaves pages out of transition and does not
 apply cold-delete checkpoint state, publish secondary `DiskTree` roots, rebuild
-allocation state, or swap the table-file root. Schedulers should retain the
-batch and treat either delay as backoff pressure rather than storage failure.
+allocation state, or swap the table-file root. The table retains the canonical
+batch and its validation cache; schedulers retry `checkpoint_table` and treat
+either delay as backoff pressure rather than storage failure. The active-root
+check runs once while the checkpoint owns root-mutation exclusion and before it
+forks the mutable table-file root; there is no separate public readiness
+preflight.
 
 When the effective-timestamp gate passes, checkpoint may rebuild the mutable
 root's allocation map from the current active root and the mutable root that
@@ -287,6 +305,11 @@ conditions are true:
 - the file name decodes to a low-half user table id
 - the id is below checkpointed `next_table_id`
 - the id is absent from the checkpointed catalog table list
+
+Freeze/checkpoint workflow state is not durable. Every recovered live user
+table starts with an idle workflow and no canonical batch. Recovery replay of a
+committed drop explicitly closes that idle workflow before consuming the
+runtime.
 
 This cleanup is safe because catalog absence is already durable in
 `catalog.mtb`.
@@ -387,6 +410,14 @@ $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
 
 Foreground `DROP TABLE` commits the catalog deletion and removes the runtime
 handle from the catalog cache. The removed runtime is handed to transaction GC.
+
+After logical DDL locks are held, drop synchronously changes the terminal table
+lifecycle, closes new publish admission, and closes the table checkpoint
+workflow. It discards a frozen or reversible batch without waiting. Drop waits
+asynchronously only when a checkpoint already won publish admission; that
+publisher retains ownership through route/root publication and commit. Once
+the terminal gate is crossed, abandonment of the drop future poisons storage
+instead of reopening the runtime.
 
 Cleanup proceeds in two gates:
 

@@ -15,9 +15,7 @@ use crate::stats::{
     BufferPoolStats, StorageIoStats, TransactionSystemStats, buffer_pool_runtime_stats_snapshot,
     storage_io_stats_snapshot, transaction_system_stats_snapshot,
 };
-use crate::table::{
-    CheckpointOutcome, CheckpointReadiness, FrozenPageBatch, SecondaryMemIndexCleanupStats, Table,
-};
+use crate::table::{CheckpointOutcome, FreezeOutcome, SecondaryMemIndexCleanupStats, Table};
 use crate::trx::{
     StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
     transaction_discarded_err,
@@ -372,52 +370,26 @@ impl Session {
         })
     }
 
-    /// Freeze a row-page prefix for an existing user table and return its retryable batch.
+    /// Freeze a row-page prefix or report the existing table-owned batch.
     #[inline]
     pub async fn freeze_table(
-        &self,
+        &mut self,
         table_id: TableID,
         max_rows: usize,
-    ) -> Result<FrozenPageBatch> {
+    ) -> Result<FreezeOutcome> {
         let session = self.pin("freeze table")?;
         let table = session.resolve_user_table(table_id, "freeze table").await?;
         table.freeze(&session, max_rows).await
     }
 
-    /// Report whether an existing user table checkpoint can safely publish now.
-    #[inline]
-    pub fn table_checkpoint_readiness(&self, table_id: TableID) -> Result<CheckpointReadiness> {
-        let session = self.pin("check checkpoint readiness")?;
-        let Some(table) = session.find_existing_user_table_now(table_id) else {
-            return Ok(CheckpointReadiness::TableNotFound);
-        };
-        table.checkpoint_readiness(&session)
-    }
-
-    /// Persist eligible state using a compatibility batch rebuilt from the frozen prefix.
-    ///
-    /// Call [`Session::checkpoint_frozen_pages`] to retain validation state
-    /// across delayed attempts.
+    /// Persist eligible state using the table-owned canonical frozen batch.
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
         let session = self.pin("checkpoint table")?;
         let table = session
             .resolve_existing_user_table(table_id, "checkpoint table")
             .await?;
-        table.checkpoint_existing_frozen(session).await
-    }
-
-    /// Persist one explicit frozen-page batch plus eligible cold-delete state.
-    #[inline]
-    pub async fn checkpoint_frozen_pages(
-        &mut self,
-        batch: &mut FrozenPageBatch,
-    ) -> Result<CheckpointOutcome> {
-        let session = self.pin("checkpoint frozen pages")?;
-        let table = session
-            .resolve_existing_user_table(batch.table_id(), "checkpoint frozen pages")
-            .await?;
-        table.checkpoint(session, batch).await
+        table.checkpoint(session).await
     }
 
     /// Returns total number of hot row pages for an existing user table.
@@ -556,17 +528,6 @@ impl SessionPin {
             .ok_or_else(|| table_not_found_error(table_id, operation))?;
         self.state.cache_user_table(&table);
         Ok(table)
-    }
-
-    /// Finds an existing user table from cache or currently loaded catalog state.
-    #[inline]
-    pub(crate) fn find_existing_user_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
-        if let Some(table) = self.state.cached_user_table(table_id) {
-            return Some(table);
-        }
-        let table = self.engine.catalog().get_table_now(table_id)?;
-        self.state.cache_user_table(&table);
-        Some(table)
     }
 
     /// Acquires an explicit session-lifetime table lock from this pinned session.
@@ -758,6 +719,13 @@ impl SessionRegistry {
     #[inline]
     pub(crate) fn wait_for_trx_change_since(&self, observed_epoch: u64) {
         self.trx_changes.wait_since(observed_epoch);
+    }
+
+    /// Wait asynchronously for a transaction lifecycle change in tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) async fn wait_for_trx_change_since_async(&self, observed_epoch: u64) {
+        self.trx_changes.wait_since_async(observed_epoch).await;
     }
 
     /// Remove idle and abandoned-idle sessions during engine shutdown.
@@ -1302,7 +1270,7 @@ pub(crate) mod tests {
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
     use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
-    use crate::table::tests::FailingFirstWriteHook;
+    use crate::table::tests::{FailingFirstWriteHook, assert_freeze_created};
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
     };
@@ -1785,7 +1753,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
 
             let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1855,7 +1823,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -1997,7 +1965,7 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
             session.checkpoint_catalog().await.unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
 
             let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -2069,7 +2037,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -2355,7 +2323,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -2425,7 +2393,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 

@@ -45,6 +45,38 @@ impl CreateTablePhase {
     }
 }
 
+struct DropTableProgressGuard {
+    engine: EngineRef,
+    table_id: TableID,
+    armed: bool,
+}
+
+impl DropTableProgressGuard {
+    #[inline]
+    fn new(engine: EngineRef, table_id: TableID) -> Self {
+        Self {
+            engine,
+            table_id,
+            armed: true,
+        }
+    }
+
+    #[inline]
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DropTableProgressGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            let _ =
+                poison_drop_table_after_gate(&self.engine, self.table_id, "drop future abandoned");
+        }
+    }
+}
+
 struct CreateTableProgress {
     table_id: TableID,
     phase: CreateTablePhase,
@@ -179,6 +211,7 @@ impl CreateTableProgress {
                 Arc::strong_count(&table)
             ))
         })?;
+        table.close_checkpoint_workflow_offline();
         table.destroy_dropped_runtime(guards).await
     }
 
@@ -1210,10 +1243,15 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
 
     let mut trx = session.begin_trx("begin transaction")?;
 
-    if let Err(err) = table.begin_drop_lifecycle().await {
-        trx.rollback().await?;
-        return Err(err);
-    }
+    let drain = match table.start_drop_lifecycle() {
+        Ok(drain) => drain,
+        Err(err) => {
+            trx.rollback().await?;
+            return Err(err);
+        }
+    };
+    let mut drop_progress = DropTableProgressGuard::new(engine.clone(), table_id);
+    drain.wait().await;
     table_locks.fail_waiters_on_release(OperationError::TableDropping);
 
     let metadata = table.metadata().clone();
@@ -1245,6 +1283,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         .catalog()
         .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
     finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)?;
+    drop_progress.disarm();
     table_locks.fail_waiters_on_release(OperationError::TableNotFound);
     // Foreground DROP TABLE stops at logical removal. The catalog map retains
     // the dropped runtime and replay floor until purge and catalog checkpoint
@@ -1603,7 +1642,7 @@ fn poison_drop_table_after_gate(
     table_id: TableID,
     operation: &'static str,
 ) -> Report<FatalError> {
-    // Once `begin_drop_lifecycle` succeeds, the table's checkpoint publish gate
+    // Once terminal drop admission succeeds, the table's checkpoint publish gate
     // is closed and the operation cannot be safely retried as an ordinary DDL
     // failure. Poison admission so future work sees the fatal state; explicit
     // engine shutdown remains responsible for stopping background workers.
@@ -1696,7 +1735,7 @@ mod tests {
     use crate::lock::{LockMode, LockOwner, LockOwnerGroup, LockResource};
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
-    use crate::table::TableLifecycleState;
+    use crate::table::TableTerminal;
     use crate::table::tests::*;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests as trx_tests;
@@ -3084,17 +3123,18 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             table_for_internal_assertion(&engine, table_id)
-                .begin_drop_lifecycle()
-                .await
-                .unwrap();
+                .start_drop_lifecycle()
+                .unwrap()
+                .wait()
+                .await;
 
             let err = session.drop_table(table_id).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
             assert_eq!(
                 table_for_internal_assertion(&engine, table_id)
                     .lifecycle
-                    .state(),
-                TableLifecycleState::Dropping
+                    .inspect_terminal(),
+                TableTerminal::Dropping
             );
             assert!(!session.in_trx().unwrap());
             assert!(engine.inner().trx_sys.poison_error().is_none());
@@ -3169,8 +3209,8 @@ mod tests {
             assert_eq!(
                 table_for_internal_assertion(&engine, table_id)
                     .lifecycle
-                    .state(),
-                TableLifecycleState::Live
+                    .inspect_terminal(),
+                TableTerminal::Live
             );
             assert!(!drop_session.in_trx().unwrap());
             assert!(engine.inner().trx_sys.poison_error().is_none());
@@ -3198,8 +3238,8 @@ mod tests {
                 assert_eq!(
                     table_for_internal_assertion(&engine, table_id)
                         .lifecycle
-                        .state(),
-                    TableLifecycleState::Live
+                        .inspect_terminal(),
+                    TableTerminal::Live
                 );
                 assert!(engine.catalog().get_table(table_id).await.is_some());
                 assert!(!has_lock_resource(
@@ -3245,8 +3285,7 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
-            let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
-            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
             let mut drop_session = engine.new_session().unwrap();
             let drop_owner = LockOwner::Session(drop_session.id());
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
@@ -3292,14 +3331,47 @@ mod tests {
     }
 
     #[test]
+    fn test_abandoned_drop_future_after_terminal_gate_poisons_storage() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
+            let mut drop_session = engine.new_session().unwrap();
+            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+            assert_checkpoint_workflow_closed(&table);
+
+            drop(drop_fut);
+            let poison = engine
+                .inner()
+                .trx_sys
+                .poison_error()
+                .expect("abandoned terminal drop should poison storage");
+            assert_eq!(*poison.current_context(), FatalError::Poisoned);
+
+            drop(publish_lease);
+            drop(root_lease);
+            drop(table);
+            drop(drop_session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
     fn test_drop_table_fails_waiting_transaction_table_lock() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
-            let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
-            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
             let mut drop_session = engine.new_session().unwrap();
             let drop_owner = LockOwner::Session(drop_session.id());
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
@@ -3675,8 +3747,7 @@ mod tests {
             corrupt_trx.commit().await.unwrap();
 
             let table = table_for_internal_assertion(&engine, table_id);
-            let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
-            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
             let mut drop_session = engine.new_session().unwrap();
             let drop_owner = LockOwner::Session(drop_session.id());
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));

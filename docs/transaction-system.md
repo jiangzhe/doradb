@@ -79,7 +79,16 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
     cold RowID in the deletion buffer, recording cold-delete undo/redo,
     masking old secondary-index entries, and inserting the modified values as a
     new hot RowStore row.
-- **Tuple Mover**: A background thread responsible for converting frozen RowStore pages into ColumnStore blocks and advancing the `Pivot_RowID`.
+- **Tuple Mover**: Maintenance converts frozen RowStore pages into ColumnStore
+  blocks and advances the `Pivot_RowID`. Each table owns one volatile
+  freeze/checkpoint workflow and canonical frozen batch. Asynchronous freeze
+  loading leaves foreground reads and writes unchanged; the final freeze
+  publication takes one short page-state write lock at a time. Repeated freeze
+  returns the original fence rather than extending the prefix. Checkpoint
+  validates and caches that batch, acquires publish/drop admission before page
+  transition, and retains admission through route/root publication and commit.
+  This workflow is maintenance-only: foreground statements, transactions, row
+  writes, and scans do not acquire or inspect its mutex.
 
 ## Index Structure
 

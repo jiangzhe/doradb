@@ -472,7 +472,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(2i32);
@@ -535,17 +535,14 @@ mod tests {
             insert_rows(table_id, &mut session, 0, 10, "name").await;
 
             let key = single_key(3i32);
-            let mut batch = session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             wait_gc_cutoff_after(&session, session.last_cts()).await;
             let mut trx_delete = session.begin_trx().unwrap();
             let res = trx_delete_row_by_id(&mut trx_delete, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
 
             let mut checkpoint_session = engine.new_session().unwrap();
-            let outcome = checkpoint_session
-                .checkpoint_frozen_pages(&mut batch)
-                .await
-                .unwrap();
+            let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
 
             let mut reader_session = engine.new_session().unwrap();

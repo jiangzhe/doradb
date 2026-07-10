@@ -185,6 +185,15 @@ state, or a combination of those changes:
 Secondary-index `DiskTree` updates are companion work of those checkpoints, not
 an independent third checkpoint stream.
 
+The table's volatile checkpoint workflow owns the canonical frozen-page batch
+and original fence. Lifecycle publish admission is acquired before the first
+row page enters `TRANSITION`, and is retained through root publication, runtime
+route installation, old-root retention, and checkpoint transaction commit.
+Deletion-only/root-only and silent-watermark attempts use the same gate through
+their irreversible publication or commit handoff. Consequently `DROP TABLE`
+either closes a reversible workflow immediately or asynchronously drains the
+publisher that already won admission.
+
 ### 7.1 Data Checkpoint Publication
 
 Data checkpoint publishes:
@@ -235,13 +244,13 @@ returns a normal delayed outcome and does not move frozen pages into transition,
 publish DiskTree roots, advance delete metadata, rebuild allocation state, or
 swap the table-file root.
 
-The check is repeated against the mutable root snapshot that will be published
-from, so a scheduler preflight cannot race with the root actually displaced by
-the A/B super-block swap. Once the active root crosses the horizon, checkpoint
-may rebuild the mutable root's allocation map from only two protected roots:
-the current active root and the mutable root about to be published. This
-reclaims obsolete CoW blocks and dropped secondary-index `DiskTree` pages
-without a foreground vacuum command.
+The definitive check runs once while checkpoint owns table-root mutation
+exclusion and before `MutableTableFile::fork()`. There is no standalone public
+readiness observation that can race with checkpoint execution. Once the active
+root crosses the horizon, checkpoint may rebuild the mutable root's allocation
+map from only two protected roots: the current active root and the mutable root
+about to be published. This reclaims obsolete CoW blocks and dropped
+secondary-index `DiskTree` pages without a foreground vacuum command.
 
 Catalog checkpoints do not use the user-table two-root retention rule.
 Foreground catalog reads use in-memory catalog tables, and `catalog.mtb` is
@@ -280,6 +289,10 @@ On restart, the table file supplies:
 - checkpointed block-index state
 - checkpointed persistent delete state
 - checkpointed secondary-index `DiskTree` roots
+
+The freeze/checkpoint workflow is volatile rather than part of the table-file
+root. A loaded live table initializes it as idle with no frozen batch. Recovery
+drop replay closes the idle workflow before destroying the offline runtime.
 
 Redo recovery then rebuilds only the missing hot state:
 

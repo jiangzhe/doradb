@@ -1137,6 +1137,7 @@ pub(crate) mod tests {
     use crate::id::BlockID;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::log::redo::DDLRedo;
+    use crate::table::tests::assert_freeze_created;
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
@@ -2065,10 +2066,12 @@ pub(crate) mod tests {
                 .get_table(replay_only_table_id)
                 .await
                 .unwrap();
-            session
-                .freeze_table(checkpointed_table.table_id(), usize::MAX)
-                .await
-                .unwrap();
+            assert_freeze_created(
+                session
+                    .freeze_table(checkpointed_table.table_id(), usize::MAX)
+                    .await
+                    .unwrap(),
+            );
             let mut checkpoint_session = engine.new_session().unwrap();
             let checkpoint_outcome = checkpoint_session
                 .checkpoint_table(checkpointed_table.table_id())

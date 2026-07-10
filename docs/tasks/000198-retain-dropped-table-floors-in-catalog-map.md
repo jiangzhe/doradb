@@ -143,7 +143,7 @@ DroppedFloor {
    - `Session::list_table_ids` should keep its public shape but inherit the live
      filtering.
    - Existing cached stale `Arc<Table>` handles should continue to fail through
-     `TableLifecycleState::Dropping` or `Dropped` checks.
+     `TableTerminal::Dropping` or `Dropped` checks.
    - `TableCache` and rollback/purge helpers that require live user tables
      should keep using live lookup unless a specific cleanup path needs a new
      dropped-entry helper.
