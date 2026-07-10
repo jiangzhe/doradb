@@ -3945,7 +3945,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "first").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let captured_pivot = table.file().active_root_unchecked().pivot_row_id;

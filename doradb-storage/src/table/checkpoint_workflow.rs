@@ -2,6 +2,7 @@ use super::CheckpointCancelReason;
 use super::lifecycle::{CheckpointPublishLease, TableLifecycle, TableTerminal};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use parking_lot::Mutex;
+use std::mem::replace;
 use std::result::Result as StdResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +114,7 @@ impl FrozenPageBatchInfo {
 }
 
 /// Result of attempting to freeze one table's hot row-page prefix.
+#[must_use = "freeze outcome must be checked for cancellation or an existing frozen batch"]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FreezeOutcome {
     /// This call created and installed the table's canonical frozen batch.
@@ -208,7 +210,7 @@ impl TableCheckpointWorkflow {
             }
             TableCheckpointWorkflowState::Frozen(_) => {
                 let TableCheckpointWorkflowState::Frozen(batch) =
-                    std::mem::replace(&mut *state, TableCheckpointWorkflowState::Idle)
+                    replace(&mut *state, TableCheckpointWorkflowState::Idle)
                 else {
                     unreachable!("frozen workflow state changed while locked")
                 };
@@ -571,5 +573,55 @@ mod tests {
                 reason: CheckpointCancelReason::TableDropping,
             }
         );
+    }
+
+    #[test]
+    fn test_publish_states_reject_concurrent_freeze_and_checkpoint() {
+        fn assert_checkpoint_conflicts(
+            workflow: &TableCheckpointWorkflow,
+            lifecycle: &TableLifecycle,
+        ) {
+            assert_eq!(
+                workflow.begin_checkpoint(lifecycle).err().unwrap(),
+                CheckpointCancelReason::CheckpointInProgress
+            );
+            assert_eq!(
+                workflow.begin_freeze(lifecycle).err().unwrap(),
+                FreezeOutcome::Cancelled {
+                    reason: CheckpointCancelReason::CheckpointInProgress,
+                }
+            );
+        }
+
+        let lifecycle = TableLifecycle::new();
+        let workflow = TableCheckpointWorkflow::new();
+
+        let publishing_attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
+        let publishing_root = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+        let publishing_lease = workflow
+            .try_begin_publishing(&lifecycle, publishing_attempt.source())
+            .unwrap();
+        assert_eq!(workflow.state_name(), "Publishing");
+        assert_checkpoint_conflicts(&workflow, &lifecycle);
+        workflow.finish_publication();
+        drop(publishing_lease);
+        drop(publishing_root);
+        drop(publishing_attempt);
+
+        let freeze = workflow.begin_freeze(&lifecycle).unwrap();
+        assert!(matches!(
+            freeze.finish(one_page_batch(TrxID::new(102)), &lifecycle),
+            FreezeOutcome::Frozen { .. }
+        ));
+        let transition_attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
+        let transition_root = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+        let transition_lease = workflow.try_begin_transition(&lifecycle).unwrap();
+        assert_eq!(workflow.state_name(), "Transition");
+        assert_checkpoint_conflicts(&workflow, &lifecycle);
+        workflow.finish_publication();
+        drop(transition_lease);
+        drop(transition_root);
+        drop(transition_attempt);
+        assert_eq!(workflow.state_name(), "Idle");
     }
 }

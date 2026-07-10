@@ -1502,6 +1502,7 @@ mod tests {
     use crate::session::Session;
     use crate::session::tests::SessionTestExt;
     use crate::table::CheckpointOutcome;
+    use crate::table::tests::assert_freeze_created;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use smol::Timer;
@@ -1764,10 +1765,12 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
             insert_rows(&table, &mut session, 10, 8, "cold").await;
-            session
-                .freeze_table(table.table_id(), usize::MAX)
-                .await
-                .unwrap();
+            assert_freeze_created(
+                session
+                    .freeze_table(table.table_id(), usize::MAX)
+                    .await
+                    .unwrap(),
+            );
             checkpoint_published(&table, &mut session).await;
 
             let index_no = session
@@ -1907,10 +1910,12 @@ mod tests {
             let row1 =
                 insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("dup")]).await;
             insert_one_row(&table, &mut session, vec![Val::from(2), Val::from("dup")]).await;
-            session
-                .freeze_table(table.table_id(), usize::MAX)
-                .await
-                .unwrap();
+            assert_freeze_created(
+                session
+                    .freeze_table(table.table_id(), usize::MAX)
+                    .await
+                    .unwrap(),
+            );
             checkpoint_published(&table, &mut session).await;
             delete_one_row(&table, &mut session, &single_key(2)).await;
 
@@ -1972,10 +1977,12 @@ mod tests {
                 vec![Val::from(1), Val::from("persisted")],
             )
             .await;
-            session
-                .freeze_table(table.table_id(), usize::MAX)
-                .await
-                .unwrap();
+            assert_freeze_created(
+                session
+                    .freeze_table(table.table_id(), usize::MAX)
+                    .await
+                    .unwrap(),
+            );
             checkpoint_published(&table, &mut session).await;
             assert_eq!(
                 session

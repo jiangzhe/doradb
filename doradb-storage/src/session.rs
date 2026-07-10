@@ -721,6 +721,13 @@ impl SessionRegistry {
         self.trx_changes.wait_since(observed_epoch);
     }
 
+    /// Wait asynchronously for a transaction lifecycle change in tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) async fn wait_for_trx_change_since_async(&self, observed_epoch: u64) {
+        self.trx_changes.wait_since_async(observed_epoch).await;
+    }
+
     /// Remove idle and abandoned-idle sessions during engine shutdown.
     #[inline]
     pub(crate) fn shutdown_idle(&self) {
@@ -1263,7 +1270,7 @@ pub(crate) mod tests {
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
     use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
-    use crate::table::tests::FailingFirstWriteHook;
+    use crate::table::tests::{FailingFirstWriteHook, assert_freeze_created};
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
     };
@@ -1746,7 +1753,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
 
             let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1816,7 +1823,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -1958,7 +1965,7 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
             session.checkpoint_catalog().await.unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
 
             let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -2030,7 +2037,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -2316,7 +2323,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -2386,7 +2393,7 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 

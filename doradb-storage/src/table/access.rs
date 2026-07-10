@@ -3582,7 +3582,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -3617,7 +3617,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -3661,7 +3661,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -3709,7 +3709,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -3752,7 +3752,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -3797,7 +3797,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -3842,7 +3842,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -3887,7 +3887,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(4i32);
@@ -3925,7 +3925,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(5i32);
@@ -3969,7 +3969,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(5i32);
@@ -4015,7 +4015,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -4114,7 +4114,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(5i32);
@@ -4170,7 +4170,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let old_key = single_key(2i32);
@@ -4256,7 +4256,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(1i32);
@@ -4312,7 +4312,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let old_key = single_key(1i32);
@@ -4373,7 +4373,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let old_key = single_key(1i32);
@@ -4460,7 +4460,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let old_key = single_key(1i32);
@@ -4567,7 +4567,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let old_key = single_key(1i32);
@@ -5295,7 +5295,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 5, "cold").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let mut trx = session.begin_trx().unwrap();
@@ -5325,7 +5325,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 5, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let mut old_reader_session = engine.new_session().unwrap();
@@ -5358,7 +5358,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 3, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let mut old_reader_session = engine.new_session().unwrap();
@@ -5407,7 +5407,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let mut writer = session.begin_trx().unwrap();
@@ -5436,7 +5436,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 6, "name").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let key = single_key(4i32);
@@ -5476,7 +5476,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 5, "cold").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
             insert_rows(table_id, &mut session, 100, 2, "hot").await;
 
@@ -5517,7 +5517,7 @@ mod tests {
             }
             let row_pages = session1.total_row_pages(table_id).await.unwrap();
             assert!(row_pages == 1);
-            session1.freeze_table(table_id, 10).await.unwrap();
+            assert_freeze_created(session1.freeze_table(table_id, 10).await.unwrap());
             // after freezing, new row should be inserted into second page.
             {
                 let trx = session1.begin_trx().unwrap();
@@ -5587,7 +5587,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 1, "lock").await;
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
 
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
@@ -5792,7 +5792,7 @@ mod tests {
             assert_eq!(cached_row_id, row_id);
             session.save_active_insert_page(table_id, cached_page, cached_row_id);
 
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(table_id, &mut checkpoint_session).await;
 
@@ -5862,7 +5862,7 @@ mod tests {
             let (stale_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
             assert_eq!(cached_row_id, stale_row_id);
 
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(table_id, &mut checkpoint_session).await;
 
@@ -6401,7 +6401,7 @@ mod tests {
             assert!(res.is_ok());
             insert.commit().await.unwrap();
 
-            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_published(table_id, &mut session).await;
 
             let table = table_for_internal_assertion(&engine, table_id);

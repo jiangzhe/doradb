@@ -595,6 +595,8 @@ impl Table {
                 self.table_id(),
                 page_info.page_id
             );
+            #[cfg(test)]
+            test_hooks::run_test_freeze_page_state_locked_hook(page_info.page_id);
             *state = RowPageState::Frozen;
         }
         true
@@ -1645,8 +1647,8 @@ pub(crate) mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::{
-        CheckpointOutcome, CheckpointPublishLease, DeleteMarker, Table,
-        TableCheckpointRootMutationLease, TableRuntimeLayout,
+        CheckpointOutcome, CheckpointPublishLease, DeleteMarker, FreezeOutcome,
+        FrozenPageBatchInfo, Table, TableCheckpointRootMutationLease, TableRuntimeLayout,
     };
     use crate::trx::Transaction;
     use crate::trx::stmt::Statement;
@@ -1661,18 +1663,76 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     pub(crate) mod test_hooks {
-        use std::cell::Cell;
+        use crate::id::PageID;
+        use std::cell::{Cell, RefCell};
+
+        type FreezePageHook = Box<dyn FnOnce(PageID) + 'static>;
+        type HotRowWriteHook = Box<dyn FnOnce() + 'static>;
 
         thread_local! {
             static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+            static TEST_FREEZE_PAGE_STATE_LOCKED_HOOK: RefCell<Option<FreezePageHook>> =
+                const { RefCell::new(None) };
+            static TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK: RefCell<Option<HotRowWriteHook>> =
+                const { RefCell::new(None) };
         }
 
         pub(crate) fn set_test_force_lwc_build_error(enabled: bool) {
             TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
         }
 
+        pub(crate) struct ForceLwcBuildErrorGuard;
+
+        impl ForceLwcBuildErrorGuard {
+            pub(crate) fn new() -> Self {
+                set_test_force_lwc_build_error(true);
+                Self
+            }
+        }
+
+        impl Drop for ForceLwcBuildErrorGuard {
+            fn drop(&mut self) {
+                set_test_force_lwc_build_error(false);
+            }
+        }
+
         pub(crate) fn test_force_lwc_build_error_enabled() -> bool {
             TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get())
+        }
+
+        pub(crate) fn set_test_freeze_page_state_locked_hook<F>(hook: F)
+        where
+            F: FnOnce(PageID) + 'static,
+        {
+            TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "freeze page-state hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_freeze_page_state_locked_hook(page_id: PageID) {
+            let hook = TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn set_test_hot_row_write_before_state_lock_hook<F>(hook: F)
+        where
+            F: FnOnce() + 'static,
+        {
+            TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "hot-row state-lock hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_hot_row_write_before_state_lock_hook() {
+            let hook =
+                TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
         }
     }
 
@@ -1700,6 +1760,13 @@ pub(crate) mod tests {
 
     pub(crate) fn assert_checkpoint_workflow_closed(table: &Table) {
         table.checkpoint_workflow.assert_closed();
+    }
+
+    pub(crate) fn assert_freeze_created(outcome: FreezeOutcome) -> FrozenPageBatchInfo {
+        let FreezeOutcome::Frozen { batch } = outcome else {
+            panic!("freeze should create a new frozen batch, got {outcome:?}");
+        };
+        batch
     }
 
     pub(crate) fn assert_table_data_integrity(
