@@ -53,9 +53,9 @@ impl RowVersionMap {
         }
     }
 
-    /// Returns current row page state.
+    /// Inspects the current row page state.
     #[inline]
-    pub(crate) fn state(&self) -> RowPageState {
+    pub(crate) fn inspect_state(&self) -> RowPageState {
         *self.state.read()
     }
 
@@ -69,42 +69,6 @@ impl RowVersionMap {
     #[inline]
     pub(crate) fn write_state(&self) -> RwLockWriteGuard<'_, RowPageState> {
         self.state.write()
-    }
-
-    /// Returns whether this page is frozen.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by row-page state tests"))]
-    pub(crate) fn is_frozen(&self) -> bool {
-        matches!(
-            self.state(),
-            RowPageState::Frozen | RowPageState::Transition
-        )
-    }
-
-    /// Returns whether this page is in transition.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    pub(crate) fn is_transition(&self) -> bool {
-        self.state() == RowPageState::Transition
-    }
-
-    /// Freeze current row page.
-    #[inline]
-    pub(crate) fn set_frozen(&self) {
-        let mut state = self.state.write();
-        if *state == RowPageState::Active {
-            *state = RowPageState::Frozen;
-        }
-    }
-
-    /// Set current row page to transition.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by transition-path tests"))]
-    pub(crate) fn set_transition(&self) {
-        let mut state = self.state.write();
-        if *state == RowPageState::Frozen {
-            *state = RowPageState::Transition;
-        }
     }
 
     /// Set commit timestamp of page creation.
@@ -131,13 +95,6 @@ impl RowVersionMap {
     pub(crate) fn write_latch(&self, row_idx: usize) -> RowVersionWriteGuard<'_> {
         let g = self.entries[row_idx].write();
         RowVersionWriteGuard { g }
-    }
-
-    /// Acquire exclusive latch as self is exclusive.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    pub(crate) fn write_exclusive(&mut self, row_idx: usize) -> &mut Option<Box<RowUndoHead>> {
-        self.entries[row_idx].get_mut()
     }
 }
 
@@ -212,19 +169,13 @@ mod tests {
         )
         .expect("valid table metadata");
         let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
-        assert_eq!(map.state(), RowPageState::Active);
-        assert!(!map.is_frozen());
-        assert!(!map.is_transition());
+        assert_eq!(map.inspect_state(), RowPageState::Active);
 
-        map.set_frozen();
-        assert_eq!(map.state(), RowPageState::Frozen);
-        assert!(map.is_frozen());
-        assert!(!map.is_transition());
+        *map.write_state() = RowPageState::Frozen;
+        assert_eq!(map.inspect_state(), RowPageState::Frozen);
 
-        map.set_transition();
-        assert_eq!(map.state(), RowPageState::Transition);
-        assert!(map.is_frozen());
-        assert!(map.is_transition());
+        *map.write_state() = RowPageState::Transition;
+        assert_eq!(map.inspect_state(), RowPageState::Transition);
     }
 
     #[test]

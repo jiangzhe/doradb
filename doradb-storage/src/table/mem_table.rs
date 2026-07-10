@@ -2534,6 +2534,7 @@ mod tests {
     use crate::table::tests::*;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::ver_map::RowPageState;
     use crate::value::{Val, ValKind};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -3829,8 +3830,7 @@ mod tests {
                 .expect("inserted row page should validate");
             let (ctx, _) = page_guard.ctx_and_page();
             let row_ver = ctx.row_ver().unwrap();
-            row_ver.set_frozen();
-            row_ver.set_transition();
+            *row_ver.write_state() = RowPageState::Transition;
             drop(page_guard);
 
             let key = single_key(1i32);

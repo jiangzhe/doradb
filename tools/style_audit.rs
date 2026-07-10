@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
 syn = { version = "2", features = ["full", "visit"] }
 ---
 
 use proc_macro2::Span;
+use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -74,6 +76,17 @@ struct Args {
 struct TestImportCandidate {
     line: usize,
     names: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InherentImplContext {
+    self_ty: String,
+    display_name: String,
+    generic_params: String,
+    where_clause: Option<String>,
+    attrs: Vec<String>,
+    is_default: bool,
+    is_unsafe: bool,
 }
 
 #[derive(Debug, Default)]
@@ -148,7 +161,11 @@ impl QualifiedPathVisitor<'_> {
     }
 
     fn path_is_associated_type_rooted(&self, path: &SynPath) -> bool {
-        let Some(root) = path.segments.first().map(|segment| segment.ident.to_string()) else {
+        let Some(root) = path
+            .segments
+            .first()
+            .map(|segment| segment.ident.to_string())
+        else {
             return false;
         };
         root == "Self"
@@ -257,7 +274,10 @@ fn parse_args() -> Result<Args, String> {
                     return Err(format!("missing value for --diff-base\n{}", usage()));
                 };
                 if parsed.diff_base.replace(diff_base).is_some() {
-                    return Err(format!("--diff-base can only be provided once\n{}", usage()));
+                    return Err(format!(
+                        "--diff-base can only be provided once\n{}",
+                        usage()
+                    ));
                 }
             }
             "--help" | "-h" => {
@@ -817,12 +837,19 @@ fn check_impl_adjacency(path: &str, items: &[Item], out: &mut Vec<Violation>) {
         .iter()
         .filter_map(type_def_name)
         .collect::<BTreeSet<_>>();
-    let mut inherent_impls: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut inherent_impls: BTreeMap<InherentImplContext, Vec<usize>> = BTreeMap::new();
 
     for (idx, item) in items.iter().enumerate() {
         let Item::Impl(item_impl) = item else {
             continue;
         };
+        if item_impl.trait_.is_none() {
+            inherent_impls
+                .entry(inherent_impl_context(item_impl))
+                .or_default()
+                .push(span_line(item_impl.impl_token.span));
+        }
+
         let Some(self_name) = impl_self_name(item_impl) else {
             continue;
         };
@@ -843,16 +870,9 @@ fn check_impl_adjacency(path: &str, items: &[Item], out: &mut Vec<Violation>) {
                 format!("impl for `{self_name}` should directly follow its type definition"),
             ));
         }
-
-        if item_impl.trait_.is_none() {
-            inherent_impls
-                .entry(self_name)
-                .or_default()
-                .push(span_line(item_impl.impl_token.span));
-        }
     }
 
-    for (name, lines) in inherent_impls {
+    for (context, lines) in inherent_impls {
         if lines.len() > 1 {
             for line in lines.into_iter().skip(1) {
                 out.push(violation(
@@ -860,12 +880,39 @@ fn check_impl_adjacency(path: &str, items: &[Item], out: &mut Vec<Violation>) {
                     line,
                     "impl-merge",
                     format!(
-                        "multiple inherent impl blocks for `{name}`; merge them when cfg/generic bounds allow it"
+                        "multiple inherent impl blocks for `{}` have identical constraints; merge them",
+                        context.display_name
                     ),
                 ));
             }
         }
     }
+}
+
+fn inherent_impl_context(item_impl: &ItemImpl) -> InherentImplContext {
+    InherentImplContext {
+        self_ty: normalized_tokens(item_impl.self_ty.as_ref()),
+        display_name: impl_self_name(item_impl)
+            .unwrap_or_else(|| normalized_tokens(item_impl.self_ty.as_ref())),
+        generic_params: normalized_tokens(&item_impl.generics.params),
+        where_clause: item_impl
+            .generics
+            .where_clause
+            .as_ref()
+            .map(normalized_tokens),
+        attrs: item_impl
+            .attrs
+            .iter()
+            .filter(|attr| !is_doc_attr(attr))
+            .map(normalized_tokens)
+            .collect(),
+        is_default: item_impl.defaultness.is_some(),
+        is_unsafe: item_impl.unsafety.is_some(),
+    }
+}
+
+fn normalized_tokens<T: ToTokens + ?Sized>(value: &T) -> String {
+    value.to_token_stream().to_string()
 }
 
 fn check_visible_docs(path: &str, items: &[Item], lines: &[String], out: &mut Vec<Violation>) {

@@ -426,9 +426,10 @@ mod tests {
                 .get_table_now(table_id)
                 .expect("created table should still be loaded");
             table_for_internal_lifecycle
-                .begin_drop_lifecycle()
-                .await
-                .unwrap();
+                .start_drop_lifecycle()
+                .unwrap()
+                .wait()
+                .await;
 
             drop(table_for_internal_lifecycle);
             drop(session);

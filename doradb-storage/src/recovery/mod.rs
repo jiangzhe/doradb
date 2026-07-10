@@ -766,6 +766,7 @@ impl<'a> RecoveryCoordinator<'a> {
         // Recovery runs before normal runtime admission, so a committed DROP
         // should have the only remaining table runtime handle here. Destroy the
         // row/index runtime state immediately after logical removal.
+        table.close_checkpoint_workflow_offline();
         table
             .destroy_dropped_runtime(&self.resources.pool_guards)
             .await?;

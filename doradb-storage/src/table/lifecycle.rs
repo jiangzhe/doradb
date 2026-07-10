@@ -14,7 +14,7 @@ const METADATA_CHANGE_MASK: u32 = 0b11 << METADATA_CHANGE_SHIFT;
 const ROOT_MUTATION_ACTIVE_BIT: u32 = 1 << 6;
 const STATE_MASK: u32 =
     TERMINAL_MASK | PUBLISH_MASK | METADATA_CHANGE_MASK | ROOT_MUTATION_ACTIVE_BIT;
-const INITIAL_STATE: u32 = (TableLifecycleState::Live as u32)
+const INITIAL_STATE: u32 = (TableTerminal::Live as u32)
     | ((PublishGateState::Open as u32) << PUBLISH_SHIFT)
     | ((MetadataChangePhase::Open as u32) << METADATA_CHANGE_SHIFT);
 
@@ -27,14 +27,16 @@ pub enum CheckpointCancelReason {
     TableDropped,
     /// Checkpoint was excluded by an active table metadata change.
     TableMetadataChanging,
+    /// Freeze or checkpoint was excluded because another freeze is active.
+    FreezeInProgress,
     /// Checkpoint was excluded because another checkpoint is already active.
     CheckpointInProgress,
 }
 
-/// Volatile runtime lifecycle state for a user-table handle.
+/// Terminal liveness for a user-table runtime handle.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TableLifecycleState {
+pub(crate) enum TableTerminal {
     /// Foreground and checkpoint publication may proceed.
     Live = 0,
     /// Drop has crossed the irreversible runtime barrier.
@@ -61,9 +63,9 @@ enum MetadataChangePhase {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TableLifecycleInner {
+struct TableLifecycleState {
     /// Terminal liveness visible to foreground operations and DDL.
-    terminal: TableLifecycleState,
+    terminal: TableTerminal,
     /// Admission/drain state for checkpoint root publication.
     publish: PublishGateState,
     /// Future index-DDL gate state relative to checkpoint root mutation.
@@ -72,7 +74,7 @@ struct TableLifecycleInner {
     root_mutation_active: bool,
 }
 
-impl TableLifecycleInner {
+impl TableLifecycleState {
     #[inline]
     fn decode(raw: u32) -> Self {
         debug_assert_eq!(
@@ -81,9 +83,9 @@ impl TableLifecycleInner {
             "table lifecycle atomic state contains unknown bits: {raw:#x}"
         );
         let terminal = match raw & TERMINAL_MASK {
-            0 => TableLifecycleState::Live,
-            1 => TableLifecycleState::Dropping,
-            2 => TableLifecycleState::Dropped,
+            0 => TableTerminal::Live,
+            1 => TableTerminal::Dropping,
+            2 => TableTerminal::Dropped,
             _ => unreachable!("invalid table lifecycle terminal bits"),
         };
         let publish = match (raw & PUBLISH_MASK) >> PUBLISH_SHIFT {
@@ -131,24 +133,24 @@ impl TableLifecycleInner {
     #[inline]
     fn valid_publish_domain(&self) -> bool {
         match self.terminal {
-            TableLifecycleState::Live => {
+            TableTerminal::Live => {
                 matches!(
                     self.publish,
                     PublishGateState::Open | PublishGateState::Publishing
                 )
             }
-            TableLifecycleState::Dropping => matches!(
+            TableTerminal::Dropping => matches!(
                 self.publish,
                 PublishGateState::ClosingPublishing | PublishGateState::Closed
             ),
-            TableLifecycleState::Dropped => self.publish == PublishGateState::Closed,
+            TableTerminal::Dropped => self.publish == PublishGateState::Closed,
         }
     }
 
     #[inline]
     fn valid_metadata_root_domain(&self) -> bool {
         if self.metadata_change == MetadataChangePhase::Active {
-            self.terminal == TableLifecycleState::Live && !self.root_mutation_active
+            self.terminal == TableTerminal::Live && !self.root_mutation_active
         } else {
             true
         }
@@ -211,24 +213,24 @@ impl TableLifecycle {
     }
 
     #[inline]
-    fn load_state(&self, operation: &'static str) -> (u32, TableLifecycleInner) {
+    fn inspect_state(&self, operation: &'static str) -> (u32, TableLifecycleState) {
         let raw = self.state.load(Ordering::Acquire);
-        let state = TableLifecycleInner::decode(raw);
+        let state = TableLifecycleState::decode(raw);
         state.debug_assert_valid(operation);
         (raw, state)
     }
 
     #[inline]
-    fn compare_exchange_state(&self, current: u32, next: TableLifecycleInner) -> bool {
+    fn compare_exchange_state(&self, current: u32, next: TableLifecycleState) -> bool {
         self.state
             .compare_exchange(current, next.encode(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    /// Returns the current externally visible lifecycle state.
+    /// Returns the current externally visible terminal state.
     #[inline]
-    pub(crate) fn state(&self) -> TableLifecycleState {
-        let (_, state) = self.load_state("read state");
+    pub(crate) fn inspect_terminal(&self) -> TableTerminal {
+        let (_, state) = self.inspect_state("read terminal");
         state.terminal
     }
 
@@ -239,20 +241,21 @@ impl TableLifecycle {
         table_id: TableID,
         operation: &'static str,
     ) -> Result<()> {
-        match self.state() {
-            TableLifecycleState::Live => Ok(()),
+        match self.inspect_terminal() {
+            TableTerminal::Live => Ok(()),
             state => Err(foreground_not_live_err(table_id, operation, state)),
         }
     }
 
     /// Starts the irreversible drop gate after the caller has acquired DDL locks.
     ///
-    /// This marks the handle as dropping, closes new checkpoint publication
-    /// admission, and waits for any already-held publish lease to drain.
-    pub(crate) async fn begin_drop(&self, table_id: TableID) -> Result<()> {
+    /// This synchronously marks the handle as dropping and closes new checkpoint
+    /// publication admission. The returned token asynchronously drains only a
+    /// publish lease that was already admitted.
+    pub(crate) fn start_drop(&self, table_id: TableID) -> Result<TableDropDrain<'_>> {
         loop {
-            let (raw, state) = self.load_state("begin drop enter");
-            if state.terminal != TableLifecycleState::Live {
+            let (raw, state) = self.inspect_state("begin drop enter");
+            if state.terminal != TableTerminal::Live {
                 return Err(drop_not_live_err(table_id, "begin drop", state.terminal));
             }
             if state.metadata_change == MetadataChangePhase::Active {
@@ -260,7 +263,7 @@ impl TableLifecycle {
             }
 
             let mut next = state;
-            next.terminal = TableLifecycleState::Dropping;
+            next.terminal = TableTerminal::Dropping;
             let wait_for_publish = match state.publish {
                 PublishGateState::Open => {
                     next.publish = PublishGateState::Closed;
@@ -281,10 +284,10 @@ impl TableLifecycle {
 
             if self.compare_exchange_state(raw, next) {
                 self.changed.notify(usize::MAX);
-                if wait_for_publish {
-                    self.wait_for_publish_gate_closed().await;
-                }
-                return Ok(());
+                return Ok(TableDropDrain {
+                    lifecycle: self,
+                    wait_for_publish,
+                });
             }
         }
     }
@@ -293,8 +296,8 @@ impl TableLifecycle {
     #[inline]
     pub(crate) fn mark_dropped(&self, table_id: TableID) -> Result<()> {
         loop {
-            let (raw, state) = self.load_state("mark dropped enter");
-            if state.terminal != TableLifecycleState::Dropping {
+            let (raw, state) = self.inspect_state("mark dropped enter");
+            if state.terminal != TableTerminal::Dropping {
                 return Err(mark_dropped_err(table_id, state.terminal));
             }
             if state.publish != PublishGateState::Closed {
@@ -302,7 +305,7 @@ impl TableLifecycle {
             }
 
             let mut next = state;
-            next.terminal = TableLifecycleState::Dropped;
+            next.terminal = TableTerminal::Dropped;
             next.debug_assert_valid("mark dropped exit");
             if self.compare_exchange_state(raw, next) {
                 self.changed.notify(usize::MAX);
@@ -316,7 +319,7 @@ impl TableLifecycle {
         &self,
     ) -> StdResult<CheckpointPublishLease<'_>, CheckpointCancelReason> {
         loop {
-            let (raw, state) = self.load_state("begin checkpoint publish enter");
+            let (raw, state) = self.inspect_state("begin checkpoint publish enter");
             check_terminal_for_checkpoint(state.terminal)?;
             assert!(
                 state.root_mutation_active,
@@ -356,8 +359,8 @@ impl TableLifecycle {
         loop {
             let mut should_wait = true;
             {
-                let (raw, state) = self.load_state("begin metadata change enter");
-                if state.terminal != TableLifecycleState::Live {
+                let (raw, state) = self.inspect_state("begin metadata change enter");
+                if state.terminal != TableTerminal::Live {
                     return Err(drop_not_live_err(
                         table_id,
                         "begin metadata change",
@@ -409,8 +412,8 @@ impl TableLifecycle {
 
             listener!(self.changed => listener);
             {
-                let (_, state) = self.load_state("begin metadata change wait");
-                if state.terminal != TableLifecycleState::Live
+                let (_, state) = self.inspect_state("begin metadata change wait");
+                if state.terminal != TableTerminal::Live
                     || state.metadata_change == MetadataChangePhase::Open
                     || (state.metadata_change == MetadataChangePhase::Pending
                         && pending.is_some()
@@ -429,7 +432,7 @@ impl TableLifecycle {
         &self,
     ) -> StdResult<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
         loop {
-            let (raw, state) = self.load_state("begin checkpoint root mutation enter");
+            let (raw, state) = self.inspect_state("begin checkpoint root mutation enter");
             check_terminal_for_checkpoint(state.terminal)?;
             if state.metadata_change != MetadataChangePhase::Open {
                 return Err(CheckpointCancelReason::TableMetadataChanging);
@@ -450,14 +453,14 @@ impl TableLifecycle {
     async fn wait_for_publish_gate_closed(&self) {
         loop {
             {
-                let (_, state) = self.load_state("wait for publish gate closed check");
+                let (_, state) = self.inspect_state("wait for publish gate closed check");
                 if state.publish == PublishGateState::Closed {
                     break;
                 }
             }
             listener!(self.changed => listener);
             {
-                let (_, state) = self.load_state("wait for publish gate closed listen check");
+                let (_, state) = self.inspect_state("wait for publish gate closed listen check");
                 if state.publish == PublishGateState::Closed {
                     break;
                 }
@@ -469,7 +472,7 @@ impl TableLifecycle {
     #[inline]
     fn release_publish_lease(&self) {
         loop {
-            let (raw, state) = self.load_state("release checkpoint publish lease enter");
+            let (raw, state) = self.inspect_state("release checkpoint publish lease enter");
             // Normal checkpoint publication reopens the gate. If drop observed this
             // lease and moved the gate to ClosingPublishing, this release is the
             // handoff point that permanently closes the gate and wakes the dropper.
@@ -500,7 +503,7 @@ impl TableLifecycle {
     #[inline]
     fn release_metadata_change(&self) {
         loop {
-            let (raw, state) = self.load_state("release metadata change enter");
+            let (raw, state) = self.inspect_state("release metadata change enter");
             debug_assert_eq!(state.metadata_change, MetadataChangePhase::Active);
             if state.metadata_change != MetadataChangePhase::Active {
                 return;
@@ -518,7 +521,7 @@ impl TableLifecycle {
     #[inline]
     fn release_checkpoint_root_mutation(&self) {
         loop {
-            let (raw, state) = self.load_state("release checkpoint root mutation enter");
+            let (raw, state) = self.inspect_state("release checkpoint root mutation enter");
             debug_assert!(state.root_mutation_active);
             if !state.root_mutation_active {
                 return;
@@ -536,7 +539,7 @@ impl TableLifecycle {
     #[inline]
     fn release_pending_metadata_change(&self) {
         loop {
-            let (raw, state) = self.load_state("release pending metadata change enter");
+            let (raw, state) = self.inspect_state("release pending metadata change enter");
             if state.metadata_change != MetadataChangePhase::Pending {
                 return;
             }
@@ -547,6 +550,31 @@ impl TableLifecycle {
                 self.changed.notify(usize::MAX);
                 return;
             }
+        }
+    }
+}
+
+/// Asynchronous drain for a publisher admitted before terminal drop closure.
+pub(crate) struct TableDropDrain<'a> {
+    lifecycle: &'a TableLifecycle,
+    wait_for_publish: bool,
+}
+
+impl Debug for TableDropDrain<'_> {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("TableDropDrain")
+            .field("wait_for_publish", &self.wait_for_publish)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TableDropDrain<'_> {
+    /// Waits until the already-admitted checkpoint publisher releases its lease.
+    #[inline]
+    pub(crate) async fn wait(self) {
+        if self.wait_for_publish {
+            self.lifecycle.wait_for_publish_gate_closed().await;
         }
     }
 }
@@ -641,13 +669,11 @@ impl Drop for TableCheckpointRootMutationLease<'_> {
 }
 
 #[inline]
-fn check_terminal_for_checkpoint(
-    state: TableLifecycleState,
-) -> StdResult<(), CheckpointCancelReason> {
+fn check_terminal_for_checkpoint(state: TableTerminal) -> StdResult<(), CheckpointCancelReason> {
     match state {
-        TableLifecycleState::Live => Ok(()),
-        TableLifecycleState::Dropping => Err(CheckpointCancelReason::TableDropping),
-        TableLifecycleState::Dropped => Err(CheckpointCancelReason::TableDropped),
+        TableTerminal::Live => Ok(()),
+        TableTerminal::Dropping => Err(CheckpointCancelReason::TableDropping),
+        TableTerminal::Dropped => Err(CheckpointCancelReason::TableDropped),
     }
 }
 
@@ -655,12 +681,12 @@ fn check_terminal_for_checkpoint(
 fn foreground_not_live_err(
     table_id: TableID,
     operation: &'static str,
-    state: TableLifecycleState,
+    state: TableTerminal,
 ) -> Error {
     let reason = match state {
-        TableLifecycleState::Live => unreachable!("live table should not fail foreground check"),
-        TableLifecycleState::Dropping => OperationError::TableDropping,
-        TableLifecycleState::Dropped => OperationError::TableNotFound,
+        TableTerminal::Live => unreachable!("live table should not fail foreground check"),
+        TableTerminal::Dropping => OperationError::TableDropping,
+        TableTerminal::Dropped => OperationError::TableNotFound,
     };
     Report::new(reason)
         .attach(format!(
@@ -670,15 +696,11 @@ fn foreground_not_live_err(
 }
 
 #[inline]
-fn drop_not_live_err(
-    table_id: TableID,
-    operation: &'static str,
-    state: TableLifecycleState,
-) -> Error {
+fn drop_not_live_err(table_id: TableID, operation: &'static str, state: TableTerminal) -> Error {
     let reason = match state {
-        TableLifecycleState::Live => unreachable!("live table should not fail drop gate"),
-        TableLifecycleState::Dropping => OperationError::TableDropping,
-        TableLifecycleState::Dropped => OperationError::TableNotFound,
+        TableTerminal::Live => unreachable!("live table should not fail drop gate"),
+        TableTerminal::Dropping => OperationError::TableDropping,
+        TableTerminal::Dropped => OperationError::TableNotFound,
     };
     Report::new(reason)
         .attach(format!(
@@ -688,7 +710,7 @@ fn drop_not_live_err(
 }
 
 #[inline]
-fn mark_dropped_err(table_id: TableID, state: TableLifecycleState) -> Error {
+fn mark_dropped_err(table_id: TableID, state: TableTerminal) -> Error {
     Report::new(InternalError::Generic)
         .attach(format!(
             "mark dropped requires Dropping state: table_id={table_id}, lifecycle_state={state:?}"
@@ -719,8 +741,8 @@ mod tests {
     use super::*;
     use crate::id::TrxID;
     use crate::session::tests::SessionTestExt;
+    use crate::table::CheckpointOutcome;
     use crate::table::tests::*;
-    use crate::table::{CheckpointOutcome, CheckpointReadiness};
     use crate::value::Val;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -731,7 +753,7 @@ mod tests {
     fn test_lifecycle_foreground_errors_for_terminal_states() {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
-            lifecycle.begin_drop(TABLE_ID).await.unwrap();
+            lifecycle.start_drop(TABLE_ID).unwrap().wait().await;
 
             let err = lifecycle
                 .check_foreground_live(TABLE_ID, "scan")
@@ -752,13 +774,14 @@ mod tests {
             let lifecycle = Arc::new(TableLifecycle::new());
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
             let lease = lifecycle.try_begin_checkpoint_publish().unwrap();
-            let mut drop_fut = Box::pin(lifecycle.begin_drop(TABLE_ID));
+            let drain = lifecycle.start_drop(TABLE_ID).unwrap();
+            let mut drop_fut = Box::pin(drain.wait());
 
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert_eq!(lifecycle.state(), TableLifecycleState::Dropping);
+            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropping);
             match lifecycle.try_begin_checkpoint_publish() {
                 Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
@@ -771,8 +794,8 @@ mod tests {
             assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
 
             drop(lease);
-            drop_fut.await.unwrap();
-            assert_eq!(lifecycle.state(), TableLifecycleState::Dropping);
+            drop_fut.await;
+            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropping);
             drop(root_lease);
         });
     }
@@ -783,7 +806,8 @@ mod tests {
             let lifecycle = Arc::new(TableLifecycle::new());
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
             let publish_lease = lifecycle.try_begin_checkpoint_publish().unwrap();
-            let mut drop_fut = Box::pin(lifecycle.begin_drop(TABLE_ID));
+            let drain = lifecycle.start_drop(TABLE_ID).unwrap();
+            let mut drop_fut = Box::pin(drain.wait());
 
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
@@ -792,9 +816,9 @@ mod tests {
             assert!(lifecycle.mark_dropped(TABLE_ID).is_err());
 
             drop(publish_lease);
-            drop_fut.await.unwrap();
+            drop_fut.await;
             lifecycle.mark_dropped(TABLE_ID).unwrap();
-            assert_eq!(lifecycle.state(), TableLifecycleState::Dropped);
+            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropped);
             drop(root_lease);
         });
     }
@@ -812,12 +836,12 @@ mod tests {
             let lifecycle = TableLifecycle::new();
             let metadata_lease = lifecycle.begin_metadata_change(TABLE_ID).await.unwrap();
 
-            assert!(lifecycle.begin_drop(TABLE_ID).await.is_err());
-            assert_eq!(lifecycle.state(), TableLifecycleState::Live);
+            assert!(lifecycle.start_drop(TABLE_ID).is_err());
+            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Live);
 
             drop(metadata_lease);
-            lifecycle.begin_drop(TABLE_ID).await.unwrap();
-            assert_eq!(lifecycle.state(), TableLifecycleState::Dropping);
+            lifecycle.start_drop(TABLE_ID).unwrap().wait().await;
+            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropping);
         });
     }
 
@@ -825,14 +849,14 @@ mod tests {
     fn test_dropping_transition_has_no_live_restore_path() {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
-            lifecycle.begin_drop(TABLE_ID).await.unwrap();
-            assert_eq!(lifecycle.state(), TableLifecycleState::Dropping);
+            lifecycle.start_drop(TABLE_ID).unwrap().wait().await;
+            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
-            let err = lifecycle.begin_drop(TABLE_ID).await.unwrap_err();
+            let err = lifecycle.start_drop(TABLE_ID).unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
 
             lifecycle.mark_dropped(TABLE_ID).unwrap();
-            assert_eq!(lifecycle.state(), TableLifecycleState::Dropped);
+            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropped);
         });
     }
 
@@ -928,7 +952,7 @@ mod tests {
             .await;
 
             let table = table_for_internal_assertion(&engine, table_id);
-            table.begin_drop_lifecycle().await.unwrap();
+            table.start_drop_lifecycle().unwrap().wait().await;
 
             let mut read_trx = session.begin_trx().unwrap();
             let err = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &single_key(1), &[0, 1])
@@ -978,23 +1002,23 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
-            let _root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
-            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
-            let mut drop_fut = Box::pin(table.begin_drop_lifecycle());
+            let (_root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
+            let drain = table.start_drop_lifecycle().unwrap();
+            let mut drop_fut = Box::pin(drain.wait());
 
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert_eq!(table.lifecycle.state(), TableLifecycleState::Dropping);
-            match table.try_begin_checkpoint_publish() {
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+            match table.lifecycle.try_begin_checkpoint_publish() {
                 Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
             }
 
             drop(publish_lease);
-            drop_fut.await.unwrap();
-            assert_eq!(table.lifecycle.state(), TableLifecycleState::Dropping);
+            drop_fut.await;
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
         });
     }
 
@@ -1010,9 +1034,10 @@ mod tests {
 
             wait_checkpoint_ready(table_id, &session).await;
             table_for_internal_assertion(&engine, table_id)
-                .begin_drop_lifecycle()
-                .await
-                .unwrap();
+                .start_drop_lifecycle()
+                .unwrap()
+                .wait()
+                .await;
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert_eq!(
                 outcome,
@@ -1043,13 +1068,13 @@ mod tests {
             let reader = reader_session.begin_trx().unwrap();
             checkpoint_published(table_id, &mut session).await;
             assert!(matches!(
-                session.table_checkpoint_readiness(table_id).unwrap(),
-                CheckpointReadiness::Delayed { .. }
+                session.checkpoint_table(table_id).await.unwrap(),
+                CheckpointOutcome::Delayed { .. }
             ));
 
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
-            table.begin_drop_lifecycle().await.unwrap();
+            table.start_drop_lifecycle().unwrap().wait().await;
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert_eq!(
@@ -1075,7 +1100,7 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
 
-            table.begin_drop_lifecycle().await.unwrap();
+            table.start_drop_lifecycle().unwrap().wait().await;
             table.mark_dropped_lifecycle().unwrap();
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();

@@ -968,7 +968,7 @@ mod tests {
         assert!(matches!(res, InsertRow::Ok(id) if id == RowID::new(0)));
         assert!(matches!(page.delete(RowID::new(0)), Delete::Ok));
 
-        let mut map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
+        let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         let undo = OwnedRowUndo::new(
             TableID::new(0),
             Some(VersionedPageID {
@@ -989,7 +989,7 @@ mod tests {
             },
             purge_ts: MIN_SNAPSHOT_TS,
         };
-        *map.write_exclusive(0) = Some(Box::new(head));
+        *map.write_latch(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
         let view = page
@@ -1052,7 +1052,7 @@ mod tests {
             InsertRow::Ok(id) if id == RowID::new(0)
         ));
 
-        let mut map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
+        let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         let uncommitted_ts = MIN_ACTIVE_TRX_ID + 1;
         let undo = OwnedRowUndo::new(
             TableID::new(0),
@@ -1074,7 +1074,7 @@ mod tests {
             },
             purge_ts: MIN_SNAPSHOT_TS,
         };
-        *map.write_exclusive(0) = Some(Box::new(head));
+        *map.write_latch(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
         let Err(err) = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, TrxID::new(100))
