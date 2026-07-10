@@ -1,7 +1,7 @@
 ---
 id: 000218
 title: Unify table freeze and checkpoint workflow state
-status: proposal
+status: implemented
 created: 2026-07-10
 github_issue: 834
 ---
@@ -520,6 +520,37 @@ task.
 
 ## Implementation Notes
 
+- Implemented one volatile `TableCheckpointWorkflow` per user table. It owns the
+  canonical frozen-page batch, original fence, validation cache, and reversible
+  versus irreversible maintenance phase, while `TableLifecycle` remains the
+  authority for terminal state, metadata/root exclusion, and publish/drop
+  admission. Freeze publishes page state one page at a time, checkpoint attempt
+  guards restore reversible state, and drop closes the workflow before runtime
+  destruction while asynchronously draining only a publisher that already won
+  admission.
+- Replaced caller-owned freeze/checkpoint state with `FreezeOutcome` and
+  `FrozenPageBatchInfo`; `Session::freeze_table` now requires mutable session
+  ownership and `checkpoint_table` consumes the table-owned batch or runs the
+  idle checkpoint path. The explicit-batch checkpoint and standalone readiness
+  APIs were removed. Review hardening marked `FreezeOutcome` as `must_use` and
+  made test setup assert `Frozen`, with explicit `AlreadyFrozen` and
+  cancellation assertions where those outcomes are intentional.
+- Moved publish admission before page transition and retained it through root or
+  silent-watermark publication, route installation, and transaction commit.
+  Recovery initializes live workflow state as idle, and recovery/drop cleanup
+  explicitly closes offline runtimes before destruction. Living checkpoint,
+  transaction, and table-file documentation was synchronized with these
+  ownership and ordering contracts.
+- Dropped-runtime destruction now filters historical `RowPageIndex` entries
+  below the published pivot because purge may already have reclaimed those row
+  pages. This is a safety bridge rather than the planned long-term cleanup;
+  actual left-prefix index deletion before row-page deallocation is deferred to
+  backlog 000155.
+- Verification completed with branch-diff style audit over 22 Rust files,
+  `cargo fmt --all -- --check`, strict workspace clippy, 1323 workspace nextest
+  tests, and 1247 `libaio` nextest tests. Focused coverage across the nine
+  workflow, persistence, lifecycle, catalog, recovery, table, hot-row, and
+  session files was 93.88%, above the repository's 80% review bar.
 
 ## Impacts
 
@@ -641,9 +672,19 @@ task.
 
 ## Open Questions
 
-No design questions remain open for this task.
+No blocking design questions remain. The following improvements stay explicitly
+outside this task:
 
-`docs/backlogs/000151-optimize-frozen-page-checkpoint-transition-planning.md`
-remains the explicit follow-up for the existing batch-wide checkpoint validation
-lock duration, fused transition analysis, page-local irreversible transition,
-and measurement of foreground delete/update tail latency.
+- `docs/backlogs/000151-optimize-frozen-page-checkpoint-transition-planning.md`
+  tracks the existing batch-wide checkpoint validation lock duration, fused
+  transition analysis, page-local irreversible transition, and foreground
+  delete/update tail-latency measurement.
+- `docs/backlogs/000153-remove-obsolete-global-catalog-namespace-lock.md`
+  tracks removal of the coarse catalog namespace lock so a checkpoint drain for
+  one table does not delay unrelated-table DDL.
+- `docs/backlogs/000154-move-table-checkpoint-completion-to-no-wait-system-transactions.md`
+  tracks a checkpoint-specific no-wait system transaction while preserving
+  redo, silent-watermark, DROP ordering, and purge guarantees.
+- `docs/backlogs/000155-add-block-index-range-deletion-for-purged-row-pages.md`
+  tracks left-prefix `BlockIndex` deletion, balancing/root collapse, and unlink
+  before purge deallocates checkpointed row pages.
