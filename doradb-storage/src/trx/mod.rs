@@ -1863,9 +1863,7 @@ impl PrecommitTrxPayload {
         self.index_undo
             .rollback(&mut table_cache, &pool_guards, self.sts)
             .await?;
-        self.row_undo
-            .rollback(&mut table_cache, &pool_guards, self.sts)
-            .await
+        self.row_undo.rollback(&mut table_cache, &pool_guards).await
     }
 
     #[inline]

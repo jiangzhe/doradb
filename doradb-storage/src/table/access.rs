@@ -1527,8 +1527,7 @@ impl<'a> UserTableAccessor<'a> {
         };
         let metadata = self.metadata();
         let (page_ctx, page) = new_guard.ctx_and_page();
-        let mut new_access =
-            RowWriteAccess::new(page, page_ctx, page.row_idx(new_id), Some(rt.sts()), false);
+        let mut new_access = RowWriteAccess::new(page, page_ctx, page.row_idx(new_id));
         let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
@@ -1618,13 +1617,7 @@ impl<'a> UserTableAccessor<'a> {
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
                 let (page_ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(
-                    page,
-                    page_ctx,
-                    page.row_idx(new_id),
-                    Some(rt.sts()),
-                    false,
-                );
+                let mut new_access = RowWriteAccess::new(page, page_ctx, page.row_idx(new_id));
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
@@ -3108,7 +3101,7 @@ mod tests {
     use crate::table::DeleteMarker;
     use crate::table::hot::{HotRowDeleter, HotRowUpdater, RowInserter};
     use crate::table::tests::*;
-    use crate::table::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
+    use crate::table::{DeleteInternal, InsertRowIntoPage, UpdateRowInplace};
     use crate::trx::row::LockRowForWrite;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
@@ -5590,6 +5583,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 1, "lock").await;
+            let mut frozen_batch = session.freeze_table(table_id, usize::MAX).await.unwrap();
 
             let key = single_key(1i32);
             let mut trx = session.begin_trx().unwrap();
@@ -5651,25 +5645,21 @@ mod tests {
                         _ => panic!("lock should succeed"),
                     }
 
-                    let frozen_page = {
-                        let (page_ctx, page) = page_guard.ctx_and_page();
-                        let frozen_page = FrozenPage {
-                            page_id,
-                            start_row_id: page.header.start_row_id,
-                            end_row_id: page.header.start_row_id + page.header.max_row_count as u64,
-                        };
-                        page_ctx.row_ver().unwrap().set_frozen();
-                        frozen_page
-                    };
                     let table = table_for_internal_assertion(&engine, table_id);
                     let transition_pages = table
-                        .load_frozen_pages_for_transition(&session.pool_guards(), &[frozen_page])
+                        .load_frozen_pages_for_transition(
+                            &session.pool_guards(),
+                            &frozen_batch.pages,
+                        )
                         .await
                         .unwrap();
-                    table.set_loaded_frozen_pages_to_transition(
+                    let delay = table.validate_and_set_loaded_frozen_pages_to_transition(
                         &transition_pages,
+                        &mut frozen_batch,
                         stmt.runtime().sts(),
+                        || {},
                     );
+                    assert!(delay.is_none());
 
                     let marker = table_for_internal_assertion(&engine, table_id)
                         .deletion_buffer()

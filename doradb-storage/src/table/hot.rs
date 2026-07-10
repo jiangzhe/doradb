@@ -67,14 +67,7 @@ impl<'m, 'r> RowInserter<'m, 'r> {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new_with_state_guard(
-            page,
-            page_ctx,
-            row_idx,
-            Some(self.rt.sts()),
-            true,
-            state_guard,
-        );
+        let mut access = RowWriteAccess::new_with_state_guard(page, page_ctx, row_idx, state_guard);
         let res = access.lock_undo(
             self.rt,
             effects,
@@ -253,8 +246,6 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                 page,
                 page_ctx,
                 page.row_idx(row_id),
-                Some(self.rt.sts()),
-                false,
                 state_guard,
             );
             let lock_undo = access.lock_undo(
@@ -402,8 +393,6 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                         // The provisional row lock now becomes the operation
                         // kind that MVCC reads and rollback will interpret.
                         effects.update_last_row_undo(RowUndoKind::Update(undo_cols));
-                        // Mark this access as update, so page-level max_ins_sts will be updated.
-                        access.enable_ins_or_update();
                         drop(access); // unlock the row.
                         drop(lock_row);
                         // we may still need this page if we'd like to update index.

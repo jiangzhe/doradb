@@ -15,6 +15,7 @@ use crate::trx::trx_is_committed;
 use crate::trx::undo::RowUndoKind;
 use crate::value::{PageVar, Val, ValBuffer, ValType};
 use error_stack::Report;
+use std::result::Result as StdResult;
 use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
     U32 as LeU32, U64 as LeU64,
@@ -389,6 +390,15 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
     }
 }
 
+/// Row image state that cannot be represented by a transition LWC view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransitionViewError {
+    /// Row offset within the source page.
+    pub(crate) row_idx: usize,
+    /// Active transaction id or future commit timestamp found in the chain.
+    pub(crate) status_ts: TrxID,
+}
+
 impl RowPage {
     /// Create a vectorized view on row page in transition state.
     /// This view reflects MVCC visibility at given snapshot timestamp.
@@ -398,18 +408,10 @@ impl RowPage {
         col_layout: &'m TableColumnLayout,
         ctx: &FrameContext,
         cutoff_ts: TrxID,
-        global_min_active_sts: TrxID,
-    ) -> PageVectorView<'p, 'm> {
+    ) -> StdResult<PageVectorView<'p, 'm>, TransitionViewError> {
         let Some(map) = ctx.row_ver() else {
-            return self.vector_view(col_layout);
+            return Ok(self.vector_view(col_layout));
         };
-        let initial_mod_counter = map.mod_counter();
-        if map.max_sts() < global_min_active_sts {
-            let view = self.vector_view(col_layout);
-            if map.mod_counter() == initial_mod_counter {
-                return view;
-            }
-        }
         let row_count = self.header.row_count();
         let mut del_bitmap = self.del_bitmap(row_count);
         for row_idx in 0..row_count {
@@ -432,7 +434,10 @@ impl RowPage {
                     }
                     RowUndoKind::Insert | RowUndoKind::Update(_) => {
                         if !trx_is_committed(ts) || ts >= cutoff_ts {
-                            panic!("Uncommitted/Future Insert/Update found in Checkpoint");
+                            return Err(TransitionViewError {
+                                row_idx,
+                                status_ts: ts,
+                            });
                         }
                         del_bitmap.bitmap_unset(row_idx);
                         break;
@@ -447,12 +452,12 @@ impl RowPage {
                 }
             }
         }
-        PageVectorView {
+        Ok(PageVectorView {
             page: self,
             col_layout,
             row_count,
             del_bitmap,
-        }
+        })
     }
 }
 
@@ -987,12 +992,9 @@ mod tests {
         *map.write_exclusive(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
-        let view = page.vector_view_in_transition(
-            metadata.col.as_ref(),
-            &ctx,
-            TrxID::new(100),
-            TrxID::new(0),
-        );
+        let view = page
+            .vector_view_in_transition(metadata.col.as_ref(), &ctx, TrxID::new(100))
+            .unwrap();
         assert_eq!(view.rows_non_deleted(), 1);
         let _keep_undo = undo;
     }
@@ -1025,18 +1027,14 @@ mod tests {
         let ctx = FrameContext::RowVerMap(map);
 
         let expected = page.vector_view(metadata.col.as_ref());
-        let view = page.vector_view_in_transition(
-            metadata.col.as_ref(),
-            &ctx,
-            TrxID::new(100),
-            TrxID::new(1),
-        );
+        let view = page
+            .vector_view_in_transition(metadata.col.as_ref(), &ctx, TrxID::new(100))
+            .unwrap();
         assert_eq!(view.rows_non_deleted(), expected.rows_non_deleted());
     }
 
     #[test]
-    #[should_panic(expected = "Uncommitted/Future Insert/Update found in Checkpoint")]
-    fn test_vector_view_in_transition_uncommitted_insert_panics() {
+    fn test_vector_view_in_transition_returns_uncommitted_insert_error() {
         let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("c1"),
@@ -1079,12 +1077,12 @@ mod tests {
         *map.write_exclusive(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
-        let _view = page.vector_view_in_transition(
-            metadata.col.as_ref(),
-            &ctx,
-            TrxID::new(100),
-            TrxID::new(0),
-        );
+        let Err(err) = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, TrxID::new(100))
+        else {
+            panic!("uncommitted insert should return a checked transition-view error");
+        };
+        assert_eq!(err.row_idx, 0);
+        assert_eq!(err.status_ts, uncommitted_ts);
         let _keep_undo = undo;
     }
 }

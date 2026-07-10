@@ -105,8 +105,9 @@ Table checkpoint has two persistence responsibilities:
 2. persist committed cold-row deletes into delete bitmaps
 
 Secondary-index persistence happens as companion work of those same checkpoint
-operations. The public table checkpoint API is a single `checkpoint()` call
-that runs eligible data and deletion work in one publication flow.
+operations. Freezing returns an explicit `FrozenPageBatch`, and the batch-aware
+checkpoint API runs eligible data and deletion work in one publication flow.
+The batch retains per-page validation state across delayed retries.
 
 ### 4.1 Data Checkpoint
 
@@ -126,14 +127,24 @@ Each RowPage moves through:
 
 #### Data Checkpoint Workflow
 
-1. Freeze selected RowStore pages.
-2. Wait until all relevant inserts/updates are committed or aborted.
-3. Move pages to `TRANSITION`.
-4. Build LWC blocks from the committed visible rows.
-5. Insert matching `ColumnBlockIndex` entries.
-6. Build companion secondary-index entries from the same committed visible rows
+1. Freeze a contiguous RowStore-page prefix and allocate `frozen_ts` after all
+   selected pages publish `FROZEN`.
+2. Select the purge-published GC horizon as the exclusive checkpoint cutoff.
+3. Validate each unchecked page by walking row undo chains under page-state
+   write locks. Leading `Lock` and `Delete` entries are traced to the first
+   image-producing `Insert` or `Update`; unresolved pre-fence operations block,
+   and committed image operations require `cts < cutoff`.
+4. Cache each unblocked page's required cutoff. If any page is unresolved or
+   requires a newer cutoff, return a normal frozen-page cutoff delay without
+   moving pages to `TRANSITION`.
+5. Move the whole validated batch to `TRANSITION` while the page-state locks
+   remain held, then capture future/uncommitted lock-delete overlay state in the
+   `ColumnDeletionBuffer`.
+6. Build LWC blocks from the checked committed-visible transition view.
+7. Insert matching `ColumnBlockIndex` entries.
+8. Build companion secondary-index entries from the same committed visible rows
    and merge them into each affected `DiskTree`.
-7. Publish one new table checkpoint root that contains:
+9. Publish one new table checkpoint root that contains:
    - new LWC blocks
    - new block-index state
    - updated `DiskTree` roots
@@ -201,11 +212,13 @@ $$ \text{active\_root.effective\_ts} < \text{Global\_Min\_Active\_STS} $$
 The effective timestamp is allocated after the table-root pointer swap, so it
 captures the moment the newly published root can be observed by later
 transactions. If a long-running transaction pins the horizon at or below the
-active root effective timestamp, checkpoint returns a normal delayed outcome. A
-delayed checkpoint does not move frozen pages into transition, apply cold-delete
-checkpoint state, publish secondary `DiskTree` roots, rebuild allocation state,
-or swap the table-file root. Schedulers should treat this as backoff pressure
-rather than storage failure.
+active root effective timestamp, checkpoint returns an active-root delayed
+outcome. Frozen-page validation can separately return a cutoff delay with the
+page, selected cutoff, required cutoff when known, stable-prefix count, and
+unresolved-status flag. Either delay leaves pages out of transition and does not
+apply cold-delete checkpoint state, publish secondary `DiskTree` roots, rebuild
+allocation state, or swap the table-file root. Schedulers should retain the
+batch and treat either delay as backoff pressure rather than storage failure.
 
 When the effective-timestamp gate passes, checkpoint may rebuild the mutable
 root's allocation map from the current active root and the mutable root that

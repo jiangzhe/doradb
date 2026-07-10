@@ -58,3 +58,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000217 with undo-chain cutoff validation, retryable frozen-page batches, and checked transition views.
+- Closed By: backlog close
+- Reference: docs/tasks/000217-redesign-checkpoint-frozen-page-cutoff-validation.md; GitHub PR #833
+- Closed At: 2026-07-10

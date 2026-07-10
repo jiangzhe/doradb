@@ -899,18 +899,12 @@ pub(crate) struct RowWriteAccess<'a> {
 impl<'a> RowWriteAccess<'a> {
     /// Acquire write access to one row and read-lock the page state.
     #[inline]
-    pub(crate) fn new(
-        page: &'a RowPage,
-        ctx: &'a FrameContext,
-        row_idx: usize,
-        sts: Option<TrxID>,
-        ins_or_update: bool,
-    ) -> Self {
+    pub(crate) fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
         let ver_map = ctx
             .row_ver()
             .expect("write_row not supported without undo map");
         let state_guard = ver_map.read_state();
-        Self::new_with_state_guard(page, ctx, row_idx, sts, ins_or_update, state_guard)
+        Self::new_with_state_guard(page, ctx, row_idx, state_guard)
     }
 
     /// Acquire write access using an existing page-state guard.
@@ -919,14 +913,12 @@ impl<'a> RowWriteAccess<'a> {
         page: &'a RowPage,
         ctx: &'a FrameContext,
         row_idx: usize,
-        sts: Option<TrxID>,
-        ins_or_update: bool,
         state_guard: RwLockReadGuard<'a, RowPageState>,
     ) -> Self {
         let ver_map = ctx
             .row_ver()
             .expect("write_row not supported without undo map");
-        let guard = ver_map.write_latch(row_idx, sts, ins_or_update);
+        let guard = ver_map.write_latch(row_idx);
         RowWriteAccess {
             page,
             row_idx,
@@ -1286,12 +1278,6 @@ impl<'a> RowWriteAccess<'a> {
                 head.next = next;
             }
         }
-    }
-
-    /// Marks this guarded write as an insert or update for page-level tracking.
-    #[inline]
-    pub(crate) fn enable_ins_or_update(&mut self) {
-        self.guard.enable_ins_or_update();
     }
 }
 

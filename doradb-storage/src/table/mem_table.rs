@@ -323,7 +323,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         entry: OwnedRowUndo,
         guards: &PoolGuards,
-        rollback_sts: TrxID,
         on_cold_row_rollback: F,
     ) -> StdResult<(), (Error, OwnedRowUndo)>
     where
@@ -349,7 +348,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         // TODO: we should retry or wait for notification if rollback happens on a page
         // in transition state. This will be handled in a future task.
         let row_idx = page.row_idx(entry.row_id);
-        let mut access = RowWriteAccess::new(page, ctx, row_idx, Some(rollback_sts), false);
+        let mut access = RowWriteAccess::new(page, ctx, row_idx);
         access.rollback_first_undo(metadata, entry);
         Ok(())
     }
@@ -860,13 +859,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             FindOldVersion::WriteConflict => Ok(LinkForUniqueIndex::WriteConflict),
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 let (page_ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(
-                    page,
-                    page_ctx,
-                    page.row_idx(new_id),
-                    Some(rt.sts()),
-                    false,
-                );
+                let mut new_access = RowWriteAccess::new(page, page_ctx, page.row_idx(new_id));
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
