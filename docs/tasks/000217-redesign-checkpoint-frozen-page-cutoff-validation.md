@@ -1,7 +1,7 @@
 ---
 id: 000217
 title: Redesign checkpoint frozen page cutoff validation
-status: proposal
+status: implemented
 created: 2026-07-10
 github_issue: 832
 ---
@@ -181,6 +181,40 @@ event-driven checkpoint scheduler.
 
 ## Implementation Notes
 
+- Implemented public retryable `FrozenPageBatch` ownership across
+  `Session::freeze_table` and `Session::checkpoint_frozen_pages`. The batch
+  records the post-freeze fence, selected page metadata, approximate rows, and
+  cached per-page validation state. The compatibility `checkpoint_table` entry
+  point remains and rebuilds a batch from the current frozen prefix.
+- Replaced page-level `max_ins_sts` readiness with undo-chain validation against
+  the purge-published exclusive cutoff. Stable pages cache their maximum
+  required image cutoff across retries; unresolved or future image state returns
+  structured `CheckpointDelayReason::FrozenPageCutoff` diagnostics before any
+  selected page enters `TRANSITION`.
+- Removed the obsolete row-version modification/max-writer timestamp bookkeeping
+  and simplified row write and rollback plumbing. Transition capture now traces
+  lock/delete chains, while LWC and secondary-index sidecar construction consume
+  the same cutoff-visible row view. Table-root, LWC, deletion metadata, and
+  secondary `DiskTree` publication remain atomic.
+- Changed `RowPage::vector_view_in_transition` from a defensive panic to a
+  checked error. An unexpected stale image after the irreversible transition
+  boundary fails closed through the existing checkpoint publication guard and
+  poisons storage instead of leaving foreground route waiters blocked.
+- Added regression coverage for unresolved pre-fence inserts, committed future
+  updates, cached retry after cutoff advancement, future updates hidden behind
+  deletes, and checked transition-view failures. Resolve validation passed
+  `tools/style_audit.rs --diff-base origin/main` for 16 Rust files,
+  `cargo nextest run --workspace` with 1,299 tests, and
+  `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  with 1,223 tests; all tests passed with no skips. PR #833 CI and automated
+  reviews passed, and both inline review threads were resolved.
+- The implementation deliberately retains compatibility batch reconstruction.
+  Its later fence can conservatively delay a valid post-freeze lock/delete
+  overlay. Review accepted this limitation for follow-up in
+  `docs/backlogs/000152-unify-table-freeze-checkpoint-workflow-state.md` rather
+  than expanding this correctness task. Repeated undo analysis and batch-wide
+  page-state lock duration are separately deferred to
+  `docs/backlogs/000151-optimize-frozen-page-checkpoint-transition-planning.md`.
 
 ## Impacts
 
@@ -253,10 +287,10 @@ event-driven checkpoint scheduler.
 
 ## Open Questions
 
-- The first implementation should use cached per-page validation state. A later
-  task or RFC can evaluate transaction-status notifications or event-driven
-  checkpoint scheduling if repeated scans remain too expensive.
-- The exact API placement and visibility can be finalized during
-  implementation. Prefer boundaries that make batch ownership and retry
-  semantics explicit without forcing callers to understand unsafe page
-  internals.
+- `docs/backlogs/000151-optimize-frozen-page-checkpoint-transition-planning.md`
+  tracks fused transition analysis, shorter page-state lock duration, and the
+  measured decision on commit-maintained page watermarks.
+- `docs/backlogs/000152-unify-table-freeze-checkpoint-workflow-state.md` tracks a
+  table-owned freeze/checkpoint state machine, canonical batch ownership,
+  concurrent-call and drop coordination, and removal of the compatibility
+  rebuilt-fence ambiguity.
