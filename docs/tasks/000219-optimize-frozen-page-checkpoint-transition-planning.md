@@ -1,7 +1,7 @@
 ---
 id: 000219
 title: Optimize frozen page checkpoint transition planning
-status: proposal
+status: implemented
 created: 2026-07-10
 github_issue: 836
 ---
@@ -40,7 +40,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000151-optimize-frozen-page-checkpoint-transition-planning.md
+- docs/backlogs/closed/000151-optimize-frozen-page-checkpoint-transition-planning.md
 
 Related implemented tasks:
 
@@ -372,6 +372,20 @@ Update `docs/checkpoint-and-recovery.md`, `docs/transaction-system.md`, and
 
 ## Implementation Notes
 
+- Extracted frozen-page readiness, optimistic planning, locked revalidation,
+  and transition publication into `table/page_transition.rs`. Checkpoint
+  orchestration now calls `prepare_page_transition`, acquires one
+  `FrozenPageTransitionGuard` through `try_begin_page_transition`, and then
+  calls `apply_page_transition`; there is no first-page special case.
+- `FrozenPageTransitionGuard` owns workflow admission, lifecycle publish
+  lease, and fatal poisoning together. All reversible delays finish before
+  admission, while apply/build/publication failures after admission remain
+  fail-closed. Locked stable-plan regeneration uses an invariant `expect`, and
+  runtime/recovered call sites use `FrameContext::expect_vmap` when the
+  `RowVersionMap` must exist.
+- Moved `Table::build_lwc_blocks` into `table/persistence.rs`, where it consumes
+  the owned prepared bitmap for LWC construction and secondary-sidecar visible
+  row collection without another undo-chain walk.
 - Added deterministic test-only analyzer-row, immediate-version-comparison,
   readiness-complete, and full-refresh-complete hooks. All new correctness
   races use hooks, channels, scoped threads, or explicit predicate checks
@@ -395,21 +409,26 @@ Update `docs/checkpoint-and-recovery.md`, `docs/transaction-system.md`, and
 - Prepared-bitmap coverage now checks unique, non-unique, and zero-index table
   layouts. The non-unique split test snapshots the analyzer count at build
   admission and proves LWC block splitting does not trigger another analysis.
-- Validation completed on 2026-07-11:
+- Final validation completed on 2026-07-11:
   - `cargo fmt --all -- --check` passed;
   - `cargo clippy --workspace --all-targets -- -D warnings` passed (the
     repository toolchain still reports its existing unknown allowed-lint
     warning for `clippy::manual_assert_eq`);
-  - `cargo nextest run --workspace --no-fail-fast` passed 1,342/1,342 tests;
+  - `cargo nextest run --workspace --retries 2` passed 1,342/1,342 tests; the
+    timing-sensitive catalog checkpoint heartbeat test passed on retry and is
+    tracked by backlog 000156;
   - `cargo nextest run -p doradb-storage --no-default-features --features
-    libaio --no-fail-fast` passed 1,266/1,266 tests;
+    libaio --retries 2` passed 1,266/1,266 tests;
   - focused coverage for row-version, transition, persistence, rollback,
     purge, and recovery paths was 10,385/11,306 lines (91.85%); every requested
     file exceeded 80%;
-  - `tools/style_audit.rs` passed for 13 branch-diff Rust files.
+  - `tools/style_audit.rs --diff-base origin/main` passed for 14 branch-diff
+    Rust files.
 - Public event-driven maintenance progress waits and migration of polling test
   helpers remain deferred to
   `docs/backlogs/000156-event-driven-maintenance-progress-waits.md`.
+- Source backlog 000151 was closed as implemented and archived under
+  `docs/backlogs/closed/`.
 
 ## Impacts
 
@@ -422,7 +441,7 @@ Update `docs/checkpoint-and-recovery.md`, `docs/transaction-system.md`, and
 - `doradb-storage/src/table/checkpoint_workflow.rs`
   - extend canonical batch state with optional cutoff-specific prepared plans;
   - keep stable image proof counts distinct from plan availability.
-- `doradb-storage/src/table/mod.rs`
+- `doradb-storage/src/table/page_transition.rs`
   - replace separate validation, marker capture, and bitmap analysis with the
     fused analyzer;
   - implement optimistic preparation, immediate version comparison,
@@ -431,7 +450,8 @@ Update `docs/checkpoint-and-recovery.md`, `docs/transaction-system.md`, and
 - `doradb-storage/src/table/persistence.rs`
   - sequence reversible optimistic preparation before page-local irreversible
     transition;
-  - carry prepared plans into LWC and secondary-sidecar construction.
+  - carry prepared plans into LWC and secondary-sidecar construction;
+  - own `Table::build_lwc_blocks` next to checkpoint orchestration.
 - `doradb-storage/src/row/vector_scan.rs`
   - add the prepared-bitmap vector-view boundary;
   - remove redundant transition undo scans from the successful build path.
@@ -534,7 +554,7 @@ Update `docs/checkpoint-and-recovery.md`, `docs/transaction-system.md`, and
 37. Run `cargo nextest run --workspace`.
 38. Run `cargo nextest run -p doradb-storage --no-default-features --features libaio`
     because checkpoint transition and persistence sequencing are changed.
-35. Run focused coverage for the changed row-version, transition analyzer,
+39. Run focused coverage for the changed row-version, transition analyzer,
     workflow, persistence, rollback, purge, and recovery paths; meet the 80%
     focused coverage review bar or explain definition-heavy exceptions with
     covered consumers.
@@ -542,6 +562,10 @@ Update `docs/checkpoint-and-recovery.md`, `docs/transaction-system.md`, and
 ## Open Questions
 
 No blocking design questions remain.
+
+Public event-driven maintenance progress waits and migration of timer-based
+checkpoint/GC test helpers remain tracked in
+`docs/backlogs/000156-event-driven-maintenance-progress-waits.md`.
 
 Commit-maintained `max_writer_sts` and `max_committed_cts` summaries and an O(1)
 raw-page fast path remain outside this task. They require separate planning
