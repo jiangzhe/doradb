@@ -1,7 +1,7 @@
 //! Logical metadata and table-data lock manager primitives.
 //!
 //! This module is the standalone core for RFC-0016 logical locks. It tracks
-//! catalog, table metadata, and table data resources independently from the
+//! table metadata and table data resources independently from the
 //! engine/session/transaction lifecycle wiring that later phases will add.
 
 mod state;
@@ -29,8 +29,7 @@ pub(crate) type StmtNo = u64;
 /// multi-resource operations:
 ///
 /// ```text
-/// CatalogNamespace
-///   -> TableMetadata(table_id ascending)
+/// TableMetadata(table_id ascending)
 ///   -> TableData(table_id ascending)
 ///   -> row undo/CDB ownership
 /// ```
@@ -40,8 +39,6 @@ pub(crate) type StmtNo = u64;
 /// acquired only after the relevant `TableData` lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum LockResource {
-    /// Catalog-wide table identity or namespace invariants.
-    CatalogNamespace,
     /// Table definition and metadata for one table.
     TableMetadata(TableID),
     /// Multi-granularity table-data root above row ownership.
@@ -167,23 +164,6 @@ impl Drop for FreshLockGuard<'_> {
     }
 }
 
-/// Scoped catalog namespace lock guard.
-pub(crate) struct ScopedCatalogNamespaceLock<'a> {
-    lock_manager: &'a LockManager,
-    resource: LockResource,
-    owner: LockOwner,
-    fresh: bool,
-}
-
-impl Drop for ScopedCatalogNamespaceLock<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.fresh {
-            self.lock_manager.release(self.resource, self.owner);
-        }
-    }
-}
-
 /// Scoped table DDL lock guard for metadata and data resources.
 pub(crate) struct ScopedTableDdlLocks<'a> {
     lock_manager: &'a LockManager,
@@ -293,25 +273,6 @@ impl LockManager {
     ) -> Result<LockGrant> {
         self.acquire_with_group(resource, mode, owner, Some(owner_group))
             .await
-    }
-
-    /// Acquires the catalog namespace lock for grouped catalog DDL.
-    #[inline]
-    pub(crate) async fn acquire_catalog_namespace_lock<'a>(
-        &'a self,
-        owner: LockOwner,
-        owner_group: LockOwnerGroup,
-    ) -> Result<ScopedCatalogNamespaceLock<'a>> {
-        let resource = LockResource::CatalogNamespace;
-        let grant = self
-            .acquire_grouped_with_grant(resource, LockMode::Exclusive, owner, owner_group)
-            .await?;
-        Ok(ScopedCatalogNamespaceLock {
-            lock_manager: self,
-            resource,
-            owner,
-            fresh: grant == LockGrant::Fresh,
-        })
     }
 
     /// Acquires the ordered metadata/data locks for a grouped table operation.
@@ -1077,7 +1038,7 @@ fn validate_mode(resource: LockResource, mode: LockMode) -> Result<()> {
 #[inline]
 fn mode_is_valid(resource: LockResource, mode: LockMode) -> bool {
     match resource {
-        LockResource::CatalogNamespace | LockResource::TableMetadata(_) => {
+        LockResource::TableMetadata(_) => {
             matches!(mode, LockMode::Shared | LockMode::Exclusive)
         }
         LockResource::TableData(_) => true,
@@ -1087,11 +1048,11 @@ fn mode_is_valid(resource: LockResource, mode: LockMode) -> bool {
 /// Returns whether two modes can be granted together on the same resource.
 ///
 /// Compatibility is symmetric and is checked only after both modes have been
-/// validated for the resource. Catalog and table-metadata resources use the
-/// ordinary shared/exclusive matrix:
+/// validated for the resource. Table-metadata resources use the ordinary
+/// shared/exclusive matrix:
 ///
 /// ```text
-/// CatalogNamespace and TableMetadata
+/// TableMetadata
 ///
 ///       | S | X
 /// ------+---+---
@@ -1114,7 +1075,7 @@ fn mode_is_valid(resource: LockResource, mode: LockMode) -> bool {
 #[inline]
 fn modes_are_compatible(resource: LockResource, left: LockMode, right: LockMode) -> bool {
     match resource {
-        LockResource::CatalogNamespace | LockResource::TableMetadata(_) => {
+        LockResource::TableMetadata(_) => {
             matches!((left, right), (LockMode::Shared, LockMode::Shared))
         }
         LockResource::TableData(_) => matches!(
@@ -1134,12 +1095,11 @@ fn modes_are_compatible(resource: LockResource, left: LockMode, right: LockMode)
 ///
 /// Coverage is directional: a mode can cover another mode even when the reverse
 /// is not true. The lock manager uses this for reentrant acquisitions and
-/// immediate same-owner conversions. Catalog and table-metadata resources use
-/// the ordinary hierarchy where `X` covers every valid request and `S` covers
-/// only `S`.
+/// immediate same-owner conversions. Table-metadata resources use the ordinary
+/// hierarchy where `X` covers every valid request and `S` covers only `S`.
 ///
 /// ```text
-/// CatalogNamespace and TableMetadata
+/// TableMetadata
 ///
 /// held \ requested | S | X
 /// -----------------+---+---
@@ -1164,9 +1124,7 @@ fn modes_are_compatible(resource: LockResource, left: LockMode, right: LockMode)
 #[inline]
 fn mode_covers(resource: LockResource, held: LockMode, requested: LockMode) -> bool {
     match resource {
-        LockResource::CatalogNamespace | LockResource::TableMetadata(_) => {
-            held == LockMode::Exclusive || held == requested
-        }
+        LockResource::TableMetadata(_) => held == LockMode::Exclusive || held == requested,
         LockResource::TableData(_) => match held {
             LockMode::IntentShared => requested == LockMode::IntentShared,
             LockMode::IntentExclusive => {
@@ -1477,37 +1435,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn metadata_and_catalog_only_accept_shared_and_exclusive() {
-        for resource in [
-            LockResource::CatalogNamespace,
-            table_metadata(TableID::new(1)),
-        ] {
-            assert!(LockMode::Shared.validate_for(resource).is_ok());
-            assert!(LockMode::Exclusive.validate_for(resource).is_ok());
-            assert_operation_err(
-                LockMode::IntentShared.validate_for(resource),
-                OperationError::InvalidLockMode,
-            );
-            assert_operation_err(
-                LockMode::IntentExclusive.validate_for(resource),
-                OperationError::InvalidLockMode,
-            );
-            assert!(modes_are_compatible(
-                resource,
-                LockMode::Shared,
-                LockMode::Shared
-            ));
-            assert!(!modes_are_compatible(
-                resource,
-                LockMode::Shared,
-                LockMode::Exclusive
-            ));
-            assert!(!modes_are_compatible(
-                resource,
-                LockMode::Exclusive,
-                LockMode::Shared
-            ));
-        }
+    fn metadata_only_accepts_shared_and_exclusive() {
+        let resource = table_metadata(TableID::new(1));
+        assert!(LockMode::Shared.validate_for(resource).is_ok());
+        assert!(LockMode::Exclusive.validate_for(resource).is_ok());
+        assert_operation_err(
+            LockMode::IntentShared.validate_for(resource),
+            OperationError::InvalidLockMode,
+        );
+        assert_operation_err(
+            LockMode::IntentExclusive.validate_for(resource),
+            OperationError::InvalidLockMode,
+        );
+        assert!(modes_are_compatible(
+            resource,
+            LockMode::Shared,
+            LockMode::Shared
+        ));
+        assert!(!modes_are_compatible(
+            resource,
+            LockMode::Shared,
+            LockMode::Exclusive
+        ));
+        assert!(!modes_are_compatible(
+            resource,
+            LockMode::Exclusive,
+            LockMode::Shared
+        ));
     }
 
     #[test]
@@ -1860,48 +1814,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nested_catalog_namespace_scope_does_not_release_outer_grant() {
-        smol::block_on(async {
-            let manager = LockManager::new();
-            let resource = LockResource::CatalogNamespace;
-            let owner = session(SessionID::new(7));
-            let owner_group = group(SessionID::new(7));
-
-            let outer = manager
-                .acquire_catalog_namespace_lock(owner, owner_group)
-                .await
-                .unwrap();
-            assert!(manager.owner_holds(resource, owner, LockMode::Exclusive));
-            {
-                let inner = manager
-                    .acquire_catalog_namespace_lock(owner, owner_group)
-                    .await
-                    .unwrap();
-                let snapshot = debug_snapshot(&manager);
-                assert_eq!(
-                    count_entries(&snapshot, resource, LockDebugEntryState::Granted),
-                    1
-                );
-                drop(inner);
-            }
-
-            assert!(manager.owner_holds(resource, owner, LockMode::Exclusive));
-            let snapshot = debug_snapshot(&manager);
-            assert_eq!(
-                count_entries(&snapshot, resource, LockDebugEntryState::Granted),
-                1
-            );
-            drop(outer);
-            assert!(!manager.owner_holds(resource, owner, LockMode::Exclusive));
-            let snapshot = debug_snapshot(&manager);
-            assert_eq!(
-                count_entries(&snapshot, resource, LockDebugEntryState::Granted),
-                0
-            );
-        });
-    }
-
-    #[test]
     fn same_group_covered_request_grants_without_waiting() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
@@ -2108,7 +2020,7 @@ pub(crate) mod tests {
     fn async_acquire_waits_behind_conflict_and_completes_after_release() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = LockResource::CatalogNamespace;
+            let resource = table_metadata(TableID::new(70));
             assert!(
                 try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
             );
@@ -2142,7 +2054,7 @@ pub(crate) mod tests {
     fn duplicate_async_acquire_reuses_existing_waiter() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = LockResource::CatalogNamespace;
+            let resource = table_metadata(TableID::new(71));
             let owner = trx(TrxID::new(2));
             assert!(
                 try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
@@ -2214,7 +2126,7 @@ pub(crate) mod tests {
     fn cancelled_acquire_removes_queued_waiter() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = LockResource::CatalogNamespace;
+            let resource = table_metadata(TableID::new(72));
             assert!(
                 try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
             );

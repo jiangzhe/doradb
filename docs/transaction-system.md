@@ -230,12 +230,18 @@ deletes acquire transaction-lifetime `TableMetadata(S)` followed by
 secondary-index write undo. Repeated writes to the same table reuse the
 transaction lock cache rather than re-entering the lock manager.
 
-`CREATE TABLE` acquires a session-owned `CatalogNamespace(X)` before allocating
-the user table id and holds it through catalog-row writes, provisional
-table-file publication, runtime table construction, catalog DDL commit, and
-catalog runtime publication. The initial table-file root uses the create
-transaction STS as `root_ts`; catalog commit is held until file/runtime staging
-succeeds, and the runtime is inserted only after the durable catalog commit.
+`CREATE TABLE` does not acquire a logical lock. The atomic table-id allocator
+assigns a distinct id before the operation creates its deterministic table
+file, stages catalog rows, or builds the per-id runtime. The initial table-file
+root uses the create transaction STS as `root_ts`; catalog commit is held until
+file/runtime staging succeeds, and the runtime is inserted into the concurrent
+per-id catalog map only after the durable catalog commit.
+
+`DROP TABLE` prechecks the id-only runtime and catalog row, acquires
+`TableMetadata(X)` followed by `TableData(X)`, and then revalidates the target
+under those table-local locks before crossing the terminal lifecycle gate. A
+drop that waits for an already-admitted checkpoint publisher therefore does
+not delay CREATE or DROP for unrelated table ids.
 Recovery, checkpoint, purge, and no-transaction catalog replay
 remain outside logical lock acquisition because they run at internal lifecycle
 boundaries rather than through foreground sessions and waiters.
