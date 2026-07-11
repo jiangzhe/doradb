@@ -1092,10 +1092,6 @@ pub(crate) async fn create_table_for_session(
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     reject_user_table_primary_key_indexes(&index_specs, "create table")?;
-    let _namespace_lock = engine
-        .lock_manager()
-        .acquire_catalog_namespace_lock(ctx.owner, ctx.owner_group)
-        .await?;
 
     let table_id = engine.catalog().next_table_id();
     let metadata = Arc::new(TableMetadata::try_new(
@@ -1228,17 +1224,12 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     let ctx = SessionDdlContext::new(&session)?;
     let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
-    // Keep this guard alive until the catalog entry is transitioned to dropped
-    // state so table identity changes remain namespace-serialized.
-    let _namespace_lock = lock_manager
-        .acquire_catalog_namespace_lock(ctx.owner, ctx.owner_group)
-        .await?;
-
-    let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
+    validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
     lock_manager.reject_table_ddl_explicit_session_lock(table_id, ctx.owner, "drop table")?;
     let mut table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
         .await?;
+    let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
     engine.trx_sys.ensure_runtime_healthy()?;
 
     let mut trx = session.begin_trx("begin transaction")?;
@@ -2378,55 +2369,74 @@ mod tests {
     }
 
     #[test]
-    fn test_create_table_waits_on_catalog_namespace_lock() {
+    fn test_concurrent_create_table_publishes_distinct_tables() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
                 evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let _ = create_table2_for_test(&engine).await;
-            let blocker = LockOwner::Session(SessionID::new(91_400));
-            assert!(
-                try_acquire(
-                    engine.lock_manager(),
-                    LockResource::CatalogNamespace,
-                    LockMode::Exclusive,
-                    blocker,
-                )
-                .unwrap()
-            );
-
-            let mut session = engine.new_session().unwrap();
-            let waiting_owner = LockOwner::Session(session.id());
-            let create_task = smol::spawn(async move {
-                session
-                    .create_table(
-                        TableSpec::new(vec![ColumnSpec::new(
-                            "id",
-                            crate::value::ValKind::I32,
-                            ColumnAttributes::empty(),
-                        )]),
-                        vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
-                    )
-                    .await
+            let mut session1 = engine.new_session().unwrap();
+            let mut session2 = engine.new_session().unwrap();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            let create1 = smol::spawn({
+                let table_spec = table_spec.clone();
+                let index_specs = index_specs.clone();
+                async move { session1.create_table(table_spec, index_specs).await }
             });
+            let create2 =
+                smol::spawn(async move { session2.create_table(table_spec, index_specs).await });
 
-            wait_for_lock_entry(
-                &engine,
-                waiting_owner,
-                LockResource::CatalogNamespace,
-                LockMode::Exclusive,
-                LockDebugEntryState::Waiting,
-            )
-            .await;
+            let table_id1 = create1.await.unwrap();
+            let table_id2 = create2.await.unwrap();
+            assert_ne!(table_id1, table_id2);
 
-            assert_eq!(engine.lock_manager().release_owner(blocker), 1);
-            let table_id = create_task.await.unwrap();
-            assert!(engine.catalog().get_table(table_id).await.is_some());
-            assert!(!has_lock_resource(
-                &engine,
-                waiting_owner,
-                LockResource::CatalogNamespace,
-            ));
+            let verify_session = engine.new_session().unwrap();
+            let guards = verify_session.pool_guards();
+            for table_id in [table_id1, table_id2] {
+                assert!(engine.catalog().get_table(table_id).await.is_some());
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .tables()
+                        .find_uncommitted_by_id(&guards, table_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .list_uncommitted_by_table_id(&guards, table_id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .list_uncommitted_by_table_id(&guards, table_id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .list_uncommitted_by_table_id(&guards, table_id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    Path::new(&engine.inner().table_fs.user_table_file_path(table_id)).exists()
+                );
+            }
         });
     }
 
@@ -3242,11 +3252,6 @@ mod tests {
                     TableTerminal::Live
                 );
                 assert!(engine.catalog().get_table(table_id).await.is_some());
-                assert!(!has_lock_resource(
-                    &engine,
-                    owner,
-                    LockResource::CatalogNamespace,
-                ));
                 assert!(has_lock_entry(
                     &engine,
                     owner,
@@ -3275,6 +3280,77 @@ mod tests {
                 ));
                 session.drop_table(table_id).await.unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn test_drop_waiting_on_checkpoint_does_not_block_other_table_drop() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let other_table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
+
+            let mut waiting_session = engine.new_session().unwrap();
+            let mut waiting_drop = Box::pin(waiting_session.drop_table(table_id));
+            assert!(matches!(
+                futures::poll!(waiting_drop.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+
+            let mut other_session = engine.new_session().unwrap();
+            other_session.drop_table(other_table_id).await.unwrap();
+            assert!(engine.catalog().get_table(other_table_id).await.is_none());
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+
+            drop(publish_lease);
+            waiting_drop.await.unwrap();
+            drop(root_lease);
+        });
+    }
+
+    #[test]
+    fn test_drop_waiting_on_checkpoint_does_not_block_create_table() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
+
+            let mut waiting_session = engine.new_session().unwrap();
+            let mut waiting_drop = Box::pin(waiting_session.drop_table(table_id));
+            assert!(matches!(
+                futures::poll!(waiting_drop.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+
+            let mut create_session = engine.new_session().unwrap();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            let created_table_id = create_session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap();
+            assert_ne!(created_table_id, table_id);
+            assert!(engine.catalog().get_table(created_table_id).await.is_some());
+            assert!(
+                Path::new(
+                    &engine
+                        .inner()
+                        .table_fs
+                        .user_table_file_path(created_table_id)
+                )
+                .exists()
+            );
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
+
+            drop(publish_lease);
+            waiting_drop.await.unwrap();
+            drop(root_lease);
         });
     }
 
@@ -3494,11 +3570,6 @@ mod tests {
             assert!(Path::new(&table_file_path).exists());
             session.drop_table(table_id).await.unwrap();
 
-            assert!(!has_lock_resource(
-                &engine,
-                owner,
-                LockResource::CatalogNamespace,
-            ));
             assert!(!has_lock_resource(
                 &engine,
                 owner,

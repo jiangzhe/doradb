@@ -951,7 +951,7 @@ mod tests {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let engine_ref = engine.new_ref().unwrap();
-            let resource = LockResource::CatalogNamespace;
+            let resource = LockResource::TableMetadata(TableID::new(10));
             let owner = LockOwner::Session(SessionID::new(10));
 
             assert!(
