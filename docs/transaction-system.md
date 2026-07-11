@@ -85,8 +85,11 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
   loading leaves foreground reads and writes unchanged; the final freeze
   publication takes one short page-state write lock at a time. Repeated freeze
   returns the original fence rather than extending the prefix. Checkpoint
-  validates and caches that batch, acquires publish/drop admission before page
-  transition, and retains admission through route/root publication and commit.
+  optimistically prepares cutoff-specific page plans, acquires publish/drop
+  admission before the first page transition, and retains admission through
+  route/root publication and commit. Frozen-page mutations publish paired
+  equality-only version increments so final page-local validation can reuse or
+  rebuild each plan without a batch-wide lock set.
   This workflow is maintenance-only: foreground statements, transactions, row
   writes, and scans do not acquire or inspect its mutex.
 
@@ -377,9 +380,19 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 1. **Tuple Mover**:
    - Freezes a contiguous RowStore-page prefix and retains the returned batch
      across checkpoint retries.
-   - Validates image-producing undo CTS values against the purge-published
-     checkpoint cutoff before moving the whole batch to transition.
+   - Optimistically analyzes each frozen page without a page-state write lock,
+     fusing image-cutoff proof, cutoff-visible deletion bitmap construction,
+     and transition marker selection into one owned plan.
+   - Rejects a plan immediately when the paired mutation version changes during
+     analysis. Full-value equality is the only validity rule; counter parity
+     does not indicate writer quiescence.
+   - Reuses or rebuilds the plan under only that page's state write lock
+     immediately before transition. Once the complete batch is image-ready,
+     pages transition in canonical order as a growing `TRANSITION` prefix and
+     still-mutable `FROZEN` suffix.
    - Converts them into **LWC** (lightweight compressed) ColumnStore blocks.
+   - Uses the same prepared deletion bitmap for LWC membership, block-split
+     retries, and companion secondary-index entries without another undo walk.
    - Updates the `Pivot_RowID` and persists metadata.
    - Publishes companion `DiskTree` updates for those checkpointed rows.
    - This is the primary mechanism for long-term heap storage and commit log

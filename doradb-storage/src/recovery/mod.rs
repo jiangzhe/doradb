@@ -634,9 +634,8 @@ impl<'a> RecoveryCoordinator<'a> {
             .unwrap_or(TrxID::new(0));
         let max_row_count = page_guard.page().header.max_row_count as usize;
         page_guard.bf_mut().init_undo_map(col_layout, max_row_count);
-        if let Some(row_ver) = page_guard.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver()) {
-            row_ver.set_create_cts(create_cts);
-        }
+        let (ctx, _) = page_guard.ctx_and_page_mut();
+        ctx.expect_vmap().set_create_cts(create_cts);
         Ok(())
     }
 

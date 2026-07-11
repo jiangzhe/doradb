@@ -324,6 +324,14 @@ impl SharedTrxStatus {
         TrxID::new(self.ts.load(Ordering::Acquire))
     }
 
+    /// Publishes a committed status for deterministic undo-marker tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn commit_for_test(&self, cts: TrxID) {
+        debug_assert!(trx_is_committed(cts));
+        self.ts.store(cts.as_u64(), Ordering::SeqCst);
+    }
+
     /// Returns whether this transaction is preparing.
     #[inline]
     pub(crate) fn preparing(&self) -> bool {

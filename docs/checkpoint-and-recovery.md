@@ -109,7 +109,8 @@ operations. Each live user table owns one volatile freeze/checkpoint workflow,
 including the canonical frozen-page batch, its original post-freeze fence, and
 per-page validation cache. Freeze returns only a read-only summary; checkpoint
 claims the table-owned batch and restores it unchanged, including cached
-validation progress, when a reversible attempt is delayed or cancelled.
+validation progress and any usable prepared transition plans, when a reversible
+attempt is delayed or cancelled.
 
 ### 4.1 Data Checkpoint
 
@@ -124,6 +125,7 @@ Each RowPage moves through:
 2. `FROZEN`
    - rejects new insert/update
    - still allows delete while in-flight writers drain
+   - brackets each row/undo mutation with paired mutation-version increments
 3. `TRANSITION`
    - immutable source for LWC generation
 
@@ -136,22 +138,43 @@ Each RowPage moves through:
    Repeated freeze returns the same fence and batch summary without extending
    the prefix.
 2. Select the purge-published GC horizon as the exclusive checkpoint cutoff.
-3. Validate each unchecked page by walking row undo chains under page-state
-   write locks. Leading `Lock` and `Delete` entries are traced to the first
-   image-producing `Insert` or `Update`; unresolved pre-fence operations block,
-   and committed image operations require `cts < cutoff`.
-4. Cache each unblocked page's required cutoff. If any page is unresolved or
-   requires a newer cutoff, return a normal frozen-page cutoff delay without
-   moving pages to `TRANSITION`.
-5. While the validated page-state locks remain held, acquire lifecycle publish
-   admission and record the workflow's irreversible owner. Only then move the
-   whole batch to `TRANSITION` and capture future/uncommitted lock-delete
-   overlay state in the `ColumnDeletionBuffer`.
-6. Build LWC blocks from the checked committed-visible transition view.
-7. Insert matching `ColumnBlockIndex` entries.
-8. Build companion secondary-index entries from the same committed visible rows
-   and merge them into each affected `DiskTree`.
-9. Publish one new table checkpoint root that contains:
+3. Incrementally validate readiness without page-state write locks. Reanalyze
+   only `Unchecked` or `Blocked` pages and reuse cached `Stable` image proofs.
+   Stop at the first unsafe page, preserving its preceding stable prefix and
+   leaving the suffix unchecked until a later retry. A stable page waiting only
+   for a newer cutoff is not rescanned while the selected cutoff remains too
+   old.
+4. If readiness is incomplete, return the first canonical frozen-page cutoff
+   delay and its preceding stable-prefix count before publish admission and
+   before any page enters `TRANSITION`.
+5. Once every page is ready, make one full optimistic plan-refresh pass before
+   acquiring the first page-state write lock. One undo walk traces leading
+   `Lock` and `Delete` entries through the first image-producing `Insert` or
+   `Update` and produces an owned, cutoff-specific plan containing the required
+   image cutoff, cutoff-visible deletion bitmap, and representable transition
+   overlay markers. A matching page/cutoff/version plan may be reused.
+6. Load each page's paired mutation version before and after its refresh. Retain
+   the plan only on full-value equality; discard it immediately on mismatch
+   without retrying for a quiet window. The counter is not an odd/even seqlock
+   because different row writers may overlap. A stable image proof remains
+   cached even when its attempt-local bitmap and markers are discarded. Once
+   incremental readiness succeeds, later lock/delete ownership observed on the
+   frozen page is representable regardless of writer STS and cannot cause
+   another cutoff delay.
+7. Acquire lifecycle publish admission and arm the fatal irreversible guard,
+   then revalidate in canonical order under one page-state write lock at a
+   time. A matching page identity, cutoff, and full mutation version reuses the
+   plan; an absent or stale plan is rebuilt under that page-local lock without
+   reapplying the initial pre-fence blocker rule. Locked regeneration must
+   produce a plan because frozen pages cannot add an Insert/Update image after
+   stable readiness. Publish each page as `TRANSITION`, install its prepared
+   markers, and release its lock immediately. During this phase the batch is a
+   growing `TRANSITION` prefix followed by a `FROZEN` suffix.
+8. Build LWC blocks from immutable page values plus the prepared deletion
+   bitmap. Block-split retries reuse the bitmap rather than rescanning undo.
+9. Insert matching `ColumnBlockIndex` entries and build companion secondary
+   index entries from exactly the same prepared visible-row ranges.
+10. Publish one new table checkpoint root that contains:
    - new LWC blocks
    - new block-index state
    - updated `DiskTree` roots
@@ -159,6 +182,15 @@ Each RowPage moves through:
 
 This guarantees that newly checkpointed cold rows and their cold secondary
 index entries become durable together.
+
+The mutation version and prepared plans are volatile checkpoint coordination
+state. They do not change table-file, redo, catalog, or recovery formats.
+Shared transaction-status commit publication does not bump the version: an
+unresolved image cannot yield a ready plan, while a retained post-fence
+lock/delete marker owns its shared status reference and remains valid if that
+status commits after preparation. After workflow transition admission, any
+unexpected locked analysis, marker, build, publication, or commit failure is
+fatal and wakes transition-route waiters through storage poison.
 
 ### 4.2 Deletion Checkpoint
 

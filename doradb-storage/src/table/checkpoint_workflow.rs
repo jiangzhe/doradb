@@ -1,7 +1,9 @@
 use super::CheckpointCancelReason;
+use super::deletion_buffer::DeleteMarker;
 use super::lifecycle::{CheckpointPublishLease, TableLifecycle, TableTerminal};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use parking_lot::Mutex;
+use std::fmt;
 use std::mem::replace;
 use std::result::Result as StdResult;
 
@@ -19,6 +21,44 @@ pub(super) enum FrozenPageValidationState {
     Stable { required_cutoff_ts: Option<TrxID> },
 }
 
+#[derive(Clone)]
+pub(super) struct PreparedTransitionPage {
+    pub(super) page_id: PageID,
+    pub(super) start_row_id: RowID,
+    pub(super) end_row_id: RowID,
+    pub(super) cutoff_ts: TrxID,
+    pub(super) observed_version: u64,
+    pub(super) required_cutoff_ts: Option<TrxID>,
+    pub(super) del_bitmap: Vec<u64>,
+    pub(super) overlay_markers: Vec<(RowID, DeleteMarker)>,
+}
+
+impl PreparedTransitionPage {
+    #[inline]
+    pub(super) fn matches(&self, page: FrozenPage, cutoff_ts: TrxID, version: u64) -> bool {
+        self.page_id == page.page_id
+            && self.start_row_id == page.start_row_id
+            && self.end_row_id == page.end_row_id
+            && self.cutoff_ts == cutoff_ts
+            && self.observed_version == version
+    }
+}
+
+impl fmt::Debug for PreparedTransitionPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedTransitionPage")
+            .field("page_id", &self.page_id)
+            .field("start_row_id", &self.start_row_id)
+            .field("end_row_id", &self.end_row_id)
+            .field("cutoff_ts", &self.cutoff_ts)
+            .field("observed_version", &self.observed_version)
+            .field("required_cutoff_ts", &self.required_cutoff_ts)
+            .field("del_bitmap", &self.del_bitmap)
+            .field("overlay_marker_count", &self.overlay_markers.len())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct FrozenPageBatch {
     pub(super) table_id: TableID,
@@ -27,6 +67,7 @@ pub(super) struct FrozenPageBatch {
     pub(super) approximate_rows: usize,
     pub(super) pages: Vec<FrozenPage>,
     pub(super) validation: Vec<FrozenPageValidationState>,
+    pub(super) prepared: Vec<Option<PreparedTransitionPage>>,
 }
 
 impl FrozenPageBatch {
@@ -39,6 +80,8 @@ impl FrozenPageBatch {
         pages: Vec<FrozenPage>,
     ) -> Self {
         let validation = vec![FrozenPageValidationState::Unchecked; pages.len()];
+        let mut prepared = Vec::with_capacity(pages.len());
+        prepared.resize_with(pages.len(), || None);
         Self {
             table_id,
             frozen_ts,
@@ -46,6 +89,7 @@ impl FrozenPageBatch {
             approximate_rows,
             pages,
             validation,
+            prepared,
         }
     }
 
@@ -322,6 +366,47 @@ impl TableCheckpointWorkflow {
     }
 
     #[cfg(test)]
+    pub(super) fn prepared_page_ids(&self) -> Option<Vec<PageID>> {
+        match &*self.state.lock() {
+            TableCheckpointWorkflowState::Frozen(batch) => Some(
+                batch
+                    .prepared
+                    .iter()
+                    .filter_map(|plan| plan.as_ref().map(|plan| plan.page_id))
+                    .collect(),
+            ),
+            TableCheckpointWorkflowState::Idle
+            | TableCheckpointWorkflowState::Freezing
+            | TableCheckpointWorkflowState::Checkpointing { .. }
+            | TableCheckpointWorkflowState::Publishing
+            | TableCheckpointWorkflowState::Transition
+            | TableCheckpointWorkflowState::Closed => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn frozen_page_validation(
+        &self,
+    ) -> Option<Vec<(PageID, FrozenPageValidationState)>> {
+        match &*self.state.lock() {
+            TableCheckpointWorkflowState::Frozen(batch) => Some(
+                batch
+                    .pages
+                    .iter()
+                    .zip(&batch.validation)
+                    .map(|(page, validation)| (page.page_id, *validation))
+                    .collect(),
+            ),
+            TableCheckpointWorkflowState::Idle
+            | TableCheckpointWorkflowState::Freezing
+            | TableCheckpointWorkflowState::Checkpointing { .. }
+            | TableCheckpointWorkflowState::Publishing
+            | TableCheckpointWorkflowState::Transition
+            | TableCheckpointWorkflowState::Closed => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn state_name(&self) -> &'static str {
         match &*self.state.lock() {
             TableCheckpointWorkflowState::Idle => "Idle",
@@ -484,6 +569,45 @@ mod tests {
                 end_row_id: RowID::new(20),
             }],
         )
+    }
+
+    #[test]
+    fn test_prepared_transition_page_matches_identity_cutoff_and_full_version() {
+        let page = FrozenPage {
+            page_id: PageID::new(3),
+            start_row_id: RowID::new(10),
+            end_row_id: RowID::new(20),
+        };
+        let plan = PreparedTransitionPage {
+            page_id: page.page_id,
+            start_row_id: page.start_row_id,
+            end_row_id: page.end_row_id,
+            cutoff_ts: TrxID::new(100),
+            observed_version: 8,
+            required_cutoff_ts: Some(TrxID::new(90)),
+            del_bitmap: vec![],
+            overlay_markers: vec![],
+        };
+
+        assert!(plan.matches(page, TrxID::new(100), 8));
+        assert!(!plan.matches(page, TrxID::new(101), 8));
+        assert!(!plan.matches(page, TrxID::new(100), 10));
+        assert!(!plan.matches(
+            FrozenPage {
+                page_id: PageID::new(4),
+                ..page
+            },
+            TrxID::new(100),
+            8,
+        ));
+        assert!(!plan.matches(
+            FrozenPage {
+                end_row_id: RowID::new(21),
+                ..page
+            },
+            TrxID::new(100),
+            8,
+        ));
     }
 
     #[test]

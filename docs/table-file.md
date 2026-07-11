@@ -186,13 +186,20 @@ Secondary-index `DiskTree` updates are companion work of those checkpoints, not
 an independent third checkpoint stream.
 
 The table's volatile checkpoint workflow owns the canonical frozen-page batch
-and original fence. Lifecycle publish admission is acquired before the first
-row page enters `TRANSITION`, and is retained through root publication, runtime
-route installation, old-root retention, and checkpoint transaction commit.
-Deletion-only/root-only and silent-watermark attempts use the same gate through
-their irreversible publication or commit handoff. Consequently `DROP TABLE`
-either closes a reversible workflow immediately or asynchronously drains the
-publisher that already won admission.
+and original fence. Before publication it optimistically builds owned,
+cutoff-specific transition plans without page-state write locks. Frozen-page
+mutations use paired equality-only version increments; plans whose version
+changes during analysis are discarded immediately, and final reuse or rebuild
+is decided under one page-local state write lock. After the full optimistic
+refresh, lifecycle publish admission starts the irreversible workflow before
+the page-local transition loop. The batch can then contain a growing
+`TRANSITION` prefix and a still-`FROZEN` suffix, while the publisher retains
+admission through root publication, runtime route installation, old-root
+retention, and checkpoint transaction commit. Deletion-only/root-only and
+silent-watermark attempts use the same gate through their irreversible
+publication or commit handoff. Consequently `DROP TABLE` either closes a
+reversible workflow immediately or asynchronously drains the publisher that
+already won admission.
 
 ### 7.1 Data Checkpoint Publication
 
@@ -203,6 +210,12 @@ Data checkpoint publishes:
 - updated secondary-index `DiskTree` roots for the newly checkpointed rows
 - updated `pivot_row_id`
 - updated `heap_redo_start_ts`
+
+The LWC encoder and companion secondary-index sidecar consume the same prepared
+visibility bitmap. LWC block-split retries reuse that owned bitmap and do not
+walk row undo chains again. Prepared plans and mutation versions remain
+volatile; the durable LWC, block-index, delete metadata, secondary roots,
+allocation reachability, replay bounds, and atomic root format are unchanged.
 
 ### 7.2 Deletion Checkpoint Publication
 
