@@ -38,6 +38,10 @@ pub(crate) struct RowVersionMap {
     // It is guarded by rwlock so that checkpointer can block incoming
     // writers when switching frozen page to transition state.
     state: RwLock<RowPageState>,
+    // Equality-only version for optimistic frozen-page checkpoint plans.
+    // Writers publish paired bumps around every mutation. The value is not a
+    // seqlock: overlapping writers can leave either parity while still active.
+    frozen_mutation_version: AtomicU64,
 }
 
 impl RowVersionMap {
@@ -50,6 +54,7 @@ impl RowVersionMap {
             column_layout,
             create_cts: AtomicU64::new(0),
             state: RwLock::new(RowPageState::Active),
+            frozen_mutation_version: AtomicU64::new(0),
         }
     }
 
@@ -69,6 +74,40 @@ impl RowVersionMap {
     #[inline]
     pub(crate) fn write_state(&self) -> RwLockWriteGuard<'_, RowPageState> {
         self.state.write()
+    }
+
+    /// Loads the equality-only frozen-page mutation version.
+    #[inline]
+    pub(crate) fn frozen_mutation_version(&self) -> u64 {
+        self.frozen_mutation_version.load(Ordering::Acquire)
+    }
+
+    /// Publishes the opening bump before a frozen-page mutation.
+    #[inline]
+    pub(crate) fn begin_frozen_mutation(&self) {
+        let bumped = self.frozen_mutation_version.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |version| version.checked_add(1),
+        );
+        assert!(
+            bumped.is_ok(),
+            "frozen-page mutation version wrapped before opening bump"
+        );
+    }
+
+    /// Publishes the closing bump before the mutation guards are released.
+    #[inline]
+    pub(crate) fn finish_frozen_mutation(&self) {
+        let bumped = self.frozen_mutation_version.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |version| version.checked_add(1),
+        );
+        assert!(
+            bumped.is_ok(),
+            "frozen-page mutation version wrapped before closing bump"
+        );
     }
 
     /// Set commit timestamp of page creation.

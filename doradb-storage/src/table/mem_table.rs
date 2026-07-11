@@ -1434,7 +1434,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     {
         self.scan(guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
-            let col_layout = ctx.row_ver().unwrap().column_layout.as_ref();
+            let col_layout = ctx.expect_vmap().column_layout.as_ref();
             for row_access in ReadAllRows::new(page, ctx) {
                 if !row_action(col_layout, row_access.row()) {
                     return false;
@@ -1489,7 +1489,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         if !page.row_id_in_valid_range(row_id) {
             return Ok(None);
         }
-        let row_layout = ctx.row_ver().unwrap().column_layout.as_ref();
+        let row_layout = ctx.expect_vmap().column_layout.as_ref();
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         let row = access.row();
         if row.is_deleted() {
@@ -3829,7 +3829,7 @@ mod tests {
                 .unwrap()
                 .expect("inserted row page should validate");
             let (ctx, _) = page_guard.ctx_and_page();
-            let row_ver = ctx.row_ver().unwrap();
+            let row_ver = ctx.expect_vmap();
             *row_ver.write_state() = RowPageState::Transition;
             drop(page_guard);
 

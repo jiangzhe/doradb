@@ -48,9 +48,7 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         let page_id = page_guard.page_id();
         let versioned_page_id = page_guard.versioned_page_id();
         let (page_ctx, page) = page_guard.ctx_and_page();
-        let ver_map = page_ctx
-            .row_ver()
-            .expect("hot-row inserts require row-version metadata on page context");
+        let ver_map = page_ctx.expect_vmap();
         let state_guard = ver_map.read_state();
         if *state_guard != RowPageState::Active {
             return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
@@ -234,9 +232,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         key: Option<(usize, &[Val])>,
     ) -> LockRowForWrite<'b> {
         let (page_ctx, page) = page_guard.ctx_and_page();
-        let ver_map = page_ctx
-            .row_ver()
-            .expect("hot-row writes require row-version metadata on page context");
+        let ver_map = page_ctx.expect_vmap();
         loop {
             #[cfg(test)]
             {

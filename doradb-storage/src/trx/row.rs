@@ -12,7 +12,7 @@ use crate::trx::undo::{
     IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead,
     RowUndoKind, RowUndoRef, UndoStatus,
 };
-use crate::trx::ver_map::{RowPageState, RowVersionReadGuard, RowVersionWriteGuard};
+use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
@@ -894,15 +894,14 @@ pub(crate) struct RowWriteAccess<'a> {
     row_idx: usize,
     guard: RowVersionWriteGuard<'a>,
     _state_guard: RwLockReadGuard<'a, RowPageState>,
+    frozen_version_map: Option<&'a RowVersionMap>,
 }
 
 impl<'a> RowWriteAccess<'a> {
     /// Acquire write access to one row and read-lock the page state.
     #[inline]
     pub(crate) fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
-        let ver_map = ctx
-            .row_ver()
-            .expect("write_row not supported without undo map");
+        let ver_map = ctx.expect_vmap();
         let state_guard = ver_map.read_state();
         Self::new_with_state_guard(page, ctx, row_idx, state_guard)
     }
@@ -915,15 +914,23 @@ impl<'a> RowWriteAccess<'a> {
         row_idx: usize,
         state_guard: RwLockReadGuard<'a, RowPageState>,
     ) -> Self {
-        let ver_map = ctx
-            .row_ver()
-            .expect("write_row not supported without undo map");
+        let ver_map = ctx.expect_vmap();
         let guard = ver_map.write_latch(row_idx);
+        let frozen_version_map = if *state_guard == RowPageState::Frozen {
+            // The row latch and page-state guard are already held, so a final
+            // page-state writer cannot pass this modifier before its paired
+            // closing bump is published from `Drop`.
+            ver_map.begin_frozen_mutation();
+            Some(ver_map)
+        } else {
+            None
+        };
         RowWriteAccess {
             page,
             row_idx,
             guard,
             _state_guard: state_guard,
+            frozen_version_map,
         }
     }
 
@@ -1281,6 +1288,16 @@ impl<'a> RowWriteAccess<'a> {
     }
 }
 
+impl Drop for RowWriteAccess<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(ver_map) = self.frozen_version_map {
+            // This runs before Rust releases either retained lock field.
+            ver_map.finish_frozen_mutation();
+        }
+    }
+}
+
 /// Result of trying to install or reuse a row undo lock.
 pub(crate) enum LockUndo {
     /// The row undo lock is available or installed.
@@ -1331,9 +1348,11 @@ mod tests {
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
     };
+    use crate::trx::undo::RowUndoHead;
     use crate::trx::{MIN_ACTIVE_TRX_ID, ver_map::RowVersionMap};
     use crate::value::ValKind;
     use std::collections::BTreeMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
 
     fn sparse_metadata() -> TableMetadata {
@@ -1361,12 +1380,208 @@ mod tests {
         page
     }
 
+    fn row_page_with_two_rows(metadata: &TableMetadata) -> RowPage {
+        let page = row_page(metadata);
+        assert!(
+            page.insert(metadata.col.as_ref(), &[Val::from(30i32), Val::from(40i32)])
+                .is_ok()
+        );
+        page
+    }
+
     fn test_trx_context(sts: TrxID) -> TrxContext {
         TrxContext {
             status: Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + sts.as_u64())),
             sts,
             gc_no: 0,
         }
+    }
+
+    #[test]
+    fn test_row_write_access_pairs_frozen_mutation_version() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        *row_ver.write_state() = RowPageState::Frozen;
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let row_ver = frame_ctx.expect_vmap();
+
+        assert_eq!(row_ver.frozen_mutation_version(), 0);
+        {
+            let _access = RowWriteAccess::new(&page, &frame_ctx, 0);
+            assert_eq!(row_ver.frozen_mutation_version(), 1);
+        }
+        assert_eq!(row_ver.frozen_mutation_version(), 2);
+
+        *row_ver.write_state() = RowPageState::Active;
+        drop(RowWriteAccess::new(&page, &frame_ctx, 0));
+        assert_eq!(row_ver.frozen_mutation_version(), 2);
+    }
+
+    #[test]
+    fn test_row_write_access_closes_frozen_version_during_unwind() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        *row_ver.write_state() = RowPageState::Frozen;
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _access = RowWriteAccess::new(&page, &frame_ctx, 0);
+            panic!("exercise unwind cleanup");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(frame_ctx.expect_vmap().frozen_mutation_version(), 2);
+    }
+
+    #[test]
+    fn test_overlapping_frozen_writers_do_not_use_version_parity_as_quiescence() {
+        let metadata = sparse_metadata();
+        let page = row_page_with_two_rows(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        *row_ver.write_state() = RowPageState::Frozen;
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let row_ver = frame_ctx.expect_vmap();
+
+        let first = RowWriteAccess::new(&page, &frame_ctx, 0);
+        assert_eq!(row_ver.frozen_mutation_version(), 1);
+        let second = RowWriteAccess::new(&page, &frame_ctx, 1);
+        assert_eq!(row_ver.frozen_mutation_version(), 2);
+
+        drop(first);
+        assert_eq!(row_ver.frozen_mutation_version(), 3);
+        drop(second);
+        assert_eq!(row_ver.frozen_mutation_version(), 4);
+        assert_ne!(row_ver.frozen_mutation_version(), 0);
+    }
+
+    #[test]
+    fn test_active_page_mutations_do_not_change_frozen_version() {
+        let metadata = sparse_metadata();
+        let page = row_page_with_two_rows(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let row_ver = frame_ctx.expect_vmap();
+        assert_eq!(row_ver.inspect_state(), RowPageState::Active);
+
+        assert!(
+            page.insert(metadata.col.as_ref(), &[Val::from(50i32), Val::from(60i32)])
+                .is_ok()
+        );
+        {
+            let _access = RowWriteAccess::new(&page, &frame_ctx, 0);
+            page.update_col(metadata.col.as_ref(), 0, 0, &Val::from(11i32), 0, true);
+        }
+        {
+            let mut access = RowWriteAccess::new(&page, &frame_ctx, 1);
+            access.delete_row();
+        }
+
+        let rollback_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10));
+        let rollback_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            rollback_status,
+            rollback_undo.leak(),
+        )));
+        // Statement rollback and full transaction rollback share this row
+        // restoration boundary, so exercise two independent rollback passes.
+        RowWriteAccess::new(&page, &frame_ctx, 0).rollback_first_undo(&metadata, rollback_undo);
+        let trx_rollback_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 11)),
+            trx_rollback_undo.leak(),
+        )));
+        RowWriteAccess::new(&page, &frame_ctx, 0).rollback_first_undo(&metadata, trx_rollback_undo);
+
+        let purge_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
+        *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
+            Arc::new(SharedTrxStatus::new(TrxID::new(20))),
+            purge_undo.leak(),
+        )));
+        RowWriteAccess::new(&page, &frame_ctx, 1).purge_undo_chain(TrxID::new(21));
+
+        assert_eq!(row_ver.frozen_mutation_version(), 0);
+    }
+
+    #[test]
+    fn test_frozen_delete_rollbacks_and_purge_publish_paired_versions() {
+        let metadata = sparse_metadata();
+        let page = row_page_with_two_rows(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        *row_ver.write_state() = RowPageState::Frozen;
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let row_ver = frame_ctx.expect_vmap();
+        let repeated_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 9));
+        let repeated_first_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        let repeated_second_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            Arc::clone(&repeated_status),
+            repeated_first_undo.leak(),
+        )));
+        *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
+            repeated_status,
+            repeated_second_undo.leak(),
+        )));
+
+        {
+            let mut access = RowWriteAccess::new(&page, &frame_ctx, 0);
+            assert_eq!(row_ver.frozen_mutation_version(), 1);
+            access.delete_row();
+        }
+        assert_eq!(row_ver.frozen_mutation_version(), 2);
+        {
+            let mut access = RowWriteAccess::new(&page, &frame_ctx, 1);
+            assert_eq!(row_ver.frozen_mutation_version(), 3);
+            access.delete_row();
+        }
+        assert_eq!(row_ver.frozen_mutation_version(), 4);
+
+        let rollback_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10));
+        let rollback_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            rollback_status,
+            rollback_undo.leak(),
+        )));
+        let prepared_version = row_ver.frozen_mutation_version();
+        // First model statement rollback of the current undo entry.
+        {
+            let mut access = RowWriteAccess::new(&page, &frame_ctx, 0);
+            assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 1);
+            access.rollback_first_undo(&metadata, rollback_undo);
+        }
+        assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
+
+        let trx_rollback_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 11)),
+            trx_rollback_undo.leak(),
+        )));
+        let prepared_version = row_ver.frozen_mutation_version();
+        // Then model the identical boundary reached by transaction rollback.
+        RowWriteAccess::new(&page, &frame_ctx, 0).rollback_first_undo(&metadata, trx_rollback_undo);
+        assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
+
+        let purge_undo =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
+        *row_ver.write_latch(1) = Some(Box::new(RowUndoHead::new(
+            Arc::new(SharedTrxStatus::new(TrxID::new(20))),
+            purge_undo.leak(),
+        )));
+        let prepared_version = row_ver.frozen_mutation_version();
+        {
+            let mut access = RowWriteAccess::new(&page, &frame_ctx, 1);
+            assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 1);
+            access.purge_undo_chain(TrxID::new(21));
+        }
+        assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
     }
 
     #[test]

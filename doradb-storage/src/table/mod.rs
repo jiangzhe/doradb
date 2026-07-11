@@ -7,15 +7,14 @@ mod hot;
 mod layout;
 mod lifecycle;
 mod mem_table;
+mod page_transition;
 mod persistence;
 mod recover;
 mod rollback;
 mod storage;
 pub(crate) use access::*;
-use checkpoint_workflow::{
-    FreezeAttempt, FrozenPage, FrozenPageBatch, FrozenPageValidationState, TableCheckpointWorkflow,
-};
 pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
+use checkpoint_workflow::{FrozenPage, FrozenPageBatch, TableCheckpointWorkflow};
 pub(crate) use deletion_buffer::*;
 pub(crate) use dml_validator::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
@@ -34,26 +33,24 @@ pub(crate) use storage::ColumnStorage;
 #[cfg(test)]
 pub(crate) use tests::{test_hooks, test_user_table_id};
 
-use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
-use crate::file::table_file::{ActiveRoot, LwcBlockPersist, TableFile};
+use crate::error::{DataIntegrityError, Error, FatalError, InternalError, OperationError, Result};
+use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
-    BlockIndex, ColumnBlockEntryShape, NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime,
-    SecondaryIndex, UniqueMemIndex,
+    BlockIndex, NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime, SecondaryIndex,
+    UniqueMemIndex,
 };
-use crate::lwc::LwcBuilder;
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol, UpdateIndex};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
-use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
-use crate::trx::ver_map::RowPageState;
-use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxReadProof, trx_is_committed};
+use crate::trx::sys::TransactionSystem;
+use crate::trx::undo::{IndexBranch, RowUndoKind};
+use crate::trx::{TrxContext, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
 use parking_lot::Mutex;
@@ -522,376 +519,6 @@ impl Table {
             .ok_or_else(|| self.missing_pool_guard(operation, "meta"))
     }
 
-    async fn load_frozen_pages_for_transition(
-        &self,
-        guards: &PoolGuards,
-        frozen_pages: &[FrozenPage],
-    ) -> Result<Vec<PageSharedGuard<RowPage>>> {
-        let mut page_guards = Vec::with_capacity(frozen_pages.len());
-        for page_info in frozen_pages {
-            page_guards.push(
-                self.mem
-                    .must_get_row_page_shared(guards, page_info.page_id)
-                    .await?,
-            );
-        }
-        Ok(page_guards)
-    }
-
-    fn validate_and_publish_loaded_pages_frozen(
-        &self,
-        page_guards: &[PageSharedGuard<RowPage>],
-        pages: &[FrozenPage],
-        attempt: &mut FreezeAttempt<'_>,
-    ) -> bool {
-        assert_eq!(
-            page_guards.len(),
-            pages.len(),
-            "freeze page guard count mismatch: table_id={}",
-            self.table_id()
-        );
-
-        // Preflight is fully reversible. Workflow admission excludes another
-        // maintenance state transition, while foreground writers do not change
-        // page state or row-page identity.
-        for (page_guard, page_info) in page_guards.iter().zip(pages) {
-            let (ctx, page) = page_guard.ctx_and_page();
-            assert_eq!(
-                page_guard.page_id(),
-                page_info.page_id,
-                "freeze page id mismatch: table_id={}",
-                self.table_id()
-            );
-            assert_eq!(
-                page.header.start_row_id,
-                page_info.start_row_id,
-                "freeze page start row id mismatch: table_id={}, page_id={}",
-                self.table_id(),
-                page_info.page_id
-            );
-            let state = ctx.row_ver().unwrap().inspect_state();
-            assert_eq!(
-                state,
-                RowPageState::Active,
-                "admitted freeze requires ACTIVE page: table_id={}, page_id={}",
-                self.table_id(),
-                page_info.page_id
-            );
-        }
-
-        // No fallible operation or await is allowed after workflow publication
-        // admission. Each state critical section is independent so unrelated
-        // page writers are not held behind a batch-wide set of state locks.
-        if !attempt.begin_page_publication() {
-            return false;
-        }
-        for (page_guard, page_info) in page_guards.iter().zip(pages) {
-            let (ctx, _) = page_guard.ctx_and_page();
-            let mut state = ctx.row_ver().unwrap().write_state();
-            assert_eq!(
-                *state,
-                RowPageState::Active,
-                "freeze page state changed after preflight: table_id={}, page_id={}",
-                self.table_id(),
-                page_info.page_id
-            );
-            #[cfg(test)]
-            test_hooks::run_test_freeze_page_state_locked_hook(page_info.page_id);
-            *state = RowPageState::Frozen;
-        }
-        true
-    }
-
-    fn validate_and_set_loaded_frozen_pages_to_transition<F>(
-        &self,
-        page_guards: &[PageSharedGuard<RowPage>],
-        batch: &mut FrozenPageBatch,
-        cutoff_ts: TrxID,
-        arm_transition_guard: F,
-    ) -> StdResult<Option<FrozenPageValidationDelay>, CheckpointCancelReason>
-    where
-        F: FnOnce() -> StdResult<(), CheckpointCancelReason>,
-    {
-        assert_eq!(
-            page_guards.len(),
-            batch.pages.len(),
-            "frozen page batch guard count mismatch: table_id={}",
-            batch.table_id
-        );
-        assert_eq!(
-            batch.validation.len(),
-            batch.pages.len(),
-            "frozen page batch validation count mismatch: table_id={}",
-            batch.table_id
-        );
-
-        // Holding every state write lock closes the validation-to-transition
-        // race for deletes, which remain allowed while a page is frozen.
-        let mut state_guards = Vec::with_capacity(page_guards.len());
-        for (page_guard, page_info) in page_guards.iter().zip(&batch.pages) {
-            let (ctx, page) = page_guard.ctx_and_page();
-            assert_eq!(
-                page_guard.page_id(),
-                page_info.page_id,
-                "frozen page batch page id mismatch: table_id={}",
-                batch.table_id
-            );
-            assert_eq!(
-                page.header.start_row_id, page_info.start_row_id,
-                "frozen page batch start row id mismatch: table_id={}, page_id={}",
-                batch.table_id, page_info.page_id
-            );
-            let state = ctx.row_ver().unwrap().write_state();
-            assert_eq!(
-                *state,
-                RowPageState::Frozen,
-                "frozen page batch state mismatch: table_id={}, page_id={}",
-                batch.table_id,
-                page_info.page_id
-            );
-            state_guards.push(state);
-        }
-
-        for (page_idx, page_guard) in page_guards.iter().enumerate() {
-            if matches!(
-                batch.validation[page_idx],
-                FrozenPageValidationState::Stable { .. }
-            ) {
-                continue;
-            }
-            let (ctx, page) = page_guard.ctx_and_page();
-            batch.validation[page_idx] = validate_frozen_page(page, ctx, batch.frozen_ts);
-        }
-
-        let mut stable_page_count = 0usize;
-        for (page_info, validation) in batch.pages.iter().zip(&batch.validation) {
-            match validation {
-                FrozenPageValidationState::Unchecked => unreachable!("page was not validated"),
-                FrozenPageValidationState::Blocked { required_cutoff_ts } => {
-                    return Ok(Some(FrozenPageValidationDelay {
-                        page_id: page_info.page_id,
-                        stable_page_count,
-                        required_cutoff_ts: *required_cutoff_ts,
-                        unresolved_status: true,
-                    }));
-                }
-                FrozenPageValidationState::Stable { required_cutoff_ts }
-                    if required_cutoff_ts.is_some_and(|required| required > cutoff_ts) =>
-                {
-                    return Ok(Some(FrozenPageValidationDelay {
-                        page_id: page_info.page_id,
-                        stable_page_count,
-                        required_cutoff_ts: *required_cutoff_ts,
-                        unresolved_status: false,
-                    }));
-                }
-                FrozenPageValidationState::Stable { .. } => {
-                    stable_page_count += 1;
-                }
-            }
-        }
-
-        arm_transition_guard()?;
-        for state in &mut state_guards {
-            **state = RowPageState::Transition;
-        }
-        for page_guard in page_guards {
-            let (ctx, page) = page_guard.ctx_and_page();
-            self.capture_delete_markers_for_transition(page, ctx, cutoff_ts);
-        }
-        Ok(None)
-    }
-
-    async fn build_lwc_blocks<C>(
-        &self,
-        metadata: &TableMetadata,
-        guards: &PoolGuards,
-        cutoff_ts: TrxID,
-        frozen_pages: &[FrozenPage],
-        mut collect_visible_row: Option<C>,
-    ) -> Result<Vec<LwcBlockPersist>>
-    where
-        C: FnMut(&RowPage, usize, RowID) -> Result<()>,
-    {
-        #[cfg(test)]
-        {
-            if test_hooks::test_force_lwc_build_error_enabled() {
-                return Err(Report::new(InternalError::InjectedTestFailure).into());
-            }
-        }
-        let mut lwc_blocks = Vec::new();
-        if !frozen_pages.is_empty() {
-            let mut builder = LwcBuilder::new(metadata.col.as_ref());
-            let mut current_start = RowID::new(0);
-            let mut current_end = RowID::new(0);
-            for page_info in frozen_pages {
-                let page_guard = self
-                    .mem
-                    .must_get_row_page_shared(guards, page_info.page_id)
-                    .await?;
-                let (ctx, page) = page_guard.ctx_and_page();
-                let view = page.vector_view_in_transition(
-                    metadata.col.as_ref(),
-                    ctx,
-                    cutoff_ts,
-                ).map_err(|err| {
-                    Report::new(InternalError::LwcBuilderMisuse).attach(format!(
-                        "validated transition view became stale: page_id={}, row_idx={}, status_ts={}, cutoff_ts={cutoff_ts}",
-                        page_info.page_id, err.row_idx, err.status_ts
-                    ))
-                })?;
-                if view.rows_non_deleted() == 0 {
-                    continue;
-                }
-                if let Some(collect_visible_row) = collect_visible_row.as_mut() {
-                    for (start_idx, end_idx) in view.range_non_deleted() {
-                        for row_idx in start_idx..end_idx {
-                            collect_visible_row(page, row_idx, page.row_id(row_idx))?;
-                        }
-                    }
-                }
-                if builder.is_empty() {
-                    current_start = page_info.start_row_id;
-                    current_end = page_info.end_row_id;
-                }
-                if !builder.append_view(page, view)? {
-                    let shape = ColumnBlockEntryShape::new(
-                        current_start,
-                        current_end,
-                        builder.row_ids().to_vec(),
-                        Vec::new(),
-                    )?;
-                    let buf = builder.build(shape.row_shape_fingerprint())?;
-                    lwc_blocks.push(LwcBlockPersist { shape, buf });
-                    builder = LwcBuilder::new(metadata.col.as_ref());
-                    current_start = page_info.start_row_id;
-                    current_end = page_info.end_row_id;
-                    let view = page.vector_view_in_transition(
-                        metadata.col.as_ref(),
-                        ctx,
-                        cutoff_ts,
-                    ).map_err(|err| {
-                        Report::new(InternalError::LwcBuilderMisuse).attach(format!(
-                            "validated transition view became stale: page_id={}, row_idx={}, status_ts={}, cutoff_ts={cutoff_ts}",
-                            page_info.page_id, err.row_idx, err.status_ts
-                        ))
-                    })?;
-                    if !builder.append_view(page, view)? {
-                        return Err(Report::new(InternalError::LwcBuilderMisuse)
-                            .attach(format!(
-                                "single row page does not fit in LWC block: page_id={}",
-                                page_info.page_id
-                            ))
-                            .into());
-                    }
-                } else {
-                    current_end = page_info.end_row_id;
-                }
-            }
-            if !builder.is_empty() {
-                let shape = ColumnBlockEntryShape::new(
-                    current_start,
-                    current_end,
-                    builder.row_ids().to_vec(),
-                    Vec::new(),
-                )?;
-                let buf = builder.build(shape.row_shape_fingerprint())?;
-                lwc_blocks.push(LwcBlockPersist { shape, buf });
-            }
-        }
-        Ok(lwc_blocks)
-    }
-
-    fn capture_delete_markers_for_transition(
-        &self,
-        page: &RowPage,
-        ctx: &FrameContext,
-        cutoff_ts: TrxID,
-    ) {
-        let Some(map) = ctx.row_ver() else {
-            return;
-        };
-        let row_count = page.header.row_count();
-        for row_idx in 0..row_count {
-            let undo_guard = map.read_latch(row_idx);
-            let Some(head) = undo_guard.as_ref() else {
-                continue;
-            };
-            let mut ts = head.next.main.status.ts();
-            let mut status = match &head.next.main.status {
-                UndoStatus::Ref(status) => Some(status.clone()),
-                UndoStatus::Committed(_) => None,
-            };
-            let mut entry = head.next.main.entry.clone();
-            let mut marker_recorded = false;
-            loop {
-                let row_id = page.row_id(row_idx);
-                match entry.as_ref().kind {
-                    RowUndoKind::Lock => {
-                        if !marker_recorded
-                            && let Some(trx_status) = status.as_ref()
-                            && !trx_is_committed(trx_status.ts())
-                        {
-                            let _ = self.deletion_buffer().put_ref(
-                                row_id,
-                                trx_status.clone(),
-                                MAX_SNAPSHOT_TS,
-                            );
-                            marker_recorded = true;
-                        }
-                    }
-                    RowUndoKind::Delete => {
-                        if !marker_recorded {
-                            match status.as_ref() {
-                                Some(trx_status) => {
-                                    let status_ts = trx_status.ts();
-                                    if trx_is_committed(status_ts) {
-                                        if status_ts >= cutoff_ts {
-                                            let _ = self
-                                                .deletion_buffer()
-                                                .put_committed(row_id, status_ts);
-                                            marker_recorded = true;
-                                        }
-                                    } else {
-                                        let _ = self.deletion_buffer().put_ref(
-                                            row_id,
-                                            trx_status.clone(),
-                                            MAX_SNAPSHOT_TS,
-                                        );
-                                        marker_recorded = true;
-                                    }
-                                }
-                                None => {
-                                    if ts >= cutoff_ts {
-                                        let _ = self.deletion_buffer().put_committed(row_id, ts);
-                                        marker_recorded = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    RowUndoKind::Insert | RowUndoKind::Update(_) => {
-                        break;
-                    }
-                }
-                let next = entry.as_ref().next.as_ref().map(|next| {
-                    let ts = next.main.status.ts();
-                    let status = match &next.main.status {
-                        UndoStatus::Ref(status) => Some(status.clone()),
-                        UndoStatus::Committed(_) => None,
-                    };
-                    (ts, status, next.main.entry.clone())
-                });
-                let Some((next_ts, next_status, next_entry)) = next else {
-                    break;
-                };
-                ts = next_ts;
-                status = next_status;
-                entry = next_entry;
-            }
-        }
-    }
-
     /// Returns total number of row pages.
     #[inline]
     pub(crate) async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
@@ -1253,12 +880,36 @@ impl<'ctx> TableRootSnapshot<'ctx> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FrozenPageValidationDelay {
-    page_id: PageID,
-    stable_page_count: usize,
-    required_cutoff_ts: Option<TrxID>,
-    unresolved_status: bool,
+struct IrreversibleCheckpointGuard<'a> {
+    trx_sys: &'a TransactionSystem,
+    armed: bool,
+}
+
+impl<'a> IrreversibleCheckpointGuard<'a> {
+    #[inline]
+    fn arm(trx_sys: &'a TransactionSystem) -> Self {
+        Self {
+            trx_sys,
+            armed: true,
+        }
+    }
+
+    #[inline]
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IrreversibleCheckpointGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            // Transition publication, a table-root swap, and checkpoint commit
+            // handoff cannot be abandoned safely. Poison storage so foreground
+            // route waiters and later maintenance fail closed.
+            let _ = self.trx_sys.poison_engine(FatalError::CheckpointWrite);
+        }
+    }
 }
 
 /// Stages newly built dual-tree secondary indexes until the caller publishes them.
@@ -1393,67 +1044,6 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
         builder.push(index_no, index);
     }
     Ok(builder.publish())
-}
-
-fn validate_frozen_page(
-    page: &RowPage,
-    ctx: &FrameContext,
-    frozen_ts: TrxID,
-) -> FrozenPageValidationState {
-    let Some(map) = ctx.row_ver() else {
-        return FrozenPageValidationState::Stable {
-            required_cutoff_ts: None,
-        };
-    };
-    let mut required_cutoff_ts = None;
-    let mut blocked = false;
-    for row_idx in 0..page.header.row_count() {
-        let undo_guard = map.read_latch(row_idx);
-        let Some(head) = undo_guard.as_ref() else {
-            continue;
-        };
-        let mut status = &head.next.main.status;
-        let mut entry = head.next.main.entry.as_ref();
-        loop {
-            let ts = status.ts();
-            let committed = trx_is_committed(ts);
-            match entry.kind {
-                RowUndoKind::Lock | RowUndoKind::Delete => {
-                    if !committed && active_writer_sts(ts) < frozen_ts {
-                        blocked = true;
-                    }
-                }
-                RowUndoKind::Insert | RowUndoKind::Update(_) => {
-                    if committed {
-                        let required = ts.saturating_add(1);
-                        required_cutoff_ts = Some(
-                            required_cutoff_ts
-                                .map_or(required, |current: TrxID| current.max(required)),
-                        );
-                    } else {
-                        blocked = true;
-                    }
-                    break;
-                }
-            }
-            let Some(next) = entry.next.as_ref() else {
-                break;
-            };
-            status = &next.main.status;
-            entry = next.main.entry.as_ref();
-        }
-    }
-    if blocked {
-        FrozenPageValidationState::Blocked { required_cutoff_ts }
-    } else {
-        FrozenPageValidationState::Stable { required_cutoff_ts }
-    }
-}
-
-#[inline]
-fn active_writer_sts(trx_id: TrxID) -> TrxID {
-    debug_assert!(!trx_is_committed(trx_id));
-    TrxID::new(trx_id.as_u64() & (MAX_SNAPSHOT_TS.as_u64() - 1))
 }
 
 #[inline]
@@ -1667,11 +1257,28 @@ pub(crate) mod tests {
         use std::cell::{Cell, RefCell};
 
         type FreezePageHook = Box<dyn FnOnce(PageID) + 'static>;
+        type FrozenPageAnalysisHook = Box<dyn FnMut(PageID) + 'static>;
+        type FrozenPageRowAnalyzedHook = Box<dyn FnMut(PageID, usize) + 'static>;
+        type FrozenPageImmediateComparisonHook = Box<dyn FnMut(PageID, u64, u64, bool) + 'static>;
+        type FrozenPagePhaseHook = Box<dyn FnOnce() + 'static>;
+        type TransitionPageHook = Box<dyn FnOnce(PageID) + 'static>;
         type HotRowWriteHook = Box<dyn FnOnce() + 'static>;
 
         thread_local! {
             static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
             static TEST_FREEZE_PAGE_STATE_LOCKED_HOOK: RefCell<Option<FreezePageHook>> =
+                const { RefCell::new(None) };
+            static TEST_FROZEN_PAGE_ANALYSIS_HOOK: RefCell<Option<FrozenPageAnalysisHook>> =
+                const { RefCell::new(None) };
+            static TEST_FROZEN_PAGE_ROW_ANALYZED_HOOK: RefCell<Option<FrozenPageRowAnalyzedHook>> =
+                const { RefCell::new(None) };
+            static TEST_FROZEN_PAGE_IMMEDIATE_COMPARISON_HOOK:
+                RefCell<Option<FrozenPageImmediateComparisonHook>> = const { RefCell::new(None) };
+            static TEST_FROZEN_PAGES_READY_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
+                const { RefCell::new(None) };
+            static TEST_FROZEN_PAGE_PLANS_REFRESHED_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
+                const { RefCell::new(None) };
+            static TEST_TRANSITION_PAGE_PUBLISHED_HOOK: RefCell<Option<TransitionPageHook>> =
                 const { RefCell::new(None) };
             static TEST_HOT_ROW_WRITE_BEFORE_STATE_LOCK_HOOK: RefCell<Option<HotRowWriteHook>> =
                 const { RefCell::new(None) };
@@ -1712,6 +1319,122 @@ pub(crate) mod tests {
 
         pub(crate) fn run_test_freeze_page_state_locked_hook(page_id: PageID) {
             let hook = TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn set_test_transition_page_published_hook<F>(hook: F)
+        where
+            F: FnOnce(PageID) + 'static,
+        {
+            TEST_TRANSITION_PAGE_PUBLISHED_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "transition page hook already installed");
+            });
+        }
+
+        pub(crate) fn set_test_frozen_page_analysis_hook<F>(hook: F)
+        where
+            F: FnMut(PageID) + 'static,
+        {
+            TEST_FROZEN_PAGE_ANALYSIS_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "frozen-page analysis hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_frozen_page_analysis_hook(page_id: PageID) {
+            TEST_FROZEN_PAGE_ANALYSIS_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(page_id);
+                }
+            });
+        }
+
+        pub(crate) fn set_test_frozen_page_row_analyzed_hook<F>(hook: F)
+        where
+            F: FnMut(PageID, usize) + 'static,
+        {
+            TEST_FROZEN_PAGE_ROW_ANALYZED_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(
+                    old.is_none(),
+                    "frozen-page row-analysis hook already installed"
+                );
+            });
+        }
+
+        pub(crate) fn run_test_frozen_page_row_analyzed_hook(page_id: PageID, row_idx: usize) {
+            TEST_FROZEN_PAGE_ROW_ANALYZED_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(page_id, row_idx);
+                }
+            });
+        }
+
+        pub(crate) fn set_test_frozen_page_immediate_comparison_hook<F>(hook: F)
+        where
+            F: FnMut(PageID, u64, u64, bool) + 'static,
+        {
+            TEST_FROZEN_PAGE_IMMEDIATE_COMPARISON_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(
+                    old.is_none(),
+                    "frozen-page immediate-comparison hook already installed"
+                );
+            });
+        }
+
+        pub(crate) fn run_test_frozen_page_immediate_comparison_hook(
+            page_id: PageID,
+            version_before: u64,
+            version_after: u64,
+            retained: bool,
+        ) {
+            TEST_FROZEN_PAGE_IMMEDIATE_COMPARISON_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(page_id, version_before, version_after, retained);
+                }
+            });
+        }
+
+        pub(crate) fn set_test_frozen_pages_ready_hook<F>(hook: F)
+        where
+            F: FnOnce() + 'static,
+        {
+            TEST_FROZEN_PAGES_READY_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "frozen-pages-ready hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_frozen_pages_ready_hook() {
+            let hook = TEST_FROZEN_PAGES_READY_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        pub(crate) fn set_test_frozen_page_plans_refreshed_hook<F>(hook: F)
+        where
+            F: FnOnce() + 'static,
+        {
+            TEST_FROZEN_PAGE_PLANS_REFRESHED_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "frozen-page plans hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_frozen_page_plans_refreshed_hook() {
+            let hook = TEST_FROZEN_PAGE_PLANS_REFRESHED_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        pub(crate) fn run_test_transition_page_published_hook(page_id: PageID) {
+            let hook = TEST_TRANSITION_PAGE_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
             if let Some(hook) = hook {
                 hook(page_id);
             }

@@ -2254,7 +2254,7 @@ impl<'a> UserTableAccessor<'a> {
     {
         self.mem_scan(guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
-            let col_layout = ctx.row_ver().unwrap().column_layout.as_ref();
+            let col_layout = ctx.expect_vmap().column_layout.as_ref();
             for row_access in ReadAllRows::new(page, ctx) {
                 if !row_action(col_layout, row_access.row()) {
                     return false;
@@ -4729,7 +4729,7 @@ mod tests {
                 .await
                 .unwrap();
             let (ctx, _) = page_guard.ctx_and_page();
-            let row_ver = ctx.row_ver().unwrap();
+            let row_ver = ctx.expect_vmap();
             *row_ver.write_state() = RowPageState::Transition;
 
             let insert_page_guard = engine
@@ -5660,23 +5660,22 @@ mod tests {
                         .load_frozen_pages_for_transition(&session.pool_guards(), &frozen_pages)
                         .await
                         .unwrap();
-                    let mut publish_lease = None;
-                    let delay = table
-                        .validate_and_set_loaded_frozen_pages_to_transition(
+                    let delay = table.prepare_page_transition(
+                        &transition_pages,
+                        checkpoint_attempt.batch_mut().unwrap(),
+                        stmt.runtime().sts(),
+                    );
+                    assert!(delay.is_none());
+                    let transition_guard = table
+                        .try_begin_page_transition(&engine.inner().trx_sys)
+                        .unwrap();
+                    table
+                        .apply_page_transition(
                             &transition_pages,
                             checkpoint_attempt.batch_mut().unwrap(),
                             stmt.runtime().sts(),
-                            || {
-                                publish_lease = Some(
-                                    table
-                                        .checkpoint_workflow
-                                        .try_begin_transition(&table.lifecycle)?,
-                                );
-                                Ok(())
-                            },
                         )
                         .unwrap();
-                    assert!(delay.is_none());
 
                     let marker = table_for_internal_assertion(&engine, table_id)
                         .deletion_buffer()
@@ -5690,8 +5689,7 @@ mod tests {
                             panic!("uncommitted lock should remain as marker ref")
                         }
                     }
-                    table.checkpoint_workflow.finish_publication();
-                    drop(publish_lease);
+                    transition_guard.finish();
                     drop(root_lease);
                     drop(lock_row);
                     drop(page_guard);

@@ -233,12 +233,17 @@ pub(crate) enum FrameContext {
 }
 
 impl FrameContext {
-    /// Returns the row-version map when this context stores one.
+    /// Returns the row-version map required by normal runtime operations.
+    ///
+    /// Recovery-time callers must use [`FrameContext::recover`] or match the
+    /// context variant directly until the page is refreshed after redo replay.
     #[inline]
-    pub(crate) fn row_ver(&self) -> Option<&RowVersionMap> {
+    pub(crate) fn expect_vmap(&self) -> &RowVersionMap {
         match self {
-            FrameContext::RowVerMap(ver) => Some(ver),
-            FrameContext::RowRecoveryMap(_) => None,
+            FrameContext::RowVerMap(ver) => ver,
+            FrameContext::RowRecoveryMap(_) => {
+                panic!("row-version map required after recovery")
+            }
         }
     }
 
@@ -258,5 +263,39 @@ impl FrameContext {
             FrameContext::RowRecoveryMap(rec) => Some(rec),
             FrameContext::RowVerMap(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameContext;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::id::TrxID;
+    use crate::recovery::RowRecoveryMap;
+    use crate::trx::ver_map::RowVersionMap;
+    use crate::value::ValKind;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_expect_vmap_returns_version_map() {
+        let metadata = TableMetadata::try_new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I64,
+                ColumnAttributes::empty(),
+            )],
+            Vec::new(),
+        )
+        .expect("valid table metadata");
+        let ctx = FrameContext::RowVerMap(RowVersionMap::new(Arc::clone(&metadata.col), 1));
+
+        assert!(Arc::ptr_eq(&ctx.expect_vmap().column_layout, &metadata.col));
+    }
+
+    #[test]
+    #[should_panic(expected = "row-version map required after recovery")]
+    fn test_expect_vmap_rejects_recovery_map() {
+        let ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(1)));
+        let _ = ctx.expect_vmap();
     }
 }

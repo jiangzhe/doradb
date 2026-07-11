@@ -6,16 +6,11 @@
 //! but that's not included in this module.
 
 use crate::bitmap::{Bitmap, BitmapRangeFilter};
-use crate::buffer::frame::FrameContext;
 use crate::catalog::TableColumnLayout;
 use crate::error::{Error, InternalError, Result};
-use crate::id::TrxID;
 use crate::row::{RowPage, RowPageNullBitmap};
-use crate::trx::trx_is_committed;
-use crate::trx::undo::RowUndoKind;
 use crate::value::{PageVar, Val, ValBuffer, ValType};
 use error_stack::Report;
-use std::result::Result as StdResult;
 use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
     U32 as LeU32, U64 as LeU64,
@@ -390,67 +385,22 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
     }
 }
 
-/// Row image state that cannot be represented by a transition LWC view.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TransitionViewError {
-    /// Row offset within the source page.
-    pub(crate) row_idx: usize,
-    /// Active transaction id or future commit timestamp found in the chain.
-    pub(crate) status_ts: TrxID,
-}
-
 impl RowPage {
-    /// Create a vectorized view on row page in transition state.
-    /// This view reflects MVCC visibility at given snapshot timestamp.
+    /// Creates a transition view from checkpoint-prepared row visibility.
     #[inline]
-    pub(crate) fn vector_view_in_transition<'p, 'm>(
+    pub(crate) fn vector_view_with_del_bitmap<'p, 'm>(
         &'p self,
         col_layout: &'m TableColumnLayout,
-        ctx: &FrameContext,
-        cutoff_ts: TrxID,
-    ) -> StdResult<PageVectorView<'p, 'm>, TransitionViewError> {
-        let Some(map) = ctx.row_ver() else {
-            return Ok(self.vector_view(col_layout));
-        };
+        del_bitmap: Vec<u64>,
+    ) -> Result<PageVectorView<'p, 'm>> {
         let row_count = self.header.row_count();
-        let mut del_bitmap = self.del_bitmap(row_count);
-        for row_idx in 0..row_count {
-            let undo_guard = map.read_latch(row_idx);
-            let Some(head) = undo_guard.as_ref() else {
-                continue;
-            };
-            let mut ts = head.ts();
-            let mut entry = head.next.main.entry.clone();
-            loop {
-                match &entry.as_ref().kind {
-                    RowUndoKind::Lock => {}
-                    RowUndoKind::Delete => {
-                        if !trx_is_committed(ts) || ts >= cutoff_ts {
-                            del_bitmap.bitmap_unset(row_idx);
-                        } else {
-                            del_bitmap.bitmap_set(row_idx);
-                        }
-                        break;
-                    }
-                    RowUndoKind::Insert | RowUndoKind::Update(_) => {
-                        if !trx_is_committed(ts) || ts >= cutoff_ts {
-                            return Err(TransitionViewError {
-                                row_idx,
-                                status_ts: ts,
-                            });
-                        }
-                        del_bitmap.bitmap_unset(row_idx);
-                        break;
-                    }
-                }
-                match entry.as_ref().next.as_ref() {
-                    None => break,
-                    Some(next) => {
-                        ts = next.main.status.ts();
-                        entry = next.main.entry.clone();
-                    }
-                }
-            }
+        if del_bitmap.len() != row_count.div_ceil(64) {
+            return Err(Report::new(InternalError::LwcBuilderMisuse)
+                .attach(format!(
+                    "prepared delete bitmap shape mismatch: rows={row_count}, units={}",
+                    del_bitmap.len()
+                ))
+                .into());
         }
         Ok(PageVectorView {
             page: self,
@@ -522,21 +472,13 @@ fn append_scan_value(buf: &mut ValBuffer, val: &Val) -> Result<()> {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::buffer::page::VersionedPageID;
-    use crate::buffer::test_page_id;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
-    use crate::id::{RowID, TableID};
+    use crate::id::RowID;
     use crate::row::tests::create_row_page;
     use crate::row::{Delete, InsertRow};
-    use crate::trx::undo::{
-        MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, UndoStatus,
-    };
-    use crate::trx::ver_map::RowVersionMap;
-    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
     use std::borrow::Cow;
-    use std::sync::Arc;
 
     #[test]
     fn test_row_page_vector_scan() {
@@ -951,56 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_view_in_transition_revive_deleted_row() {
-        let metadata = TableMetadata::try_new(
-            vec![ColumnSpec {
-                column_name: SemiStr::new("c1"),
-                column_type: ValKind::I8,
-                column_attributes: ColumnAttributes::empty(),
-            }],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut page = create_row_page();
-        page.init(RowID::new(0), 1, metadata.col.as_ref());
-        let insert = vec![Val::I8(1)];
-        let res = page.insert(metadata.col.as_ref(), &insert);
-        assert!(matches!(res, InsertRow::Ok(id) if id == RowID::new(0)));
-        assert!(matches!(page.delete(RowID::new(0)), Delete::Ok));
-
-        let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
-        let undo = OwnedRowUndo::new(
-            TableID::new(0),
-            Some(VersionedPageID {
-                page_id: test_page_id(0),
-                generation: 0,
-            }),
-            page.row_id(0),
-            RowUndoKind::Delete,
-        );
-        let undo_ref = undo.leak();
-        let head = RowUndoHead {
-            next: NextRowUndo {
-                main: MainBranch {
-                    entry: undo_ref,
-                    status: UndoStatus::Committed(TrxID::new(200)),
-                },
-                indexes: vec![],
-            },
-            purge_ts: MIN_SNAPSHOT_TS,
-        };
-        *map.write_latch(0) = Some(Box::new(head));
-        let ctx = FrameContext::RowVerMap(map);
-
-        let view = page
-            .vector_view_in_transition(metadata.col.as_ref(), &ctx, TrxID::new(100))
-            .unwrap();
-        assert_eq!(view.rows_non_deleted(), 1);
-        let _keep_undo = undo;
-    }
-
-    #[test]
-    fn test_vector_view_in_transition_fast_path() {
+    fn test_vector_view_with_del_bitmap_uses_prepared_visibility() {
         let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("c1"),
@@ -1022,19 +915,16 @@ mod tests {
             InsertRow::Ok(id) if id == RowID::new(1)
         ));
         assert!(matches!(page.delete(RowID::new(1)), Delete::Ok));
-
-        let map = RowVersionMap::new(Arc::clone(&metadata.col), 2);
-        let ctx = FrameContext::RowVerMap(map);
-
-        let expected = page.vector_view(metadata.col.as_ref());
+        let mut prepared = page.del_bitmap(page.header.row_count());
+        prepared.bitmap_unset(1);
         let view = page
-            .vector_view_in_transition(metadata.col.as_ref(), &ctx, TrxID::new(100))
+            .vector_view_with_del_bitmap(metadata.col.as_ref(), prepared)
             .unwrap();
-        assert_eq!(view.rows_non_deleted(), expected.rows_non_deleted());
+        assert_eq!(view.rows_non_deleted(), 2);
     }
 
     #[test]
-    fn test_vector_view_in_transition_returns_uncommitted_insert_error() {
+    fn test_vector_view_with_del_bitmap_rejects_wrong_shape() {
         let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("c1"),
@@ -1051,38 +941,9 @@ mod tests {
             page.insert(metadata.col.as_ref(), &insert),
             InsertRow::Ok(id) if id == RowID::new(0)
         ));
-
-        let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
-        let uncommitted_ts = MIN_ACTIVE_TRX_ID + 1;
-        let undo = OwnedRowUndo::new(
-            TableID::new(0),
-            Some(VersionedPageID {
-                page_id: test_page_id(0),
-                generation: 0,
-            }),
-            page.row_id(0),
-            RowUndoKind::Insert,
+        assert!(
+            page.vector_view_with_del_bitmap(metadata.col.as_ref(), Vec::new())
+                .is_err()
         );
-        let undo_ref = undo.leak();
-        let head = RowUndoHead {
-            next: NextRowUndo {
-                main: MainBranch {
-                    entry: undo_ref,
-                    status: UndoStatus::Committed(uncommitted_ts),
-                },
-                indexes: vec![],
-            },
-            purge_ts: MIN_SNAPSHOT_TS,
-        };
-        *map.write_latch(0) = Some(Box::new(head));
-        let ctx = FrameContext::RowVerMap(map);
-
-        let Err(err) = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, TrxID::new(100))
-        else {
-            panic!("uncommitted insert should return a checked transition-view error");
-        };
-        assert_eq!(err.row_idx, 0);
-        assert_eq!(err.status_ts, uncommitted_ts);
-        let _keep_undo = undo;
     }
 }

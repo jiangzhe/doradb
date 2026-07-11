@@ -622,11 +622,8 @@ impl<P: BufferPool> RowPageIndex<P> {
 
                     match inserted.create_redo {
                         Ok(Some(create_cts)) => {
-                            if let Some(row_ver) =
-                                new_page.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver())
-                            {
-                                row_ver.set_create_cts(create_cts);
-                            }
+                            let (ctx, _) = new_page.ctx_and_page_mut();
+                            ctx.expect_vmap().set_create_cts(create_cts);
                         }
                         Ok(None) => (),
                         Err(err) => {
@@ -2107,13 +2104,8 @@ mod tests {
                     )
                     .await
                     .expect("test insert-page allocation should succeed");
-                let create_cts = page_guard
-                    .bf()
-                    .ctx
-                    .as_ref()
-                    .and_then(|ctx| ctx.row_ver())
-                    .map(|row_ver| row_ver.create_cts())
-                    .unwrap();
+                let (ctx, _) = page_guard.ctx_and_page();
+                let create_cts = ctx.expect_vmap().create_cts();
                 assert!(create_cts > TrxID::new(0));
 
                 let page_id = page_guard.page_id();
