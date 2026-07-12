@@ -1,4 +1,4 @@
-use event_listener::{Event, Listener};
+use event_listener::{Event, EventListener, Listener};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -104,6 +104,66 @@ impl Default for ChangeNotifier {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Monotonic `u64` progress paired with a coalesced change notification.
+///
+/// Waiters must use the value as their sticky predicate: check the value,
+/// register a listener, recheck the value, and wait only while the predicate
+/// remains false. The second check observes progress that raced listener
+/// registration, so a separate notification epoch is unnecessary.
+pub(crate) struct MonotonicU64 {
+    value: AtomicU64,
+    changed: Event,
+}
+
+impl MonotonicU64 {
+    /// Creates monotonic progress with the given initial value.
+    #[inline]
+    pub(crate) fn new(initial: u64) -> Self {
+        Self {
+            value: AtomicU64::new(initial),
+            changed: Event::new(),
+        }
+    }
+
+    /// Returns the current progress value.
+    #[inline]
+    pub(crate) fn load(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    /// Advances progress and wakes current listeners.
+    ///
+    /// Returns whether `candidate` advanced the published value. Equal or
+    /// smaller candidates are ignored.
+    #[inline]
+    pub(crate) fn advance(&self, candidate: u64) -> bool {
+        let mut current = self.value.load(Ordering::Acquire);
+        loop {
+            if candidate <= current {
+                return false;
+            }
+            match self.value.compare_exchange_weak(
+                current,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.changed.notify(usize::MAX);
+                    return true;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Registers for a subsequent progress notification.
+    #[inline]
+    pub(crate) fn listen(&self) -> EventListener {
+        self.changed.listen()
     }
 }
 
@@ -221,5 +281,35 @@ mod tests {
 
         notifier.notify();
         assert_eq!(notifier.epoch(), initial + 2);
+    }
+
+    #[test]
+    fn test_monotonic_u64_advances_and_notifies() {
+        smol::block_on(async {
+            let progress = MonotonicU64::new(10);
+            assert_eq!(progress.load(), 10);
+
+            let mut listener = Box::pin(progress.listen());
+            assert!(futures::poll!(listener.as_mut()).is_pending());
+            assert!(!progress.advance(10));
+            assert!(!progress.advance(9));
+            assert!(futures::poll!(listener.as_mut()).is_pending());
+
+            assert!(progress.advance(11));
+            assert_eq!(progress.load(), 11);
+            assert!(futures::poll!(listener.as_mut()).is_ready());
+        });
+    }
+
+    #[test]
+    fn test_monotonic_u64_value_records_prior_advance() {
+        let progress = MonotonicU64::new(10);
+        let observed = progress.load();
+
+        assert!(progress.advance(11));
+        let listener = progress.listen();
+
+        assert!(progress.load() > observed);
+        drop(listener);
     }
 }

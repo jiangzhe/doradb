@@ -1241,20 +1241,18 @@ mod tests {
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::serde::Ser;
-    use crate::session::{Session, tests::SessionTestExt};
+    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::assert_freeze_created;
-    use crate::table::{CheckpointOutcome, DeleteMarker, Table, TableRedoReplayFloor};
+    use crate::table::{DeleteMarker, Table, TableRedoReplayFloor};
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use crate::value::ValKind;
-    use smol::Timer;
     use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::iter::repeat_n;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Duration;
     use tempfile::TempDir;
 
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -1416,7 +1414,7 @@ mod tests {
         );
 
         let table = engine.catalog().get_table(table_id).await.unwrap();
-        checkpoint_published(&table, &mut session).await;
+        assert_checkpoint_published(&mut session, table.table_id()).await;
         drop(table);
         let mut durability_trx = session.begin_trx().unwrap();
         trx_insert_row_by_id(
@@ -1624,26 +1622,6 @@ mod tests {
                 })),
                 dml: BTreeMap::default(),
             },
-        )
-    }
-
-    async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
-        let mut last_delay = None;
-        for _ in 0..50 {
-            match session.checkpoint_table(table.table_id()).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts, .. } => return checkpoint_ts,
-                CheckpointOutcome::Delayed { reason } => {
-                    last_delay = Some(reason);
-                    Timer::after(Duration::from_millis(20)).await;
-                }
-                CheckpointOutcome::Cancelled { reason } => {
-                    panic!("checkpoint should publish, cancelled by {reason:?}")
-                }
-            }
-        }
-        panic!(
-            "checkpoint should publish, delayed after retries by {:?}",
-            last_delay.unwrap()
         )
     }
 
@@ -2874,7 +2852,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let root_floor = table.redo_replay_floor_snapshot();
             let mut session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut session).await;
+            assert_checkpoint_published(&mut session, table.table_id()).await;
             let watermark = engine
                 .catalog()
                 .storage
@@ -3045,7 +3023,7 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
             let root_after_checkpoint = table.file().active_root_unchecked();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
@@ -3166,7 +3144,7 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
             assert!(table.file().active_root_unchecked().pivot_row_id > cold_row_id);
 
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
@@ -3304,7 +3282,7 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
             assert!(
                 same_row_ids
                     .iter()
@@ -3450,7 +3428,7 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
             let root_after_checkpoint = table.file().active_root_unchecked();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
@@ -3562,7 +3540,7 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
 
             let mut trx = session.begin_trx().unwrap();
             let key0 = SelectKey::new(0, vec![Val::from(0u32)]);
@@ -3574,21 +3552,8 @@ mod tests {
                 DeleteMarker::Committed(ts) => ts,
                 DeleteMarker::Ref(status) => status.ts(),
             };
-            let trx_sys = session.engine().trx_sys.clone();
-            let mut ready = false;
-            for _ in 0..50 {
-                if trx_sys.calc_min_active_sts_for_gc() > marker0_ts {
-                    ready = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(20)).await;
-            }
-            assert!(
-                ready,
-                "deletion marker ts {} not yet below checkpoint cutoff",
-                marker0_ts
-            );
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            session.wait_for_gc_horizon_after(marker0_ts).await.unwrap();
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
             let checkpointed_cutoff = table.file().active_root_unchecked().deletion_cutoff_ts;
             assert!(checkpointed_cutoff > marker0_ts);
 
@@ -3608,7 +3573,6 @@ mod tests {
             assert!(insert.is_ok());
             trx.commit().await.unwrap();
 
-            drop(trx_sys);
             drop(table);
             drop(checkpoint_session);
             drop(session);
@@ -3756,7 +3720,8 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&checkpointed_table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, checkpointed_table.table_id())
+                .await;
 
             let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
@@ -3931,7 +3896,7 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
 
             let active_root = table.file().active_root_unchecked();
             let block_id = {
@@ -4050,7 +4015,7 @@ mod tests {
                     .unwrap(),
             );
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
 
             let mut trx = session.begin_trx().unwrap();
             for i in 0..64u32 {
@@ -4065,20 +4030,7 @@ mod tests {
                 DeleteMarker::Committed(ts) => ts,
                 DeleteMarker::Ref(status) => status.ts(),
             };
-            let trx_sys = session.engine().trx_sys.clone();
-            let mut ready = false;
-            for _ in 0..50 {
-                if trx_sys.calc_min_active_sts_for_gc() > marker_ts {
-                    ready = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(20)).await;
-            }
-            assert!(
-                ready,
-                "deletion marker ts {} not yet below checkpoint cutoff",
-                marker_ts
-            );
+            session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(&mut trx, &table, vec![Val::from(1000u32)]).await;
@@ -4091,7 +4043,7 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            checkpoint_published(&table, &mut checkpoint_session).await;
+            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
 
             let active_root = table.file().active_root_unchecked();
             let blob_ref = {
@@ -4115,7 +4067,6 @@ mod tests {
             };
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            drop(trx_sys);
             drop(checkpoint_session);
             drop(table);
             drop(session);

@@ -1,7 +1,7 @@
 use crate::error::{Error, InternalError, OperationError, Result};
 use crate::id::TableID;
 use error_stack::Report;
-use event_listener::{Event, listener};
+use event_listener::{Event, EventListener, listener};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -232,6 +232,12 @@ impl TableLifecycle {
     pub(crate) fn inspect_terminal(&self) -> TableTerminal {
         let (_, state) = self.inspect_state("read terminal");
         state.terminal
+    }
+
+    /// Registers for any table lifecycle state change.
+    #[inline]
+    pub(crate) fn listener(&self) -> EventListener {
+        self.changed.listen()
     }
 
     /// Ensures a foreground operation may proceed after logical locks are held.
@@ -740,7 +746,9 @@ fn begin_drop_metadata_active_err(table_id: TableID) -> Error {
 mod tests {
     use super::*;
     use crate::id::TrxID;
-    use crate::session::tests::SessionTestExt;
+    use crate::session::tests::{
+        SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_root_ready,
+    };
     use crate::table::CheckpointOutcome;
     use crate::table::tests::*;
     use crate::value::Val;
@@ -1032,7 +1040,7 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
 
-            wait_checkpoint_ready(table_id, &session).await;
+            wait_for_checkpoint_root_ready(&session, table_id).await;
             table_for_internal_assertion(&engine, table_id)
                 .start_drop_lifecycle()
                 .unwrap()
@@ -1066,7 +1074,7 @@ mod tests {
 
             let mut reader_session = engine.new_session().unwrap();
             let reader = reader_session.begin_trx().unwrap();
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
             assert!(matches!(
                 session.checkpoint_table(table_id).await.unwrap(),
                 CheckpointOutcome::Delayed { .. }

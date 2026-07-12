@@ -138,6 +138,15 @@ impl DroppedTableFileCleanupQueue {
 }
 
 impl TransactionSystem {
+    /// Request one coalescible full-purge observation.
+    ///
+    /// Bucket and retained-work state remain authoritative, so this best-effort
+    /// wake can be dropped or coalesced during shutdown without losing payload.
+    #[inline]
+    pub(crate) fn request_purge_observation(&self) {
+        let _ = self.purge_tx.send(Purge::HorizonAdvanced);
+    }
+
     /// Wake the purge coordinator for table-root retention cleanup only.
     ///
     /// This is best-effort. Dropping the purge receiver is the normal shutdown
@@ -1114,7 +1123,6 @@ fn purge_undo_chain_from_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::{Page, VersionedPageID};
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
@@ -1128,15 +1136,11 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::table::tests::bound_unique_index;
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
-    use crate::trx::row::RowReadAccess;
     use crate::trx::stmt::Statement;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus, SysTrxPayload};
     use crate::value::Val;
-    use smol::Timer;
     use std::sync::Arc;
-    use std::thread::sleep;
-    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     #[inline]
@@ -1953,13 +1957,14 @@ mod tests {
                 .unwrap();
 
             let table_id = table1(&engine).await;
-
-            // Since we populate metadata table, we need to count those purge transactions and rows.
-            // 100ms should be enough.
-            Timer::after(Duration::from_secs(1)).await;
-            let init_stats = engine.inner().trx_sys.trx_sys_stats();
-
             let mut session = engine.new_session().unwrap();
+            let initial_target = engine.inner().trx_sys.purge_handoff_cts();
+            session
+                .wait_for_purge_completion_after(initial_target)
+                .await
+                .unwrap();
+            let init_stats = engine.inner().trx_sys.trx_sys_stats();
+            let mut purge_target = initial_target;
             // insert
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
@@ -1970,8 +1975,7 @@ mod tests {
                     })
                     .await;
                 assert!(res.is_ok());
-                let res = trx.commit().await;
-                assert!(res.is_ok());
+                purge_target = trx.commit().await.unwrap();
             }
             // delete
             for i in 0..PURGE_SIZE {
@@ -1984,33 +1988,26 @@ mod tests {
                     })
                     .await;
                 assert!(res.is_ok());
-                let res = trx.commit().await;
-                assert!(res.is_ok());
+                purge_target = trx.commit().await.unwrap();
             }
 
-            // wait for GC.
-            let start = Instant::now();
-            loop {
-                let stats = engine.inner().trx_sys.trx_sys_stats();
-                assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
-                assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
-                assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
-                println!(
-                    "purge_trx={},purge_row={},purge_index={}",
-                    stats.purge_trx_count, stats.purge_row_count, stats.purge_index_count
-                );
-                if stats.purge_trx_count >= init_stats.purge_trx_count + PURGE_SIZE * 2
-                    && stats.purge_row_count >= init_stats.purge_row_count + PURGE_SIZE * 2
-                    && stats.purge_index_count >= init_stats.purge_index_count + PURGE_SIZE
-                {
-                    break;
-                }
-                if start.elapsed() >= Duration::from_secs(1) {
-                    panic!("gc timeout");
-                } else {
-                    sleep(Duration::from_millis(100));
-                }
-            }
+            session
+                .wait_for_purge_completion_after(purge_target)
+                .await
+                .unwrap();
+            let stats = engine.inner().trx_sys.trx_sys_stats();
+            assert_eq!(
+                stats.purge_trx_count,
+                init_stats.purge_trx_count + PURGE_SIZE * 2
+            );
+            assert_eq!(
+                stats.purge_row_count,
+                init_stats.purge_row_count + PURGE_SIZE * 2
+            );
+            assert_eq!(
+                stats.purge_index_count,
+                init_stats.purge_index_count + PURGE_SIZE
+            );
             drop(session);
         });
     }
@@ -2041,13 +2038,14 @@ mod tests {
                 .unwrap();
 
             let table_id = table1(&engine).await;
-
-            // Since we populate metadata table, we need to count those purge transactions and rows.
-            // 100ms should be enough.
-            Timer::after(Duration::from_millis(100)).await;
-            let init_stats = engine.inner().trx_sys.trx_sys_stats();
-
             let mut session = engine.new_session().unwrap();
+            let initial_target = engine.inner().trx_sys.purge_handoff_cts();
+            session
+                .wait_for_purge_completion_after(initial_target)
+                .await
+                .unwrap();
+            let init_stats = engine.inner().trx_sys.trx_sys_stats();
+            let mut purge_target = initial_target;
             // insert
             for i in 0..PURGE_SIZE {
                 let mut trx = session.begin_trx().unwrap();
@@ -2058,8 +2056,7 @@ mod tests {
                     })
                     .await;
                 assert!(res.is_ok());
-                let res = trx.commit().await;
-                assert!(res.is_ok());
+                purge_target = trx.commit().await.unwrap();
             }
             // delete
             for i in 0..PURGE_SIZE {
@@ -2072,74 +2069,25 @@ mod tests {
                     })
                     .await;
                 assert!(res.is_ok());
-                let res = trx.commit().await;
-                assert!(res.is_ok());
+                purge_target = trx.commit().await.unwrap();
             }
 
-            // wait for GC.
-            let start = Instant::now();
-            let mut gc_timeout = false;
-            loop {
-                let stats = engine.inner().trx_sys.trx_sys_stats();
-                assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
-                assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
-                assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
-                println!(
-                    "purge_trx={},purge_row={},purge_index={}",
-                    stats.purge_trx_count, stats.purge_row_count, stats.purge_index_count
-                );
-                if stats.purge_trx_count == init_stats.purge_trx_count + PURGE_SIZE * 2
-                    && stats.purge_row_count == init_stats.purge_row_count + PURGE_SIZE * 2
-                    && stats.purge_index_count == init_stats.purge_index_count + PURGE_SIZE
-                {
-                    break;
-                }
-                if start.elapsed() >= Duration::from_secs(1) {
-                    // panic!("gc timeout");
-                    gc_timeout = true;
-                    break;
-                } else {
-                    sleep(Duration::from_millis(100));
-                }
-            }
-            if gc_timeout {
-                // see which one is not purged, and its cts.
-                let table = engine.catalog().get_table(table_id).await.unwrap();
-                let pool_guards = full_pool_guards(&engine);
-                let index = bound_unique_index(&table, &pool_guards, 0);
-                let mut remained_row_ids = vec![];
-                index
-                    .scan_values(&mut remained_row_ids, TrxID::new(100))
-                    .await
-                    .unwrap();
-                println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
-                let row_id = remained_row_ids[0];
-                let location = table
-                    .find_row(&pool_guards, row_id)
-                    .await
-                    .expect("test row lookup should succeed");
-                let page_id = match location {
-                    RowLocation::RowPage(page_id) => page_id,
-                    _ => unreachable!(),
-                };
-                let mem_guard = engine.inner().mem_pool.pool_guard();
-                let page_guard: PageSharedGuard<RowPage> = engine
-                    .inner()
-                    .mem_pool
-                    .get_page(&mem_guard, page_id, LatchFallbackMode::Shared)
-                    .await
-                    .expect("buffer-pool read failed in test")
-                    .lock_shared_async()
-                    .await
-                    .unwrap();
-                let (ctx, page) = page_guard.ctx_and_page();
-                let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
-                let ts = access.ts();
-                println!("row ts={:?}", ts);
-            }
-            println!(
-                "final min_active_sts={}",
-                engine.inner().trx_sys.global_visible_sts()
+            session
+                .wait_for_purge_completion_after(purge_target)
+                .await
+                .unwrap();
+            let stats = engine.inner().trx_sys.trx_sys_stats();
+            assert_eq!(
+                stats.purge_trx_count,
+                init_stats.purge_trx_count + PURGE_SIZE * 2
+            );
+            assert_eq!(
+                stats.purge_row_count,
+                init_stats.purge_row_count + PURGE_SIZE * 2
+            );
+            assert_eq!(
+                stats.purge_index_count,
+                init_stats.purge_index_count + PURGE_SIZE
             );
             drop(session);
         });

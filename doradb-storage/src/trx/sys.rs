@@ -13,6 +13,7 @@ use crate::id::{SessionID, TrxID};
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
 use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, RedoLogWriter};
+use crate::notify::MonotonicU64;
 use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
@@ -445,12 +446,15 @@ pub(crate) struct TransactionSystem {
     /// It's updated by purge coordination after cleaning out-of-date version chains.
     ///
     /// Data associated with smaller timestamp will be always visible to all transactions.
-    global_visible_sts: CachePadded<AtomicU64>,
+    global_visible_sts: CachePadded<MonotonicU64>,
     /// Purge-published active transaction horizon.
     ///
     /// This advances as soon as purge observes active-bucket progress. Unlike
     /// `global_visible_sts`, it does not imply physical purge work has finished.
-    published_gc_horizon: CachePadded<AtomicU64>,
+    published_gc_horizon: CachePadded<MonotonicU64>,
+    /// Highest ordered CTS whose committed payload has reached the purge queue.
+    #[cfg(test)]
+    purge_handoff_cts: CachePadded<MonotonicU64>,
     /// Round-robin user-transaction GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
     /// Round-robin system-transaction GC number generator.
@@ -519,8 +523,10 @@ impl TransactionSystem {
         );
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
-            global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
-            published_gc_horizon: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
+            global_visible_sts: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
+            published_gc_horizon: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
+            #[cfg(test)]
+            purge_handoff_cts: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
             rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
             rr_sys_gc_no: CachePadded::new(AtomicUsize::new(0)),
             gc_buckets: gc_buckets.into_boxed_slice(),
@@ -1101,6 +1107,7 @@ impl TransactionSystem {
     ) -> Result<()> {
         let sts = inner.sts();
         let gc_no = inner.gc_no();
+        let status = inner.ctx().status();
         let pool_guards = attachment.pool_guards().clone();
         let mut table_cache = TableCache::new(&self.catalog);
         if inner
@@ -1132,6 +1139,7 @@ impl TransactionSystem {
         inner.release_transaction_locks(attachment);
         inner.finish_session_rollback(attachment);
         entry.finish(TrxEntryState::Terminal);
+        status.finish_terminal();
         Ok(())
     }
 
@@ -1147,7 +1155,10 @@ impl TransactionSystem {
             .payload
             .take()
             .expect("prepared no-op cleanup requires user transaction payload");
-        let PreparedTrxPayload::User { gc_no, sts, .. } = payload else {
+        let PreparedTrxPayload::User {
+            status, gc_no, sts, ..
+        } = payload
+        else {
             panic!("prepared no-op cleanup requires user transaction state")
         };
         self.record_rollback_for_purge(gc_no, sts);
@@ -1155,6 +1166,7 @@ impl TransactionSystem {
             s.rollback();
         }
         trx.release_transaction_locks();
+        status.finish_terminal();
     }
 
     /// Returns statistics of group commit.
@@ -1180,13 +1192,48 @@ impl TransactionSystem {
     /// Returns global visible snapshot timestamp.
     #[inline]
     pub(crate) fn global_visible_sts(&self) -> TrxID {
-        TrxID::new(self.global_visible_sts.load(Ordering::Relaxed))
+        TrxID::new(self.global_visible_sts.load())
     }
 
     /// Returns the purge-published active transaction GC horizon.
     #[inline]
     pub(crate) fn published_gc_horizon(&self) -> TrxID {
-        TrxID::new(self.published_gc_horizon.load(Ordering::Acquire))
+        TrxID::new(self.published_gc_horizon.load())
+    }
+
+    /// Registers for purge-published horizon advancement.
+    #[inline]
+    pub(crate) fn gc_horizon_listener(&self) -> EventListener {
+        self.published_gc_horizon.listen()
+    }
+
+    /// Registers for completed full-purge advancement.
+    #[inline]
+    pub(crate) fn purge_completion_listener(&self) -> EventListener {
+        self.global_visible_sts.listen()
+    }
+
+    /// Returns the highest ordered CTS handed to purge coordination.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn purge_handoff_cts(&self) -> TrxID {
+        TrxID::new(self.purge_handoff_cts.load())
+    }
+
+    /// Registers for ordered purge-handoff advancement.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn purge_handoff_listener(&self) -> EventListener {
+        self.purge_handoff_cts.listen()
+    }
+
+    /// Publish that ordered commit payloads through `cts` reached purge coordination.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn publish_purge_handoff(&self, cts: TrxID) {
+        let previous = self.purge_handoff_cts.load();
+        debug_assert!(cts.as_u64() >= previous);
+        self.purge_handoff_cts.advance(cts.as_u64());
     }
 
     /// Publish active transaction horizon progress observed by purge.
@@ -1197,32 +1244,13 @@ impl TransactionSystem {
     /// completes and updates `global_visible_sts`.
     #[inline]
     pub(crate) fn publish_gc_horizon(&self, sts: TrxID) -> bool {
-        let mut curr = self.published_gc_horizon.load(Ordering::Acquire);
-        loop {
-            if sts.as_u64() <= curr {
-                return false;
-            }
-            match self.published_gc_horizon.compare_exchange_weak(
-                curr,
-                sts.as_u64(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => curr = observed,
-            }
-        }
+        self.published_gc_horizon.advance(sts.as_u64())
     }
 
     /// Update global visible snapshot timestamp.
     #[inline]
-    pub(crate) fn update_global_visible_sts(&self, sts: TrxID) {
-        debug_assert!({
-            let curr_sts = TrxID::new(self.global_visible_sts.load(Ordering::Relaxed));
-            sts >= curr_sts
-        });
-        self.global_visible_sts
-            .store(sts.as_u64(), Ordering::SeqCst)
+    pub(crate) fn update_global_visible_sts(&self, sts: TrxID) -> bool {
+        self.global_visible_sts.advance(sts.as_u64())
     }
 
     #[inline]

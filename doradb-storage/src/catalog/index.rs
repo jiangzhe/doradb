@@ -1500,8 +1500,7 @@ mod tests {
     use crate::file::table_file::ActiveRoot;
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::session::Session;
-    use crate::session::tests::SessionTestExt;
-    use crate::table::CheckpointOutcome;
+    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::assert_freeze_created;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
@@ -1771,7 +1770,7 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            checkpoint_published(&table, &mut session).await;
+            assert_checkpoint_published(&mut session, table.table_id()).await;
 
             let index_no = session
                 .create_index(
@@ -1812,8 +1811,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let retained_root_fence = table.file().active_root_unchecked().effective_ts();
             engine.inner().trx_sys.request_table_root_retention_purge();
 
+            // Timer audit: bounded negative assertion while an active reader pins the root.
             for _ in 0..10 {
                 Timer::after(Duration::from_millis(10)).await;
                 assert_eq!(
@@ -1824,14 +1825,11 @@ mod tests {
             }
 
             read_trx.commit().await.unwrap();
-            engine.inner().trx_sys.request_table_root_retention_purge();
-            for _ in 0..100 {
-                if old_root_drop_count(retained_root_ptr) > drop_count_before {
-                    return;
-                }
-                Timer::after(Duration::from_millis(10)).await;
-            }
-            panic!("create index old root was not released after purge crossed the fence");
+            session
+                .wait_for_purge_completion_after(retained_root_fence)
+                .await
+                .unwrap();
+            assert!(old_root_drop_count(retained_root_ptr) > drop_count_before);
         });
     }
 
@@ -1916,7 +1914,7 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            checkpoint_published(&table, &mut session).await;
+            assert_checkpoint_published(&mut session, table.table_id()).await;
             delete_one_row(&table, &mut session, &single_key(2)).await;
 
             let index_no = session
@@ -1983,7 +1981,7 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            checkpoint_published(&table, &mut session).await;
+            assert_checkpoint_published(&mut session, table.table_id()).await;
             assert_eq!(
                 session
                     .create_index(
@@ -2366,28 +2364,6 @@ mod tests {
             .into_iter()
             .map(|(_, row_id)| row_id)
             .collect()
-    }
-
-    async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
-        let mut last_delay = None;
-        for _ in 0..50 {
-            match session.checkpoint_table(table.table_id()).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts, .. } => {
-                    return checkpoint_ts;
-                }
-                CheckpointOutcome::Delayed { reason } => {
-                    last_delay = Some(reason);
-                    Timer::after(Duration::from_millis(20)).await;
-                }
-                CheckpointOutcome::Cancelled { reason } => {
-                    panic!("checkpoint should publish, cancelled by {reason:?}")
-                }
-            }
-        }
-        panic!(
-            "checkpoint should publish, delayed after retries by {:?}",
-            last_delay.unwrap()
-        )
     }
 
     fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {

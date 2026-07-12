@@ -23,7 +23,7 @@ use crate::session::{Session, SessionRegistry};
 use crate::trx::sys::TransactionSystem;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ensure};
-use event_listener::{Event, Listener, listener};
+use event_listener::{Event, EventListener, Listener, listener};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem::forget;
@@ -86,6 +86,7 @@ struct EngineLifecycle {
     admission_released: Event,
     runtime_refs: AtomicUsize,
     runtime_refs_released: Event,
+    shutdown_started: Event,
     shutdown_lock: Mutex<()>,
 }
 
@@ -97,6 +98,7 @@ impl EngineLifecycle {
             admission_released: Event::new(),
             runtime_refs: AtomicUsize::new(0),
             runtime_refs_released: Event::new(),
+            shutdown_started: Event::new(),
             shutdown_lock: Mutex::new(()),
         }
     }
@@ -159,6 +161,7 @@ impl EngineLifecycle {
                         .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                     {
+                        self.shutdown_started.notify(usize::MAX);
                         return;
                     }
                 }
@@ -234,6 +237,12 @@ impl EngineLifecycle {
         if active_admissions == 1 {
             self.admission_released.notify(usize::MAX);
         }
+    }
+
+    /// Registers for the transition away from the running state.
+    #[inline]
+    fn shutdown_listener(&self) -> EventListener {
+        self.shutdown_started.listen()
     }
 }
 
@@ -706,6 +715,18 @@ impl EngineInner {
         Err(Report::new(LifecycleError::Shutdown)
             .attach(format!("{operation}: engine admission is closed"))
             .into())
+    }
+
+    /// Returns whether owner-side shutdown has started.
+    #[inline]
+    pub(crate) fn shutdown_started(&self) -> bool {
+        self.lifecycle.state() != EngineLifecycleState::Running
+    }
+
+    /// Registers for owner-side shutdown start.
+    #[inline]
+    pub(crate) fn shutdown_listener(&self) -> EventListener {
+        self.lifecycle.shutdown_listener()
     }
 
     /// Run immediate synchronous work under engine admission.
@@ -1568,6 +1589,26 @@ mod tests {
             assert_eq!(result, Ok(()));
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
             shutdown_handle.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_engine_shutdown_wakes_maintenance_progress_wait() {
+        let root = TempDir::new().unwrap();
+        let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
+        let session = engine.new_session().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let waiter = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let err = smol::block_on(session.wait_for_gc_horizon_after(TrxID::new(u64::MAX)))
+                    .unwrap_err();
+                assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            });
+            started_rx.recv().unwrap();
+            engine.shutdown().unwrap();
+            waiter.join().unwrap();
         });
     }
 

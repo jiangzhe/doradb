@@ -189,7 +189,7 @@ mod tests {
     use crate::id::{PageID, TrxID};
     use crate::index::IndexInsert;
     use crate::row::ops::UpdateCol;
-    use crate::session::tests::SessionTestExt;
+    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::*;
     use crate::value::Val;
     use std::sync::Arc;
@@ -223,7 +223,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(6i32);
             let reader = session.begin_trx().unwrap();

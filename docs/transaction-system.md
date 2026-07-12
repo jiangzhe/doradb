@@ -379,6 +379,15 @@ precommit performs no rollback or active-STS removal.
   are not purged merely because a row became cold, crossed `pivot_row_id`, or no
   longer appears in the deletion buffer.
 
+The private shared transaction status has a sticky terminal-resolution event
+used only for maintenance coordination. Commit publishes it after storing the
+commit CTS. Successful active, abandoned, and failed-precommit rollback publish
+it only after rollback-capable row/index undo, purge bookkeeping, locks, and
+session cleanup have reached the safe reanalysis boundary. A rollback access
+failure does not publish normal resolution; storage poison is the terminal wake
+and ownership-retention boundary. The status event is not part of the public
+transaction API and does not change MVCC visibility.
+
 ### Checkpoint and Persistence
 
 ####  Index Checkpoint
@@ -468,6 +477,17 @@ horizon. A system payload has no STS to remove; its ordered CTS is its
 reclamation fence. Each purge round finishes eligible row-undo and index work
 from every bucket before the dispatcher deallocates any collected retired page,
 because undo in one bucket may still reference a page retired in another.
+
+Purge publishes two monotonic coordination boundaries in order. First it
+publishes the observed oldest-active-snapshot horizon, which is sufficient for
+checkpoint cutoff and active-root readiness but does not prove reclamation.
+After full eligible undo/index work, retired-page deallocation, retained-root
+processing, and coalesced cleanup complete, it publishes completed-purge
+progress. Idle-session waits expose these as separate strict `> ts` predicates,
+request a lossy/idempotent purge observation before sleeping, and terminate on
+storage poison or engine shutdown. Reclamation tests for a no-wait checkpoint
+system CTS separately observe its ordered redo-to-purge handoff before waiting
+for a later completed purge cycle.
 
 #### MemIndex Eviction
 

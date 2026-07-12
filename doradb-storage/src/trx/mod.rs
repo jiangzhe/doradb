@@ -51,7 +51,7 @@ use crate::session::TrxAttachment;
 use crate::table::Table;
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::Report;
-use event_listener::EventListener;
+use event_listener::{Event, EventListener};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem;
@@ -292,16 +292,21 @@ pub(crate) struct SharedTrxStatus {
     ts: AtomicU64,
     preparing: AtomicBool,
     prepare_ev: Mutex<Option<EventNotifyOnDrop>>,
+    terminal: AtomicBool,
+    terminal_ev: Event,
 }
 
 impl SharedTrxStatus {
     /// Create a new shared transaction status for given transaction id.
     #[inline]
     pub(crate) fn new(trx_id: TrxID) -> Self {
+        let terminal = trx_is_committed(trx_id);
         SharedTrxStatus {
             ts: AtomicU64::new(trx_id.as_u64()),
             preparing: AtomicBool::new(false),
             prepare_ev: Mutex::new(None),
+            terminal: AtomicBool::new(terminal),
+            terminal_ev: Event::new(),
         }
     }
 
@@ -317,6 +322,30 @@ impl SharedTrxStatus {
     pub(crate) fn commit_for_test(&self, cts: TrxID) {
         debug_assert!(trx_is_committed(cts));
         self.ts.store(cts.as_u64(), Ordering::SeqCst);
+        self.finish_terminal();
+    }
+
+    /// Publishes successful rollback resolution for deterministic status tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn rollback_for_test(&self) {
+        self.finish_terminal();
+    }
+
+    /// Returns whether commit or successful rollback reached its terminal boundary.
+    #[inline]
+    pub(crate) fn terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
+    /// Registers for terminal resolution, or returns `None` if it already happened.
+    #[inline]
+    pub(crate) fn terminal_listener(&self) -> Option<EventListener> {
+        if self.terminal() {
+            return None;
+        }
+        let listener = self.terminal_ev.listen();
+        (!self.terminal()).then_some(listener)
     }
 
     /// Returns whether this transaction is preparing.
@@ -358,7 +387,16 @@ impl SharedTrxStatus {
     #[inline]
     fn commit_prepared(&self, cts: TrxID) {
         self.ts.store(cts.as_u64(), Ordering::SeqCst);
+        self.finish_terminal();
         self.finish_preparing();
+    }
+
+    /// Publishes sticky successful terminal resolution and wakes all waiters.
+    #[inline]
+    fn finish_terminal(&self) {
+        if !self.terminal.swap(true, Ordering::AcqRel) {
+            self.terminal_ev.notify(usize::MAX);
+        }
     }
 
     /// Marks prepare complete and wakes listeners registered before completion.
@@ -1853,6 +1891,14 @@ impl PrecommitTrxPayload {
             status.finish_preparing();
         }
     }
+
+    #[inline]
+    fn finish_successful_rollback(&self) {
+        if let PrecommitTrxPayload::User { status, .. } = self {
+            status.finish_terminal();
+            status.finish_preparing();
+        }
+    }
 }
 
 /// Transaction in the logical Committing state.
@@ -1969,7 +2015,7 @@ impl PrecommitTrx {
             s.rollback();
         }
         if let Some(payload) = self.payload.take() {
-            payload.release_prepare_waiters();
+            payload.finish_successful_rollback();
         }
         true
     }
@@ -2216,6 +2262,27 @@ pub(crate) mod tests {
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
         test_engine_with_mem_size(log_file_stem, 64usize * 1024 * 1024).await
+    }
+
+    #[test]
+    fn test_shared_status_terminal_resolution_is_sticky_and_wakeable() {
+        smol::block_on(async {
+            let committed = SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1);
+            let mut commit_listener = Box::pin(committed.terminal_listener().unwrap());
+            assert!(futures::poll!(commit_listener.as_mut()).is_pending());
+            committed.commit_for_test(TrxID::new(10));
+            commit_listener.await;
+            assert!(committed.terminal());
+            assert!(committed.terminal_listener().is_none());
+
+            let rolled_back = SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 2);
+            let mut rollback_listener = Box::pin(rolled_back.terminal_listener().unwrap());
+            assert!(futures::poll!(rollback_listener.as_mut()).is_pending());
+            rolled_back.rollback_for_test();
+            rollback_listener.await;
+            assert!(rolled_back.terminal());
+            assert!(rolled_back.terminal_listener().is_none());
+        });
     }
 
     async fn test_engine_with_mem_size(
@@ -2656,6 +2723,7 @@ pub(crate) mod tests {
     }
 
     fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
+        // Timer audit: engine-shutdown/test-hook state inspection watchdog.
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done() {
             assert!(Instant::now() < deadline, "{message}");
@@ -3755,6 +3823,7 @@ pub(crate) mod tests {
                     break;
                 }
             }
+            // Timer audit: buffer-eviction/I/O test coordination.
             let mut evicted = false;
             for _ in 0..20 {
                 if test_frame_kind(&table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
@@ -3922,7 +3991,9 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(table_file.active_root_unchecked().root_ts, TrxID::new(2));
+            let retained_root_fence = table_file.active_root_unchecked().effective_ts();
 
+            // Timer audit: bounded negative assertion while an active reader pins the root.
             for _ in 0..10 {
                 Timer::after(Duration::from_millis(10)).await;
                 assert_eq!(
@@ -3932,14 +4003,11 @@ pub(crate) mod tests {
                 );
             }
             read_trx.commit().await.unwrap();
-            engine.inner().trx_sys.request_table_root_retention_purge();
-            for _ in 0..100 {
-                if old_root_drop_count(old_root_ptr) > drop_count_before {
-                    return;
-                }
-                Timer::after(Duration::from_millis(10)).await;
-            }
-            panic!("old root was not released after the fence crossed the purge horizon");
+            session
+                .wait_for_purge_completion_after(retained_root_fence)
+                .await
+                .unwrap();
+            assert!(old_root_drop_count(old_root_ptr) > drop_count_before);
         });
     }
 }

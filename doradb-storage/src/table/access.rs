@@ -3097,12 +3097,16 @@ mod tests {
     use crate::row::ops::{
         DeleteMvcc, RowUpdateInput, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
     };
-    use crate::session::tests::SessionTestExt;
+    use crate::session::tests::{
+        SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
+    };
     use crate::table::DeleteMarker;
     use crate::table::checkpoint_workflow::CheckpointPublicationGuard;
     use crate::table::hot::{HotRowDeleter, HotRowUpdater, RowInserter};
     use crate::table::tests::*;
-    use crate::table::{DeleteInternal, FreezeOutcome, InsertRowIntoPage, UpdateRowInplace};
+    use crate::table::{
+        CheckpointOutcome, DeleteInternal, FreezeOutcome, InsertRowIntoPage, UpdateRowInplace,
+    };
     use crate::trx::row::LockRowForWrite;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::fatal_rollback_retention_count;
@@ -3584,7 +3588,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let mut reader_session = engine.new_session().unwrap();
@@ -3619,7 +3623,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let mut reader_session = engine.new_session().unwrap();
@@ -3663,7 +3667,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let trx = session.begin_trx().unwrap();
@@ -3711,7 +3715,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let trx = session.begin_trx().unwrap();
@@ -3754,7 +3758,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let trx = session.begin_trx().unwrap();
@@ -3799,7 +3803,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let trx = session.begin_trx().unwrap();
@@ -3844,7 +3848,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let trx = session.begin_trx().unwrap();
@@ -3889,7 +3893,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(4i32);
             let trx = session.begin_trx().unwrap();
@@ -3927,7 +3931,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(5i32);
             let trx = session.begin_trx().unwrap();
@@ -3971,7 +3975,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(5i32);
             let mut writer_session = engine.new_session().unwrap();
@@ -4017,7 +4021,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let mut old_reader_session = engine.new_session().unwrap();
@@ -4116,7 +4120,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(5i32);
             let mut writer_session = engine.new_session().unwrap();
@@ -4172,7 +4176,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let old_key = single_key(2i32);
             let new_key = single_key(20i32);
@@ -4258,7 +4262,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(1i32);
             let duplicate_key = single_key(2i32);
@@ -4314,7 +4318,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let old_key = single_key(1i32);
             let claimed_key = single_key(2i32);
@@ -4375,7 +4379,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let old_key = single_key(1i32);
             let claimed_key = single_key(2i32);
@@ -4462,7 +4466,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let old_key = single_key(1i32);
             let claimed_key = single_key(2i32);
@@ -4569,7 +4573,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 1, 2, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let old_key = single_key(1i32);
             let claimed_key = single_key(2i32);
@@ -5297,7 +5301,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 5, "cold").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let mut trx = session.begin_trx().unwrap();
             assert_eq!(
@@ -5327,7 +5331,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 5, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let mut old_reader_session = engine.new_session().unwrap();
             let mut old_reader = old_reader_session.begin_trx().unwrap();
@@ -5360,7 +5364,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 3, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let mut old_reader_session = engine.new_session().unwrap();
             let mut old_reader = old_reader_session.begin_trx().unwrap();
@@ -5409,7 +5413,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let mut writer = session.begin_trx().unwrap();
             let res = trx_delete_row_by_id(&mut writer, table_id, &single_key(1i32)).await;
@@ -5438,7 +5442,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 6, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(4i32);
             let reader = session.begin_trx().unwrap();
@@ -5449,8 +5453,8 @@ mod tests {
 
             expect_delete_committed(table_id, &mut session, &key).await;
             let marker_ts = delete_marker_ts(table.deletion_buffer().get(row_id).unwrap());
-            wait_gc_cutoff_after(&session, marker_ts).await;
-            checkpoint_published(table_id, &mut session).await;
+            session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let snapshot = column_block_index_snapshot(&engine, table_id);
             let pool_guards = session.pool_guards();
@@ -5478,7 +5482,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 5, "cold").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
             insert_rows(table_id, &mut session, 100, 2, "hot").await;
 
             let mut trx = session.begin_trx().unwrap();
@@ -5796,22 +5800,20 @@ mod tests {
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(table_id, &mut checkpoint_session).await;
-
-            let mut reclaimed = false;
-            for _ in 0..20 {
-                if table_for_internal_assertion(&engine, table_id)
-                    .mem
-                    .get_row_page_versioned_shared(&session.pool_guards(), cached_page)
-                    .await
-                    .unwrap()
-                    .is_none()
-                {
-                    reclaimed = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(200)).await;
-            }
+            let outcome = checkpoint_session
+                .checkpoint_table_with_wait(table_id)
+                .await
+                .unwrap();
+            let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
+                panic!("checkpoint should publish, got {outcome:?}");
+            };
+            wait_for_checkpoint_purge(&session, redo_cts).await;
+            let reclaimed = table_for_internal_assertion(&engine, table_id)
+                .mem
+                .get_row_page_versioned_shared(&session.pool_guards(), cached_page)
+                .await
+                .unwrap()
+                .is_none();
             assert!(
                 reclaimed,
                 "row page should be reclaimed before repro insert"
@@ -5866,22 +5868,20 @@ mod tests {
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let mut checkpoint_session = engine.new_session().unwrap();
-            checkpoint_published(table_id, &mut checkpoint_session).await;
-
-            let mut reclaimed = false;
-            for _ in 0..20 {
-                if table_for_internal_assertion(&engine, table_id)
-                    .mem
-                    .get_row_page_versioned_shared(&session.pool_guards(), stale_page)
-                    .await
-                    .unwrap()
-                    .is_none()
-                {
-                    reclaimed = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(200)).await;
-            }
+            let outcome = checkpoint_session
+                .checkpoint_table_with_wait(table_id)
+                .await
+                .unwrap();
+            let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
+                panic!("checkpoint should publish, got {outcome:?}");
+            };
+            wait_for_checkpoint_purge(&session, redo_cts).await;
+            let reclaimed = table_for_internal_assertion(&engine, table_id)
+                .mem
+                .get_row_page_versioned_shared(&session.pool_guards(), stale_page)
+                .await
+                .unwrap()
+                .is_none();
             assert!(
                 reclaimed,
                 "row page should be reclaimed before stale-range validation"
@@ -5993,6 +5993,7 @@ mod tests {
                     break;
                 }
             }
+            // Timer audit: buffer-eviction/I/O test coordination.
             let mut evicted = false;
             for _ in 0..20 {
                 if test_frame_kind(
@@ -6080,6 +6081,7 @@ mod tests {
                     break;
                 }
             }
+            // Timer audit: buffer-eviction/I/O test coordination.
             let mut evicted = false;
             for _ in 0..20 {
                 if test_frame_kind(
@@ -6176,6 +6178,7 @@ mod tests {
                             break;
                         }
                     }
+                    // Timer audit: buffer-eviction/I/O test coordination.
                     let mut evicted = false;
                     for _ in 0..20 {
                         if test_frame_kind(
@@ -6307,6 +6310,7 @@ mod tests {
                 }
             }
 
+            // Timer audit: index-pool eviction/I/O test coordination.
             for _ in 0..20 {
                 let stats = engine.inner().index_pool.stats();
                 if stats.completed_writes > 0 && stats.write_errors == 0 {
@@ -6404,7 +6408,7 @@ mod tests {
             insert.commit().await.unwrap();
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let table = table_for_internal_assertion(&engine, table_id);
             let key = SelectKey::new(0, vec![Val::from(10i32)]);

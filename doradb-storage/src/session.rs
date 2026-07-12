@@ -15,12 +15,15 @@ use crate::stats::{
     BufferPoolStats, StorageIoStats, TransactionSystemStats, buffer_pool_runtime_stats_snapshot,
     storage_io_stats_snapshot, transaction_system_stats_snapshot,
 };
-use crate::table::{CheckpointOutcome, FreezeOutcome, SecondaryMemIndexCleanupStats, Table};
+use crate::table::{
+    CheckpointDelayReason, CheckpointOutcome, FreezeOutcome, SecondaryMemIndexCleanupStats, Table,
+};
 use crate::trx::{
     StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
     transaction_discarded_err,
 };
 use error_stack::Report;
+use futures::future::select_all;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -117,6 +120,32 @@ impl SessionDdlContext {
             owner: LockOwner::Session(id),
             owner_group: LockOwnerGroup::Session(id),
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MaintenanceBoundary {
+    GcHorizon,
+    PurgeCompletion,
+}
+
+impl MaintenanceBoundary {
+    #[inline]
+    fn observed(self, session: &SessionPin) -> TrxID {
+        match self {
+            MaintenanceBoundary::GcHorizon => session.engine.trx_sys.published_gc_horizon(),
+            MaintenanceBoundary::PurgeCompletion => session.engine.trx_sys.global_visible_sts(),
+        }
+    }
+
+    #[inline]
+    fn listener(self, session: &SessionPin) -> event_listener::EventListener {
+        match self {
+            MaintenanceBoundary::GcHorizon => session.engine.trx_sys.gc_horizon_listener(),
+            MaintenanceBoundary::PurgeCompletion => {
+                session.engine.trx_sys.purge_completion_listener()
+            }
+        }
     }
 }
 
@@ -390,6 +419,76 @@ impl Session {
             .resolve_existing_user_table(table_id, "checkpoint table")
             .await?;
         table.checkpoint(session).await
+    }
+
+    /// Wait until retry may be useful for one self-identifying checkpoint delay.
+    ///
+    /// Completion means the observed predicate is satisfied or obsolete; a
+    /// later checkpoint attempt can still encounter a different delay.
+    pub async fn wait_for_checkpoint_retry(&self, reason: CheckpointDelayReason) -> Result<()> {
+        let session = self.pin("wait for checkpoint retry")?;
+        ensure_idle_maintenance_session(&session, "wait for checkpoint retry")?;
+        let table_id = match reason {
+            CheckpointDelayReason::ActiveRoot { table_id, .. }
+            | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
+        };
+        let table = match session.state.cached_user_table(table_id) {
+            Some(table) => table,
+            None => {
+                let Some(table) = session.engine.catalog().get_table(table_id).await else {
+                    return Ok(());
+                };
+                session.state.cache_user_table(&table);
+                table
+            }
+        };
+        table.wait_for_checkpoint_retry(&session, reason).await
+    }
+
+    /// Retry delayed table checkpoints through their exact production wait predicate.
+    ///
+    /// Published and cancelled outcomes are returned unchanged. Only a normal
+    /// [`CheckpointOutcome::Delayed`] result is waited and retried.
+    pub async fn checkpoint_table_with_wait(
+        &mut self,
+        table_id: TableID,
+    ) -> Result<CheckpointOutcome> {
+        loop {
+            match self.checkpoint_table(table_id).await? {
+                CheckpointOutcome::Delayed { reason } => {
+                    self.wait_for_checkpoint_retry(reason).await?;
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+    }
+
+    /// Wait for the purge-published active horizon to become strictly newer.
+    ///
+    /// This boundary is published before physical purge work completes and is
+    /// suitable for checkpoint cutoff and active-snapshot readiness decisions.
+    pub async fn wait_for_gc_horizon_after(&self, ts: TrxID) -> Result<TrxID> {
+        let session = self.pin("wait for GC horizon")?;
+        ensure_idle_maintenance_session(&session, "wait for GC horizon")?;
+        wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon).await
+    }
+
+    /// Wait for completed full-purge progress to become strictly newer.
+    ///
+    /// The returned boundary is published only after eligible undo/index,
+    /// retired-page, retained-root, and coalesced cleanup work completes.
+    pub async fn wait_for_purge_completion_after(&self, ts: TrxID) -> Result<TrxID> {
+        let session = self.pin("wait for purge completion")?;
+        ensure_idle_maintenance_session(&session, "wait for purge completion")?;
+        wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::PurgeCompletion).await
+    }
+
+    /// Wait until ordered commit payloads through `ts` reach purge coordination.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_purge_handoff_for_test(&self, ts: TrxID) -> Result<()> {
+        let session = self.pin("wait for purge handoff")?;
+        ensure_idle_maintenance_session(&session, "wait for purge handoff")?;
+        wait_for_purge_handoff(&session, ts).await
     }
 
     /// Returns total number of hot row pages for an existing user table.
@@ -1237,6 +1336,82 @@ impl TrxAttachment {
 }
 
 #[inline]
+fn ensure_idle_maintenance_session(session: &SessionPin, operation: &'static str) -> Result<()> {
+    if session.in_trx(operation)? {
+        return Err(Report::new(OperationError::NotSupported)
+            .attach(format!("{operation} requires an idle session"))
+            .into());
+    }
+    Ok(())
+}
+
+async fn wait_for_maintenance_boundary(
+    session: &SessionPin,
+    ts: TrxID,
+    boundary: MaintenanceBoundary,
+) -> Result<TrxID> {
+    let trx_sys = &session.engine.trx_sys;
+    loop {
+        trx_sys.ensure_runtime_healthy()?;
+        if session.engine.shutdown_started() {
+            return Err(Report::new(LifecycleError::Shutdown)
+                .attach("maintenance progress wait observed engine shutdown")
+                .into());
+        }
+        let observed = boundary.observed(session);
+        if observed > ts {
+            return Ok(observed);
+        }
+
+        trx_sys.request_purge_observation();
+        let progress_listener = boundary.listener(session);
+        let poison_listener = trx_sys.poison_listener();
+        let shutdown_listener = session.engine.shutdown_listener();
+
+        trx_sys.ensure_runtime_healthy()?;
+        if session.engine.shutdown_started() {
+            return Err(Report::new(LifecycleError::Shutdown)
+                .attach("maintenance progress wait observed engine shutdown")
+                .into());
+        }
+        let observed = boundary.observed(session);
+        if observed > ts {
+            return Ok(observed);
+        }
+        select_all(vec![progress_listener, poison_listener, shutdown_listener]).await;
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_purge_handoff(session: &SessionPin, ts: TrxID) -> Result<()> {
+    let trx_sys = &session.engine.trx_sys;
+    loop {
+        trx_sys.ensure_runtime_healthy()?;
+        if session.engine.shutdown_started() {
+            return Err(Report::new(LifecycleError::Shutdown)
+                .attach("completed-purge wait observed engine shutdown before ordered handoff")
+                .into());
+        }
+        if trx_sys.purge_handoff_cts() >= ts {
+            return Ok(());
+        }
+        let handoff_listener = trx_sys.purge_handoff_listener();
+        let poison_listener = trx_sys.poison_listener();
+        let shutdown_listener = session.engine.shutdown_listener();
+        trx_sys.ensure_runtime_healthy()?;
+        if session.engine.shutdown_started() {
+            return Err(Report::new(LifecycleError::Shutdown)
+                .attach("completed-purge wait observed engine shutdown before ordered handoff")
+                .into());
+        }
+        if trx_sys.purge_handoff_cts() >= ts {
+            return Ok(());
+        }
+        select_all(vec![handoff_listener, poison_listener, shutdown_listener]).await;
+    }
+}
+
+#[inline]
 fn table_not_found_error(table_id: TableID, operation: &'static str) -> Error {
     Report::new(OperationError::TableNotFound)
         .attach(format!("operation={operation}, table_id={table_id}"))
@@ -1277,7 +1452,6 @@ pub(crate) mod tests {
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use crate::value::Val;
     use futures::task::noop_waker;
-    use smol::Timer;
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
@@ -1395,24 +1569,47 @@ pub(crate) mod tests {
         panic!("test setup did not create redo file {target_file_seq:08x}");
     }
 
-    async fn checkpoint_table_published(session: &mut Session, table_id: TableID) -> TrxID {
-        let mut last_delay = None;
-        for _ in 0..50 {
-            match session.checkpoint_table(table_id).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts, .. } => return checkpoint_ts,
-                CheckpointOutcome::Delayed { reason } => {
-                    last_delay = Some(reason);
-                    Timer::after(Duration::from_millis(20)).await;
-                }
-                CheckpointOutcome::Cancelled { reason } => {
-                    panic!("checkpoint should publish, cancelled by {reason:?}")
-                }
-            }
+    pub(crate) async fn assert_checkpoint_published(
+        session: &mut Session,
+        table_id: TableID,
+    ) -> TrxID {
+        let outcome = session.checkpoint_table_with_wait(table_id).await.unwrap();
+        let CheckpointOutcome::Published { checkpoint_ts, .. } = outcome else {
+            panic!("checkpoint should publish, got {outcome:?}");
+        };
+        checkpoint_ts
+    }
+
+    pub(crate) async fn wait_for_checkpoint_purge(session: &Session, redo_cts: TrxID) -> TrxID {
+        session
+            .wait_for_purge_handoff_for_test(redo_cts)
+            .await
+            .unwrap();
+        session
+            .wait_for_purge_completion_after(redo_cts)
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn wait_for_checkpoint_root_ready(session: &Session, table_id: TableID) {
+        let table = session
+            .engine()
+            .catalog()
+            .get_table_now(table_id)
+            .expect("test table should exist");
+        let effective_ts = table.file().active_root_unchecked().effective_ts();
+        let min_active_sts = session.engine().trx_sys.calc_min_active_sts_for_gc();
+        if effective_ts < min_active_sts {
+            return;
         }
-        panic!(
-            "checkpoint should publish, delayed after retries by {:?}",
-            last_delay.unwrap()
-        )
+        session
+            .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
+                table_id,
+                effective_ts,
+                min_active_sts,
+            })
+            .await
+            .unwrap();
     }
 
     async fn commit_redo_durability_anchor(session: &mut Session, table_id: TableID) {
@@ -1671,6 +1868,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_maintenance_progress_waits_and_idle_requirement() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            table2(&engine).await;
+            let session = engine.new_session().unwrap();
+            let target = engine.inner().trx_sys.purge_handoff_cts();
+
+            let horizon = session.wait_for_gc_horizon_after(target).await.unwrap();
+            assert!(horizon > target);
+            let completed = session
+                .wait_for_purge_completion_after(target)
+                .await
+                .unwrap();
+            assert!(completed > target);
+
+            let mut active_session = engine.new_session().unwrap();
+            let trx = active_session.begin_trx().unwrap();
+            let horizon_err = active_session
+                .wait_for_gc_horizon_after(target)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                horizon_err.operation_error(),
+                Some(OperationError::NotSupported)
+            );
+            let retry_err = active_session
+                .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
+                    table_id: TableID::new(1),
+                    effective_ts: target,
+                    min_active_sts: target,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                retry_err.operation_error(),
+                Some(OperationError::NotSupported)
+            );
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_session_checkpoint_catalog_persists_catalog_state() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1770,7 +2014,7 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_table_published(&mut session, table_id).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert_eq!(before.meta.first_redo_log_seq, 0);
@@ -1840,7 +2084,7 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_table_published(&mut session, table_id).await;
+            assert_checkpoint_published(&mut session, table_id).await;
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -1984,7 +2228,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             session.checkpoint_catalog().await.unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_table_published(&mut session, table_id).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert_eq!(before.meta.first_redo_log_seq, 0);
@@ -2056,7 +2300,7 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_table_published(&mut session, table_id).await;
+            assert_checkpoint_published(&mut session, table_id).await;
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -2343,7 +2587,7 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_table_published(&mut session, table_id).await;
+            assert_checkpoint_published(&mut session, table_id).await;
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
@@ -2414,7 +2658,7 @@ pub(crate) mod tests {
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_table_published(&mut session, table_id).await;
+            assert_checkpoint_published(&mut session, table_id).await;
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 

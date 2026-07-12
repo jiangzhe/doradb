@@ -3,11 +3,13 @@ use super::deletion_buffer::DeleteMarker;
 use super::lifecycle::{CheckpointPublishLease, TableLifecycle, TableTerminal};
 use crate::error::FatalError;
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::trx::SharedTrxStatus;
 use crate::trx::sys::TransactionSystem;
 use parking_lot::Mutex;
 use std::fmt;
 use std::mem::replace;
 use std::result::Result as StdResult;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FrozenPage {
@@ -61,7 +63,11 @@ impl fmt::Debug for PreparedTransitionPage {
     }
 }
 
-#[derive(Debug)]
+struct BlockedFrozenPage {
+    page_id: PageID,
+    blockers: Vec<Arc<SharedTrxStatus>>,
+}
+
 pub(super) struct FrozenPageBatch {
     pub(super) table_id: TableID,
     pub(super) frozen_ts: TrxID,
@@ -69,6 +75,8 @@ pub(super) struct FrozenPageBatch {
     pub(super) approximate_rows: usize,
     pub(super) pages: Vec<FrozenPage>,
     pub(super) validation: Vec<FrozenPageValidationState>,
+    /// Exact unresolved image blockers for the first canonical delayed page.
+    blocked_page: Option<BlockedFrozenPage>,
     pub(super) prepared: Vec<Option<PreparedTransitionPage>>,
 }
 
@@ -91,8 +99,47 @@ impl FrozenPageBatch {
             approximate_rows,
             pages,
             validation,
+            blocked_page: None,
             prepared,
         }
+    }
+
+    #[inline]
+    pub(super) fn blockers_for(&self, page_id: PageID) -> Option<&[Arc<SharedTrxStatus>]> {
+        self.blocked_page
+            .as_ref()
+            .filter(|blocked| blocked.page_id == page_id)
+            .map(|blocked| blocked.blockers.as_slice())
+    }
+
+    #[inline]
+    pub(super) fn set_blocked_page(
+        &mut self,
+        page_id: PageID,
+        blockers: Vec<Arc<SharedTrxStatus>>,
+    ) {
+        assert!(
+            !blockers.is_empty(),
+            "blocked frozen page must retain at least one transaction status"
+        );
+        assert!(
+            self.blocked_page
+                .as_ref()
+                .is_none_or(|blocked| blocked.page_id == page_id),
+            "only the first canonical delayed page may retain blockers"
+        );
+        self.blocked_page = Some(BlockedFrozenPage { page_id, blockers });
+    }
+
+    #[inline]
+    pub(super) fn clear_blocked_page(&mut self, page_id: PageID) {
+        assert!(
+            self.blocked_page
+                .as_ref()
+                .is_none_or(|blocked| blocked.page_id == page_id),
+            "only the canonical delayed page may clear retained blockers"
+        );
+        self.blocked_page = None;
     }
 
     #[inline]
@@ -108,6 +155,27 @@ impl FrozenPageBatch {
                 .filter(|state| matches!(state, FrozenPageValidationState::Stable { .. }))
                 .count(),
         }
+    }
+}
+
+impl fmt::Debug for FrozenPageBatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrozenPageBatch")
+            .field("table_id", &self.table_id)
+            .field("frozen_ts", &self.frozen_ts)
+            .field("heap_redo_start_ts", &self.heap_redo_start_ts)
+            .field("approximate_rows", &self.approximate_rows)
+            .field("pages", &self.pages)
+            .field("validation", &self.validation)
+            .field(
+                "blocked_page",
+                &self
+                    .blocked_page
+                    .as_ref()
+                    .map(|blocked| (blocked.page_id, blocked.blockers.len())),
+            )
+            .field("prepared", &self.prepared)
+            .finish()
     }
 }
 
