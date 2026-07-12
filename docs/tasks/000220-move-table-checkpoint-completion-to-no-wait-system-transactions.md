@@ -1,7 +1,7 @@
 ---
 id: 000220
 title: Move Table Checkpoint Completion to No-Wait System Transactions
-status: proposal
+status: implemented
 created: 2026-07-11
 github_issue: 839
 ---
@@ -39,7 +39,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000154-move-table-checkpoint-completion-to-no-wait-system-transactions.md
+- docs/backlogs/closed/000154-move-table-checkpoint-completion-to-no-wait-system-transactions.md
 
 Related implemented design:
 - `docs/tasks/000199-catalog-silent-table-replay-watermarks.md`
@@ -273,9 +273,10 @@ existing `committed.cts < global_min_active_sts` rule.
 
 On rejected or failed system precommit, clear/drop the attachmentless system
 payload without running user rollback or active-STS removal. Do not deallocate
-its pages: after irreversible checkpoint publication, the engine is poisoned
-and teardown retains ownership. Preserve existing user failed-precommit
-rollback and fatal-retention behavior unchanged.
+its pages through purge or direct page deallocation: after irreversible
+checkpoint publication, the engine is poisoned and normal engine teardown
+releases the arena backing those allocations. Preserve existing user
+failed-precommit rollback and fatal-retention behavior unchanged.
 
 ### 4. Reuse the existing all-bucket purge and deallocation mechanism
 
@@ -474,8 +475,9 @@ publication, or no-transaction silent-mirror mutation becomes irreversible:
 - asynchronous redo write/sync failure uses the existing redo poison path;
 - failed system payload cleanup performs no rollback and never hands its pages
   to purge;
-- page IDs remain owned until poisoned-engine teardown rather than being
-  deallocated against uncertain publication state;
+- rejected payload page IDs are dropped without deallocating their pages
+  against uncertain publication state; poisoned-engine teardown releases the
+  backing arena;
 - workflow/drop waiters wake through the existing poison and guard paths.
 
 Preserve worker shutdown ordering: group-commit admission closes, redo drains
@@ -498,6 +500,48 @@ Update:
 
 ## Implementation Notes
 
+- Replaced checkpoint completion with the existing no-wait `SysTrx` path.
+  Checkpoint construction now allocates a non-active `checkpoint_ts`, while
+  ordered group commit assigns the distinct accepted `redo_cts`; neither root
+  nor silent checkpoint waits for redo persistence.
+- Final transaction payload ownership uses explicit `User` and `System` enum
+  variants rather than an optional-user common payload. `SysTrxPayload`,
+  defined with `SysTrx`, carries the system GC bucket and retired row pages
+  unchanged through prepare, precommit, ordered completion, and purge handoff.
+  Every `SysTrx` allocates a GC number, while redo-only system transactions
+  omit the payload when they own no retired pages.
+- Added callback-driven no-transaction catalog primary-key upsert and used it
+  for monotonic silent-watermark mutation. Successful inserts and updates emit
+  matching logical catalog DML, while an already-covered watermark retains the
+  ordered DDL marker without redundant DML.
+- Consolidated irreversible checkpoint restoration, lifecycle publication
+  admission, and poison classification in `CheckpointPublicationGuard`.
+  Silent-watermark mutation failures use `FatalError::CatalogWrite`; later
+  root/enqueue failures use the checkpoint failure classification. A rejected
+  post-publication system payload is dropped without rollback or purge page
+  handoff; storage is poisoned, and normal engine teardown releases the arena
+  allocations.
+- Catalog checkpoint and combined checkpoint/truncation now sample
+  `persisted_watermark_cts()` directly. No empty transaction is committed to
+  manufacture a newer durable upper CTS; accepted redo above the sampled
+  prefix remains for a later periodic catalog checkpoint.
+- Review cleanup removed checkpoint-only MVCC and test mutation APIs, kept
+  reserved no-transaction table APIs under test-aware dead-code expectations,
+  flattened catalog checkpoint tests into their owner module, and colocated
+  focused `SysTrx` tests with `sys_trx.rs`.
+- Deferred eligibility-aware full-GC triggering and dispatcher participation
+  as a configured purge worker to
+  `docs/backlogs/000157-optimize-purge-full-gc-triggering-and-dispatcher-worker-utilization.md`.
+- Validation completed:
+  - `cargo check -p doradb-storage --tests`
+  - focused transaction/purge tests: 4 passed
+  - focused checkpoint publication-guard/failure tests: 6 passed
+  - catalog storage tests: 21 passed
+  - workspace nextest validation: 1,352 tests passed with one known checkpoint
+    concurrency case run separately; that exact test passed independently
+  - libaio nextest validation: 1,276 tests passed
+  - `tools/style_audit.rs --diff-base origin/main`: 23 branch-diff Rust files
+    passed
 
 ## Impacts
 
@@ -658,3 +702,6 @@ Workflow and regression validation:
 ## Open Questions
 
 No blocking design questions remain for the approved scope.
+
+Follow-up purge scheduling and worker-utilization optimization is tracked in
+`docs/backlogs/000157-optimize-purge-full-gc-triggering-and-dispatcher-worker-utilization.md`.

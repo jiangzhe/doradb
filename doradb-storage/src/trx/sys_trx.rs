@@ -18,20 +18,6 @@ pub(crate) struct SysTrx {
     pub(super) gc_row_pages: Vec<PageID>,
 }
 
-/// System transaction GC payload carried unchanged through ordered commit.
-pub(crate) struct SysTrxPayload {
-    pub(super) gc_no: usize,
-    pub(super) gc_row_pages: Vec<PageID>,
-}
-
-impl SysTrxPayload {
-    /// Returns whether this payload owns no retired row pages.
-    #[inline]
-    pub(super) fn is_empty(&self) -> bool {
-        self.gc_row_pages.is_empty()
-    }
-}
-
 impl SysTrx {
     /// Return accumulated redo for focused system-transaction tests.
     #[cfg(test)]
@@ -165,6 +151,20 @@ impl SysTrx {
             lock_manager: None,
             lock_state: None,
         }
+    }
+}
+
+/// System transaction GC payload carried unchanged through ordered commit.
+pub(crate) struct SysTrxPayload {
+    pub(super) gc_no: usize,
+    pub(super) gc_row_pages: Vec<PageID>,
+}
+
+impl SysTrxPayload {
+    /// Returns whether this payload owns no retired row pages.
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.gc_row_pages.is_empty()
     }
 }
 
