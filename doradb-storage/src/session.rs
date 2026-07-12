@@ -131,6 +131,14 @@ enum MaintenanceBoundary {
 
 impl MaintenanceBoundary {
     #[inline]
+    fn name(self) -> &'static str {
+        match self {
+            MaintenanceBoundary::GcHorizon => "GC horizon",
+            MaintenanceBoundary::PurgeCompletion => "purge completion",
+        }
+    }
+
+    #[inline]
     fn observed(self, session: &SessionPin) -> TrxID {
         match self {
             MaintenanceBoundary::GcHorizon => session.engine.trx_sys.published_gc_horizon(),
@@ -1354,9 +1362,7 @@ async fn wait_for_maintenance_boundary(
     loop {
         trx_sys.ensure_runtime_healthy()?;
         if session.engine.shutdown_started() {
-            return Err(Report::new(LifecycleError::Shutdown)
-                .attach("maintenance progress wait observed engine shutdown")
-                .into());
+            return Err(maintenance_boundary_shutdown_err(boundary, ts));
         }
         let observed = boundary.observed(session);
         if observed > ts {
@@ -1370,9 +1376,7 @@ async fn wait_for_maintenance_boundary(
 
         trx_sys.ensure_runtime_healthy()?;
         if session.engine.shutdown_started() {
-            return Err(Report::new(LifecycleError::Shutdown)
-                .attach("maintenance progress wait observed engine shutdown")
-                .into());
+            return Err(maintenance_boundary_shutdown_err(boundary, ts));
         }
         let observed = boundary.observed(session);
         if observed > ts {
@@ -1380,6 +1384,16 @@ async fn wait_for_maintenance_boundary(
         }
         select_all(vec![progress_listener, poison_listener, shutdown_listener]).await;
     }
+}
+
+#[inline]
+fn maintenance_boundary_shutdown_err(boundary: MaintenanceBoundary, ts: TrxID) -> Error {
+    Report::new(LifecycleError::Shutdown)
+        .attach(format!(
+            "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
+            boundary.name()
+        ))
+        .into()
 }
 
 #[cfg(test)]

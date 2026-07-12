@@ -140,11 +140,13 @@ impl DroppedTableFileCleanupQueue {
 impl TransactionSystem {
     /// Request one coalescible full-purge observation.
     ///
+    /// `Purge::FullObservation` is the payload-free signal for observing all
+    /// authoritative purge state and scheduling every eligible cleanup class.
     /// Bucket and retained-work state remain authoritative, so this best-effort
     /// wake can be dropped or coalesced during shutdown without losing payload.
     #[inline]
     pub(crate) fn request_purge_observation(&self) {
-        let _ = self.purge_tx.send(Purge::HorizonAdvanced);
+        let _ = self.purge_tx.send(Purge::FullObservation);
     }
 
     /// Wake the purge coordinator for table-root retention cleanup only.
@@ -243,17 +245,17 @@ impl TransactionSystem {
         changed
     }
 
-    /// Record rollback progress and wake purge if the active horizon advanced.
+    /// Record rollback progress and request a full observation if the horizon advanced.
     ///
     /// Commit handoffs are non-lossy through `Purge::Committed` because purge
-    /// must retain every committed payload batch. Rollback horizon wakeups are
-    /// lossy: bucket state is already authoritative, so the message only asks
-    /// purge to recalculate the horizon and run one full GC cycle.
+    /// must retain every committed payload batch. Rollback observations are
+    /// lossy: bucket state is already authoritative, and a newer horizon may
+    /// make every cleanup class eligible for the requested full purge cycle.
     #[inline]
     pub(crate) fn record_rollback_for_purge(&self, gc_no: usize, sts: TrxID) -> bool {
         let advanced = self.gc_buckets[gc_no].record_rollback_for_purge(sts);
         if advanced {
-            let _ = self.purge_tx.send(Purge::HorizonAdvanced);
+            let _ = self.purge_tx.send(Purge::FullObservation);
         }
         advanced
     }
@@ -757,8 +759,11 @@ pub(crate) enum Purge {
     /// The payload map is grouped by GC bucket. The purge coordinator must
     /// record every accepted batch before it exits.
     Committed(FastHashMap<usize, Vec<CommittedTrx>>),
-    /// Lossy rollback-driven active-horizon wakeup.
-    HorizonAdvanced,
+    /// Lossy, payload-free request to observe all purge state and run full cleanup.
+    ///
+    /// Active-horizon advancement after rollback is one producer because the
+    /// new horizon may make undo, retained roots, and dropped tables eligible.
+    FullObservation,
     /// Release retained table roots whose post-publish readers have drained.
     TableRootRetention,
     /// Run only dropped-table runtime/file cleanup.
@@ -837,7 +842,7 @@ impl PurgeWork {
                     *self = PurgeWork::full();
                 }
             }
-            Purge::HorizonAdvanced => *self = PurgeWork::full(),
+            Purge::FullObservation => *self = PurgeWork::full(),
             Purge::TableRootRetention => self.table_root_retention = true,
             Purge::DroppedTable => self.dropped_table = true,
         }
@@ -1080,10 +1085,11 @@ fn coalesce_purge_work<F>(
 where
     F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> bool,
 {
-    // Collapse queued lossy wakeups so bursts do not trigger repeated scans,
-    // while committed payload batches are recorded one by one and never
-    // coalesced away. `Stop` is a terminal shutdown barrier: messages before it
-    // have been absorbed, messages after it are intentionally ignored.
+    // Collapse queued lossy observations and targeted wakeups so bursts do not
+    // trigger repeated scans, while committed payload batches are recorded one
+    // by one and never coalesced away. `Stop` is a terminal shutdown barrier:
+    // messages before it have been absorbed, messages after it are intentionally
+    // ignored.
     let mut work = PurgeWork::none();
     if !work.absorb(initial, &mut analyze_committed) {
         return work;
@@ -1297,11 +1303,11 @@ mod tests {
         );
 
         let (tx, rx) = flume::unbounded();
-        tx.send(Purge::HorizonAdvanced).unwrap();
-        tx.send(Purge::HorizonAdvanced).unwrap();
+        tx.send(Purge::FullObservation).unwrap();
+        tx.send(Purge::FullObservation).unwrap();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::HorizonAdvanced, |_| {
-                panic!("rollback horizon wakeups carry no committed payload")
+            coalesce_purge_work(&rx, Purge::FullObservation, |_| {
+                panic!("full observations carry no committed payload")
             }),
             PurgeWork::full()
         );

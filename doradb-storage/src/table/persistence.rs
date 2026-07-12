@@ -4233,6 +4233,14 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut setup = engine.new_session().unwrap();
             insert_rows(table_id, &mut setup, 1, 1, "before").await;
+            let active_root_effective_ts = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .effective_ts();
+            setup
+                .wait_for_gc_horizon_after(active_root_effective_ts)
+                .await
+                .unwrap();
 
             let mut writer_session = engine.new_session().unwrap();
             let mut writer = writer_session.begin_trx().unwrap();

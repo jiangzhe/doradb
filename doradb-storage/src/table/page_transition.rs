@@ -13,6 +13,7 @@ use crate::trx::undo::{RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MAX_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
 use error_stack::Report;
+use std::mem::take;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,24 +39,6 @@ struct FrozenPageScan {
     overlay_markers: Vec<(RowID, DeleteMarker)>,
 }
 
-#[derive(Clone, Copy)]
-enum FrozenPageScanMode {
-    EstablishReadiness { frozen_ts: TrxID },
-    RefreshStablePlan,
-}
-
-impl FrozenPageScanMode {
-    #[inline]
-    fn unresolved_ownership_blocks(self, ts: TrxID) -> bool {
-        match self {
-            FrozenPageScanMode::EstablishReadiness { frozen_ts } => {
-                active_writer_sts(ts) < frozen_ts
-            }
-            FrozenPageScanMode::RefreshStablePlan => false,
-        }
-    }
-}
-
 impl FrozenPageScan {
     #[inline]
     fn validation(&self) -> FrozenPageValidationState {
@@ -76,7 +59,7 @@ impl FrozenPageScan {
         observed_version: u64,
     ) -> FrozenPageReadinessAnalysis {
         let validation = self.validation();
-        let blockers = std::mem::take(&mut self.blockers);
+        let blockers = take(&mut self.blockers);
         let plan = self.into_plan(cutoff_ts, observed_version);
         FrozenPageReadinessAnalysis {
             validation,
@@ -103,6 +86,24 @@ impl FrozenPageScan {
             del_bitmap: self.del_bitmap,
             overlay_markers: self.overlay_markers,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FrozenPageScanMode {
+    EstablishReadiness { frozen_ts: TrxID },
+    RefreshStablePlan,
+}
+
+impl FrozenPageScanMode {
+    #[inline]
+    fn unresolved_ownership_blocks(self, ts: TrxID) -> bool {
+        match self {
+            FrozenPageScanMode::EstablishReadiness { frozen_ts } => {
+                active_writer_sts(ts) < frozen_ts
+            }
+            FrozenPageScanMode::RefreshStablePlan => false,
+        }
     }
 }
 
@@ -519,12 +520,16 @@ fn retain_optimistic_page_plan(
 ) {
     batch.prepared[page_idx] = (version_before == version_after).then_some(plan).flatten();
     #[cfg(test)]
-    super::test_hooks::run_test_optimistic_page_plan_comparison_hook(
-        batch.pages[page_idx].page_id,
-        version_before,
-        version_after,
-        batch.prepared[page_idx].is_some(),
-    );
+    {
+        use super::test_hooks::run_test_optimistic_page_plan_comparison_hook;
+
+        run_test_optimistic_page_plan_comparison_hook(
+            batch.pages[page_idx].page_id,
+            version_before,
+            version_after,
+            batch.prepared[page_idx].is_some(),
+        );
+    }
 }
 
 #[inline]

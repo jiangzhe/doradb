@@ -1,7 +1,7 @@
 ---
 id: 000221
 title: Event-driven maintenance progress waits
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-12
 github_issue: 841
 ---
@@ -33,7 +33,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000156-event-driven-maintenance-progress-waits.md
+- docs/backlogs/closed/000156-event-driven-maintenance-progress-waits.md
 
 User-table checkpoint currently returns a normal `CheckpointOutcome::Delayed`
 for two distinct readiness gates:
@@ -401,6 +401,43 @@ completion means retry may be useful, not guaranteed publication.
 
 ## Implementation Notes
 
+Implemented the public idle-session maintenance surface described by the plan:
+self-identifying checkpoint delays, exact delay waits,
+`checkpoint_table_with_wait`, and distinct GC-horizon and completed-purge
+waits. Waits use register/recheck/await loops and terminate on poison,
+shutdown, or table lifecycle changes. Shared transaction status now exposes
+sticky terminal resolution for exact blocker coordination.
+
+The monotonic timestamp plus notification pairs were consolidated into the
+`MonotonicU64` primitive. Purge's coalescible full-work request was renamed
+`FullObservation` to match its actual semantics. Ordered purge-handoff progress
+remains test-only, so production builds carry no handoff counter or notifier
+overhead.
+
+Frozen-page waiting retains blockers only for the current canonical page,
+waits for the complete blocker generation, and then reanalyses that page once.
+The shared undo-chain scan feeds separate readiness analysis and stable-plan
+refresh paths, avoiding validation work that stable-plan refresh does not
+consume. Test hooks were renamed and reshaped around those split phases.
+
+Checkpoint and purge test helpers were deduplicated under the session test
+module, normalized to take the session first, and migrated to one async
+`smol::block_on` per test. Successful checkpoint setup uses the retrying API;
+tests that require a particular delayed outcome explicitly clear earlier
+readiness gates before constructing the target race. The two remaining flaky
+cases found during resolve were fixed by applying those rules, and the general
+practice was added to the unit-test and coding-guidance process documents.
+
+Final validation completed without retries: all three target regressions passed
+200 stress iterations with the default backend and 100 with `libaio`; the full
+workspace passed 1,359 tests and the full `libaio` configuration passed 1,283
+tests. Rustfmt, Clippy with warnings denied, `git diff --check`, and
+`tools/style_audit.rs --diff-base origin/main` all passed. Focused behavior is
+covered through the session, checkpoint workflow/analysis, transaction status,
+purge, lifecycle, registration-race, and target-regression consumers. Focused
+line coverage across the six primary maintenance files was 7,606/7,928
+(95.94%); every file exceeded the 80% bar, so no coverage exception or deferred
+follow-up remains.
 
 ## Impacts
 
