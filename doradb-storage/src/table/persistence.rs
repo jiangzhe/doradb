@@ -1,4 +1,6 @@
-use super::checkpoint_workflow::{CheckpointAttempt, PreparedTransitionPage};
+use super::checkpoint_workflow::{
+    CheckpointAttempt, CheckpointPublicationGuard, PreparedTransitionPage,
+};
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
@@ -16,18 +18,14 @@ use crate::index::disk_tree::{
 use crate::index::{
     ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry,
 };
-use crate::log::redo::DDLRedo;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
 use crate::obs;
 use crate::row::RowPage;
 use crate::session::SessionPin;
 use crate::table::{
-    CheckpointCancelReason, CheckpointPublishLease, FreezeOutcome, FrozenPage, FrozenPageBatch,
-    IrreversibleCheckpointGuard, Table, TableCheckpointWorkflow, TableRedoReplayFloor,
-    TableRuntimeLayout,
+    CheckpointCancelReason, FreezeOutcome, FrozenPage, FrozenPageBatch, Table,
+    TableRedoReplayFloor, TableRuntimeLayout,
 };
-#[cfg(test)]
-use crate::trx::tests::discard_transaction_after_fatal_rollback;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use std::collections::BTreeSet;
@@ -37,52 +35,17 @@ pub(crate) use tests::test_hooks;
 
 const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
 
-struct ReversibleWorkflowPublishGuard<'a> {
-    workflow: &'a TableCheckpointWorkflow,
-    _lease: CheckpointPublishLease<'a>,
-    reversible: bool,
-}
-
-impl<'a> ReversibleWorkflowPublishGuard<'a> {
-    #[inline]
-    fn new(workflow: &'a TableCheckpointWorkflow, lease: CheckpointPublishLease<'a>) -> Self {
-        Self {
-            workflow,
-            _lease: lease,
-            reversible: true,
-        }
-    }
-
-    #[inline]
-    fn make_irreversible(&mut self) {
-        self.reversible = false;
-    }
-
-    #[inline]
-    fn finish(&mut self) {
-        self.workflow.finish_publication();
-        self.reversible = false;
-    }
-}
-
-impl Drop for ReversibleWorkflowPublishGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.reversible {
-            // Restore workflow state before the contained publish lease reopens
-            // lifecycle admission.
-            self.workflow.finish_publication();
-        }
-    }
-}
-
 /// User-table checkpoint execution result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointOutcome {
-    /// A checkpoint transaction was durably published.
+    /// A checkpoint publication was accepted into ordered system commit.
     Published {
-        /// Commit timestamp of the publishing checkpoint transaction.
+        /// Non-active timestamp used to construct and publish checkpoint state.
         checkpoint_ts: TrxID,
+        /// System CTS accepted into ordered group commit.
+        ///
+        /// Acceptance does not by itself acknowledge redo durability.
+        redo_cts: TrxID,
         /// Whether publication used only a catalog silent replay watermark.
         ///
         /// `true` means no user-table root was published. `false` means the
@@ -1113,11 +1076,13 @@ impl Table {
             .inspect(|outcome| match outcome {
                 CheckpointOutcome::Published {
                     checkpoint_ts,
+                    redo_cts,
                     silent,
                 } => obs::info!(
-                    "event=checkpoint_publish component=table table_id={} action=publish result=ok checkpoint_ts={} silent={}",
+                    "event=checkpoint_publish component=table table_id={} action=publish result=ok checkpoint_ts={} redo_cts={} silent={}",
                     table_id,
                     checkpoint_ts,
+                    redo_cts,
                     silent
                 ),
                 CheckpointOutcome::Delayed { reason } => obs::warn!(
@@ -1159,7 +1124,7 @@ impl Table {
         let trx_sys = session.engine.trx_sys.clone();
         let table_writes = session.engine.table_fs.background_writes().clone();
         let pool_guards = session.pool_guards();
-        let root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
+        let _root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
             Ok(lease) => lease,
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
         };
@@ -1185,10 +1150,11 @@ impl Table {
             .unwrap_or_default();
         let cutoff_ts = trx_sys.published_gc_horizon();
 
-        // Step 3: open a checkpoint transaction before final validation. The
-        // selected cutoff remains the purge-published horizon, not checkpoint STS.
-        let mut trx = session.begin_trx("checkpoint table")?;
-        let checkpoint_ts = trx.sts();
+        // Step 3: allocate a construction/publication timestamp without
+        // registering an active transaction STS. Ordered system redo receives a
+        // separate CTS only after publication reaches group-commit enqueue.
+        let checkpoint_ts = trx_sys.allocate_checkpoint_ts();
+        let mut sys_trx = trx_sys.begin_sys_trx();
         #[cfg(test)]
         test_hooks::run_test_checkpoint_after_trx_start_hook().await;
         // If freeze did not observe a successor page, resolve the current hot
@@ -1200,42 +1166,26 @@ impl Table {
             .unwrap_or(pivot_row_id);
         let next_heap_redo_start_ts = match frozen_heap_redo_start_ts {
             Some(heap_redo_start_ts) => Some(heap_redo_start_ts),
-            None => match self
-                .heap_redo_start_from(&pool_guards, heap_redo_start_row_id)
-                .await
-            {
-                Ok(heap_redo_start_ts) => heap_redo_start_ts,
-                Err(err) => {
-                    trx.rollback().await?;
-                    return Err(err);
+            None => {
+                let heap_redo_start_ts = self
+                    .heap_redo_start_from(&pool_guards, heap_redo_start_row_id)
+                    .await?;
+                if let Some(batch) = attempt.batch_mut() {
+                    batch.heap_redo_start_ts = heap_redo_start_ts;
                 }
-            },
+                heap_redo_start_ts
+            }
         };
-        if frozen_heap_redo_start_ts.is_none()
-            && let Some(heap_redo_start_ts) = next_heap_redo_start_ts
-            && let Some(batch) = attempt.batch_mut()
-        {
-            batch.heap_redo_start_ts = Some(heap_redo_start_ts);
-        }
-        let mut irreversible_guard = None;
-        let mut transition_guard = None;
+        let mut publication_guard =
+            CheckpointPublicationGuard::new(&self.checkpoint_workflow, &self.lifecycle, &trx_sys);
         if !pages.is_empty() {
-            let transition_pages = match self
+            let transition_pages = self
                 .load_frozen_pages_for_transition(&pool_guards, &pages)
-                .await
-            {
-                Ok(pages) => pages,
-                Err(err) => {
-                    trx.rollback().await?;
-                    return Err(err);
-                }
-            };
+                .await?;
             let Some(batch) = attempt.batch_mut() else {
                 panic!("non-empty checkpoint page list requires frozen source")
             };
             if let Some(delay) = self.prepare_page_transition(&transition_pages, batch, cutoff_ts) {
-                drop(transition_pages);
-                trx.rollback().await?;
                 return Ok(CheckpointOutcome::Delayed {
                     reason: CheckpointDelayReason::FrozenPageCutoff {
                         table_id,
@@ -1249,27 +1199,16 @@ impl Table {
             }
             // Preparation has exhausted every reversible delay. Acquire the
             // workflow lease and fatal guard before applying any page state.
-            let guard = match self.try_begin_page_transition(&trx_sys) {
-                Ok(guard) => guard,
-                Err(reason) => {
-                    drop(transition_pages);
-                    trx.rollback().await?;
-                    return Ok(CheckpointOutcome::Cancelled { reason });
-                }
-            };
-            if let Err(err) = self.apply_page_transition(&transition_pages, batch, cutoff_ts) {
-                drop(transition_pages);
-                // Apply may already have published a Transition prefix. Drop
-                // the armed guard before rollback so storage fails closed.
-                drop(guard);
-                trx.rollback().await?;
-                return Err(err);
+            match publication_guard.begin_transition() {
+                Ok(()) => {}
+                Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
             }
-            drop(transition_pages);
-            transition_guard = Some(guard);
+            // Apply may already have published a Transition prefix. On error,
+            // the armed guard poisons storage as this scope returns.
+            self.apply_page_transition(&transition_pages, batch, cutoff_ts)?;
         }
         #[cfg(test)]
-        if transition_guard.is_some() {
+        if !pages.is_empty() {
             test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
         }
 
@@ -1288,7 +1227,7 @@ impl Table {
                 secondary_sidecar.add_data_row(col_layout, page, row_idx, row_id)
             })
         };
-        let (mut lwc_blocks, heap_redo_start_ts) = match self
+        let mut lwc_blocks = self
             .build_lwc_blocks(
                 metadata,
                 &pool_guards,
@@ -1298,16 +1237,10 @@ impl Table {
                     .unwrap_or_default(),
                 collect_visible_row,
             )
-            .await
-        {
-            // A heartbeat checkpoint still advances the heap replay floor:
-            // its transaction STS comes from the global timestamp sequence.
-            Ok(pages) => (pages, next_heap_redo_start_ts.unwrap_or(checkpoint_ts)),
-            Err(err) => {
-                trx.rollback().await?;
-                return Err(err);
-            }
-        };
+            .await?;
+        // A heartbeat checkpoint still advances the heap replay floor: its
+        // transaction STS comes from the global timestamp sequence.
+        let heap_redo_start_ts = next_heap_redo_start_ts.unwrap_or(checkpoint_ts);
 
         if let Some(last) = lwc_blocks.last_mut()
             && last.shape.end_row_id() < new_pivot_row_id
@@ -1315,197 +1248,103 @@ impl Table {
             last.shape.set_end_row_id(new_pivot_row_id)?;
         }
 
-        let gc_pages: Vec<PageID> = pages.iter().map(|page| page.page_id).collect();
-        trx.extend_gc_row_pages(gc_pages)?;
-
-        // Step 5: emit one checkpoint redo marker for recovery.
-        let old = trx.set_ddl_redo(DDLRedo::DataCheckpoint {
-            table_id: self.table_id(),
-            pivor_row_id: new_pivot_row_id,
-            sts: checkpoint_ts,
-        })?;
-        debug_assert!(old.is_none());
-
-        // Step 6: apply checkpoint changes to the already-checked mutable root.
+        // Step 5: apply checkpoint changes to the already-checked mutable root.
         if !lwc_blocks.is_empty() {
-            if let Err(err) = mutable_file
+            mutable_file
                 .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, checkpoint_ts, disk_pool)
-                .await
-            {
-                trx.rollback().await?;
-                return Err(err);
-            }
-        } else if let Err(err) =
-            mutable_file.apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)
-        {
-            trx.rollback().await?;
-            return Err(err);
+                .await?;
+        } else {
+            mutable_file.apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)?;
         }
 
         // Step 7: merge committed cold-row deletions into column index payloads,
         // collect matching secondary-index delete sidecar work, and publish the
         // durable cold-delete replay watermark.
-        if let Err(err) = self
-            .apply_deletion_checkpoint(
-                &mut mutable_file,
-                metadata,
-                &mut secondary_sidecar,
-                cutoff_ts,
-                checkpoint_ts,
-            )
-            .await
-        {
-            trx.rollback().await?;
-            return Err(err);
-        }
+        self.apply_deletion_checkpoint(
+            &mut mutable_file,
+            metadata,
+            &mut secondary_sidecar,
+            cutoff_ts,
+            checkpoint_ts,
+        )
+        .await?;
 
         // Step 8: apply accumulated secondary-index sidecar work to DiskTree
         // roots on the same mutable file fork. Root publication remains atomic
         // with the table checkpoint commit below.
-        if let Err(err) = self
-            .apply_secondary_checkpoint_sidecar(
-                &mut mutable_file,
-                &layout,
-                &mut secondary_sidecar,
-                checkpoint_ts,
-            )
-            .await
-        {
-            trx.rollback().await?;
-            return Err(err);
-        }
+        self.apply_secondary_checkpoint_sidecar(
+            &mut mutable_file,
+            &layout,
+            &mut secondary_sidecar,
+            checkpoint_ts,
+        )
+        .await?;
 
         // Step 9: after all checkpoint CoW writes are represented in the
         // mutable root, rebuild its allocation map from the current active root
         // and the mutable root that will be published.
-        if let Err(err) = self
-            .rebuild_reachable_alloc_map(&mut mutable_file, &layout)
-            .await
-        {
-            trx.rollback().await?;
-            return Err(err);
-        }
+        self.rebuild_reachable_alloc_map(&mut mutable_file, &layout)
+            .await?;
 
         if let Some(requested_floor) =
             silent_watermark_floor(table_file.active_root_unchecked(), mutable_file.root())
         {
             drop(mutable_file);
-            let mut publishing_guard = if transition_guard.is_none() {
-                let lease = match self
-                    .checkpoint_workflow
-                    .try_begin_publishing(&self.lifecycle, attempt.source())
-                {
-                    Ok(lease) => lease,
-                    Err(reason) => {
-                        trx.rollback().await?;
-                        return Ok(CheckpointOutcome::Cancelled { reason });
-                    }
-                };
-                Some(ReversibleWorkflowPublishGuard::new(
-                    &self.checkpoint_workflow,
-                    lease,
-                ))
-            } else {
-                None
-            };
-            #[cfg(test)]
-            if publishing_guard.is_some() {
-                test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
+            match publication_guard.begin_publishing(attempt.source()) {
+                Ok(true) => {
+                    #[cfg(test)]
+                    test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
+                }
+                Ok(false) => {}
+                Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
             }
-            let old = trx.set_ddl_redo(DDLRedo::TableReplaySilentWatermark {
-                table_id: self.table_id(),
-            })?;
-            debug_assert!(matches!(
-                old.as_deref(),
-                Some(DDLRedo::DataCheckpoint { .. })
-            ));
             let watermark = SilentWatermarkObject {
                 table_id: self.table_id(),
                 heap_redo_start_ts: requested_floor.heap_redo_start_ts,
                 deletion_cutoff_ts: requested_floor.deletion_cutoff_ts,
             };
-            if let Err(err) = trx
-                .exec(async |stmt| {
-                    session
-                        .engine
-                        .catalog()
-                        .storage
-                        .table_replay_silent_watermarks()
-                        .upsert(stmt, &watermark)
-                        .await?;
-                    Ok(())
-                })
-                .await
-            {
-                trx.rollback().await?;
-                return Err(err);
+            publication_guard.make_irreversible(FatalError::CatalogWrite);
+            async {
+                #[cfg(test)]
+                test_hooks::run_test_silent_watermark_mutation_hook().await?;
+                sys_trx
+                    .upsert_silent_watermark(session.engine.catalog(), &pool_guards, watermark)
+                    .await
             }
-            if transition_guard.is_none() && irreversible_guard.is_none() {
-                irreversible_guard = Some(IrreversibleCheckpointGuard::arm(&trx_sys));
-            }
-            if let Some(guard) = publishing_guard.as_mut() {
-                guard.make_irreversible();
-            }
+            .await
+            .map_err(|_| Error::from(trx_sys.poison_engine(FatalError::CatalogWrite)))?;
+            publication_guard.set_failure_reason(FatalError::CheckpointWrite);
             #[cfg(test)]
             test_hooks::maybe_force_checkpoint_commit_error(&trx_sys);
-            let checkpoint_ts = match trx.commit().await {
-                Ok(checkpoint_ts) => checkpoint_ts,
-                Err(_) => {
-                    let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
-                    return Err(poison.into());
-                }
-            };
-            if let Some(guard) = irreversible_guard.as_mut() {
-                guard.disarm();
-            }
-            if let Some(guard) = publishing_guard.as_mut() {
-                guard.finish();
-            } else if let Some(guard) = transition_guard.take() {
-                guard.finish();
-            } else {
-                unreachable!("checkpoint publication completed without an owning guard")
-            }
-            drop(publishing_guard);
-            drop(root_mutation_lease);
+            let redo_cts = trx_sys
+                .commit_sys(sys_trx)
+                .map_err(|_| Error::from(trx_sys.poison_engine(FatalError::CheckpointWrite)))?;
+            publication_guard.finish();
             return Ok(CheckpointOutcome::Published {
                 checkpoint_ts,
+                redo_cts,
                 silent: true,
             });
         }
 
+        let gc_pages: Vec<PageID> = pages.iter().map(|page| page.page_id).collect();
+        sys_trx.extend_gc_row_pages(gc_pages);
+        sys_trx.record_data_checkpoint(self.table_id(), new_pivot_row_id, checkpoint_ts);
+
         // Step 10: enter the no-cancel publication section, publish a new
-        // table-file root, and then commit the checkpoint transaction. This
+        // table-file root, and then enqueue the checkpoint system transaction. This
         // happens only when table-file state beyond replay-bound fields
         // changed. Replay-bound-only checkpoints are published as catalog
         // silent watermark rows above.
-        let mut publishing_guard = if transition_guard.is_none() {
-            let lease = match self
-                .checkpoint_workflow
-                .try_begin_publishing(&self.lifecycle, attempt.source())
-            {
-                Ok(lease) => lease,
-                Err(reason) => {
-                    trx.rollback().await?;
-                    return Ok(CheckpointOutcome::Cancelled { reason });
-                }
-            };
-            Some(ReversibleWorkflowPublishGuard::new(
-                &self.checkpoint_workflow,
-                lease,
-            ))
-        } else {
-            None
-        };
-        #[cfg(test)]
-        if publishing_guard.is_some() {
-            test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
+        match publication_guard.begin_publishing(attempt.source()) {
+            Ok(true) => {
+                #[cfg(test)]
+                test_hooks::run_test_checkpoint_after_publish_admission_hook().await;
+            }
+            Ok(false) => {}
+            Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
         }
-        if transition_guard.is_none() && irreversible_guard.is_none() {
-            irreversible_guard = Some(IrreversibleCheckpointGuard::arm(&trx_sys));
-        }
-        if let Some(guard) = publishing_guard.as_mut() {
-            guard.make_irreversible();
-        }
+        publication_guard.make_irreversible(FatalError::CheckpointWrite);
         let published_root = mutable_file.root();
         let published_pivot_row_id = published_root.pivot_row_id;
         let published_column_root = published_root.column_block_index_root;
@@ -1515,14 +1354,10 @@ impl Table {
         {
             Ok(res) => res,
             Err(err) if err.kind() == ErrorKind::Io => {
-                let _ = trx.rollback().await;
                 let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
                 return Err(poison.into());
             }
-            Err(err) => {
-                trx.rollback().await?;
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         self.mem
             .blk_idx()
@@ -1531,30 +1366,18 @@ impl Table {
         #[cfg(test)]
         if test_hooks::test_force_post_publish_checkpoint_error_enabled() {
             let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
-            discard_transaction_after_fatal_rollback(&mut trx);
             return Err(poison.into());
         }
 
         #[cfg(test)]
         test_hooks::maybe_force_checkpoint_commit_error(&trx_sys);
-        if trx.commit().await.is_err() {
-            let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
-            return Err(poison.into());
-        }
-        if let Some(guard) = irreversible_guard.as_mut() {
-            guard.disarm();
-        }
-        if let Some(guard) = publishing_guard.as_mut() {
-            guard.finish();
-        } else if let Some(guard) = transition_guard.take() {
-            guard.finish();
-        } else {
-            unreachable!("checkpoint publication completed without an owning guard")
-        }
-        drop(publishing_guard);
-        drop(root_mutation_lease);
+        let redo_cts = trx_sys
+            .commit_sys(sys_trx)
+            .map_err(|_| Error::from(trx_sys.poison_engine(FatalError::CheckpointWrite)))?;
+        publication_guard.finish();
         Ok(CheckpointOutcome::Published {
             checkpoint_ts,
+            redo_cts,
             silent: false,
         })
     }
@@ -1595,13 +1418,15 @@ fn silent_watermark_floor(
 #[cfg(test)]
 mod tests {
     pub(crate) mod test_hooks {
-        use crate::error::FatalError;
+        use crate::error::{FatalError, Result};
         use crate::trx::sys::TransactionSystem;
         use std::cell::{Cell, RefCell};
         use std::future::Future;
         use std::pin::Pin;
 
         type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+        type FallibleTableHook =
+            Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + 'static>> + 'static>;
 
         thread_local! {
             static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
@@ -1612,6 +1437,8 @@ mod tests {
             static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
                 const { RefCell::new(None) };
             static TEST_CHECKPOINT_AFTER_PUBLISH_ADMISSION_HOOK: RefCell<Option<TableHook>> =
+                const { RefCell::new(None) };
+            static TEST_SILENT_WATERMARK_MUTATION_HOOK: RefCell<Option<FallibleTableHook>> =
                 const { RefCell::new(None) };
         }
 
@@ -1712,6 +1539,22 @@ mod tests {
             });
         }
 
+        pub(crate) fn set_test_silent_watermark_mutation_hook<F, Fut>(hook: F)
+        where
+            F: FnOnce() -> Fut + 'static,
+            Fut: Future<Output = Result<()>> + 'static,
+        {
+            TEST_SILENT_WATERMARK_MUTATION_HOOK.with(|slot| {
+                let old = slot
+                    .borrow_mut()
+                    .replace(Box::new(move || Box::pin(hook())));
+                assert!(
+                    old.is_none(),
+                    "silent watermark mutation hook already installed"
+                );
+            });
+        }
+
         pub(crate) async fn run_test_checkpoint_after_trx_start_hook() {
             let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
             if let Some(hook) = hook {
@@ -1724,6 +1567,14 @@ mod tests {
                 TEST_CHECKPOINT_AFTER_PUBLISH_ADMISSION_HOOK.with(|slot| slot.borrow_mut().take());
             if let Some(hook) = hook {
                 hook().await;
+            }
+        }
+
+        pub(crate) async fn run_test_silent_watermark_mutation_hook() -> Result<()> {
+            let hook = TEST_SILENT_WATERMARK_MUTATION_HOOK.with(|slot| slot.borrow_mut().take());
+            match hook {
+                Some(hook) => hook().await,
+                None => Ok(()),
             }
         }
 
@@ -1744,11 +1595,12 @@ mod tests {
     use crate::io::install_storage_backend_test_hook;
     use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
-    use crate::table::checkpoint_workflow::FrozenPageValidationState;
+    use crate::table::checkpoint_workflow::{FrozenPageValidationState, TableCheckpointWorkflow};
     use crate::table::persistence::test_hooks::{
         ForceCheckpointCommitErrorGuard, ForcePostPublishCheckpointErrorGuard,
         set_test_checkpoint_after_publish_admission_hook, set_test_checkpoint_after_trx_start_hook,
         set_test_force_secondary_sidecar_error, set_test_freeze_after_loading_hook,
+        set_test_silent_watermark_mutation_hook,
     };
     use crate::table::test_hooks::{
         ForceLwcBuildErrorGuard, set_test_freeze_page_state_locked_hook,
@@ -1762,10 +1614,12 @@ mod tests {
     use crate::trx::Transaction;
     use crate::trx::row::RowWriteAccess;
     use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::tests::discard_transaction_after_fatal_rollback;
     use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind};
     use crate::trx::ver_map::RowPageState;
     use crate::trx::{MIN_ACTIVE_TRX_ID, SharedTrxStatus};
     use futures::FutureExt;
+    use futures::future::pending;
     use smol::Timer;
     use std::cell::{Cell, RefCell};
     use std::cmp::Ordering;
@@ -1901,7 +1755,7 @@ mod tests {
         );
 
         let mut drop_session = engine.new_session().unwrap();
-        let checkpoint_ts = {
+        let checkpoint_redo_cts = {
             let drop_table = drop_session.drop_table(table_id).fuse();
             futures::pin_mut!(drop_table);
             assert!(matches!(
@@ -1913,17 +1767,16 @@ mod tests {
             release_tx.send_async(()).await.unwrap();
             let outcome = checkpoint.await.unwrap();
             let CheckpointOutcome::Published {
-                checkpoint_ts,
-                silent,
+                redo_cts, silent, ..
             } = outcome
             else {
                 panic!("admitted checkpoint should publish: {outcome:?}");
             };
             assert_eq!(silent, expected_silent);
             drop_table.await.unwrap();
-            checkpoint_ts
+            redo_cts
         };
-        assert!(checkpoint_ts < drop_session.last_cts());
+        assert!(checkpoint_redo_cts < drop_session.last_cts());
         assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
     }
 
@@ -2763,6 +2616,7 @@ mod tests {
                     .unwrap()
                     .expect("silent checkpoint should write a watermark");
                 assert!(watermark.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+                insert_rows(table_id, &mut session, 1, 2, "durability-anchor").await;
                 session.checkpoint_catalog().await.unwrap();
             }
             let effective = engine.catalog().effective_user_table_redo_replay_floor(
@@ -4033,7 +3887,12 @@ mod tests {
                 cutoff_ts,
             );
             assert!(delay.is_none());
-            let result = table.try_begin_page_transition(&engine.inner().trx_sys);
+            let mut publication_guard = CheckpointPublicationGuard::new(
+                &table.checkpoint_workflow,
+                &table.lifecycle,
+                &engine.inner().trx_sys,
+            );
+            let result = publication_guard.begin_transition();
             assert!(matches!(result, Err(CheckpointCancelReason::TableDropping)));
             assert!(transition_pages.iter().all(|page_guard| {
                 let (ctx, _) = page_guard.ctx_and_page();
@@ -4152,16 +4011,95 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_guard_finishes_workflow_before_releasing_lifecycle_lease() {
+    fn test_initial_publication_guard_leaves_attempt_reversible() {
         smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "initial-publication-guard").await;
+            let lifecycle = TableLifecycle::new();
+            let workflow = TableCheckpointWorkflow::new();
+            let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
+            let guard =
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+
+            drop(guard);
+
+            assert_eq!(workflow.state_name(), "Checkpointing");
+            drop(attempt);
+            assert_eq!(workflow.state_name(), "Idle");
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_publication_guard_rejects_invalid_state_transitions() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "invalid-publication-guard").await;
             let lifecycle = TableLifecycle::new();
             let workflow = TableCheckpointWorkflow::new();
             let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
-            let publish_lease = workflow
-                .try_begin_publishing(&lifecycle, attempt.source())
-                .unwrap();
-            let mut guard = ReversibleWorkflowPublishGuard::new(&workflow, publish_lease);
+            let mut guard =
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+            assert!(guard.begin_publishing(attempt.source()).unwrap());
+
+            let duplicate = catch_unwind(AssertUnwindSafe(|| {
+                let _ = guard.begin_publishing(attempt.source());
+            }));
+            assert!(duplicate.is_err());
+
+            drop(guard);
+            assert_eq!(workflow.state_name(), "Idle");
+            drop(attempt);
+
+            let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
+            let mut guard =
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+            let finish = catch_unwind(AssertUnwindSafe(|| guard.finish()));
+            assert!(finish.is_err());
+            drop(guard);
+            drop(attempt);
+            assert_eq!(workflow.state_name(), "Idle");
+            drop(root_lease);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_reversible_publish_guard_drop_restores_workflow() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "reversible-publication-guard").await;
+            let lifecycle = TableLifecycle::new();
+            let workflow = TableCheckpointWorkflow::new();
+            let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
+            let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            let mut guard =
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+            assert!(guard.begin_publishing(attempt.source()).unwrap());
+            assert_eq!(workflow.state_name(), "Publishing");
+
+            drop(guard);
+
+            assert_eq!(workflow.state_name(), "Idle");
+            drop(root_lease);
+            drop(attempt);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_publish_guard_finishes_workflow_before_releasing_lifecycle_lease() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "finished-publication-guard").await;
+            let lifecycle = TableLifecycle::new();
+            let workflow = TableCheckpointWorkflow::new();
+            let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
+            let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+            let mut guard =
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+            assert!(guard.begin_publishing(attempt.source()).unwrap());
 
             guard.finish();
             assert_eq!(workflow.state_name(), "Idle");
@@ -4176,6 +4114,7 @@ mod tests {
             drain.await;
             drop(root_lease);
             drop(attempt);
+            engine.shutdown().unwrap();
         });
     }
 
@@ -4216,7 +4155,7 @@ mod tests {
 
             let mut drop_session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let checkpoint_ts = {
+            let checkpoint_redo_cts = {
                 let drop_table = drop_session.drop_table(table_id).fuse();
                 futures::pin_mut!(drop_table);
                 assert!(matches!(
@@ -4228,13 +4167,13 @@ mod tests {
 
                 release_tx.send_async(()).await.unwrap();
                 let outcome = checkpoint.await.unwrap();
-                let CheckpointOutcome::Published { checkpoint_ts, .. } = outcome else {
+                let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
                     panic!("admitted checkpoint should publish: {outcome:?}");
                 };
                 drop_table.as_mut().await.unwrap();
-                checkpoint_ts
+                redo_cts
             };
-            assert!(checkpoint_ts < drop_session.last_cts());
+            assert!(checkpoint_redo_cts < drop_session.last_cts());
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
         });
     }
@@ -5015,6 +4954,129 @@ mod tests {
         });
     }
 
+    async fn prepare_silent_checkpoint_failure(
+        engine: &Engine,
+        session: &mut Session,
+    ) -> (TableID, ActiveRoot) {
+        let table_id = create_table2_for_test(engine).await;
+        insert_rows(table_id, session, 0, 8, "silent-failure").await;
+        wait_checkpoint_ready(table_id, session).await;
+        let root = table_for_internal_assertion(engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
+        (table_id, root)
+    }
+
+    fn assert_catalog_write_poisoned(err: &Error, engine: &Engine) {
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::CatalogWrite)
+        );
+        assert!(
+            engine
+                .inner()
+                .trx_sys
+                .poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::CatalogWrite)
+        );
+    }
+
+    async fn assert_silent_watermark_absent(
+        engine: &Engine,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) {
+        let watermark = engine
+            .catalog()
+            .storage
+            .table_replay_silent_watermarks()
+            .find_uncommitted_by_table_id(guards, table_id)
+            .await
+            .unwrap();
+        assert!(watermark.is_none());
+    }
+
+    #[test]
+    fn test_silent_watermark_mutation_failure_poisons_catalog_write() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "silent-mutation-failure").await;
+            let mut session = engine.new_session().unwrap();
+            let (table_id, root_before) =
+                prepare_silent_checkpoint_failure(&engine, &mut session).await;
+            let guards = session.pool_guards();
+            set_test_silent_watermark_mutation_hook(|| async {
+                Err(Report::new(InternalError::InjectedTestFailure).into())
+            });
+
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+
+            assert_catalog_write_poisoned(&err, &engine);
+            assert_silent_watermark_absent(&engine, &guards, table_id).await;
+            assert_root_metadata_unchanged(
+                &root_before,
+                &table_for_internal_assertion(&engine, table_id),
+            );
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .checkpoint_workflow
+                    .state_name(),
+                "Publishing"
+            );
+            drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_silent_watermark_mutation_cancellation_poisons_catalog_write() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "silent-mutation-cancel").await;
+            let mut session = engine.new_session().unwrap();
+            let (table_id, root_before) =
+                prepare_silent_checkpoint_failure(&engine, &mut session).await;
+            let guards = session.pool_guards();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            set_test_silent_watermark_mutation_hook(move || async move {
+                entered_tx.send_async(()).await.unwrap();
+                pending().await
+            });
+            let mut checkpoint = Box::pin(session.checkpoint_table(table_id).fuse());
+            let mut entered = Box::pin(entered_rx.recv_async().fuse());
+            futures::select! {
+                result = checkpoint.as_mut() => {
+                    panic!("silent checkpoint completed before mutation cancellation: {result:?}");
+                }
+                result = entered.as_mut() => result.unwrap(),
+            }
+
+            drop(checkpoint);
+
+            let poison = engine
+                .inner()
+                .trx_sys
+                .poison_error()
+                .expect("cancelled silent mutation should poison storage");
+            assert_eq!(*poison.current_context(), FatalError::CatalogWrite);
+            assert_silent_watermark_absent(&engine, &guards, table_id).await;
+            assert_root_metadata_unchanged(
+                &root_before,
+                &table_for_internal_assertion(&engine, table_id),
+            );
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .checkpoint_workflow
+                    .state_name(),
+                "Publishing"
+            );
+            drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
+
     #[test]
     fn test_checkpoint_heartbeat() {
         smol::block_on(async {
@@ -5088,6 +5150,7 @@ mod tests {
                 table_for_internal_assertion(&engine, table_id).redo_replay_floor_snapshot()
             );
 
+            insert_rows(table_id, &mut session, 40, 41, &name).await;
             session.checkpoint_catalog().await.unwrap();
             let checkpointed = engine.catalog().storage.checkpointed_silent_watermarks();
             let checkpointed_floor = checkpointed

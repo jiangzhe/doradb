@@ -1,17 +1,45 @@
+use crate::buffer::PoolGuards;
+use crate::catalog::{Catalog, SilentWatermarkObject};
+use crate::error::{Error, InternalError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::log::block_group::TrxLog;
-use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
-use crate::trx::PreparedTrx;
+use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
+use crate::table::NoTrxUpsertChange;
+use crate::trx::{PreparedTrx, PreparedTrxPayload};
+use error_stack::Report;
 use std::mem;
 
 /// SysTrx is a special kind of transaction only used for system
 /// operations. Its effect is immediately visible for other
 /// transactions and it can not rollback.
 pub(crate) struct SysTrx {
+    pub(super) gc_no: usize,
     pub(super) redo: RedoLogs,
+    pub(super) gc_row_pages: Vec<PageID>,
+}
+
+/// System transaction GC payload carried unchanged through ordered commit.
+pub(crate) struct SysTrxPayload {
+    pub(super) gc_no: usize,
+    pub(super) gc_row_pages: Vec<PageID>,
+}
+
+impl SysTrxPayload {
+    /// Returns whether this payload owns no retired row pages.
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.gc_row_pages.is_empty()
+    }
 }
 
 impl SysTrx {
+    /// Return accumulated redo for focused system-transaction tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn redo(&self) -> &RedoLogs {
+        &self.redo
+    }
+
     /// Record creation of a row page in this system transaction's redo payload.
     #[inline]
     pub(crate) fn create_row_page(
@@ -32,6 +60,85 @@ impl SysTrx {
         }));
     }
 
+    /// Record publication of one durable user-table checkpoint root.
+    #[inline]
+    pub(crate) fn record_data_checkpoint(
+        &mut self,
+        table_id: TableID,
+        pivot_row_id: RowID,
+        checkpoint_ts: TrxID,
+    ) {
+        debug_assert!(self.redo.ddl.is_none());
+        self.redo.ddl.replace(Box::new(DDLRedo::DataCheckpoint {
+            table_id,
+            pivor_row_id: pivot_row_id,
+            checkpoint_ts,
+        }));
+    }
+
+    /// Extend row pages retired by the checkpoint represented by this transaction.
+    #[inline]
+    pub(crate) fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
+        self.gc_row_pages.extend(pages);
+    }
+
+    /// Monotonically update the live silent-watermark mirror and record logical redo.
+    pub(crate) async fn upsert_silent_watermark(
+        &mut self,
+        catalog: &Catalog,
+        guards: &PoolGuards,
+        watermark: SilentWatermarkObject,
+    ) -> Result<()> {
+        match self.redo.ddl.as_deref() {
+            None => {
+                self.redo
+                    .ddl
+                    .replace(Box::new(DDLRedo::TableReplaySilentWatermark {
+                        table_id: watermark.table_id,
+                    }));
+            }
+            Some(DDLRedo::TableReplaySilentWatermark { table_id })
+                if *table_id == watermark.table_id => {}
+            Some(existing) => {
+                return Err(Error::from(
+                    Report::new(InternalError::Generic).attach(format!(
+                        "silent watermark system transaction has incompatible DDL redo: existing={existing:?}, table_id={}",
+                        watermark.table_id
+                    )),
+                ));
+            }
+        }
+        let watermarks = catalog.storage.table_replay_silent_watermarks();
+        let catalog_table_id = watermarks.table_id();
+        let redo = &mut self.redo;
+        watermarks
+            .upsert_no_trx(guards, &watermark, |change| {
+                let entry = match change {
+                    NoTrxUpsertChange::Inserted {
+                        page_id,
+                        row_id,
+                        vals,
+                    } => RowRedo {
+                        page_id,
+                        row_id,
+                        kind: RowRedoKind::Insert(vals),
+                    },
+                    NoTrxUpsertChange::Updated {
+                        page_id,
+                        row_id,
+                        key,
+                        cols,
+                    } => RowRedo {
+                        page_id,
+                        row_id,
+                        kind: RowRedoKind::UpdateByPrimaryKey(key, cols),
+                    },
+                };
+                redo.insert_dml(catalog_table_id, entry);
+            })
+            .await
+    }
+
     /// Prepare this transaction for commit.
     #[inline]
     pub(crate) fn prepare(mut self) -> PreparedTrx {
@@ -48,10 +155,41 @@ impl SysTrx {
         };
         PreparedTrx {
             redo_bin,
-            payload: None,
+            payload: (!self.gc_row_pages.is_empty()).then(|| {
+                PreparedTrxPayload::System(SysTrxPayload {
+                    gc_no: self.gc_no,
+                    gc_row_pages: mem::take(&mut self.gc_row_pages),
+                })
+            }),
             attachment: None,
             lock_manager: None,
             lock_state: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sys_gc_prepare_uses_system_payload_variant() {
+        let mut sys_trx = SysTrx {
+            gc_no: 3,
+            redo: RedoLogs::default(),
+            gc_row_pages: Vec::new(),
+        };
+        sys_trx.record_data_checkpoint(TableID::new(7), RowID::new(11), TrxID::new(13));
+        sys_trx.extend_gc_row_pages(vec![PageID::new(17)]);
+        let mut prepared = sys_trx.prepare();
+        assert!(matches!(
+            prepared.payload.as_ref(),
+            Some(PreparedTrxPayload::System(SysTrxPayload {
+                gc_no: 3,
+                gc_row_pages,
+            })) if gc_row_pages == &vec![PageID::new(17)]
+        ));
+        prepared.redo_bin.take();
+        prepared.payload.take();
     }
 }

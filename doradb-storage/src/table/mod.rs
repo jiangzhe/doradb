@@ -21,12 +21,13 @@ pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
+pub(crate) use lifecycle::CheckpointPublishLease;
+#[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
 pub(crate) use lifecycle::{
-    CheckpointPublishLease, TableCheckpointRootMutationLease, TableDropDrain, TableLifecycle,
-    TableMetadataChangeLease,
+    TableCheckpointRootMutationLease, TableDropDrain, TableLifecycle, TableMetadataChangeLease,
 };
-pub(crate) use mem_table::MemTable;
+pub(crate) use mem_table::{MemTable, NoTrxUpsertChange};
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
 pub(crate) use storage::ColumnStorage;
@@ -36,7 +37,7 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{DataIntegrityError, Error, FatalError, InternalError, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
@@ -48,7 +49,6 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol, UpdateIndex};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
-use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind};
 use crate::trx::{TrxContext, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
@@ -877,38 +877,6 @@ impl<'ctx> TableRootSnapshot<'ctx> {
     #[inline]
     pub(crate) fn root_is_visible_to(&self, sts: TrxID) -> bool {
         self.effective_ts < sts
-    }
-}
-
-struct IrreversibleCheckpointGuard<'a> {
-    trx_sys: &'a TransactionSystem,
-    armed: bool,
-}
-
-impl<'a> IrreversibleCheckpointGuard<'a> {
-    #[inline]
-    fn arm(trx_sys: &'a TransactionSystem) -> Self {
-        Self {
-            trx_sys,
-            armed: true,
-        }
-    }
-
-    #[inline]
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for IrreversibleCheckpointGuard<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.armed {
-            // Transition publication, a table-root swap, and checkpoint commit
-            // handoff cannot be abandoned safely. Poison storage so foreground
-            // route waiters and later maintenance fail closed.
-            let _ = self.trx_sys.poison_engine(FatalError::CheckpointWrite);
-        }
     }
 }
 

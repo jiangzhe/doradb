@@ -382,16 +382,11 @@ fn row_to_index_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> I
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::tests::open_catalog_test_engine;
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
-    use crate::trx::Transaction;
     use tempfile::TempDir;
-
-    fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {
-        let old = trx.set_ddl_redo(ddl).unwrap();
-        debug_assert!(old.is_none());
-    }
 
     #[test]
     fn test_indexes_delete_by_id() {
@@ -443,11 +438,11 @@ mod tests {
                         .insert(stmt, &idx_43_0)
                         .await
                 );
+                mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -468,11 +463,11 @@ mod tests {
                         .delete_by_id(stmt, TableID::new(42), 9)
                         .await
                 );
+                mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let idx_42 = engine
@@ -521,11 +516,11 @@ mod tests {
                         .delete_by_id(stmt, TableID::new(43), 0)
                         .await
                 );
+                mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             assert!(
@@ -585,11 +580,11 @@ mod tests {
                 for index in &indexes {
                     assert!(engine.catalog().storage.indexes().insert(stmt, index).await);
                 }
+                mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -614,11 +609,11 @@ mod tests {
                         .unwrap(),
                     0
                 );
+                mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             assert!(
@@ -697,11 +692,11 @@ mod tests {
                             .await
                     );
                 }
+                mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -726,11 +721,11 @@ mod tests {
                         .unwrap(),
                     0
                 );
+                mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let remaining_42 = engine
@@ -765,11 +760,11 @@ mod tests {
                         .unwrap(),
                     0
                 );
+                mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             assert!(

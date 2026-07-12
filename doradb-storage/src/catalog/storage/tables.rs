@@ -125,16 +125,11 @@ fn row_to_table_object(col_layout: &TableColumnLayout, row: Row<'_>) -> TableObj
 mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+    use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::tests::{open_catalog_test_engine, table1};
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
-    use crate::trx::Transaction;
     use tempfile::TempDir;
-
-    fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {
-        let old = trx.set_ddl_redo(ddl).unwrap();
-        debug_assert!(old.is_none());
-    }
 
     #[test]
     fn test_tables_delete_by_id() {
@@ -170,11 +165,11 @@ mod tests {
                         .insert(stmt, &table101)
                         .await
                 );
+                mark_catalog_ddl(stmt, DDLRedo::CreateTable(table100.table_id));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(table100.table_id));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -195,11 +190,11 @@ mod tests {
                         .delete_by_id(stmt, TableID::new(999))
                         .await
                 );
+                mark_catalog_ddl(stmt, DDLRedo::DropTable(table100.table_id));
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(table100.table_id));
             trx.commit().await.unwrap();
 
             assert!(

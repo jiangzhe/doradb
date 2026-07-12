@@ -686,19 +686,27 @@ impl GCBucket {
         // Update both active sts list and committed transaction list
         let mut active_sts_list = self.active_sts_list.lock();
         let mut min_sts = MAX_SNAPSHOT_TS;
+        let mut removed_active_sts = false;
+        let mut system_gc_handoff = false;
         {
             let mut committed_trx_list = self.committed_trx_list.lock();
             for trx in trx_list {
                 if let Some(sts) = trx.sts() {
                     min_sts = active_sts_list.remove(sts);
-                    committed_trx_list.push_back(trx);
+                    removed_active_sts = true;
+                } else {
+                    system_gc_handoff = true;
                 }
+                committed_trx_list.push_back(trx);
             }
+        }
+        if !removed_active_sts {
+            return system_gc_handoff;
         }
         // Update minimum active STS
         // separate load and store is safe because this update will only happen when lock of
         // active_sts_list is acquired.
-        self.update_min_active_sts(min_sts)
+        self.update_min_active_sts(min_sts) || system_gc_handoff
     }
 
     #[inline]
@@ -860,8 +868,6 @@ impl PurgeLoop for PurgeSingleThreaded {
         pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     ) {
-        // initialize min_active_sts.
-        let mut min_sts = trx_sys.global_visible_sts();
         while let Ok(purge) = purge_chan.recv() {
             let work = coalesce_purge_work(&purge_chan, purge, |trx_list| {
                 trx_sys.record_committed_for_purge(trx_list)
@@ -871,9 +877,11 @@ impl PurgeLoop for PurgeSingleThreaded {
             }
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
             trx_sys.publish_gc_horizon(curr_sts);
-            if work.full_gc && curr_sts > min_sts {
+            if work.full_gc {
                 // Start GC. Purge undo/index first, then deallocate retired
-                // row pages once all bucket lists have been collected.
+                // row pages once all bucket lists have been collected. System
+                // GC handoffs can require this observation without advancing
+                // the active-snapshot horizon.
                 let mut gc_row_pages = FastHashSet::default();
                 let mut trx_list = vec![];
                 for gc_bucket in &trx_sys.gc_buckets {
@@ -913,7 +921,6 @@ impl PurgeLoop for PurgeSingleThreaded {
                 // Once GC is finished, update global_visible_sts so other threads can use it to
                 // speed up visibility check.
                 trx_sys.update_global_visible_sts(curr_sts);
-                min_sts = curr_sts;
             }
         }
     }
@@ -943,7 +950,7 @@ impl PurgeLoop for PurgeDispatcher {
             }
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
             trx_sys.publish_gc_horizon(curr_sts);
-            if work.full_gc && curr_sts > min_sts {
+            if work.full_gc {
                 // dispatch tasks to executors
                 let (done_tx, done_rx) = flume::unbounded();
                 let mut expected_tasks = 0usize;
@@ -962,7 +969,8 @@ impl PurgeLoop for PurgeDispatcher {
                     dispatch_no += 1;
                 }
                 drop(done_tx);
-                // wait for all executors to finish their tasks in this cycle.
+                // Wait for every bucket's undo/index work before the dispatcher
+                // deallocates any retired page collected by any bucket.
                 for _ in 0..expected_tasks {
                     match done_rx.recv_async().await {
                         Ok(Ok(())) => (),
@@ -1123,7 +1131,7 @@ mod tests {
     use crate::trx::row::RowReadAccess;
     use crate::trx::stmt::Statement;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
-    use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus};
+    use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus, SysTrxPayload};
     use crate::value::Val;
     use smol::Timer;
     use std::sync::Arc;
@@ -1293,6 +1301,29 @@ mod tests {
             }),
             PurgeWork::full()
         );
+    }
+
+    #[test]
+    fn test_gc_bucket_records_system_payload_without_active_sts() {
+        let bucket = GCBucket::new();
+        let committed = CommittedTrx {
+            cts: TrxID::new(10),
+            payload: Some(CommittedTrxPayload::System(SysTrxPayload {
+                gc_no: 0,
+                gc_row_pages: vec![PageID::new(19)],
+            })),
+        };
+        assert!(bucket.record_committed_for_purge(vec![committed]));
+        assert!(bucket.active_sts_list.lock().active.is_empty());
+        assert_eq!(
+            TrxID::new(bucket.min_active_sts.load(Ordering::Relaxed)),
+            MAX_SNAPSHOT_TS
+        );
+        let mut purge = Vec::new();
+        bucket.get_purge_list(TrxID::new(11), &mut purge);
+        assert_eq!(purge.len(), 1);
+        assert_eq!(purge[0].sts(), None);
+        assert_eq!(purge[0].gc_row_pages(), Some(&[PageID::new(19)][..]));
     }
 
     #[test]
@@ -1478,12 +1509,11 @@ mod tests {
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload {
+                payload: Some(CommittedTrxPayload::User {
                     sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
-                    gc_row_pages: vec![],
                 }),
             };
             let guards = PoolGuards::builder()
@@ -1569,12 +1599,11 @@ mod tests {
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload {
+                payload: Some(CommittedTrxPayload::User {
                     sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
-                    gc_row_pages: vec![],
                 }),
             };
             {
@@ -1653,12 +1682,11 @@ mod tests {
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload {
+                payload: Some(CommittedTrxPayload::User {
                     sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
-                    gc_row_pages: vec![],
                 }),
             };
             {
@@ -1764,12 +1792,11 @@ mod tests {
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload {
+                payload: Some(CommittedTrxPayload::User {
                     sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
-                    gc_row_pages: vec![],
                 }),
             };
             {
@@ -1871,12 +1898,11 @@ mod tests {
             ));
             let trx = CommittedTrx {
                 cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload {
+                payload: Some(CommittedTrxPayload::User {
                     sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
-                    gc_row_pages: vec![],
                 }),
             };
             {

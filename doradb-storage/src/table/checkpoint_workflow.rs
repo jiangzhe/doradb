@@ -1,7 +1,9 @@
 use super::CheckpointCancelReason;
 use super::deletion_buffer::DeleteMarker;
 use super::lifecycle::{CheckpointPublishLease, TableLifecycle, TableTerminal};
+use crate::error::FatalError;
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::trx::sys::TransactionSystem;
 use parking_lot::Mutex;
 use std::fmt;
 use std::mem::replace;
@@ -193,6 +195,155 @@ enum TableCheckpointWorkflowState {
     Publishing,
     Transition,
     Closed,
+}
+
+enum CheckpointPublicationState {
+    /// No publication admission is held; `CheckpointAttempt` still owns
+    /// reversible workflow restoration.
+    Initial,
+    /// Row-page transition admission is held and any failure must poison
+    /// storage because a Transition prefix may already be visible.
+    Transition { reason: FatalError },
+    /// Late publication admission is held, but no irreversible mutation has
+    /// occurred, so dropping the guard restores the workflow.
+    Publishing,
+    /// Late publication crossed the irreversible mutation boundary and any
+    /// failure must poison storage with the current reason.
+    IrreversiblePublishing { reason: FatalError },
+    /// Workflow publication completed successfully; the lifecycle lease stays
+    /// held until the guard itself is dropped.
+    Finished,
+}
+
+/// Owns checkpoint workflow, lifecycle, and fatal-failure publication state.
+pub(super) struct CheckpointPublicationGuard<'table, 'trx> {
+    workflow: &'table TableCheckpointWorkflow,
+    lifecycle: &'table TableLifecycle,
+    trx_sys: &'trx TransactionSystem,
+    publish_lease: Option<CheckpointPublishLease<'table>>,
+    state: CheckpointPublicationState,
+}
+
+impl<'table, 'trx> CheckpointPublicationGuard<'table, 'trx> {
+    #[inline]
+    pub(super) fn new(
+        workflow: &'table TableCheckpointWorkflow,
+        lifecycle: &'table TableLifecycle,
+        trx_sys: &'trx TransactionSystem,
+    ) -> Self {
+        Self {
+            workflow,
+            lifecycle,
+            trx_sys,
+            publish_lease: None,
+            state: CheckpointPublicationState::Initial,
+        }
+    }
+
+    pub(super) fn begin_transition(&mut self) -> StdResult<(), CheckpointCancelReason> {
+        if !matches!(self.state, CheckpointPublicationState::Initial) {
+            panic!("page transition requires an initial publication guard")
+        }
+        let lease = self.workflow.try_begin_transition(self.lifecycle)?;
+        self.publish_lease = Some(lease);
+        self.state = CheckpointPublicationState::Transition {
+            reason: FatalError::CheckpointWrite,
+        };
+        Ok(())
+    }
+
+    /// Ensures final publication admission and reports whether this call
+    /// acquired it. An existing Transition admission already owns the gate.
+    pub(super) fn begin_publishing(
+        &mut self,
+        source: CheckpointSource,
+    ) -> StdResult<bool, CheckpointCancelReason> {
+        if matches!(self.state, CheckpointPublicationState::Transition { .. }) {
+            return Ok(false);
+        }
+        if !matches!(self.state, CheckpointPublicationState::Initial) {
+            panic!("final publication requires an initial or transition guard")
+        }
+        let lease = self.workflow.try_begin_publishing(self.lifecycle, source)?;
+        self.publish_lease = Some(lease);
+        self.state = CheckpointPublicationState::Publishing;
+        Ok(true)
+    }
+
+    #[inline]
+    pub(super) fn make_irreversible(&mut self, reason: FatalError) {
+        if matches!(self.state, CheckpointPublicationState::Publishing) {
+            self.state = CheckpointPublicationState::IrreversiblePublishing { reason };
+            return;
+        }
+        match &mut self.state {
+            CheckpointPublicationState::Transition {
+                reason: current, ..
+            } => *current = reason,
+            CheckpointPublicationState::Initial => {
+                panic!("initial checkpoint publication cannot become irreversible")
+            }
+            CheckpointPublicationState::Publishing => unreachable!(),
+            CheckpointPublicationState::IrreversiblePublishing { .. } => {
+                panic!("checkpoint publication is already irreversible")
+            }
+            CheckpointPublicationState::Finished => {
+                panic!("finished checkpoint publication cannot become irreversible")
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn set_failure_reason(&mut self, reason: FatalError) {
+        match &mut self.state {
+            CheckpointPublicationState::Transition {
+                reason: current, ..
+            }
+            | CheckpointPublicationState::IrreversiblePublishing {
+                reason: current, ..
+            } => *current = reason,
+            CheckpointPublicationState::Initial
+            | CheckpointPublicationState::Publishing
+            | CheckpointPublicationState::Finished => {
+                panic!("checkpoint publication failure reason requires irreversible state")
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn finish(&mut self) {
+        match self.state {
+            CheckpointPublicationState::Transition { .. }
+            | CheckpointPublicationState::Publishing
+            | CheckpointPublicationState::IrreversiblePublishing { .. } => {}
+            CheckpointPublicationState::Initial => {
+                panic!("initial checkpoint publication cannot finish")
+            }
+            CheckpointPublicationState::Finished => {
+                panic!("checkpoint publication already finished")
+            }
+        }
+        self.workflow.finish_publication();
+        self.state = CheckpointPublicationState::Finished;
+    }
+}
+
+impl Drop for CheckpointPublicationGuard<'_, '_> {
+    #[inline]
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.publish_lease.is_some(),
+            !matches!(self.state, CheckpointPublicationState::Initial)
+        );
+        match &self.state {
+            CheckpointPublicationState::Initial | CheckpointPublicationState::Finished => {}
+            CheckpointPublicationState::Publishing => self.workflow.finish_publication(),
+            CheckpointPublicationState::Transition { reason }
+            | CheckpointPublicationState::IrreversiblePublishing { reason } => {
+                let _ = self.trx_sys.poison_engine(*reason);
+            }
+        }
+    }
 }
 
 /// Volatile ownership state for one table's freeze-to-checkpoint workflow.

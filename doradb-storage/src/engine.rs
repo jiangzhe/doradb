@@ -829,7 +829,7 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{ConfigError, ErrorKind, LifecycleError, OperationError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
-    use crate::id::{PageID, TableID, TrxID};
+    use crate::id::{TableID, TrxID};
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::session::tests::{SessionTestExt, session_registry_len};
@@ -1479,10 +1479,6 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
             assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
 
-            let err = trx.extend_gc_row_pages(vec![PageID::new(46)]).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
-
             trx.rollback().await.unwrap();
             drop(session);
             engine.shutdown().unwrap();
@@ -1787,7 +1783,7 @@ mod tests {
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
@@ -1884,7 +1880,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
             let cts = trx.commit().await.unwrap();
             assert!(cts > TrxID::new(0));
             assert!(!session.in_trx().unwrap());

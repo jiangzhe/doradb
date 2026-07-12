@@ -1128,6 +1128,7 @@ fn index_ddl_metadata_reconcilable(
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::CatalogCheckpointScanStopReason;
+    use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1138,7 +1139,7 @@ pub(crate) mod tests {
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::log::redo::DDLRedo;
     use crate::table::tests::assert_freeze_created;
-    use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
+    use crate::trx::MIN_SNAPSHOT_TS;
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
     use std::fs::OpenOptions;
@@ -1381,11 +1382,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {
-        let old = trx.set_ddl_redo(ddl).unwrap();
-        debug_assert!(old.is_none());
-    }
-
     #[test]
     fn test_catalog_table_id_boundary_predicates() {
         let last_user = TableID::new(USER_TABLE_ID_LIMIT.as_u64() - 1);
@@ -1542,17 +1538,17 @@ pub(crate) mod tests {
                         )
                         .await
                 );
+                mark_catalog_ddl(
+                    stmt,
+                    DDLRedo::CreateIndex {
+                        table_id,
+                        index_no: orphan_index_no,
+                    },
+                );
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(
-                &mut trx,
-                DDLRedo::CreateIndex {
-                    table_id,
-                    index_no: orphan_index_no,
-                },
-            );
             trx.commit().await.unwrap();
 
             let guards = PoolGuards::builder()

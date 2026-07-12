@@ -346,6 +346,24 @@ valid only for the running process. Any effect that must be reconstructed after
 restart must therefore emit a real redo record or marker instead of relying on
 the ordered-only path.
 
+#### System Transactions
+
+`SysTrx` is the single sessionless transaction type for row-page creation and
+user-table checkpoint completion. It has no STS, active-bucket registration,
+session attachment, undo, locks, rollback, or durability waiter. Table
+checkpoint allocates a separate non-active `checkpoint_ts` for construction and
+root publication. `commit_sys` later assigns an ordered `redo_cts` and returns
+after enqueue acceptance; that return does not acknowledge redo persistence.
+Each `SysTrx` preallocates a purge shard from a system-only round-robin sequence;
+the shard remains unused when the transaction produces no purge payload, so
+redo-only system work does not perturb user-transaction bucket distribution.
+
+Prepared, precommit, and committed payloads distinguish `User` and `System`
+variants. User payloads own status, STS, undo, and session completion. System
+checkpoint payloads own only the purge shard and retired row pages, and are
+valid only when coupled to recovery-visible checkpoint redo. Failed system
+precommit performs no rollback or active-STS removal.
+
 #### Rollback Phase
 
 - Row undo is rolled back in reverse order. `Insert` marks the hot row deleted,
@@ -444,6 +462,12 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 - **Action**: Background threads collect committed transaction contexts.
   - Any Undo versions in the transaction with `Commit_STS < Global_Min_STS` are obsolete (no active transaction can see them).
   - These records are unlinked and memory is reclaimed.
+
+Checkpoint-retired row pages use the same committed-payload queues and CTS
+horizon. A system payload has no STS to remove; its ordered CTS is its
+reclamation fence. Each purge round finishes eligible row-undo and index work
+from every bucket before the dispatcher deallocates any collected retired page,
+because undo in one bucket may still reference a page retired in another.
 
 #### MemIndex Eviction
 

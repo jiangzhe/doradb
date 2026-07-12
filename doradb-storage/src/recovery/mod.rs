@@ -1215,7 +1215,7 @@ mod tests {
         RecoveryCoordinator, invalid_user_table_keyed_redo, validate_create_table_reloaded_root_ts,
     };
     use crate::buffer::PoolRole;
-    use crate::catalog::storage::{SilentWatermarkObject, publish_first_redo_log_seq_for_test};
+    use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
         IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
@@ -1418,6 +1418,15 @@ mod tests {
         let table = engine.catalog().get_table(table_id).await.unwrap();
         checkpoint_published(&table, &mut session).await;
         drop(table);
+        let mut durability_trx = session.begin_trx().unwrap();
+        trx_insert_row_by_id(
+            &mut durability_trx,
+            table_id,
+            vec![Val::from(10_001), Val::from(10_001)],
+        )
+        .await
+        .unwrap();
+        durability_trx.commit().await.unwrap();
         drop(session);
         engine
             .catalog()
@@ -1611,7 +1620,7 @@ mod tests {
                 ddl: Some(Box::new(DDLRedo::DataCheckpoint {
                     table_id,
                     pivor_row_id: RowID::new(0),
-                    sts: cts,
+                    checkpoint_ts: cts,
                 })),
                 dml: BTreeMap::default(),
             },
@@ -2881,6 +2890,15 @@ mod tests {
             assert!(watermark_floor.heap_redo_start_ts > root_floor.heap_redo_start_ts);
             assert!(watermark_floor.deletion_cutoff_ts > root_floor.deletion_cutoff_ts);
             if checkpoint_catalog {
+                let mut durability_trx = session.begin_trx().unwrap();
+                trx_insert_row_by_id(
+                    &mut durability_trx,
+                    table_id,
+                    vec![Val::from(1i32), Val::from(1i32)],
+                )
+                .await
+                .unwrap();
+                durability_trx.commit().await.unwrap();
                 session.checkpoint_catalog().await.unwrap();
                 assert_eq!(
                     engine
@@ -2962,85 +2980,6 @@ mod tests {
             assert_eq!(live_after_catalog_checkpoint[0].floor, expected_floor);
             drop(recovered);
         })
-    }
-
-    #[test]
-    fn test_recovery_replays_uncheckpointed_silent_watermark_keyed_update() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().join("keyed-update");
-            fs::create_dir_all(&main_dir).unwrap();
-            let log_file_stem = "recover-silent-keyed-update";
-            let engine = lightweight_recovery_engine_config(main_dir.clone(), log_file_stem)
-                .build()
-                .await
-                .unwrap();
-            let table_id =
-                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            let mut session = engine.new_session().unwrap();
-
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                engine
-                    .catalog()
-                    .storage
-                    .table_replay_silent_watermarks()
-                    .upsert(
-                        stmt,
-                        &SilentWatermarkObject {
-                            table_id,
-                            heap_redo_start_ts: TrxID::new(10),
-                            deletion_cutoff_ts: TrxID::new(12),
-                        },
-                    )
-                    .await
-            })
-            .await
-            .unwrap();
-            trx.set_ddl_redo(DDLRedo::TableReplaySilentWatermark { table_id })
-                .unwrap();
-            trx.commit().await.unwrap();
-
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                engine
-                    .catalog()
-                    .storage
-                    .table_replay_silent_watermarks()
-                    .upsert(
-                        stmt,
-                        &SilentWatermarkObject {
-                            table_id,
-                            heap_redo_start_ts: TrxID::new(11),
-                            deletion_cutoff_ts: TrxID::new(14),
-                        },
-                    )
-                    .await
-            })
-            .await
-            .unwrap();
-            trx.set_ddl_redo(DDLRedo::TableReplaySilentWatermark { table_id })
-                .unwrap();
-            trx.commit().await.unwrap();
-            drop(session);
-            drop(engine);
-
-            let recovered = lightweight_recovery_engine_config(main_dir, log_file_stem)
-                .build()
-                .await
-                .unwrap();
-            let session = recovered.new_session().unwrap();
-            let watermark = recovered
-                .catalog()
-                .storage
-                .table_replay_silent_watermarks()
-                .find_uncommitted_by_table_id(&session.pool_guards(), table_id)
-                .await
-                .unwrap()
-                .expect("recovery should replay keyed silent watermark update");
-            assert_eq!(watermark.heap_redo_start_ts, TrxID::new(11));
-            assert_eq!(watermark.deletion_cutoff_ts, TrxID::new(14));
-        });
     }
 
     #[test]

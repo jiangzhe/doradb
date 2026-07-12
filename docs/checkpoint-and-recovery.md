@@ -104,6 +104,13 @@ Table checkpoint has two persistence responsibilities:
 1. move committed hot rows into persistent LWC blocks
 2. persist committed cold-row deletes into delete bitmaps
 
+Checkpoint construction uses a non-active `checkpoint_ts`, not a normal
+transaction STS. Root timestamps, LWC/DiskTree writers, replay bounds, and
+`DDLRedo::DataCheckpoint` carry that value. After root or silent-mirror
+publication, the sessionless `SysTrx` receives a distinct ordered `redo_cts` and
+returns after no-wait enqueue acceptance. The root is already durable at that
+point, but accepted system redo may still be waiting for write/sync completion.
+
 Secondary-index persistence happens as companion work of those same checkpoint
 operations. Each live user table owns one volatile freeze/checkpoint workflow,
 including the canonical frozen-page batch, its original post-freeze fence, and
@@ -161,15 +168,17 @@ Each RowPage moves through:
    incremental readiness succeeds, later lock/delete ownership observed on the
    frozen page is representable regardless of writer STS and cannot cause
    another cutoff delay.
-7. Acquire lifecycle publish admission and arm the fatal irreversible guard,
-   then revalidate in canonical order under one page-state write lock at a
-   time. A matching page identity, cutoff, and full mutation version reuses the
-   plan; an absent or stale plan is rebuilt under that page-local lock without
-   reapplying the initial pre-fence blocker rule. Locked regeneration must
-   produce a plan because frozen pages cannot add an Insert/Update image after
-   stable readiness. Publish each page as `TRANSITION`, install its prepared
-   markers, and release its lock immediately. During this phase the batch is a
-   growing `TRANSITION` prefix followed by a `FROZEN` suffix.
+7. Acquire the unified publication guard, which owns lifecycle publish
+   admission, workflow completion, and fatal classification. Make it
+   irreversible before revalidating in canonical order under one page-state
+   write lock at a time. A matching page identity, cutoff, and full mutation
+   version reuses the plan; an absent or stale plan is rebuilt under that
+   page-local lock without reapplying the initial pre-fence blocker rule.
+   Locked regeneration must produce a plan because frozen pages cannot add an
+   Insert/Update image after stable readiness. Publish each page as
+   `TRANSITION`, install its prepared markers, and release its lock immediately.
+   During this phase the batch is a growing `TRANSITION` prefix followed by a
+   `FROZEN` suffix.
 8. Build LWC blocks from immutable page values plus the prepared deletion
    bitmap. Block-split retries reuse the bitmap rather than rescanning undo.
 9. Insert matching `ColumnBlockIndex` entries and build companion secondary
@@ -227,8 +236,11 @@ row values undecodable before that publication.
 
 If no table-file state changes are selected, a heartbeat checkpoint does not
 publish a metadata-only user-table root only to advance replay bounds. Instead,
-it writes a row in `catalog.table_replay_silent_watermarks` through normal
-catalog DML plus `DDLRedo::TableReplaySilentWatermark`. That row becomes
+it monotonically updates `catalog.table_replay_silent_watermarks` without a
+normal transaction or undo. The no-transaction primary-key upsert reports the
+actual insert/update to `SysTrx`, which emits logical `Insert` or
+`UpdateByPrimaryKey` catalog redo plus
+`DDLRedo::TableReplaySilentWatermark`. That live row becomes
 recovery and truncation proof only after a catalog checkpoint folds it into
 `catalog.mtb`. Effective table replay bounds are computed fieldwise:
 
@@ -246,9 +258,14 @@ bounds remain part of the user-table root publication.
 Silent-watermark DML, deletion-only/root-only publication, and row-page
 transition all use the same lifecycle publish/drop gate. A no-transition
 attempt records the reversible `Publishing` workflow phase before catalog DML
-or root publication and retains publish admission through commit. A frozen
-checkpoint acquires the lease before the first page enters `TRANSITION` and
-retains it through route installation and commit.
+or root publication and retains publish admission through system enqueue. A
+frozen checkpoint acquires the lease before the first page enters `TRANSITION`
+and retains it through route installation and system enqueue. The publication
+guard restores a reversible attempt on drop, leaves an irreversible workflow
+fail-closed, and releases the lifecycle lease only after workflow completion.
+During the async silent-watermark mutation its fatal reason is
+`FatalError::CatalogWrite`; after successful mutation, later root/system commit
+failures remain `FatalError::CheckpointWrite`.
 
 Before any user-table checkpoint publication, the active table-file root's
 runtime effective timestamp must be older than the GC horizon:
@@ -292,6 +309,14 @@ primary key, merges the folded deltas with checkpoint-visible catalog rows, and
 rewrites the changed table root with fresh dense row ids. Persisted catalog
 roots contain only final live rows and empty delete-delta payloads; catalog
 root loading rejects non-empty persisted delete deltas as invalid payload.
+
+Standalone and combined catalog checkpoint sample the transaction system's
+current persisted watermark and scan only through that already-durable ordered
+prefix. Accepted system redo that has not reached the sampled watermark is left
+for a later catalog checkpoint. Catalog checkpoint is periodic maintenance,
+normally scheduled after redo-file rotation and sealing when useful durable
+progress is available; it does not force progress by enqueueing an empty
+transaction.
 
 ### 4.3 No Independent Index Checkpoint
 
@@ -431,6 +456,12 @@ longer needed for live snapshots:
 
 $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
 
+Checkpoint-retired row pages travel in the committed `System` payload through
+the normal GC buckets. The payload has no STS to unregister; its ordered system
+CTS is the reclamation fence. A purge round completes eligible row-undo and
+index cleanup in every bucket before the dispatcher deallocates any collected
+page, preserving cross-bucket undo references.
+
 ### 6.3 DiskTree Page GC
 
 `DiskTree` uses normal CoW garbage collection:
@@ -447,7 +478,8 @@ After logical DDL locks are held, drop synchronously changes the terminal table
 lifecycle, closes new publish admission, and closes the table checkpoint
 workflow. It discards a frozen or reversible batch without waiting. Drop waits
 asynchronously only when a checkpoint already won publish admission; that
-publisher retains ownership through route/root publication and commit. Once
+publisher retains ownership through route/root publication and successful
+system-commit enqueue. Once
 the terminal gate is crossed, abandonment of the drop future poisons storage
 instead of reopening the runtime.
 

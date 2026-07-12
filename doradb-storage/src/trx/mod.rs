@@ -26,6 +26,8 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
+pub(crate) use sys_trx::SysTrxPayload;
+
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableCache, is_catalog_table};
@@ -227,21 +229,6 @@ impl Transaction {
                 Err(err)
             }
         }
-    }
-
-    /// Extends row pages that should be GCed after commit.
-    #[inline]
-    pub(crate) fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) -> Result<()> {
-        let mut checkout = self.checkout("extend transaction GC row pages")?;
-        checkout.inner_mut().extend_gc_row_pages(pages);
-        Ok(())
-    }
-
-    /// Replace the transaction-level DDL redo marker.
-    #[inline]
-    pub(crate) fn set_ddl_redo(&mut self, ddl: DDLRedo) -> Result<Option<Box<DDLRedo>>> {
-        let mut checkout = self.checkout("set transaction DDL redo")?;
-        Ok(checkout.inner_mut().redo_mut().ddl.replace(Box::new(ddl)))
     }
 
     /// Commit the transaction.
@@ -574,7 +561,6 @@ pub(crate) struct TrxEffects {
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
     redo: RedoLogs,
-    gc_row_pages: Vec<PageID>,
 }
 
 impl TrxEffects {
@@ -585,7 +571,6 @@ impl TrxEffects {
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
-            gc_row_pages: Vec::new(),
         }
     }
 
@@ -607,10 +592,7 @@ impl TrxEffects {
     /// must not be relied on by recovery.
     #[inline]
     pub(crate) fn require_ordered_commit(&self) -> bool {
-        self.require_durability()
-            || !self.row_undo.is_empty()
-            || !self.index_undo.is_empty()
-            || !self.gc_row_pages.is_empty()
+        self.require_durability() || !self.row_undo.is_empty() || !self.index_undo.is_empty()
     }
 
     /// Returns mutable access to transaction row undo logs.
@@ -623,18 +605,6 @@ impl TrxEffects {
     #[inline]
     pub(crate) fn index_undo_mut(&mut self) -> &mut IndexUndoLogs {
         &mut self.index_undo
-    }
-
-    /// Returns mutable access to transaction redo logs.
-    #[inline]
-    pub(crate) fn redo_mut(&mut self) -> &mut RedoLogs {
-        &mut self.redo
-    }
-
-    /// Extends row pages that should be GCed after commit.
-    #[inline]
-    pub(crate) fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
-        self.gc_row_pages.extend(pages);
     }
 
     /// Merges one successful statement's effects into this transaction.
@@ -682,11 +652,10 @@ impl TrxEffects {
 
     /// Moves transaction effects into a prepared transaction payload.
     #[inline]
-    pub(crate) fn take_payload_parts(&mut self) -> (RowUndoLogs, IndexUndoLogs, Vec<PageID>) {
+    pub(crate) fn take_payload_parts(&mut self) -> (RowUndoLogs, IndexUndoLogs) {
         (
             mem::take(&mut self.row_undo),
             mem::take(&mut self.index_undo),
-            mem::take(&mut self.gc_row_pages),
         )
     }
 
@@ -696,7 +665,6 @@ impl TrxEffects {
         self.redo.clear();
         self.row_undo = RowUndoLogs::empty();
         self.index_undo = IndexUndoLogs::empty();
-        self.gc_row_pages.clear();
     }
 
     /// Move remaining rollback-owned effects into fatal retention.
@@ -706,7 +674,6 @@ impl TrxEffects {
         FatalRollbackRetention::Active {
             row_undo: mem::take(&mut self.row_undo),
             index_undo: mem::take(&mut self.index_undo),
-            gc_row_pages: mem::take(&mut self.gc_row_pages),
         }
     }
 
@@ -716,10 +683,6 @@ impl TrxEffects {
         assert!(self.redo.is_empty(), "redo should be cleared");
         assert!(self.row_undo.is_empty(), "row undo should be cleared");
         assert!(self.index_undo.is_empty(), "index undo should be cleared");
-        assert!(
-            self.gc_row_pages.is_empty(),
-            "gc row pages should be cleared"
-        );
     }
 }
 
@@ -1286,7 +1249,6 @@ pub(in crate::trx) enum FatalRollbackRetention {
     Active {
         row_undo: RowUndoLogs,
         index_undo: IndexUndoLogs,
-        gc_row_pages: Vec<PageID>,
     },
     Statement {
         row_undo: RowUndoLogs,
@@ -1302,8 +1264,7 @@ impl FatalRollbackRetention {
             FatalRollbackRetention::Active {
                 row_undo,
                 index_undo,
-                gc_row_pages,
-            } => row_undo.is_empty() && index_undo.is_empty() && gc_row_pages.is_empty(),
+            } => row_undo.is_empty() && index_undo.is_empty(),
             FatalRollbackRetention::Statement {
                 row_undo,
                 index_undo,
@@ -1547,12 +1508,6 @@ impl TrxInner {
         self.ctx().gc_no()
     }
 
-    /// Returns mutable access to transaction redo logs.
-    #[inline]
-    pub(crate) fn redo_mut(&mut self) -> &mut RedoLogs {
-        self.effects.redo_mut()
-    }
-
     /// Returns mutable access to transaction row undo logs.
     #[inline]
     pub(crate) fn row_undo_mut(&mut self) -> &mut RowUndoLogs {
@@ -1622,12 +1577,6 @@ impl TrxInner {
         self.effects.require_ordered_commit()
     }
 
-    /// Extends row pages that should be GCed after commit.
-    #[inline]
-    pub(crate) fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
-        self.effects.extend_gc_row_pages(pages);
-    }
-
     /// Rolls back the attached session without taking the attachment.
     #[inline]
     pub(crate) fn finish_session_rollback(&mut self, attachment: &TrxAttachment) {
@@ -1661,13 +1610,12 @@ impl TrxInner {
             debug_assert!(self.effects.index_undo.is_empty());
             return Ok(PreparedTrx {
                 redo_bin: None,
-                payload: Some(PreparedTrxPayload {
+                payload: Some(PreparedTrxPayload::User {
                     status: self.ctx.status(),
                     sts: self.ctx.sts(),
                     gc_no: self.ctx.gc_no(),
                     row_undo: RowUndoLogs::empty(),
                     index_undo: IndexUndoLogs::empty(),
-                    gc_row_pages: Vec::new(),
                 }),
                 attachment: Some(attachment),
                 lock_manager,
@@ -1683,17 +1631,16 @@ impl TrxInner {
         } else {
             None
         };
-        let (row_undo, index_undo, gc_row_pages) = self.effects.take_payload_parts();
+        let (row_undo, index_undo) = self.effects.take_payload_parts();
         let lock_manager = self.clone_lock_manager_guard(&attachment);
         Ok(PreparedTrx {
             redo_bin,
-            payload: Some(PreparedTrxPayload {
+            payload: Some(PreparedTrxPayload::User {
                 status: self.ctx.status(),
                 sts: self.ctx.sts(),
                 gc_no: self.ctx.gc_no(),
                 row_undo,
                 index_undo,
-                gc_row_pages,
             }),
             attachment: Some(attachment),
             lock_manager,
@@ -1713,20 +1660,29 @@ impl Drop for TrxInner {
 }
 
 /// Runtime effects moved out of an active transaction before CTS assignment.
-pub(crate) struct PreparedTrxPayload {
-    status: Arc<SharedTrxStatus>,
-    sts: TrxID,
-    gc_no: usize,
-    row_undo: RowUndoLogs,
-    index_undo: IndexUndoLogs,
-    gc_row_pages: Vec<PageID>,
+pub(crate) enum PreparedTrxPayload {
+    User {
+        status: Arc<SharedTrxStatus>,
+        sts: TrxID,
+        gc_no: usize,
+        row_undo: RowUndoLogs,
+        index_undo: IndexUndoLogs,
+    },
+    System(SysTrxPayload),
 }
 
 impl PreparedTrxPayload {
     /// Returns whether this payload has runtime effects that require ordered commit.
     #[inline]
     fn require_ordered_commit(&self) -> bool {
-        !self.row_undo.is_empty() || !self.index_undo.is_empty() || !self.gc_row_pages.is_empty()
+        match self {
+            PreparedTrxPayload::User {
+                row_undo,
+                index_undo,
+                ..
+            } => !row_undo.is_empty() || !index_undo.is_empty(),
+            PreparedTrxPayload::System(payload) => !payload.is_empty(),
+        }
     }
 }
 
@@ -1779,45 +1735,35 @@ impl PreparedTrx {
         } else {
             None
         };
-        match self.payload.take() {
-            Some(PreparedTrxPayload {
+        // CTS assignment is only an ordering reservation. Redo durability can
+        // still fail after this point, so user precommit retains rollback-capable
+        // index undo while system precommit retains only its GC page ownership.
+        let payload = self.payload.take().map(|payload| match payload {
+            PreparedTrxPayload::User {
                 status,
                 sts,
                 gc_no,
                 row_undo,
                 index_undo,
-                gc_row_pages,
-            }) => {
-                // CTS assignment is only an ordering reservation. Redo durability
-                // can still fail after this point, so precommit must retain
-                // rollback-capable index undo until successful commit.
-                PrecommitTrx {
-                    cts,
-                    redo_bin,
-                    payload: Some(PrecommitTrxPayload {
-                        status,
-                        sts,
-                        gc_no,
-                        row_undo,
-                        index_undo,
-                        gc_row_pages,
-                    }),
-                    attachment: self.attachment.take(),
-                    lock_manager: self.lock_manager.take(),
-                    lock_state: self.lock_state.take(),
-                }
-            }
-            None => {
-                debug_assert!(self.attachment.is_none());
-                PrecommitTrx {
-                    cts,
-                    redo_bin,
-                    payload: None,
-                    attachment: None,
-                    lock_manager: self.lock_manager.take(),
-                    lock_state: self.lock_state.take(),
-                }
-            }
+            } => PrecommitTrxPayload::User {
+                status,
+                sts,
+                gc_no,
+                row_undo,
+                index_undo,
+            },
+            PreparedTrxPayload::System(payload) => PrecommitTrxPayload::System(payload),
+        });
+        if payload.is_none() {
+            debug_assert!(self.attachment.is_none());
+        }
+        PrecommitTrx {
+            cts,
+            redo_bin,
+            payload,
+            attachment: self.attachment.take(),
+            lock_manager: self.lock_manager.take(),
+            lock_state: self.lock_state.take(),
         }
     }
 
@@ -1843,46 +1789,69 @@ impl Drop for PreparedTrx {
 }
 
 /// Runtime effects retained while a precommit transaction waits for redo outcome.
-pub(crate) struct PrecommitTrxPayload {
-    status: Arc<SharedTrxStatus>,
-    sts: TrxID,
-    gc_no: usize,
-    row_undo: RowUndoLogs,
-    /// Rollback-capable index undo retained until redo durability succeeds.
-    ///
-    /// A precommit CTS is not a durability proof: failed redo write/sync must
-    /// still rollback secondary-index effects before dropping transaction
-    /// payload ownership.
-    index_undo: IndexUndoLogs,
-    gc_row_pages: Vec<PageID>,
+pub(crate) enum PrecommitTrxPayload {
+    User {
+        status: Arc<SharedTrxStatus>,
+        sts: TrxID,
+        gc_no: usize,
+        row_undo: RowUndoLogs,
+        /// Rollback-capable index undo retained until redo durability succeeds.
+        ///
+        /// A precommit CTS is not a durability proof: failed redo write/sync must
+        /// still rollback secondary-index effects before dropping transaction
+        /// payload ownership.
+        index_undo: IndexUndoLogs,
+    },
+    System(SysTrxPayload),
 }
 
 impl PrecommitTrxPayload {
     #[inline]
     fn is_empty(&self) -> bool {
-        self.row_undo.is_empty() && self.index_undo.is_empty() && self.gc_row_pages.is_empty()
+        match self {
+            PrecommitTrxPayload::User {
+                row_undo,
+                index_undo,
+                ..
+            } => row_undo.is_empty() && index_undo.is_empty(),
+            PrecommitTrxPayload::System(payload) => payload.is_empty(),
+        }
     }
 
     #[inline]
     async fn rollback(&mut self, attachment: &TrxAttachment) -> Result<()> {
+        let PrecommitTrxPayload::User {
+            sts,
+            row_undo,
+            index_undo,
+            ..
+        } = self
+        else {
+            panic!("rollback requires a user precommit payload")
+        };
         let trx_sys = &attachment.engine().trx_sys;
         let pool_guards = attachment.pool_guards().clone();
         let mut table_cache = TableCache::new(&trx_sys.catalog);
-        self.index_undo
-            .rollback(&mut table_cache, &pool_guards, self.sts)
+        index_undo
+            .rollback(&mut table_cache, &pool_guards, *sts)
             .await?;
-        self.row_undo.rollback(&mut table_cache, &pool_guards).await
+        row_undo.rollback(&mut table_cache, &pool_guards).await
     }
 
     #[inline]
     fn record_rollback_for_purge(&self, attachment: &TrxAttachment) {
         let trx_sys = &attachment.engine().trx_sys;
-        trx_sys.record_rollback_for_purge(self.gc_no, self.sts);
+        let PrecommitTrxPayload::User { sts, gc_no, .. } = self else {
+            panic!("rollback purge record requires a user precommit payload")
+        };
+        trx_sys.record_rollback_for_purge(*gc_no, *sts);
     }
 
     #[inline]
     fn release_prepare_waiters(&self) {
-        self.status.finish_preparing();
+        if let PrecommitTrxPayload::User { status, .. } = self {
+            status.finish_preparing();
+        }
     }
 }
 
@@ -1927,35 +1896,38 @@ impl PrecommitTrx {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
         // release the prepare notifier in transaction status
         let committed = match self.payload.take() {
-            Some(PrecommitTrxPayload {
+            Some(PrecommitTrxPayload::User {
                 status,
                 sts,
                 gc_no,
                 row_undo,
                 mut index_undo,
-                gc_row_pages,
             }) => {
                 let index_gc = index_undo.commit_for_gc();
-                // For user transaction, we need to notify readers that this transaction is committed,
-                // and readers can continue their work.
                 status.commit_prepared(self.cts);
                 if let Some(s) = self.attachment.take() {
                     s.commit(self.cts);
                 }
                 CommittedTrx {
                     cts: self.cts,
-                    payload: Some(CommittedTrxPayload {
+                    payload: Some(CommittedTrxPayload::User {
                         sts,
                         gc_no,
                         row_undo,
                         index_gc,
-                        gc_row_pages,
                     }),
+                }
+            }
+            Some(PrecommitTrxPayload::System(payload)) => {
+                debug_assert!(self.attachment.is_none());
+                CommittedTrx {
+                    cts: self.cts,
+                    payload: Some(CommittedTrxPayload::System(payload)),
                 }
             }
             None => {
                 debug_assert!(self.attachment.is_none());
-                // For system transaction, there is nothing we have to keep once it's committed.
+                // A system transaction without GC pages has no purge payload.
                 CommittedTrx {
                     cts: self.cts,
                     payload: None,
@@ -2038,8 +2010,10 @@ impl PrecommitTrx {
     /// Discard an attachmentless rejected precommit transaction.
     #[inline]
     pub(crate) fn discard_rejected(mut self) {
-        debug_assert!(self.payload.is_none());
         debug_assert!(self.attachment.is_none());
+        if let Some(payload) = self.payload.take() {
+            debug_assert!(matches!(payload, PrecommitTrxPayload::System(_)));
+        }
         self.redo_bin.take();
         self.release_transaction_locks();
     }
@@ -2064,12 +2038,14 @@ impl Drop for PrecommitTrx {
     }
 }
 
-struct CommittedTrxPayload {
-    sts: TrxID,
-    gc_no: usize,
-    row_undo: RowUndoLogs,
-    index_gc: Vec<IndexPurgeEntry>,
-    gc_row_pages: Vec<PageID>,
+enum CommittedTrxPayload {
+    User {
+        sts: TrxID,
+        gc_no: usize,
+        row_undo: RowUndoLogs,
+        index_gc: Vec<IndexPurgeEntry>,
+    },
+    System(SysTrxPayload),
 }
 
 /// Transaction payload handed from ordered commit into purge coordination.
@@ -2082,28 +2058,43 @@ impl CommittedTrx {
     /// Returns the transaction snapshot timestamp for GC-aware user transactions.
     #[inline]
     pub(crate) fn sts(&self) -> Option<TrxID> {
-        self.payload.as_ref().map(|p| p.sts)
+        match self.payload.as_ref() {
+            Some(CommittedTrxPayload::User { sts, .. }) => Some(*sts),
+            Some(CommittedTrxPayload::System(_)) | None => None,
+        }
     }
 
     /// Returns gc_no if this transaction is GC-aware.
     #[inline]
     pub(crate) fn gc_no(&self) -> Option<usize> {
-        self.payload.as_ref().map(|p| p.gc_no)
+        self.payload.as_ref().map(|payload| match payload {
+            CommittedTrxPayload::User { gc_no, .. } => *gc_no,
+            CommittedTrxPayload::System(payload) => payload.gc_no,
+        })
     }
 
     #[inline]
     fn row_undo(&self) -> Option<&RowUndoLogs> {
-        self.payload.as_ref().map(|p| &p.row_undo)
+        match self.payload.as_ref() {
+            Some(CommittedTrxPayload::User { row_undo, .. }) => Some(row_undo),
+            Some(CommittedTrxPayload::System(_)) | None => None,
+        }
     }
 
     #[inline]
     fn index_gc(&self) -> Option<&[IndexPurgeEntry]> {
-        self.payload.as_ref().map(|p| &p.index_gc[..])
+        match self.payload.as_ref() {
+            Some(CommittedTrxPayload::User { index_gc, .. }) => Some(index_gc),
+            Some(CommittedTrxPayload::System(_)) | None => None,
+        }
     }
 
     #[inline]
     fn gc_row_pages(&self) -> Option<&[PageID]> {
-        self.payload.as_ref().map(|p| &p.gc_row_pages[..])
+        match self.payload.as_ref() {
+            Some(CommittedTrxPayload::System(payload)) => Some(&payload.gc_row_pages),
+            Some(CommittedTrxPayload::User { .. }) | None => None,
+        }
     }
 }
 
@@ -2510,7 +2501,10 @@ pub(crate) mod tests {
             && let Some(attachment) = prepared.attachment.as_ref()
         {
             let trx_sys = &attachment.engine().trx_sys;
-            trx_sys.record_rollback_for_purge(payload.gc_no, payload.sts);
+            let PreparedTrxPayload::User { gc_no, sts, .. } = payload else {
+                panic!("production prepared transaction must carry user payload")
+            };
+            trx_sys.record_rollback_for_purge(gc_no, sts);
         }
         prepared.redo_bin.take();
         if let Some(attachment) = prepared.attachment.take() {
@@ -2537,16 +2531,16 @@ pub(crate) mod tests {
 
     /// Add one redo log entry for tests that need a non-readonly transaction.
     #[inline]
-    pub(crate) fn add_pseudo_redo_log_entry(trx: &mut Transaction) {
+    pub(crate) async fn add_pseudo_redo_log_entry(trx: &mut Transaction) {
         use crate::catalog::USER_TABLE_ID_START;
 
         static PSEUDO_SYSBENCH_VAR1: [u8; 60] = [3; 60];
         static PSEUDO_SYSBENCH_VAR2: [u8; 120] = [4; 120];
 
-        with_transaction_inner_mut(trx, "add pseudo redo log entry", |inner| {
+        trx.exec(async |stmt| {
             // Simulate one sysbench record:
             // uint64 + int32 + int32 + char(60) + char(120)
-            inner.redo_mut().insert_dml(
+            stmt.effects_mut().insert_row_redo(
                 USER_TABLE_ID_START,
                 RowRedo {
                     page_id: PageID::new(0),
@@ -2559,8 +2553,10 @@ pub(crate) mod tests {
                         Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
                     ]),
                 },
-            )
+            );
+            Ok(())
         })
+        .await
         .expect("test transaction must be active")
     }
 
@@ -2781,11 +2777,20 @@ pub(crate) mod tests {
             assert!(!prepared.require_durability());
             assert!(!prepared.require_ordered_commit());
             let payload = prepared.payload.as_ref().unwrap();
-            assert_eq!(payload.sts, expected_sts);
-            assert_eq!(payload.gc_no, expected_gc_no);
-            assert!(payload.row_undo.is_empty());
-            assert!(payload.index_undo.is_empty());
-            assert!(payload.gc_row_pages.is_empty());
+            let PreparedTrxPayload::User {
+                sts,
+                gc_no,
+                row_undo,
+                index_undo,
+                ..
+            } = payload
+            else {
+                panic!("readonly transaction must carry user payload")
+            };
+            assert_eq!(*sts, expected_sts);
+            assert_eq!(*gc_no, expected_gc_no);
+            assert!(row_undo.is_empty());
+            assert!(index_undo.is_empty());
 
             discard_production_prepared_for_test(prepared);
         });
@@ -2796,7 +2801,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_prepare").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
             with_transaction_inner_mut(&mut trx, "test prepare payload", |inner| {
                 inner.row_undo_mut().push(OwnedRowUndo::new(
                     TableID::new(11),
@@ -2819,11 +2824,20 @@ pub(crate) mod tests {
             assert!(prepared.require_durability());
             assert!(prepared.require_ordered_commit());
             let payload = prepared.payload.as_ref().unwrap();
-            assert_eq!(payload.sts, expected_sts);
-            assert_eq!(payload.gc_no, expected_gc_no);
-            assert_eq!(payload.row_undo.len(), 1);
-            assert_eq!(payload.index_undo.len(), 1);
-            assert!(payload.gc_row_pages.is_empty());
+            let PreparedTrxPayload::User {
+                sts,
+                gc_no,
+                row_undo,
+                index_undo,
+                ..
+            } = payload
+            else {
+                panic!("prepared transaction must carry user payload")
+            };
+            assert_eq!(*sts, expected_sts);
+            assert_eq!(*gc_no, expected_gc_no);
+            assert_eq!(row_undo.len(), 1);
+            assert_eq!(index_undo.len(), 1);
 
             discard_production_prepared_for_test(prepared);
         });
@@ -2847,7 +2861,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .fill_cts(TrxID::new(91_247));
             let payload = precommit.payload.as_ref().unwrap();
-            assert_eq!(payload.index_undo.len(), 1);
+            let PrecommitTrxPayload::User { index_undo, .. } = payload else {
+                panic!("precommit transaction must carry user payload")
+            };
+            assert_eq!(index_undo.len(), 1);
 
             let committed = precommit.commit();
             let index_gc = committed.index_gc().unwrap();
@@ -2864,7 +2881,7 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_prepare_waiter_commit").await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
             let status =
                 with_transaction_inner(&trx, "test prepare commit waiter status", |inner| {
                     inner.ctx().status()
@@ -2919,7 +2936,7 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_prepare_waiter_rollback").await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
             let status =
                 with_transaction_inner(&trx, "test prepare rollback waiter status", |inner| {
                     inner.ctx().status()
@@ -3406,7 +3423,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
             assert!(trx.commit().await.unwrap() > TrxID::new(0));
             assert_eq!(lock_entry_count(&engine, owner), 0);
         });
@@ -3426,7 +3443,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
 
             let prepared = prepare_transaction(trx).unwrap();
             let precommit = prepared.fill_cts(TrxID::new(91_241));
@@ -3855,16 +3872,6 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            trx.extend_gc_row_pages(vec![PageID::new(46)]).unwrap();
-            assert!(!transaction_require_durability(&trx));
-            assert!(transaction_require_ordered_commit(&trx));
-            let prepared = prepare_transaction(trx).unwrap();
-            assert!(prepared.redo_bin.is_none());
-            assert!(!prepared.require_durability());
-            assert!(prepared.require_ordered_commit());
-            discard_production_prepared_for_test(prepared);
-
-            let mut trx = session.begin_trx().unwrap();
             with_transaction_inner_mut(&mut trx, "test index undo predicate", |inner| {
                 inner.index_undo_mut().push(IndexUndo {
                     table_id: TableID::new(47),
@@ -3882,7 +3889,7 @@ pub(crate) mod tests {
             discard_production_prepared_for_test(prepared);
 
             let mut trx = session.begin_trx().unwrap();
-            add_pseudo_redo_log_entry(&mut trx);
+            add_pseudo_redo_log_entry(&mut trx).await;
             assert!(transaction_require_durability(&trx));
             assert!(transaction_require_ordered_commit(&trx));
             let prepared = prepare_transaction(trx).unwrap();

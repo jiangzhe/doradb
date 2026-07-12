@@ -1537,7 +1537,8 @@ where
             for trx in mem::take(&mut sync_group.trx_list) {
                 let trx = trx.commit();
                 if let Some(gc_no) = trx.gc_no() {
-                    // Only user transaction is involved in GC process.
+                    // User undo payloads and system checkpoint page payloads
+                    // share the same ordered purge handoff.
                     committed_trx_list.entry(gc_no).or_default().push(trx);
                 }
             }
@@ -2764,7 +2765,9 @@ mod tests {
                 }
                 smol::block_on(listener);
             }
-            *res = Err(IoError::from_raw_os_error(self.inner.errno));
+            if self.inner.errno != 0 {
+                *res = Err(IoError::from_raw_os_error(self.inner.errno));
+            }
         }
     }
 
@@ -5286,6 +5289,41 @@ mod tests {
             );
             let cts = engine.inner().trx_sys.commit_sys(sys_trx).unwrap();
             assert!(cts >= MIN_SNAPSHOT_TS);
+        });
+    }
+
+    #[test]
+    fn test_commit_sys_returns_before_held_redo_sync() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                build_redo_test_engine("redo_no_wait_held_sync", LogSync::Fsync).await;
+            let redo_fd = {
+                engine
+                    .inner()
+                    .trx_sys
+                    .redo_log
+                    .group_commit
+                    .lock()
+                    .log_file
+                    .as_ref()
+                    .unwrap()
+                    .as_raw_fd()
+            };
+            let hook = ControlledRedoSyncHook::new(redo_fd, IOKind::Fsync, 0);
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
+            let mut sys_trx = engine.inner().trx_sys.begin_sys_trx();
+            sys_trx.create_row_page(
+                TableID::new(1),
+                test_page_id(1),
+                RowID::new(0),
+                RowID::new(1),
+            );
+
+            let cts = engine.inner().trx_sys.commit_sys(sys_trx).unwrap();
+            hook.wait_started(1).await;
+            assert!(engine.inner().trx_sys.persisted_watermark_cts() < cts);
+            hook.release();
+            engine.shutdown().unwrap();
         });
     }
 }

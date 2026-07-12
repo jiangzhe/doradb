@@ -107,6 +107,12 @@ newly checkpointed overlays for truncation planning in the same call. Standalone
 `Session::truncate_redo_log` continues to use only already checkpoint-durable
 silent watermark overlays.
 
+Table checkpoint completion uses the no-wait system commit path. Its returned
+`redo_cts` means the redo was accepted into global commit order, not that it is
+durable. A later normal commit waiter covers earlier accepted system redo.
+Catalog maintenance does not manufacture an empty ordered transaction to force
+that progress; it consumes the durable prefix visible when maintenance begins.
+
 Each log file is created as an `O_DIRECT` sparse file and truncated to the
 effective `log_file_max_size`. The configured value is first rounded so the
 data region after the fixed super-block slots contains a whole number of
@@ -540,9 +546,13 @@ Replay rules:
 Checkpointed cold secondary-index state is not rebuilt from redo. It is loaded
 from `DiskTree` roots in table-file checkpoints.
 
-Catalog checkpoint also scans redo. It reads the same single stream from
-`catalog_replay_start_ts` through `TransactionSystem::persisted_watermark_cts()`
-and folds safe catalog metadata changes into `catalog.mtb`.
+Catalog checkpoint also scans redo. It samples
+`TransactionSystem::persisted_watermark_cts()`, reads the same single stream
+from `catalog_replay_start_ts` through that conservative durable upper CTS, and
+folds safe catalog metadata changes into `catalog.mtb`. Accepted redo above the
+sampled watermark remains for a later periodic checkpoint. Scheduling after a
+redo file is sealed is preferred because the sealed prefix already provides
+useful durable progress for recovery reduction and log truncation.
 `DDLRedo::TableReplaySilentWatermark` is a catalog metadata marker: its catalog
 row DML is folded into `catalog.mtb`, but committed rows newer than the last
 catalog checkpoint are not used for recovery replay skipping or redo
@@ -592,6 +602,9 @@ Redo write and sync failures are fatal storage boundaries.
 - User precommit failures must enqueue rollback cleanup before waiters are
   completed, because row-version and index structures can still reference
   transaction-owned undo.
+- System precommit failures have no rollback or active STS to clean. Retired
+  checkpoint pages remain allocated under poisoned-engine teardown ownership
+  and are never handed to purge after failed redo.
 - Successful committed payload handoff to purge happens before successful
   waiters are woken.
 
