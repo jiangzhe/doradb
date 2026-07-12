@@ -3099,6 +3099,7 @@ mod tests {
     };
     use crate::session::tests::SessionTestExt;
     use crate::table::DeleteMarker;
+    use crate::table::checkpoint_workflow::CheckpointPublicationGuard;
     use crate::table::hot::{HotRowDeleter, HotRowUpdater, RowInserter};
     use crate::table::tests::*;
     use crate::table::{DeleteInternal, FreezeOutcome, InsertRowIntoPage, UpdateRowInplace};
@@ -5666,9 +5667,12 @@ mod tests {
                         stmt.runtime().sts(),
                     );
                     assert!(delay.is_none());
-                    let transition_guard = table
-                        .try_begin_page_transition(&engine.inner().trx_sys)
-                        .unwrap();
+                    let mut transition_guard = CheckpointPublicationGuard::new(
+                        &table.checkpoint_workflow,
+                        &table.lifecycle,
+                        &engine.inner().trx_sys,
+                    );
+                    transition_guard.begin_transition().unwrap();
                     table
                         .apply_page_transition(
                             &transition_pages,

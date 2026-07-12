@@ -10,6 +10,7 @@ use crate::error::{DataIntegrityError, Error, Result};
 use crate::id::{TableID, TrxID};
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
+use crate::table::NoTrxUpsertChange;
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
@@ -33,29 +34,10 @@ pub(crate) struct TableReplaySilentWatermarks<'a> {
 }
 
 impl TableReplaySilentWatermarks<'_> {
-    /// List all watermark rows from uncommitted-visible catalog state.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "task scope requires the catalog accessor even though production callers use point lookup and checkpoint-root decoding"
-        )
-    )]
-    pub(crate) async fn list_uncommitted(
-        &self,
-        guards: &PoolGuards,
-    ) -> Result<Vec<SilentWatermarkObject>> {
-        let mut res = vec![];
-        self.table
-            .table_scan_uncommitted(guards, |col_layout, row| {
-                if row.is_deleted() {
-                    return true;
-                }
-                res.push(row_to_table_replay_silent_watermark_object(col_layout, row));
-                true
-            })
-            .await?;
-        Ok(res)
+    /// Return the catalog table id used for logical redo grouping.
+    #[inline]
+    pub(crate) fn table_id(&self) -> TableID {
+        self.table.table_id()
     }
 
     /// Find a silent replay watermark by user table id.
@@ -76,27 +58,37 @@ impl TableReplaySilentWatermarks<'_> {
             .await
     }
 
-    /// Upsert one caller-supplied watermark row.
-    pub(crate) async fn upsert(
+    /// Upsert one caller-supplied monotonic live watermark without transaction state.
+    ///
+    /// The supplied callback is forwarded to the catalog table's no-transaction
+    /// primary-key upsert and therefore runs at most once, only after a
+    /// successful insert or update.
+    pub(crate) async fn upsert_no_trx<F>(
         &self,
-        stmt: &mut Statement<'_>,
+        guards: &PoolGuards,
         obj: &SilentWatermarkObject,
-    ) -> Result<()> {
+        on_change: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(NoTrxUpsertChange),
+    {
         debug_assert!({
-            let existing = self
-                .find_uncommitted_by_table_id(stmt.runtime().pool_guards(), obj.table_id)
+            let current = self
+                .find_uncommitted_by_table_id(guards, obj.table_id)
                 .await?;
-            existing.is_none_or(|existing| {
-                existing.heap_redo_start_ts <= obj.heap_redo_start_ts
-                    && existing.deletion_cutoff_ts <= obj.deletion_cutoff_ts
+            current.is_none_or(|current| {
+                current.heap_redo_start_ts <= obj.heap_redo_start_ts
+                    && current.deletion_cutoff_ts <= obj.deletion_cutoff_ts
             })
         });
-        stmt.catalog_upsert_primary_key_mvcc(
-            self.table,
-            cols_from_table_replay_silent_watermark(obj),
-        )
-        .await?;
-        Ok(())
+        self.table
+            .upsert_primary_key_no_trx(
+                guards,
+                cols_from_table_replay_silent_watermark(obj),
+                false,
+                on_change,
+            )
+            .await
     }
 
     /// Delete one watermark row by user table id.
@@ -233,166 +225,99 @@ mod tests {
     use super::*;
     use crate::catalog::tests::open_catalog_test_engine;
     use crate::log::redo::{DDLRedo, RowRedoKind};
-    use crate::row::ops::UpdateCol;
+    use crate::row::ops::{SelectKey, UpdateCol};
     use crate::session::tests::SessionTestExt;
-    use crate::trx::Transaction;
-    use crate::trx::stmt::tests as stmt_tests;
     use tempfile::TempDir;
 
-    fn mark_watermark_ddl(trx: &mut Transaction, table_id: TableID) {
-        let old = trx
-            .set_ddl_redo(DDLRedo::TableReplaySilentWatermark { table_id })
-            .unwrap();
-        debug_assert!(old.is_none());
-    }
-
     #[test]
-    fn test_table_replay_silent_watermark_upsert_replaces_with_input_values() {
+    fn test_sys_trx_silent_watermark_emits_monotonic_logical_redo() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = open_catalog_test_engine(temp_dir.path().to_path_buf(), None).await;
-            let mut session = engine.new_session().unwrap();
-            let table_id = TableID::new(100);
-
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                engine
-                    .catalog()
-                    .storage
-                    .table_replay_silent_watermarks()
-                    .upsert(
-                        stmt,
-                        &SilentWatermarkObject {
-                            table_id,
-                            heap_redo_start_ts: TrxID::new(7),
-                            deletion_cutoff_ts: TrxID::new(11),
-                        },
-                    )
-                    .await
-            })
-            .await
-            .unwrap();
-            mark_watermark_ddl(&mut trx, table_id);
-            trx.commit().await.unwrap();
-
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                engine
-                    .catalog()
-                    .storage
-                    .table_replay_silent_watermarks()
-                    .upsert(
-                        stmt,
-                        &SilentWatermarkObject {
-                            table_id,
-                            heap_redo_start_ts: TrxID::new(8),
-                            deletion_cutoff_ts: TrxID::new(11),
-                        },
-                    )
-                    .await
-            })
-            .await
-            .unwrap();
-            mark_watermark_ddl(&mut trx, table_id);
-            trx.commit().await.unwrap();
-
+            let session = engine.new_session().unwrap();
             let guards = session.pool_guards();
-            let rows = engine
-                .catalog()
-                .storage
-                .table_replay_silent_watermarks()
-                .list_uncommitted(&guards)
+            let table_id = TableID::new(102);
+
+            let mut insert = engine.inner().trx_sys.begin_sys_trx();
+            insert
+                .upsert_silent_watermark(
+                    engine.catalog(),
+                    &guards,
+                    SilentWatermarkObject {
+                        table_id,
+                        heap_redo_start_ts: TrxID::new(7),
+                        deletion_cutoff_ts: TrxID::new(11),
+                    },
+                )
                 .await
                 .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0],
-                SilentWatermarkObject {
-                    table_id,
-                    heap_redo_start_ts: TrxID::new(8),
-                    deletion_cutoff_ts: TrxID::new(11),
-                }
-            );
-        });
-    }
+            assert!(matches!(
+                insert.redo().ddl.as_deref(),
+                Some(DDLRedo::TableReplaySilentWatermark { table_id: id }) if *id == table_id
+            ));
+            let insert_redo = insert
+                .redo()
+                .dml
+                .get(&TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS)
+                .unwrap()
+                .rows
+                .values()
+                .next()
+                .unwrap();
+            assert!(matches!(&insert_redo.kind, RowRedoKind::Insert(..)));
+            engine.inner().trx_sys.commit_sys(insert).unwrap();
 
-    #[test]
-    fn test_table_replay_silent_watermark_upsert_logs_primary_key_update() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = open_catalog_test_engine(temp_dir.path().to_path_buf(), None).await;
-            let mut session = engine.new_session().unwrap();
-            let table_id = TableID::new(101);
+            let mut update = engine.inner().trx_sys.begin_sys_trx();
+            update
+                .upsert_silent_watermark(
+                    engine.catalog(),
+                    &guards,
+                    SilentWatermarkObject {
+                        table_id,
+                        heap_redo_start_ts: TrxID::new(7),
+                        deletion_cutoff_ts: TrxID::new(13),
+                    },
+                )
+                .await
+                .unwrap();
+            let update_redo = update
+                .redo()
+                .dml
+                .get(&TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS)
+                .unwrap()
+                .rows
+                .values()
+                .next()
+                .unwrap();
+            assert!(matches!(
+                &update_redo.kind,
+                RowRedoKind::UpdateByPrimaryKey(key, cols)
+                    if key == &SelectKey::new(0, vec![Val::from(table_id)])
+                        && cols == &vec![UpdateCol {
+                            idx: COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS,
+                            val: Val::from(13u64),
+                        }]
+            ));
+            engine.inner().trx_sys.commit_sys(update).unwrap();
 
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                engine
-                    .catalog()
-                    .storage
-                    .table_replay_silent_watermarks()
-                    .upsert(
-                        stmt,
-                        &SilentWatermarkObject {
-                            table_id,
-                            heap_redo_start_ts: TrxID::new(7),
-                            deletion_cutoff_ts: TrxID::new(9),
-                        },
-                    )
-                    .await
-            })
-            .await
-            .unwrap();
-            mark_watermark_ddl(&mut trx, table_id);
-            trx.commit().await.unwrap();
-
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                engine
-                    .catalog()
-                    .storage
-                    .table_replay_silent_watermarks()
-                    .upsert(
-                        stmt,
-                        &SilentWatermarkObject {
-                            table_id,
-                            heap_redo_start_ts: TrxID::new(8),
-                            deletion_cutoff_ts: TrxID::new(11),
-                        },
-                    )
-                    .await?;
-                let redo = stmt_tests::redo_logs(stmt.effects_mut());
-                let table_dml = redo
-                    .dml
-                    .get(&TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS)
-                    .expect("changed watermark should emit row redo");
-                assert_eq!(table_dml.rows.len(), 1);
-                let row_redo = table_dml.rows.values().next().unwrap();
-                match &row_redo.kind {
-                    RowRedoKind::UpdateByPrimaryKey(key, cols) => {
-                        assert_eq!(key.index_no, PK_NO_TABLE_REPLAY_SILENT_WATERMARKS);
-                        assert_eq!(key.vals, vec![Val::from(table_id)]);
-                        assert_eq!(
-                            cols,
-                            &vec![
-                                UpdateCol {
-                                    idx: COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_HEAP_REDO_START_TS,
-                                    val: Val::from(8u64),
-                                },
-                                UpdateCol {
-                                    idx: COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_DELETION_CUTOFF_TS,
-                                    val: Val::from(11u64),
-                                },
-                            ]
-                        );
-                    }
-                    kind => panic!("expected primary-key update redo, got {kind:?}"),
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
-            mark_watermark_ddl(&mut trx, table_id);
-            trx.commit().await.unwrap();
+            let mut no_op = engine.inner().trx_sys.begin_sys_trx();
+            no_op
+                .upsert_silent_watermark(
+                    engine.catalog(),
+                    &guards,
+                    SilentWatermarkObject {
+                        table_id,
+                        heap_redo_start_ts: TrxID::new(7),
+                        deletion_cutoff_ts: TrxID::new(13),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(no_op.redo().dml.is_empty());
+            assert!(matches!(
+                no_op.redo().ddl.as_deref(),
+                Some(DDLRedo::TableReplaySilentWatermark { table_id: id }) if *id == table_id
+            ));
         });
     }
 }

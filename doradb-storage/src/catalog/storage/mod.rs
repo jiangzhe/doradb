@@ -1011,7 +1011,27 @@ fn validate_catalog_row(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::buffer::{PoolGuards, PoolRole};
+    use crate::catalog::USER_TABLE_ID_START;
+    use crate::catalog::tests::{open_catalog_test_engine, table1, table2};
+    use crate::catalog::{CatalogCheckpointBatch, CatalogCheckpointScanStopReason};
+    use crate::error::DataIntegrityError;
+    use crate::file::BlockKey;
     use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
+    use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
+    use crate::id::BlockID;
+    use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
+    use crate::log::redo::{DDLRedo, RowRedoKind};
+    use crate::row::ops::{SelectKey, UpdateCol};
+    use crate::trx::stmt::Statement;
+    use crate::value::{Val, ValKind};
+    use tempfile::TempDir;
+
+    /// Attach one catalog DDL marker to the current test statement.
+    pub(crate) fn mark_catalog_ddl(stmt: &mut Statement<'_>, ddl: DDLRedo) {
+        let old = stmt.effects_mut().set_ddl_redo(ddl);
+        debug_assert!(old.is_none());
+    }
 
     /// Publish a metadata-only catalog root with a test-controlled redo retention marker.
     pub(crate) async fn publish_first_redo_log_seq_for_test(
@@ -1025,274 +1045,343 @@ pub(crate) mod tests {
         )
         .await
     }
-    mod checkpoint_tests {
-        use super::super::*;
-        use crate::buffer::{PoolGuards, PoolRole};
-        use crate::catalog::USER_TABLE_ID_START;
-        use crate::catalog::tests::{open_catalog_test_engine, table1, table2};
-        use crate::catalog::{CatalogCheckpointBatch, CatalogCheckpointScanStopReason};
-        use crate::error::DataIntegrityError;
-        use crate::file::BlockKey;
-        use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
-        use crate::id::BlockID;
-        use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
-        use crate::log::redo::RowRedoKind;
-        use crate::row::ops::{SelectKey, UpdateCol};
-        use crate::value::{Val, ValKind};
-        use tempfile::TempDir;
-
-        fn metadata_only_batch(replay_start_ts: TrxID) -> CatalogCheckpointBatch {
-            CatalogCheckpointBatch {
-                replay_start_ts,
-                safe_cts: replay_start_ts,
-                first_retained_file_seq: 0,
-                sealed_redo_segments: Vec::new(),
-                catalog_ops: Vec::new(),
-                catalog_ddl_txn_count: 0,
-                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
-            }
+    fn metadata_only_batch(replay_start_ts: TrxID) -> CatalogCheckpointBatch {
+        CatalogCheckpointBatch {
+            replay_start_ts,
+            safe_cts: replay_start_ts,
+            first_retained_file_seq: 0,
+            sealed_redo_segments: Vec::new(),
+            catalog_ops: Vec::new(),
+            catalog_ddl_txn_count: 0,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         }
+    }
 
-        #[test]
-        fn test_static_catalog_definitions_expose_one_primary_key() {
-            for CatalogDefinition { table_id, metadata } in [
-                catalog_definition_of_tables(),
-                catalog_definition_of_columns(),
-                catalog_definition_of_indexes(),
-                catalog_definition_of_index_columns(),
-                catalog_definition_of_table_replay_silent_watermarks(),
-            ] {
-                let primary_keys = metadata
-                    .idx
-                    .active_indexes()
-                    .filter(|(_, index_spec)| index_spec.primary_key())
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    primary_keys.len(),
-                    1,
-                    "catalog table {table_id} must expose exactly one primary key"
-                );
-                for key in &primary_keys[0].1.cols {
-                    assert!(
-                        !metadata.col.nullable(usize::from(key.col_no)),
-                        "catalog table {table_id} primary key column {} must be non-null",
-                        key.col_no
-                    );
-                }
-            }
-        }
-
-        async fn apply_metadata_only_checkpoint(
-            storage: &CatalogStorage,
-            next_table_id: TableID,
-        ) -> Result<()> {
-            let replay_start_ts = storage
-                .checkpoint_snapshot()
-                .unwrap()
-                .catalog_replay_start_ts;
-            storage
-                .apply_checkpoint_batch(metadata_only_batch(replay_start_ts), next_table_id)
-                .await
-                .map(|_| ())
-        }
-
-        fn checkpoint_batch_with_ops(
-            storage: &CatalogStorage,
-            catalog_ops: Vec<CatalogRedoEntry>,
-        ) -> CatalogCheckpointBatch {
-            let replay_start_ts = storage
-                .checkpoint_snapshot()
-                .unwrap()
-                .catalog_replay_start_ts;
-            CatalogCheckpointBatch {
-                replay_start_ts,
-                safe_cts: replay_start_ts,
-                first_retained_file_seq: 0,
-                sealed_redo_segments: Vec::new(),
-                catalog_ops,
-                catalog_ddl_txn_count: 0,
-                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
-            }
-        }
-
-        fn catalog_column_insert(
-            table_id: TableID,
-            column_no: u16,
-            name_len: usize,
-        ) -> CatalogRedoEntry {
-            let mut name = vec![b'x'; name_len];
-            name[0] = b'a' + (column_no % 26) as u8;
-            CatalogRedoEntry {
-                table_id: TABLE_ID_COLUMNS,
-                kind: RowRedoKind::Insert(vec![
-                    Val::from(table_id),
-                    Val::from(column_no),
-                    Val::from(name),
-                    Val::from(ValKind::U64 as u32),
-                    Val::from(0u32),
-                ]),
-            }
-        }
-
-        fn catalog_column_row_record(
-            row_id: RowID,
-            table_id: TableID,
-            column_no: u16,
-            name_len: usize,
-        ) -> RowRecord {
-            let mut name = vec![b'x'; name_len];
-            if let Some(first) = name.first_mut() {
-                *first = b'a' + (column_no % 26) as u8;
-            }
-            RowRecord {
-                row_id,
-                vals: vec![
-                    Val::from(table_id),
-                    Val::from(column_no),
-                    Val::from(name),
-                    Val::from(ValKind::U64 as u32),
-                    Val::from(0u32),
-                ],
-            }
-        }
-
-        fn catalog_table_vals(table_id: TableID, next_index_no: u16) -> Vec<Val> {
-            vec![Val::from(table_id), Val::from(next_index_no)]
-        }
-
-        async fn catalog_root_rows(storage: &CatalogStorage, table_id: TableID) -> Vec<RowRecord> {
-            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots
-                [must_catalog_table_slot(table_id)];
-            let table = storage.get_catalog_table(table_id).unwrap();
-            let disk_pool_guard = storage.disk_pool.pool_guard();
-            storage
-                .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
-                .await
-                .unwrap()
-        }
-
-        async fn assert_compact_catalog_root(
-            storage: &CatalogStorage,
-            table_id: TableID,
-        ) -> Vec<RowRecord> {
-            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots
-                [must_catalog_table_slot(table_id)];
-            let rows = catalog_root_rows(storage, table_id).await;
-            for (idx, row) in rows.iter().enumerate() {
-                assert_eq!(row.row_id, RowID::new(idx as u64));
-            }
-            if root.root_block_id.is_none() {
-                assert_eq!(root.pivot_row_id, RowID::new(0));
-                assert!(rows.is_empty());
-                return rows;
-            }
-            assert_eq!(root.pivot_row_id, RowID::new(rows.len() as u64));
-            let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
-            let disk_pool_guard = storage.disk_pool.pool_guard();
-            let entries = storage
-                .collect_index_entries(&disk_pool_guard, root_block_id)
-                .await
-                .unwrap();
-            assert!(!entries.is_empty());
-            assert_eq!(entries[0].start_row_id, RowID::new(0));
-            for pair in entries.windows(2) {
-                assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
-            }
-            assert_eq!(entries.last().unwrap().end_row_id(), root.pivot_row_id);
-            let index = ColumnBlockIndex::new(
-                root_block_id,
-                root.pivot_row_id,
-                storage.mtb.file_kind(),
-                storage.mtb.sparse_file(),
-                &storage.disk_pool,
-                &disk_pool_guard,
+    #[test]
+    fn test_static_catalog_definitions_expose_one_primary_key() {
+        for CatalogDefinition { table_id, metadata } in [
+            catalog_definition_of_tables(),
+            catalog_definition_of_columns(),
+            catalog_definition_of_indexes(),
+            catalog_definition_of_index_columns(),
+            catalog_definition_of_table_replay_silent_watermarks(),
+        ] {
+            let primary_keys = metadata
+                .idx
+                .active_indexes()
+                .filter(|(_, index_spec)| index_spec.primary_key())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                primary_keys.len(),
+                1,
+                "catalog table {table_id} must expose exactly one primary key"
             );
-            for entry in entries {
-                assert!(index.load_delete_deltas(&entry).await.unwrap().is_empty());
+            for key in &primary_keys[0].1.cols {
+                assert!(
+                    !metadata.col.nullable(usize::from(key.col_no)),
+                    "catalog table {table_id} primary key column {} must be non-null",
+                    key.col_no
+                );
             }
-            rows
         }
+    }
 
-        async fn build_unpublished_catalog_root(
-            storage: &CatalogStorage,
-            table_id: TableID,
-            metadata: &TableMetadata,
-            rows: &[RowRecord],
-            delete_deltas: Option<&[u32]>,
-        ) -> CatalogTableRootDesc {
-            let mut mutable =
-                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
-            let pages = build_lwc_blocks_from_row_records(metadata, rows).unwrap();
-            let mut entries = Vec::with_capacity(pages.len());
-            for page in pages {
-                let block_id = mutable.allocate_block().unwrap();
-                mutable.write_block(block_id, page.buf).await.unwrap();
-                entries.push(page.shape.with_block_id(block_id));
-            }
-            let disk_pool_guard = storage.disk_pool.pool_guard();
-            let pivot_row_id = RowID::new(rows.len() as u64);
+    async fn apply_metadata_only_checkpoint(
+        storage: &CatalogStorage,
+        next_table_id: TableID,
+    ) -> Result<()> {
+        let replay_start_ts = storage
+            .checkpoint_snapshot()
+            .unwrap()
+            .catalog_replay_start_ts;
+        storage
+            .apply_checkpoint_batch(metadata_only_batch(replay_start_ts), next_table_id)
+            .await
+            .map(|_| ())
+    }
+
+    fn checkpoint_batch_with_ops(
+        storage: &CatalogStorage,
+        catalog_ops: Vec<CatalogRedoEntry>,
+    ) -> CatalogCheckpointBatch {
+        let replay_start_ts = storage
+            .checkpoint_snapshot()
+            .unwrap()
+            .catalog_replay_start_ts;
+        CatalogCheckpointBatch {
+            replay_start_ts,
+            safe_cts: replay_start_ts,
+            first_retained_file_seq: 0,
+            sealed_redo_segments: Vec::new(),
+            catalog_ops,
+            catalog_ddl_txn_count: 0,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+        }
+    }
+
+    fn catalog_column_insert(
+        table_id: TableID,
+        column_no: u16,
+        name_len: usize,
+    ) -> CatalogRedoEntry {
+        let mut name = vec![b'x'; name_len];
+        name[0] = b'a' + (column_no % 26) as u8;
+        CatalogRedoEntry {
+            table_id: TABLE_ID_COLUMNS,
+            kind: RowRedoKind::Insert(vec![
+                Val::from(table_id),
+                Val::from(column_no),
+                Val::from(name),
+                Val::from(ValKind::U64 as u32),
+                Val::from(0u32),
+            ]),
+        }
+    }
+
+    fn catalog_column_row_record(
+        row_id: RowID,
+        table_id: TableID,
+        column_no: u16,
+        name_len: usize,
+    ) -> RowRecord {
+        let mut name = vec![b'x'; name_len];
+        if let Some(first) = name.first_mut() {
+            *first = b'a' + (column_no % 26) as u8;
+        }
+        RowRecord {
+            row_id,
+            vals: vec![
+                Val::from(table_id),
+                Val::from(column_no),
+                Val::from(name),
+                Val::from(ValKind::U64 as u32),
+                Val::from(0u32),
+            ],
+        }
+    }
+
+    fn catalog_table_vals(table_id: TableID, next_index_no: u16) -> Vec<Val> {
+        vec![Val::from(table_id), Val::from(next_index_no)]
+    }
+
+    async fn catalog_root_rows(storage: &CatalogStorage, table_id: TableID) -> Vec<RowRecord> {
+        let root = storage.checkpoint_snapshot().unwrap().meta.table_roots
+            [must_catalog_table_slot(table_id)];
+        let table = storage.get_catalog_table(table_id).unwrap();
+        let disk_pool_guard = storage.disk_pool.pool_guard();
+        storage
+            .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_compact_catalog_root(
+        storage: &CatalogStorage,
+        table_id: TableID,
+    ) -> Vec<RowRecord> {
+        let root = storage.checkpoint_snapshot().unwrap().meta.table_roots
+            [must_catalog_table_slot(table_id)];
+        let rows = catalog_root_rows(storage, table_id).await;
+        for (idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.row_id, RowID::new(idx as u64));
+        }
+        if root.root_block_id.is_none() {
+            assert_eq!(root.pivot_row_id, RowID::new(0));
+            assert!(rows.is_empty());
+            return rows;
+        }
+        assert_eq!(root.pivot_row_id, RowID::new(rows.len() as u64));
+        let root_block_id = BlockID::from(root.root_block_id.unwrap().get());
+        let disk_pool_guard = storage.disk_pool.pool_guard();
+        let entries = storage
+            .collect_index_entries(&disk_pool_guard, root_block_id)
+            .await
+            .unwrap();
+        assert!(!entries.is_empty());
+        assert_eq!(entries[0].start_row_id, RowID::new(0));
+        for pair in entries.windows(2) {
+            assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
+        }
+        assert_eq!(entries.last().unwrap().end_row_id(), root.pivot_row_id);
+        let index = ColumnBlockIndex::new(
+            root_block_id,
+            root.pivot_row_id,
+            storage.mtb.file_kind(),
+            storage.mtb.sparse_file(),
+            &storage.disk_pool,
+            &disk_pool_guard,
+        );
+        for entry in entries {
+            assert!(index.load_delete_deltas(&entry).await.unwrap().is_empty());
+        }
+        rows
+    }
+
+    async fn build_unpublished_catalog_root(
+        storage: &CatalogStorage,
+        table_id: TableID,
+        metadata: &TableMetadata,
+        rows: &[RowRecord],
+        delete_deltas: Option<&[u32]>,
+    ) -> CatalogTableRootDesc {
+        let mut mutable =
+            MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+        let pages = build_lwc_blocks_from_row_records(metadata, rows).unwrap();
+        let mut entries = Vec::with_capacity(pages.len());
+        for page in pages {
+            let block_id = mutable.allocate_block().unwrap();
+            mutable.write_block(block_id, page.buf).await.unwrap();
+            entries.push(page.shape.with_block_id(block_id));
+        }
+        let disk_pool_guard = storage.disk_pool.pool_guard();
+        let pivot_row_id = RowID::new(rows.len() as u64);
+        let column_index = ColumnBlockIndex::new(
+            SUPER_BLOCK_ID,
+            RowID::new(0),
+            storage.mtb.file_kind(),
+            storage.mtb.sparse_file(),
+            &storage.disk_pool,
+            &disk_pool_guard,
+        );
+        let mut root_block_id = column_index
+            .batch_insert(&mut mutable, &entries, pivot_row_id, TrxID::new(77))
+            .await
+            .unwrap();
+        if let Some(delete_deltas) = delete_deltas {
             let column_index = ColumnBlockIndex::new(
-                SUPER_BLOCK_ID,
-                RowID::new(0),
+                root_block_id,
+                pivot_row_id,
                 storage.mtb.file_kind(),
                 storage.mtb.sparse_file(),
                 &storage.disk_pool,
                 &disk_pool_guard,
             );
-            let mut root_block_id = column_index
-                .batch_insert(&mut mutable, &entries, pivot_row_id, TrxID::new(77))
+            root_block_id = column_index
+                .batch_replace_delete_deltas(
+                    &mut mutable,
+                    &[ColumnDeleteDeltaPatch {
+                        start_row_id: RowID::new(0),
+                        delete_deltas,
+                    }],
+                    TrxID::new(78),
+                )
                 .await
                 .unwrap();
-            if let Some(delete_deltas) = delete_deltas {
-                let column_index = ColumnBlockIndex::new(
-                    root_block_id,
-                    pivot_row_id,
-                    storage.mtb.file_kind(),
-                    storage.mtb.sparse_file(),
-                    &storage.disk_pool,
-                    &disk_pool_guard,
-                );
-                root_block_id = column_index
-                    .batch_replace_delete_deltas(
-                        &mut mutable,
-                        &[ColumnDeleteDeltaPatch {
-                            start_row_id: RowID::new(0),
-                            delete_deltas,
-                        }],
-                        TrxID::new(78),
-                    )
-                    .await
-                    .unwrap();
-            }
-            CatalogTableRootDesc {
-                table_id,
-                root_block_id: NonZeroU64::new(root_block_id.into()),
-                pivot_row_id,
-            }
         }
+        CatalogTableRootDesc {
+            table_id,
+            root_block_id: NonZeroU64::new(root_block_id.into()),
+            pivot_row_id,
+        }
+    }
 
-        async fn assert_checkpoint_rejects_delete_key(
-            engine_name: &str,
-            key: SelectKey,
-            expected_message: &str,
-        ) {
+    async fn assert_checkpoint_rejects_delete_key(
+        engine_name: &str,
+        key: SelectKey,
+        expected_message: &str,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = open_catalog_test_engine(main_dir, Some(engine_name)).await;
+
+        let storage = &engine.catalog().storage;
+        let replay_start_ts = storage
+            .checkpoint_snapshot()
+            .unwrap()
+            .catalog_replay_start_ts;
+        let batch = CatalogCheckpointBatch {
+            replay_start_ts,
+            safe_cts: replay_start_ts,
+            first_retained_file_seq: 0,
+            sealed_redo_segments: Vec::new(),
+            catalog_ops: vec![CatalogRedoEntry {
+                table_id: TABLE_ID_TABLES,
+                kind: RowRedoKind::DeleteByPrimaryKey(key),
+            }],
+            catalog_ddl_txn_count: 0,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+        };
+
+        let err = storage
+            .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains(expected_message), "{report}");
+        let current_replay_start_ts = storage
+            .checkpoint_snapshot()
+            .unwrap()
+            .catalog_replay_start_ts;
+        assert_eq!(current_replay_start_ts, replay_start_ts);
+    }
+
+    #[test]
+    fn test_bootstrap_rejects_empty_catalog_root_table_id_mismatch() {
+        smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = open_catalog_test_engine(main_dir, Some(engine_name)).await;
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-empty-root-mismatch")).await;
+
+            let storage = &engine.catalog().storage;
+            let mut snapshot = storage.checkpoint_snapshot().unwrap();
+            let root = &mut snapshot.meta.table_roots[0];
+            assert_eq!(root.root_block_id, None);
+            assert_eq!(root.pivot_row_id, RowID::new(0));
+            root.table_id = TABLE_ID_COLUMNS;
+
+            let guards = PoolGuards::builder()
+                .push(PoolRole::Meta, storage.meta_pool.pool_guard())
+                .push(PoolRole::Disk, storage.disk_pool.pool_guard())
+                .build();
+            let err = storage
+                .bootstrap_from_checkpoint(&snapshot, &guards, false)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("catalog root table id mismatch"),
+                "{report}"
+            );
+            assert!(
+                report.contains(&format!("root_table_id={TABLE_ID_COLUMNS}")),
+                "{report}"
+            );
+            assert!(report.contains("slot_idx=0"), "{report}");
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_rejects_out_of_range_redo_table_id() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-redo-table-range")).await;
 
             let storage = &engine.catalog().storage;
             let replay_start_ts = storage
                 .checkpoint_snapshot()
                 .unwrap()
                 .catalog_replay_start_ts;
+            let invalid_table_id = catalog_table_id_from_slot(CATALOG_TABLE_ROOT_DESC_COUNT);
             let batch = CatalogCheckpointBatch {
                 replay_start_ts,
                 safe_cts: replay_start_ts,
                 first_retained_file_seq: 0,
                 sealed_redo_segments: Vec::new(),
                 catalog_ops: vec![CatalogRedoEntry {
-                    table_id: TABLE_ID_TABLES,
-                    kind: RowRedoKind::DeleteByPrimaryKey(key),
+                    table_id: invalid_table_id,
+                    kind: RowRedoKind::Insert(Vec::new()),
                 }],
                 catalog_ddl_txn_count: 0,
                 stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
@@ -1308,135 +1397,49 @@ pub(crate) mod tests {
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
-            assert!(report.contains(expected_message), "{report}");
+            assert!(
+                report.contains("catalog checkpoint redo table id out of range"),
+                "{report}"
+            );
+            assert!(
+                report.contains(&format!("table_id={invalid_table_id}")),
+                "{report}"
+            );
+            assert!(
+                report.contains(&format!("slot={}", CATALOG_TABLE_ROOT_DESC_COUNT)),
+                "{report}"
+            );
+            assert!(
+                report.contains(&format!(
+                    "catalog_table_count={}",
+                    CATALOG_TABLE_ROOT_DESC_COUNT
+                )),
+                "{report}"
+            );
             let current_replay_start_ts = storage
                 .checkpoint_snapshot()
                 .unwrap()
                 .catalog_replay_start_ts;
             assert_eq!(current_replay_start_ts, replay_start_ts);
-        }
+        });
+    }
 
-        #[test]
-        fn test_bootstrap_rejects_empty_catalog_root_table_id_mismatch() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-empty-root-mismatch")).await;
+    #[test]
+    fn test_catalog_checkpoint_rejects_delete_key_non_primary_key() {
+        smol::block_on(async {
+            assert_checkpoint_rejects_delete_key(
+                "catalog-delete-key-non-primary",
+                SelectKey::new(1, vec![Val::from(USER_TABLE_ID_START)]),
+                "catalog checkpoint delete key is not primary key",
+            )
+            .await;
+        });
+    }
 
-                let storage = &engine.catalog().storage;
-                let mut snapshot = storage.checkpoint_snapshot().unwrap();
-                let root = &mut snapshot.meta.table_roots[0];
-                assert_eq!(root.root_block_id, None);
-                assert_eq!(root.pivot_row_id, RowID::new(0));
-                root.table_id = TABLE_ID_COLUMNS;
-
-                let guards = PoolGuards::builder()
-                    .push(PoolRole::Meta, storage.meta_pool.pool_guard())
-                    .push(PoolRole::Disk, storage.disk_pool.pool_guard())
-                    .build();
-                let err = storage
-                    .bootstrap_from_checkpoint(&snapshot, &guards, false)
-                    .await
-                    .unwrap_err();
-
-                assert_eq!(
-                    err.data_integrity_error(),
-                    Some(DataIntegrityError::InvalidPayload)
-                );
-                let report = format!("{err:?}");
-                assert!(
-                    report.contains("catalog root table id mismatch"),
-                    "{report}"
-                );
-                assert!(
-                    report.contains(&format!("root_table_id={TABLE_ID_COLUMNS}")),
-                    "{report}"
-                );
-                assert!(report.contains("slot_idx=0"), "{report}");
-            });
-        }
-
-        #[test]
-        fn test_catalog_checkpoint_rejects_out_of_range_redo_table_id() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-redo-table-range")).await;
-
-                let storage = &engine.catalog().storage;
-                let replay_start_ts = storage
-                    .checkpoint_snapshot()
-                    .unwrap()
-                    .catalog_replay_start_ts;
-                let invalid_table_id = catalog_table_id_from_slot(CATALOG_TABLE_ROOT_DESC_COUNT);
-                let batch = CatalogCheckpointBatch {
-                    replay_start_ts,
-                    safe_cts: replay_start_ts,
-                    first_retained_file_seq: 0,
-                    sealed_redo_segments: Vec::new(),
-                    catalog_ops: vec![CatalogRedoEntry {
-                        table_id: invalid_table_id,
-                        kind: RowRedoKind::Insert(Vec::new()),
-                    }],
-                    catalog_ddl_txn_count: 0,
-                    stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
-                };
-
-                let err = storage
-                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
-                    .await
-                    .unwrap_err();
-
-                assert_eq!(
-                    err.data_integrity_error(),
-                    Some(DataIntegrityError::InvalidPayload)
-                );
-                let report = format!("{err:?}");
-                assert!(
-                    report.contains("catalog checkpoint redo table id out of range"),
-                    "{report}"
-                );
-                assert!(
-                    report.contains(&format!("table_id={invalid_table_id}")),
-                    "{report}"
-                );
-                assert!(
-                    report.contains(&format!("slot={}", CATALOG_TABLE_ROOT_DESC_COUNT)),
-                    "{report}"
-                );
-                assert!(
-                    report.contains(&format!(
-                        "catalog_table_count={}",
-                        CATALOG_TABLE_ROOT_DESC_COUNT
-                    )),
-                    "{report}"
-                );
-                let current_replay_start_ts = storage
-                    .checkpoint_snapshot()
-                    .unwrap()
-                    .catalog_replay_start_ts;
-                assert_eq!(current_replay_start_ts, replay_start_ts);
-            });
-        }
-
-        #[test]
-        fn test_catalog_checkpoint_rejects_delete_key_non_primary_key() {
-            smol::block_on(async {
-                assert_checkpoint_rejects_delete_key(
-                    "catalog-delete-key-non-primary",
-                    SelectKey::new(1, vec![Val::from(USER_TABLE_ID_START)]),
-                    "catalog checkpoint delete key is not primary key",
-                )
-                .await;
-            });
-        }
-
-        #[test]
-        fn test_catalog_checkpoint_rejects_delete_key_value_count_mismatch() {
-            smol::block_on(async {
-                assert_checkpoint_rejects_delete_key(
+    #[test]
+    fn test_catalog_checkpoint_rejects_delete_key_value_count_mismatch() {
+        smol::block_on(async {
+            assert_checkpoint_rejects_delete_key(
                     "catalog-delete-key-value-count",
                     SelectKey::new(
                         0,
@@ -1445,798 +1448,788 @@ pub(crate) mod tests {
                     "catalog checkpoint delete key value count 2 does not match primary key column count 1",
                 )
                 .await;
-            });
-        }
+        });
+    }
 
-        #[test]
-        fn test_catalog_lwc_direct_building_does_not_allocate_meta_pages() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-lwc-direct-build")).await;
+    #[test]
+    fn test_catalog_lwc_direct_building_does_not_allocate_meta_pages() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-lwc-direct-build")).await;
 
-                let storage = &engine.catalog().storage;
-                let catalog_table = storage.get_catalog_table(TABLE_ID_COLUMNS).unwrap();
-                let metadata = catalog_table.metadata();
-                let table_id = USER_TABLE_ID_START + 101;
+            let storage = &engine.catalog().storage;
+            let catalog_table = storage.get_catalog_table(TABLE_ID_COLUMNS).unwrap();
+            let metadata = catalog_table.metadata();
+            let table_id = USER_TABLE_ID_START + 101;
 
-                let allocated_before = storage.meta_pool.allocated();
-                let rows = vec![
-                    catalog_column_row_record(RowID::new(0), table_id, 0, 16),
-                    catalog_column_row_record(RowID::new(1), table_id, 1, 24),
-                ];
-                let blocks = build_lwc_blocks_from_row_records(metadata, &rows)
-                    .expect("small rows should build directly");
-                assert!(!blocks.is_empty());
-                assert_eq!(storage.meta_pool.allocated(), allocated_before);
+            let allocated_before = storage.meta_pool.allocated();
+            let rows = vec![
+                catalog_column_row_record(RowID::new(0), table_id, 0, 16),
+                catalog_column_row_record(RowID::new(1), table_id, 1, 24),
+            ];
+            let blocks = build_lwc_blocks_from_row_records(metadata, &rows)
+                .expect("small rows should build directly");
+            assert!(!blocks.is_empty());
+            assert_eq!(storage.meta_pool.allocated(), allocated_before);
 
-                let oversized_row =
-                    catalog_column_row_record(RowID::new(0), table_id, 0, u16::MAX as usize);
-                let result = build_lwc_blocks_from_row_records(metadata, &[oversized_row]);
-                let err = match result {
-                    Ok(_) => panic!("oversized row should fail LWC block build"),
-                    Err(err) => err,
-                };
-                assert_eq!(
-                    err.data_integrity_error(),
-                    Some(DataIntegrityError::InvalidPayload)
-                );
-                assert_eq!(storage.meta_pool.allocated(), allocated_before);
+            let oversized_row =
+                catalog_column_row_record(RowID::new(0), table_id, 0, u16::MAX as usize);
+            let result = build_lwc_blocks_from_row_records(metadata, &[oversized_row]);
+            let err = match result {
+                Ok(_) => panic!("oversized row should fail LWC block build"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            assert_eq!(storage.meta_pool.allocated(), allocated_before);
 
-                assert_eq!(storage.meta_pool.allocated(), allocated_before);
-            });
-        }
+            assert_eq!(storage.meta_pool.allocated(), allocated_before);
+        });
+    }
 
-        #[cfg(debug_assertions)]
-        #[test]
-        #[should_panic(expected = "catalog root should not contain delete deltas")]
-        fn test_catalog_root_loader_debug_asserts_delete_deltas() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-root-delete-deltas")).await;
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "catalog root should not contain delete deltas")]
+    fn test_catalog_root_loader_debug_asserts_delete_deltas() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-root-delete-deltas")).await;
 
-                let storage = &engine.catalog().storage;
-                let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
-                let table_id = USER_TABLE_ID_START + 111;
-                let rows = vec![RowRecord {
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
+            let table_id = USER_TABLE_ID_START + 111;
+            let rows = vec![RowRecord {
+                row_id: RowID::new(0),
+                vals: catalog_table_vals(table_id, 0),
+            }];
+            let root = build_unpublished_catalog_root(
+                storage,
+                TABLE_ID_TABLES,
+                table.metadata(),
+                &rows,
+                Some(&[0]),
+            )
+            .await;
+
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            storage
+                .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn test_catalog_root_loader_rejects_duplicate_primary_keys() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-root-duplicate-pk")).await;
+
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
+            let table_id = USER_TABLE_ID_START + 112;
+            let rows = vec![
+                RowRecord {
                     row_id: RowID::new(0),
                     vals: catalog_table_vals(table_id, 0),
-                }];
-                let root = build_unpublished_catalog_root(
-                    storage,
-                    TABLE_ID_TABLES,
-                    table.metadata(),
-                    &rows,
-                    Some(&[0]),
-                )
-                .await;
+                },
+                RowRecord {
+                    row_id: RowID::new(1),
+                    vals: catalog_table_vals(table_id, 1),
+                },
+            ];
+            let root = build_unpublished_catalog_root(
+                storage,
+                TABLE_ID_TABLES,
+                table.metadata(),
+                &rows,
+                None,
+            )
+            .await;
 
-                let disk_pool_guard = storage.disk_pool.pool_guard();
-                storage
-                    .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
-                    .await
-                    .unwrap();
-            });
-        }
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let err = storage
+                .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
+                .await
+                .unwrap_err();
 
-        #[test]
-        fn test_catalog_root_loader_rejects_duplicate_primary_keys() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-root-duplicate-pk")).await;
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("duplicate primary key"), "{report}");
+        });
+    }
 
-                let storage = &engine.catalog().storage;
-                let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
-                let table_id = USER_TABLE_ID_START + 112;
-                let rows = vec![
-                    RowRecord {
-                        row_id: RowID::new(0),
-                        vals: catalog_table_vals(table_id, 0),
-                    },
-                    RowRecord {
-                        row_id: RowID::new(1),
-                        vals: catalog_table_vals(table_id, 1),
-                    },
-                ];
-                let root = build_unpublished_catalog_root(
-                    storage,
-                    TABLE_ID_TABLES,
-                    table.metadata(),
-                    &rows,
-                    None,
-                )
-                .await;
+    #[test]
+    fn test_catalog_metadata_only_checkpoint_reclaims_displaced_meta_block() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir.clone(), Some("catalog-meta-reclaim")).await;
 
-                let disk_pool_guard = storage.disk_pool.pool_guard();
-                let err = storage
-                    .load_rows_from_root(table.metadata(), &disk_pool_guard, root)
-                    .await
-                    .unwrap_err();
+            let storage = &engine.catalog().storage;
+            let before_root = storage.mtb.active_root_unchecked();
+            let old_meta_block_id = before_root.meta_block_id;
+            let before_allocated = before_root.alloc_map.allocated();
 
-                assert_eq!(
-                    err.data_integrity_error(),
-                    Some(DataIntegrityError::InvalidPayload)
-                );
-                let report = format!("{err:?}");
-                assert!(report.contains("duplicate primary key"), "{report}");
-            });
-        }
+            apply_metadata_only_checkpoint(storage, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
 
-        #[test]
-        fn test_catalog_metadata_only_checkpoint_reclaims_displaced_meta_block() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir.clone(), Some("catalog-meta-reclaim")).await;
+            let after_root = storage.mtb.active_root_unchecked();
+            assert_ne!(after_root.meta_block_id, old_meta_block_id);
+            assert!(
+                after_root
+                    .alloc_map
+                    .is_allocated(usize::from(SUPER_BLOCK_ID))
+            );
+            assert!(
+                after_root
+                    .alloc_map
+                    .is_allocated(usize::from(after_root.meta_block_id))
+            );
+            assert!(
+                !after_root
+                    .alloc_map
+                    .is_allocated(usize::from(old_meta_block_id))
+            );
+            assert_eq!(after_root.alloc_map.allocated(), before_allocated);
+            let expected_replay_start_ts = after_root.root_ts;
+            drop(engine);
 
-                let storage = &engine.catalog().storage;
-                let before_root = storage.mtb.active_root_unchecked();
-                let old_meta_block_id = before_root.meta_block_id;
-                let before_allocated = before_root.alloc_map.allocated();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-meta-reclaim")).await;
+            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(snap.catalog_replay_start_ts, expected_replay_start_ts);
+            assert_eq!(snap.meta.next_table_id, USER_TABLE_ID_START);
+        });
+    }
 
-                apply_metadata_only_checkpoint(storage, engine.catalog().curr_next_table_id())
-                    .await
-                    .unwrap();
+    #[test]
+    fn test_catalog_publish_first_redo_log_seq_preserves_checkpoint_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-redo-marker-preserve")).await;
 
-                let after_root = storage.mtb.active_root_unchecked();
-                assert_ne!(after_root.meta_block_id, old_meta_block_id);
-                assert!(
-                    after_root
-                        .alloc_map
-                        .is_allocated(usize::from(SUPER_BLOCK_ID))
-                );
-                assert!(
-                    after_root
-                        .alloc_map
-                        .is_allocated(usize::from(after_root.meta_block_id))
-                );
-                assert!(
-                    !after_root
-                        .alloc_map
-                        .is_allocated(usize::from(old_meta_block_id))
-                );
-                assert_eq!(after_root.alloc_map.allocated(), before_allocated);
-                let expected_replay_start_ts = after_root.root_ts;
-                drop(engine);
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
 
-                let engine = open_catalog_test_engine(main_dir, Some("catalog-meta-reclaim")).await;
-                let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
-                assert_eq!(snap.catalog_replay_start_ts, expected_replay_start_ts);
-                assert_eq!(snap.meta.next_table_id, USER_TABLE_ID_START);
-            });
-        }
+            let storage = &engine.catalog().storage;
+            let before = storage.checkpoint_snapshot().unwrap();
 
-        #[test]
-        fn test_catalog_publish_first_redo_log_seq_preserves_checkpoint_metadata() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-redo-marker-preserve")).await;
+            let marker = storage.publish_first_redo_log_seq(3).await.unwrap();
 
-                let _ = table1(&engine).await;
-                engine
-                    .catalog()
-                    .checkpoint_now(&engine.inner().trx_sys)
-                    .await
-                    .unwrap();
+            assert_eq!(marker, 3);
+            let after = storage.checkpoint_snapshot().unwrap();
+            assert_ne!(after.meta_block_id, before.meta_block_id);
+            assert_eq!(
+                after.catalog_replay_start_ts,
+                before.catalog_replay_start_ts
+            );
+            assert_eq!(after.meta.next_table_id, before.meta.next_table_id);
+            assert_eq!(after.meta.table_roots, before.meta.table_roots);
+            assert_eq!(after.meta.first_redo_log_seq, 3);
 
-                let storage = &engine.catalog().storage;
-                let before = storage.checkpoint_snapshot().unwrap();
+            let marker = storage.publish_first_redo_log_seq(2).await.unwrap();
 
-                let marker = storage.publish_first_redo_log_seq(3).await.unwrap();
+            assert_eq!(marker, 3);
+            assert_eq!(storage.checkpoint_snapshot().unwrap(), after);
+        });
+    }
 
-                assert_eq!(marker, 3);
-                let after = storage.checkpoint_snapshot().unwrap();
-                assert_ne!(after.meta_block_id, before.meta_block_id);
-                assert_eq!(
-                    after.catalog_replay_start_ts,
-                    before.catalog_replay_start_ts
-                );
-                assert_eq!(after.meta.next_table_id, before.meta.next_table_id);
-                assert_eq!(after.meta.table_roots, before.meta.table_roots);
-                assert_eq!(after.meta.first_redo_log_seq, 3);
+    #[test]
+    fn test_catalog_metadata_only_checkpoint_skips_reachability_reads() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-meta-fast-path")).await;
 
-                let marker = storage.publish_first_redo_log_seq(2).await.unwrap();
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
 
-                assert_eq!(marker, 3);
-                assert_eq!(storage.checkpoint_snapshot().unwrap(), after);
-            });
-        }
-
-        #[test]
-        fn test_catalog_metadata_only_checkpoint_skips_reachability_reads() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-meta-fast-path")).await;
-
-                let _ = table1(&engine).await;
-                engine
-                    .catalog()
-                    .checkpoint_now(&engine.inner().trx_sys)
-                    .await
-                    .unwrap();
-
-                let storage = &engine.catalog().storage;
-                let snap = storage.checkpoint_snapshot().unwrap();
-                let disk_pool_guard = storage.disk_pool.pool_guard();
-                let mut catalog_index_blocks = BTreeSet::new();
-                for root in snap.meta.table_roots {
-                    let Some(root_block_id) = root.checkpoint_root_block_id() else {
-                        continue;
-                    };
-                    catalog_index_blocks.insert(root_block_id);
-                    let entries = storage
-                        .collect_index_entries(&disk_pool_guard, root_block_id)
-                        .await
-                        .unwrap();
-                    for entry in entries {
-                        catalog_index_blocks.insert(entry.leaf_block_id);
-                    }
-                }
-                assert!(!catalog_index_blocks.is_empty());
-                for block_id in &catalog_index_blocks {
-                    let _ = engine
-                        .inner()
-                        .disk_pool
-                        .invalidate_block(CATALOG_MTB_FILE_ID, *block_id);
-                    let key = BlockKey::new(CATALOG_MTB_FILE_ID, *block_id);
-                    assert!(engine.inner().disk_pool.try_get_frame_id(&key).is_none());
-                }
-                let cached_before = engine.inner().disk_pool.allocated();
-
-                apply_metadata_only_checkpoint(storage, engine.catalog().curr_next_table_id())
-                    .await
-                    .unwrap();
-
-                assert_eq!(engine.inner().disk_pool.allocated(), cached_before);
-                for block_id in catalog_index_blocks {
-                    let key = BlockKey::new(CATALOG_MTB_FILE_ID, block_id);
-                    assert!(engine.inner().disk_pool.try_get_frame_id(&key).is_none());
-                }
-            });
-        }
-
-        #[test]
-        fn test_catalog_checkpoint_canceled_ops_use_meta_only_reclamation() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-canceled-fast-path")).await;
-
-                let storage = &engine.catalog().storage;
-                let before_root = storage.mtb.active_root_unchecked();
-                let old_meta_block_id = before_root.meta_block_id;
-                let before_allocated = before_root.alloc_map.allocated();
-                let replay_start_ts = storage
-                    .checkpoint_snapshot()
-                    .unwrap()
-                    .catalog_replay_start_ts;
-                let table_id = USER_TABLE_ID_START + 4242;
-                let batch = CatalogCheckpointBatch {
-                    replay_start_ts,
-                    safe_cts: replay_start_ts,
-                    first_retained_file_seq: 0,
-                    sealed_redo_segments: Vec::new(),
-                    catalog_ops: vec![
-                        CatalogRedoEntry {
-                            table_id: TABLE_ID_TABLES,
-                            kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
-                        },
-                        CatalogRedoEntry {
-                            table_id: TABLE_ID_TABLES,
-                            kind: RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
-                                0,
-                                vec![Val::from(table_id)],
-                            )),
-                        },
-                    ],
-                    catalog_ddl_txn_count: 0,
-                    stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+            let storage = &engine.catalog().storage;
+            let snap = storage.checkpoint_snapshot().unwrap();
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let mut catalog_index_blocks = BTreeSet::new();
+            for root in snap.meta.table_roots {
+                let Some(root_block_id) = root.checkpoint_root_block_id() else {
+                    continue;
                 };
-
-                storage
-                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                catalog_index_blocks.insert(root_block_id);
+                let entries = storage
+                    .collect_index_entries(&disk_pool_guard, root_block_id)
                     .await
                     .unwrap();
+                for entry in entries {
+                    catalog_index_blocks.insert(entry.leaf_block_id);
+                }
+            }
+            assert!(!catalog_index_blocks.is_empty());
+            for block_id in &catalog_index_blocks {
+                let _ = engine
+                    .inner()
+                    .disk_pool
+                    .invalidate_block(CATALOG_MTB_FILE_ID, *block_id);
+                let key = BlockKey::new(CATALOG_MTB_FILE_ID, *block_id);
+                assert!(engine.inner().disk_pool.try_get_frame_id(&key).is_none());
+            }
+            let cached_before = engine.inner().disk_pool.allocated();
 
-                let after_root = storage.mtb.active_root_unchecked();
-                assert_ne!(after_root.meta_block_id, old_meta_block_id);
-                assert!(
-                    !after_root
-                        .alloc_map
-                        .is_allocated(usize::from(old_meta_block_id))
-                );
-                assert_eq!(after_root.alloc_map.allocated(), before_allocated);
-                assert_eq!(after_root.table_roots[0].root_block_id, None);
-                assert_eq!(after_root.table_roots[0].pivot_row_id, RowID::new(0));
-            });
-        }
+            apply_metadata_only_checkpoint(storage, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
 
-        #[test]
-        fn test_catalog_checkpoint_update_by_primary_key_updates_same_batch_insert() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine = open_catalog_test_engine(
-                    main_dir,
-                    Some("catalog-update-key-same-batch-insert"),
-                )
-                .await;
+            assert_eq!(engine.inner().disk_pool.allocated(), cached_before);
+            for block_id in catalog_index_blocks {
+                let key = BlockKey::new(CATALOG_MTB_FILE_ID, block_id);
+                assert!(engine.inner().disk_pool.try_get_frame_id(&key).is_none());
+            }
+        });
+    }
 
-                let storage = &engine.catalog().storage;
-                let table_id = USER_TABLE_ID_START + 5252;
-                let batch = checkpoint_batch_with_ops(
-                    storage,
-                    vec![
-                        CatalogRedoEntry {
-                            table_id: TABLE_ID_TABLES,
-                            kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
-                        },
-                        CatalogRedoEntry {
-                            table_id: TABLE_ID_TABLES,
-                            kind: RowRedoKind::UpdateByPrimaryKey(
-                                SelectKey::new(0, vec![Val::from(table_id)]),
-                                vec![UpdateCol {
-                                    idx: 1,
-                                    val: Val::from(7u16),
-                                }],
-                            ),
-                        },
-                    ],
-                );
+    #[test]
+    fn test_catalog_checkpoint_canceled_ops_use_meta_only_reclamation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-canceled-fast-path")).await;
 
-                storage
-                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
-                    .await
-                    .unwrap();
+            let storage = &engine.catalog().storage;
+            let before_root = storage.mtb.active_root_unchecked();
+            let old_meta_block_id = before_root.meta_block_id;
+            let before_allocated = before_root.alloc_map.allocated();
+            let replay_start_ts = storage
+                .checkpoint_snapshot()
+                .unwrap()
+                .catalog_replay_start_ts;
+            let table_id = USER_TABLE_ID_START + 4242;
+            let batch = CatalogCheckpointBatch {
+                replay_start_ts,
+                safe_cts: replay_start_ts,
+                first_retained_file_seq: 0,
+                sealed_redo_segments: Vec::new(),
+                catalog_ops: vec![
+                    CatalogRedoEntry {
+                        table_id: TABLE_ID_TABLES,
+                        kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                    },
+                    CatalogRedoEntry {
+                        table_id: TABLE_ID_TABLES,
+                        kind: RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
+                            0,
+                            vec![Val::from(table_id)],
+                        )),
+                    },
+                ],
+                catalog_ddl_txn_count: 0,
+                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+            };
 
-                let rows = catalog_root_rows(storage, TABLE_ID_TABLES).await;
-                let matching_rows = rows
-                    .iter()
-                    .filter(|row| row.vals[0] == Val::from(table_id))
-                    .collect::<Vec<_>>();
-                assert_eq!(matching_rows.len(), 1);
-                assert_eq!(matching_rows[0].vals[1], Val::from(7u16));
-                assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
-            });
-        }
+            storage
+                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
 
-        #[test]
-        fn test_catalog_checkpoint_update_by_primary_key_rejects_primary_key_column() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-update-pk-column")).await;
+            let after_root = storage.mtb.active_root_unchecked();
+            assert_ne!(after_root.meta_block_id, old_meta_block_id);
+            assert!(
+                !after_root
+                    .alloc_map
+                    .is_allocated(usize::from(old_meta_block_id))
+            );
+            assert_eq!(after_root.alloc_map.allocated(), before_allocated);
+            assert_eq!(after_root.table_roots[0].root_block_id, None);
+            assert_eq!(after_root.table_roots[0].pivot_row_id, RowID::new(0));
+        });
+    }
 
-                let storage = &engine.catalog().storage;
-                let table_id = USER_TABLE_ID_START + 6262;
-                let batch = checkpoint_batch_with_ops(
-                    storage,
-                    vec![
-                        CatalogRedoEntry {
-                            table_id: TABLE_ID_TABLES,
-                            kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
-                        },
-                        CatalogRedoEntry {
-                            table_id: TABLE_ID_TABLES,
-                            kind: RowRedoKind::UpdateByPrimaryKey(
-                                SelectKey::new(0, vec![Val::from(table_id)]),
-                                vec![UpdateCol {
-                                    idx: 0,
-                                    val: Val::from(table_id),
-                                }],
-                            ),
-                        },
-                    ],
-                );
+    #[test]
+    fn test_catalog_checkpoint_update_by_primary_key_updates_same_batch_insert() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-update-key-same-batch-insert"))
+                    .await;
 
-                let err = storage
-                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
-                    .await
-                    .unwrap_err();
-
-                assert_eq!(
-                    err.data_integrity_error(),
-                    Some(DataIntegrityError::InvalidPayload)
-                );
-                let report = format!("{err:?}");
-                assert!(
-                    report.contains("catalog checkpoint update cannot change primary key column"),
-                    "{report}"
-                );
-            });
-        }
-
-        #[test]
-        fn test_catalog_checkpoint_update_by_primary_key_replaces_existing_row() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-update-key-existing-row"))
-                        .await;
-
-                let table_id = table1(&engine).await;
-                engine
-                    .catalog()
-                    .checkpoint_now(&engine.inner().trx_sys)
-                    .await
-                    .unwrap();
-
-                let storage = &engine.catalog().storage;
-                let batch = checkpoint_batch_with_ops(
-                    storage,
-                    vec![CatalogRedoEntry {
+            let storage = &engine.catalog().storage;
+            let table_id = USER_TABLE_ID_START + 5252;
+            let batch = checkpoint_batch_with_ops(
+                storage,
+                vec![
+                    CatalogRedoEntry {
+                        table_id: TABLE_ID_TABLES,
+                        kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                    },
+                    CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
                         kind: RowRedoKind::UpdateByPrimaryKey(
                             SelectKey::new(0, vec![Val::from(table_id)]),
                             vec![UpdateCol {
                                 idx: 1,
-                                val: Val::from(9u16),
+                                val: Val::from(7u16),
                             }],
                         ),
-                    }],
-                );
+                    },
+                ],
+            );
 
-                storage
-                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
-                    .await
-                    .unwrap();
+            storage
+                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
 
-                let rows = catalog_root_rows(storage, TABLE_ID_TABLES).await;
-                let matching_rows = rows
-                    .iter()
-                    .filter(|row| row.vals[0] == Val::from(table_id))
-                    .collect::<Vec<_>>();
-                assert_eq!(matching_rows.len(), 1);
-                assert_eq!(matching_rows[0].vals[1], Val::from(9u16));
-                assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
-            });
-        }
+            let rows = catalog_root_rows(storage, TABLE_ID_TABLES).await;
+            let matching_rows = rows
+                .iter()
+                .filter(|row| row.vals[0] == Val::from(table_id))
+                .collect::<Vec<_>>();
+            assert_eq!(matching_rows.len(), 1);
+            assert_eq!(matching_rows[0].vals[1], Val::from(7u16));
+            assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
+        });
+    }
 
-        #[test]
-        fn test_catalog_reclamation_rejects_unallocated_root_descriptor_before_publish() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-reclaim-invalid-root")).await;
+    #[test]
+    fn test_catalog_checkpoint_update_by_primary_key_rejects_primary_key_column() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-update-pk-column")).await;
 
-                let storage = &engine.catalog().storage;
-                let active_before = storage.mtb.active_root_unchecked();
-                let active_meta_before = active_before.meta_block_id;
-                let active_root_ts_before = active_before.root_ts;
-                let bogus_root_block_id = (1..active_before.alloc_map.len())
-                    .rev()
-                    .map(BlockID::from)
-                    .find(|block_id| !active_before.alloc_map.is_allocated(usize::from(*block_id)))
-                    .unwrap();
+            let storage = &engine.catalog().storage;
+            let table_id = USER_TABLE_ID_START + 6262;
+            let batch = checkpoint_batch_with_ops(
+                storage,
+                vec![
+                    CatalogRedoEntry {
+                        table_id: TABLE_ID_TABLES,
+                        kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                    },
+                    CatalogRedoEntry {
+                        table_id: TABLE_ID_TABLES,
+                        kind: RowRedoKind::UpdateByPrimaryKey(
+                            SelectKey::new(0, vec![Val::from(table_id)]),
+                            vec![UpdateCol {
+                                idx: 0,
+                                val: Val::from(table_id),
+                            }],
+                        ),
+                    },
+                ],
+            );
 
-                let mut roots = storage.checkpoint_snapshot().unwrap().meta.table_roots;
-                roots[0].root_block_id = NonZeroU64::new(u64::from(bogus_root_block_id));
-                roots[0].pivot_row_id = RowID::new(1);
+            let err = storage
+                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap_err();
 
-                let mut mutable =
-                    MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
-                mutable
-                    .apply_checkpoint_metadata(
-                        active_root_ts_before.saturating_add(1),
-                        engine.catalog().curr_next_table_id(),
-                        roots,
-                    )
-                    .unwrap();
-                let err = storage
-                    .rebuild_catalog_alloc_map(&mut mutable)
-                    .await
-                    .unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("catalog checkpoint update cannot change primary key column"),
+                "{report}"
+            );
+        });
+    }
 
-                assert_eq!(
-                    err.data_integrity_error(),
-                    Some(DataIntegrityError::InvalidRootInvariant)
-                );
-                let active_after = storage.mtb.active_root_unchecked();
-                assert_eq!(active_after.meta_block_id, active_meta_before);
-                assert_eq!(active_after.root_ts, active_root_ts_before);
-            });
-        }
+    #[test]
+    fn test_catalog_checkpoint_update_by_primary_key_replaces_existing_row() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-update-key-existing-row")).await;
 
-        #[test]
-        fn test_catalog_checkpoint_apply_table_ops_keeps_empty_root_for_canceled_insert_batch() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine = open_catalog_test_engine(
-                    main_dir,
-                    Some("catalog-checkpoint-canceled-empty-root"),
-                )
-                .await;
+            let table_id = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
 
-                let storage = &engine.catalog().storage;
-                let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
-                let root = CatalogTableRootDesc {
+            let storage = &engine.catalog().storage;
+            let batch = checkpoint_batch_with_ops(
+                storage,
+                vec![CatalogRedoEntry {
                     table_id: TABLE_ID_TABLES,
-                    root_block_id: None,
-                    pivot_row_id: RowID::new(0),
-                };
-                let table_id = USER_TABLE_ID_START + 42;
-                let table_ops = vec![
-                    RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
-                    RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
-                ];
-                let mut mutable =
-                    MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+                    kind: RowRedoKind::UpdateByPrimaryKey(
+                        SelectKey::new(0, vec![Val::from(table_id)]),
+                        vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from(9u16),
+                        }],
+                    ),
+                }],
+            );
 
-                let (next_root, blocks_changed) = storage
-                    .apply_table_ops(
-                        &mut mutable,
-                        TABLE_ID_TABLES,
-                        table.metadata(),
-                        root,
-                        &table_ops,
-                        TrxID::new(7),
-                    )
-                    .await
-                    .unwrap();
+            storage
+                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
 
-                assert_eq!(next_root.root_block_id, None);
-                assert_eq!(next_root.pivot_row_id, RowID::new(0));
-                assert!(!blocks_changed);
-            });
-        }
+            let rows = catalog_root_rows(storage, TABLE_ID_TABLES).await;
+            let matching_rows = rows
+                .iter()
+                .filter(|row| row.vals[0] == Val::from(table_id))
+                .collect::<Vec<_>>();
+            assert_eq!(matching_rows.len(), 1);
+            assert_eq!(matching_rows[0].vals[1], Val::from(9u16));
+            assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
+        });
+    }
 
-        #[test]
-        fn test_catalog_checkpoint_apply_table_ops_keeps_existing_root_for_canceled_insert_batch() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine = open_catalog_test_engine(
-                    main_dir,
-                    Some("catalog-checkpoint-canceled-existing-root"),
+    #[test]
+    fn test_catalog_reclamation_rejects_unallocated_root_descriptor_before_publish() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-reclaim-invalid-root")).await;
+
+            let storage = &engine.catalog().storage;
+            let active_before = storage.mtb.active_root_unchecked();
+            let active_meta_before = active_before.meta_block_id;
+            let active_root_ts_before = active_before.root_ts;
+            let bogus_root_block_id = (1..active_before.alloc_map.len())
+                .rev()
+                .map(BlockID::from)
+                .find(|block_id| !active_before.alloc_map.is_allocated(usize::from(*block_id)))
+                .unwrap();
+
+            let mut roots = storage.checkpoint_snapshot().unwrap().meta.table_roots;
+            roots[0].root_block_id = NonZeroU64::new(u64::from(bogus_root_block_id));
+            roots[0].pivot_row_id = RowID::new(1);
+
+            let mut mutable =
+                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+            mutable
+                .apply_checkpoint_metadata(
+                    active_root_ts_before.saturating_add(1),
+                    engine.catalog().curr_next_table_id(),
+                    roots,
                 )
-                .await;
+                .unwrap();
+            let err = storage
+                .rebuild_catalog_alloc_map(&mut mutable)
+                .await
+                .unwrap_err();
 
-                let _ = table1(&engine).await;
-                engine
-                    .catalog()
-                    .checkpoint_now(&engine.inner().trx_sys)
-                    .await
-                    .unwrap();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            let active_after = storage.mtb.active_root_unchecked();
+            assert_eq!(active_after.meta_block_id, active_meta_before);
+            assert_eq!(active_after.root_ts, active_root_ts_before);
+        });
+    }
 
-                let storage = &engine.catalog().storage;
-                let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
-                let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[0];
-                assert!(root.root_block_id.is_some());
+    #[test]
+    fn test_catalog_checkpoint_apply_table_ops_keeps_empty_root_for_canceled_insert_batch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-canceled-empty-root"))
+                    .await;
 
-                let table_id = USER_TABLE_ID_START + 4242;
-                let table_ops = vec![
-                    RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
-                    RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
-                ];
-                let mut mutable =
-                    MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
+            let root = CatalogTableRootDesc {
+                table_id: TABLE_ID_TABLES,
+                root_block_id: None,
+                pivot_row_id: RowID::new(0),
+            };
+            let table_id = USER_TABLE_ID_START + 42;
+            let table_ops = vec![
+                RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
+            ];
+            let mut mutable =
+                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
 
-                let (next_root, blocks_changed) = storage
-                    .apply_table_ops(
-                        &mut mutable,
-                        TABLE_ID_TABLES,
-                        table.metadata(),
-                        root,
-                        &table_ops,
-                        TrxID::new(8),
-                    )
-                    .await
-                    .unwrap();
-
-                assert_eq!(next_root.root_block_id, root.root_block_id);
-                assert_eq!(next_root.pivot_row_id, root.pivot_row_id);
-                assert!(!blocks_changed);
-            });
-        }
-
-        #[test]
-        fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-checkpoint-readonly-cache"))
-                        .await;
-
-                let _ = table1(&engine).await;
-                engine
-                    .catalog()
-                    .checkpoint_now(&engine.inner().trx_sys)
-                    .await
-                    .unwrap();
-
-                let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
-                let tables_root = snap.meta.table_roots[0];
-                let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
-                let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
-
-                let cached_before_first = engine.inner().disk_pool.allocated();
-
-                let entries1 = engine
-                    .catalog()
-                    .storage
-                    .collect_index_entries(&disk_pool_guard, root_block_id)
-                    .await
-                    .unwrap();
-                assert!(!entries1.is_empty());
-
-                let cached_after_first = engine.inner().disk_pool.allocated();
-                assert!(cached_after_first >= cached_before_first);
-                let root_key = BlockKey::new(CATALOG_MTB_FILE_ID, root_block_id);
-                assert!(
-                    engine
-                        .inner()
-                        .disk_pool
-                        .try_get_frame_id(&root_key)
-                        .is_some()
-                );
-
-                let entries2 = engine
-                    .catalog()
-                    .storage
-                    .collect_index_entries(&disk_pool_guard, root_block_id)
-                    .await
-                    .unwrap();
-                assert_eq!(entries2.len(), entries1.len());
-                assert_eq!(engine.inner().disk_pool.allocated(), cached_after_first);
-            });
-        }
-
-        #[test]
-        fn test_catalog_checkpoint_rewrites_changed_table_as_compact_root() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine = open_catalog_test_engine(
-                    main_dir.clone(),
-                    Some("catalog-checkpoint-compact-rewrite"),
+            let (next_root, blocks_changed) = storage
+                .apply_table_ops(
+                    &mut mutable,
+                    TABLE_ID_TABLES,
+                    table.metadata(),
+                    root,
+                    &table_ops,
+                    TrxID::new(7),
                 )
-                .await;
+                .await
+                .unwrap();
 
-                let table1_id = table1(&engine).await;
+            assert_eq!(next_root.root_block_id, None);
+            assert_eq!(next_root.pivot_row_id, RowID::new(0));
+            assert!(!blocks_changed);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_apply_table_ops_keeps_existing_root_for_canceled_insert_batch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = open_catalog_test_engine(
+                main_dir,
+                Some("catalog-checkpoint-canceled-existing-root"),
+            )
+            .await;
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
+            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[0];
+            assert!(root.root_block_id.is_some());
+
+            let table_id = USER_TABLE_ID_START + 4242;
+            let table_ops = vec![
+                RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
+            ];
+            let mut mutable =
+                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+
+            let (next_root, blocks_changed) = storage
+                .apply_table_ops(
+                    &mut mutable,
+                    TABLE_ID_TABLES,
+                    table.metadata(),
+                    root,
+                    &table_ops,
+                    TrxID::new(8),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(next_root.root_block_id, root.root_block_id);
+            assert_eq!(next_root.pivot_row_id, root.pivot_row_id);
+            assert!(!blocks_changed);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-readonly-cache")).await;
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+
+            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let tables_root = snap.meta.table_roots[0];
+            let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
+            let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
+
+            let cached_before_first = engine.inner().disk_pool.allocated();
+
+            let entries1 = engine
+                .catalog()
+                .storage
+                .collect_index_entries(&disk_pool_guard, root_block_id)
+                .await
+                .unwrap();
+            assert!(!entries1.is_empty());
+
+            let cached_after_first = engine.inner().disk_pool.allocated();
+            assert!(cached_after_first >= cached_before_first);
+            let root_key = BlockKey::new(CATALOG_MTB_FILE_ID, root_block_id);
+            assert!(
                 engine
-                    .catalog()
-                    .checkpoint_now(&engine.inner().trx_sys)
-                    .await
-                    .unwrap();
+                    .inner()
+                    .disk_pool
+                    .try_get_frame_id(&root_key)
+                    .is_some()
+            );
 
-                let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-                let tables_root1 = snap1.meta.table_roots[0];
-                assert!(tables_root1.root_block_id.is_some());
+            let entries2 = engine
+                .catalog()
+                .storage
+                .collect_index_entries(&disk_pool_guard, root_block_id)
+                .await
+                .unwrap();
+            assert_eq!(entries2.len(), entries1.len());
+            assert_eq!(engine.inner().disk_pool.allocated(), cached_after_first);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_rewrites_changed_table_as_compact_root() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = open_catalog_test_engine(
+                main_dir.clone(),
+                Some("catalog-checkpoint-compact-rewrite"),
+            )
+            .await;
+
+            let table1_id = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+
+            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let tables_root1 = snap1.meta.table_roots[0];
+            assert!(tables_root1.root_block_id.is_some());
+            assert_compact_catalog_root(&engine.catalog().storage, TABLE_ID_TABLES).await;
+
+            let table2_id = table2(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+
+            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let tables_root2 = snap2.meta.table_roots[0];
+            let rows =
                 assert_compact_catalog_root(&engine.catalog().storage, TABLE_ID_TABLES).await;
 
-                let table2_id = table2(&engine).await;
-                engine
-                    .catalog()
-                    .checkpoint_now(&engine.inner().trx_sys)
+            assert!(tables_root2.root_block_id != tables_root1.root_block_id);
+            assert_eq!(tables_root2.pivot_row_id, RowID::new(rows.len() as u64));
+            let active_root = engine.catalog().storage.mtb.active_root_unchecked();
+            let root_block_id1 = BlockID::from(tables_root1.root_block_id.unwrap().get());
+            let root_block_id2 = BlockID::from(tables_root2.root_block_id.unwrap().get());
+            assert!(
+                !active_root
+                    .alloc_map
+                    .is_allocated(usize::from(root_block_id1))
+            );
+            assert!(
+                active_root
+                    .alloc_map
+                    .is_allocated(usize::from(root_block_id2))
+            );
+            drop(engine);
+
+            let recovered =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-compact-rewrite"))
+                    .await;
+            let mut recovered_table_ids = recovered.catalog().list_user_table_ids_now();
+            recovered_table_ids.sort();
+            let mut expected_table_ids = vec![table1_id, table2_id];
+            expected_table_ids.sort();
+            assert_eq!(recovered_table_ids, expected_table_ids);
+            assert_eq!(
+                assert_compact_catalog_root(&recovered.catalog().storage, TABLE_ID_TABLES)
                     .await
-                    .unwrap();
+                    .len(),
+                rows.len()
+            );
+        });
+    }
 
-                let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
-                let tables_root2 = snap2.meta.table_roots[0];
-                let rows =
-                    assert_compact_catalog_root(&engine.catalog().storage, TABLE_ID_TABLES).await;
+    #[test]
+    fn test_catalog_checkpoint_compact_rewrite_uses_dense_row_ids_after_large_append() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-compact-large-append")).await;
 
-                assert!(tables_root2.root_block_id != tables_root1.root_block_id);
-                assert_eq!(tables_root2.pivot_row_id, RowID::new(rows.len() as u64));
-                let active_root = engine.catalog().storage.mtb.active_root_unchecked();
-                let root_block_id1 = BlockID::from(tables_root1.root_block_id.unwrap().get());
-                let root_block_id2 = BlockID::from(tables_root2.root_block_id.unwrap().get());
-                assert!(
-                    !active_root
-                        .alloc_map
-                        .is_allocated(usize::from(root_block_id1))
-                );
-                assert!(
-                    active_root
-                        .alloc_map
-                        .is_allocated(usize::from(root_block_id2))
-                );
-                drop(engine);
+            let storage = &engine.catalog().storage;
+            let table_id = USER_TABLE_ID_START + 9000;
+            storage
+                .apply_checkpoint_batch(
+                    checkpoint_batch_with_ops(
+                        storage,
+                        vec![catalog_column_insert(table_id, 0, 30_000)],
+                    ),
+                    engine.catalog().curr_next_table_id(),
+                )
+                .await
+                .unwrap();
 
-                let recovered =
-                    open_catalog_test_engine(main_dir, Some("catalog-checkpoint-compact-rewrite"))
-                        .await;
-                let mut recovered_table_ids = recovered.catalog().list_user_table_ids_now();
-                recovered_table_ids.sort();
-                let mut expected_table_ids = vec![table1_id, table2_id];
-                expected_table_ids.sort();
-                assert_eq!(recovered_table_ids, expected_table_ids);
-                assert_eq!(
-                    assert_compact_catalog_root(&recovered.catalog().storage, TABLE_ID_TABLES)
-                        .await
-                        .len(),
-                    rows.len()
-                );
-            });
-        }
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let snap1 = storage.checkpoint_snapshot().unwrap();
+            let columns_root1 = snap1.meta.table_roots[1];
+            assert_eq!(columns_root1.pivot_row_id, RowID::new(1));
+            let entries1 = storage
+                .collect_index_entries(
+                    &disk_pool_guard,
+                    BlockID::from(columns_root1.root_block_id.unwrap().get()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(entries1.len(), 1);
 
-        #[test]
-        fn test_catalog_checkpoint_compact_rewrite_uses_dense_row_ids_after_large_append() {
-            smol::block_on(async {
-                let temp_dir = TempDir::new().unwrap();
-                let main_dir = temp_dir.path().to_path_buf();
-                let engine =
-                    open_catalog_test_engine(main_dir, Some("catalog-compact-large-append")).await;
+            let second_batch = (1..=4)
+                .map(|column_no| catalog_column_insert(table_id, column_no, 15_000))
+                .collect();
+            storage
+                .apply_checkpoint_batch(
+                    checkpoint_batch_with_ops(storage, second_batch),
+                    engine.catalog().curr_next_table_id(),
+                )
+                .await
+                .unwrap();
 
-                let storage = &engine.catalog().storage;
-                let table_id = USER_TABLE_ID_START + 9000;
-                storage
-                    .apply_checkpoint_batch(
-                        checkpoint_batch_with_ops(
-                            storage,
-                            vec![catalog_column_insert(table_id, 0, 30_000)],
-                        ),
-                        engine.catalog().curr_next_table_id(),
-                    )
-                    .await
-                    .unwrap();
+            let snap2 = storage.checkpoint_snapshot().unwrap();
+            let columns_root2 = snap2.meta.table_roots[1];
+            let rows = assert_compact_catalog_root(storage, TABLE_ID_COLUMNS).await;
+            assert_eq!(rows.len(), 5);
+            assert_eq!(columns_root2.pivot_row_id, RowID::new(5));
+            let entries2 = storage
+                .collect_index_entries(
+                    &disk_pool_guard,
+                    BlockID::from(columns_root2.root_block_id.unwrap().get()),
+                )
+                .await
+                .unwrap();
 
-                let disk_pool_guard = storage.disk_pool.pool_guard();
-                let snap1 = storage.checkpoint_snapshot().unwrap();
-                let columns_root1 = snap1.meta.table_roots[1];
-                assert_eq!(columns_root1.pivot_row_id, RowID::new(1));
-                let entries1 = storage
-                    .collect_index_entries(
-                        &disk_pool_guard,
-                        BlockID::from(columns_root1.root_block_id.unwrap().get()),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(entries1.len(), 1);
-
-                let second_batch = (1..=4)
-                    .map(|column_no| catalog_column_insert(table_id, column_no, 15_000))
-                    .collect();
-                storage
-                    .apply_checkpoint_batch(
-                        checkpoint_batch_with_ops(storage, second_batch),
-                        engine.catalog().curr_next_table_id(),
-                    )
-                    .await
-                    .unwrap();
-
-                let snap2 = storage.checkpoint_snapshot().unwrap();
-                let columns_root2 = snap2.meta.table_roots[1];
-                let rows = assert_compact_catalog_root(storage, TABLE_ID_COLUMNS).await;
-                assert_eq!(rows.len(), 5);
-                assert_eq!(columns_root2.pivot_row_id, RowID::new(5));
-                let entries2 = storage
-                    .collect_index_entries(
-                        &disk_pool_guard,
-                        BlockID::from(columns_root2.root_block_id.unwrap().get()),
-                    )
-                    .await
-                    .unwrap();
-
-                assert!(
-                    columns_root2.root_block_id != columns_root1.root_block_id,
-                    "changed catalog tables should publish a rewritten compact root"
-                );
-                assert_eq!(entries2[0].start_row_id, RowID::new(0));
-                for pair in entries2.windows(2) {
-                    assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
-                }
-                assert_eq!(
-                    entries2.last().unwrap().end_row_id(),
-                    columns_root2.pivot_row_id
-                );
-            });
-        }
+            assert!(
+                columns_root2.root_block_id != columns_root1.root_block_id,
+                "changed catalog tables should publish a rewritten compact root"
+            );
+            assert_eq!(entries2[0].start_row_id, RowID::new(0));
+            for pair in entries2.windows(2) {
+                assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
+            }
+            assert_eq!(
+                entries2.last().unwrap().end_row_id(),
+                columns_root2.pivot_row_id
+            );
+        });
     }
 }

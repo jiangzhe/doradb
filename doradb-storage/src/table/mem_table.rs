@@ -22,11 +22,9 @@ use crate::index::{
 use crate::latch::LatchFallbackMode;
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
-#[cfg(test)]
-use crate::row::ops::UpdateMvcc;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, LinkForUniqueIndex, RowUpdateInput, RowUpdateView, SelectKey,
-    UpdateCol, UpdateIndex, UpsertMvcc,
+    UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
@@ -42,6 +40,23 @@ use std::sync::Arc;
 struct NoTrxIndexRefresh {
     old_keys: Vec<SelectKey>,
     new_keys: Vec<SelectKey>,
+}
+
+/// Successful catalog primary-key upsert performed without transaction state.
+pub(crate) enum NoTrxUpsertChange {
+    /// A new logical row was inserted at the reported runtime location.
+    Inserted {
+        page_id: PageID,
+        row_id: RowID,
+        vals: Vec<Val>,
+    },
+    /// An existing logical row was updated at the reported final runtime location.
+    Updated {
+        page_id: PageID,
+        row_id: RowID,
+        key: SelectKey,
+        cols: Vec<UpdateCol>,
+    },
 }
 
 /// Shared in-memory table core used by both catalog and user tables.
@@ -1166,6 +1181,18 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         cols: &[Val],
         disable_dml_validation: bool,
     ) -> Result<()> {
+        self.insert_no_trx_location(guards, cols, disable_dml_validation)
+            .await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn insert_no_trx_location(
+        &self,
+        guards: &PoolGuards,
+        cols: &[Val],
+        disable_dml_validation: bool,
+    ) -> Result<(PageID, RowID)> {
         let metadata = self.metadata();
         if !disable_dml_validation {
             DmlValidator::new(
@@ -1189,6 +1216,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             let mut page_guard = self
                 .get_insert_page_exclusive(guards, row_count, None)
                 .await?;
+            let page_id = page_guard.page_id();
             let page = page_guard.page_mut();
             debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);
@@ -1210,8 +1238,97 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             }
             row.finish_insert();
             self.cache_exclusive_insert_page(page_guard);
+            return Ok((page_id, row_id));
+        }
+    }
+
+    /// Upsert one catalog row by primary key without transaction state.
+    ///
+    /// The callback is the final infallible step after a successful mutation.
+    /// It is not invoked when the current logical row already equals `cols` or
+    /// when validation/access/mutation fails.
+    #[inline]
+    pub(crate) async fn upsert_primary_key_no_trx<F>(
+        &self,
+        guards: &PoolGuards,
+        cols: Vec<Val>,
+        disable_dml_validation: bool,
+        on_change: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(NoTrxUpsertChange),
+    {
+        let metadata = self.metadata();
+        let primary_key = metadata.primary_key().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::CatalogPrimaryKeyMissing).attach(format!(
+                    "catalog primary-key no-trx upsert requires primary key: table_id={}",
+                    self.table_id()
+                )),
+            )
+        })?;
+        let primary_key_index_no = primary_key.index_no();
+        if !disable_dml_validation {
+            let validator = DmlValidator::new(
+                metadata,
+                self.table_id(),
+                "upsert_primary_key_no_trx",
+                DmlValidationDomain::Recovery,
+            );
+            validator.validate_full_row(&cols)?;
+            validator.validate_unique_index(primary_key_index_no)?;
+        }
+        let key = unique_key_from_full_row(
+            metadata,
+            primary_key_index_no,
+            &cols,
+            "upsert primary key no-trx",
+        )?;
+        let current = self
+            .index_lookup_unique_uncommitted(guards, key.index_no, &key.vals, |layout, row| {
+                row.clone_vals(layout)
+            })
+            .await?;
+        let Some(current) = current else {
+            let (page_id, row_id) = self
+                .insert_no_trx_location(guards, &cols, disable_dml_validation)
+                .await?;
+            on_change(NoTrxUpsertChange::Inserted {
+                page_id,
+                row_id,
+                vals: cols,
+            });
+            return Ok(());
+        };
+        let update: Vec<UpdateCol> = current
+            .iter()
+            .zip(&cols)
+            .enumerate()
+            .filter(|(_, (old, new))| old != new)
+            .map(|(idx, (_, val))| UpdateCol {
+                idx,
+                val: val.clone(),
+            })
+            .collect();
+        if update.is_empty() {
             return Ok(());
         }
+        let (page_id, row_id) = self
+            .update_primary_key_no_trx_location(
+                guards,
+                key.index_no,
+                &key.vals,
+                &update,
+                disable_dml_validation,
+            )
+            .await?;
+        on_change(NoTrxUpsertChange::Updated {
+            page_id,
+            row_id,
+            key,
+            cols: update,
+        });
+        Ok(())
     }
 
     /// Delete one catalog row through its primary key without transaction state.
@@ -1306,6 +1423,26 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         update: &[UpdateCol],
         disable_dml_validation: bool,
     ) -> Result<()> {
+        self.update_primary_key_no_trx_location(
+            guards,
+            index_no,
+            key_vals,
+            update,
+            disable_dml_validation,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn update_primary_key_no_trx_location(
+        &self,
+        guards: &PoolGuards,
+        index_no: usize,
+        key_vals: &[Val],
+        update: &[UpdateCol],
+        disable_dml_validation: bool,
+    ) -> Result<(PageID, RowID)> {
         let metadata = self.metadata();
         let index_spec = if disable_dml_validation {
             metadata.idx.require_index_spec(index_no)?
@@ -1348,6 +1485,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 }
             },
         };
+        let page_id = page_guard.page_id();
         let page = page_guard.page_mut();
         if !page.row_id_in_valid_range(row_id) {
             return Err(catalog_primary_key_payload_error(format!(
@@ -1393,7 +1531,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     )
                     .await?;
                 }
-                Ok(())
+                Ok((page_id, row_id))
             }
             None => {
                 // Catalog redo is logical by primary key. When variable-length
@@ -1409,7 +1547,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 drop(page_guard);
                 self.delete_primary_key_no_trx(guards, index_no, key_vals, disable_dml_validation)
                     .await?;
-                self.insert_no_trx(guards, &row_vals, disable_dml_validation)
+                self.insert_no_trx_location(guards, &row_vals, disable_dml_validation)
                     .await
             }
         }
@@ -1547,6 +1685,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     /// Insert or replace one MVCC row selected by a unique key derived from the row.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved for future memory-only user tables")
+    )]
     #[inline]
     pub(crate) async fn upsert_unique_mvcc(
         &self,
@@ -1580,7 +1722,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     }
 
     #[inline]
-    #[cfg(test)]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved for future memory-only user tables")
+    )]
     async fn update_unique_mvcc(
         &self,
         rt: TrxRuntime<'_>,
@@ -2514,7 +2659,7 @@ fn invalid_scan_start(table_id: TableID, operation: &'static str, start_row_id: 
 
 #[cfg(test)]
 mod tests {
-    use super::MemTable;
+    use super::{MemTable, NoTrxUpsertChange};
     use crate::buffer::guard::PageGuard;
     use crate::buffer::{BufferPool, EvictableBufferPool};
     use crate::buffer::{PoolGuards, PoolRole};
@@ -2936,6 +3081,80 @@ mod tests {
             assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row1, None).await;
             assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row2, Some(true))
                 .await;
+        });
+    }
+
+    #[test]
+    fn test_mem_table_primary_key_no_trx_upsert_reports_logical_change() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_no_trx_upsert").await;
+            let mem_table_id = test_user_table_id(10_011);
+            let mem_table =
+                test_mem_table_with_metadata(&engine, mem_table_id, primary_key_payload_metadata())
+                    .await;
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+            let initial = indexed_payload_row(1, "name", b"old");
+
+            let mut inserted = None;
+            mem_table
+                .upsert_primary_key_no_trx(&guards, initial.clone(), false, |change| {
+                    inserted = Some(change);
+                })
+                .await
+                .unwrap();
+            let (insert_page_id, insert_row_id) = match inserted.unwrap() {
+                NoTrxUpsertChange::Inserted {
+                    page_id,
+                    row_id,
+                    vals,
+                } => {
+                    assert_eq!(vals, initial);
+                    (page_id, row_id)
+                }
+                NoTrxUpsertChange::Updated { .. } => panic!("first upsert must insert"),
+            };
+            let mut no_op_called = false;
+            mem_table
+                .upsert_primary_key_no_trx(&guards, initial, false, |_| {
+                    no_op_called = true;
+                })
+                .await
+                .unwrap();
+            assert!(!no_op_called);
+
+            let mut updated = None;
+            mem_table
+                .upsert_primary_key_no_trx(
+                    &guards,
+                    indexed_payload_row(1, "name", b"new"),
+                    false,
+                    |change| updated = Some(change),
+                )
+                .await
+                .unwrap();
+            match updated.unwrap() {
+                NoTrxUpsertChange::Updated {
+                    page_id,
+                    row_id,
+                    key,
+                    cols,
+                } => {
+                    assert_eq!(page_id, insert_page_id);
+                    assert_eq!(row_id, insert_row_id);
+                    assert_eq!(key, single_key(1i32));
+                    assert_eq!(
+                        cols,
+                        vec![UpdateCol {
+                            idx: 2,
+                            val: Val::from(&b"new"[..]),
+                        }]
+                    );
+                }
+                NoTrxUpsertChange::Inserted { .. } => panic!("second changed upsert must update"),
+            }
         });
     }
 

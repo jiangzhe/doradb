@@ -197,6 +197,8 @@ pub(crate) enum FatalError {
     StorageIo,
     #[error("checkpoint write failed")]
     CheckpointWrite,
+    #[error("catalog write failed")]
+    CatalogWrite,
     #[error("purge deallocate failed")]
     PurgeDeallocate,
     #[error("purge access failed")]

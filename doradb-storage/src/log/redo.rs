@@ -234,7 +234,7 @@ pub(crate) enum DDLRedo {
     DataCheckpoint {
         table_id: TableID,
         pivor_row_id: RowID,
-        sts: TrxID,
+        checkpoint_ts: TrxID,
     },
     TableReplaySilentWatermark {
         table_id: TableID,
@@ -312,11 +312,11 @@ impl Ser<'_> for DDLRedo {
             DDLRedo::DataCheckpoint {
                 table_id,
                 pivor_row_id,
-                sts,
+                checkpoint_ts,
             } => {
                 idx = out.ser_u64(idx, table_id.as_u64());
                 idx = out.ser_u64(idx, pivor_row_id.as_u64());
-                idx = out.ser_u64(idx, sts.as_u64());
+                idx = out.ser_u64(idx, checkpoint_ts.as_u64());
             }
             DDLRedo::TableReplaySilentWatermark { table_id } => {
                 idx = out.ser_u64(idx, table_id.as_u64());
@@ -376,13 +376,13 @@ impl Deser for DDLRedo {
             DDLRedoCode::DataCheckpoint => {
                 let (idx, table_id) = TableID::deser(input, idx)?;
                 let (idx, pivor_row_id) = RowID::deser(input, idx)?;
-                let (idx, sts) = TrxID::deser(input, idx)?;
+                let (idx, checkpoint_ts) = TrxID::deser(input, idx)?;
                 Ok((
                     idx,
                     DDLRedo::DataCheckpoint {
                         table_id,
                         pivor_row_id,
-                        sts,
+                        checkpoint_ts,
                     },
                 ))
             }
@@ -1200,7 +1200,7 @@ mod tests {
         let data_checkpoint = DDLRedo::DataCheckpoint {
             table_id: TableID::new(9),
             pivor_row_id: RowID::new(128),
-            sts: TrxID::new(42),
+            checkpoint_ts: TrxID::new(42),
         };
         let mut buf = vec![0; data_checkpoint.ser_len()];
         data_checkpoint.ser(&mut buf[..], 0);
@@ -1211,11 +1211,11 @@ mod tests {
             DDLRedo::DataCheckpoint {
                 table_id,
                 pivor_row_id,
-                sts,
+                checkpoint_ts,
             } => {
                 assert_eq!(table_id, TableID::new(9));
                 assert_eq!(pivor_row_id, RowID::new(128));
-                assert_eq!(sts, TrxID::new(42));
+                assert_eq!(checkpoint_ts, TrxID::new(42));
             }
             _ => panic!("Expected DataCheckpoint"),
         }

@@ -25,8 +25,8 @@ use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
     FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
     MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PrecommitTrx, PreparedTrx,
-    StartedTransaction, Transaction, TrxCleanupJob, TrxCleanupReason, TrxCompletionClaim, TrxEntry,
-    TrxEntryState, TrxInner,
+    PreparedTrxPayload, StartedTransaction, Transaction, TrxCleanupJob, TrxCleanupReason,
+    TrxCompletionClaim, TrxEntry, TrxEntryState, TrxInner,
 };
 use crossbeam_utils::CachePadded;
 use either::Either::{Left, Right};
@@ -451,8 +451,10 @@ pub(crate) struct TransactionSystem {
     /// This advances as soon as purge observes active-bucket progress. Unlike
     /// `global_visible_sts`, it does not imply physical purge work has finished.
     published_gc_horizon: CachePadded<AtomicU64>,
-    /// Round-robin GC number generator.
+    /// Round-robin user-transaction GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
+    /// Round-robin system-transaction GC number generator.
+    rr_sys_gc_no: CachePadded<AtomicUsize>,
     /// Active and completed transaction buckets used by purge.
     ///
     /// Split into multiple buckets to avoid a single global synchronization
@@ -520,6 +522,7 @@ impl TransactionSystem {
             global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             published_gc_horizon: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
+            rr_sys_gc_no: CachePadded::new(AtomicUsize::new(0)),
             gc_buckets: gc_buckets.into_boxed_slice(),
             redo_log,
             config: CachePadded::new(config),
@@ -645,6 +648,15 @@ impl TransactionSystem {
     #[inline]
     fn next_gc_no(&self) -> usize {
         self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
+    }
+
+    /// Returns the next system-transaction GC number.
+    ///
+    /// System transactions use an independent sequence because transactions
+    /// without purge payloads still reserve a bucket when they begin.
+    #[inline]
+    fn next_sys_gc_no(&self) -> usize {
+        self.rr_sys_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
     }
 
     /// Returns the minimum active snapshot timestamp across all GC buckets.
@@ -933,11 +945,24 @@ impl TransactionSystem {
         fence
     }
 
+    /// Allocate a non-active timestamp for table checkpoint construction/publication.
+    ///
+    /// Unlike a transaction STS, this timestamp is not registered in an active
+    /// GC bucket and therefore has no rollback or active-snapshot ownership.
+    #[inline]
+    pub(crate) fn allocate_checkpoint_ts(&self) -> TrxID {
+        let checkpoint_ts = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
+        debug_assert!(checkpoint_ts < MAX_SNAPSHOT_TS);
+        checkpoint_ts
+    }
+
     /// Begin a sessionless system transaction.
     #[inline]
     pub(crate) fn begin_sys_trx(&self) -> SysTrx {
         SysTrx {
+            gc_no: self.next_sys_gc_no(),
             redo: RedoLogs::default(),
+            gc_row_pages: Vec::new(),
         }
     }
 
@@ -976,6 +1001,12 @@ impl TransactionSystem {
     pub(crate) fn commit_sys(&self, trx: SysTrx) -> Result<TrxID> {
         self.ensure_runtime_healthy()?;
         if trx.redo.is_empty() {
+            if !trx.gc_row_pages.is_empty() {
+                return Err(Error::from(
+                    Report::new(InternalError::Generic)
+                        .attach("system GC pages require recovery-visible redo"),
+                ));
+            }
             // System transaction does not hold any active start timestamp
             // so we can just drop it if there is no change to replay.
             return Ok(TrxID::new(0));
@@ -1116,7 +1147,10 @@ impl TransactionSystem {
             .payload
             .take()
             .expect("prepared no-op cleanup requires user transaction payload");
-        self.record_rollback_for_purge(payload.gc_no, payload.sts);
+        let PreparedTrxPayload::User { gc_no, sts, .. } = payload else {
+            panic!("prepared no-op cleanup requires user transaction state")
+        };
+        self.record_rollback_for_purge(gc_no, sts);
         if let Some(s) = trx.attachment.take() {
             s.rollback();
         }
@@ -1296,12 +1330,13 @@ impl TransactionSystem {
         }
     }
 
-    /// Returns the ordered-completion watermark `W` from the redo log.
+    /// Returns the current ordered durable-prefix watermark `W` from the redo log.
     ///
-    /// This is used as the upper bound for scanning durable redo. No-log
-    /// commit barriers can advance this runtime watermark, but recovery still
-    /// seeds future timestamps only from checkpoint metadata, table roots, and
-    /// real redo headers.
+    /// Catalog maintenance uses this conservative snapshot as its redo scan
+    /// upper bound. Accepted work that has not reached the durable prefix is
+    /// left for a later checkpoint. Ordered no-log transactions can advance
+    /// this runtime watermark, but recovery still seeds future timestamps only
+    /// from checkpoint metadata, table roots, and real redo headers.
     #[inline]
     pub(crate) fn persisted_watermark_cts(&self) -> TrxID {
         TrxID::new(self.redo_log.persisted_cts.load(Ordering::Acquire))
@@ -1928,6 +1963,69 @@ pub(crate) mod tests {
             assert_eq!(
                 err.resource_error(),
                 Some(ResourceError::StorageFileCapacityExceeded)
+            );
+            engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_timestamp_is_not_registered_as_active() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "checkpoint_non_active_ts",
+                64usize * 1024,
+            )
+            .await;
+            let trx_sys = &engine.inner().trx_sys;
+            let checkpoint_ts = trx_sys.allocate_checkpoint_ts();
+            assert!(checkpoint_ts >= MIN_SNAPSHOT_TS);
+            assert_eq!(trx_sys.min_active_sts(), MAX_SNAPSHOT_TS);
+            assert!(
+                trx_sys.gc_buckets.iter().all(|bucket| bucket
+                    .active_sts_list
+                    .lock()
+                    .active
+                    .is_empty())
+            );
+        });
+    }
+
+    #[test]
+    fn test_sys_trx_uses_independent_gc_sequence() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "sys_trx_gc_sequence",
+                64usize * 1024,
+            )
+            .await;
+            let trx_sys = &engine.inner().trx_sys;
+            let user_gc_no = trx_sys.rr_gc_no.load(Ordering::Relaxed);
+            let sys_gc_no = trx_sys.rr_sys_gc_no.load(Ordering::Relaxed);
+
+            let first = trx_sys.begin_sys_trx();
+            let second = trx_sys.begin_sys_trx();
+
+            assert_eq!(first.gc_no, sys_gc_no % GC_BUCKETS);
+            assert_eq!(second.gc_no, (sys_gc_no + 1) % GC_BUCKETS);
+            assert_eq!(trx_sys.rr_gc_no.load(Ordering::Relaxed), user_gc_no);
+            assert_eq!(trx_sys.rr_sys_gc_no.load(Ordering::Relaxed), sys_gc_no + 2);
+        });
+    }
+
+    #[test]
+    fn test_commit_sys_rejects_gc_pages_without_redo() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "sys_gc_requires_redo",
+                64usize * 1024,
+            )
+            .await;
+            let mut sys_trx = engine.inner().trx_sys.begin_sys_trx();
+            sys_trx.extend_gc_row_pages(vec![PageID::new(46)]);
+            let err = engine.inner().trx_sys.commit_sys(sys_trx).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic)
             );
             engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
         });

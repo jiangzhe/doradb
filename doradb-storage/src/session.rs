@@ -1415,6 +1415,22 @@ pub(crate) mod tests {
         )
     }
 
+    async fn commit_redo_durability_anchor(session: &mut Session, table_id: TableID) {
+        let payload = [9u8; 196];
+        let mut trx = session.begin_trx().unwrap();
+        trx.exec(async |stmt| {
+            stmt.table_insert_mvcc(
+                table_id,
+                vec![Val::from(10_000i32), Val::from(&payload[..])],
+            )
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        trx.commit().await.unwrap();
+    }
+
     /// Returns the number of registry-owned sessions for tests.
     #[inline]
     pub(crate) fn session_registry_len(registry: &SessionRegistry) -> usize {
@@ -1825,6 +1841,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
+            commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
             let checkpointed = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1910,6 +1927,7 @@ pub(crate) mod tests {
                 "{durable_plan:?}"
             );
 
+            commit_redo_durability_anchor(&mut session, table_id).await;
             let outcome = session
                 .checkpoint_catalog_and_truncate_redo_log()
                 .await
@@ -2039,6 +2057,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
+            commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
             let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -2325,6 +2344,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
+            commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
             let outcome = session.truncate_redo_log().await.unwrap();
@@ -2395,6 +2415,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             checkpoint_table_published(&mut session, table_id).await;
+            commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
             let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();

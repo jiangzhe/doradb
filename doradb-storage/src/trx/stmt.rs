@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
-use crate::error::{Error, FatalError, InternalError, OperationError, Result};
+use crate::error::{Error, FatalError, OperationError, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::row::ops::{
@@ -611,44 +611,6 @@ impl<'stmt> Statement<'stmt> {
         table.insert_mvcc(rt, effects, cols).await
     }
 
-    /// Inserts or updates one catalog-table row by its primary key.
-    #[inline]
-    pub(crate) async fn catalog_upsert_primary_key_mvcc(
-        &mut self,
-        table: &CatalogTable,
-        cols: Vec<Val>,
-    ) -> Result<UpsertMvcc> {
-        self.acquire_table_write_metadata_lock(table.table_id())
-            .await?;
-        let primary_key_index_no = table
-            .metadata()
-            .primary_key()
-            .ok_or_else(|| {
-                Error::from(
-                    Report::new(InternalError::CatalogPrimaryKeyMissing).attach(format!(
-                        "catalog primary-key upsert requires primary key: table_id={}",
-                        table.table_id()
-                    )),
-                )
-            })?
-            .index_no();
-        if !self.disable_dml_validation {
-            let validator = DmlValidator::new(
-                table.metadata(),
-                table.table_id(),
-                "catalog_upsert_primary_key_mvcc",
-                DmlValidationDomain::Foreground,
-            );
-            validator.validate_full_row(&cols)?;
-            validator.validate_unique_index(primary_key_index_no)?;
-        }
-        self.acquire_table_write_data_lock(table.table_id()).await?;
-        let (rt, effects) = self.runtime_and_effects_mut();
-        table
-            .upsert_unique_mvcc(rt, effects, primary_key_index_no, cols, true)
-            .await
-    }
-
     /// Deletes one catalog-table row through the foreground lock-aware path.
     #[inline]
     pub(crate) async fn catalog_delete_primary_key_mvcc(
@@ -801,11 +763,6 @@ pub(crate) mod tests {
         stmt: &'borrow mut Statement<'_>,
     ) -> (TrxRuntime<'borrow>, &'borrow mut StmtEffects) {
         stmt.runtime_and_effects_mut()
-    }
-
-    #[inline]
-    pub(crate) fn redo_logs(effects: &StmtEffects) -> &RedoLogs {
-        &effects.redo
     }
 
     #[inline]

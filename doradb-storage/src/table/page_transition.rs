@@ -1,11 +1,7 @@
 use super::checkpoint_workflow::{
     FreezeAttempt, FrozenPage, FrozenPageBatch, FrozenPageValidationState, PreparedTransitionPage,
-    TableCheckpointWorkflow,
 };
-use super::{
-    CheckpointCancelReason, CheckpointPublishLease, DeleteMarker, IrreversibleCheckpointGuard,
-    Table, TableLifecycle,
-};
+use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
 use crate::buffer::frame::FrameContext;
@@ -13,12 +9,10 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::error::{InternalError, Result};
 use crate::id::{PageID, TableID, TrxID};
 use crate::row::RowPage;
-use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MAX_SNAPSHOT_TS, trx_is_committed};
 use error_stack::Report;
-use std::result::Result as StdResult;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,34 +21,6 @@ pub(super) struct FrozenPageValidationDelay {
     pub(super) stable_page_count: usize,
     pub(super) required_cutoff_ts: Option<TrxID>,
     pub(super) unresolved_status: bool,
-}
-
-pub(super) struct FrozenPageTransitionGuard<'table, 'trx> {
-    workflow: &'table TableCheckpointWorkflow,
-    irreversible_guard: IrreversibleCheckpointGuard<'trx>,
-    _publish_lease: CheckpointPublishLease<'table>,
-}
-
-impl<'table, 'trx> FrozenPageTransitionGuard<'table, 'trx> {
-    #[inline]
-    fn try_begin(
-        workflow: &'table TableCheckpointWorkflow,
-        lifecycle: &'table TableLifecycle,
-        trx_sys: &'trx TransactionSystem,
-    ) -> StdResult<Self, CheckpointCancelReason> {
-        let publish_lease = workflow.try_begin_transition(lifecycle)?;
-        Ok(Self {
-            workflow,
-            irreversible_guard: IrreversibleCheckpointGuard::arm(trx_sys),
-            _publish_lease: publish_lease,
-        })
-    }
-
-    #[inline]
-    pub(super) fn finish(mut self) {
-        self.workflow.finish_publication();
-        self.irreversible_guard.disarm();
-    }
 }
 
 struct FrozenPageAnalysis {
@@ -194,13 +160,6 @@ impl Table {
         #[cfg(test)]
         test_hooks::run_test_frozen_page_plans_refreshed_hook();
         None
-    }
-
-    pub(super) fn try_begin_page_transition<'table, 'trx>(
-        &'table self,
-        trx_sys: &'trx TransactionSystem,
-    ) -> StdResult<FrozenPageTransitionGuard<'table, 'trx>, CheckpointCancelReason> {
-        FrozenPageTransitionGuard::try_begin(&self.checkpoint_workflow, &self.lifecycle, trx_sys)
     }
 
     pub(super) fn apply_page_transition(

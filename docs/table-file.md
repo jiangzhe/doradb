@@ -77,7 +77,8 @@ The active `MetaBlock` stores:
 `root_ts` is a publication timestamp, not always a transaction commit
 timestamp. Initial `CREATE TABLE` roots use the create transaction STS because
 the table file is staged before catalog commit. Table checkpoint roots use the
-checkpoint transaction STS. Index-DDL roots use the index DDL commit CTS because
+separately allocated non-active checkpoint publication timestamp. Index-DDL
+roots use the index DDL commit CTS because
 recovery uses the root as proof that the DDL metadata change reached durable
 table state. Catalog multi-table roots use the catalog checkpoint replay
 boundary/safe timestamp.
@@ -195,9 +196,9 @@ refresh, lifecycle publish admission starts the irreversible workflow before
 the page-local transition loop. The batch can then contain a growing
 `TRANSITION` prefix and a still-`FROZEN` suffix, while the publisher retains
 admission through root publication, runtime route installation, old-root
-retention, and checkpoint transaction commit. Deletion-only/root-only and
+retention, and no-wait system-transaction enqueue. Deletion-only/root-only and
 silent-watermark attempts use the same gate through their irreversible
-publication or commit handoff. Consequently `DROP TABLE` either closes a
+publication or enqueue handoff. Consequently `DROP TABLE` either closes a
 reversible workflow immediately or asynchronously drains the publisher that
 already won admission.
 
