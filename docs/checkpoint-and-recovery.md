@@ -201,6 +201,30 @@ status commits after preparation. After workflow transition admission, any
 unexpected locked analysis, marker, build, publication, or commit failure is
 fatal and wakes transition-route waiters through storage poison.
 
+Checkpoint delays are self-identifying: both `ActiveRoot` and
+`FrozenPageCutoff` carry the user-table id. An idle session can pass either
+delay to `wait_for_checkpoint_retry`. Active-root waiting observes the same
+root effective timestamp and the purge-published active horizon; it completes
+when the horizon is strictly newer or the root/lifecycle has changed.
+Frozen-page waiting reversibly owns the canonical batch and the named page. It
+retains one complete blocker generation for the current canonical delayed page,
+waits for every exact unresolved image-producing transaction status in that
+generation, and then reanalyses the page once. A replacement blocker generation
+is handled the same way. The page must also have a purge-published cutoff that
+covers its maximum committed image requirement. Resolving only one blocker or
+committing a blocker with a newer cutoff does not make an unready page ready. A
+successful wait preserves the page's stable proof for the following checkpoint
+attempt.
+
+Wait completion means retry may be useful, not that the next attempt is
+guaranteed to publish: another page or a newly published root can become the
+next canonical delay. `checkpoint_table_with_wait` applies this rule only to
+`Delayed`; it returns `Published`, `Cancelled`, and errors unchanged. Table
+drop makes the delay obsolete, while storage poison and engine shutdown are
+terminal errors. Listener registration always rechecks the underlying
+predicate, so progress racing registration cannot be lost. These waits do not
+change checkpoint publication, persistence, redo, or recovery rules.
+
 ### 4.2 Deletion Checkpoint
 
 Deletion checkpoint persists committed cold-row deletes.
@@ -461,6 +485,19 @@ the normal GC buckets. The payload has no STS to unregister; its ordered system
 CTS is the reclamation fence. A purge round completes eligible row-undo and
 index cleanup in every bucket before the dispatcher deallocates any collected
 page, preserving cross-bucket undo references.
+
+Maintenance exposes two deliberately different progress boundaries. The
+purge-published GC horizon advances immediately after purge observes the oldest
+active snapshot and is the boundary used for checkpoint cutoff/readiness.
+Completed-purge progress advances only after eligible undo/index cleanup,
+retired-page deallocation, retained-root processing, and coalesced cleanup work
+finish. `wait_for_gc_horizon_after` and
+`wait_for_purge_completion_after` both use strict `> ts` semantics and request
+one coalescible purge observation before sleeping. Tests of accepted no-wait
+checkpoint system work first observe its ordered purge handoff, then use
+completed-purge progress for physical reclamation. Other tests and callers that
+need physical reclamation likewise use completed-purge progress rather than the
+earlier horizon publication.
 
 ### 6.3 DiskTree Page GC
 

@@ -48,7 +48,7 @@ impl<'a> RowReadAccess<'a> {
 
     /// Returns the timestamp associated with this row read state, if present.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved ts"))]
+    #[expect(dead_code, reason = "reserved row-state timestamp diagnostic")]
     pub(crate) fn ts(&self) -> Option<TrxID> {
         match &self.state {
             RowReadState::RowVer(head) => head.as_ref().map(|h| h.ts()),

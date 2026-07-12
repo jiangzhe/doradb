@@ -455,7 +455,7 @@ mod tests {
     use crate::id::RowID;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-    use crate::session::tests::SessionTestExt;
+    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::CheckpointOutcome;
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
@@ -473,7 +473,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 10, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
 
             let key = single_key(2i32);
             let mut reader_session = engine.new_session().unwrap();
@@ -536,7 +536,10 @@ mod tests {
 
             let key = single_key(3i32);
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            wait_gc_cutoff_after(&session, session.last_cts()).await;
+            session
+                .wait_for_gc_horizon_after(session.last_cts())
+                .await
+                .unwrap();
             let mut trx_delete = session.begin_trx().unwrap();
             let res = trx_delete_row_by_id(&mut trx_delete, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));

@@ -32,6 +32,27 @@ Doctests are not part of routine validation.
 See [Coding Guidance](coding-guidance.md) for test structure and test-only code
 conventions.
 
+## Flaky Tests
+
+A pass on rerun does not resolve a flaky test. Flakes usually mean the test
+depends on scheduler timing, omits a prerequisite predicate, or accepts several
+valid intermediate states while asserting only one of them.
+
+-   Reproduce without retries, using focused stress runs such as
+    `cargo nextest run -p doradb-storage --stress-count 100 <test-filter>`.
+-   Include the actual outcome and relevant boundary values in assertion
+    failures so the competing predicate is visible.
+-   List readiness gates in production order and explicitly satisfy earlier
+    gates before arranging the race under test.
+-   Use production wait/retry APIs for successful setup. Use a single-attempt
+    API only when the intermediate delayed or cancelled outcome is itself under
+    test.
+-   Do not replace missing synchronization with sleeps or retries. A timeout
+    may detect a hang, but elapsed time must not make the predicate true.
+
+A passing stress run increases confidence but does not replace reasoning about
+the predicates and lost-wakeup behavior.
+
 ## Local Coverage Focus
 
 Use the local coverage focus script when you need fast coverage feedback for

@@ -949,6 +949,7 @@ mod tests {
                 let metadata_lease = second_waiter.await;
                 drop(metadata_lease);
             };
+            // Timer audit: hang watchdog for explicit metadata-latch coordination.
             or(waiter, async {
                 Timer::after(Duration::from_secs(1)).await;
                 panic!(

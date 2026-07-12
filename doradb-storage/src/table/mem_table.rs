@@ -2675,7 +2675,10 @@ mod tests {
     use crate::index::{BlockIndex, NonUniqueIndex, RowLocation, UniqueIndex};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc};
-    use crate::session::{Session, tests::SessionTestExt};
+    use crate::session::{
+        Session,
+        tests::{SessionTestExt, assert_checkpoint_published},
+    };
     use crate::table::tests::*;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::stmt::tests as stmt_tests;
@@ -4165,7 +4168,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 4, "first").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            checkpoint_published(table_id, &mut session).await;
+            assert_checkpoint_published(&mut session, table_id).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let captured_pivot = table.file().active_root_unchecked().pivot_row_id;
 

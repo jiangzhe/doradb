@@ -7,12 +7,13 @@ use crate::buffer::PoolGuards;
 use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::error::{InternalError, Result};
-use crate::id::{PageID, TableID, TrxID};
+use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::RowPage;
 use crate::trx::undo::{RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MAX_SNAPSHOT_TS, trx_is_committed};
+use crate::trx::{MAX_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
 use error_stack::Report;
+use std::mem::take;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,25 +24,85 @@ pub(super) struct FrozenPageValidationDelay {
     pub(super) unresolved_status: bool,
 }
 
-struct FrozenPageAnalysis {
+struct FrozenPageReadinessAnalysis {
     validation: FrozenPageValidationState,
+    blockers: Vec<Arc<SharedTrxStatus>>,
     plan: Option<PreparedTransitionPage>,
 }
 
+struct FrozenPageScan {
+    page_info: FrozenPage,
+    required_cutoff_ts: Option<TrxID>,
+    blocked: bool,
+    blockers: Vec<Arc<SharedTrxStatus>>,
+    del_bitmap: Vec<u64>,
+    overlay_markers: Vec<(RowID, DeleteMarker)>,
+}
+
+impl FrozenPageScan {
+    #[inline]
+    fn validation(&self) -> FrozenPageValidationState {
+        if self.blocked {
+            FrozenPageValidationState::Blocked {
+                required_cutoff_ts: self.required_cutoff_ts,
+            }
+        } else {
+            FrozenPageValidationState::Stable {
+                required_cutoff_ts: self.required_cutoff_ts,
+            }
+        }
+    }
+
+    fn into_readiness_analysis(
+        mut self,
+        cutoff_ts: TrxID,
+        observed_version: u64,
+    ) -> FrozenPageReadinessAnalysis {
+        let validation = self.validation();
+        let blockers = take(&mut self.blockers);
+        let plan = self.into_plan(cutoff_ts, observed_version);
+        FrozenPageReadinessAnalysis {
+            validation,
+            blockers,
+            plan,
+        }
+    }
+
+    fn into_plan(self, cutoff_ts: TrxID, observed_version: u64) -> Option<PreparedTransitionPage> {
+        if self.blocked
+            || self
+                .required_cutoff_ts
+                .is_some_and(|required| required > cutoff_ts)
+        {
+            return None;
+        }
+        Some(PreparedTransitionPage {
+            page_id: self.page_info.page_id,
+            start_row_id: self.page_info.start_row_id,
+            end_row_id: self.page_info.end_row_id,
+            cutoff_ts,
+            observed_version,
+            required_cutoff_ts: self.required_cutoff_ts,
+            del_bitmap: self.del_bitmap,
+            overlay_markers: self.overlay_markers,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
-enum FrozenPageAnalysisMode {
+enum FrozenPageScanMode {
     EstablishReadiness { frozen_ts: TrxID },
     RefreshStablePlan,
 }
 
-impl FrozenPageAnalysisMode {
+impl FrozenPageScanMode {
     #[inline]
     fn unresolved_ownership_blocks(self, ts: TrxID) -> bool {
         match self {
-            FrozenPageAnalysisMode::EstablishReadiness { frozen_ts } => {
+            FrozenPageScanMode::EstablishReadiness { frozen_ts } => {
                 active_writer_sts(ts) < frozen_ts
             }
-            FrozenPageAnalysisMode::RefreshStablePlan => false,
+            FrozenPageScanMode::RefreshStablePlan => false,
         }
     }
 }
@@ -158,8 +219,30 @@ impl Table {
         // changes may invalidate plans but cannot reintroduce a cutoff delay.
         refresh_frozen_page_plans_optimistically(page_guards, batch, cutoff_ts);
         #[cfg(test)]
-        test_hooks::run_test_frozen_page_plans_refreshed_hook();
+        test_hooks::run_test_stable_page_plans_refreshed_hook();
         None
+    }
+
+    /// Refresh one canonical frozen page's complete readiness description.
+    pub(super) fn refresh_frozen_page_readiness(
+        &self,
+        page_guard: &PageSharedGuard<RowPage>,
+        batch: &mut FrozenPageBatch,
+        page_idx: usize,
+        cutoff_ts: TrxID,
+    ) -> FrozenPageValidationState {
+        let page_info = batch.pages[page_idx];
+        match batch.validation[page_idx] {
+            state @ FrozenPageValidationState::Stable { .. } => {
+                let (ctx, _) = page_guard.ctx_and_page();
+                assert_frozen_page_state(ctx, batch.table_id, page_info.page_id);
+                debug_assert!(batch.blockers_for(page_info.page_id).is_none());
+                state
+            }
+            FrozenPageValidationState::Unchecked | FrozenPageValidationState::Blocked { .. } => {
+                analyze_frozen_page_readiness(page_guard, batch, page_idx, cutoff_ts)
+            }
+        }
     }
 
     pub(super) fn apply_page_transition(
@@ -214,15 +297,14 @@ impl Table {
                 .take()
                 .filter(|plan| plan.matches(page_info, cutoff_ts, version))
                 .or_else(|| {
-                    analyze_frozen_page(
+                    scan_frozen_page(
                         page,
                         ctx,
                         page_info,
-                        FrozenPageAnalysisMode::RefreshStablePlan,
+                        FrozenPageScanMode::RefreshStablePlan,
                         cutoff_ts,
-                        version,
                     )
-                    .plan
+                    .into_plan(cutoff_ts, version)
                 })
                 .expect("stable frozen page must yield a transition plan under its state lock");
             *state = RowPageState::Transition;
@@ -301,12 +383,7 @@ fn validate_frozen_pages_incrementally(
                 // Unchecked pages need their first proof; blocked pages must be
                 // revisited because transaction resolution may have made the
                 // image checkpointable since the previous attempt.
-                let mode = FrozenPageAnalysisMode::EstablishReadiness {
-                    frozen_ts: batch.frozen_ts,
-                };
-                refresh_frozen_page_plan_optimistically(
-                    page_guard, batch, page_idx, cutoff_ts, mode,
-                )
+                analyze_frozen_page_readiness(page_guard, batch, page_idx, cutoff_ts)
             }
         };
         record_frozen_page_readiness(
@@ -335,87 +412,124 @@ fn refresh_frozen_page_plans_optimistically(
     // Later mutations observed the Frozen state, so they can change bitmap or
     // overlay output but cannot invalidate the established image proof.
     for (page_idx, page_guard) in page_guards.iter().enumerate() {
-        refresh_frozen_page_plan_optimistically(
-            page_guard,
-            batch,
-            page_idx,
-            cutoff_ts,
-            FrozenPageAnalysisMode::RefreshStablePlan,
-        );
+        refresh_stable_page_plan(page_guard, batch, page_idx, cutoff_ts);
     }
 }
 
-fn refresh_frozen_page_plan_optimistically(
+fn analyze_frozen_page_readiness(
     page_guard: &PageSharedGuard<RowPage>,
     batch: &mut FrozenPageBatch,
     page_idx: usize,
     cutoff_ts: TrxID,
-    mode: FrozenPageAnalysisMode,
 ) -> FrozenPageValidationState {
-    #[cfg(test)]
-    use super::test_hooks;
-
     let page_info = batch.pages[page_idx];
     let (ctx, page) = page_guard.ctx_and_page();
     let map = ctx.expect_vmap();
     assert_frozen_page_state(ctx, batch.table_id, page_info.page_id);
-    let previous_validation = batch.validation[page_idx];
-    if matches!(mode, FrozenPageAnalysisMode::RefreshStablePlan) {
-        assert!(
-            matches!(
-                previous_validation,
-                FrozenPageValidationState::Stable { required_cutoff_ts }
-                    if required_cutoff_ts.is_none_or(|required| required <= cutoff_ts)
-            ),
-            "stable-plan refresh requires ready page: table_id={}, page_id={}, cutoff_ts={cutoff_ts}",
-            batch.table_id,
-            page_info.page_id
-        );
-    }
     // This version is an equality token, not a seqlock parity value. Any
     // mutation between the samples invalidates the optimistic plan.
     let version_before = map.frozen_mutation_version();
-    // Exact matches avoid another undo walk. A cutoff or version change makes
-    // the representation stale even when the cached readiness proof survives.
-    let (validation, plan) = match batch.prepared[page_idx]
-        .take()
-        .filter(|plan| plan.matches(page_info, cutoff_ts, version_before))
-    {
-        Some(plan) => (
-            FrozenPageValidationState::Stable {
-                required_cutoff_ts: plan.required_cutoff_ts,
-            },
-            Some(plan),
-        ),
-        None => {
-            let analysis =
-                analyze_frozen_page(page, ctx, page_info, mode, cutoff_ts, version_before);
-            (analysis.validation, analysis.plan)
-        }
-    };
+    let analysis = scan_frozen_page(
+        page,
+        ctx,
+        page_info,
+        FrozenPageScanMode::EstablishReadiness {
+            frozen_ts: batch.frozen_ts,
+        },
+        cutoff_ts,
+    )
+    .into_readiness_analysis(cutoff_ts, version_before);
     // A mutation that overlaps analysis can start and finish before the final
     // transition lock is taken. Comparing the complete counter values here
     // prevents carrying that already-stale plan into locked revalidation.
     let version_after = map.frozen_mutation_version();
-    // Readiness analysis may advance Unchecked/Blocked to Stable. Stable-plan
-    // refresh never downgrades that monotonic proof; it only replaces the
-    // cutoff-specific representation when the version window is valid.
-    let validation = match mode {
-        FrozenPageAnalysisMode::EstablishReadiness { .. } => validation,
-        FrozenPageAnalysisMode::RefreshStablePlan => previous_validation,
-    };
-    batch.validation[page_idx] = validation;
+    batch.validation[page_idx] = analysis.validation;
+    match analysis.validation {
+        FrozenPageValidationState::Blocked { .. } => {
+            batch.set_blocked_page(page_info.page_id, analysis.blockers);
+        }
+        FrozenPageValidationState::Stable { .. } => {
+            assert!(
+                analysis.blockers.is_empty(),
+                "stable frozen page cannot retain transaction blockers"
+            );
+            batch.clear_blocked_page(page_info.page_id);
+        }
+        FrozenPageValidationState::Unchecked => {
+            unreachable!("readiness analysis cannot publish unchecked blockers")
+        }
+    }
     // The readiness proof remains monotonic, but a plan from a changing page
     // must be rebuilt under its final state write lock.
-    batch.prepared[page_idx] = (version_before == version_after).then_some(plan).flatten();
-    #[cfg(test)]
-    test_hooks::run_test_frozen_page_immediate_comparison_hook(
-        page_info.page_id,
+    retain_optimistic_page_plan(
+        batch,
+        page_idx,
         version_before,
         version_after,
-        batch.prepared[page_idx].is_some(),
+        analysis.plan,
     );
-    validation
+    analysis.validation
+}
+
+fn refresh_stable_page_plan(
+    page_guard: &PageSharedGuard<RowPage>,
+    batch: &mut FrozenPageBatch,
+    page_idx: usize,
+    cutoff_ts: TrxID,
+) {
+    let page_info = batch.pages[page_idx];
+    let (ctx, page) = page_guard.ctx_and_page();
+    let map = ctx.expect_vmap();
+    assert_frozen_page_state(ctx, batch.table_id, page_info.page_id);
+    assert!(
+        matches!(
+            batch.validation[page_idx],
+            FrozenPageValidationState::Stable { required_cutoff_ts }
+                if required_cutoff_ts.is_none_or(|required| required <= cutoff_ts)
+        ),
+        "stable-plan refresh requires ready page: table_id={}, page_id={}, cutoff_ts={cutoff_ts}",
+        batch.table_id,
+        page_info.page_id
+    );
+    let version_before = map.frozen_mutation_version();
+    // Exact matches avoid another undo walk. A cutoff or version change makes
+    // the representation stale even though the cached readiness proof survives.
+    let plan = batch.prepared[page_idx]
+        .take()
+        .filter(|plan| plan.matches(page_info, cutoff_ts, version_before))
+        .or_else(|| {
+            scan_frozen_page(
+                page,
+                ctx,
+                page_info,
+                FrozenPageScanMode::RefreshStablePlan,
+                cutoff_ts,
+            )
+            .into_plan(cutoff_ts, version_before)
+        });
+    let version_after = map.frozen_mutation_version();
+    retain_optimistic_page_plan(batch, page_idx, version_before, version_after, plan);
+}
+
+fn retain_optimistic_page_plan(
+    batch: &mut FrozenPageBatch,
+    page_idx: usize,
+    version_before: u64,
+    version_after: u64,
+    plan: Option<PreparedTransitionPage>,
+) {
+    batch.prepared[page_idx] = (version_before == version_after).then_some(plan).flatten();
+    #[cfg(test)]
+    {
+        use super::test_hooks::run_test_optimistic_page_plan_comparison_hook;
+
+        run_test_optimistic_page_plan_comparison_hook(
+            batch.pages[page_idx].page_id,
+            version_before,
+            version_after,
+            batch.prepared[page_idx].is_some(),
+        );
+    }
 }
 
 #[inline]
@@ -455,19 +569,18 @@ fn record_frozen_page_readiness(
     }
 }
 
-fn analyze_frozen_page(
+fn scan_frozen_page(
     page: &RowPage,
     ctx: &FrameContext,
     page_info: FrozenPage,
-    mode: FrozenPageAnalysisMode,
+    mode: FrozenPageScanMode,
     cutoff_ts: TrxID,
-    observed_version: u64,
-) -> FrozenPageAnalysis {
+) -> FrozenPageScan {
     #[cfg(test)]
     use super::test_hooks;
 
     #[cfg(test)]
-    test_hooks::run_test_frozen_page_analysis_hook(page_info.page_id);
+    test_hooks::run_test_frozen_page_scan_hook(page_info.page_id);
     let row_count = page.header.row_count();
     // Start from the current physical image. Undo inspection below only
     // adjusts rows whose cutoff visibility differs from that latest image.
@@ -475,13 +588,14 @@ fn analyze_frozen_page(
     let map = ctx.expect_vmap();
     let mut required_cutoff_ts = None;
     let mut blocked = false;
+    let mut blockers = Vec::new();
     let mut overlay_markers = Vec::new();
     for row_idx in 0..row_count {
         let undo_guard = map.read_latch(row_idx);
         let Some(head) = undo_guard.as_ref() else {
             drop(undo_guard);
             #[cfg(test)]
-            test_hooks::run_test_frozen_page_row_analyzed_hook(page_info.page_id, row_idx);
+            test_hooks::run_test_frozen_page_row_scan_hook(page_info.page_id, row_idx);
             continue;
         };
         // Walk the main branch from newest to oldest. Leading locks and deletes
@@ -502,6 +616,7 @@ fn analyze_frozen_page(
                     // as the first cold ownership marker candidate.
                     if !committed && mode.unresolved_ownership_blocks(ts) {
                         blocked = true;
+                        push_blocker(&mut blockers, status);
                     }
                     if marker.is_none()
                         && !committed
@@ -518,6 +633,7 @@ fn analyze_frozen_page(
                     // unresolved delete revives the row in the prepared view.
                     if !committed && mode.unresolved_ownership_blocks(ts) {
                         blocked = true;
+                        push_blocker(&mut blockers, status);
                     }
                     if !delete_seen {
                         if committed && ts < cutoff_ts {
@@ -557,6 +673,7 @@ fn analyze_frozen_page(
                         );
                     } else {
                         blocked = true;
+                        push_blocker(&mut blockers, status);
                     }
                     if !delete_seen && committed && ts < cutoff_ts {
                         del_bitmap.bitmap_unset(row_idx);
@@ -577,30 +694,27 @@ fn analyze_frozen_page(
         }
         drop(undo_guard);
         #[cfg(test)]
-        test_hooks::run_test_frozen_page_row_analyzed_hook(page_info.page_id, row_idx);
+        test_hooks::run_test_frozen_page_row_scan_hook(page_info.page_id, row_idx);
     }
-    let validation = if blocked {
-        FrozenPageValidationState::Blocked { required_cutoff_ts }
-    } else {
-        FrozenPageValidationState::Stable { required_cutoff_ts }
+    FrozenPageScan {
+        page_info,
+        required_cutoff_ts,
+        blocked,
+        blockers,
+        del_bitmap,
+        overlay_markers,
+    }
+}
+
+#[inline]
+fn push_blocker(blockers: &mut Vec<Arc<SharedTrxStatus>>, status: &UndoStatus) {
+    let UndoStatus::Ref(shared) = status else {
+        return;
     };
-    // Bitmap and markers are usable only when the same analysis also proves
-    // that every image is ready at this exact cutoff.
-    let plan = if !blocked && required_cutoff_ts.is_none_or(|required| required <= cutoff_ts) {
-        Some(PreparedTransitionPage {
-            page_id: page_info.page_id,
-            start_row_id: page_info.start_row_id,
-            end_row_id: page_info.end_row_id,
-            cutoff_ts,
-            observed_version,
-            required_cutoff_ts,
-            del_bitmap,
-            overlay_markers,
-        })
-    } else {
-        None
-    };
-    FrozenPageAnalysis { validation, plan }
+    if blockers.iter().any(|blocker| Arc::ptr_eq(blocker, shared)) {
+        return;
+    }
+    blockers.push(Arc::clone(shared));
 }
 
 #[inline]
@@ -725,29 +839,31 @@ mod tests {
         fixture: &FrozenAnalyzerFixture,
         frozen_ts: TrxID,
         cutoff_ts: TrxID,
-    ) -> FrozenPageAnalysis {
-        analyze_frozen_page(
+    ) -> FrozenPageReadinessAnalysis {
+        let observed_version = fixture.ctx.expect_vmap().frozen_mutation_version();
+        scan_frozen_page(
             &fixture.page,
             &fixture.ctx,
             fixture.page_info,
-            FrozenPageAnalysisMode::EstablishReadiness { frozen_ts },
+            FrozenPageScanMode::EstablishReadiness { frozen_ts },
             cutoff_ts,
-            fixture.ctx.expect_vmap().frozen_mutation_version(),
         )
+        .into_readiness_analysis(cutoff_ts, observed_version)
     }
 
     fn run_stable_frozen_analyzer(
         fixture: &FrozenAnalyzerFixture,
         cutoff_ts: TrxID,
-    ) -> FrozenPageAnalysis {
-        analyze_frozen_page(
+    ) -> Option<PreparedTransitionPage> {
+        let observed_version = fixture.ctx.expect_vmap().frozen_mutation_version();
+        scan_frozen_page(
             &fixture.page,
             &fixture.ctx,
             fixture.page_info,
-            FrozenPageAnalysisMode::RefreshStablePlan,
+            FrozenPageScanMode::RefreshStablePlan,
             cutoff_ts,
-            fixture.ctx.expect_vmap().frozen_mutation_version(),
         )
+        .into_plan(cutoff_ts, observed_version)
     }
 
     #[test]
@@ -792,19 +908,19 @@ mod tests {
             entered_rx.recv().unwrap();
             let version_before = ctx.expect_vmap().frozen_mutation_version();
             assert_eq!(version_before, 1);
-            test_hooks::set_test_frozen_page_analysis_hook(move |_| {
+            test_hooks::set_test_frozen_page_scan_hook(move |_| {
                 release_tx.send(()).unwrap();
             });
-            let analysis = analyze_frozen_page(
+            let analysis = scan_frozen_page(
                 &page,
                 &ctx,
                 page_info,
-                FrozenPageAnalysisMode::EstablishReadiness {
+                FrozenPageScanMode::EstablishReadiness {
                     frozen_ts: TrxID::new(20),
                 },
                 TrxID::new(20),
-                version_before,
-            );
+            )
+            .into_readiness_analysis(TrxID::new(20), version_before);
             writer.join().unwrap();
             let version_after = ctx.expect_vmap().frozen_mutation_version();
             assert_eq!(version_after, 2);
@@ -854,12 +970,7 @@ mod tests {
                 ],
                 latest_deleted,
             );
-            let analysis = run_stable_frozen_analyzer(&fixture, cutoff_ts);
-            assert!(matches!(
-                analysis.validation,
-                FrozenPageValidationState::Stable { .. }
-            ));
-            let plan = analysis.plan.unwrap();
+            let plan = run_stable_frozen_analyzer(&fixture, cutoff_ts).unwrap();
             assert!(!plan.del_bitmap.bitmap_get(0));
             let [(_, DeleteMarker::Ref(marker_status))] = plan.overlay_markers.as_slice() else {
                 panic!("stable ownership must produce one shared-status marker");
@@ -878,12 +989,7 @@ mod tests {
                 )],
                 false,
             );
-            let analysis = run_stable_frozen_analyzer(&fixture, TrxID::new(50));
-            assert!(matches!(
-                analysis.validation,
-                FrozenPageValidationState::Blocked { .. }
-            ));
-            assert!(analysis.plan.is_none());
+            assert!(run_stable_frozen_analyzer(&fixture, TrxID::new(50)).is_none());
         }
     }
 

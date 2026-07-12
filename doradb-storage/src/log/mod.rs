@@ -1554,6 +1554,10 @@ where
             }
             sync_group.completion.complete(Ok(()));
         }
+        // Publish only after every committed payload through this ordered
+        // prefix has been enqueued to purge coordination.
+        #[cfg(test)]
+        self.trx_sys.publish_purge_handoff(max_cts);
 
         self.trx_sys.redo_log.update_stats(
             ready.trx_count,

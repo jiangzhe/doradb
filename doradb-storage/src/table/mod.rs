@@ -1203,10 +1203,10 @@ pub(crate) mod tests {
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::quiescent::QuiescentGuard;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-    use crate::session::{Session, tests::SessionTestExt};
+    use crate::session::Session;
     use crate::table::{
-        CheckpointOutcome, CheckpointPublishLease, DeleteMarker, FreezeOutcome,
-        FrozenPageBatchInfo, Table, TableCheckpointRootMutationLease, TableRuntimeLayout,
+        CheckpointPublishLease, DeleteMarker, FreezeOutcome, FrozenPageBatchInfo, Table,
+        TableCheckpointRootMutationLease, TableRuntimeLayout,
     };
     use crate::trx::Transaction;
     use crate::trx::stmt::Statement;
@@ -1225,9 +1225,9 @@ pub(crate) mod tests {
         use std::cell::{Cell, RefCell};
 
         type FreezePageHook = Box<dyn FnOnce(PageID) + 'static>;
-        type FrozenPageAnalysisHook = Box<dyn FnMut(PageID) + 'static>;
-        type FrozenPageRowAnalyzedHook = Box<dyn FnMut(PageID, usize) + 'static>;
-        type FrozenPageImmediateComparisonHook = Box<dyn FnMut(PageID, u64, u64, bool) + 'static>;
+        type FrozenPageScanHook = Box<dyn FnMut(PageID) + 'static>;
+        type FrozenPageRowScanHook = Box<dyn FnMut(PageID, usize) + 'static>;
+        type OptimisticPagePlanComparisonHook = Box<dyn FnMut(PageID, u64, u64, bool) + 'static>;
         type FrozenPagePhaseHook = Box<dyn FnOnce() + 'static>;
         type TransitionPageHook = Box<dyn FnOnce(PageID) + 'static>;
         type HotRowWriteHook = Box<dyn FnOnce() + 'static>;
@@ -1236,15 +1236,15 @@ pub(crate) mod tests {
             static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
             static TEST_FREEZE_PAGE_STATE_LOCKED_HOOK: RefCell<Option<FreezePageHook>> =
                 const { RefCell::new(None) };
-            static TEST_FROZEN_PAGE_ANALYSIS_HOOK: RefCell<Option<FrozenPageAnalysisHook>> =
+            static TEST_FROZEN_PAGE_SCAN_HOOK: RefCell<Option<FrozenPageScanHook>> =
                 const { RefCell::new(None) };
-            static TEST_FROZEN_PAGE_ROW_ANALYZED_HOOK: RefCell<Option<FrozenPageRowAnalyzedHook>> =
+            static TEST_FROZEN_PAGE_ROW_SCAN_HOOK: RefCell<Option<FrozenPageRowScanHook>> =
                 const { RefCell::new(None) };
-            static TEST_FROZEN_PAGE_IMMEDIATE_COMPARISON_HOOK:
-                RefCell<Option<FrozenPageImmediateComparisonHook>> = const { RefCell::new(None) };
+            static TEST_OPTIMISTIC_PAGE_PLAN_COMPARISON_HOOK:
+                RefCell<Option<OptimisticPagePlanComparisonHook>> = const { RefCell::new(None) };
             static TEST_FROZEN_PAGES_READY_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
                 const { RefCell::new(None) };
-            static TEST_FROZEN_PAGE_PLANS_REFRESHED_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
+            static TEST_STABLE_PAGE_PLANS_REFRESHED_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
                 const { RefCell::new(None) };
             static TEST_TRANSITION_PAGE_PUBLISHED_HOOK: RefCell<Option<TransitionPageHook>> =
                 const { RefCell::new(None) };
@@ -1302,65 +1302,62 @@ pub(crate) mod tests {
             });
         }
 
-        pub(crate) fn set_test_frozen_page_analysis_hook<F>(hook: F)
+        pub(crate) fn set_test_frozen_page_scan_hook<F>(hook: F)
         where
             F: FnMut(PageID) + 'static,
         {
-            TEST_FROZEN_PAGE_ANALYSIS_HOOK.with(|slot| {
+            TEST_FROZEN_PAGE_SCAN_HOOK.with(|slot| {
                 let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "frozen-page analysis hook already installed");
+                assert!(old.is_none(), "frozen-page scan hook already installed");
             });
         }
 
-        pub(crate) fn run_test_frozen_page_analysis_hook(page_id: PageID) {
-            TEST_FROZEN_PAGE_ANALYSIS_HOOK.with(|slot| {
+        pub(crate) fn run_test_frozen_page_scan_hook(page_id: PageID) {
+            TEST_FROZEN_PAGE_SCAN_HOOK.with(|slot| {
                 if let Some(hook) = slot.borrow_mut().as_mut() {
                     hook(page_id);
                 }
             });
         }
 
-        pub(crate) fn set_test_frozen_page_row_analyzed_hook<F>(hook: F)
+        pub(crate) fn set_test_frozen_page_row_scan_hook<F>(hook: F)
         where
             F: FnMut(PageID, usize) + 'static,
         {
-            TEST_FROZEN_PAGE_ROW_ANALYZED_HOOK.with(|slot| {
+            TEST_FROZEN_PAGE_ROW_SCAN_HOOK.with(|slot| {
                 let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(
-                    old.is_none(),
-                    "frozen-page row-analysis hook already installed"
-                );
+                assert!(old.is_none(), "frozen-page row-scan hook already installed");
             });
         }
 
-        pub(crate) fn run_test_frozen_page_row_analyzed_hook(page_id: PageID, row_idx: usize) {
-            TEST_FROZEN_PAGE_ROW_ANALYZED_HOOK.with(|slot| {
+        pub(crate) fn run_test_frozen_page_row_scan_hook(page_id: PageID, row_idx: usize) {
+            TEST_FROZEN_PAGE_ROW_SCAN_HOOK.with(|slot| {
                 if let Some(hook) = slot.borrow_mut().as_mut() {
                     hook(page_id, row_idx);
                 }
             });
         }
 
-        pub(crate) fn set_test_frozen_page_immediate_comparison_hook<F>(hook: F)
+        pub(crate) fn set_test_optimistic_page_plan_comparison_hook<F>(hook: F)
         where
             F: FnMut(PageID, u64, u64, bool) + 'static,
         {
-            TEST_FROZEN_PAGE_IMMEDIATE_COMPARISON_HOOK.with(|slot| {
+            TEST_OPTIMISTIC_PAGE_PLAN_COMPARISON_HOOK.with(|slot| {
                 let old = slot.borrow_mut().replace(Box::new(hook));
                 assert!(
                     old.is_none(),
-                    "frozen-page immediate-comparison hook already installed"
+                    "optimistic page-plan comparison hook already installed"
                 );
             });
         }
 
-        pub(crate) fn run_test_frozen_page_immediate_comparison_hook(
+        pub(crate) fn run_test_optimistic_page_plan_comparison_hook(
             page_id: PageID,
             version_before: u64,
             version_after: u64,
             retained: bool,
         ) {
-            TEST_FROZEN_PAGE_IMMEDIATE_COMPARISON_HOOK.with(|slot| {
+            TEST_OPTIMISTIC_PAGE_PLAN_COMPARISON_HOOK.with(|slot| {
                 if let Some(hook) = slot.borrow_mut().as_mut() {
                     hook(page_id, version_before, version_after, retained);
                 }
@@ -1384,18 +1381,18 @@ pub(crate) mod tests {
             }
         }
 
-        pub(crate) fn set_test_frozen_page_plans_refreshed_hook<F>(hook: F)
+        pub(crate) fn set_test_stable_page_plans_refreshed_hook<F>(hook: F)
         where
             F: FnOnce() + 'static,
         {
-            TEST_FROZEN_PAGE_PLANS_REFRESHED_HOOK.with(|slot| {
+            TEST_STABLE_PAGE_PLANS_REFRESHED_HOOK.with(|slot| {
                 let old = slot.borrow_mut().replace(Box::new(hook));
-                assert!(old.is_none(), "frozen-page plans hook already installed");
+                assert!(old.is_none(), "stable page-plans hook already installed");
             });
         }
 
-        pub(crate) fn run_test_frozen_page_plans_refreshed_hook() {
-            let hook = TEST_FROZEN_PAGE_PLANS_REFRESHED_HOOK.with(|slot| slot.borrow_mut().take());
+        pub(crate) fn run_test_stable_page_plans_refreshed_hook() {
+            let hook = TEST_STABLE_PAGE_PLANS_REFRESHED_HOOK.with(|slot| slot.borrow_mut().take());
             if let Some(hook) = hook {
                 hook();
             }
@@ -2207,6 +2204,7 @@ pub(crate) mod tests {
         owner: LockOwner,
         resource: LockResource,
     ) {
+        // Timer audit: lock-manager diagnostic state inspection.
         for _ in 0..100 {
             if !has_lock_resource(engine, owner, resource) {
                 return;
@@ -2223,6 +2221,7 @@ pub(crate) mod tests {
         mode: LockMode,
         state: LockDebugEntryState,
     ) {
+        // Timer audit: lock-manager diagnostic state inspection.
         for _ in 0..100 {
             if has_lock_entry(engine, owner, resource, mode, state) {
                 return;
@@ -2643,40 +2642,8 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
-        let trx_sys = session.engine().trx_sys.clone();
-        for _ in 0..50 {
-            if trx_sys.published_gc_horizon() > ts {
-                return;
-            }
-            Timer::after(Duration::from_millis(20)).await;
-        }
-        panic!("published GC cutoff did not advance past {ts}");
-    }
-
-    pub(crate) async fn wait_checkpoint_ready(table_id: TableID, session: &Session) {
-        let mut last_delay = None;
-        for _ in 0..50 {
-            let table = session
-                .engine()
-                .catalog()
-                .get_table_now(table_id)
-                .expect("test table should exist");
-            let effective_ts = table.file().active_root_unchecked().effective_ts();
-            let min_active_sts = session.engine().trx_sys.calc_min_active_sts_for_gc();
-            if effective_ts < min_active_sts {
-                return;
-            }
-            last_delay = Some((effective_ts, min_active_sts));
-            Timer::after(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "checkpoint readiness stayed delayed after retries: {:?}",
-            last_delay.unwrap()
-        );
-    }
-
     pub(crate) async fn wait_path_exists(path: &str, expected: bool) {
+        // Timer audit: filesystem unlink/create side-effect observation.
         for _ in 0..250 {
             if Path::new(path).exists() == expected {
                 return;
@@ -2684,28 +2651,6 @@ pub(crate) mod tests {
             Timer::after(Duration::from_millis(50)).await;
         }
         panic!("path existence did not become {expected}: {path}");
-    }
-
-    pub(crate) async fn checkpoint_published(table_id: TableID, session: &mut Session) -> TrxID {
-        let mut last_delay = None;
-        for _ in 0..50 {
-            match session.checkpoint_table(table_id).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts, .. } => {
-                    return checkpoint_ts;
-                }
-                CheckpointOutcome::Delayed { reason } => {
-                    last_delay = Some(reason);
-                    Timer::after(Duration::from_millis(20)).await;
-                }
-                CheckpointOutcome::Cancelled { reason } => {
-                    panic!("checkpoint should publish, cancelled by {reason:?}")
-                }
-            }
-        }
-        panic!(
-            "checkpoint should publish, delayed after retries by {:?}",
-            last_delay.unwrap()
-        )
     }
 
     pub(crate) fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
@@ -2897,6 +2842,9 @@ pub(crate) mod tests {
             let cts = trx.commit().await.unwrap();
             max_delete_cts = max_delete_cts.max(cts);
         }
-        wait_gc_cutoff_after(session, max_delete_cts).await;
+        session
+            .wait_for_gc_horizon_after(max_delete_cts)
+            .await
+            .unwrap();
     }
 }

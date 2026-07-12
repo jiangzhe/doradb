@@ -2070,7 +2070,7 @@ pub(crate) mod tests {
             );
             let mut checkpoint_session = engine.new_session().unwrap();
             let checkpoint_outcome = checkpoint_session
-                .checkpoint_table(checkpointed_table.table_id())
+                .checkpoint_table_with_wait(checkpointed_table.table_id())
                 .await
                 .unwrap();
             assert!(matches!(
