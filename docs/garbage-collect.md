@@ -44,9 +44,11 @@ retained-dropped catalog state and validates the batch against the current
 Validation failure changes nothing and poisons storage with purge-access
 failure. Successful pruning removes complete left subtrees, compacts the first
 surviving fringe, collapses redundant fixed-root levels, reclaims detached
-metadata, and removes retired ids from the insert free list. Physical row pages
-are deallocated only afterward and only from the ids returned by pruning;
-failure there poisons with the deallocation-specific fatal domain.
+metadata, and returns the exact retired ids. Physical row pages are deallocated
+only afterward and only from the ids returned by pruning; failure there poisons
+with the deallocation-specific fatal domain. The insert free list stores
+versioned page identities and lazily discards entries whose page was removed or
+recycled.
 
 Dropped-runtime destruction validates that no remaining hot-index entry begins
 below the captured pivot before deallocating any still-hot page. This makes a

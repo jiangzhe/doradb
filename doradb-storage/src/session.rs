@@ -6,7 +6,7 @@ use crate::catalog::{
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{Error, LifecycleError, OperationError, Result};
-use crate::id::{RowID, SessionID, TableID, TrxID};
+use crate::id::{SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::ChangeNotifier;
@@ -907,7 +907,7 @@ pub(crate) struct SessionState {
     lifecycle: Mutex<SessionLifecycle>,
     last_cts: AtomicU64,
     table_cache: Mutex<FastHashMap<TableID, Weak<Table>>>,
-    active_insert_pages: Mutex<FastHashMap<TableID, (VersionedPageID, RowID)>>,
+    active_insert_pages: Mutex<FastHashMap<TableID, VersionedPageID>>,
 }
 
 impl SessionState {
@@ -1193,21 +1193,16 @@ impl SessionState {
 
     /// Remove and return the cached insert page for a table, if present.
     #[inline]
-    pub fn load_active_insert_page(&self, table_id: TableID) -> Option<(VersionedPageID, RowID)> {
+    pub fn load_active_insert_page(&self, table_id: TableID) -> Option<VersionedPageID> {
         let mut g = self.active_insert_pages.lock();
         g.remove(&table_id)
     }
 
     /// Cache the active insert page for a table.
     #[inline]
-    pub fn save_active_insert_page(
-        &self,
-        table_id: TableID,
-        page_id: VersionedPageID,
-        row_id: RowID,
-    ) {
+    pub fn save_active_insert_page(&self, table_id: TableID, page_id: VersionedPageID) {
         let mut g = self.active_insert_pages.lock();
-        let res = g.insert(table_id, (page_id, row_id));
+        let res = g.insert(table_id, page_id);
         debug_assert!(res.is_none());
     }
 
@@ -1220,6 +1215,15 @@ impl SessionState {
 impl Drop for SessionState {
     #[inline]
     fn drop(&mut self) {
+        let active_insert_pages = self.active_insert_pages.get_mut();
+        let table_cache = self.table_cache.get_mut();
+        for (table_id, page_id) in active_insert_pages.drain() {
+            // Only user tables populate this weak runtime cache. Catalog page
+            // tokens and entries for destroyed table runtimes are discarded.
+            if let Some(table) = table_cache.get(&table_id).and_then(Weak::upgrade) {
+                table.mem.cache_insert_page_version(page_id);
+            }
+        }
         self.release_session_locks();
     }
 }
@@ -1296,23 +1300,14 @@ impl TrxAttachment {
 
     /// Remove and return the cached insert page for a table, if session state remains.
     #[inline]
-    pub(crate) fn load_active_insert_page(
-        &self,
-        table_id: TableID,
-    ) -> Option<(VersionedPageID, RowID)> {
+    pub(crate) fn load_active_insert_page(&self, table_id: TableID) -> Option<VersionedPageID> {
         self.session.load_active_insert_page(table_id)
     }
 
     /// Cache the active insert page if session state remains.
     #[inline]
-    pub(crate) fn save_active_insert_page(
-        &self,
-        table_id: TableID,
-        page_id: VersionedPageID,
-        row_id: RowID,
-    ) {
-        self.session
-            .save_active_insert_page(table_id, page_id, row_id);
+    pub(crate) fn save_active_insert_page(&self, table_id: TableID, page_id: VersionedPageID) {
+        self.session.save_active_insert_page(table_id, page_id);
     }
 
     /// Mark the owning session committed.
@@ -1677,16 +1672,8 @@ pub(crate) mod tests {
         fn pool_guards(&self) -> PoolGuards;
         fn engine(&self) -> EngineRef;
         fn last_cts(&self) -> TrxID;
-        fn load_active_insert_page(
-            &mut self,
-            table_id: TableID,
-        ) -> Option<(VersionedPageID, RowID)>;
-        fn save_active_insert_page(
-            &mut self,
-            table_id: TableID,
-            page_id: VersionedPageID,
-            row_id: RowID,
-        );
+        fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
+        fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
     }
 
     impl SessionTestExt for Session {
@@ -1722,10 +1709,7 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        fn load_active_insert_page(
-            &mut self,
-            table_id: TableID,
-        ) -> Option<(VersionedPageID, RowID)> {
+        fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID> {
             self.pin("load active insert page")
                 .expect("test session must be running")
                 .state
@@ -1733,16 +1717,11 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        fn save_active_insert_page(
-            &mut self,
-            table_id: TableID,
-            page_id: VersionedPageID,
-            row_id: RowID,
-        ) {
+        fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID) {
             self.pin("save active insert page")
                 .expect("test session must be running")
                 .state
-                .save_active_insert_page(table_id, page_id, row_id);
+                .save_active_insert_page(table_id, page_id);
         }
     }
 

@@ -36,7 +36,7 @@ use crate::error::{
     CompletionErrorKind, Error, FatalError, InternalError, LifecycleError, OperationError,
     ResourceError, Result,
 };
-use crate::id::{RowID, SessionID, TableID, TrxID};
+use crate::id::{SessionID, TableID, TrxID};
 use crate::io::Completion;
 use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
@@ -574,23 +574,14 @@ impl<'r> TrxRuntime<'r> {
 
     /// Loads the cached active insert page through the current attachment.
     #[inline]
-    pub(crate) fn load_active_insert_page(
-        &self,
-        table_id: TableID,
-    ) -> Option<(VersionedPageID, RowID)> {
+    pub(crate) fn load_active_insert_page(&self, table_id: TableID) -> Option<VersionedPageID> {
         self.attachment.load_active_insert_page(table_id)
     }
 
     /// Saves the cached active insert page through the current attachment.
     #[inline]
-    pub(crate) fn save_active_insert_page(
-        &self,
-        table_id: TableID,
-        page_id: VersionedPageID,
-        row_id: RowID,
-    ) {
-        self.attachment
-            .save_active_insert_page(table_id, page_id, row_id);
+    pub(crate) fn save_active_insert_page(&self, table_id: TableID, page_id: VersionedPageID) {
+        self.attachment.save_active_insert_page(table_id, page_id);
     }
 }
 
@@ -2240,7 +2231,7 @@ pub(crate) mod tests {
     use crate::error::OperationError;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::id::{PageID, SessionID};
+    use crate::id::{PageID, RowID, SessionID};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
@@ -3798,7 +3789,7 @@ pub(crate) mod tests {
                 precommit_with_cold_row_undo(&mut session2, table_id, TrxID::new(91_262));
 
             let mut trx3 = session3.begin_trx().unwrap();
-            let row_id = trx3
+            let _row_id = trx3
                 .exec(async |stmt| {
                     stmt.table_insert_mvcc(
                         table_id,
@@ -3808,8 +3799,7 @@ pub(crate) mod tests {
                 })
                 .await
                 .unwrap();
-            let (cached_page, cached_row_id) = session3.load_active_insert_page(table_id).unwrap();
-            assert_eq!(cached_row_id, row_id);
+            let cached_page = session3.load_active_insert_page(table_id).unwrap();
             let precommit3 = prepare_transaction(trx3)
                 .unwrap()
                 .fill_cts(TrxID::new(91_263));

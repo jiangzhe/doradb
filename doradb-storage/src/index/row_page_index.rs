@@ -1,8 +1,10 @@
 use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
-use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
-use crate::buffer::{BufferPool, PoolGuard};
+use crate::buffer::page::{
+    BufferPage, BufferPageKind, PAGE_SIZE, VersionedPageID, assert_buffer_page, sealed,
+};
+use crate::buffer::{BufferPool, PoolGuard, get_page_versioned_shared};
 use crate::catalog::TableColumnLayout;
 use crate::error::{
     Error, InternalError, Result, Validation,
@@ -84,16 +86,6 @@ const _: () = assert!(
 );
 
 const _: () = assert_buffer_page::<RowPageIndexNode>();
-
-enum InsertFreeListProbe<T> {
-    Hit(T),
-    Miss(InsertFreeListMiss),
-}
-
-enum InsertFreeListMiss {
-    Empty,
-    BufferPageGenerationMismatch,
-}
 
 enum InsertPageGuardError {
     // The row-page index did not publish the new page id. The caller still
@@ -417,7 +409,7 @@ pub(crate) struct RowPagePrefixPrune {
 pub(crate) struct RowPageIndex<P: 'static> {
     root_page_id: PageID,
     height: AtomicUsize,
-    insert_free_list: Mutex<Vec<PageID>>,
+    insert_free_list: Mutex<Vec<VersionedPageID>>,
     // Buffer pool that owns row-page-index nodes.
     pool: QuiescentGuard<P>,
 }
@@ -675,9 +667,6 @@ impl<P: BufferPool> RowPageIndex<P> {
             reclaimed_nodes += 1;
         }
 
-        self.insert_free_list
-            .lock()
-            .retain(|page_id| !expected_page_ids.contains(page_id));
         Ok(RowPagePrefixPrune {
             page_ids: expected_page_ids.to_vec().into_boxed_slice(),
             reclaimed_nodes,
@@ -902,16 +891,11 @@ impl<P: BufferPool> RowPageIndex<P> {
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageExclusiveGuard<RowPage>> {
-        use self::InsertFreeListMiss::{BufferPageGenerationMismatch, Empty};
-        use self::InsertFreeListProbe::{Hit, Miss};
-
-        match self
+        if let Some(free_page) = self
             .get_insert_page_exclusive_from_free_list(mem_pool, mem_pool_guard)
-            .await
+            .await?
         {
-            Ok(Hit(free_page)) => return Ok(free_page),
-            Ok(Miss(Empty | BufferPageGenerationMismatch)) => (),
-            Err(err) => return Err(err),
+            return Ok(free_page);
         }
         // Empty or stale free-list entries fall back to allocating a fresh row page.
         let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await?;
@@ -1014,12 +998,21 @@ impl<P: BufferPool> RowPageIndex<P> {
         }
     }
 
-    /// Put given page into insert free list.
+    /// Caches the guarded page version for a later no-transaction insert.
     #[inline]
     pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
-        let page_id = guard.page_id();
+        let page_id = guard.versioned_page_id();
         drop(guard);
+        self.cache_insert_page_version(page_id);
+    }
+
+    /// Caches a page version for a later insert.
+    #[inline]
+    pub(crate) fn cache_insert_page_version(&self, page_id: VersionedPageID) {
         let mut free_list = self.insert_free_list.lock();
+        // Exact duplicates violate the cache-token ownership invariant. Older
+        // generations of the same physical page remain valid stale candidates.
+        debug_assert!(!free_list.contains(&page_id));
         free_list.push(page_id);
     }
 
@@ -1043,19 +1036,21 @@ impl<P: BufferPool> RowPageIndex<P> {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        let page_id = {
-            let mut g = self.insert_free_list.lock();
-            if g.is_empty() {
-                return Ok(None);
-            }
-            g.pop().unwrap()
-        };
-        let page_guard = mem_pool
-            .get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Shared)
-            .await?
-            .lock_shared_async()
-            .await;
-        Ok(page_guard)
+        loop {
+            let page_id = {
+                let mut g = self.insert_free_list.lock();
+                let Some(page_id) = g.pop() else {
+                    return Ok(None);
+                };
+                page_id
+            };
+            let Some(page_guard) =
+                get_page_versioned_shared::<RowPage, _>(mem_pool, mem_pool_guard, page_id).await?
+            else {
+                continue;
+            };
+            return Ok(Some(page_guard));
+        }
     }
 
     #[inline]
@@ -1063,24 +1058,29 @@ impl<P: BufferPool> RowPageIndex<P> {
         &self,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-    ) -> Result<InsertFreeListProbe<PageExclusiveGuard<RowPage>>> {
-        use self::InsertFreeListMiss::{BufferPageGenerationMismatch, Empty};
-        use self::InsertFreeListProbe::{Hit, Miss};
-
-        let page_id = {
-            let mut g = self.insert_free_list.lock();
-            if g.is_empty() {
-                return Ok(Miss(Empty));
+    ) -> Result<Option<PageExclusiveGuard<RowPage>>> {
+        loop {
+            let page_id = {
+                let mut g = self.insert_free_list.lock();
+                let Some(page_id) = g.pop() else {
+                    return Ok(None);
+                };
+                page_id
+            };
+            let Some(page_guard) = mem_pool
+                .get_page_versioned::<RowPage>(
+                    mem_pool_guard,
+                    page_id,
+                    LatchFallbackMode::Exclusive,
+                )
+                .await?
+            else {
+                continue;
+            };
+            if let Some(page_guard) = page_guard.lock_exclusive_async().await {
+                return Ok(Some(page_guard));
             }
-            g.pop().unwrap()
-        };
-        let page_guard = mem_pool
-            .get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Exclusive)
-            .await?;
-        let Some(page_guard) = page_guard.lock_exclusive_async().await else {
-            return Ok(Miss(BufferPageGenerationMismatch));
-        };
-        Ok(Hit(page_guard))
+        }
     }
 
     /// Insert row page by splitting root.
@@ -1857,13 +1857,16 @@ mod tests {
         }
 
         #[inline]
-        fn get_page_versioned<T: BufferPage>(
+        async fn get_page_versioned<T: BufferPage>(
             &self,
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send {
-            self.inner.get_page_versioned(guard, id, mode)
+        ) -> Result<Option<FacadePageGuard<T>>> {
+            if id.page_id == self.fail_page_id.load(Ordering::Acquire) {
+                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
+            }
+            self.inner.get_page_versioned(guard, id, mode).await
         }
 
         #[inline]
@@ -2001,6 +2004,78 @@ mod tests {
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
             drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_row_page_index_free_list_skips_recycled_page_versions() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(fixed_pool_bytes(1));
+            let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
+                .await
+                .expect("test row-page-index construction should succeed");
+
+            let old_page = mem_pool
+                .allocate_page::<RowPage>(&mem_guard)
+                .await
+                .expect("old row-page allocation should succeed");
+            let stale_id = old_page.versioned_page_id();
+            mem_pool.deallocate_page(old_page);
+            let replacement = mem_pool
+                .allocate_page::<RowPage>(&mem_guard)
+                .await
+                .expect("replacement row-page allocation should succeed");
+            let replacement_id = replacement.versioned_page_id();
+            assert_eq!(replacement_id.page_id, stale_id.page_id);
+            assert_ne!(replacement_id.generation, stale_id.generation);
+            drop(replacement);
+
+            blk_idx.insert_free_list.lock().push(stale_id);
+            assert!(
+                blk_idx
+                    .get_insert_page_from_free_list(&*mem_pool, &mem_guard)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(blk_idx.insert_free_list.lock().is_empty());
+
+            let replacement = mem_pool
+                .get_page_versioned::<RowPage>(
+                    &mem_guard,
+                    replacement_id,
+                    LatchFallbackMode::Exclusive,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            mem_pool.deallocate_page(replacement);
+            let replacement = mem_pool
+                .allocate_page::<RowPage>(&mem_guard)
+                .await
+                .expect("second replacement row-page allocation should succeed");
+            assert_eq!(replacement.page_id(), replacement_id.page_id);
+            assert_ne!(
+                replacement.versioned_page_id().generation,
+                replacement_id.generation
+            );
+            drop(replacement);
+
+            blk_idx.insert_free_list.lock().push(replacement_id);
+            assert!(
+                blk_idx
+                    .get_insert_page_exclusive_from_free_list(&*mem_pool, &mem_guard)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(blk_idx.insert_free_list.lock().is_empty());
         })
     }
 
@@ -2414,10 +2489,6 @@ mod tests {
                 .await
                 .unwrap();
             let page_ids = append_test_row_pages(&index, &pool_guard, 4, 10).await;
-            index
-                .insert_free_list
-                .lock()
-                .extend(page_ids.iter().copied());
 
             let before_height = index.height();
             let panic = AssertUnwindSafe(index.prune_checkpoint_prefix(
@@ -2430,7 +2501,6 @@ mod tests {
             .await;
             assert!(panic.is_err());
             assert_eq!(index.height(), before_height);
-            assert_eq!(index.insert_free_list.lock().as_slice(), page_ids);
 
             let pruned = index
                 .prune_checkpoint_prefix(&pool_guard, RowID::new(0), RowID::new(20), &page_ids[..2])
@@ -2439,7 +2509,6 @@ mod tests {
             assert_eq!(pruned.page_ids.as_ref(), &page_ids[..2]);
             assert_eq!(pruned.reclaimed_nodes, 0);
             assert_eq!(pruned.collapsed_levels, 0);
-            assert_eq!(index.insert_free_list.lock().as_slice(), &page_ids[2..]);
             assert!(matches!(
                 index.find_row(&pool_guard, RowID::new(19)).await.unwrap(),
                 RowLocation::NotFound
@@ -2460,7 +2529,6 @@ mod tests {
                 .unwrap();
             assert_eq!(pruned.page_ids.as_ref(), &page_ids[2..]);
             assert_eq!(index.height(), 0);
-            assert!(index.insert_free_list.lock().is_empty());
 
             let appended = test_page_id(20_000);
             let inserted = loop {

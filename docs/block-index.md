@@ -194,8 +194,10 @@ the table id, the inclusive/exclusive RowID bounds of the canonical frozen
 prefix, and its row page ids in RowID order. Eligible transaction purge first
 finishes row-undo and secondary-index cleanup in every GC bucket. It then pins
 the live or retained-dropped table runtime, validates that the batch is exactly
-the current index left prefix, unlinks it, scrubs those ids from the insert free
-list, and only then deallocates the returned row pages.
+the current index left prefix, unlinks it, and only then deallocates the returned
+row pages. The insert free list stores `VersionedPageID` values;
+lookups consume entries lazily and reject missing or recycled page generations,
+so prefix pruning does not mutate that cache.
 
 Prefix pruning is specialized for the append-only RowID lifecycle. It compacts
 the first surviving leaf and its left-spine ancestors, detaches fully covered

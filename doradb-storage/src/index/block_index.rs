@@ -1,4 +1,5 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
+use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableColumnLayout;
 use crate::error::{Error, InternalError, Result};
@@ -196,6 +197,12 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
         self.row.cache_exclusive_insert_page(guard)
+    }
+
+    /// Returns an insert-page version to the in-memory free-list cache.
+    #[inline]
+    pub(crate) fn cache_insert_page_version(&self, page_id: VersionedPageID) {
+        self.row.cache_insert_page_version(page_id);
     }
 
     /// Creates a cursor to scan in-memory row-page-index leaves.
@@ -498,13 +505,16 @@ mod tests {
         }
 
         #[inline]
-        fn get_page_versioned<T: BufferPage>(
+        async fn get_page_versioned<T: BufferPage>(
             &self,
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send {
-            self.inner.get_page_versioned(guard, id, mode)
+        ) -> Result<Option<FacadePageGuard<T>>> {
+            if id.page_id == self.fail_page_id.load(Ordering::Acquire) {
+                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
+            }
+            self.inner.get_page_versioned(guard, id, mode).await
         }
 
         #[inline]

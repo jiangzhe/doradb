@@ -173,6 +173,16 @@ operation-local `TrxAttachment` and exposes a copyable `TrxRuntime` value that
 pairs the immutable `TrxContext` with runtime access to the engine, pool
 guards, and session-local insert-page cache. `TrxContext` never stores the
 attachment.
+
+The session cache maps each table directly to one `VersionedPageID`. Insert
+selection removes that token, reopens only the matching page generation, and
+otherwise falls back to the table insert free list before allocating a page.
+The row inserter remains responsible for checking active page state and
+capacity; cached RowID range state is not required. A successful insert returns
+the version token to the session cache. When session state is destroyed, cached
+user-table tokens whose weak table runtime remains reachable are returned to the
+same free list; catalog tokens and unreachable table runtimes are discarded.
+
 `Statement` owns this checkout for statement execution. Explicit commit and
 rollback consume the public handle, suppress drop abandonment, and claim
 terminal ownership through private completion claims. Dropping a public
@@ -482,8 +492,9 @@ from every bucket before the coordinator processes ordered retirement batches,
 because undo in one bucket may still reference a page retired in another. For
 each batch the coordinator pins the table runtime from either live or
 retained-dropped catalog state, validates and unlinks the exact current
-`RowPageIndex` prefix, reclaims detached metadata and scrubs the insert free
-list, then deallocates only the page ids returned by that successful operation.
+`RowPageIndex` prefix, reclaims detached metadata, then deallocates only the page
+ids returned by that successful operation. The insert free list uses versioned
+page identities and lazily rejects removed or recycled entries.
 Same-table batches are processed sequentially in their table-affine bucket FIFO.
 
 Purge publishes two monotonic coordination boundaries in order. First it

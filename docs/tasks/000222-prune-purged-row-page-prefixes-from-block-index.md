@@ -21,9 +21,11 @@ Keep deletion specialized for the append-only RowID lifecycle. Remove complete
 left subtrees, trim the first surviving leaf and its ancestors, reclaim detached
 metadata nodes, and collapse redundant fixed-root levels without implementing
 arbitrary interval deletion or general B+Tree redistribution. Purge must pin
-either a live or retained-dropped table runtime, scrub removed row-page ids from
-the insert free list, and fail closed before any row-page deallocation when the
-runtime, range, mapping, or structural mutation is invalid.
+either a live or retained-dropped table runtime and fail closed before any
+row-page deallocation when the runtime, range, mapping, or structural mutation
+is invalid. Keep insert-page caches independent by storing versioned page
+identities, returning session-owned user-table entries to the shared insert free
+list at session teardown, and lazily rejecting removed or recycled entries.
 
 ## Context
 
@@ -106,7 +108,7 @@ Rejected alternatives:
    its existing FIFO preserves checkpoint order without purge-time grouping,
    sorting, or coalescing.
 3. Validate that a batch is the exact current left prefix before changing any
-   parent link, entry array, insert-free-list state, or row-page allocation.
+   parent link, entry array, or row-page allocation.
 4. Unlink the validated prefix before deallocating any corresponding row page,
    and deallocate only the ordered page ids returned by the successful index
    operation.
@@ -116,8 +118,8 @@ Rejected alternatives:
    at the batch end boundary.
 6. Keep the surviving left fringe structurally bounded without sibling borrow,
    redistribution, or minimum-occupancy enforcement.
-7. Remove every unlinked row page id from the insert free list before returning
-   a successful prefix deletion.
+7. Store versioned page identities in the insert free list and lazily discard
+   stale generations without prune-time cache mutation.
 8. Let purge pin the same table runtime from either live or retained-dropped
    catalog state without acquiring logical table locks or waiting for a
    transaction-lifetime table lock.
@@ -129,6 +131,9 @@ Rejected alternatives:
 11. Replace pivot-filtered dropped-runtime destruction with validation of the new
     invariant that no `RowPageIndex` entry below the pivot remains.
 12. Keep persistent formats and recovery behavior unchanged.
+13. Store only versioned page identity in the session insert cache, and return
+    reachable user-table entries to the insert free list when session state is
+    destroyed.
 
 ## Non-Goals
 
@@ -250,9 +255,7 @@ Rejected alternatives:
    - while the fixed root is a branch with one child, copy the child image into
      the fixed root, deallocate the child node, and update the atomic height;
    - when all entries are removed, initialize the fixed root as an empty
-     height-zero leaf starting at `end_row_id`;
-   - remove the unlinked page ids from `insert_free_list` before reporting
-     success.
+     height-zero leaf starting at `end_row_id`.
 
    Do not rebalance occupancy. Append already permits a sparse right fringe;
    prefix pruning creates at most one sparse left-fringe node per level. Empty
@@ -274,8 +277,8 @@ Rejected alternatives:
    1. publish the observed GC horizon;
    2. complete eligible row-undo and secondary-index cleanup for every bucket;
    3. process ordered retirement batches returned by the workers;
-   4. pin each table runtime, unlink and validate its prefix, scrub the free list,
-      and deallocate only the returned row page ids;
+   4. pin each table runtime, unlink and validate its prefix, and deallocate only
+      the returned row page ids;
    5. release runtime pins;
    6. process retained table roots and purge-ready dropped runtimes;
    7. publish completed-purge progress.
@@ -315,9 +318,8 @@ Rejected alternatives:
 
 - `doradb-storage/src/index/row_page_index.rs`
   - compact batch-range preflight, exclusive-root prefix validation,
-    left-fringe apply,
-    metadata-node reclamation, free-list scrubbing, root collapse, and destroy
-    invariant.
+    left-fringe apply, metadata-node reclamation, versioned insert-cache lookup,
+    root collapse, and destroy invariant.
 - `doradb-storage/src/index/block_index.rs`
   - narrow checkpoint-prefix facade and exact unlink result.
 - `doradb-storage/src/table/persistence.rs`
@@ -339,6 +341,10 @@ Rejected alternatives:
     poisoning, and single-threaded/dispatched integration.
 - `doradb-storage/src/catalog/mod.rs`
   - purge-only live-or-retained-dropped runtime pin.
+- `doradb-storage/src/session.rs`, `doradb-storage/src/table/access.rs`, and
+  `doradb-storage/src/table/mem_table.rs`
+  - version-only session cache lookup and user-table cache handoff at session
+    teardown.
 - `docs/block-index.md`, `docs/transaction-system.md`,
   `docs/checkpoint-and-recovery.md`, and `docs/garbage-collect.md`
   - runtime and GC contract synchronization.
@@ -363,8 +369,9 @@ Rejected alternatives:
 9. Compare metadata-pool allocation before and after pruning to prove every
    detached index node is reclaimed while the fixed root and surviving nodes
    remain allocated.
-10. Seed the insert free list with removed and surviving page ids; verify only
-    removed ids are scrubbed before the operation succeeds.
+10. Cache a versioned insert-page identity, recycle the same physical page id,
+    and verify shared and exclusive lookup both consume and reject the stale
+    generation.
 11. Verify removed RowIDs return `NotFound`, surviving lookup and cursor order
     remain correct, and cursor seek at the new left boundary succeeds.
 12. Append after partial pruning and after an empty-root reset; verify new page
@@ -372,8 +379,8 @@ Rejected alternatives:
     root start and normal root growth still works.
 13. Use table-driven invalid batches for empty ids, invalid collapsed range,
     wrong start, wrong end, missing/extra/reordered/wrong page ids, and an index
-    gap; require an invariant assertion before any entry, free-list item,
-    metadata node, or row page is changed.
+    gap; require an invariant assertion before any entry, metadata node, or row
+    page is changed.
 14. Pause an optimistic point lookup while prune applies; verify validation retry
     returns the surviving mapping or `NotFound` without following a detached
     child.
@@ -396,8 +403,8 @@ Rejected alternatives:
 20. Verify a system batch with `cts == min_active_sts` remains queued and becomes
     eligible only when a later observation makes `cts < min_active_sts`.
 21. In single-threaded purge, verify all bucket undo/index work completes before
-    prefix unlink, metadata reclamation, free-list scrub, and row-page
-    deallocation; completed-purge progress advances last.
+    prefix unlink, metadata reclamation, and row-page deallocation;
+    completed-purge progress advances last.
 22. In dispatched purge, verify every executor completes before the coordinator
     performs the same ordered batch sequence, including multiple same-table
     batches returned by their affine worker.
@@ -411,6 +418,10 @@ Rejected alternatives:
     `PurgeDeallocate`, no later batch processing, and no completed-purge
     publication. Restart from the durable pivot must build a clean empty hot
     index without replaying the volatile retirement payload.
+25. End an idle user session through explicit close and handle drop; verify the
+    next session reuses its cached page through the insert free list. Keep stale
+    generation and reload-error fallback coverage for both session and free-list
+    lookup paths.
 
 Use deterministic hooks, channels, events, or predicate signaling for races;
 do not use sleeps. Run:
