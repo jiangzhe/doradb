@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000222 with checkpoint-prefix pruning and ordered purge integration
+- Closed By: backlog close
+- Reference: docs/tasks/000222-prune-purged-row-page-prefixes-from-block-index.md; issue #843
+- Closed At: 2026-07-13

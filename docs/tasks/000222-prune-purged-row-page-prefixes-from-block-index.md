@@ -1,7 +1,7 @@
 ---
 id: 000222
 title: Prune purged row-page prefixes from BlockIndex
-status: proposal
+status: implemented
 created: 2026-07-12
 github_issue: 843
 ---
@@ -35,7 +35,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000155-add-block-index-range-deletion-for-purged-row-pages.md
+- docs/backlogs/closed/000155-add-block-index-range-deletion-for-purged-row-pages.md
 
 Task 000218 unified table freeze/checkpoint workflow ownership and left a
 temporary dropped-runtime safety bridge: `RowPageIndex::destroy` filters entries
@@ -313,6 +313,50 @@ Rejected alternatives:
 
 ## Implementation Notes
 
+Implemented checkpoint-aligned hot-prefix pruning across the row-page index,
+checkpoint transaction payload, and purge coordinators. `RetiredRowPageBatch`
+now retains the table id, collapsed RowID bounds, and canonical page-id order;
+table-affine system-GC routing preserves same-table checkpoint order. Both
+single-threaded and dispatched purge finish bucket undo/index cleanup before
+pinning a live or retained-dropped table runtime, pruning each eligible prefix,
+and deallocating only the page ids returned by the successful index operation.
+Missing runtime, prefix mismatch, access failure, and deallocation failure keep
+the existing fail-closed purge error domains.
+
+`RowPageIndex::prune_checkpoint_prefix` validates the exact current left prefix
+under the fixed-root exclusive latch, trims the surviving left fringe, reclaims
+detached metadata nodes, collapses redundant root levels, and resets a fully
+emptied index to a height-zero fixed root at the batch end boundary.
+`BlockIndex` and `MemTable` expose only the narrow checkpoint-prefix operation.
+Dropped-runtime destruction now validates that no hot-index entry remains below
+the published pivot instead of filtering stale entries during teardown.
+
+Post-implementation review changed the insert-cache integration from eager
+prune-time free-list scrubbing to generation-aware lazy invalidation. The shared
+free list and session cache now store `VersionedPageID`; insert lookup consumes
+and rejects removed or recycled generations, while explicit session close and
+idle-session drop return reachable user-table cache entries to the table free
+list. This keeps pruning independent from foreground cache mutation and adds
+session teardown reuse coverage. The review findings were incorporated by the
+follow-up branch commit `f6d6c77`.
+
+Living design documentation was synchronized in `docs/block-index.md`,
+`docs/transaction-system.md`, `docs/checkpoint-and-recovery.md`, and
+`docs/garbage-collect.md`. Persistent formats and recovery replay remain
+unchanged. Source backlog
+`docs/backlogs/closed/000155-add-block-index-range-deletion-for-purged-row-pages.md`
+was resolved as implemented. The benchmark-gated adaptive planning question
+remains deferred to
+`docs/backlogs/000158-evaluate-adaptive-row-page-prefix-pruning.md`.
+
+Validation completed on 2026-07-13:
+
+- `tools/style_audit.rs --diff-base origin/main`: passed for 15 branch-diff Rust
+  files.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo nextest run --workspace`: 1,368 tests passed.
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`:
+  1,292 tests passed.
 
 ## Impacts
 
