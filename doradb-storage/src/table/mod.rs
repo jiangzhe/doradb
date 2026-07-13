@@ -490,7 +490,7 @@ impl Table {
 
     #[inline]
     fn missing_pool_guard(&self, operation: &'static str, role: &'static str) -> Error {
-        Report::new(InternalError::Generic)
+        Report::new(InternalError::PoolGuardMissing)
             .attach(format!(
                 "operation={operation}, table_id={}, missing {role} pool guard",
                 self.table_id()
@@ -500,7 +500,7 @@ impl Table {
 
     #[inline]
     fn stale_block_index_leaf(&self, operation: &'static str) -> Error {
-        Report::new(InternalError::Generic)
+        Report::new(InternalError::BlockIndexLeafStale)
             .attach(format!(
                 "operation={operation}, table_id={}, stale block-index leaf lock",
                 self.table_id()

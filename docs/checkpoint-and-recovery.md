@@ -480,11 +480,19 @@ longer needed for live snapshots:
 
 $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
 
-Checkpoint-retired row pages travel in the committed `System` payload through
-the normal GC buckets. The payload has no STS to unregister; its ordered system
-CTS is the reclamation fence. A purge round completes eligible row-undo and
-index cleanup in every bucket before the dispatcher deallocates any collected
-page, preserving cross-bucket undo references.
+Each nonempty data checkpoint collapses its canonical frozen prefix into one
+volatile `RetiredRowPageBatch`: table id, inclusive/exclusive RowID bounds, and
+ordered row page ids. It travels in the committed `System` payload through the
+table-affine normal GC bucket. The payload has no STS to unregister; its ordered
+system CTS is the reclamation fence. A purge round completes eligible row-undo
+and index cleanup in every bucket before the coordinator validates and unlinks
+each exact hot-index prefix and deallocates its returned pages, preserving
+cross-bucket undo references.
+
+The retirement batch is not redo and does not change persistent formats.
+Recovery loads the durable pivot and cold block-index root, then constructs a
+fresh empty hot `RowPageIndex` beginning at that pivot; it never replays runtime
+prefix deletion.
 
 Maintenance exposes two deliberately different progress boundaries. The
 purge-published GC horizon advances immediately after purge observes the oldest

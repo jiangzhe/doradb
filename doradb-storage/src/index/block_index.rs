@@ -6,7 +6,9 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
-use crate::index::row_page_index::{RowLocation, RowPageIndex, RowPageIndexMemCursor};
+use crate::index::row_page_index::{
+    RowLocation, RowPageIndex, RowPageIndexMemCursor, RowPagePrefixPrune,
+};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
@@ -102,6 +104,20 @@ impl<P: BufferPool> BlockIndex<P> {
         let pivot_row_id = self.root.pivot_row_id();
         self.row
             .destroy(meta_pool_guard, mem_pool, mem_pool_guard, pivot_row_id)
+            .await
+    }
+
+    /// Unlinks one exact checkpoint-retired hot row-page prefix.
+    #[inline]
+    pub(crate) async fn prune_checkpoint_prefix(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        start_row_id: RowID,
+        end_row_id: RowID,
+        expected_page_ids: &[PageID],
+    ) -> Result<RowPagePrefixPrune> {
+        self.row
+            .prune_checkpoint_prefix(meta_pool_guard, start_row_id, end_row_id, expected_page_ids)
             .await
     }
 

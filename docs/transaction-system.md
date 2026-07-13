@@ -354,14 +354,17 @@ session attachment, undo, locks, rollback, or durability waiter. Table
 checkpoint allocates a separate non-active `checkpoint_ts` for construction and
 root publication. `commit_sys` later assigns an ordered `redo_cts` and returns
 after enqueue acceptance; that return does not acknowledge redo persistence.
-Each `SysTrx` preallocates a purge shard from a system-only round-robin sequence;
-the shard remains unused when the transaction produces no purge payload, so
-redo-only system work does not perturb user-transaction bucket distribution.
+Redo-only system work has no purge bucket. A nonempty data checkpoint owns one
+compact `RetiredRowPageBatch` and derives its purge bucket deterministically
+from the owning table id. All retirement batches for one table therefore enter
+one bucket's committed FIFO in ordered CTS order, while user transactions keep
+their existing round-robin bucket selection.
 
 Prepared, precommit, and committed payloads distinguish `User` and `System`
 variants. User payloads own status, STS, undo, and session completion. System
-checkpoint payloads own only the purge shard and retired row pages, and are
-valid only when coupled to recovery-visible checkpoint redo. Failed system
+checkpoint payloads own only the table-affine purge shard and one ordered
+retirement batch, and are valid only when coupled to recovery-visible
+checkpoint redo. Failed system
 precommit performs no rollback or active-STS removal.
 
 #### Rollback Phase
@@ -475,8 +478,13 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 Checkpoint-retired row pages use the same committed-payload queues and CTS
 horizon. A system payload has no STS to remove; its ordered CTS is its
 reclamation fence. Each purge round finishes eligible row-undo and index work
-from every bucket before the dispatcher deallocates any collected retired page,
-because undo in one bucket may still reference a page retired in another.
+from every bucket before the coordinator processes ordered retirement batches,
+because undo in one bucket may still reference a page retired in another. For
+each batch the coordinator pins the table runtime from either live or
+retained-dropped catalog state, validates and unlinks the exact current
+`RowPageIndex` prefix, reclaims detached metadata and scrubs the insert free
+list, then deallocates only the page ids returned by that successful operation.
+Same-table batches are processed sequentially in their table-affine bucket FIFO.
 
 Purge publishes two monotonic coordination boundaries in order. First it
 publishes the observed oldest-active-snapshot horizon, which is sufficient for

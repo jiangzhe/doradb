@@ -26,7 +26,7 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
-pub(crate) use sys_trx::SysTrxPayload;
+pub(crate) use sys_trx::{RetiredRowPageBatch, SysTrxPayload};
 
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
@@ -36,7 +36,7 @@ use crate::error::{
     CompletionErrorKind, Error, FatalError, InternalError, LifecycleError, OperationError,
     ResourceError, Result,
 };
-use crate::id::{PageID, RowID, SessionID, TableID, TrxID};
+use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::io::Completion;
 use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
@@ -2136,9 +2136,18 @@ impl CommittedTrx {
     }
 
     #[inline]
-    fn gc_row_pages(&self) -> Option<&[PageID]> {
+    #[cfg(test)]
+    fn retired_row_pages(&self) -> Option<&RetiredRowPageBatch> {
         match self.payload.as_ref() {
-            Some(CommittedTrxPayload::System(payload)) => Some(&payload.gc_row_pages),
+            Some(CommittedTrxPayload::System(payload)) => Some(&payload.retired_row_pages),
+            Some(CommittedTrxPayload::User { .. }) | None => None,
+        }
+    }
+
+    #[inline]
+    fn into_retired_row_pages(mut self) -> Option<RetiredRowPageBatch> {
+        match self.payload.take() {
+            Some(CommittedTrxPayload::System(payload)) => Some(payload.retired_row_pages),
             Some(CommittedTrxPayload::User { .. }) | None => None,
         }
     }
@@ -2231,7 +2240,7 @@ pub(crate) mod tests {
     use crate::error::OperationError;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::id::SessionID;
+    use crate::id::{PageID, SessionID};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,

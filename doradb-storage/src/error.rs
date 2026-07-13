@@ -246,8 +246,12 @@ pub(crate) enum InternalError {
     ReadonlyFrameLockMissing,
     #[error("row page missing")]
     RowPageMissing,
+    #[error("pool guard missing")]
+    PoolGuardMissing,
     #[error("disk pool guard missing")]
     DiskPoolGuardMissing,
+    #[error("block-index leaf stale")]
+    BlockIndexLeafStale,
     #[error("indexed value missing")]
     IndexedValueMissing,
     #[error("index key missing")]
@@ -300,6 +304,8 @@ pub(crate) enum InternalError {
     ColumnDeletionBlobInvariant,
     #[error("active transaction is discarded")]
     ActiveTransactionDiscarded,
+    #[error("system transaction redo missing")]
+    SystemTransactionRedoMissing,
     #[error("statement number overflow")]
     StatementNumberOverflow,
     #[cfg(test)]

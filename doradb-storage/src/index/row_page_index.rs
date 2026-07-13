@@ -252,6 +252,16 @@ impl RowPageIndexNode {
         self.branch_entries_mut()[idx as usize] = entry;
     }
 
+    /// Removes `count` leading branch entries and compacts the suffix.
+    #[inline]
+    fn branch_remove_prefix(&mut self, count: usize) {
+        debug_assert!(self.is_branch());
+        let old_count = self.header.count as usize;
+        debug_assert!(count <= old_count);
+        self.entries_mut(old_count).copy_within(count..old_count, 0);
+        self.header.count = (old_count - count) as u32;
+    }
+
     /* leaf methods */
 
     /// Returns whether the leaf node is full.
@@ -300,6 +310,16 @@ impl RowPageIndexNode {
         entry.row_id = start_row_id;
         entry.page_id = page_id;
         self.header.end_row_id = start_row_id + count;
+    }
+
+    /// Removes `count` leading leaf entries and compacts the suffix.
+    #[inline]
+    fn leaf_remove_prefix(&mut self, count: usize) {
+        debug_assert!(self.is_leaf());
+        let old_count = self.header.count as usize;
+        debug_assert!(count <= old_count);
+        self.entries_mut(old_count).copy_within(count..old_count, 0);
+        self.header.count = (old_count - count) as u32;
     }
 
     #[inline]
@@ -356,6 +376,18 @@ impl PageEntry {
     pub(crate) fn new(row_id: RowID, page_id: PageID) -> Self {
         PageEntry { row_id, page_id }
     }
+}
+
+/// Result of one successful checkpoint-prefix prune.
+pub(crate) struct RowPagePrefixPrune {
+    /// Row pages unlinked in canonical RowID order.
+    pub(crate) page_ids: Box<[PageID]>,
+    /// Detached metadata nodes reclaimed by the operation.
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved prune statistics"))]
+    pub(crate) reclaimed_nodes: usize,
+    /// Redundant fixed-root levels collapsed by the operation.
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved prune statistics"))]
+    pub(crate) collapsed_levels: usize,
 }
 
 /// In-memory index for runtime row pages.
@@ -442,6 +474,8 @@ impl<P: BufferPool> RowPageIndex<P> {
         mem_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
     ) -> Result<()> {
+        self.validate_destroy_pivot(meta_pool_guard, pivot_row_id)
+            .await?;
         let mut stack = vec![(self.root_page_id, false)];
         while let Some((page_id, visited_children)) = stack.pop() {
             let guard = self
@@ -475,11 +509,6 @@ impl<P: BufferPool> RowPageIndex<P> {
                     .page()
                     .leaf_entries()
                     .iter()
-                    // Checkpoint GC may already have reclaimed entries below
-                    // the published pivot. The append-only row-page index keeps
-                    // those historical ids for routing bounds, so dropped-table
-                    // destruction must visit only the still-hot suffix.
-                    .filter(|entry| entry.row_id >= pivot_row_id)
                     .map(|entry| entry.page_id)
                     .collect::<Vec<_>>();
                 for row_page_id in row_page_ids {
@@ -502,6 +531,335 @@ impl<P: BufferPool> RowPageIndex<P> {
             self.pool.deallocate_page(guard);
         }
         Ok(())
+    }
+
+    #[inline]
+    async fn validate_destroy_pivot(
+        &self,
+        pool_guard: &PoolGuard,
+        pivot_row_id: RowID,
+    ) -> Result<()> {
+        let mut stack = vec![self.root_page_id];
+        while let Some(page_id) = stack.pop() {
+            let guard = self
+                .pool
+                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Shared)
+                .await?
+                .lock_shared_async()
+                .await
+                .ok_or_else(|| row_page_index_missing(page_id))?;
+            let page = guard.page();
+            if page.is_branch() {
+                stack.extend(
+                    page.branch_entries()
+                        .iter()
+                        .rev()
+                        .map(|entry| entry.page_id),
+                );
+            } else {
+                for entry in page.leaf_entries() {
+                    assert!(
+                        entry.row_id >= pivot_row_id,
+                        "row-page index retains entry below pivot during destroy: pivot_row_id={pivot_row_id}, entry_row_id={}, page_id={}",
+                        entry.row_id,
+                        entry.page_id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates and removes the exact current left row-page prefix.
+    #[inline]
+    pub(crate) async fn prune_checkpoint_prefix(
+        &self,
+        pool_guard: &PoolGuard,
+        start_row_id: RowID,
+        end_row_id: RowID,
+        expected_page_ids: &[PageID],
+    ) -> Result<RowPagePrefixPrune> {
+        assert!(
+            !expected_page_ids.is_empty(),
+            "checkpoint row-page prefix has no page ids"
+        );
+        assert!(
+            start_row_id < end_row_id,
+            "checkpoint row-page prefix has invalid range: start_row_id={start_row_id}, end_row_id={end_row_id}"
+        );
+
+        let root = self
+            .pool
+            .get_page::<RowPageIndexNode>(
+                pool_guard,
+                self.root_page_id,
+                LatchFallbackMode::Exclusive,
+            )
+            .await?
+            .lock_exclusive_async()
+            .await
+            .ok_or_else(|| row_page_index_missing(self.root_page_id))?;
+        assert_eq!(
+            root.page().header.start_row_id,
+            start_row_id,
+            "checkpoint row-page prefix does not start at index boundary"
+        );
+        self.validate_checkpoint_prefix(
+            pool_guard,
+            root.page(),
+            start_row_id,
+            end_row_id,
+            expected_page_ids,
+        )
+        .await?;
+
+        let (mut root, detached_subtrees, mut detached_nodes) = self
+            .apply_checkpoint_prefix(pool_guard, root, end_row_id)
+            .await?;
+        let mut collapsed_levels = 0usize;
+        loop {
+            if root.page().is_leaf() {
+                if root.page().leaf_is_empty() {
+                    root.page_mut().init_empty(0, end_row_id);
+                    self.height.store(0, Ordering::Relaxed);
+                }
+                break;
+            }
+            match root.page().header.count {
+                0 => {
+                    root.page_mut().init_empty(0, end_row_id);
+                    self.height.store(0, Ordering::Relaxed);
+                    break;
+                }
+                1 => {
+                    let child_page_id = root.page().branch_entry(0).page_id;
+                    let child = self
+                        .pool
+                        .get_page::<RowPageIndexNode>(
+                            pool_guard,
+                            child_page_id,
+                            LatchFallbackMode::Exclusive,
+                        )
+                        .await?
+                        .lock_exclusive_async()
+                        .await
+                        .ok_or_else(|| row_page_index_missing(child_page_id))?;
+                    root.page_mut().clone_from(child.page());
+                    self.height
+                        .store(root.page().header.height as usize, Ordering::Relaxed);
+                    detached_nodes.push(child_page_id);
+                    drop(child);
+                    collapsed_levels += 1;
+                }
+                _ => {
+                    self.height
+                        .store(root.page().header.height as usize, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        drop(root);
+
+        let mut reclaimed_nodes = self
+            .reclaim_detached_subtrees(pool_guard, detached_subtrees)
+            .await?;
+        for page_id in detached_nodes {
+            let guard = self
+                .pool
+                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Exclusive)
+                .await?
+                .lock_exclusive_async()
+                .await
+                .ok_or_else(|| row_page_index_missing(page_id))?;
+            self.pool.deallocate_page(guard);
+            reclaimed_nodes += 1;
+        }
+
+        self.insert_free_list
+            .lock()
+            .retain(|page_id| !expected_page_ids.contains(page_id));
+        Ok(RowPagePrefixPrune {
+            page_ids: expected_page_ids.to_vec().into_boxed_slice(),
+            reclaimed_nodes,
+            collapsed_levels,
+        })
+    }
+
+    async fn validate_checkpoint_prefix(
+        &self,
+        pool_guard: &PoolGuard,
+        root: &RowPageIndexNode,
+        start_row_id: RowID,
+        end_row_id: RowID,
+        expected_page_ids: &[PageID],
+    ) -> Result<()> {
+        let mut next_row_id = start_row_id;
+        let mut expected_idx = 0usize;
+        let mut stack = Vec::new();
+        if root.is_branch() {
+            stack.extend(
+                root.branch_entries()
+                    .iter()
+                    .rev()
+                    .map(|entry| entry.page_id),
+            );
+        } else {
+            validate_leaf_prefix(
+                root,
+                &mut next_row_id,
+                end_row_id,
+                expected_page_ids,
+                &mut expected_idx,
+            );
+        }
+        while expected_idx < expected_page_ids.len() {
+            let page_id = stack
+                .pop()
+                .expect("checkpoint row-page prefix exceeds index");
+            let guard = self
+                .pool
+                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Shared)
+                .await?
+                .lock_shared_async()
+                .await
+                .ok_or_else(|| row_page_index_missing(page_id))?;
+            let page = guard.page();
+            if page.is_branch() {
+                stack.extend(
+                    page.branch_entries()
+                        .iter()
+                        .rev()
+                        .map(|entry| entry.page_id),
+                );
+            } else {
+                validate_leaf_prefix(
+                    page,
+                    &mut next_row_id,
+                    end_row_id,
+                    expected_page_ids,
+                    &mut expected_idx,
+                );
+            }
+        }
+        assert_eq!(
+            next_row_id, end_row_id,
+            "checkpoint row-page prefix end mismatch"
+        );
+        Ok(())
+    }
+
+    async fn apply_checkpoint_prefix(
+        &self,
+        pool_guard: &PoolGuard,
+        root: PageExclusiveGuard<RowPageIndexNode>,
+        end_row_id: RowID,
+    ) -> Result<(
+        PageExclusiveGuard<RowPageIndexNode>,
+        Vec<PageID>,
+        Vec<PageID>,
+    )> {
+        let mut path = vec![root];
+        let mut boundary_indexes = Vec::new();
+        loop {
+            let page = path.last().unwrap().page();
+            if page.is_leaf() {
+                break;
+            }
+            let entries = page.branch_entries();
+            let first_at_or_after = entries.partition_point(|entry| entry.row_id < end_row_id);
+            if first_at_or_after < entries.len() && entries[first_at_or_after].row_id == end_row_id
+            {
+                boundary_indexes.push((first_at_or_after, false));
+                break;
+            }
+            let boundary_idx = first_at_or_after.saturating_sub(1);
+            let child_page_id = entries[boundary_idx].page_id;
+            boundary_indexes.push((boundary_idx, true));
+            let child = self
+                .pool
+                .get_page::<RowPageIndexNode>(
+                    pool_guard,
+                    child_page_id,
+                    LatchFallbackMode::Exclusive,
+                )
+                .await?
+                .lock_exclusive_async()
+                .await
+                .ok_or_else(|| row_page_index_missing(child_page_id))?;
+            path.push(child);
+        }
+
+        let mut detached_subtrees = Vec::new();
+        let mut detached_nodes = Vec::new();
+        let mut child_empty = false;
+        for idx in (0..path.len()).rev() {
+            let page_id = path[idx].page_id();
+            let page = path[idx].page_mut();
+            let empty = if page.is_leaf() {
+                let trim = page
+                    .leaf_entries()
+                    .partition_point(|entry| entry.row_id < end_row_id);
+                page.leaf_remove_prefix(trim);
+                page.header.start_row_id = end_row_id;
+                if !page.leaf_is_empty() {
+                    page.leaf_entries_mut()[0].row_id = end_row_id;
+                }
+                page.leaf_is_empty()
+            } else {
+                let (boundary_idx, descended) = boundary_indexes[idx];
+                let trim = boundary_idx + usize::from(descended && child_empty);
+                detached_subtrees.extend(
+                    page.branch_entries()[..boundary_idx]
+                        .iter()
+                        .map(|entry| entry.page_id),
+                );
+                page.branch_remove_prefix(trim);
+                page.header.start_row_id = end_row_id;
+                if page.header.count != 0 {
+                    page.branch_entries_mut()[0].row_id = end_row_id;
+                }
+                page.header.count == 0
+            };
+            if idx != 0 && empty {
+                detached_nodes.push(page_id);
+            }
+            child_empty = empty;
+        }
+
+        while path.len() > 1 {
+            drop(path.pop());
+        }
+        Ok((path.pop().unwrap(), detached_subtrees, detached_nodes))
+    }
+
+    async fn reclaim_detached_subtrees(
+        &self,
+        pool_guard: &PoolGuard,
+        roots: Vec<PageID>,
+    ) -> Result<usize> {
+        let mut reclaimed = 0usize;
+        let mut stack = roots;
+        while let Some(page_id) = stack.pop() {
+            let guard = self
+                .pool
+                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Exclusive)
+                .await?
+                .lock_exclusive_async()
+                .await
+                .ok_or_else(|| row_page_index_missing(page_id))?;
+            if guard.page().is_branch() {
+                stack.extend(
+                    guard
+                        .page()
+                        .branch_entries()
+                        .iter()
+                        .map(|entry| entry.page_id),
+                );
+            }
+            self.pool.deallocate_page(guard);
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
     }
 
     /// Get row page for insertion.
@@ -1254,6 +1612,51 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
 }
 
 #[inline]
+fn validate_leaf_prefix(
+    leaf: &RowPageIndexNode,
+    next_row_id: &mut RowID,
+    end_row_id: RowID,
+    expected_page_ids: &[PageID],
+    expected_idx: &mut usize,
+) {
+    debug_assert!(leaf.is_leaf());
+    let entries = leaf.leaf_entries();
+    for (idx, entry) in entries.iter().enumerate() {
+        if *expected_idx == expected_page_ids.len() {
+            break;
+        }
+        assert_eq!(
+            entry.row_id, *next_row_id,
+            "checkpoint row-page prefix row-id mismatch at index {expected_idx}"
+        );
+        assert_eq!(
+            entry.page_id, expected_page_ids[*expected_idx],
+            "checkpoint row-page prefix page-id mismatch at index {expected_idx}"
+        );
+        let entry_end_row_id = entries
+            .get(idx + 1)
+            .map(|next| next.row_id)
+            .unwrap_or(leaf.header.end_row_id);
+        assert!(
+            entry_end_row_id > entry.row_id && entry_end_row_id <= end_row_id,
+            "checkpoint row-page prefix range mismatch: page_id={}, entry_start={}, entry_end={}, batch_end={end_row_id}",
+            entry.page_id,
+            entry.row_id,
+            entry_end_row_id
+        );
+        *next_row_id = entry_end_row_id;
+        *expected_idx += 1;
+    }
+}
+
+#[inline]
+fn row_page_index_missing(page_id: PageID) -> Error {
+    Report::new(InternalError::RowPageMissing)
+        .attach(format!("row-page-index node missing: page_id={page_id}"))
+        .into()
+}
+
+#[inline]
 fn cleanup_failed_insert_page<B: BufferPool>(
     mem_pool: &B,
     new_page: PageExclusiveGuard<RowPage>,
@@ -1296,11 +1699,12 @@ mod tests {
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::recovery::stream::RedoReplayPlanner;
     use crate::value::ValKind;
-    use futures::future::join_all;
+    use futures::{FutureExt, future::join_all};
     use semistr::SemiStr;
     use std::future::Future;
     use std::io::Error as StdIoError;
     use std::mem::size_of;
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
@@ -1314,6 +1718,29 @@ mod tests {
 
     fn fixed_pool_bytes(page_count: usize) -> usize {
         page_count * (size_of::<BufferFrame>() + size_of::<Page>())
+    }
+
+    async fn append_test_row_pages(
+        index: &RowPageIndex<FixedBufferPool>,
+        pool_guard: &PoolGuard,
+        count: usize,
+        rows_per_page: u64,
+    ) -> Vec<PageID> {
+        let mut page_ids = Vec::with_capacity(count);
+        for idx in 0..count {
+            let page_id = test_page_id(10_000 + idx as i32);
+            loop {
+                if let Valid(_) = index
+                    .insert_row_page(pool_guard, rows_per_page, page_id, None)
+                    .await
+                    .expect("test row-page insertion should succeed")
+                {
+                    break;
+                }
+            }
+            page_ids.push(page_id);
+        }
+        page_ids
     }
 
     #[test]
@@ -1612,6 +2039,47 @@ mod tests {
                 .unwrap();
             assert_eq!((*meta_pool).allocated(), 0);
             assert_eq!((*mem_pool).allocated(), 0);
+        });
+    }
+
+    #[test]
+    fn test_row_page_index_destroy_rejects_entry_below_pivot_before_deallocation() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(64 * 1024 * 1024);
+            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let metadata = make_test_metadata();
+            let index = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                drop(
+                    index
+                        .get_insert_page_exclusive(
+                            &meta_guard,
+                            &*mem_pool,
+                            &mem_guard,
+                            &metadata.col,
+                            100,
+                            None,
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+
+            let panic = AssertUnwindSafe(index.destroy(
+                &meta_guard,
+                &*mem_pool,
+                &mem_guard,
+                RowID::new(100),
+            ))
+            .catch_unwind()
+            .await;
+            assert!(panic.is_err());
+            assert_eq!((*meta_pool).allocated(), 1);
+            assert_eq!((*mem_pool).allocated(), 2);
         });
     }
 
@@ -1934,6 +2402,223 @@ mod tests {
             assert_eq!(leaf_headers[1].2, overflow_entries);
             assert_eq!(cursor_leaf_page_ids, root_leaf_page_ids);
             assert!(cursor.next().await.is_none());
+        })
+    }
+
+    #[test]
+    fn test_prune_checkpoint_prefix_in_root_leaf_and_reset_empty_root() {
+        smol::block_on(async {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let index = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
+                .await
+                .unwrap();
+            let page_ids = append_test_row_pages(&index, &pool_guard, 4, 10).await;
+            index
+                .insert_free_list
+                .lock()
+                .extend(page_ids.iter().copied());
+
+            let before_height = index.height();
+            let panic = AssertUnwindSafe(index.prune_checkpoint_prefix(
+                &pool_guard,
+                RowID::new(0),
+                RowID::new(20),
+                &[page_ids[1], page_ids[0]],
+            ))
+            .catch_unwind()
+            .await;
+            assert!(panic.is_err());
+            assert_eq!(index.height(), before_height);
+            assert_eq!(index.insert_free_list.lock().as_slice(), page_ids);
+
+            let pruned = index
+                .prune_checkpoint_prefix(&pool_guard, RowID::new(0), RowID::new(20), &page_ids[..2])
+                .await
+                .unwrap();
+            assert_eq!(pruned.page_ids.as_ref(), &page_ids[..2]);
+            assert_eq!(pruned.reclaimed_nodes, 0);
+            assert_eq!(pruned.collapsed_levels, 0);
+            assert_eq!(index.insert_free_list.lock().as_slice(), &page_ids[2..]);
+            assert!(matches!(
+                index.find_row(&pool_guard, RowID::new(19)).await.unwrap(),
+                RowLocation::NotFound
+            ));
+            assert!(matches!(
+                index.find_row(&pool_guard, RowID::new(20)).await.unwrap(),
+                RowLocation::RowPage(page_id) if page_id == page_ids[2]
+            ));
+
+            let pruned = index
+                .prune_checkpoint_prefix(
+                    &pool_guard,
+                    RowID::new(20),
+                    RowID::new(40),
+                    &page_ids[2..],
+                )
+                .await
+                .unwrap();
+            assert_eq!(pruned.page_ids.as_ref(), &page_ids[2..]);
+            assert_eq!(index.height(), 0);
+            assert!(index.insert_free_list.lock().is_empty());
+
+            let appended = test_page_id(20_000);
+            let inserted = loop {
+                if let Valid(inserted) = index
+                    .insert_row_page(&pool_guard, 5, appended, None)
+                    .await
+                    .unwrap()
+                {
+                    break inserted;
+                }
+            };
+            assert_eq!(inserted.start_row_id, RowID::new(40));
+            assert_eq!(inserted.end_row_id, RowID::new(45));
+        })
+    }
+
+    #[test]
+    fn test_prune_checkpoint_prefix_reclaims_leaf_and_collapses_root() {
+        smol::block_on(async {
+            let pool = owned_index_pool(128 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let index = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
+                .await
+                .unwrap();
+            let total = NBR_ROW_PAGE_ENTRIES_IN_LEAF + 3;
+            let page_ids = append_test_row_pages(&index, &pool_guard, total, 1).await;
+            assert_eq!(index.height(), 1);
+
+            let pruned = index
+                .prune_checkpoint_prefix(
+                    &pool_guard,
+                    RowID::new(0),
+                    RowID::from(NBR_ROW_PAGE_ENTRIES_IN_LEAF + 1),
+                    &page_ids[..NBR_ROW_PAGE_ENTRIES_IN_LEAF + 1],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pruned.page_ids.as_ref(),
+                &page_ids[..NBR_ROW_PAGE_ENTRIES_IN_LEAF + 1]
+            );
+            assert_eq!(pruned.reclaimed_nodes, 2);
+            assert_eq!(pruned.collapsed_levels, 1);
+            assert_eq!(index.height(), 0);
+            assert!(matches!(
+                index
+                    .find_row(
+                        &pool_guard,
+                        RowID::from(NBR_ROW_PAGE_ENTRIES_IN_LEAF + 1),
+                    )
+                    .await
+                    .unwrap(),
+                RowLocation::RowPage(page_id)
+                    if page_id == page_ids[NBR_ROW_PAGE_ENTRIES_IN_LEAF + 1]
+            ));
+        })
+    }
+
+    #[test]
+    fn test_prune_checkpoint_prefix_across_multiple_branch_levels() {
+        smol::block_on(async {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let index = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
+                .await
+                .unwrap();
+
+            async fn leaf(
+                pool: &FixedBufferPool,
+                guard: &PoolGuard,
+                entries: &[(u64, i32)],
+                end: u64,
+            ) -> PageID {
+                let mut node = pool.allocate_page::<RowPageIndexNode>(guard).await.unwrap();
+                node.page_mut().init_empty(0, RowID::new(entries[0].0));
+                for (start, page_id) in entries {
+                    let count = end - start;
+                    node.page_mut().leaf_add_entry(
+                        RowID::new(*start),
+                        count,
+                        test_page_id(*page_id),
+                    );
+                }
+                node.page_mut().header.end_row_id = RowID::new(end);
+                node.page_id()
+            }
+
+            let leaf_a = leaf(&pool, &pool_guard, &[(0, 1)], 10).await;
+            let leaf_b = leaf(&pool, &pool_guard, &[(10, 2)], 20).await;
+            let leaf_c = leaf(&pool, &pool_guard, &[(20, 3), (25, 4)], 30).await;
+            let leaf_d = leaf(&pool, &pool_guard, &[(30, 5)], 40).await;
+            let mut branch_a = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .unwrap();
+            branch_a.page_mut().init_empty(1, RowID::new(0));
+            branch_a
+                .page_mut()
+                .branch_add_entry(PageEntry::new(RowID::new(0), leaf_a));
+            branch_a
+                .page_mut()
+                .branch_add_entry(PageEntry::new(RowID::new(10), leaf_b));
+            branch_a.page_mut().header.end_row_id = RowID::new(20);
+            let branch_a_id = branch_a.page_id();
+            drop(branch_a);
+            let mut branch_b = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .unwrap();
+            branch_b.page_mut().init_empty(1, RowID::new(20));
+            branch_b
+                .page_mut()
+                .branch_add_entry(PageEntry::new(RowID::new(20), leaf_c));
+            branch_b
+                .page_mut()
+                .branch_add_entry(PageEntry::new(RowID::new(30), leaf_d));
+            let branch_b_id = branch_b.page_id();
+            drop(branch_b);
+            let mut root = pool
+                .get_page::<RowPageIndexNode>(
+                    &pool_guard,
+                    index.root_page_id(),
+                    LatchFallbackMode::Exclusive,
+                )
+                .await
+                .unwrap()
+                .lock_exclusive_async()
+                .await
+                .unwrap();
+            root.page_mut().init_empty(2, RowID::new(0));
+            root.page_mut()
+                .branch_add_entry(PageEntry::new(RowID::new(0), branch_a_id));
+            root.page_mut()
+                .branch_add_entry(PageEntry::new(RowID::new(20), branch_b_id));
+            index.height.store(2, Ordering::Relaxed);
+            drop(root);
+
+            let expected = [test_page_id(1), test_page_id(2), test_page_id(3)];
+            let pruned = index
+                .prune_checkpoint_prefix(&pool_guard, RowID::new(0), RowID::new(25), &expected)
+                .await
+                .unwrap();
+            assert_eq!(pruned.page_ids.as_ref(), expected);
+            assert_eq!(pruned.reclaimed_nodes, 4);
+            assert_eq!(pruned.collapsed_levels, 1);
+            assert_eq!(index.height(), 1);
+            assert!(matches!(
+                index.find_row(&pool_guard, RowID::new(24)).await.unwrap(),
+                RowLocation::NotFound
+            ));
+            assert!(matches!(
+                index.find_row(&pool_guard, RowID::new(25)).await.unwrap(),
+                RowLocation::RowPage(page_id) if page_id == test_page_id(4)
+            ));
+            assert!(matches!(
+                index.find_row(&pool_guard, RowID::new(30)).await.unwrap(),
+                RowLocation::RowPage(page_id) if page_id == test_page_id(5)
+            ));
         })
     }
 

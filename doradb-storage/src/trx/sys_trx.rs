@@ -1,3 +1,4 @@
+use super::sys::GC_BUCKETS;
 use crate::buffer::PoolGuards;
 use crate::catalog::{Catalog, SilentWatermarkObject};
 use crate::error::{Error, InternalError, Result};
@@ -9,13 +10,43 @@ use crate::trx::{PreparedTrx, PreparedTrxPayload};
 use error_stack::Report;
 use std::mem;
 
+/// One ordered row-page prefix retired by a successful table checkpoint.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RetiredRowPageBatch {
+    /// Owning user table.
+    pub(crate) table_id: TableID,
+    /// Inclusive start of the retired contiguous RowID range.
+    pub(crate) start_row_id: RowID,
+    /// Exclusive end of the retired contiguous RowID range.
+    pub(crate) end_row_id: RowID,
+    /// Row pages in their canonical RowID order.
+    pub(crate) page_ids: Box<[PageID]>,
+}
+
+impl RetiredRowPageBatch {
+    /// Creates one checkpoint retirement descriptor.
+    #[inline]
+    pub(crate) fn new(
+        table_id: TableID,
+        start_row_id: RowID,
+        end_row_id: RowID,
+        page_ids: Box<[PageID]>,
+    ) -> Self {
+        Self {
+            table_id,
+            start_row_id,
+            end_row_id,
+            page_ids,
+        }
+    }
+}
+
 /// SysTrx is a special kind of transaction only used for system
 /// operations. Its effect is immediately visible for other
 /// transactions and it can not rollback.
 pub(crate) struct SysTrx {
-    pub(super) gc_no: usize,
     pub(super) redo: RedoLogs,
-    pub(super) gc_row_pages: Vec<PageID>,
+    pub(super) retired_row_pages: Option<RetiredRowPageBatch>,
 }
 
 impl SysTrx {
@@ -62,10 +93,11 @@ impl SysTrx {
         }));
     }
 
-    /// Extend row pages retired by the checkpoint represented by this transaction.
+    /// Records the one row-page prefix retired by this checkpoint transaction.
     #[inline]
-    pub(crate) fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
-        self.gc_row_pages.extend(pages);
+    pub(crate) fn retire_row_pages(&mut self, batch: RetiredRowPageBatch) {
+        debug_assert!(self.retired_row_pages.is_none());
+        self.retired_row_pages = Some(batch);
     }
 
     /// Monotonically update the live silent-watermark mirror and record logical redo.
@@ -141,10 +173,10 @@ impl SysTrx {
         };
         PreparedTrx {
             redo_bin,
-            payload: (!self.gc_row_pages.is_empty()).then(|| {
+            payload: self.retired_row_pages.take().map(|retired_row_pages| {
                 PreparedTrxPayload::System(SysTrxPayload {
-                    gc_no: self.gc_no,
-                    gc_row_pages: mem::take(&mut self.gc_row_pages),
+                    gc_no: retirement_gc_no(retired_row_pages.table_id),
+                    retired_row_pages,
                 })
             }),
             attachment: None,
@@ -157,15 +189,20 @@ impl SysTrx {
 /// System transaction GC payload carried unchanged through ordered commit.
 pub(crate) struct SysTrxPayload {
     pub(super) gc_no: usize,
-    pub(super) gc_row_pages: Vec<PageID>,
+    pub(super) retired_row_pages: RetiredRowPageBatch,
 }
 
 impl SysTrxPayload {
-    /// Returns whether this payload owns no retired row pages.
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
-        self.gc_row_pages.is_empty()
+        false
     }
+}
+
+/// Returns the deterministic GC bucket for one table's retirement payloads.
+#[inline]
+pub(crate) fn retirement_gc_no(table_id: TableID) -> usize {
+    (table_id.as_u64() % GC_BUCKETS as u64) as usize
 }
 
 #[cfg(test)]
@@ -175,21 +212,38 @@ mod tests {
     #[test]
     fn test_sys_gc_prepare_uses_system_payload_variant() {
         let mut sys_trx = SysTrx {
-            gc_no: 3,
             redo: RedoLogs::default(),
-            gc_row_pages: Vec::new(),
+            retired_row_pages: None,
         };
         sys_trx.record_data_checkpoint(TableID::new(7), RowID::new(11), TrxID::new(13));
-        sys_trx.extend_gc_row_pages(vec![PageID::new(17)]);
+        sys_trx.retire_row_pages(RetiredRowPageBatch::new(
+            TableID::new(7),
+            RowID::new(3),
+            RowID::new(11),
+            vec![PageID::new(17)].into_boxed_slice(),
+        ));
         let mut prepared = sys_trx.prepare();
         assert!(matches!(
             prepared.payload.as_ref(),
             Some(PreparedTrxPayload::System(SysTrxPayload {
-                gc_no: 3,
-                gc_row_pages,
-            })) if gc_row_pages == &vec![PageID::new(17)]
+                gc_no,
+                retired_row_pages,
+            })) if *gc_no == retirement_gc_no(TableID::new(7))
+                && retired_row_pages.page_ids.as_ref() == [PageID::new(17)]
         ));
         prepared.redo_bin.take();
         prepared.payload.take();
+    }
+
+    #[test]
+    fn test_retirement_gc_no_is_table_affine() {
+        let table_id = TableID::new(91);
+        assert_eq!(retirement_gc_no(table_id), retirement_gc_no(table_id));
+        assert_eq!(
+            retirement_gc_no(table_id),
+            retirement_gc_no(TableID::new(
+                table_id.as_u64() + super::super::sys::GC_BUCKETS as u64,
+            ))
+        );
     }
 }

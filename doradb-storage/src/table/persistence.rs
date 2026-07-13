@@ -28,6 +28,7 @@ use crate::table::{
     CheckpointCancelReason, FreezeOutcome, FrozenPage, FrozenPageBatch, Table,
     TableRedoReplayFloor, TableRuntimeLayout,
 };
+use crate::trx::RetiredRowPageBatch;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use futures::future::select_all;
@@ -1505,8 +1506,19 @@ impl Table {
             });
         }
 
-        let gc_pages: Vec<PageID> = pages.iter().map(|page| page.page_id).collect();
-        sys_trx.extend_gc_row_pages(gc_pages);
+        if let (Some(first), Some(last)) = (pages.first(), pages.last()) {
+            let page_ids = pages
+                .iter()
+                .map(|page| page.page_id)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            sys_trx.retire_row_pages(RetiredRowPageBatch::new(
+                self.table_id(),
+                first.start_row_id,
+                last.end_row_id,
+                page_ids,
+            ));
+        }
         sys_trx.record_data_checkpoint(self.table_id(), new_pivot_row_id, checkpoint_ts);
 
         // Step 10: enter the no-cancel publication section, publish a new

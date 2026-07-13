@@ -30,7 +30,7 @@ use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_inse
 use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
-use crate::trx::{MIN_SNAPSHOT_TS, TrxRuntime};
+use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
 use crate::value::Val;
 use error_stack::Report;
 use std::mem::take;
@@ -224,7 +224,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
 
     #[inline]
     fn missing_pool_guard(&self, operation: &'static str, role: &'static str) -> Error {
-        Report::new(InternalError::Generic)
+        Report::new(InternalError::PoolGuardMissing)
             .attach(format!(
                 "operation={operation}, table_id={}, missing {role} pool guard",
                 self.table_id()
@@ -234,7 +234,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
 
     #[inline]
     fn stale_block_index_leaf(&self, operation: &'static str) -> Error {
-        Report::new(InternalError::Generic)
+        Report::new(InternalError::BlockIndexLeafStale)
             .attach(format!(
                 "operation={operation}, table_id={}, stale block-index leaf lock",
                 self.table_id()
@@ -290,6 +290,49 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         blk_idx
             .destroy(meta_pool_guard, &*mem_pool, row_pool_guard)
             .await
+    }
+
+    /// Unlinks one exact checkpoint-retired row-page prefix from the hot index.
+    #[inline]
+    pub(crate) async fn unlink_retired_row_pages(
+        &self,
+        guards: &PoolGuards,
+        batch: &RetiredRowPageBatch,
+    ) -> Result<Box<[PageID]>> {
+        let result = self
+            .blk_idx
+            .prune_checkpoint_prefix(
+                self.meta_pool_guard(guards, "unlink retired row pages")?,
+                batch.start_row_id,
+                batch.end_row_id,
+                &batch.page_ids,
+            )
+            .await?;
+        Ok(result.page_ids)
+    }
+
+    /// Physically deallocates row pages already unlinked from the hot index.
+    #[inline]
+    pub(crate) async fn deallocate_retired_row_pages(
+        &self,
+        guards: &PoolGuards,
+        page_ids: &[PageID],
+    ) -> Result<()> {
+        let row_pool_guard = self.row_pool_guard(guards, "deallocate retired row pages")?;
+        for page_id in page_ids {
+            let page_guard = self
+                .mem_pool
+                .get_page::<RowPage>(row_pool_guard, *page_id, LatchFallbackMode::Exclusive)
+                .await?
+                .lock_exclusive_async()
+                .await
+                .ok_or_else(|| {
+                    Report::new(InternalError::RowPageMissing)
+                        .attach(format!("retired row page missing: page_id={page_id}"))
+                })?;
+            self.mem_pool.deallocate_page(page_guard);
+        }
+        Ok(())
     }
 
     /// Lock an in-memory row page for shared access if it is present.
@@ -4001,7 +4044,7 @@ mod tests {
             let err = mem_table.stale_block_index_leaf("test stale block-index");
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::Generic)
+                Some(InternalError::BlockIndexLeafStale)
             );
             let report = format!("{err:?}");
             assert!(report.contains("test stale block-index"), "{report}");
@@ -4153,7 +4196,7 @@ mod tests {
 
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::Generic)
+                Some(InternalError::PoolGuardMissing)
             );
         });
     }
