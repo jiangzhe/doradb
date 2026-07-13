@@ -843,10 +843,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
         let inserter = RowInserter::new(self.table_id(), metadata, rt);
         loop {
-            let page_guard = self.get_insert_page(rt, row_count).await?;
+            let page_guard = self
+                .try_get_insert_page(rt.pool_guards(), row_count, None)
+                .await?;
             match inserter.insert_to_page(effects, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
-                    rt.save_active_insert_page(self.table_id(), page_guard.versioned_page_id());
+                    self.cache_insert_page_version(page_guard.versioned_page_id());
                     return Ok((row_id, page_guard));
                 }
                 InsertRowIntoPage::NoSpaceOrFrozen(ins, uk, ib) => {
@@ -856,22 +858,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 }
             }
         }
-    }
-
-    #[inline]
-    async fn get_insert_page(
-        &self,
-        rt: TrxRuntime<'_>,
-        row_count: usize,
-    ) -> Result<PageSharedGuard<RowPage>> {
-        let guards = rt.pool_guards();
-        if let Some(page_id) = rt.load_active_insert_page(self.table_id()) {
-            let page_guard = self.get_row_page_versioned_shared(guards, page_id).await?;
-            if let Some(page_guard) = page_guard {
-                return Ok(page_guard);
-            }
-        }
-        self.try_get_insert_page(guards, row_count, None).await
     }
 
     #[inline]

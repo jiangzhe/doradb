@@ -899,6 +899,22 @@ impl SessionRegistry {
     }
 }
 
+/// Session-local user-table runtime and insert-page state.
+struct SessionTableCacheEntry {
+    table: Weak<Table>,
+    active_insert_page: Option<VersionedPageID>,
+}
+
+impl SessionTableCacheEntry {
+    #[inline]
+    fn new(table: &Arc<Table>) -> Self {
+        SessionTableCacheEntry {
+            table: Arc::downgrade(table),
+            active_insert_page: None,
+        }
+    }
+}
+
 /// Shared mutable state referenced by transactions started from one [`Session`].
 pub(crate) struct SessionState {
     id: SessionID,
@@ -906,8 +922,7 @@ pub(crate) struct SessionState {
     lock_manager: QuiescentGuard<LockManager>,
     lifecycle: Mutex<SessionLifecycle>,
     last_cts: AtomicU64,
-    table_cache: Mutex<FastHashMap<TableID, Weak<Table>>>,
-    active_insert_pages: Mutex<FastHashMap<TableID, VersionedPageID>>,
+    table_cache: Mutex<FastHashMap<TableID, SessionTableCacheEntry>>,
 }
 
 impl SessionState {
@@ -923,7 +938,6 @@ impl SessionState {
             lifecycle: Mutex::new(SessionLifecycle::RunningIdle),
             last_cts: AtomicU64::new(0),
             table_cache: Mutex::new(FastHashMap::default()),
-            active_insert_pages: Mutex::new(FastHashMap::default()),
         }
     }
 
@@ -1174,8 +1188,8 @@ impl SessionState {
     #[inline]
     pub(crate) fn cached_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         let mut cache = self.table_cache.lock();
-        let weak = cache.get(&table_id)?;
-        match weak.upgrade() {
+        let entry = cache.get(&table_id)?;
+        match entry.table.upgrade() {
             Some(table) => Some(table),
             None => {
                 cache.remove(&table_id);
@@ -1188,22 +1202,39 @@ impl SessionState {
     #[inline]
     pub(crate) fn cache_user_table(&self, table: &Arc<Table>) {
         let mut cache = self.table_cache.lock();
-        cache.insert(table.table_id(), Arc::downgrade(table));
+        match cache.get_mut(&table.table_id()) {
+            Some(entry) => entry.table = Arc::downgrade(table),
+            None => {
+                cache.insert(table.table_id(), SessionTableCacheEntry::new(table));
+            }
+        }
     }
 
     /// Remove and return the cached insert page for a table, if present.
     #[inline]
     pub fn load_active_insert_page(&self, table_id: TableID) -> Option<VersionedPageID> {
-        let mut g = self.active_insert_pages.lock();
-        g.remove(&table_id)
+        self.table_cache
+            .lock()
+            .get_mut(&table_id)
+            .and_then(|entry| entry.active_insert_page.take())
     }
 
     /// Cache the active insert page for a table.
     #[inline]
     pub fn save_active_insert_page(&self, table_id: TableID, page_id: VersionedPageID) {
-        let mut g = self.active_insert_pages.lock();
-        let res = g.insert(table_id, page_id);
-        debug_assert!(res.is_none());
+        let mut cache = self.table_cache.lock();
+        let entry = cache.get_mut(&table_id);
+        assert!(
+            entry.is_some(),
+            "active insert page requires a cached user-table runtime: table_id={table_id}"
+        );
+        if let Some(entry) = entry {
+            let previous = entry.active_insert_page.replace(page_id);
+            assert!(
+                previous.is_none(),
+                "active insert page token already cached: table_id={table_id}"
+            );
+        }
     }
 
     #[inline]
@@ -1215,12 +1246,10 @@ impl SessionState {
 impl Drop for SessionState {
     #[inline]
     fn drop(&mut self) {
-        let active_insert_pages = self.active_insert_pages.get_mut();
         let table_cache = self.table_cache.get_mut();
-        for (table_id, page_id) in active_insert_pages.drain() {
-            // Only user tables populate this weak runtime cache. Catalog page
-            // tokens and entries for destroyed table runtimes are discarded.
-            if let Some(table) = table_cache.get(&table_id).and_then(Weak::upgrade) {
+        for (_, entry) in table_cache.drain() {
+            if let (Some(page_id), Some(table)) = (entry.active_insert_page, entry.table.upgrade())
+            {
                 table.mem.cache_insert_page_version(page_id);
             }
         }
@@ -1446,7 +1475,12 @@ fn stale_session_error(id: SessionID, operation: &'static str) -> Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::buffer::guard::PageGuard;
+    use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests::{table1, table2};
+    use crate::catalog::{
+        CatalogTable, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, is_catalog_table,
+    };
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{Error, ErrorKind, FatalError, LifecycleError, OperationError};
@@ -1459,7 +1493,7 @@ pub(crate) mod tests {
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
     };
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
-    use crate::value::Val;
+    use crate::value::{Val, ValKind};
     use futures::task::noop_waker;
     use std::fs;
     use std::future::Future;
@@ -1637,6 +1671,37 @@ pub(crate) mod tests {
         trx.commit().await.unwrap();
     }
 
+    async fn create_cache_test_table(session: &mut Session) -> TableID {
+        session
+            .create_table(
+                TableSpec::new(vec![ColumnSpec::new(
+                    "id",
+                    ValKind::I32,
+                    ColumnAttributes::empty(),
+                )]),
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn catalog_row_page_count(table: &CatalogTable, guards: &PoolGuards) -> usize {
+        let mut count = 0usize;
+        let pivot_row_id = table.pivot_row_id();
+        let mut cursor = table.blk_idx().mem_cursor(guards.meta_guard());
+        cursor.seek(pivot_row_id).await;
+        while let Some(leaf) = cursor.next().await {
+            let guard = leaf.lock_shared_async().await.unwrap();
+            count += guard
+                .page()
+                .leaf_entries()
+                .iter()
+                .filter(|entry| entry.row_id >= pivot_row_id)
+                .count();
+        }
+        count
+    }
+
     /// Returns the number of registry-owned sessions for tests.
     #[inline]
     pub(crate) fn session_registry_len(registry: &SessionRegistry) -> usize {
@@ -1723,6 +1788,108 @@ pub(crate) mod tests {
                 .state
                 .save_active_insert_page(table_id, page_id);
         }
+    }
+
+    #[test]
+    fn test_session_table_cache_owns_active_user_insert_page() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = create_cache_test_table(&mut session).await;
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(table_id, vec![Val::from(1i32)])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            let pin = session.pin("test session table cache").unwrap();
+            let cached_page = {
+                let cache = pin.state.table_cache.lock();
+                let entry = cache.get(&table_id).unwrap();
+                assert!(entry.table.upgrade().is_some());
+                entry.active_insert_page.unwrap()
+            };
+            assert_eq!(
+                pin.state.load_active_insert_page(table_id),
+                Some(cached_page)
+            );
+            assert!(pin.state.cached_user_table(table_id).is_some());
+            assert!(
+                pin.state
+                    .table_cache
+                    .lock()
+                    .get(&table_id)
+                    .is_some_and(|entry| entry.active_insert_page.is_none())
+            );
+            pin.state.save_active_insert_page(table_id, cached_page);
+            assert_eq!(
+                pin.state
+                    .table_cache
+                    .lock()
+                    .get(&table_id)
+                    .and_then(|entry| entry.active_insert_page),
+                Some(cached_page)
+            );
+        });
+    }
+
+    #[test]
+    fn test_catalog_insert_pages_use_shared_free_list() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let catalog_tables = engine
+                .catalog()
+                .storage
+                .get_catalog_table(TABLE_ID_TABLES)
+                .unwrap();
+
+            let mut session1 = engine.new_session().unwrap();
+            create_cache_test_table(&mut session1).await;
+            let guards1 = session1.pool_guards();
+            let row_page_count = catalog_row_page_count(&catalog_tables, &guards1).await;
+            assert!(row_page_count > 0);
+            {
+                let pin = session1.pin("test catalog session cache").unwrap();
+                assert!(
+                    pin.state
+                        .table_cache
+                        .lock()
+                        .keys()
+                        .all(|table_id| !is_catalog_table(*table_id))
+                );
+            }
+
+            let mut session2 = engine.new_session().unwrap();
+            create_cache_test_table(&mut session2).await;
+            let guards2 = session2.pool_guards();
+            assert_eq!(
+                catalog_row_page_count(&catalog_tables, &guards2).await,
+                row_page_count
+            );
+            let pin = session2.pin("test catalog session cache").unwrap();
+            assert!(
+                pin.state
+                    .table_cache
+                    .lock()
+                    .keys()
+                    .all(|table_id| !is_catalog_table(*table_id))
+            );
+        });
     }
 
     #[test]

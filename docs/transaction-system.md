@@ -171,17 +171,24 @@ non-terminal operation through private `TrxCheckout` plumbing; ordinary
 `TrxCheckout` drop returns the core to the entry. `TrxCheckout` owns the
 operation-local `TrxAttachment` and exposes a copyable `TrxRuntime` value that
 pairs the immutable `TrxContext` with runtime access to the engine, pool
-guards, and session-local insert-page cache. `TrxContext` never stores the
+guards, and session-local user-table cache. `TrxContext` never stores the
 attachment.
 
-The session cache maps each table directly to one `VersionedPageID`. Insert
-selection removes that token, reopens only the matching page generation, and
-otherwise falls back to the table insert free list before allocating a page.
-The row inserter remains responsible for checking active page state and
-capacity; cached RowID range state is not required. A successful insert returns
-the version token to the session cache. When session state is destroyed, cached
-user-table tokens whose weak table runtime remains reachable are returned to the
-same free list; catalog tokens and unreachable table runtimes are discarded.
+Each session user-table cache entry contains one weak `Table` runtime and an
+optional `VersionedPageID`. User-table insert selection takes the optional page
+token while retaining the weak runtime entry, reopens only the matching page
+generation, and otherwise falls back to the table insert free list before
+allocating a page. The row inserter remains responsible for checking active page
+state and capacity; cached RowID range state is not required. A successful user
+insert returns the version token to the same entry. When session state is
+destroyed, cached tokens whose weak runtime remains reachable are returned to
+the table insert free list; tokens attached to unreachable runtimes are
+discarded.
+
+Catalog-table MVCC inserts do not use session entries. They acquire and return
+versioned page tokens through the catalog table's shared insert free list, so
+catalog insert capacity remains available across sessions without requiring a
+user-table runtime cache entry.
 
 `Statement` owns this checkout for statement execution. Explicit commit and
 rollback consume the public handle, suppress drop abandonment, and claim
