@@ -402,6 +402,26 @@ impl Catalog {
             .and_then(|entry| entry.value().live_table().map(Arc::clone))
     }
 
+    /// Pins a user-table runtime for checkpoint-retirement purge.
+    ///
+    /// Purge may race the catalog transition from live to retained dropped
+    /// state. Both variants own the same runtime identity; a dropped floor or
+    /// absent entry no longer has a runtime that can safely service the batch.
+    #[inline]
+    pub(crate) fn pin_user_table_for_purge(&self, table_id: TableID) -> Option<Arc<Table>> {
+        if is_catalog_table(table_id) {
+            return None;
+        }
+        self.user_tables
+            .get(&table_id)
+            .and_then(|entry| match entry.value() {
+                UserTableEntry::Live { table } | UserTableEntry::DroppedRuntime { table, .. } => {
+                    Some(Arc::clone(table))
+                }
+                UserTableEntry::DroppedFloor { .. } => None,
+            })
+    }
+
     /// Return sorted ids for currently loaded user-table runtimes.
     #[inline]
     pub(crate) fn list_user_table_ids_now(&self) -> Vec<TableID> {

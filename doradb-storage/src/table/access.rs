@@ -28,7 +28,7 @@ use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
     InsertRowIntoPage, MemTable, Table, TableRootSnapshot, TableRuntimeLayout, UpdateRowInplace,
     UpdateUniqueMvcc, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
-    unique_key_from_full_row, update_index_result_to_update_unique_mvcc, validate_page_row_range,
+    unique_key_from_full_row, update_index_result_to_update_unique_mvcc,
 };
 use crate::trx::row::{
     FindOldVersion, IndexCandidateRecheck, ReadAllRows, RowReadAccess, RowWriteAccess,
@@ -1013,11 +1013,7 @@ impl<'a> UserTableAccessor<'a> {
             let page_guard = self.get_insert_page(rt, row_count).await?;
             match inserter.insert_to_page(effects, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
-                    rt.save_active_insert_page(
-                        self.table_id(),
-                        page_guard.versioned_page_id(),
-                        row_id,
-                    );
+                    rt.save_active_insert_page(self.table_id(), page_guard.versioned_page_id());
                     return Ok((row_id, page_guard));
                 }
                 // this page cannot be inserted any more, just leave it and retry another page.
@@ -1428,19 +1424,13 @@ impl<'a> UserTableAccessor<'a> {
         rt: TrxRuntime<'_>,
         row_count: usize,
     ) -> Result<PageSharedGuard<RowPage>> {
-        if let Some((page_id, row_id)) = rt.load_active_insert_page(self.table_id()) {
+        if let Some(page_id) = rt.load_active_insert_page(self.table_id()) {
             let page_guard = self
                 .mem()
                 .get_row_page_versioned_shared(rt.pool_guards(), page_id)
                 .await?;
             if let Some(page_guard) = page_guard {
-                // because we save last insert page in session and meanwhile other thread may access this page
-                // and do some modification, even worse, buffer pool may evict it and reload other data into
-                // this page. so here, we do not require that no change should happen, but if something change,
-                // we validate that page id and row id range is still valid.
-                if validate_page_row_range(&page_guard, page_id.page_id, row_id) {
-                    return Ok(page_guard);
-                }
+                return Ok(page_guard);
             }
         }
         let redo_ctx = self.row_page_create_redo_ctx(rt);
@@ -5722,7 +5712,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let row_id = unwrap_insert_result(
+            let _row_id = unwrap_insert_result(
                 trx_insert_row_by_id(
                     &mut trx,
                     table_id,
@@ -5732,8 +5722,7 @@ mod tests {
             );
             trx.commit().await.unwrap();
 
-            let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
-            assert_eq!(cached_row_id, row_id);
+            let cached_page = session.load_active_insert_page(table_id).unwrap();
             assert!(
                 table_for_internal_assertion(&engine, table_id)
                     .mem
@@ -5742,7 +5731,7 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            session.save_active_insert_page(table_id, cached_page, cached_row_id);
+            session.save_active_insert_page(table_id, cached_page);
 
             let mut trx = session.begin_trx().unwrap();
             let next_row_id = unwrap_insert_result(
@@ -5767,11 +5756,89 @@ mod tests {
             };
             assert_eq!(next_page_id, cached_page.page_id);
 
-            let (next_cached_page, next_cached_row_id) =
-                session.load_active_insert_page(table_id).unwrap();
-            assert_eq!(next_cached_row_id, next_row_id);
+            let next_cached_page = session.load_active_insert_page(table_id).unwrap();
             assert_eq!(next_cached_page, cached_page);
         });
+    }
+
+    enum CachedInsertPageSessionEnd {
+        Close,
+        Drop,
+    }
+
+    async fn assert_session_end_returns_cached_insert_page(end: CachedInsertPageSessionEnd) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(
+            &temp_dir,
+            64u64 * 1024 * 1024,
+            "cached_insert_page_session_end",
+        )
+        .await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let first_row_id = unwrap_insert_result(
+            trx_insert_row_by_id(
+                &mut trx,
+                table_id,
+                vec![Val::from(1), Val::from("first-session")],
+            )
+            .await,
+        );
+        trx.commit().await.unwrap();
+        let first_page_id = match table_for_internal_assertion(&engine, table_id)
+            .find_row(&session.pool_guards(), first_row_id)
+            .await
+            .unwrap()
+        {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+                panic!("inserted row should remain in the row store")
+            }
+        };
+
+        match end {
+            CachedInsertPageSessionEnd::Close => session.close().await.unwrap(),
+            CachedInsertPageSessionEnd::Drop => drop(session),
+        }
+
+        let mut next_session = engine.new_session().unwrap();
+        let mut trx = next_session.begin_trx().unwrap();
+        let next_row_id = unwrap_insert_result(
+            trx_insert_row_by_id(
+                &mut trx,
+                table_id,
+                vec![Val::from(2), Val::from("next-session")],
+            )
+            .await,
+        );
+        trx.commit().await.unwrap();
+        let next_page_id = match table_for_internal_assertion(&engine, table_id)
+            .find_row(&next_session.pool_guards(), next_row_id)
+            .await
+            .unwrap()
+        {
+            RowLocation::RowPage(page_id) => page_id,
+            RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
+                panic!("inserted row should remain in the row store")
+            }
+        };
+        assert_eq!(next_page_id, first_page_id);
+    }
+
+    #[test]
+    fn test_session_close_returns_cached_insert_page() {
+        smol::block_on(assert_session_end_returns_cached_insert_page(
+            CachedInsertPageSessionEnd::Close,
+        ));
+    }
+
+    #[test]
+    fn test_idle_session_drop_returns_cached_insert_page() {
+        smol::block_on(assert_session_end_returns_cached_insert_page(
+            CachedInsertPageSessionEnd::Drop,
+        ));
     }
 
     #[test]
@@ -5784,7 +5851,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let row_id = unwrap_insert_result(
+            let _row_id = unwrap_insert_result(
                 trx_insert_row_by_id(
                     &mut trx,
                     table_id,
@@ -5794,9 +5861,8 @@ mod tests {
             );
             trx.commit().await.unwrap();
 
-            let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
-            assert_eq!(cached_row_id, row_id);
-            session.save_active_insert_page(table_id, cached_page, cached_row_id);
+            let cached_page = session.load_active_insert_page(table_id).unwrap();
+            session.save_active_insert_page(table_id, cached_page);
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let mut checkpoint_session = engine.new_session().unwrap();
@@ -5820,7 +5886,7 @@ mod tests {
             );
 
             let mut trx = session.begin_trx().unwrap();
-            let post_gc_row_id = unwrap_insert_result(
+            let _post_gc_row_id = unwrap_insert_result(
                 trx_insert_row_by_id(
                     &mut trx,
                     table_id,
@@ -5836,9 +5902,7 @@ mod tests {
             })
             .await;
 
-            let (next_cached_page, next_cached_row_id) =
-                session.load_active_insert_page(table_id).unwrap();
-            assert_eq!(next_cached_row_id, post_gc_row_id);
+            let next_cached_page = session.load_active_insert_page(table_id).unwrap();
             assert_ne!(next_cached_page, cached_page);
         });
     }
@@ -5863,8 +5927,7 @@ mod tests {
             );
             trx.commit().await.unwrap();
 
-            let (stale_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
-            assert_eq!(cached_row_id, stale_row_id);
+            let stale_page = session.load_active_insert_page(table_id).unwrap();
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let mut checkpoint_session = engine.new_session().unwrap();
@@ -5963,7 +6026,7 @@ mod tests {
 
             let large = "r".repeat(48 * 1024);
             let mut trx = session.begin_trx().unwrap();
-            let row_id = unwrap_insert_result(
+            let _row_id = unwrap_insert_result(
                 trx_insert_row_by_id(
                     &mut trx,
                     table_id,
@@ -5973,9 +6036,8 @@ mod tests {
             );
             trx.commit().await.unwrap();
 
-            let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
-            assert_eq!(cached_row_id, row_id);
-            session.save_active_insert_page(table_id, cached_page, cached_row_id);
+            let cached_page = session.load_active_insert_page(table_id).unwrap();
+            session.save_active_insert_page(table_id, cached_page);
 
             let mut writer = engine.new_session().unwrap();
             for i in 2..258 {
@@ -6051,7 +6113,7 @@ mod tests {
 
             let large = "r".repeat(48 * 1024);
             let mut trx = session.begin_trx().unwrap();
-            let row_id = match trx_insert_row_by_id(
+            let _row_id = match trx_insert_row_by_id(
                 &mut trx,
                 table_id,
                 vec![Val::from(1), Val::from(&large[..])],
@@ -6062,8 +6124,7 @@ mod tests {
                 res => panic!("res={res:?}"),
             };
 
-            let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
-            assert_eq!(cached_row_id, row_id);
+            let cached_page = session.load_active_insert_page(table_id).unwrap();
 
             let mut writer = engine.new_session().unwrap();
             for i in 2..258 {
@@ -6148,7 +6209,7 @@ mod tests {
 
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    let row_id = match stmt_insert_row_by_id(
+                    let _row_id = match stmt_insert_row_by_id(
                         stmt,
                         table_id,
                         vec![Val::from(1), Val::from(&large[..])],
@@ -6159,9 +6220,7 @@ mod tests {
                         res => panic!("res={res:?}"),
                     };
 
-                    let (cached_page, cached_row_id) =
-                        session.load_active_insert_page(table_id).unwrap();
-                    assert_eq!(cached_row_id, row_id);
+                    let cached_page = session.load_active_insert_page(table_id).unwrap();
 
                     for i in 2..258 {
                         expect_insert_committed(

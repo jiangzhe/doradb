@@ -173,6 +173,16 @@ operation-local `TrxAttachment` and exposes a copyable `TrxRuntime` value that
 pairs the immutable `TrxContext` with runtime access to the engine, pool
 guards, and session-local insert-page cache. `TrxContext` never stores the
 attachment.
+
+The session cache maps each table directly to one `VersionedPageID`. Insert
+selection removes that token, reopens only the matching page generation, and
+otherwise falls back to the table insert free list before allocating a page.
+The row inserter remains responsible for checking active page state and
+capacity; cached RowID range state is not required. A successful insert returns
+the version token to the session cache. When session state is destroyed, cached
+user-table tokens whose weak table runtime remains reachable are returned to the
+same free list; catalog tokens and unreachable table runtimes are discarded.
+
 `Statement` owns this checkout for statement execution. Explicit commit and
 rollback consume the public handle, suppress drop abandonment, and claim
 terminal ownership through private completion claims. Dropping a public
@@ -354,14 +364,17 @@ session attachment, undo, locks, rollback, or durability waiter. Table
 checkpoint allocates a separate non-active `checkpoint_ts` for construction and
 root publication. `commit_sys` later assigns an ordered `redo_cts` and returns
 after enqueue acceptance; that return does not acknowledge redo persistence.
-Each `SysTrx` preallocates a purge shard from a system-only round-robin sequence;
-the shard remains unused when the transaction produces no purge payload, so
-redo-only system work does not perturb user-transaction bucket distribution.
+Redo-only system work has no purge bucket. A nonempty data checkpoint owns one
+compact `RetiredRowPageBatch` and derives its purge bucket deterministically
+from the owning table id. All retirement batches for one table therefore enter
+one bucket's committed FIFO in ordered CTS order, while user transactions keep
+their existing round-robin bucket selection.
 
 Prepared, precommit, and committed payloads distinguish `User` and `System`
 variants. User payloads own status, STS, undo, and session completion. System
-checkpoint payloads own only the purge shard and retired row pages, and are
-valid only when coupled to recovery-visible checkpoint redo. Failed system
+checkpoint payloads own only the table-affine purge shard and one ordered
+retirement batch, and are valid only when coupled to recovery-visible
+checkpoint redo. Failed system
 precommit performs no rollback or active-STS removal.
 
 #### Rollback Phase
@@ -475,8 +488,14 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 Checkpoint-retired row pages use the same committed-payload queues and CTS
 horizon. A system payload has no STS to remove; its ordered CTS is its
 reclamation fence. Each purge round finishes eligible row-undo and index work
-from every bucket before the dispatcher deallocates any collected retired page,
-because undo in one bucket may still reference a page retired in another.
+from every bucket before the coordinator processes ordered retirement batches,
+because undo in one bucket may still reference a page retired in another. For
+each batch the coordinator pins the table runtime from either live or
+retained-dropped catalog state, validates and unlinks the exact current
+`RowPageIndex` prefix, reclaims detached metadata, then deallocates only the page
+ids returned by that successful operation. The insert free list uses versioned
+page identities and lazily rejects removed or recycled entries.
+Same-table batches are processed sequentially in their table-affine bucket FIFO.
 
 Purge publishes two monotonic coordination boundaries in order. First it
 publishes the observed oldest-active-snapshot horizon, which is sufficient for

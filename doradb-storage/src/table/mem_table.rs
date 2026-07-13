@@ -8,7 +8,9 @@ use super::{
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
-use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
+use crate::buffer::{
+    BufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole, get_page_versioned_shared,
+};
 use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata};
 use crate::error::{
     DataIntegrityError, Error, InternalError, OperationError, RecoveryDuplicateKey, Result,
@@ -30,7 +32,7 @@ use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_inse
 use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
-use crate::trx::{MIN_SNAPSHOT_TS, TrxRuntime};
+use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
 use crate::value::Val;
 use error_stack::Report;
 use std::mem::take;
@@ -224,7 +226,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
 
     #[inline]
     fn missing_pool_guard(&self, operation: &'static str, role: &'static str) -> Error {
-        Report::new(InternalError::Generic)
+        Report::new(InternalError::PoolGuardMissing)
             .attach(format!(
                 "operation={operation}, table_id={}, missing {role} pool guard",
                 self.table_id()
@@ -234,7 +236,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
 
     #[inline]
     fn stale_block_index_leaf(&self, operation: &'static str) -> Error {
-        Report::new(InternalError::Generic)
+        Report::new(InternalError::BlockIndexLeafStale)
             .attach(format!(
                 "operation={operation}, table_id={}, stale block-index leaf lock",
                 self.table_id()
@@ -292,6 +294,49 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .await
     }
 
+    /// Unlinks one exact checkpoint-retired row-page prefix from the hot index.
+    #[inline]
+    pub(crate) async fn unlink_retired_row_pages(
+        &self,
+        guards: &PoolGuards,
+        batch: &RetiredRowPageBatch,
+    ) -> Result<Box<[PageID]>> {
+        let result = self
+            .blk_idx
+            .prune_checkpoint_prefix(
+                self.meta_pool_guard(guards, "unlink retired row pages")?,
+                batch.start_row_id,
+                batch.end_row_id,
+                &batch.page_ids,
+            )
+            .await?;
+        Ok(result.page_ids)
+    }
+
+    /// Physically deallocates row pages already unlinked from the hot index.
+    #[inline]
+    pub(crate) async fn deallocate_retired_row_pages(
+        &self,
+        guards: &PoolGuards,
+        page_ids: &[PageID],
+    ) -> Result<()> {
+        let row_pool_guard = self.row_pool_guard(guards, "deallocate retired row pages")?;
+        for page_id in page_ids {
+            let page_guard = self
+                .mem_pool
+                .get_page::<RowPage>(row_pool_guard, *page_id, LatchFallbackMode::Exclusive)
+                .await?
+                .lock_exclusive_async()
+                .await
+                .ok_or_else(|| {
+                    Report::new(InternalError::RowPageMissing)
+                        .attach(format!("retired row page missing: page_id={page_id}"))
+                })?;
+            self.mem_pool.deallocate_page(page_guard);
+        }
+        Ok(())
+    }
+
     /// Lock an in-memory row page for shared access if it is present.
     #[inline]
     pub(crate) async fn get_row_page_shared(
@@ -318,18 +363,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         page_id: VersionedPageID,
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        let guard = self
-            .mem_pool()
-            .get_page_versioned::<RowPage>(
-                self.row_pool_guard(guards, "get versioned row page shared")?,
-                page_id,
-                LatchFallbackMode::Shared,
-            )
-            .await?;
-        Ok(match guard {
-            Some(guard) => guard.lock_shared_async().await,
-            None => None,
-        })
+        get_page_versioned_shared::<RowPage, _>(
+            self.mem_pool(),
+            self.row_pool_guard(guards, "get versioned row page shared")?,
+            page_id,
+        )
+        .await
     }
 
     /// Roll back one row undo record against hot row state or cold-row hooks.
@@ -493,6 +532,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     #[inline]
     pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
         self.blk_idx.cache_exclusive_insert_page(guard)
+    }
+
+    /// Cache an insert-page version for subsequent inserts.
+    #[inline]
+    pub(crate) fn cache_insert_page_version(&self, page_id: VersionedPageID) {
+        self.blk_idx.cache_insert_page_version(page_id)
     }
 
     /// Scans in-memory row pages at or above the current table pivot.
@@ -801,11 +846,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             let page_guard = self.get_insert_page(rt, row_count).await?;
             match inserter.insert_to_page(effects, page_guard, insert, undo_kind, index_branches) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
-                    rt.save_active_insert_page(
-                        self.table_id(),
-                        page_guard.versioned_page_id(),
-                        row_id,
-                    );
+                    rt.save_active_insert_page(self.table_id(), page_guard.versioned_page_id());
                     return Ok((row_id, page_guard));
                 }
                 InsertRowIntoPage::NoSpaceOrFrozen(ins, uk, ib) => {
@@ -824,11 +865,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_count: usize,
     ) -> Result<PageSharedGuard<RowPage>> {
         let guards = rt.pool_guards();
-        if let Some((page_id, row_id)) = rt.load_active_insert_page(self.table_id()) {
+        if let Some(page_id) = rt.load_active_insert_page(self.table_id()) {
             let page_guard = self.get_row_page_versioned_shared(guards, page_id).await?;
-            if let Some(page_guard) = page_guard
-                && validate_page_row_range(&page_guard, page_id.page_id, row_id)
-            {
+            if let Some(page_guard) = page_guard {
                 return Ok(page_guard);
             }
         }
@@ -4001,7 +4040,7 @@ mod tests {
             let err = mem_table.stale_block_index_leaf("test stale block-index");
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::Generic)
+                Some(InternalError::BlockIndexLeafStale)
             );
             let report = format!("{err:?}");
             assert!(report.contains("test stale block-index"), "{report}");
@@ -4153,7 +4192,7 @@ mod tests {
 
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::Generic)
+                Some(InternalError::PoolGuardMissing)
             );
         });
     }

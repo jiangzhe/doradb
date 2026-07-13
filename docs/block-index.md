@@ -182,6 +182,35 @@ That contract is:
 This keeps checkpoint publication crash-safe and lets readers observe a stable
 persisted snapshot without latching through long rewrite operations.
 
+### 7.4 Retired Hot-Prefix Reclamation
+
+Checkpoint publication does not immediately remove the corresponding hot
+`RowPageIndex` entries. A reader that captured the displaced table root can
+still use that root's pivot and hot scan until the checkpoint system CTS is
+strictly older than the oldest active snapshot.
+
+Each nonempty data checkpoint therefore carries one volatile retirement batch:
+the table id, the inclusive/exclusive RowID bounds of the canonical frozen
+prefix, and its row page ids in RowID order. Eligible transaction purge first
+finishes row-undo and secondary-index cleanup in every GC bucket. It then pins
+the live or retained-dropped table runtime, validates that the batch is exactly
+the current index left prefix, unlinks it, and only then deallocates the returned
+row pages. The insert free list stores `VersionedPageID` values;
+lookups consume entries lazily and reject missing or recycled page generations,
+so prefix pruning does not mutate that cache.
+
+Prefix pruning is specialized for the append-only RowID lifecycle. It compacts
+the first surviving leaf and its left-spine ancestors, detaches fully covered
+left subtrees, reclaims detached metadata nodes, and repeatedly collapses a
+single-child fixed root. Removing all entries leaves the allocated fixed root
+as an empty height-zero leaf starting at the retired range end. It does not
+borrow, merge, or redistribute siblings, so it creates at most one sparse left
+fringe per level while leaving complete surviving subtrees unchanged.
+
+Batch shape or mapping mismatch is detected before structural mutation. After
+mutation begins, metadata reclamation failure is fatal; physical row-page
+access or deallocation failure is a separate fatal deallocation boundary.
+
 ## 8. Recovery
 
 Recovery rebuilds block index from the same hot/cold split.
@@ -215,6 +244,9 @@ same redo that rebuilds hot table state.
   side structure, because it is part of the durable cold-row routing contract.
 - LWC blocks and block index have distinct responsibilities: values live in LWC
   blocks, while cold-row routing and cold-row identity live in block index.
+- Checkpoint-retired hot entries remain available until ordered transaction
+  purge proves old-root readers have drained, then exact left-prefix pruning
+  unlinks them before their row pages are deallocated.
 
 ## 10. Summary
 

@@ -787,7 +787,6 @@ impl<T: 'static> PageExclusiveGuard<T> {
 
     /// Returns the logical page id plus captured frame generation.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn versioned_page_id(&self) -> VersionedPageID {
         VersionedPageID {
             page_id: self.page_id(),

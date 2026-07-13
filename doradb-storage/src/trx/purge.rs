@@ -1,12 +1,11 @@
 use crate::buffer::guard::PageSharedGuard;
-use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
+use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{
     Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, is_catalog_table,
 };
 use crate::error::{FatalError, InternalError, Result};
 use crate::file::table_file::OldRoot;
-use crate::id::{PageID, TrxID};
-use crate::latch::LatchFallbackMode;
+use crate::id::TrxID;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
@@ -16,7 +15,7 @@ use crate::thread;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
-use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS};
+use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, RetiredRowPageBatch};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
@@ -301,158 +300,173 @@ impl TransactionSystem {
         guards: &PoolGuards,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
-    ) -> Result<FastHashSet<PageID>> {
-        let res: Result<FastHashSet<PageID>> = async {
-            let mut table_cache = TableCache::new(catalog);
-            let purge_trx_count = trx_list.len();
-            let mut purge_row_count = 0;
-            let mut purge_index_count = 0;
-            // First, purge row undo logs by versioned page identity.
-            for trx in &trx_list {
-                if let Some(row_undo) = trx.row_undo() {
-                    purge_row_count += row_undo.len();
-                    for undo in &**row_undo {
-                        if is_catalog_table(undo.table_id) {
-                            let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
-                                continue;
-                            };
-                            let page_guard = if let Some(page_id) = undo.page_id {
-                                table.get_row_page_versioned_shared(guards, page_id).await?
-                            } else {
-                                None
-                            };
-                            let Some(page_guard) = page_guard else {
-                                continue;
-                            };
-                            purge_undo_chain_from_page(page_guard, undo, min_active_sts);
-                        } else {
-                            let Some(table) = table_cache.get_user_table(undo.table_id).await
-                            else {
-                                continue;
-                            };
-                            let page_guard = if let Some(page_id) = undo.page_id {
-                                table
-                                    .mem
-                                    .get_row_page_versioned_shared(guards, page_id)
-                                    .await?
-                            } else {
-                                None
-                            };
-                            let Some(page_guard) = page_guard else {
-                                promote_delete_marker_if_needed(table, undo);
-                                continue;
-                            };
-                            purge_undo_chain_from_page(page_guard, undo, min_active_sts);
-                        }
-                    }
-                }
-            }
-
-            // Second, we purge index.
-            for trx in &trx_list {
-                if let Some(index_gc) = trx.index_gc() {
-                    for ip in index_gc {
-                        if is_catalog_table(ip.table_id) {
-                            let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
-                                continue;
-                            };
-                            if table
-                                .delete_index(
-                                    guards,
-                                    ip.key.index_no,
-                                    &ip.key.vals,
-                                    ip.row_id,
-                                    ip.unique,
-                                    min_active_sts,
-                                )
-                                .await?
-                            {
-                                purge_index_count += 1;
-                            }
-                        } else {
-                            let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await
-                            else {
-                                continue;
-                            };
-                            if table
-                                .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
-                                .await?
-                            {
-                                purge_index_count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            let mut gc_row_pages = FastHashSet::default();
-            for trx in &trx_list {
-                if let Some(pages) = trx.gc_row_pages() {
-                    gc_row_pages.extend(pages.iter().copied());
-                }
-            }
-
-            drop(trx_list);
-
-            self.redo_log
-                .stats
-                .purge_trx_count
-                .fetch_add(purge_trx_count, Ordering::Relaxed);
-            self.redo_log
-                .stats
-                .purge_row_count
-                .fetch_add(purge_row_count, Ordering::Relaxed);
-            self.redo_log
-                .stats
-                .purge_index_count
-                .fetch_add(purge_index_count, Ordering::Relaxed);
-            Ok(gc_row_pages)
-        }
-        .await;
-        match res {
-            Ok(gc_row_pages) => Ok(gc_row_pages),
+    ) -> Result<Vec<RetiredRowPageBatch>> {
+        match self
+            .purge_trx_list_inner(catalog, guards, trx_list, min_active_sts)
+            .await
+        {
+            Ok(retired_row_pages) => Ok(retired_row_pages),
             Err(_) => Err(self.poison_engine(FatalError::PurgeAccess).into()),
         }
     }
 
-    #[inline]
-    async fn deallocate_gc_row_pages(
+    async fn purge_trx_list_inner(
         &self,
-        mem_pool: &EvictableBufferPool,
+        catalog: &Catalog,
         guards: &PoolGuards,
-        gc_row_pages: FastHashSet<PageID>,
-    ) -> Result<()> {
-        for page_id in gc_row_pages {
-            let page_guard = mem_pool
-                .get_page::<RowPage>(guards.mem_guard(), page_id, LatchFallbackMode::Exclusive)
-                .await?
-                .lock_exclusive_async()
-                .await
-                .unwrap();
-            mem_pool.deallocate_page(page_guard);
-        }
-        Ok(())
-    }
-
-    /// Deallocate retired row pages, poisoning storage on failure.
-    ///
-    /// Returns `false` only after publishing `FatalError::PurgeDeallocate`.
-    #[inline]
-    async fn deallocate_gc_row_pages_or_poison(
-        &self,
-        mem_pool: &EvictableBufferPool,
-        guards: &PoolGuards,
-        gc_row_pages: FastHashSet<PageID>,
-    ) -> bool {
-        match self
-            .deallocate_gc_row_pages(mem_pool, guards, gc_row_pages)
-            .await
-        {
-            Ok(()) => true,
-            Err(_) => {
-                let _ = self.poison_engine(FatalError::PurgeDeallocate);
-                false
+        trx_list: Vec<CommittedTrx>,
+        min_active_sts: TrxID,
+    ) -> Result<Vec<RetiredRowPageBatch>> {
+        let mut table_cache = TableCache::new(catalog);
+        let purge_trx_count = trx_list.len();
+        let mut purge_row_count = 0;
+        let mut purge_index_count = 0;
+        // First, purge row undo logs by versioned page identity.
+        for trx in &trx_list {
+            if let Some(row_undo) = trx.row_undo() {
+                purge_row_count += row_undo.len();
+                for undo in &**row_undo {
+                    if is_catalog_table(undo.table_id) {
+                        let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
+                            continue;
+                        };
+                        let page_guard = if let Some(page_id) = undo.page_id {
+                            table.get_row_page_versioned_shared(guards, page_id).await?
+                        } else {
+                            None
+                        };
+                        let Some(page_guard) = page_guard else {
+                            continue;
+                        };
+                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
+                    } else {
+                        let Some(table) = table_cache.get_user_table(undo.table_id).await else {
+                            continue;
+                        };
+                        let page_guard = if let Some(page_id) = undo.page_id {
+                            table
+                                .mem
+                                .get_row_page_versioned_shared(guards, page_id)
+                                .await?
+                        } else {
+                            None
+                        };
+                        let Some(page_guard) = page_guard else {
+                            promote_delete_marker_if_needed(table, undo);
+                            continue;
+                        };
+                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
+                    }
+                }
             }
         }
+
+        // Second, we purge index.
+        for trx in &trx_list {
+            if let Some(index_gc) = trx.index_gc() {
+                for ip in index_gc {
+                    if is_catalog_table(ip.table_id) {
+                        let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
+                            continue;
+                        };
+                        if table
+                            .delete_index(
+                                guards,
+                                ip.key.index_no,
+                                &ip.key.vals,
+                                ip.row_id,
+                                ip.unique,
+                                min_active_sts,
+                            )
+                            .await?
+                        {
+                            purge_index_count += 1;
+                        }
+                    } else {
+                        let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await else {
+                            continue;
+                        };
+                        if table
+                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                            .await?
+                        {
+                            purge_index_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let retired_row_pages = trx_list
+            .into_iter()
+            .filter_map(CommittedTrx::into_retired_row_pages)
+            .collect();
+
+        self.redo_log
+            .stats
+            .purge_trx_count
+            .fetch_add(purge_trx_count, Ordering::Relaxed);
+        self.redo_log
+            .stats
+            .purge_row_count
+            .fetch_add(purge_row_count, Ordering::Relaxed);
+        self.redo_log
+            .stats
+            .purge_index_count
+            .fetch_add(purge_index_count, Ordering::Relaxed);
+        Ok(retired_row_pages)
+    }
+
+    #[inline]
+    async fn process_retired_row_pages(
+        &self,
+        catalog: &Catalog,
+        guards: &PoolGuards,
+        retired_row_pages: Vec<RetiredRowPageBatch>,
+    ) -> bool {
+        for batch in retired_row_pages {
+            let Some(table) = catalog.pin_user_table_for_purge(batch.table_id) else {
+                let _ = self.poison_engine_with_context(
+                    FatalError::PurgeAccess,
+                    "purge",
+                    format!(
+                        "checkpoint retirement runtime missing: table_id={}, start_row_id={}, end_row_id={}",
+                        batch.table_id, batch.start_row_id, batch.end_row_id
+                    ),
+                );
+                return false;
+            };
+            let page_ids = match table.mem.unlink_retired_row_pages(guards, &batch).await {
+                Ok(page_ids) if page_ids.as_ref() == batch.page_ids.as_ref() => page_ids,
+                Ok(_) | Err(_) => {
+                    let _ = self.poison_engine_with_context(
+                        FatalError::PurgeAccess,
+                        "purge",
+                        format!(
+                            "checkpoint retirement prefix unlink failed: table_id={}, start_row_id={}, end_row_id={}",
+                            batch.table_id, batch.start_row_id, batch.end_row_id
+                        ),
+                    );
+                    return false;
+                }
+            };
+            if table
+                .mem
+                .deallocate_retired_row_pages(guards, &page_ids)
+                .await
+                .is_err()
+            {
+                let _ = self.poison_engine_with_context(
+                    FatalError::PurgeDeallocate,
+                    "purge",
+                    format!(
+                        "checkpoint retirement row-page deallocation failed: table_id={}, start_row_id={}, end_row_id={}",
+                        batch.table_id, batch.start_row_id, batch.end_row_id
+                    ),
+                );
+                return false;
+            }
+        }
+        true
     }
 
     #[inline]
@@ -854,13 +868,13 @@ struct PurgeTask {
     gc_no: usize,
     min_active_sts: TrxID,
     done: Sender<Result<()>>,
-    gc_row_pages: Arc<Mutex<Vec<PageID>>>,
+    retired_row_pages: Arc<Mutex<Vec<RetiredRowPageBatch>>>,
 }
 
 trait PurgeLoop {
     async fn purge_loop(
         &mut self,
-        mem_pool: &EvictableBufferPool,
+        _mem_pool: &EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
         pool_guards: PoolGuards,
@@ -876,7 +890,7 @@ impl PurgeLoop for PurgeSingleThreaded {
     #[inline]
     async fn purge_loop(
         &mut self,
-        mem_pool: &EvictableBufferPool,
+        _mem_pool: &EvictableBufferPool,
         catalog: &Catalog,
         trx_sys: &TransactionSystem,
         pool_guards: PoolGuards,
@@ -896,23 +910,21 @@ impl PurgeLoop for PurgeSingleThreaded {
                 // row pages once all bucket lists have been collected. System
                 // GC handoffs can require this observation without advancing
                 // the active-snapshot horizon.
-                let mut gc_row_pages = FastHashSet::default();
                 let mut trx_list = vec![];
                 for gc_bucket in &trx_sys.gc_buckets {
                     gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                 }
-                let bucket_gc_pages = match trx_sys
+                let retired_row_pages = match trx_sys
                     .purge_trx_list(catalog, &pool_guards, trx_list, curr_sts)
                     .await
                 {
-                    Ok(gc_pages) => gc_pages,
+                    Ok(retired_row_pages) => retired_row_pages,
                     Err(_) => return,
                 };
-                gc_row_pages.extend(bucket_gc_pages);
-                let deallocated = trx_sys
-                    .deallocate_gc_row_pages_or_poison(mem_pool, &pool_guards, gc_row_pages)
-                    .await;
-                if !deallocated {
+                if !trx_sys
+                    .process_retired_row_pages(catalog, &pool_guards, retired_row_pages)
+                    .await
+                {
                     // Runtime admission is already poisoned. Exiting the loop
                     // leaves shutdown to join this already-finished worker.
                     return;
@@ -947,7 +959,7 @@ impl PurgeLoop for PurgeDispatcher {
     #[inline]
     async fn purge_loop(
         &mut self,
-        mem_pool: &EvictableBufferPool,
+        _mem_pool: &EvictableBufferPool,
         _catalog: &Catalog,
         trx_sys: &TransactionSystem,
         pool_guards: PoolGuards,
@@ -968,13 +980,13 @@ impl PurgeLoop for PurgeDispatcher {
                 // dispatch tasks to executors
                 let (done_tx, done_rx) = flume::unbounded();
                 let mut expected_tasks = 0usize;
-                let gc_row_pages = Arc::new(Mutex::new(vec![]));
+                let retired_row_pages = Arc::new(Mutex::new(vec![]));
                 for gc_no in 0..trx_sys.gc_buckets.len() {
                     let task = PurgeTask {
                         gc_no,
                         min_active_sts: curr_sts,
                         done: done_tx.clone(),
-                        gc_row_pages: Arc::clone(&gc_row_pages),
+                        retired_row_pages: Arc::clone(&retired_row_pages),
                     };
                     self.0[dispatch_no % self.0.len()].send(task).expect(
                         "purge executor receiver must stay alive while dispatcher owns sender",
@@ -992,14 +1004,14 @@ impl PurgeLoop for PurgeDispatcher {
                         Err(_) => break 'DISPATCH_LOOP,
                     }
                 }
-                let gc_row_pages = {
-                    let mut g = gc_row_pages.lock();
-                    g.drain(..).collect::<FastHashSet<PageID>>()
+                let retired_row_pages = {
+                    let mut g = retired_row_pages.lock();
+                    g.drain(..).collect::<Vec<_>>()
                 };
-                let deallocated = trx_sys
-                    .deallocate_gc_row_pages_or_poison(mem_pool, &pool_guards, gc_row_pages)
-                    .await;
-                if !deallocated {
+                if !trx_sys
+                    .process_retired_row_pages(&trx_sys.catalog, &pool_guards, retired_row_pages)
+                    .await
+                {
                     // Poison is the durable-consistency boundary here. The
                     // dispatcher exits; once the worker closure drops the
                     // dispatcher value, executor task channels close and
@@ -1052,7 +1064,7 @@ impl PurgeExecutor {
             gc_no,
             min_active_sts,
             done,
-            gc_row_pages,
+            retired_row_pages,
         }) = purge_chan.recv()
         {
             let mut trx_list = vec![];
@@ -1062,9 +1074,9 @@ impl PurgeExecutor {
                 .purge_trx_list(catalog, &pool_guards, trx_list, min_active_sts)
                 .await;
             match res {
-                Ok(gc_pages) => {
-                    if !gc_pages.is_empty() {
-                        gc_row_pages.lock().extend(gc_pages);
+                Ok(batches) => {
+                    if !batches.is_empty() {
+                        retired_row_pages.lock().extend(batches);
                     }
                     let _ = done.send(Ok(()));
                 }
@@ -1129,13 +1141,13 @@ fn purge_undo_chain_from_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::page::{Page, VersionedPageID};
+    use crate::buffer::page::VersionedPageID;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, Result};
-    use crate::id::{RowID, TableID};
+    use crate::id::{PageID, RowID, TableID};
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
@@ -1143,6 +1155,7 @@ mod tests {
     use crate::table::tests::bound_unique_index;
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::stmt::Statement;
+    use crate::trx::sys_trx::retirement_gc_no;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus, SysTrxPayload};
     use crate::value::Val;
@@ -1320,7 +1333,12 @@ mod tests {
             cts: TrxID::new(10),
             payload: Some(CommittedTrxPayload::System(SysTrxPayload {
                 gc_no: 0,
-                gc_row_pages: vec![PageID::new(19)],
+                retired_row_pages: RetiredRowPageBatch::new(
+                    TableID::new(7),
+                    RowID::new(3),
+                    RowID::new(11),
+                    vec![PageID::new(19)].into_boxed_slice(),
+                ),
             })),
         };
         assert!(bucket.record_committed_for_purge(vec![committed]));
@@ -1333,7 +1351,51 @@ mod tests {
         bucket.get_purge_list(TrxID::new(11), &mut purge);
         assert_eq!(purge.len(), 1);
         assert_eq!(purge[0].sts(), None);
-        assert_eq!(purge[0].gc_row_pages(), Some(&[PageID::new(19)][..]));
+        assert_eq!(
+            purge[0]
+                .retired_row_pages()
+                .map(|batch| batch.page_ids.as_ref()),
+            Some(&[PageID::new(19)][..])
+        );
+    }
+
+    #[test]
+    fn test_gc_bucket_preserves_same_table_retirement_order() {
+        let bucket = GCBucket::new();
+        let table_id = TableID::new(7);
+        let committed = [(10, 0, 10, 19), (11, 10, 20, 23)]
+            .into_iter()
+            .map(|(cts, start, end, page_id)| CommittedTrx {
+                cts: TrxID::new(cts),
+                payload: Some(CommittedTrxPayload::System(SysTrxPayload {
+                    gc_no: retirement_gc_no(table_id),
+                    retired_row_pages: RetiredRowPageBatch::new(
+                        table_id,
+                        RowID::new(start),
+                        RowID::new(end),
+                        vec![PageID::new(page_id)].into_boxed_slice(),
+                    ),
+                })),
+            })
+            .collect();
+        assert!(bucket.record_committed_for_purge(committed));
+
+        let mut purge = Vec::new();
+        bucket.get_purge_list(TrxID::new(12), &mut purge);
+        let ranges = purge
+            .into_iter()
+            .map(|trx| {
+                let batch = trx.into_retired_row_pages().unwrap();
+                (batch.start_row_id, batch.end_row_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            vec![
+                (RowID::new(0), RowID::new(10)),
+                (RowID::new(10), RowID::new(20)),
+            ]
+        );
     }
 
     #[test]
@@ -1411,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deallocate_gc_row_pages_or_poison_poisons_runtime() {
+    fn test_process_retired_row_pages_poisons_on_missing_runtime() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1437,31 +1499,24 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .deallocate_gc_row_pages_or_poison(
-                        &engine.inner().mem_pool,
-                        &guards,
-                        FastHashSet::default(),
-                    )
+                    .process_retired_row_pages(engine.catalog(), &guards, Vec::new())
                     .await
             );
             assert!(engine.inner().trx_sys.poison_error().is_none());
 
-            let raw_page = engine
-                .inner()
-                .mem_pool
-                .allocate_page::<Page>(guards.mem_guard())
-                .await
-                .unwrap();
-            let raw_page_id = raw_page.page_id();
-            drop(raw_page);
             assert!(
                 !engine
                     .inner()
                     .trx_sys
-                    .deallocate_gc_row_pages_or_poison(
-                        &engine.inner().mem_pool,
+                    .process_retired_row_pages(
+                        engine.catalog(),
                         &guards,
-                        FastHashSet::from_iter([raw_page_id]),
+                        vec![RetiredRowPageBatch::new(
+                            TableID::new(999_999),
+                            RowID::new(0),
+                            RowID::new(1),
+                            vec![PageID::new(1)].into_boxed_slice(),
+                        )],
                     )
                     .await
             );
@@ -1471,7 +1526,7 @@ mod tests {
                     .trx_sys
                     .poison_error()
                     .as_ref()
-                    .is_some_and(|err| *err.current_context() == FatalError::PurgeDeallocate)
+                    .is_some_and(|err| *err.current_context() == FatalError::PurgeAccess)
             );
             assert!(
                 engine
@@ -1479,7 +1534,7 @@ mod tests {
                     .trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
-                    .is_err_and(|err| *err.current_context() == FatalError::PurgeDeallocate)
+                    .is_err_and(|err| *err.current_context() == FatalError::PurgeAccess)
             );
         });
     }

@@ -30,6 +30,31 @@ column-store pivot, disappeared from the deletion buffer, or became cold. They
 are collectible only when rollback/index-undo obligations are gone and
 `Global_Min_STS` proves no active snapshot can require the old owner.
 
+## Checkpoint-Retired Row Pages
+
+A nonempty data checkpoint submits one ordered retirement batch for its exact
+hot RowID prefix. Its system CTS must be strictly older than `Global_Min_STS`
+before cleanup. Table-id-affine GC routing keeps successive batches for one
+table in one bucket FIFO, so purge does not sort, group, or coalesce them.
+
+Purge completes all eligible row-undo and secondary-index cleanup first. The
+coordinator then pins the identical table runtime from either live or
+retained-dropped catalog state and validates the batch against the current
+`RowPageIndex` left boundary, RowID end boundary, and ordered page mapping.
+Validation failure changes nothing and poisons storage with purge-access
+failure. Successful pruning removes complete left subtrees, compacts the first
+surviving fringe, collapses redundant fixed-root levels, reclaims detached
+metadata, and returns the exact retired ids. Physical row pages are deallocated
+only afterward and only from the ids returned by pruning; failure there poisons
+with the deallocation-specific fatal domain. The insert free list stores
+versioned page identities and lazily discards entries whose page was removed or
+recycled.
+
+Dropped-runtime destruction validates that no remaining hot-index entry begins
+below the captured pivot before deallocating any still-hot page. This makes a
+missed ordered checkpoint cleanup fatal instead of silently filtering stale
+entries and risking a leak or double deallocation.
+
 ## MemIndex Full-Scan Cleanup
 
 User-table secondary indexes use a hot `MemIndex` and a checkpointed cold
@@ -149,6 +174,8 @@ Use the narrowest proof owned by the component being collected:
 
 - transaction purge uses `Global_Min_STS` and undo/index-undo ownership
 - row-page GC uses row undo-chain visibility
+- checkpoint row-page retirement uses ordered system CTS plus exact hot-prefix
+  validation and unlink-before-deallocation
 - runtime unique-key links use the undo GC horizon
 - `MemIndex` cleanup uses captured checkpoint roots plus deletion proof
 - user-table table-file, LWC replacement, `ColumnBlockIndex`, and `DiskTree`

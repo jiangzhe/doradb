@@ -1,4 +1,5 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
+use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableColumnLayout;
 use crate::error::{Error, InternalError, Result};
@@ -6,7 +7,9 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
-use crate::index::row_page_index::{RowLocation, RowPageIndex, RowPageIndexMemCursor};
+use crate::index::row_page_index::{
+    RowLocation, RowPageIndex, RowPageIndexMemCursor, RowPagePrefixPrune,
+};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
@@ -105,6 +108,20 @@ impl<P: BufferPool> BlockIndex<P> {
             .await
     }
 
+    /// Unlinks one exact checkpoint-retired hot row-page prefix.
+    #[inline]
+    pub(crate) async fn prune_checkpoint_prefix(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        start_row_id: RowID,
+        end_row_id: RowID,
+        expected_page_ids: &[PageID],
+    ) -> Result<RowPagePrefixPrune> {
+        self.row
+            .prune_checkpoint_prefix(meta_pool_guard, start_row_id, end_row_id, expected_page_ids)
+            .await
+    }
+
     /// Returns a shared row page suitable for appending rows, recording redo when requested.
     #[inline]
     pub(crate) async fn try_get_insert_page_with_redo<B: BufferPool>(
@@ -180,6 +197,12 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
         self.row.cache_exclusive_insert_page(guard)
+    }
+
+    /// Returns an insert-page version to the in-memory free-list cache.
+    #[inline]
+    pub(crate) fn cache_insert_page_version(&self, page_id: VersionedPageID) {
+        self.row.cache_insert_page_version(page_id);
     }
 
     /// Creates a cursor to scan in-memory row-page-index leaves.
@@ -482,13 +505,16 @@ mod tests {
         }
 
         #[inline]
-        fn get_page_versioned<T: BufferPage>(
+        async fn get_page_versioned<T: BufferPage>(
             &self,
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send {
-            self.inner.get_page_versioned(guard, id, mode)
+        ) -> Result<Option<FacadePageGuard<T>>> {
+            if id.page_id == self.fail_page_id.load(Ordering::Acquire) {
+                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
+            }
+            self.inner.get_page_versioned(guard, id, mode).await
         }
 
         #[inline]

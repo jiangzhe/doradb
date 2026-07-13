@@ -457,8 +457,6 @@ pub(crate) struct TransactionSystem {
     purge_handoff_cts: CachePadded<MonotonicU64>,
     /// Round-robin user-transaction GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
-    /// Round-robin system-transaction GC number generator.
-    rr_sys_gc_no: CachePadded<AtomicUsize>,
     /// Active and completed transaction buckets used by purge.
     ///
     /// Split into multiple buckets to avoid a single global synchronization
@@ -528,7 +526,6 @@ impl TransactionSystem {
             #[cfg(test)]
             purge_handoff_cts: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
             rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
-            rr_sys_gc_no: CachePadded::new(AtomicUsize::new(0)),
             gc_buckets: gc_buckets.into_boxed_slice(),
             redo_log,
             config: CachePadded::new(config),
@@ -654,15 +651,6 @@ impl TransactionSystem {
     #[inline]
     fn next_gc_no(&self) -> usize {
         self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
-    }
-
-    /// Returns the next system-transaction GC number.
-    ///
-    /// System transactions use an independent sequence because transactions
-    /// without purge payloads still reserve a bucket when they begin.
-    #[inline]
-    fn next_sys_gc_no(&self) -> usize {
-        self.rr_sys_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
     }
 
     /// Returns the minimum active snapshot timestamp across all GC buckets.
@@ -966,9 +954,8 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn begin_sys_trx(&self) -> SysTrx {
         SysTrx {
-            gc_no: self.next_sys_gc_no(),
             redo: RedoLogs::default(),
-            gc_row_pages: Vec::new(),
+            retired_row_pages: None,
         }
     }
 
@@ -1007,10 +994,10 @@ impl TransactionSystem {
     pub(crate) fn commit_sys(&self, trx: SysTrx) -> Result<TrxID> {
         self.ensure_runtime_healthy()?;
         if trx.redo.is_empty() {
-            if !trx.gc_row_pages.is_empty() {
+            if trx.retired_row_pages.is_some() {
                 return Err(Error::from(
-                    Report::new(InternalError::Generic)
-                        .attach("system GC pages require recovery-visible redo"),
+                    Report::new(InternalError::SystemTransactionRedoMissing)
+                        .attach("system row-page retirement requires recovery-visible redo"),
                 ));
             }
             // System transaction does not hold any active start timestamp
@@ -1566,7 +1553,7 @@ pub(crate) mod tests {
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::recovery::stream::RedoSegmentCtsRange;
     use crate::session::tests::SessionTestExt;
-    use crate::trx::SharedTrxStatus;
+    use crate::trx::{RetiredRowPageBatch, SharedTrxStatus};
     use crate::value::Val;
     use std::sync::{Arc, Barrier, OnceLock};
     use std::thread::spawn;
@@ -2019,7 +2006,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_sys_trx_uses_independent_gc_sequence() {
+    fn test_sys_trx_without_retirement_does_not_perturb_user_gc_sequence() {
         smol::block_on(async {
             let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
                 "sys_trx_gc_sequence",
@@ -2028,15 +2015,10 @@ pub(crate) mod tests {
             .await;
             let trx_sys = &engine.inner().trx_sys;
             let user_gc_no = trx_sys.rr_gc_no.load(Ordering::Relaxed);
-            let sys_gc_no = trx_sys.rr_sys_gc_no.load(Ordering::Relaxed);
+            let _first = trx_sys.begin_sys_trx();
+            let _second = trx_sys.begin_sys_trx();
 
-            let first = trx_sys.begin_sys_trx();
-            let second = trx_sys.begin_sys_trx();
-
-            assert_eq!(first.gc_no, sys_gc_no % GC_BUCKETS);
-            assert_eq!(second.gc_no, (sys_gc_no + 1) % GC_BUCKETS);
             assert_eq!(trx_sys.rr_gc_no.load(Ordering::Relaxed), user_gc_no);
-            assert_eq!(trx_sys.rr_sys_gc_no.load(Ordering::Relaxed), sys_gc_no + 2);
         });
     }
 
@@ -2049,11 +2031,16 @@ pub(crate) mod tests {
             )
             .await;
             let mut sys_trx = engine.inner().trx_sys.begin_sys_trx();
-            sys_trx.extend_gc_row_pages(vec![PageID::new(46)]);
+            sys_trx.retire_row_pages(RetiredRowPageBatch::new(
+                TableID::new(3),
+                RowID::new(0),
+                RowID::new(1),
+                vec![PageID::new(46)].into_boxed_slice(),
+            ));
             let err = engine.inner().trx_sys.commit_sys(sys_trx).unwrap_err();
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::Generic)
+                Some(InternalError::SystemTransactionRedoMissing)
             );
             engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
         });

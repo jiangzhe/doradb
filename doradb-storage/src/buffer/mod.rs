@@ -36,7 +36,7 @@ pub(crate) use readonly::{ReadSubmission, ReadonlyWriteLease, begin_write_barrie
 pub(crate) use readonly::{ReadonlyBlockGuard, ReadonlyBufferPool};
 
 use crate::DiskPool;
-use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
+use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::{BufferPage, VersionedPageID};
 use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
@@ -247,6 +247,22 @@ pub(crate) trait BufferPool: Send + Sync {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send;
+}
+
+/// Locks a specific page version for shared access if it is still present.
+#[inline]
+pub(crate) async fn get_page_versioned_shared<T: BufferPage, B: BufferPool>(
+    pool: &B,
+    guard: &PoolGuard,
+    id: VersionedPageID,
+) -> Result<Option<PageSharedGuard<T>>> {
+    let Some(guard) = pool
+        .get_page_versioned::<T>(guard, id, LatchFallbackMode::Shared)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(guard.lock_shared_async().await)
 }
 
 impl Component for MetaPool {
