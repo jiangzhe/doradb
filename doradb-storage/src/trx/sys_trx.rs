@@ -1,4 +1,3 @@
-use super::sys::GC_BUCKETS;
 use crate::buffer::PoolGuards;
 use crate::catalog::{Catalog, SilentWatermarkObject};
 use crate::error::{Error, InternalError, Result};
@@ -174,10 +173,7 @@ impl SysTrx {
         PreparedTrx {
             redo_bin,
             payload: self.retired_row_pages.take().map(|retired_row_pages| {
-                PreparedTrxPayload::System(SysTrxPayload {
-                    gc_no: retirement_gc_no(retired_row_pages.table_id),
-                    retired_row_pages,
-                })
+                PreparedTrxPayload::System(SysTrxPayload { retired_row_pages })
             }),
             attachment: None,
             lock_manager: None,
@@ -188,7 +184,6 @@ impl SysTrx {
 
 /// System transaction GC payload carried unchanged through ordered commit.
 pub(crate) struct SysTrxPayload {
-    pub(super) gc_no: usize,
     pub(super) retired_row_pages: RetiredRowPageBatch,
 }
 
@@ -201,8 +196,9 @@ impl SysTrxPayload {
 
 /// Returns the deterministic GC bucket for one table's retirement payloads.
 #[inline]
-pub(crate) fn retirement_gc_no(table_id: TableID) -> usize {
-    (table_id.as_u64() % GC_BUCKETS as u64) as usize
+pub(crate) fn retirement_gc_no(table_id: TableID, gc_buckets: usize) -> usize {
+    debug_assert!(gc_buckets > 0);
+    (table_id.as_u64() % gc_buckets as u64) as usize
 }
 
 #[cfg(test)]
@@ -225,11 +221,8 @@ mod tests {
         let mut prepared = sys_trx.prepare();
         assert!(matches!(
             prepared.payload.as_ref(),
-            Some(PreparedTrxPayload::System(SysTrxPayload {
-                gc_no,
-                retired_row_pages,
-            })) if *gc_no == retirement_gc_no(TableID::new(7))
-                && retired_row_pages.page_ids.as_ref() == [PageID::new(17)]
+            Some(PreparedTrxPayload::System(SysTrxPayload { retired_row_pages }))
+                if retired_row_pages.page_ids.as_ref() == [PageID::new(17)]
         ));
         prepared.redo_bin.take();
         prepared.payload.take();
@@ -238,12 +231,13 @@ mod tests {
     #[test]
     fn test_retirement_gc_no_is_table_affine() {
         let table_id = TableID::new(91);
-        assert_eq!(retirement_gc_no(table_id), retirement_gc_no(table_id));
         assert_eq!(
-            retirement_gc_no(table_id),
-            retirement_gc_no(TableID::new(
-                table_id.as_u64() + super::super::sys::GC_BUCKETS as u64,
-            ))
+            retirement_gc_no(table_id, 32),
+            retirement_gc_no(table_id, 32)
+        );
+        assert_eq!(
+            retirement_gc_no(table_id, 32),
+            retirement_gc_no(TableID::new(table_id.as_u64() + 32,), 32)
         );
     }
 }

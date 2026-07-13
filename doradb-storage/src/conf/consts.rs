@@ -51,5 +51,7 @@ pub const DEFAULT_LOG_FILE_STEM: &str = "redo.log";
 pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024);
 /// Default durability mode used when flushing redo-log writes.
 pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
-/// Default number of background purge threads.
+/// Default number of purge-bucket worker threads, including the dispatcher-worker.
 pub const DEFAULT_PURGE_THREADS: usize = 2;
+/// Default number of transaction GC buckets.
+pub const DEFAULT_GC_BUCKETS: usize = 32;

@@ -483,11 +483,24 @@ $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
 Each nonempty data checkpoint collapses its canonical frozen prefix into one
 volatile `RetiredRowPageBatch`: table id, inclusive/exclusive RowID bounds, and
 ordered row page ids. It travels in the committed `System` payload through the
-table-affine normal GC bucket. The payload has no STS to unregister; its ordered
-system CTS is the reclamation fence. A purge round completes eligible row-undo
-and index cleanup in every bucket before the coordinator validates and unlinks
-each exact hot-index prefix and deallocates its returned pages, preserving
-cross-bucket undo references.
+table-affine normal GC bucket. The bucket is computed at ordered handoff as
+`table_id % gc_buckets`, using the current engine's runtime configuration; no
+bucket identity is persisted in redo or checkpoint state. The payload has no
+STS to unregister; its ordered
+system CTS is the reclamation fence. Newly recorded system payloads coalesce
+their minimum CTS and become selectable only when that CTS is strictly older
+than the freshly scanned active horizon. A payload that is equal to or newer
+than the horizon stays queued without forcing an empty round. Later active
+blocker progress or an explicit observation makes it eligible without a
+persistent checkpoint-specific force flag.
+
+An eligible system payload always runs row-undo and index cleanup in every GC
+bucket before the coordinator validates and unlinks each exact hot-index prefix
+and deallocates its returned pages, preserving cross-bucket undo references.
+When eligibility occurs at an unchanged completed horizon, this system-only
+round does not repeat retained-root or dropped-table housekeeping and does not
+republish completed progress. At a genuinely newer horizon it participates in
+the complete horizon cycle.
 
 The retirement batch is not redo and does not change persistent formats.
 Recovery loads the durable pivot and cold block-index root, then constructs a
@@ -495,11 +508,13 @@ fresh empty hot `RowPageIndex` beginning at that pivot; it never replays runtime
 prefix deletion.
 
 Maintenance exposes two deliberately different progress boundaries. The
-purge-published GC horizon advances immediately after purge observes the oldest
-active snapshot and is the boundary used for checkpoint cutoff/readiness.
-Completed-purge progress advances only after eligible undo/index cleanup,
-retired-page deallocation, retained-root processing, and coalesced cleanup work
-finish. `wait_for_gc_horizon_after` and
+purge-published GC horizon advances immediately after purge freshly scans the
+oldest active snapshot and is the boundary used for checkpoint
+cutoff/readiness. It may advance even when a causal active transition does not
+cross the global blocker and no transaction-GC round is planned.
+Completed-purge progress advances only after all-bucket undo/index cleanup,
+retired-page deallocation, retained-root processing, and dropped-table work in
+a genuinely newer horizon cycle finish. `wait_for_gc_horizon_after` and
 `wait_for_purge_completion_after` both use strict `> ts` semantics and request
 one coalescible purge observation before sleeping. Tests of accepted no-wait
 checkpoint system work first observe its ordered purge handoff, then use

@@ -481,7 +481,7 @@ impl Session {
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon).await
     }
 
-    /// Wait for completed full-purge progress to become strictly newer.
+    /// Wait for completed purge-horizon-cycle progress to become strictly newer.
     ///
     /// The returned boundary is published only after eligible undo/index,
     /// retired-page, retained-root, and coalesced cleanup work completes.

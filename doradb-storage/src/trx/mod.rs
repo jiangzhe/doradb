@@ -2101,12 +2101,17 @@ impl CommittedTrx {
         }
     }
 
-    /// Returns gc_no if this transaction is GC-aware.
+    /// Returns the runtime GC bucket if this transaction carries purge work.
+    ///
+    /// User payloads retain their begin-time bucket. System retirement payloads
+    /// derive a table-affine bucket from the supplied runtime bucket count.
     #[inline]
-    pub(crate) fn gc_no(&self) -> Option<usize> {
+    pub(crate) fn gc_no(&self, gc_buckets: usize) -> Option<usize> {
         self.payload.as_ref().map(|payload| match payload {
             CommittedTrxPayload::User { gc_no, .. } => *gc_no,
-            CommittedTrxPayload::System(payload) => payload.gc_no,
+            CommittedTrxPayload::System(payload) => {
+                sys_trx::retirement_gc_no(payload.retired_row_pages.table_id, gc_buckets)
+            }
         })
     }
 
@@ -2582,7 +2587,7 @@ pub(crate) mod tests {
 
     #[inline]
     fn finish_production_committed_for_test(engine: &Engine, committed: CommittedTrx) {
-        if let Some(gc_no) = committed.gc_no() {
+        if let Some(gc_no) = committed.gc_no(engine.inner().trx_sys.gc_buckets.len()) {
             engine.inner().trx_sys.gc_buckets[gc_no].record_committed_for_purge(vec![committed]);
         }
     }

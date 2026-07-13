@@ -18,6 +18,23 @@ Purge removes runtime-only obligations:
 - delete overlays created by transaction cleanup when the row/deletion proof is
 available
 
+Finishing a transaction reports a causal bucket-minimum transition: the
+minimum before removal and the finite minimum or no-active state afterward.
+Purge coalesces the minimum original STS but calculates the current global
+horizon from the authoritative bucket atomics and timestamp upper bound. An
+active transition launches all-bucket transaction GC only when its original
+STS is strictly below a genuinely newer current horizon. A later bucket moving
+behind a long-lived global blocker therefore defers its queued committed work
+until the blocker itself finishes or an explicit later observation makes the
+prefix eligible.
+
+System payload arrival is an independent scheduling input. The minimum newly
+recorded system CTS forces all-bucket transaction GC only when
+`system_cts < Global_Min_STS`. If the completed horizon is unchanged, that
+round does not repeat retained-root or dropped-table housekeeping and does not
+advance completed progress. If the horizon is newer, the same payload joins a
+complete horizon cycle.
+
 ## Row-Page Undo GC
 
 Row-page undo-chain GC is local to the row page and keeps historical versions
@@ -36,6 +53,22 @@ A nonempty data checkpoint submits one ordered retirement batch for its exact
 hot RowID prefix. Its system CTS must be strictly older than `Global_Min_STS`
 before cleanup. Table-id-affine GC routing keeps successive batches for one
 table in one bucket FIFO, so purge does not sort, group, or coalesce them.
+
+`gc_buckets` sets the runtime sharding width. It defaults to 32 and accepts
+powers of two from 1 through 256. User transactions are assigned round-robin;
+system retirement payloads are assigned at ordered commit handoff by
+`table_id % gc_buckets`, so successive batches for one table remain FIFO in one
+bucket. The value is fixed for one engine instance but is not persisted and
+does not require a storage migration when it changes between starts.
+
+Every required transaction-GC round covers all configured buckets. With
+`purge_threads = N`, one dispatcher is worker slot zero, `N - 1` executor
+threads own the other slots, and bucket `gc_no` is assigned to `gc_no % N`.
+With `N = 1`, the dispatcher executes every bucket locally without task or
+completion channels. With executors present, it enqueues all remote buckets
+before executing its local share. Each bucket returns its own ordered
+retirement batches; the dispatcher waits for every bucket, orders results by
+bucket, and only then starts physical retirement processing.
 
 Purge completes all eligible row-undo and secondary-index cleanup first. The
 coordinator then pins the identical table runtime from either live or

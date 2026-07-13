@@ -21,6 +21,8 @@ use crate::runtime;
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
+#[cfg(test)]
+use crate::trx::purge::PurgeTestHook;
 use crate::trx::purge::{DroppedTableFileCleanupQueue, GCBucket, Purge, TableRootQueue};
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
@@ -42,9 +44,6 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-
-/// Number of transaction GC buckets used to shard active/committed tracking.
-pub(crate) const GC_BUCKETS: usize = 64;
 
 /// In-memory catalog-safe redo segment progress from a published catalog checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,14 +442,17 @@ pub(crate) struct TransactionSystem {
     /// cts range: 1 to 1<<63
     pub(crate) ts: CachePadded<AtomicU64>,
     /// Global visible snapshot timestamp.
-    /// It's updated by purge coordination after cleaning out-of-date version chains.
+    ///
+    /// Purge coordination updates it only after a complete, genuinely newer
+    /// horizon cycle succeeds.
     ///
     /// Data associated with smaller timestamp will be always visible to all transactions.
     global_visible_sts: CachePadded<MonotonicU64>,
     /// Purge-published active transaction horizon.
     ///
-    /// This advances as soon as purge observes active-bucket progress. Unlike
-    /// `global_visible_sts`, it does not imply physical purge work has finished.
+    /// This advances as soon as purge freshly scans the authoritative active
+    /// buckets. Unlike `global_visible_sts`, it does not imply physical purge
+    /// work has finished or that the scan scheduled transaction GC.
     published_gc_horizon: CachePadded<MonotonicU64>,
     /// Highest ordered CTS whose committed payload has reached the purge queue.
     #[cfg(test)]
@@ -474,6 +476,9 @@ pub(crate) struct TransactionSystem {
     engine_poisoner: QuiescentGuard<EnginePoisoner>,
     /// Wakeup channel for purge coordination.
     pub(super) purge_tx: CachePadded<Sender<Purge>>,
+    /// Narrow per-engine purge scheduling hook for deterministic tests.
+    #[cfg(test)]
+    pub(super) purge_test_hook: CachePadded<Mutex<Option<PurgeTestHook>>>,
     /// Transaction cleanup queue for abandoned and mandatory rollback work.
     cleanup_tx: CachePadded<Sender<TrxCleanupMessage>>,
     /// Swapped table roots retained until post-publish readers drain.
@@ -512,7 +517,7 @@ impl TransactionSystem {
         queues: TransactionSystemQueues,
     ) -> Self {
         debug_assert!((MIN_SNAPSHOT_TS..MAX_SNAPSHOT_TS).contains(&initial_ts));
-        let gc_buckets: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
+        let gc_buckets: Vec<_> = (0..config.gc_buckets).map(|_| GCBucket::new()).collect();
         // Recovery can insert dropped-floor entries before purge queues exist.
         // Seed the advisory queue once so checkpoint-gated file cleanup resumes
         // without scanning the catalog map on every later purge wake.
@@ -533,6 +538,8 @@ impl TransactionSystem {
             table_fs,
             engine_poisoner,
             purge_tx: CachePadded::new(queues.purge_tx),
+            #[cfg(test)]
+            purge_test_hook: CachePadded::new(Mutex::new(None)),
             cleanup_tx: CachePadded::new(queues.cleanup_tx),
             table_roots: CachePadded::new(Mutex::new(TableRootQueue::default())),
             dropped_table_files: CachePadded::new(Mutex::new(dropped_table_files)),
@@ -650,7 +657,7 @@ impl TransactionSystem {
     /// It is used to evenly dispatch transactions to all GC buckets.
     #[inline]
     fn next_gc_no(&self) -> usize {
-        self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
+        self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % self.gc_buckets.len()
     }
 
     /// Returns the minimum active snapshot timestamp across all GC buckets.
@@ -1194,7 +1201,7 @@ impl TransactionSystem {
         self.published_gc_horizon.listen()
     }
 
-    /// Registers for completed full-purge advancement.
+    /// Registers for completed purge-horizon-cycle advancement.
     #[inline]
     pub(crate) fn purge_completion_listener(&self) -> EventListener {
         self.global_visible_sts.listen()
