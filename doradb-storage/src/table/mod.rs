@@ -12,6 +12,7 @@ mod persistence;
 mod recover;
 mod rollback;
 mod storage;
+pub use access::LazyRow;
 pub(crate) use access::*;
 pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
 use checkpoint_workflow::{FrozenPage, FrozenPageBatch, TableCheckpointWorkflow};
@@ -27,7 +28,7 @@ pub(crate) use lifecycle::TableTerminal;
 pub(crate) use lifecycle::{
     TableCheckpointRootMutationLease, TableDropDrain, TableLifecycle, TableMetadataChangeLease,
 };
-pub(crate) use mem_table::{MemTable, NoTrxUpsertChange};
+pub(crate) use mem_table::{MemTable, NoTrxUpsertChange, RowPageDescriptor};
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
 pub(crate) use storage::ColumnStorage;
@@ -37,7 +38,9 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
+use crate::error::{
+    DataIntegrityError, Error, InternalError, OperationError, OperationResult, Result,
+};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
@@ -46,7 +49,7 @@ use crate::index::{
 };
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol, UpdateIndex};
+use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
 use crate::trx::undo::{IndexBranch, RowUndoKind};
@@ -1015,19 +1018,10 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
 }
 
 #[inline]
-fn update_index_result_to_update_unique_mvcc(
-    res: UpdateIndex,
-    row_id: RowID,
-    error_context: &'static str,
-) -> Result<UpdateUniqueMvcc> {
-    match res {
-        UpdateIndex::Updated => Ok(UpdateUniqueMvcc::Updated(row_id)),
-        UpdateIndex::DuplicateKey => Err(Report::new(OperationError::DuplicateKey)
-            .attach(error_context)
-            .into()),
-        UpdateIndex::WriteConflict => Err(Report::new(OperationError::WriteConflict)
-            .attach(error_context)
-            .into()),
+fn index_mutation_reached_outcome(result: &OperationResult<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(report) => report.current_context() != &OperationError::IndexMutation,
     }
 }
 

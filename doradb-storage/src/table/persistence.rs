@@ -7,8 +7,8 @@ use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
-    ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, LifecycleError,
-    OperationError, Result,
+    ConfigError, DataIntegrityError, DataIntegrityResultExt, Error, ErrorKind, FatalError,
+    InternalError, LifecycleError, OperationError, Result,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
@@ -20,7 +20,7 @@ use crate::index::disk_tree::{
 use crate::index::{
     ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry,
 };
-use crate::lwc::{LwcBuilder, PersistedLwcBlock};
+use crate::lwc::LwcBuilder;
 use crate::obs;
 use crate::row::RowPage;
 use crate::session::SessionPin;
@@ -811,14 +811,13 @@ impl Table {
         let disk_pool_guard = disk_pool.pool_guard();
         // Decode the persisted LWC block once for this block group, then derive
         // all secondary delete keys from the selected row indexes.
-        let block = PersistedLwcBlock::load(
-            self.file().file_kind(),
-            self.file().sparse_file(),
-            disk_pool,
-            &disk_pool_guard,
-            entry.block_id(),
-        )
-        .await?;
+        let file_kind = self.file().file_kind();
+        let block_id = entry.block_id();
+        let persisted = self
+            .storage
+            .load_lwc_block(&disk_pool_guard, block_id)
+            .await?;
+        let block = persisted.block();
         if block.row_count() != row_ids.len()
             || block.row_shape_fingerprint() != entry.row_shape_fingerprint()
         {
@@ -881,11 +880,9 @@ impl Table {
             for sidecar_pos in 0..secondary_sidecar.indexes.len() {
                 let (index_no, key) = {
                     let active = &secondary_sidecar.indexes[sidecar_pos];
-                    let key = block.decode_row_values(
-                        metadata.col.as_ref(),
-                        row_idx,
-                        active.key_cols.as_ref(),
-                    )?;
+                    let key = block
+                        .decode_row_values(metadata.col.as_ref(), row_idx, active.key_cols.as_ref())
+                        .with_block_context(file_kind, "lwc-block", block_id)?;
                     (active.index_no, key)
                 };
                 secondary_sidecar.add_deleted_key_at(sidecar_pos, index_no, row_id, key)?;
@@ -1245,7 +1242,7 @@ impl Table {
     }
 
     /// Execute one user-table checkpoint attempt against table-owned workflow state.
-    pub(crate) async fn checkpoint(&self, session: SessionPin) -> Result<CheckpointOutcome> {
+    pub(crate) async fn checkpoint(&self, session: &SessionPin) -> Result<CheckpointOutcome> {
         let table_id = self.table_id();
         let result = match self.checkpoint_workflow.begin_checkpoint(&self.lifecycle) {
             Ok(mut attempt) => self.checkpoint_inner(session, &mut attempt).await,
@@ -1288,7 +1285,7 @@ impl Table {
 
     async fn checkpoint_inner(
         &self,
-        session: SessionPin,
+        session: &SessionPin,
         attempt: &mut CheckpointAttempt<'_>,
     ) -> Result<CheckpointOutcome> {
         let table_id = self.table_id();
@@ -1307,7 +1304,7 @@ impl Table {
             Ok(lease) => lease,
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
         };
-        if let Some(reason) = self.active_root_checkpoint_delay(&session) {
+        if let Some(reason) = self.active_root_checkpoint_delay(session) {
             return Ok(CheckpointOutcome::Delayed { reason });
         }
         let layout = self.layout_snapshot();
@@ -1982,7 +1979,8 @@ mod tests {
                 futures::poll!(drop_table.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert_checkpoint_workflow_closed(&table);
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
+            assert_eq!(table.checkpoint_workflow.state_name(), "Publishing");
 
             release_tx.send_async(()).await.unwrap();
             let outcome = checkpoint.await.unwrap();
@@ -3853,7 +3851,7 @@ mod tests {
             assert!(session.in_trx().unwrap());
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
-            assert!(format!("{err:?}").contains("checkpoint requires idle session"));
+            assert!(format!("{err:?}").contains("checkpoint table requires an idle session"));
             assert!(session.in_trx().unwrap());
 
             checkpoint_trx.rollback().await.unwrap();
@@ -4091,7 +4089,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_closes_reversible_checkpoint_without_waiting() {
+    fn test_drop_waits_for_reversible_checkpoint() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
@@ -4129,14 +4127,25 @@ mod tests {
             }
 
             let mut drop_session = engine.new_session().unwrap();
-            drop_session.drop_table(table_id).await.unwrap();
-            release_tx.send_async(()).await.unwrap();
+            let drop_table = drop_session.drop_table(table_id).fuse();
+            futures::pin_mut!(drop_table);
+            assert!(matches!(
+                futures::poll!(drop_table.as_mut()),
+                std::task::Poll::Pending
+            ));
             assert_eq!(
-                checkpoint.await.unwrap(),
-                CheckpointOutcome::Cancelled {
-                    reason: CheckpointCancelReason::TableDropped,
-                }
+                table_for_internal_assertion(&engine, table_id)
+                    .lifecycle
+                    .inspect_terminal(),
+                TableTerminal::Live
             );
+
+            release_tx.send_async(()).await.unwrap();
+            assert!(matches!(
+                checkpoint.await.unwrap(),
+                CheckpointOutcome::Published { .. }
+            ));
+            drop_table.await.unwrap();
         });
     }
 
@@ -4196,7 +4205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_closes_active_freeze_without_state_resurrection() {
+    fn test_drop_waits_for_active_freeze() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "drop-active-freeze").await;
@@ -4221,15 +4230,18 @@ mod tests {
             }
 
             let mut drop_session = engine.new_session().unwrap();
-            drop_session.drop_table(table_id).await.unwrap();
-            assert_checkpoint_workflow_closed(&table);
+            let drop_table = drop_session.drop_table(table_id).fuse();
+            futures::pin_mut!(drop_table);
+            assert!(matches!(
+                futures::poll!(drop_table.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
+            assert_eq!(table.checkpoint_workflow.state_name(), "Freezing");
+
             release_tx.send_async(()).await.unwrap();
-            assert_eq!(
-                freeze.await.unwrap(),
-                FreezeOutcome::Cancelled {
-                    reason: CheckpointCancelReason::TableDropped,
-                }
-            );
+            assert_freeze_created(freeze.await.unwrap());
+            drop_table.await.unwrap();
             assert_checkpoint_workflow_closed(&table);
         });
     }
@@ -4468,8 +4480,8 @@ mod tests {
                     futures::poll!(drop_table.as_mut()),
                     std::task::Poll::Pending
                 ));
-                assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
-                assert_checkpoint_workflow_closed(&table);
+                assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
+                assert_eq!(table.checkpoint_workflow.state_name(), "Transition");
 
                 release_tx.send_async(()).await.unwrap();
                 let outcome = checkpoint.await.unwrap();

@@ -1,8 +1,10 @@
 use super::ColumnDeletionBuffer;
-use crate::buffer::ReadonlyBufferPool;
+use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::error::{DataIntegrityError, Result};
 use crate::file::table_file::{ActiveRoot, TableFile};
+use crate::id::BlockID;
 use crate::index::SecondaryDiskTreeRuntime;
+use crate::lwc::PersistedLwcBlock;
 use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxReadProof;
 use error_stack::Report;
@@ -78,6 +80,23 @@ impl ColumnStorage {
     #[inline]
     pub(crate) fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
         &self.disk_pool
+    }
+
+    /// Loads one validated LWC block from this column storage.
+    #[inline]
+    pub(crate) async fn load_lwc_block(
+        &self,
+        disk_pool_guard: &PoolGuard,
+        block_id: BlockID,
+    ) -> Result<PersistedLwcBlock> {
+        PersistedLwcBlock::load(
+            self.file().file_kind(),
+            self.file().sparse_file(),
+            self.disk_pool(),
+            disk_pool_guard,
+            block_id,
+        )
+        .await
     }
 
     /// Returns the deletion buffer tracking persisted-row tombstones.

@@ -1,4 +1,4 @@
-use crate::id::RowID;
+use crate::id::{BlockID, RowID};
 use crate::io::{
     IOBackendFailure, IOBackendOperationKind, backend_failure, backend_operation_kind,
 };
@@ -17,8 +17,39 @@ use thiserror::Error as ThisError;
 pub type Result<T> = result::Result<T, Error>;
 /// Result carrying configuration-domain reports.
 pub(crate) type ConfigResult<T> = result::Result<T, Report<ConfigError>>;
+/// Result carrying operation-domain reports.
+pub(crate) type OperationResult<T> = result::Result<T, Report<OperationError>>;
+
+/// Fluent conversion from a data-integrity report to the storage error boundary.
+pub(crate) trait DataIntegrityResultExt<T> {
+    /// Attaches persisted-block identity and converts into the storage result type.
+    fn with_block_context(
+        self,
+        file_kind: FileKind,
+        block_kind: &str,
+        block_id: BlockID,
+    ) -> Result<T>;
+}
+
 /// Result carrying data-integrity-domain reports.
 pub(crate) type DataIntegrityResult<T> = result::Result<T, Report<DataIntegrityError>>;
+
+impl<T> DataIntegrityResultExt<T> for DataIntegrityResult<T> {
+    #[inline]
+    fn with_block_context(
+        self,
+        file_kind: FileKind,
+        block_kind: &str,
+        block_id: BlockID,
+    ) -> Result<T> {
+        self.map_err(|report| {
+            Error::from(report.attach(format!(
+                "file={file_kind}, block={block_kind}, block_id={block_id}"
+            )))
+        })
+    }
+}
+
 /// Result carrying lifecycle-domain reports.
 pub(crate) type LifecycleResult<T> = result::Result<T, Report<LifecycleError>>;
 /// Result carrying fatal-domain reports.
@@ -166,6 +197,8 @@ pub(crate) enum OperationError {
     TableAlreadyExists,
     #[error("index not found")]
     IndexNotFound,
+    #[error("index mutation failed")]
+    IndexMutation,
     #[error("existing transaction")]
     ExistingTransaction,
     #[error("not supported")]
@@ -250,6 +283,10 @@ pub(crate) enum InternalError {
     ReadonlyFrameLockMissing,
     #[error("row page missing")]
     RowPageMissing,
+    #[error("full-table update row-page identity mismatch")]
+    FullTableUpdatePageIdentityMismatch,
+    #[error("full-table update encountered transition page")]
+    FullTableUpdateTransitionPage,
     #[error("pool guard missing")]
     PoolGuardMissing,
     #[error("disk pool guard missing")]
@@ -1020,6 +1057,7 @@ mod tests {
         IOBackendErrorPhase, IOBackendFailure, IOBackendOperationKind, IOBackendQueueState, IOKind,
         attach_backend_operation_kind,
     };
+    use error_stack::ResultExt;
     use std::io::Error as StdIoError;
 
     #[test]
@@ -1079,6 +1117,25 @@ mod tests {
         assert!(output.contains("permission denied"), "{output}");
         assert!(output.contains("op=file open"), "{output}");
         assert!(output.contains("open denied"), "{output}");
+    }
+
+    #[test]
+    fn test_index_mutation_context_preserves_lower_error() {
+        let lower: Result<()> = Err(Error::column_storage_missing());
+        let report = lower
+            .change_context(OperationError::IndexMutation)
+            .unwrap_err();
+
+        assert_eq!(report.current_context(), &OperationError::IndexMutation);
+        assert_eq!(
+            report.downcast_ref::<Error>().map(Error::kind),
+            Some(ErrorKind::Internal)
+        );
+
+        let err: Error = report.attach("secondary index claim").into();
+        assert_eq!(err.kind(), ErrorKind::Operation);
+        assert_eq!(err.operation_error(), Some(OperationError::IndexMutation));
+        assert!(format!("{err}").contains("secondary index claim"));
     }
 
     #[test]

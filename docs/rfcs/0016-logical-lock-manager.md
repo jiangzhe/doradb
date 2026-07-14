@@ -232,6 +232,20 @@ still use `ColumnDeletionBuffer` ownership. Existing `WriteConflict` behavior
 remains the row-level conflict result. [U4], [U5], [U12], [D2], [D9], [C5],
 [C6], [C7]
 
+Sequential full-table MVCC update acquires transaction-lifetime
+`TableMetadata(S)` plus `TableData(X)` before capturing its root/page snapshot
+or invoking callbacks. Its physical row ownership continues to use the existing
+hot undo and cold deletion-buffer protocols, but the table-data lock excludes
+freeze/checkpoint page-state movement for the complete transaction lifetime.
+An existing `IX` grant follows the RFC's immediate-only conversion rule and
+returns `LockUpgradeWouldBlock` before callback execution when conversion would
+wait. Idle-session freeze and checkpoint acquire scoped `TableMetadata(S)` plus
+`TableData(IS)` before entering their table-owned workflow and hold those locks
+through their final publication/system-transaction boundary. This mapping keeps
+ordinary `IX` DML and `S` readers compatible with maintenance while making
+maintenance mutually exclusive with full-table update `X`. [D2], [D4], [C5],
+[C6], [C10]
+
 No code path may install hot-row undo ownership, cold-row CDB ownership, or
 table index write effects unless the owner already holds `TableData(IX)` or
 `TableData(X)` for that table. Implementation tasks should add debug assertions

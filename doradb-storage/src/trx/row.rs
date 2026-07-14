@@ -21,6 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::sync::Arc;
 
+/// Result of checking whether the latest physical row image can be modified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadLatestRow {
+    /// The latest page image is readable by this transaction.
+    Readable,
+    /// The latest page image is deleted.
+    NotFound,
+    /// Another active transaction owns the latest page image.
+    WriteConflict,
+}
+
 /// Read row with latest or visible version.
 pub(crate) struct RowReadAccess<'a> {
     page: &'a RowPage,
@@ -44,6 +55,38 @@ impl<'a> RowReadAccess<'a> {
     #[inline]
     pub(crate) fn row(&self) -> Row<'_> {
         self.page.row(self.row_idx)
+    }
+
+    /// Checks whether this transaction may modify the latest physical row image.
+    ///
+    /// Row modification is a current read: committed heads are read directly
+    /// regardless of the transaction snapshot, and an active head owned by
+    /// this transaction is allowed for read-your-own-write. Another active
+    /// owner is a write conflict; this path never reconstructs an older image.
+    #[inline]
+    pub(crate) fn read_latest(&self, ctx: &TrxContext) -> ReadLatestRow {
+        if let RowReadState::RowVer(undo) = &self.state
+            && let Some(undo_head) = &**undo
+            && !trx_is_committed(undo_head.ts())
+            && !ctx.is_same_trx(undo_head)
+        {
+            return ReadLatestRow::WriteConflict;
+        }
+        if self.row().is_deleted() {
+            ReadLatestRow::NotFound
+        } else {
+            ReadLatestRow::Readable
+        }
+    }
+
+    /// Clones one column from the latest physical row image without a value vector.
+    #[inline]
+    pub(crate) fn read_latest_value(
+        &self,
+        column_layout: &TableColumnLayout,
+        column_no: usize,
+    ) -> Val {
+        self.row().val(column_layout, column_no)
     }
 
     /// Returns the timestamp associated with this row read state, if present.
@@ -1003,7 +1046,11 @@ impl<'a> RowWriteAccess<'a> {
         self.guard.take();
     }
 
-    /// Add a Lock undo entry as a transaction-level logical row lock.
+    /// Acquires modification ownership for the latest physical row image.
+    ///
+    /// Row writes never target an older image reconstructed from MVCC undo.
+    /// The current transaction may extend its own active chain; another active
+    /// owner conflicts or, while preparing, is awaited by the caller.
     #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     pub(crate) fn lock_undo(
@@ -1395,6 +1442,69 @@ mod tests {
             sts,
             gc_no: 0,
         }
+    }
+
+    fn install_test_undo_head(row_ver: &RowVersionMap, status: Arc<SharedTrxStatus>) {
+        let undo = OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(status, undo.leak())));
+    }
+
+    #[test]
+    fn test_read_latest_uses_committed_page_image_newer_than_snapshot() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
+        status.commit_for_test(TrxID::new(10));
+        install_test_undo_head(&row_ver, status);
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let trx_ctx = test_trx_context(TrxID::new(1));
+
+        assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::Readable);
+        assert_eq!(
+            access.read_latest_value(metadata.col.as_ref(), 1),
+            Val::from(20i32)
+        );
+    }
+
+    #[test]
+    fn test_read_latest_allows_own_head_and_rejects_foreign_active_head() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let trx_ctx = test_trx_context(TrxID::new(1));
+        install_test_undo_head(&row_ver, trx_ctx.status());
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+
+        {
+            let access = RowReadAccess::new(&page, &frame_ctx, 0);
+            assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::Readable);
+        }
+
+        install_test_undo_head(
+            frame_ctx.expect_vmap(),
+            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 100)),
+        );
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
+    }
+
+    #[test]
+    fn test_read_latest_checks_foreign_owner_before_deleted_image() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        assert!(page.set_deleted(0, true));
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
+        install_test_undo_head(&row_ver, Arc::clone(&status));
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let trx_ctx = test_trx_context(TrxID::new(1));
+
+        assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
+        status.commit_for_test(TrxID::new(10));
+        assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::NotFound);
     }
 
     #[test]

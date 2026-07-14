@@ -1046,13 +1046,8 @@ mod tests {
                 .unwrap()
                 .wait()
                 .await;
-            let outcome = session.checkpoint_table(table_id).await.unwrap();
-            assert_eq!(
-                outcome,
-                CheckpointOutcome::Cancelled {
-                    reason: CheckpointCancelReason::TableDropping
-                }
-            );
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
             assert_root_metadata_unchanged(
                 &root_before,
                 &table_for_internal_assertion(&engine, table_id),
@@ -1084,13 +1079,8 @@ mod tests {
             let root_before = table.file().active_root_unchecked().clone();
             table.start_drop_lifecycle().unwrap().wait().await;
 
-            let outcome = session.checkpoint_table(table_id).await.unwrap();
-            assert_eq!(
-                outcome,
-                CheckpointOutcome::Cancelled {
-                    reason: CheckpointCancelReason::TableDropping
-                }
-            );
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
             assert_root_metadata_unchanged(&root_before, &table);
             assert!(!session.in_trx().unwrap());
 
@@ -1111,13 +1101,8 @@ mod tests {
             table.start_drop_lifecycle().unwrap().wait().await;
             table.mark_dropped_lifecycle().unwrap();
 
-            let outcome = session.checkpoint_table(table_id).await.unwrap();
-            assert_eq!(
-                outcome,
-                CheckpointOutcome::Cancelled {
-                    reason: CheckpointCancelReason::TableDropped
-                }
-            );
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
             assert_root_metadata_unchanged(&root_before, &table);
             assert!(!session.in_trx().unwrap());
         });

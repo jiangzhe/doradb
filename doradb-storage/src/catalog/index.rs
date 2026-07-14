@@ -6,7 +6,10 @@ use crate::catalog::{
     IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
 };
 use crate::engine::EngineRef;
-use crate::error::{DataIntegrityError, Error, FatalError, InternalError, OperationError, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResultExt, Error, FatalError, InternalError, OperationError,
+    Result,
+};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
@@ -16,7 +19,6 @@ use crate::index::{
     SecondaryIndex, UniqueIndex, UniqueMemIndex,
 };
 use crate::log::redo::DDLRedo;
-use crate::lwc::PersistedLwcBlock;
 use crate::row::RowRead;
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
@@ -965,14 +967,10 @@ async fn collect_create_index_cold_rows(
     let mut rows = Vec::new();
     for entry in column_index.collect_leaf_entries().await? {
         let (delete_deltas, row_ids) = column_index.load_delete_deltas_and_row_ids(&entry).await?;
-        let block = PersistedLwcBlock::load(
-            table.file().file_kind(),
-            table.file().sparse_file(),
-            table.disk_pool(),
-            disk_guard,
-            entry.block_id(),
-        )
-        .await?;
+        let file_kind = table.file().file_kind();
+        let block_id = entry.block_id();
+        let persisted = table.storage.load_lwc_block(disk_guard, block_id).await?;
+        let block = persisted.block();
         if usize::from(entry.row_count()) != row_ids.len() || block.row_count() != row_ids.len() {
             return Err(create_index_invalid_payload(format!(
                 "create index LWC row count mismatch: block_id={}, entry_rows={}, block_rows={}, row_ids={}",
@@ -1010,7 +1008,9 @@ async fn collect_create_index_cold_rows(
             if create_index_cold_row_deleted_by_buffer(table, row_id)? {
                 continue;
             }
-            let key = block.decode_row_values(&metadata.col, row_idx, &read_set)?;
+            let key = block
+                .decode_row_values(&metadata.col, row_idx, &read_set)
+                .with_block_context(file_kind, "lwc-block", block_id)?;
             rows.push(CreateIndexRowEntry { key, row_id });
         }
     }

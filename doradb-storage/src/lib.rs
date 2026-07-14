@@ -55,7 +55,8 @@ pub use stats::{
 };
 pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, FreezeOutcome,
-    FrozenPageBatchInfo, SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats,
+    FrozenPageBatchInfo, LazyRow, SecondaryMemIndexCleanupIndexStats,
+    SecondaryMemIndexCleanupStats,
 };
 pub use trx::{IndexScanMvccStream, Statement, StreamStmt, Transaction};
 pub use value::{MemVar, Val, ValKind, ValType};

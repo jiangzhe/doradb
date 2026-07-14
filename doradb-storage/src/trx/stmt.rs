@@ -9,7 +9,7 @@ use crate::row::ops::{
     DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 use crate::session::TrxAttachment;
-use crate::table::{DmlValidationDomain, DmlValidator, Table};
+use crate::table::{DmlValidationDomain, DmlValidator, LazyRow, Table};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
@@ -329,6 +329,23 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
+    /// Acquires transaction-lifetime exclusive table-data ownership.
+    #[inline]
+    pub(crate) async fn acquire_table_exclusive_data_lock(
+        &mut self,
+        table_id: TableID,
+    ) -> Result<()> {
+        let lock_manager = self.attachment.engine().lock_manager();
+        self.inner
+            .checked_lock_state_mut("acquire exclusive table data lock")?
+            .acquire(
+                lock_manager,
+                LockResource::TableData(table_id),
+                LockMode::Exclusive,
+            )
+            .await
+    }
+
     #[inline]
     fn table_not_found(table_id: TableID, operation: &'static str) -> Error {
         Report::new(OperationError::TableNotFound)
@@ -384,6 +401,35 @@ impl<'stmt> Statement<'stmt> {
         table
             .accessor_with_layout(&layout)
             .table_scan_mvcc(rt, read_set, row_action)
+            .await
+    }
+
+    /// Sequentially update callback-selected rows using latest modification reads.
+    ///
+    /// A cold persisted image is exposed only while it remains the current
+    /// logical row. Hot-row values come from the latest physical page image
+    /// rather than an older version reconstructed for the transaction snapshot.
+    /// Another active row owner causes a write conflict; this transaction's own
+    /// active state is followed to its latest hot image. Returning `None` skips
+    /// the row, while `Some(update)` selects it and applies the sparse update. An
+    /// empty update still counts as a selected row without creating physical
+    /// row, index, undo, or redo work.
+    #[inline]
+    pub async fn table_update_mvcc<F>(&mut self, table_id: TableID, update_row: F) -> Result<usize>
+    where
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<Option<Vec<UpdateCol>>>,
+    {
+        let table = self.resolve_user_table(table_id, "table_update_mvcc")?;
+        self.acquire_table_write_metadata_lock(table_id).await?;
+        table.check_foreground_live("table_update_mvcc")?;
+        self.acquire_table_exclusive_data_lock(table_id).await?;
+        table.check_foreground_live("table_update_mvcc")?;
+        let layout = table.layout_snapshot();
+        let validate_updates = !self.disable_dml_validation;
+        let (rt, effects) = self.runtime_and_effects_mut();
+        table
+            .accessor_with_layout(&layout)
+            .table_update_mvcc(rt, effects, validate_updates, update_row)
             .await
     }
 

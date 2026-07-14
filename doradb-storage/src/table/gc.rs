@@ -1,14 +1,15 @@
 use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
-use crate::error::{DataIntegrityError, Error, FileKind, InternalError, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResultExt, Error, FileKind, InternalError, Result,
+};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::{
     ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
     UniqueMemIndex,
 };
-use crate::lwc::PersistedLwcBlock;
 use crate::session::SessionPin;
 use crate::trx::TrxReadProof;
 use crate::value::Val;
@@ -563,14 +564,13 @@ impl Table {
             .iter()
             .map(|key| key.col_no as usize)
             .collect::<Vec<_>>();
-        let block = PersistedLwcBlock::load(
-            self.file().file_kind(),
-            self.file().sparse_file(),
-            self.disk_pool(),
-            cleanup_context.disk_pool_guard,
-            row.block_id(),
-        )
-        .await?;
+        let file_kind = self.file().file_kind();
+        let block_id = row.block_id();
+        let persisted = self
+            .storage
+            .load_lwc_block(cleanup_context.disk_pool_guard, block_id)
+            .await?;
+        let block = persisted.block();
         if block.row_shape_fingerprint() != row.row_shape_fingerprint() {
             return Err(invalid_lwc_payload(
                 FileKind::TableFile,
@@ -578,7 +578,9 @@ impl Table {
                 "row shape fingerprint mismatch",
             ));
         }
-        block.decode_row_values(metadata.col.as_ref(), row.row_idx(), &read_set)
+        block
+            .decode_row_values(metadata.col.as_ref(), row.row_idx(), &read_set)
+            .with_block_context(file_kind, "lwc-block", block_id)
     }
 }
 

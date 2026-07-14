@@ -138,29 +138,37 @@ Each RowPage moves through:
 
 #### Data Checkpoint Workflow
 
-1. Claim the table workflow, asynchronously load a contiguous RowStore-page
+1. From an idle session, acquire scoped `TableMetadata(S)` and `TableData(IS)`,
+   revalidate the live table, and only then claim the table workflow. Keep the
+   locks through frozen-state publication for freeze and through final
+   root/state publication plus checkpoint system-transaction completion for
+   checkpoint. Release fresh grants on published, delayed, cancelled, and error
+   returns; preserve any covering explicit session lock. `TableData(IS)` remains
+   compatible with ordinary `IX` DML and `S` table readers, but conflicts with
+   the `TableData(X)` held by sequential full-table update.
+2. Asynchronously load a contiguous RowStore-page
    prefix, preflight every selected page as `ACTIVE`, and then publish each page
    as `FROZEN` in a separate short page-state critical section. Allocate
    `frozen_ts` after the last page is frozen and install the canonical batch.
    Repeated freeze returns the same fence and batch summary without extending
    the prefix.
-2. Select the purge-published GC horizon as the exclusive checkpoint cutoff.
-3. Incrementally validate readiness without page-state write locks. Reanalyze
+3. Select the purge-published GC horizon as the exclusive checkpoint cutoff.
+4. Incrementally validate readiness without page-state write locks. Reanalyze
    only `Unchecked` or `Blocked` pages and reuse cached `Stable` image proofs.
    Stop at the first unsafe page, preserving its preceding stable prefix and
    leaving the suffix unchecked until a later retry. A stable page waiting only
    for a newer cutoff is not rescanned while the selected cutoff remains too
    old.
-4. If readiness is incomplete, return the first canonical frozen-page cutoff
+5. If readiness is incomplete, return the first canonical frozen-page cutoff
    delay and its preceding stable-prefix count before publish admission and
    before any page enters `TRANSITION`.
-5. Once every page is ready, make one full optimistic plan-refresh pass before
+6. Once every page is ready, make one full optimistic plan-refresh pass before
    acquiring the first page-state write lock. One undo walk traces leading
    `Lock` and `Delete` entries through the first image-producing `Insert` or
    `Update` and produces an owned, cutoff-specific plan containing the required
    image cutoff, cutoff-visible deletion bitmap, and representable transition
    overlay markers. A matching page/cutoff/version plan may be reused.
-6. Load each page's paired mutation version before and after its refresh. Retain
+7. Load each page's paired mutation version before and after its refresh. Retain
    the plan only on full-value equality; discard it immediately on mismatch
    without retrying for a quiet window. The counter is not an odd/even seqlock
    because different row writers may overlap. A stable image proof remains
@@ -168,7 +176,7 @@ Each RowPage moves through:
    incremental readiness succeeds, later lock/delete ownership observed on the
    frozen page is representable regardless of writer STS and cannot cause
    another cutoff delay.
-7. Acquire the unified publication guard, which owns lifecycle publish
+8. Acquire the unified publication guard, which owns lifecycle publish
    admission, workflow completion, and fatal classification. Make it
    irreversible before revalidating in canonical order under one page-state
    write lock at a time. A matching page identity, cutoff, and full mutation
@@ -179,11 +187,11 @@ Each RowPage moves through:
    `TRANSITION`, install its prepared markers, and release its lock immediately.
    During this phase the batch is a growing `TRANSITION` prefix followed by a
    `FROZEN` suffix.
-8. Build LWC blocks from immutable page values plus the prepared deletion
+9. Build LWC blocks from immutable page values plus the prepared deletion
    bitmap. Block-split retries reuse the bitmap rather than rescanning undo.
-9. Insert matching `ColumnBlockIndex` entries and build companion secondary
+10. Insert matching `ColumnBlockIndex` entries and build companion secondary
    index entries from exactly the same prepared visible-row ranges.
-10. Publish one new table checkpoint root that contains:
+11. Publish one new table checkpoint root that contains:
    - new LWC blocks
    - new block-index state
    - updated `DiskTree` roots

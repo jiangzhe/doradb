@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-07-13`
+- Generated on: `2026-07-14`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log,recovery}`
 
@@ -14,11 +14,11 @@
 | index | 21 | 13 | 0 | 0 | 3 | 7 |
 | io | 7 | 21 | 0 | 0 | 1 | 18 |
 | trx | 13 | 5 | 0 | 0 | 0 | 4 |
-| lwc | 2 | 0 | 0 | 0 | 0 | 0 |
+| lwc | 2 | 4 | 0 | 0 | 0 | 3 |
 | file | 8 | 12 | 0 | 0 | 2 | 12 |
 | log | 6 | 0 | 0 | 0 | 0 | 0 |
 | recovery | 5 | 0 | 0 | 0 | 0 | 0 |
-| **total** | **82** | **149** | **0** | **0** | **6** | **129** |
+| **total** | **82** | **153** | **0** | **0** | **6** | **132** |
 
 ## File Hotspots (top 40)
 
@@ -39,6 +39,7 @@
 | `doradb-storage/src/file/cow_file.rs` | file | 5 | 5 |
 | `doradb-storage/src/io/buf.rs` | io | 5 | 5 |
 | `doradb-storage/src/io/mod.rs` | io | 4 | 2 |
+| `doradb-storage/src/lwc/block.rs` | lwc | 4 | 3 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 4 | 4 |
 | `doradb-storage/src/index/block_index_root.rs` | index | 3 | 3 |
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 2 | 2 |
