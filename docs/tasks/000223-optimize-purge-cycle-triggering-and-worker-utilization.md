@@ -1,7 +1,7 @@
 ---
 id: 000223
 title: Optimize Purge Cycle Triggering and Worker Utilization
-status: proposal
+status: implemented
 created: 2026-07-13
 github_issue: 846
 ---
@@ -47,7 +47,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000157-optimize-purge-full-gc-triggering-and-dispatcher-worker-utilization.md
+- docs/backlogs/closed/000157-optimize-purge-full-gc-triggering-and-dispatcher-worker-utilization.md
 
 Related implemented design:
 - `docs/tasks/000220-move-table-checkpoint-completion-to-no-wait-system-transactions.md`
@@ -309,9 +309,10 @@ active-STS transition.
 
 ### 4. Derive one shared purge-cycle plan
 
-Add a pure private planner used by both purge-loop implementations. Its inputs
-are the coalesced work, the last successfully completed GC horizon, and the
-fresh current horizon from `calc_min_active_sts_for_gc()`.
+Add a pure private planner used by the sole dispatcher loop at every configured
+worker count. Its inputs are the coalesced work, the last successfully completed
+GC horizon, and the fresh current horizon from
+`calc_min_active_sts_for_gc()`.
 
 Skip the global calculation only when recording produced no active transition
 or system CTS and no explicit observation/housekeeping work exists. Otherwise
@@ -484,6 +485,40 @@ narrow and must not complicate production data structures solely for tests.
 
 ## Implementation Notes
 
+- Implemented causal active-STS transition reporting for both commit and
+  rollback, independent minimum system-CTS aggregation, authoritative horizon
+  rescans, and one shared cycle planner. Later bucket-local progress no longer
+  launches a global round behind an older blocker; eligible system payloads at
+  an unchanged horizon run transaction GC without unrelated housekeeping or
+  completed-horizon publication.
+- Added startup `gc_buckets` configuration with default 32 and power-of-two
+  validation from 1 through 256. User and system routing use the runtime count,
+  while `purge_threads` is validated as positive and now counts the dispatcher
+  among bucket-working threads.
+- The dispatcher owns worker slot zero, enqueues remote work before executing
+  its local share, collects task-owned retirement batches, and preserves the
+  all-bucket success barrier before page deallocation. The one-worker case uses
+  the same dispatcher with zero executors and skips remote task/completion
+  channels.
+- Review simplified the internal structure beyond the original draft: removed
+  the unused `PurgeLoop` trait and separate `PurgeSingleThreaded` implementation,
+  made `GCBucket::update_min_active_sts()` load its original atomic value
+  internally, removed obsolete purge-loop parameters, and made dispatcher and
+  executor channel waits asynchronous. These changes preserved the planned
+  scheduling, failure, and shutdown contracts while eliminating duplicated or
+  unused interfaces.
+- Validation passed `cargo fmt --all --check`, workspace Clippy with warnings
+  denied, 1397 default-backend workspace tests, and 1321 alternate `libaio`
+  storage tests. The remote completion barrier and reader-delayed checkpoint
+  retirement regressions each passed 100/100 stress iterations. Branch-diff
+  style audit passed for 12 Rust files.
+- Focused coverage was 95.17% across the requested files: purge 97.60%,
+  transaction configuration 95.45%, checkpoint persistence 95.37%, and the
+  shared error catalog 77.86%. The error catalog's whole-file result is below
+  80% because it contains unrelated error domains; the new purge-thread and
+  GC-bucket configuration errors and their reporting paths are exercised by
+  focused normalization tests.
+
 ## Impacts
 
 - `doradb-storage/src/trx/purge.rs`
@@ -505,7 +540,7 @@ narrow and must not complicate production data structures solely for tests.
   - document total bucket-working thread semantics
   - add configuration tests
 - `doradb-storage/src/error.rs`
-  - add the fieldless invalid-purge-thread configuration domain error
+  - add invalid purge-thread and GC-bucket configuration domain errors
 - `doradb-storage/src/table/persistence.rs` or colocated purge integration tests
   - add long-reader checkpoint-retirement eligibility coverage using existing
     production waits and narrow test hooks
