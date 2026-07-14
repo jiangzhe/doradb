@@ -1,5 +1,5 @@
+use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageSharedGuard;
-use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{
     Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, is_catalog_table,
 };
@@ -137,6 +137,36 @@ impl DroppedTableFileCleanupQueue {
 }
 
 impl TransactionSystem {
+    /// Install a per-engine purge scheduling observer for deterministic tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn set_purge_test_observer(&self, observer: Sender<PurgeTestEvent>) {
+        self.set_purge_test_hook(Arc::new(move |event| {
+            let _ = observer.send(event);
+            PurgeTestAction::Continue
+        }));
+    }
+
+    /// Install a per-engine purge scheduling control hook for deterministic tests.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn set_purge_test_hook(&self, hook: PurgeTestHook) {
+        self.purge_test_hook.lock().replace(hook);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn run_purge_test_hook(&self, event: PurgeTestEvent) -> PurgeTestAction {
+        let hook = self.purge_test_hook.lock().clone();
+        hook.map_or(PurgeTestAction::Continue, |hook| hook(event))
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn observe_purge_test_event(&self, event: PurgeTestEvent) {
+        let _ = self.run_purge_test_hook(event);
+    }
+
     /// Request one coalescible full-purge observation.
     ///
     /// `Purge::FullObservation` is the payload-free signal for observing all
@@ -166,51 +196,26 @@ impl TransactionSystem {
         let _ = self.purge_tx.send(Purge::DroppedTable);
     }
 
-    /// Start the purge coordinator and optional executor threads.
+    /// Start exactly the configured number of purge-bucket worker threads.
+    ///
+    /// The dispatcher is worker slot zero and the remaining configured slots
+    /// are executor threads.
     #[inline]
     pub(crate) fn start_purge_threads(
         trx_sys: QuiescentGuard<Self>,
-        mem_pool: QuiescentGuard<EvictableBufferPool>,
         pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     ) -> Vec<JoinHandle<()>> {
         let trx_sys = trx_sys.into_sync();
-        let mem_pool = mem_pool.into_sync();
-        if trx_sys.config.purge_threads == 1 {
-            // single-threaded purger
-            let task_trx_sys = trx_sys.clone();
-            let task_mem_pool = mem_pool.clone();
-            let handle = thread::spawn_named("Purge-Thread", move || {
-                let mut purger = PurgeSingleThreaded;
-                runtime::block_on(purger.purge_loop(
-                    &task_mem_pool,
-                    &task_trx_sys.catalog,
-                    &task_trx_sys,
-                    pool_guards,
-                    purge_chan,
-                ))
-            });
-            vec![handle]
-        } else {
-            // multi-threaded purger
-            let dispatcher_guards = pool_guards.clone();
-            let (mut dispatcher, executors) = Self::dispatch_purge(trx_sys.clone(), pool_guards);
-            let task_trx_sys = trx_sys.clone();
-            let task_mem_pool = mem_pool.clone();
-            let handle = thread::spawn_named("Purge-Dispatcher", move || {
-                runtime::block_on(dispatcher.purge_loop(
-                    &task_mem_pool,
-                    &task_trx_sys.catalog,
-                    &task_trx_sys,
-                    dispatcher_guards,
-                    purge_chan,
-                ));
-            });
-            let mut handles = Vec::with_capacity(executors.len() + 1);
-            handles.push(handle);
-            handles.extend(executors);
-            handles
-        }
+        let (mut dispatcher, executors) = Self::dispatch_purge(trx_sys.clone(), &pool_guards);
+        let task_trx_sys = trx_sys.clone();
+        let handle = thread::spawn_named("Purge-Dispatcher", move || {
+            runtime::block_on(dispatcher.purge_loop(&task_trx_sys, pool_guards, purge_chan));
+        });
+        let mut handles = Vec::with_capacity(executors.len() + 1);
+        handles.push(handle);
+        handles.extend(executors);
+        handles
     }
 
     /// Calculate the purge horizon from active transaction buckets.
@@ -228,48 +233,53 @@ impl TransactionSystem {
     /// Record committed transaction handoffs accepted from redo completion.
     ///
     /// Purge coordination owns this step so committed payload batches cannot be
-    /// overtaken by a separate stop marker. Returns whether the
-    /// global minimum active STS may have advanced and a full purge cycle should
-    /// be requested when the engine is not already tearing down.
+    /// overtaken by a separate stop marker. The returned progress keeps active
+    /// horizon movement independent from system-payload eligibility.
     #[inline]
-    pub(super) fn record_committed_for_purge(
+    fn record_committed_for_purge(
         &self,
         trx_list: FastHashMap<usize, Vec<CommittedTrx>>,
-    ) -> bool {
-        let mut changed = false;
+    ) -> CommittedPurgeProgress {
+        let mut progress = CommittedPurgeProgress::default();
         for (gc_no, trx_list) in trx_list {
             let gc_bucket = &self.gc_buckets[gc_no];
-            changed |= gc_bucket.record_committed_for_purge(trx_list);
+            let bucket_progress = gc_bucket.record_committed_for_purge(trx_list);
+            progress.merge_bucket(bucket_progress);
         }
-        changed
+        #[cfg(test)]
+        self.observe_purge_test_event(PurgeTestEvent::CommittedRecorded {
+            min_original_sts: progress.min_original_sts,
+            min_system_cts: progress.min_system_cts,
+        });
+        progress
     }
 
-    /// Record rollback progress and request a full observation if the horizon advanced.
+    /// Record rollback progress and report the causal active-STS transition.
     ///
     /// Commit handoffs are non-lossy through `Purge::Committed` because purge
     /// must retain every committed payload batch. Rollback observations are
-    /// lossy: bucket state is already authoritative, and a newer horizon may
-    /// make every cleanup class eligible for the requested full purge cycle.
+    /// lossy: bucket state is already authoritative, and the transition is only
+    /// a coalescible scheduling observation.
     #[inline]
     pub(crate) fn record_rollback_for_purge(&self, gc_no: usize, sts: TrxID) -> bool {
-        let advanced = self.gc_buckets[gc_no].record_rollback_for_purge(sts);
-        if advanced {
-            let _ = self.purge_tx.send(Purge::FullObservation);
+        let progress = self.gc_buckets[gc_no].record_rollback_for_purge(sts);
+        if let Some(progress) = progress {
+            let _ = self.purge_tx.send(Purge::ActiveSts(progress));
         }
-        advanced
+        progress.is_some()
     }
 
     #[inline]
     pub(super) fn dispatch_purge(
         trx_sys: SyncQuiescentGuard<Self>,
-        pool_guards: PoolGuards,
+        pool_guards: &PoolGuards,
     ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
         let mut handles = vec![];
         let mut chans = vec![];
-        for i in 0..trx_sys.config.purge_threads {
+        for worker_slot in 1..trx_sys.config.purge_threads {
             let (tx, rx) = flume::unbounded();
             chans.push(tx);
-            let thread_name = format!("Purge-Executor-{i}");
+            let thread_name = format!("Purge-Executor-{worker_slot}");
             let pool_guards = pool_guards.clone();
             let task_trx_sys = trx_sys.clone();
             let handle = thread::spawn_named(thread_name, move || {
@@ -308,6 +318,35 @@ impl TransactionSystem {
             Ok(retired_row_pages) => Ok(retired_row_pages),
             Err(_) => Err(self.poison_engine(FatalError::PurgeAccess).into()),
         }
+    }
+
+    /// Execute one GC bucket through the common purge access boundary.
+    #[inline]
+    async fn purge_gc_bucket(
+        &self,
+        catalog: &Catalog,
+        guards: &PoolGuards,
+        gc_no: usize,
+        min_active_sts: TrxID,
+    ) -> Result<Vec<RetiredRowPageBatch>> {
+        #[cfg(test)]
+        if self.run_purge_test_hook(PurgeTestEvent::BucketStarted { gc_no })
+            == PurgeTestAction::Fail
+        {
+            self.observe_purge_test_event(PurgeTestEvent::BucketFailed { gc_no });
+            return Err(self.poison_engine(FatalError::PurgeAccess).into());
+        }
+        let mut trx_list = Vec::new();
+        self.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
+        let result = self
+            .purge_trx_list(catalog, guards, trx_list, min_active_sts)
+            .await;
+        #[cfg(test)]
+        match &result {
+            Ok(_) => self.observe_purge_test_event(PurgeTestEvent::BucketCompleted { gc_no }),
+            Err(_) => self.observe_purge_test_event(PurgeTestEvent::BucketFailed { gc_no }),
+        }
+        result
     }
 
     async fn purge_trx_list_inner(
@@ -653,6 +692,62 @@ impl ActiveStsList {
     }
 }
 
+/// One causal change to a GC bucket's cached active-STS minimum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveStsProgress {
+    /// Removing the old minimum left the bucket without an active transaction.
+    NoActive { original_sts: TrxID },
+    /// Removing the old minimum exposed a later active transaction.
+    Advance { original_sts: TrxID, new_sts: TrxID },
+}
+
+impl ActiveStsProgress {
+    #[inline]
+    const fn original_sts(self) -> TrxID {
+        match self {
+            ActiveStsProgress::NoActive { original_sts }
+            | ActiveStsProgress::Advance { original_sts, .. } => original_sts,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct GCBucketPurgeProgress {
+    active_sts: Option<ActiveStsProgress>,
+    min_system_cts: Option<TrxID>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CommittedPurgeProgress {
+    min_original_sts: Option<TrxID>,
+    min_system_cts: Option<TrxID>,
+}
+
+impl CommittedPurgeProgress {
+    #[inline]
+    fn merge_bucket(&mut self, progress: GCBucketPurgeProgress) {
+        if let Some(active_sts) = progress.active_sts {
+            self.merge_original_sts(active_sts.original_sts());
+        }
+        if let Some(system_cts) = progress.min_system_cts {
+            self.merge_system_cts(system_cts);
+        }
+    }
+
+    #[inline]
+    fn merge_original_sts(&mut self, sts: TrxID) {
+        self.min_original_sts = Some(
+            self.min_original_sts
+                .map_or(sts, |current| current.min(sts)),
+        );
+    }
+
+    #[inline]
+    fn merge_system_cts(&mut self, cts: TrxID) {
+        self.min_system_cts = Some(self.min_system_cts.map_or(cts, |current| current.min(cts)));
+    }
+}
+
 /// GCBucket stores and records transaction GC information for purge,
 /// including committed transaction list, old transaction list, active snapshot timestamp
 /// list, etc.
@@ -698,8 +793,7 @@ impl GCBucket {
 
     /// Record a rolled-back transaction for purge.
     #[inline]
-    pub(super) fn record_rollback_for_purge(&self, sts: TrxID) -> bool {
-        debug_assert!(TrxID::new(self.min_active_sts.load(Ordering::Relaxed)) != MAX_SNAPSHOT_TS);
+    pub(super) fn record_rollback_for_purge(&self, sts: TrxID) -> Option<ActiveStsProgress> {
         let mut active_sts_list = self.active_sts_list.lock();
         let min_sts = active_sts_list.remove(sts);
         self.update_min_active_sts(min_sts)
@@ -707,12 +801,15 @@ impl GCBucket {
 
     /// Record committed transactions for purge.
     #[inline]
-    pub(super) fn record_committed_for_purge(&self, trx_list: Vec<CommittedTrx>) -> bool {
+    pub(super) fn record_committed_for_purge(
+        &self,
+        trx_list: Vec<CommittedTrx>,
+    ) -> GCBucketPurgeProgress {
         // Update both active sts list and committed transaction list
         let mut active_sts_list = self.active_sts_list.lock();
         let mut min_sts = MAX_SNAPSHOT_TS;
         let mut removed_active_sts = false;
-        let mut system_gc_handoff = false;
+        let mut min_system_cts: Option<TrxID> = None;
         {
             let mut committed_trx_list = self.committed_trx_list.lock();
             for trx in trx_list {
@@ -720,42 +817,47 @@ impl GCBucket {
                     min_sts = active_sts_list.remove(sts);
                     removed_active_sts = true;
                 } else {
-                    system_gc_handoff = true;
+                    min_system_cts =
+                        Some(min_system_cts.map_or(trx.cts, |current| current.min(trx.cts)));
                 }
                 committed_trx_list.push_back(trx);
             }
         }
-        if !removed_active_sts {
-            return system_gc_handoff;
+        let active_sts = removed_active_sts
+            .then(|| self.update_min_active_sts(min_sts))
+            .flatten();
+        GCBucketPurgeProgress {
+            active_sts,
+            min_system_cts,
         }
-        // Update minimum active STS
-        // separate load and store is safe because this update will only happen when lock of
-        // active_sts_list is acquired.
-        self.update_min_active_sts(min_sts) || system_gc_handoff
     }
 
     #[inline]
-    fn update_min_active_sts(&self, min_sts: TrxID) -> bool {
+    fn update_min_active_sts(&self, min_sts: TrxID) -> Option<ActiveStsProgress> {
         // Because we just commit/rollback at least one transaction in this bucket, that means there must be
         // some transaction in the list before, so current value of min_active_sts must not be MAX.
-        debug_assert!(TrxID::new(self.min_active_sts.load(Ordering::Relaxed)) != MAX_SNAPSHOT_TS);
+        let original_sts = TrxID::new(self.min_active_sts.load(Ordering::Relaxed));
+        debug_assert_ne!(original_sts, MAX_SNAPSHOT_TS);
+
+        if min_sts == original_sts {
+            return None;
+        }
+        debug_assert!(original_sts < min_sts);
 
         // There is no active transaction. We should update min_active_sts.
         if min_sts == MAX_SNAPSHOT_TS {
             self.min_active_sts
                 .store(min_sts.as_u64(), Ordering::Relaxed);
-            return true;
+            return Some(ActiveStsProgress::NoActive { original_sts });
         }
 
-        // There are active transactions. We should compare them and update only if
-        // latest value is larger.
-        let curr_sts = TrxID::new(self.min_active_sts.load(Ordering::Relaxed));
-        if min_sts > curr_sts {
-            self.min_active_sts
-                .store(min_sts.as_u64(), Ordering::Relaxed);
-            return true;
-        }
-        false
+        debug_assert!(min_sts < MAX_SNAPSHOT_TS);
+        self.min_active_sts
+            .store(min_sts.as_u64(), Ordering::Relaxed);
+        Some(ActiveStsProgress::Advance {
+            original_sts,
+            new_sts: min_sts,
+        })
     }
 }
 
@@ -773,20 +875,28 @@ pub(crate) enum Purge {
     /// The payload map is grouped by GC bucket. The purge coordinator must
     /// record every accepted batch before it exits.
     Committed(FastHashMap<usize, Vec<CommittedTrx>>),
-    /// Lossy, payload-free request to observe all purge state and run full cleanup.
+    /// Lossy, payload-free observation of one changed bucket minimum.
     ///
-    /// Active-horizon advancement after rollback is one producer because the
-    /// new horizon may make undo, retained roots, and dropped tables eligible.
+    /// The bucket atomics remain authoritative. This transition only preserves
+    /// the original blocker needed to decide whether fresh global progress
+    /// crossed it.
+    ActiveSts(ActiveStsProgress),
+    /// Lossy, payload-free request to observe all purge state and run full cleanup.
     FullObservation,
     /// Release retained table roots whose post-publish readers have drained.
     TableRootRetention,
     /// Run only dropped-table runtime/file cleanup.
     DroppedTable,
+    /// Test-only system-CTS scheduling input without a retirement payload.
+    #[cfg(test)]
+    TestSystemCts(TrxID),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PurgeWork {
-    full_gc: bool,
+    min_original_sts: Option<TrxID>,
+    min_system_cts: Option<TrxID>,
+    full_observation: bool,
     table_root_retention: bool,
     dropped_table: bool,
     /// Terminal shutdown marker. When set, the purge loop returns without
@@ -798,19 +908,11 @@ impl PurgeWork {
     #[inline]
     const fn none() -> Self {
         Self {
-            full_gc: false,
+            min_original_sts: None,
+            min_system_cts: None,
+            full_observation: false,
             table_root_retention: false,
             dropped_table: false,
-            stop_after: false,
-        }
-    }
-
-    #[inline]
-    const fn full() -> Self {
-        Self {
-            full_gc: true,
-            table_root_retention: true,
-            dropped_table: true,
             stop_after: false,
         }
     }
@@ -819,7 +921,9 @@ impl PurgeWork {
     #[cfg(test)]
     const fn table_root_retention() -> Self {
         Self {
-            full_gc: false,
+            min_original_sts: None,
+            min_system_cts: None,
+            full_observation: false,
             table_root_retention: true,
             dropped_table: false,
             stop_after: false,
@@ -829,7 +933,9 @@ impl PurgeWork {
     #[inline]
     const fn stop() -> Self {
         Self {
-            full_gc: false,
+            min_original_sts: None,
+            min_system_cts: None,
+            full_observation: false,
             table_root_retention: false,
             dropped_table: false,
             stop_after: true,
@@ -837,9 +943,31 @@ impl PurgeWork {
     }
 
     #[inline]
+    fn merge_original_sts(&mut self, sts: TrxID) {
+        self.min_original_sts = Some(
+            self.min_original_sts
+                .map_or(sts, |current| current.min(sts)),
+        );
+    }
+
+    #[inline]
+    fn merge_system_cts(&mut self, cts: TrxID) {
+        self.min_system_cts = Some(self.min_system_cts.map_or(cts, |current| current.min(cts)));
+    }
+
+    #[inline]
+    const fn needs_observation(self) -> bool {
+        self.min_original_sts.is_some()
+            || self.min_system_cts.is_some()
+            || self.full_observation
+            || self.table_root_retention
+            || self.dropped_table
+    }
+
+    #[inline]
     fn absorb<F>(&mut self, purge: Purge, analyze_committed: &mut F) -> bool
     where
-        F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> bool,
+        F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> CommittedPurgeProgress,
     {
         match purge {
             Purge::Stop => {
@@ -852,121 +980,118 @@ impl PurgeWork {
                 return false;
             }
             Purge::Committed(trx_list) => {
-                if analyze_committed(trx_list) {
-                    *self = PurgeWork::full();
+                let progress = analyze_committed(trx_list);
+                if let Some(original_sts) = progress.min_original_sts {
+                    self.merge_original_sts(original_sts);
+                }
+                if let Some(system_cts) = progress.min_system_cts {
+                    self.merge_system_cts(system_cts);
                 }
             }
-            Purge::FullObservation => *self = PurgeWork::full(),
+            Purge::ActiveSts(progress) => self.merge_original_sts(progress.original_sts()),
+            Purge::FullObservation => {
+                self.full_observation = true;
+                self.table_root_retention = true;
+                self.dropped_table = true;
+            }
             Purge::TableRootRetention => self.table_root_retention = true,
             Purge::DroppedTable => self.dropped_table = true,
+            #[cfg(test)]
+            Purge::TestSystemCts(cts) => self.merge_system_cts(cts),
         }
         true
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PurgeCyclePlan {
+    transaction_gc: bool,
+    table_root_retention: bool,
+    dropped_table: bool,
+    advance_completed_horizon: bool,
+}
+
+/// Test-only action returned by a purge scheduling hook.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PurgeTestAction {
+    /// Continue normal purge execution.
+    Continue,
+    /// Fail the selected bucket before its committed prefix is drained.
+    Fail,
+}
+
+/// Test-only purge scheduling callback.
+#[cfg(test)]
+pub(crate) type PurgeTestHook = Arc<dyn Fn(PurgeTestEvent) -> PurgeTestAction + Send + Sync>;
+
+/// Narrow purge scheduling events used by deterministic concurrency tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PurgeTestEvent {
+    /// The coordinator is about to scan authoritative bucket minima.
+    PreScan,
+    /// One committed handoff was fully recorded in authoritative buckets.
+    CommittedRecorded {
+        min_original_sts: Option<TrxID>,
+        min_system_cts: Option<TrxID>,
+    },
+    /// One coalesced work item was planned.
+    Planned {
+        /// Whether all GC buckets were selected.
+        transaction_gc: bool,
+        /// Whether success may advance completed-horizon progress.
+        advance_completed_horizon: bool,
+    },
+    /// One remote bucket task was successfully enqueued.
+    RemoteEnqueued { gc_no: usize, worker_slot: usize },
+    /// One bucket is about to drain its eligible committed prefix.
+    BucketStarted { gc_no: usize },
+    /// One bucket completed successfully.
+    BucketCompleted { gc_no: usize },
+    /// One bucket failed before the cycle barrier completed.
+    BucketFailed { gc_no: usize },
+    /// The dispatcher started one local bucket.
+    LocalStarted { gc_no: usize },
+    /// The dispatcher completed one local bucket successfully.
+    LocalCompleted { gc_no: usize },
+    /// The dispatcher received one successful remote bucket result.
+    RemoteCompleted { gc_no: usize },
+    /// All selected bucket results passed and retirement processing is starting.
+    RetirementStarted,
+    /// Retained-root housekeeping is starting.
+    TableRootRetentionStarted,
+    /// Dropped-table housekeeping is starting.
+    DroppedTableStarted,
+    /// The completed purge horizon was published after cycle success.
+    CompletedHorizonPublished { sts: TrxID },
+    /// One planned cycle finished all selected work.
+    CycleCompleted,
+}
+
 struct PurgeTask {
     gc_no: usize,
     min_active_sts: TrxID,
-    done: Sender<Result<()>>,
-    retired_row_pages: Arc<Mutex<Vec<RetiredRowPageBatch>>>,
+    done: Sender<PurgeTaskResult>,
 }
 
-trait PurgeLoop {
-    async fn purge_loop(
-        &mut self,
-        _mem_pool: &EvictableBufferPool,
-        catalog: &Catalog,
-        trx_sys: &TransactionSystem,
-        pool_guards: PoolGuards,
-        purge_chan: Receiver<Purge>,
-    );
+struct PurgeTaskResult {
+    gc_no: usize,
+    result: Result<Vec<RetiredRowPageBatch>>,
 }
 
-/// Single-threaded purge-loop implementation.
-#[derive(Default)]
-pub(crate) struct PurgeSingleThreaded;
-
-impl PurgeLoop for PurgeSingleThreaded {
-    #[inline]
-    async fn purge_loop(
-        &mut self,
-        _mem_pool: &EvictableBufferPool,
-        catalog: &Catalog,
-        trx_sys: &TransactionSystem,
-        pool_guards: PoolGuards,
-        purge_chan: Receiver<Purge>,
-    ) {
-        while let Ok(purge) = purge_chan.recv() {
-            let work = coalesce_purge_work(&purge_chan, purge, |trx_list| {
-                trx_sys.record_committed_for_purge(trx_list)
-            });
-            if work.stop_after {
-                return;
-            }
-            let curr_sts = trx_sys.calc_min_active_sts_for_gc();
-            trx_sys.publish_gc_horizon(curr_sts);
-            if work.full_gc {
-                // Start GC. Purge undo/index first, then deallocate retired
-                // row pages once all bucket lists have been collected. System
-                // GC handoffs can require this observation without advancing
-                // the active-snapshot horizon.
-                let mut trx_list = vec![];
-                for gc_bucket in &trx_sys.gc_buckets {
-                    gc_bucket.get_purge_list(curr_sts, &mut trx_list);
-                }
-                let retired_row_pages = match trx_sys
-                    .purge_trx_list(catalog, &pool_guards, trx_list, curr_sts)
-                    .await
-                {
-                    Ok(retired_row_pages) => retired_row_pages,
-                    Err(_) => return,
-                };
-                if !trx_sys
-                    .process_retired_row_pages(catalog, &pool_guards, retired_row_pages)
-                    .await
-                {
-                    // Runtime admission is already poisoned. Exiting the loop
-                    // leaves shutdown to join this already-finished worker.
-                    return;
-                }
-            }
-            if work.table_root_retention {
-                trx_sys.process_retained_table_roots(curr_sts);
-            }
-            if work.dropped_table {
-                let dropped_tables_processed = trx_sys
-                    .process_dropped_table_gc_or_poison(&pool_guards, curr_sts)
-                    .await;
-                if !dropped_tables_processed {
-                    // Dropped-table runtime destruction failed after purge took
-                    // ownership. Do not retry in-place against a poisoned runtime.
-                    return;
-                }
-            }
-            if work.full_gc {
-                // Once GC is finished, update global_visible_sts so other threads can use it to
-                // speed up visibility check.
-                trx_sys.update_global_visible_sts(curr_sts);
-            }
-        }
-    }
-}
-
-/// Dispatcher that fans purge tasks out to executor threads.
+/// Purge coordinator and worker-slot-zero executor.
 pub(crate) struct PurgeDispatcher(Vec<Sender<PurgeTask>>);
 
-impl PurgeLoop for PurgeDispatcher {
+impl PurgeDispatcher {
     #[inline]
     async fn purge_loop(
         &mut self,
-        _mem_pool: &EvictableBufferPool,
-        _catalog: &Catalog,
         trx_sys: &TransactionSystem,
         pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
     ) {
-        let mut min_sts = trx_sys.global_visible_sts();
-        let mut dispatch_no: usize = 0;
+        let mut completed_horizon = trx_sys.global_visible_sts();
         'DISPATCH_LOOP: while let Ok(purge) = purge_chan.recv_async().await {
             let work = coalesce_purge_work(&purge_chan, purge, |trx_list| {
                 trx_sys.record_committed_for_purge(trx_list)
@@ -974,40 +1099,93 @@ impl PurgeLoop for PurgeDispatcher {
             if work.stop_after {
                 break 'DISPATCH_LOOP;
             }
+            if !work.needs_observation() {
+                continue;
+            }
+            #[cfg(test)]
+            trx_sys.observe_purge_test_event(PurgeTestEvent::PreScan);
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
             trx_sys.publish_gc_horizon(curr_sts);
-            if work.full_gc {
-                // dispatch tasks to executors
-                let (done_tx, done_rx) = flume::unbounded();
-                let mut expected_tasks = 0usize;
-                let retired_row_pages = Arc::new(Mutex::new(vec![]));
-                for gc_no in 0..trx_sys.gc_buckets.len() {
-                    let task = PurgeTask {
-                        gc_no,
-                        min_active_sts: curr_sts,
-                        done: done_tx.clone(),
-                        retired_row_pages: Arc::clone(&retired_row_pages),
-                    };
-                    self.0[dispatch_no % self.0.len()].send(task).expect(
-                        "purge executor receiver must stay alive while dispatcher owns sender",
-                    );
-                    expected_tasks += 1;
-                    dispatch_no += 1;
-                }
-                drop(done_tx);
-                // Wait for every bucket's undo/index work before the dispatcher
-                // deallocates any retired page collected by any bucket.
-                for _ in 0..expected_tasks {
-                    match done_rx.recv_async().await {
-                        Ok(Ok(())) => (),
-                        Ok(Err(_)) => return,
-                        Err(_) => break 'DISPATCH_LOOP,
+            let plan = plan_purge_cycle(work, completed_horizon, curr_sts);
+            #[cfg(test)]
+            trx_sys.observe_purge_test_event(PurgeTestEvent::Planned {
+                transaction_gc: plan.transaction_gc,
+                advance_completed_horizon: plan.advance_completed_horizon,
+            });
+            if plan.transaction_gc {
+                let worker_count = self.0.len() + 1;
+                // Enqueue every remote bucket before the dispatcher starts its
+                // own deterministic worker-slot share. With no executors this
+                // skips completion-channel creation entirely.
+                let remote_results = if self.0.is_empty() {
+                    None
+                } else {
+                    let (done_tx, done_rx) = flume::unbounded();
+                    let mut expected_remote_tasks = 0usize;
+                    for gc_no in 0..trx_sys.gc_buckets.len() {
+                        let worker_slot = purge_worker_slot(gc_no, worker_count);
+                        if worker_slot == 0 {
+                            continue;
+                        }
+                        let task = PurgeTask {
+                            gc_no,
+                            min_active_sts: curr_sts,
+                            done: done_tx.clone(),
+                        };
+                        self.0[worker_slot - 1].send(task).expect(
+                            "purge executor receiver must stay alive while dispatcher owns sender",
+                        );
+                        #[cfg(test)]
+                        trx_sys.observe_purge_test_event(PurgeTestEvent::RemoteEnqueued {
+                            gc_no,
+                            worker_slot,
+                        });
+                        expected_remote_tasks += 1;
+                    }
+                    drop(done_tx);
+                    Some((done_rx, expected_remote_tasks))
+                };
+                let mut bucket_results = Vec::with_capacity(trx_sys.gc_buckets.len());
+                for gc_no in (0..trx_sys.gc_buckets.len()).step_by(worker_count) {
+                    #[cfg(test)]
+                    trx_sys.observe_purge_test_event(PurgeTestEvent::LocalStarted { gc_no });
+                    let result = trx_sys
+                        .purge_gc_bucket(&trx_sys.catalog, &pool_guards, gc_no, curr_sts)
+                        .await;
+                    match result {
+                        Ok(retired_row_pages) => {
+                            bucket_results.push((gc_no, retired_row_pages));
+                            #[cfg(test)]
+                            trx_sys
+                                .observe_purge_test_event(PurgeTestEvent::LocalCompleted { gc_no });
+                        }
+                        Err(_) => return,
                     }
                 }
-                let retired_row_pages = {
-                    let mut g = retired_row_pages.lock();
-                    g.drain(..).collect::<Vec<_>>()
-                };
+                // Wait for every remote bucket's undo/index work before the
+                // dispatcher deallocates any retired page.
+                if let Some((done_rx, expected_remote_tasks)) = remote_results {
+                    for _ in 0..expected_remote_tasks {
+                        match done_rx.recv_async().await {
+                            Ok(PurgeTaskResult {
+                                gc_no,
+                                result: Ok(retired_row_pages),
+                            }) => {
+                                bucket_results.push((gc_no, retired_row_pages));
+                                #[cfg(test)]
+                                trx_sys.observe_purge_test_event(PurgeTestEvent::RemoteCompleted {
+                                    gc_no,
+                                });
+                            }
+                            Ok(PurgeTaskResult { result: Err(_), .. }) => return,
+                            Err(_) => break 'DISPATCH_LOOP,
+                        }
+                    }
+                }
+                let retired_row_pages =
+                    merge_bucket_results(bucket_results, trx_sys.gc_buckets.len());
+                #[cfg(test)]
+                trx_sys.observe_purge_test_event(PurgeTestEvent::RetirementStarted);
                 if !trx_sys
                     .process_retired_row_pages(&trx_sys.catalog, &pool_guards, retired_row_pages)
                     .await
@@ -1019,10 +1197,14 @@ impl PurgeLoop for PurgeDispatcher {
                     return;
                 }
             }
-            if work.table_root_retention {
+            if plan.table_root_retention {
+                #[cfg(test)]
+                trx_sys.observe_purge_test_event(PurgeTestEvent::TableRootRetentionStarted);
                 trx_sys.process_retained_table_roots(curr_sts);
             }
-            if work.dropped_table {
+            if plan.dropped_table {
+                #[cfg(test)]
+                trx_sys.observe_purge_test_event(PurgeTestEvent::DroppedTableStarted);
                 let dropped_tables_processed = trx_sys
                     .process_dropped_table_gc_or_poison(&pool_guards, curr_sts)
                     .await;
@@ -1032,12 +1214,18 @@ impl PurgeLoop for PurgeDispatcher {
                     return;
                 }
             }
-            if work.full_gc && curr_sts > min_sts {
+            if plan.advance_completed_horizon {
                 // Once GC is finished, update global_visible_sts so other threads can use it to
                 // speed up visibility check.
                 trx_sys.update_global_visible_sts(curr_sts);
-                min_sts = curr_sts;
+                completed_horizon = curr_sts;
+                #[cfg(test)]
+                trx_sys.observe_purge_test_event(PurgeTestEvent::CompletedHorizonPublished {
+                    sts: curr_sts,
+                });
             }
+            #[cfg(test)]
+            trx_sys.observe_purge_test_event(PurgeTestEvent::CycleCompleted);
         }
 
         // Notify executors to quit after a normal Stop or channel close. Fatal
@@ -1064,28 +1252,57 @@ impl PurgeExecutor {
             gc_no,
             min_active_sts,
             done,
-            retired_row_pages,
-        }) = purge_chan.recv()
+        }) = purge_chan.recv_async().await
         {
-            let mut trx_list = vec![];
-            trx_sys.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
-            // actual purge here
-            let res = trx_sys
-                .purge_trx_list(catalog, &pool_guards, trx_list, min_active_sts)
+            let result = trx_sys
+                .purge_gc_bucket(catalog, &pool_guards, gc_no, min_active_sts)
                 .await;
-            match res {
-                Ok(batches) => {
-                    if !batches.is_empty() {
-                        retired_row_pages.lock().extend(batches);
-                    }
-                    let _ = done.send(Ok(()));
-                }
-                Err(err) => {
-                    let _ = done.send(Err(err));
-                }
-            }
+            let _ = done.send(PurgeTaskResult { gc_no, result });
         }
     }
+}
+
+#[inline]
+fn plan_purge_cycle(
+    work: PurgeWork,
+    completed_horizon: TrxID,
+    current_horizon: TrxID,
+) -> PurgeCyclePlan {
+    let horizon_newer = current_horizon > completed_horizon;
+    let active_crossed = horizon_newer
+        && work
+            .min_original_sts
+            .is_some_and(|original_sts| original_sts < current_horizon);
+    let explicit_observation_advanced = horizon_newer && work.full_observation;
+    let system_eligible = work
+        .min_system_cts
+        .is_some_and(|system_cts| system_cts < current_horizon);
+    let horizon_cycle =
+        active_crossed || explicit_observation_advanced || (horizon_newer && system_eligible);
+    PurgeCyclePlan {
+        transaction_gc: horizon_cycle || system_eligible,
+        table_root_retention: work.table_root_retention || horizon_cycle,
+        dropped_table: work.dropped_table || horizon_cycle,
+        advance_completed_horizon: horizon_cycle,
+    }
+}
+
+#[inline]
+const fn purge_worker_slot(gc_no: usize, worker_count: usize) -> usize {
+    gc_no % worker_count
+}
+
+#[inline]
+fn merge_bucket_results(
+    mut bucket_results: Vec<(usize, Vec<RetiredRowPageBatch>)>,
+    expected_buckets: usize,
+) -> Vec<RetiredRowPageBatch> {
+    debug_assert_eq!(bucket_results.len(), expected_buckets);
+    bucket_results.sort_unstable_by_key(|(gc_no, _)| *gc_no);
+    bucket_results
+        .into_iter()
+        .flat_map(|(_, retired_row_pages)| retired_row_pages)
+        .collect()
 }
 
 #[inline]
@@ -1095,7 +1312,7 @@ fn coalesce_purge_work<F>(
     mut analyze_committed: F,
 ) -> PurgeWork
 where
-    F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> bool,
+    F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> CommittedPurgeProgress,
 {
     // Collapse queued lossy observations and targeted wakeups so bursts do not
     // trigger repeated scans, while committed payload batches are recorded one
@@ -1144,7 +1361,7 @@ mod tests {
     use crate::buffer::page::VersionedPageID;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, Result};
     use crate::id::{PageID, RowID, TableID};
@@ -1155,11 +1372,12 @@ mod tests {
     use crate::table::tests::bound_unique_index;
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::stmt::Statement;
-    use crate::trx::sys_trx::retirement_gc_no;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus, SysTrxPayload};
     use crate::value::Val;
+    use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     #[inline]
@@ -1170,6 +1388,79 @@ mod tests {
             .push(PoolRole::Mem, engine.inner().mem_pool.pool_guard())
             .push(PoolRole::Disk, engine.inner().disk_pool.pool_guard())
             .build()
+    }
+
+    fn purge_test_engine_config(
+        storage_root: &Path,
+        log_file_stem: &str,
+        gc_buckets: usize,
+        purge_threads: usize,
+    ) -> EngineConfig {
+        EngineConfig::default()
+            .storage_root(storage_root.to_path_buf())
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(64usize * 1024 * 1024)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .gc_buckets(gc_buckets)
+                    .purge_threads(purge_threads)
+                    .log_file_stem(log_file_stem),
+            )
+    }
+
+    async fn purge_test_engine(
+        log_file_stem: &str,
+        gc_buckets: usize,
+        purge_threads: usize,
+    ) -> (TempDir, Engine) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            purge_test_engine_config(temp_dir.path(), log_file_stem, gc_buckets, purge_threads)
+                .build()
+                .await
+                .unwrap();
+        (temp_dir, engine)
+    }
+
+    async fn recv_purge_event(
+        event_rx: &Receiver<PurgeTestEvent>,
+        mut predicate: impl FnMut(&PurgeTestEvent) -> bool,
+    ) -> PurgeTestEvent {
+        loop {
+            let event = event_rx.recv_async().await.unwrap();
+            if predicate(&event) {
+                return event;
+            }
+        }
+    }
+
+    async fn recv_purge_plan(event_rx: &Receiver<PurgeTestEvent>) -> PurgeTestEvent {
+        recv_purge_event(event_rx, |event| {
+            matches!(event, PurgeTestEvent::Planned { .. })
+        })
+        .await
+    }
+
+    async fn collect_purge_cycle(event_rx: &Receiver<PurgeTestEvent>) -> Vec<PurgeTestEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = event_rx.recv_async().await.unwrap();
+            events.push(event);
+            if event == PurgeTestEvent::CycleCompleted {
+                return events;
+            }
+        }
+    }
+
+    async fn wait_for_purge_poison(trx_sys: &TransactionSystem) {
+        let listener = trx_sys.poison_listener();
+        if trx_sys.poison_error().is_none() {
+            listener.await;
+        }
     }
 
     async fn stmt_insert_row(
@@ -1216,6 +1507,46 @@ mod tests {
             .iter()
             .map(|item| (item.drop_cts.as_u64(), item.table_id.as_u64()))
             .collect()
+    }
+
+    #[inline]
+    fn activate_bucket(bucket: &GCBucket, active_sts: &[u64]) {
+        let mut active = bucket.active_sts_list.lock();
+        for sts in active_sts {
+            active.insert(TrxID::new(*sts));
+        }
+        if let Some(first) = active_sts.first() {
+            bucket.min_active_sts.store(*first, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn committed_user(sts: u64, cts: u64, gc_no: usize) -> CommittedTrx {
+        CommittedTrx {
+            cts: TrxID::new(cts),
+            payload: Some(CommittedTrxPayload::User {
+                sts: TrxID::new(sts),
+                gc_no,
+                row_undo: RowUndoLogs::default(),
+                index_gc: Vec::new(),
+            }),
+        }
+    }
+
+    #[inline]
+    fn committed_system(cts: u64, table_id: u64, page_id: u64) -> CommittedTrx {
+        let table_id = TableID::new(table_id);
+        CommittedTrx {
+            cts: TrxID::new(cts),
+            payload: Some(CommittedTrxPayload::System(SysTrxPayload {
+                retired_row_pages: RetiredRowPageBatch::new(
+                    table_id,
+                    RowID::new(0),
+                    RowID::new(10),
+                    vec![PageID::new(page_id)].into_boxed_slice(),
+                ),
+            })),
+        }
     }
 
     #[test]
@@ -1277,15 +1608,42 @@ mod tests {
     }
 
     #[test]
-    fn test_coalesce_purge_work_preserves_strongest_request() {
-        let (_tx, rx) = flume::unbounded();
-        assert_eq!(
-            coalesce_purge_work(&rx, Purge::TableRootRetention, |_| {
-                panic!("no committed payload expected")
+    fn test_coalesce_purge_work_preserves_causal_minima_and_requests() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::ActiveSts(ActiveStsProgress::NoActive {
+            original_sts: TrxID::new(10),
+        }))
+        .unwrap();
+        tx.send(Purge::Committed(FastHashMap::default())).unwrap();
+        tx.send(Purge::FullObservation).unwrap();
+
+        let work = coalesce_purge_work(
+            &rx,
+            Purge::ActiveSts(ActiveStsProgress::Advance {
+                original_sts: TrxID::new(20),
+                new_sts: TrxID::new(30),
             }),
-            PurgeWork::table_root_retention()
+            |_| CommittedPurgeProgress {
+                min_original_sts: Some(TrxID::new(15)),
+                min_system_cts: Some(TrxID::new(40)),
+            },
         );
 
+        assert_eq!(
+            work,
+            PurgeWork {
+                min_original_sts: Some(TrxID::new(10)),
+                min_system_cts: Some(TrxID::new(40)),
+                full_observation: true,
+                table_root_retention: true,
+                dropped_table: true,
+                stop_after: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_coalesce_purge_work_keeps_targeted_housekeeping_independent() {
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::DroppedTable).unwrap();
         assert_eq!(
@@ -1293,55 +1651,141 @@ mod tests {
                 panic!("no committed payload expected")
             }),
             PurgeWork {
-                full_gc: false,
-                table_root_retention: true,
                 dropped_table: true,
-                stop_after: false,
+                ..PurgeWork::table_root_retention()
             }
         );
+    }
 
-        let (tx, rx) = flume::unbounded();
-        tx.send(Purge::TableRootRetention).unwrap();
-        tx.send(Purge::Committed(FastHashMap::default())).unwrap();
+    #[test]
+    fn test_plan_purge_cycle_distinguishes_horizon_and_system_work() {
+        let completed = TrxID::new(10);
+        let current = TrxID::new(20);
+        let no_plan = PurgeCyclePlan {
+            transaction_gc: false,
+            table_root_retention: false,
+            dropped_table: false,
+            advance_completed_horizon: false,
+        };
+        let full_plan = PurgeCyclePlan {
+            transaction_gc: true,
+            table_root_retention: true,
+            dropped_table: true,
+            advance_completed_horizon: true,
+        };
+
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::DroppedTable, |_| true),
-            PurgeWork::full()
+            plan_purge_cycle(
+                PurgeWork {
+                    min_original_sts: Some(TrxID::new(30)),
+                    ..PurgeWork::none()
+                },
+                completed,
+                current,
+            ),
+            no_plan
+        );
+        assert_eq!(
+            plan_purge_cycle(
+                PurgeWork {
+                    min_original_sts: Some(TrxID::new(9)),
+                    ..PurgeWork::none()
+                },
+                completed,
+                current,
+            ),
+            full_plan
+        );
+        assert_eq!(
+            plan_purge_cycle(
+                PurgeWork {
+                    min_original_sts: Some(TrxID::new(9)),
+                    ..PurgeWork::none()
+                },
+                current,
+                current,
+            ),
+            no_plan
         );
 
-        let (tx, rx) = flume::unbounded();
-        tx.send(Purge::DroppedTable).unwrap();
+        let full_observation = PurgeWork {
+            full_observation: true,
+            table_root_retention: true,
+            dropped_table: true,
+            ..PurgeWork::none()
+        };
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| true),
-            PurgeWork::full()
+            plan_purge_cycle(full_observation, current, current),
+            PurgeCyclePlan {
+                transaction_gc: false,
+                table_root_retention: true,
+                dropped_table: true,
+                advance_completed_horizon: false,
+            }
+        );
+        assert_eq!(
+            plan_purge_cycle(full_observation, completed, current),
+            full_plan
         );
 
-        let (tx, rx) = flume::unbounded();
-        tx.send(Purge::FullObservation).unwrap();
-        tx.send(Purge::FullObservation).unwrap();
+        let system_eligible = PurgeWork {
+            min_system_cts: Some(TrxID::new(19)),
+            ..PurgeWork::none()
+        };
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::FullObservation, |_| {
-                panic!("full observations carry no committed payload")
-            }),
-            PurgeWork::full()
+            plan_purge_cycle(system_eligible, current, current),
+            PurgeCyclePlan {
+                transaction_gc: true,
+                table_root_retention: false,
+                dropped_table: false,
+                advance_completed_horizon: false,
+            }
+        );
+        assert_eq!(
+            plan_purge_cycle(system_eligible, completed, current),
+            full_plan
+        );
+        assert_eq!(
+            plan_purge_cycle(
+                PurgeWork {
+                    min_system_cts: Some(current),
+                    ..PurgeWork::none()
+                },
+                current,
+                current,
+            ),
+            no_plan
+        );
+    }
+
+    #[test]
+    fn test_plan_targeted_housekeeping_does_not_advance_completed_horizon() {
+        assert_eq!(
+            plan_purge_cycle(
+                PurgeWork::table_root_retention(),
+                TrxID::new(10),
+                TrxID::new(20),
+            ),
+            PurgeCyclePlan {
+                transaction_gc: false,
+                table_root_retention: true,
+                dropped_table: false,
+                advance_completed_horizon: false,
+            }
         );
     }
 
     #[test]
     fn test_gc_bucket_records_system_payload_without_active_sts() {
         let bucket = GCBucket::new();
-        let committed = CommittedTrx {
-            cts: TrxID::new(10),
-            payload: Some(CommittedTrxPayload::System(SysTrxPayload {
-                gc_no: 0,
-                retired_row_pages: RetiredRowPageBatch::new(
-                    TableID::new(7),
-                    RowID::new(3),
-                    RowID::new(11),
-                    vec![PageID::new(19)].into_boxed_slice(),
-                ),
-            })),
-        };
-        assert!(bucket.record_committed_for_purge(vec![committed]));
+        let committed = committed_system(10, 7, 19);
+        assert_eq!(
+            bucket.record_committed_for_purge(vec![committed]),
+            GCBucketPurgeProgress {
+                active_sts: None,
+                min_system_cts: Some(TrxID::new(10)),
+            }
+        );
         assert!(bucket.active_sts_list.lock().active.is_empty());
         assert_eq!(
             TrxID::new(bucket.min_active_sts.load(Ordering::Relaxed)),
@@ -1368,7 +1812,6 @@ mod tests {
             .map(|(cts, start, end, page_id)| CommittedTrx {
                 cts: TrxID::new(cts),
                 payload: Some(CommittedTrxPayload::System(SysTrxPayload {
-                    gc_no: retirement_gc_no(table_id),
                     retired_row_pages: RetiredRowPageBatch::new(
                         table_id,
                         RowID::new(start),
@@ -1378,7 +1821,13 @@ mod tests {
                 })),
             })
             .collect();
-        assert!(bucket.record_committed_for_purge(committed));
+        assert_eq!(
+            bucket.record_committed_for_purge(committed),
+            GCBucketPurgeProgress {
+                active_sts: None,
+                min_system_cts: Some(TrxID::new(10)),
+            }
+        );
 
         let mut purge = Vec::new();
         bucket.get_purge_list(TrxID::new(12), &mut purge);
@@ -1405,7 +1854,9 @@ mod tests {
         tx.send(Purge::Stop).unwrap();
         tx.send(Purge::TableRootRetention).unwrap();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::DroppedTable, |_| true),
+            coalesce_purge_work(&rx, Purge::DroppedTable, |_| {
+                CommittedPurgeProgress::default()
+            }),
             PurgeWork::stop()
         );
         assert_eq!(
@@ -1429,7 +1880,7 @@ mod tests {
         let mut analyzed = 0usize;
         let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| {
             analyzed += 1;
-            true
+            CommittedPurgeProgress::default()
         });
 
         assert_eq!(work, PurgeWork::stop());
@@ -1437,12 +1888,198 @@ mod tests {
     }
 
     #[test]
-    fn test_coalesce_purge_work_committed_can_request_full_gc() {
+    fn test_coalesce_purge_work_committed_preserves_both_progress_dimensions() {
         let (_tx, rx) = flume::unbounded();
 
-        let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| true);
+        let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| {
+            CommittedPurgeProgress {
+                min_original_sts: Some(TrxID::new(10)),
+                min_system_cts: Some(TrxID::new(20)),
+            }
+        });
 
-        assert_eq!(work, PurgeWork::full());
+        assert_eq!(
+            work,
+            PurgeWork {
+                min_original_sts: Some(TrxID::new(10)),
+                min_system_cts: Some(TrxID::new(20)),
+                ..PurgeWork::none()
+            }
+        );
+    }
+
+    #[test]
+    fn test_gc_bucket_reports_only_changed_active_minimum() {
+        let bucket = GCBucket::new();
+        activate_bucket(&bucket, &[10, 20, 30]);
+
+        assert_eq!(bucket.record_rollback_for_purge(TrxID::new(20)), None);
+        assert_eq!(
+            TrxID::new(bucket.min_active_sts.load(Ordering::Relaxed)),
+            TrxID::new(10)
+        );
+        assert_eq!(
+            bucket.record_rollback_for_purge(TrxID::new(10)),
+            Some(ActiveStsProgress::Advance {
+                original_sts: TrxID::new(10),
+                new_sts: TrxID::new(30),
+            })
+        );
+        assert_eq!(
+            TrxID::new(bucket.min_active_sts.load(Ordering::Relaxed)),
+            TrxID::new(30)
+        );
+        assert_eq!(
+            bucket.record_rollback_for_purge(TrxID::new(30)),
+            Some(ActiveStsProgress::NoActive {
+                original_sts: TrxID::new(30),
+            })
+        );
+        assert_eq!(
+            TrxID::new(bucket.min_active_sts.load(Ordering::Relaxed)),
+            MAX_SNAPSHOT_TS
+        );
+    }
+
+    #[test]
+    fn test_gc_bucket_committed_batch_reports_one_original_to_final_transition() {
+        let bucket = GCBucket::new();
+        activate_bucket(&bucket, &[10, 20, 30, 40]);
+
+        let progress = bucket.record_committed_for_purge(vec![
+            committed_user(30, 50, 0),
+            committed_user(10, 51, 0),
+            committed_user(20, 52, 0),
+        ]);
+
+        assert_eq!(
+            progress,
+            GCBucketPurgeProgress {
+                active_sts: Some(ActiveStsProgress::Advance {
+                    original_sts: TrxID::new(10),
+                    new_sts: TrxID::new(40),
+                }),
+                min_system_cts: None,
+            }
+        );
+        assert_eq!(
+            TrxID::new(bucket.min_active_sts.load(Ordering::Relaxed)),
+            TrxID::new(40)
+        );
+        assert_eq!(bucket.committed_trx_list.lock().len(), 3);
+    }
+
+    #[test]
+    fn test_gc_bucket_mixed_commit_preserves_active_and_system_progress() {
+        let bucket = GCBucket::new();
+        activate_bucket(&bucket, &[10, 20]);
+
+        let progress = bucket.record_committed_for_purge(vec![
+            committed_user(10, 30, 0),
+            committed_system(31, 7, 19),
+            committed_system(32, 7, 23),
+        ]);
+
+        assert_eq!(
+            progress,
+            GCBucketPurgeProgress {
+                active_sts: Some(ActiveStsProgress::Advance {
+                    original_sts: TrxID::new(10),
+                    new_sts: TrxID::new(20),
+                }),
+                min_system_cts: Some(TrxID::new(31)),
+            }
+        );
+        assert_eq!(bucket.committed_trx_list.lock().len(), 3);
+    }
+
+    #[test]
+    fn test_committed_progress_merges_minima_across_buckets() {
+        let mut progress = CommittedPurgeProgress::default();
+        progress.merge_bucket(GCBucketPurgeProgress {
+            active_sts: Some(ActiveStsProgress::Advance {
+                original_sts: TrxID::new(30),
+                new_sts: TrxID::new(40),
+            }),
+            min_system_cts: Some(TrxID::new(70)),
+        });
+        progress.merge_bucket(GCBucketPurgeProgress {
+            active_sts: Some(ActiveStsProgress::NoActive {
+                original_sts: TrxID::new(10),
+            }),
+            min_system_cts: Some(TrxID::new(50)),
+        });
+
+        assert_eq!(
+            progress,
+            CommittedPurgeProgress {
+                min_original_sts: Some(TrxID::new(10)),
+                min_system_cts: Some(TrxID::new(50)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_system_bucket_routing_uses_runtime_bucket_count() {
+        let committed = committed_system(10, 39, 19);
+        assert_eq!(committed.gc_no(2), Some(1));
+        assert_eq!(committed.gc_no(32), Some(7));
+
+        let committed = committed_user(10, 20, 1);
+        assert_eq!(committed.gc_no(2), Some(1));
+        assert_eq!(committed.gc_no(256), Some(1));
+    }
+
+    #[test]
+    fn test_merge_bucket_results_orders_buckets_and_preserves_bucket_fifo() {
+        let batch = |table_id, page_id| {
+            RetiredRowPageBatch::new(
+                TableID::new(table_id),
+                RowID::new(0),
+                RowID::new(1),
+                vec![PageID::new(page_id)].into_boxed_slice(),
+            )
+        };
+        let merged = merge_bucket_results(
+            vec![
+                (1, vec![batch(11, 21), batch(11, 22)]),
+                (0, vec![batch(10, 20)]),
+            ],
+            2,
+        );
+        let pages = merged
+            .into_iter()
+            .map(|batch| batch.page_ids[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pages,
+            vec![PageID::new(20), PageID::new(21), PageID::new(22)]
+        );
+    }
+
+    #[test]
+    fn test_static_purge_worker_slots_cover_each_bucket_once() {
+        for gc_buckets in [1, 2, DEFAULT_GC_BUCKETS, 256] {
+            for worker_count in [1, 2, 3, 7, 32, 33, 257] {
+                let mut bucket_counts = vec![0usize; worker_count];
+                for gc_no in 0..gc_buckets {
+                    bucket_counts[purge_worker_slot(gc_no, worker_count)] += 1;
+                }
+                assert_eq!(bucket_counts.iter().sum::<usize>(), gc_buckets);
+                if worker_count <= gc_buckets {
+                    let min = bucket_counts.iter().copied().min().unwrap();
+                    let max = bucket_counts.iter().copied().max().unwrap();
+                    assert!(
+                        max - min <= 1,
+                        "gc_buckets={gc_buckets}, worker_count={worker_count}"
+                    );
+                }
+            }
+        }
+
+        for gc_no in 0..DEFAULT_GC_BUCKETS {
+            assert_eq!(purge_worker_slot(gc_no, 2), gc_no % 2);
+        }
     }
 
     #[test]
@@ -1470,6 +2107,55 @@ mod tests {
             };
             assert_eq!(res, expected);
         }
+    }
+
+    #[test]
+    fn test_user_transactions_round_robin_over_configured_buckets() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_gc_routing", 2, 1).await;
+            let mut sessions = Vec::new();
+            let mut transactions = Vec::new();
+            for _ in 0..5 {
+                let mut session = engine.new_session().unwrap();
+                transactions.push(session.begin_trx().unwrap());
+                sessions.push(session);
+            }
+
+            let active_counts = engine
+                .inner()
+                .trx_sys
+                .gc_buckets
+                .iter()
+                .map(|bucket| bucket.active_sts_list.lock().len())
+                .collect::<Vec<_>>();
+            assert_eq!(active_counts, vec![3, 2]);
+
+            for trx in transactions {
+                trx.rollback().await.unwrap();
+            }
+            drop(sessions);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_gc_bucket_count_can_change_across_restart_without_migration() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = purge_test_engine_config(temp_dir.path(), "redo_gc_restart", 2, 1)
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(engine.inner().trx_sys.gc_buckets.len(), 2);
+            engine.shutdown().unwrap();
+
+            let engine = purge_test_engine_config(temp_dir.path(), "redo_gc_restart", 4, 1)
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(engine.inner().trx_sys.gc_buckets.len(), 4);
+            engine.shutdown().unwrap();
+        });
     }
 
     #[test]
@@ -1993,7 +2679,555 @@ mod tests {
     }
 
     #[test]
-    fn test_trx_purge_single_thread() {
+    fn test_full_observation_at_unchanged_horizon_runs_only_requested_housekeeping() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_unchanged_observation", 2, 1).await;
+            let completed = engine.inner().trx_sys.global_visible_sts();
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
+
+            engine.inner().trx_sys.request_purge_observation();
+            let events = collect_purge_cycle(&event_rx).await;
+            assert!(events.contains(&PurgeTestEvent::Planned {
+                transaction_gc: false,
+                advance_completed_horizon: false,
+            }));
+            assert!(events.contains(&PurgeTestEvent::TableRootRetentionStarted));
+            assert!(events.contains(&PurgeTestEvent::DroppedTableStarted));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event, PurgeTestEvent::BucketStarted { .. }))
+            );
+            assert!(
+                events.iter().all(|event| !matches!(
+                    event,
+                    PurgeTestEvent::CompletedHorizonPublished { .. }
+                ))
+            );
+            assert_eq!(engine.inner().trx_sys.global_visible_sts(), completed);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_system_cts_plans_execute_with_strict_eligibility_and_housekeeping_scope() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_system_plan_execution", 2, 1).await;
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
+
+            engine.inner().trx_sys.allocate_snapshot_fence();
+            engine.inner().trx_sys.request_purge_observation();
+            let priming = collect_purge_cycle(&event_rx).await;
+            assert!(
+                priming
+                    .iter()
+                    .any(|event| matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. }))
+            );
+            let completed = engine.inner().trx_sys.global_visible_sts();
+
+            engine
+                .inner()
+                .trx_sys
+                .purge_tx
+                .send(Purge::TestSystemCts(completed))
+                .unwrap();
+            let equal = collect_purge_cycle(&event_rx).await;
+            assert!(equal.contains(&PurgeTestEvent::Planned {
+                transaction_gc: false,
+                advance_completed_horizon: false,
+            }));
+            assert!(
+                equal
+                    .iter()
+                    .all(|event| !matches!(event, PurgeTestEvent::BucketStarted { .. }))
+            );
+
+            let eligible_cts = TrxID::new(completed.as_u64() - 1);
+            engine
+                .inner()
+                .trx_sys
+                .purge_tx
+                .send(Purge::TestSystemCts(eligible_cts))
+                .unwrap();
+            let unchanged = collect_purge_cycle(&event_rx).await;
+            assert!(unchanged.contains(&PurgeTestEvent::Planned {
+                transaction_gc: true,
+                advance_completed_horizon: false,
+            }));
+            assert_eq!(
+                unchanged
+                    .iter()
+                    .filter(|event| matches!(event, PurgeTestEvent::BucketStarted { .. }))
+                    .count(),
+                2
+            );
+            assert!(unchanged.contains(&PurgeTestEvent::RetirementStarted));
+            assert!(unchanged.iter().all(|event| !matches!(
+                event,
+                PurgeTestEvent::TableRootRetentionStarted
+                    | PurgeTestEvent::DroppedTableStarted
+                    | PurgeTestEvent::CompletedHorizonPublished { .. }
+            )));
+
+            engine.inner().trx_sys.allocate_snapshot_fence();
+            engine
+                .inner()
+                .trx_sys
+                .purge_tx
+                .send(Purge::TestSystemCts(eligible_cts))
+                .unwrap();
+            let newer = collect_purge_cycle(&event_rx).await;
+            assert!(newer.contains(&PurgeTestEvent::Planned {
+                transaction_gc: true,
+                advance_completed_horizon: true,
+            }));
+            assert!(newer.contains(&PurgeTestEvent::TableRootRetentionStarted));
+            assert!(newer.contains(&PurgeTestEvent::DroppedTableStarted));
+            assert!(
+                newer
+                    .iter()
+                    .any(|event| matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. }))
+            );
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_global_blocker_rollback_runs_the_deferred_horizon_cycle() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_rollback_blocker", 2, 2).await;
+            let mut oldest_session = engine.new_session().unwrap();
+            let mut later_session = engine.new_session().unwrap();
+            let oldest = oldest_session.begin_trx().unwrap();
+            let later = later_session.begin_trx().unwrap();
+            assert!(oldest.sts() < later.sts());
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
+
+            later.commit().await.unwrap();
+            assert_eq!(
+                recv_purge_plan(&event_rx).await,
+                PurgeTestEvent::Planned {
+                    transaction_gc: false,
+                    advance_completed_horizon: false,
+                }
+            );
+            assert!(
+                event_rx
+                    .try_iter()
+                    .all(|event| !matches!(event, PurgeTestEvent::BucketStarted { .. }))
+            );
+
+            oldest.rollback().await.unwrap();
+            assert_eq!(
+                recv_purge_plan(&event_rx).await,
+                PurgeTestEvent::Planned {
+                    transaction_gc: true,
+                    advance_completed_horizon: true,
+                }
+            );
+            recv_purge_event(&event_rx, |event| {
+                matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. })
+            })
+            .await;
+
+            drop(oldest_session);
+            drop(later_session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_stale_no_active_observation_uses_fresh_bucket_minimum() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_stale_no_active", 1, 1).await;
+            let mut oldest_session = engine.new_session().unwrap();
+            let oldest = oldest_session.begin_trx().unwrap();
+            let (event_tx, event_rx) = flume::unbounded();
+            let (scan_tx, scan_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let blocked = Arc::new(AtomicBool::new(false));
+            let hook_blocked = Arc::clone(&blocked);
+            engine
+                .inner()
+                .trx_sys
+                .set_purge_test_hook(Arc::new(move |event| {
+                    let _ = event_tx.send(event);
+                    if event == PurgeTestEvent::PreScan
+                        && hook_blocked
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        scan_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    PurgeTestAction::Continue
+                }));
+
+            oldest.rollback().await.unwrap();
+            scan_rx.recv_async().await.unwrap();
+            let mut replacement_session = engine.new_session().unwrap();
+            let replacement = replacement_session.begin_trx().unwrap();
+            let replacement_sts = replacement.sts();
+            release_tx.send(()).unwrap();
+
+            assert_eq!(
+                recv_purge_plan(&event_rx).await,
+                PurgeTestEvent::Planned {
+                    transaction_gc: true,
+                    advance_completed_horizon: true,
+                }
+            );
+            assert_eq!(
+                recv_purge_event(&event_rx, |event| {
+                    matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. })
+                })
+                .await,
+                PurgeTestEvent::CompletedHorizonPublished {
+                    sts: replacement_sts,
+                }
+            );
+
+            replacement.rollback().await.unwrap();
+            drop(oldest_session);
+            drop(replacement_session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dispatcher_waits_for_blocked_remote_bucket_before_retirement_and_publication() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_remote_barrier", 2, 2).await;
+            let initial_completed = engine.inner().trx_sys.global_visible_sts();
+            let (event_tx, event_rx) = flume::unbounded();
+            let (blocked_tx, blocked_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let blocked = Arc::new(AtomicBool::new(false));
+            let hook_blocked = Arc::clone(&blocked);
+            engine
+                .inner()
+                .trx_sys
+                .set_purge_test_hook(Arc::new(move |event| {
+                    let _ = event_tx.send(event);
+                    if event == (PurgeTestEvent::BucketStarted { gc_no: 1 })
+                        && hook_blocked
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        blocked_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    PurgeTestAction::Continue
+                }));
+
+            engine.inner().trx_sys.allocate_snapshot_fence();
+            engine.inner().trx_sys.request_purge_observation();
+            blocked_rx.recv_async().await.unwrap();
+            recv_purge_event(&event_rx, |event| {
+                *event == (PurgeTestEvent::BucketCompleted { gc_no: 0 })
+            })
+            .await;
+            assert_eq!(
+                engine.inner().trx_sys.global_visible_sts(),
+                initial_completed
+            );
+            let blocked_events = event_rx.try_iter().collect::<Vec<_>>();
+            assert!(blocked_events.iter().all(|event| !matches!(
+                event,
+                PurgeTestEvent::RetirementStarted
+                    | PurgeTestEvent::CompletedHorizonPublished { .. }
+            )));
+
+            release_tx.send(()).unwrap();
+            recv_purge_event(&event_rx, |event| {
+                *event == PurgeTestEvent::RetirementStarted
+            })
+            .await;
+            recv_purge_event(&event_rx, |event| {
+                matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. })
+            })
+            .await;
+            assert!(engine.inner().trx_sys.global_visible_sts() > initial_completed);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dispatcher_bucket_failures_poison_without_retirement_or_publication() {
+        smol::block_on(async {
+            for fail_gc_no in [0, 1] {
+                let stem = format!("redo_bucket_failure_{fail_gc_no}");
+                let (_temp_dir, engine) = purge_test_engine(&stem, 2, 2).await;
+                let initial_completed = engine.inner().trx_sys.global_visible_sts();
+                let (event_tx, event_rx) = flume::unbounded();
+                let failed = Arc::new(AtomicBool::new(false));
+                let hook_failed = Arc::clone(&failed);
+                engine
+                    .inner()
+                    .trx_sys
+                    .set_purge_test_hook(Arc::new(move |event| {
+                        let _ = event_tx.send(event);
+                        if event == (PurgeTestEvent::BucketStarted { gc_no: fail_gc_no })
+                            && hook_failed
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            return PurgeTestAction::Fail;
+                        }
+                        PurgeTestAction::Continue
+                    }));
+
+                engine.inner().trx_sys.allocate_snapshot_fence();
+                engine.inner().trx_sys.request_purge_observation();
+                recv_purge_event(&event_rx, |event| {
+                    *event == (PurgeTestEvent::BucketFailed { gc_no: fail_gc_no })
+                })
+                .await;
+                wait_for_purge_poison(&engine.inner().trx_sys).await;
+                assert!(
+                    engine
+                        .inner()
+                        .trx_sys
+                        .poison_error()
+                        .as_ref()
+                        .is_some_and(|err| *err.current_context() == FatalError::PurgeAccess)
+                );
+                assert_eq!(
+                    engine.inner().trx_sys.global_visible_sts(),
+                    initial_completed
+                );
+                engine.shutdown().unwrap();
+
+                let events = event_rx.try_iter().collect::<Vec<_>>();
+                assert!(events.iter().all(|event| !matches!(
+                    event,
+                    PurgeTestEvent::RetirementStarted
+                        | PurgeTestEvent::CompletedHorizonPublished { .. }
+                )));
+            }
+        });
+    }
+
+    #[test]
+    fn test_dispatcher_without_executors_runs_every_bucket_locally_and_joins() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_dispatcher_only", 2, 1).await;
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
+            engine.inner().trx_sys.allocate_snapshot_fence();
+            engine.inner().trx_sys.request_purge_observation();
+
+            let mut events = Vec::new();
+            loop {
+                let event = event_rx.recv_async().await.unwrap();
+                events.push(event);
+                if event == PurgeTestEvent::CycleCompleted {
+                    break;
+                }
+            }
+
+            let bucket_nos = |select: fn(&PurgeTestEvent) -> Option<usize>| {
+                let mut gc_nos = events.iter().filter_map(select).collect::<Vec<_>>();
+                gc_nos.sort_unstable();
+                gc_nos
+            };
+            assert_eq!(
+                bucket_nos(|event| match event {
+                    PurgeTestEvent::BucketStarted { gc_no } => Some(*gc_no),
+                    _ => None,
+                }),
+                vec![0, 1]
+            );
+            assert_eq!(
+                bucket_nos(|event| match event {
+                    PurgeTestEvent::BucketCompleted { gc_no } => Some(*gc_no),
+                    _ => None,
+                }),
+                vec![0, 1]
+            );
+            assert_eq!(
+                bucket_nos(|event| match event {
+                    PurgeTestEvent::LocalStarted { gc_no } => Some(*gc_no),
+                    _ => None,
+                }),
+                vec![0, 1]
+            );
+            assert_eq!(
+                bucket_nos(|event| match event {
+                    PurgeTestEvent::LocalCompleted { gc_no } => Some(*gc_no),
+                    _ => None,
+                }),
+                vec![0, 1]
+            );
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                PurgeTestEvent::RemoteEnqueued { .. } | PurgeTestEvent::RemoteCompleted { .. }
+            )));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. }))
+            );
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_more_purge_workers_than_buckets_execute_each_bucket_once_and_join() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = purge_test_engine("redo_excess_workers", 2, 3).await;
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
+            engine.inner().trx_sys.allocate_snapshot_fence();
+            engine.inner().trx_sys.request_purge_observation();
+
+            let mut events = Vec::new();
+            loop {
+                let event = event_rx.recv_async().await.unwrap();
+                events.push(event);
+                if matches!(event, PurgeTestEvent::CompletedHorizonPublished { .. }) {
+                    break;
+                }
+            }
+            let mut started = events
+                .iter()
+                .filter_map(|event| match event {
+                    PurgeTestEvent::BucketStarted { gc_no } => Some(*gc_no),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut completed = events
+                .iter()
+                .filter_map(|event| match event {
+                    PurgeTestEvent::BucketCompleted { gc_no } => Some(*gc_no),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            started.sort_unstable();
+            completed.sort_unstable();
+            assert_eq!(started, vec![0, 1]);
+            assert_eq!(completed, vec![0, 1]);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dispatcher_skips_non_global_progress_and_enqueues_remote_work_first() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .purge_threads(2)
+                        .log_file_stem("redo_purge_schedule"),
+                )
+                .build()
+                .await
+                .unwrap();
+            let mut setup = engine.new_session().unwrap();
+            let initial_target = engine.inner().trx_sys.purge_handoff_cts();
+            setup.begin_trx().unwrap().commit().await.unwrap();
+            setup
+                .wait_for_purge_completion_after(initial_target)
+                .await
+                .unwrap();
+
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
+            let mut oldest_session = engine.new_session().unwrap();
+            let mut later_session = engine.new_session().unwrap();
+            let oldest = oldest_session.begin_trx().unwrap();
+            let later = later_session.begin_trx().unwrap();
+            assert!(oldest.sts() < later.sts());
+
+            later.commit().await.unwrap();
+            assert_eq!(
+                recv_purge_plan(&event_rx).await,
+                PurgeTestEvent::Planned {
+                    transaction_gc: false,
+                    advance_completed_horizon: false,
+                }
+            );
+            assert_eq!(
+                recv_purge_event(&event_rx, |event| *event == PurgeTestEvent::CycleCompleted).await,
+                PurgeTestEvent::CycleCompleted
+            );
+            assert!(event_rx.try_recv().is_err());
+
+            oldest.commit().await.unwrap();
+            assert_eq!(
+                recv_purge_plan(&event_rx).await,
+                PurgeTestEvent::Planned {
+                    transaction_gc: true,
+                    advance_completed_horizon: true,
+                }
+            );
+            let mut events = Vec::new();
+            loop {
+                let event = event_rx.recv_async().await.unwrap();
+                events.push(event);
+                if event == PurgeTestEvent::RetirementStarted {
+                    break;
+                }
+            }
+
+            let remote_enqueued = events
+                .iter()
+                .filter_map(|event| match event {
+                    PurgeTestEvent::RemoteEnqueued { gc_no, worker_slot } => {
+                        assert_eq!(*worker_slot, 1);
+                        Some(*gc_no)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let local_started = events
+                .iter()
+                .filter_map(|event| match event {
+                    PurgeTestEvent::LocalStarted { gc_no } => Some(*gc_no),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let local_completed = events
+                .iter()
+                .filter(|event| matches!(event, PurgeTestEvent::LocalCompleted { .. }))
+                .count();
+            let remote_completed = events
+                .iter()
+                .filter(|event| matches!(event, PurgeTestEvent::RemoteCompleted { .. }))
+                .count();
+
+            assert_eq!(remote_enqueued.len(), DEFAULT_GC_BUCKETS / 2);
+            assert!(remote_enqueued.iter().all(|gc_no| gc_no % 2 == 1));
+            assert_eq!(local_started.len(), DEFAULT_GC_BUCKETS / 2);
+            assert!(local_started.iter().all(|gc_no| gc_no % 2 == 0));
+            assert_eq!(local_completed, DEFAULT_GC_BUCKETS / 2);
+            assert_eq!(remote_completed, DEFAULT_GC_BUCKETS / 2);
+            let first_local = events
+                .iter()
+                .position(|event| matches!(event, PurgeTestEvent::LocalStarted { .. }))
+                .unwrap();
+            let last_remote_enqueue = events
+                .iter()
+                .rposition(|event| matches!(event, PurgeTestEvent::RemoteEnqueued { .. }))
+                .unwrap();
+            assert!(last_remote_enqueue < first_local);
+            assert_eq!(events.last(), Some(&PurgeTestEvent::RetirementStarted));
+        });
+    }
+
+    #[test]
+    fn test_trx_purge_one_worker() {
         use crate::catalog::tests::table1;
 
         const PURGE_SIZE: usize = 100;

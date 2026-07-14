@@ -1,4 +1,4 @@
-use crate::buffer::{EvictableBufferPool, PoolGuards};
+use crate::buffer::PoolGuards;
 use crate::catalog::Catalog;
 use crate::component::{EnginePools, Supplier};
 use crate::engine_poison::EnginePoisoner;
@@ -28,9 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::consts::{
-    DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH, DEFAULT_LOG_BLOCK_SIZE, DEFAULT_LOG_DIR,
-    DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_SYNC, DEFAULT_LOG_WRITE_IO_DEPTH,
-    DEFAULT_PURGE_THREADS, DEFAULT_RECOVERY_IO_DEPTH,
+    DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH, DEFAULT_GC_BUCKETS, DEFAULT_LOG_BLOCK_SIZE,
+    DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_SYNC,
+    DEFAULT_LOG_WRITE_IO_DEPTH, DEFAULT_PURGE_THREADS, DEFAULT_RECOVERY_IO_DEPTH,
 };
 use super::path::{path_to_utf8, validate_log_file_stem};
 
@@ -67,8 +67,17 @@ pub struct TrxSysConfig {
     pub log_file_max_size: Byte,
     /// Method used to sync log data to disk.
     pub log_sync: LogSync,
-    /// Number of threads used to purge undo logs.
+    /// Total number of threads that execute purge-bucket work.
+    ///
+    /// In multi-thread mode this includes the dispatcher-worker.
     pub purge_threads: usize,
+    /// Number of buckets used to shard transaction GC tracking.
+    ///
+    /// Supported values are powers of two from 1 through 256. The bucket
+    /// count is fixed for the lifetime of one engine instance and does not
+    /// affect persistent storage formats.
+    #[serde(default = "default_gc_buckets")]
+    pub gc_buckets: usize,
     /// Disable DML payload validation during recovery/no-transaction replay.
     pub recovery_disable_dml_validation: bool,
 }
@@ -86,6 +95,7 @@ impl Default for TrxSysConfig {
             log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
             log_sync: DEFAULT_LOG_SYNC,
             purge_threads: DEFAULT_PURGE_THREADS,
+            gc_buckets: DEFAULT_GC_BUCKETS,
             recovery_disable_dml_validation: false,
         }
     }
@@ -132,11 +142,21 @@ impl TrxSysConfig {
         self
     }
 
-    /// How many threads to execute for purge undo logs and remove
-    /// unused index and row pages.
+    /// Set the total number of threads that execute purge-bucket work.
+    ///
+    /// In multi-thread mode this includes the dispatcher-worker.
     #[inline]
     pub fn purge_threads(mut self, purge_threads: usize) -> Self {
         self.purge_threads = purge_threads;
+        self
+    }
+
+    /// Set the number of buckets used to shard transaction GC tracking.
+    ///
+    /// Supported values are powers of two from 1 through 256.
+    #[inline]
+    pub fn gc_buckets(mut self, gc_buckets: usize) -> Self {
+        self.gc_buckets = gc_buckets;
         self
     }
 
@@ -234,6 +254,8 @@ impl TrxSysConfig {
 
     #[inline]
     fn normalize_redo_file_layout(mut self) -> Result<Self> {
+        validate_purge_threads(self.purge_threads)?;
+        validate_gc_buckets(self.gc_buckets)?;
         validate_redo_io_depth("log_write_io_depth", self.log_write_io_depth)?;
         validate_redo_io_depth("recovery_io_depth", self.recovery_io_depth)?;
         validate_redo_io_depth(
@@ -259,7 +281,6 @@ impl TrxSysConfig {
         catalog: QuiescentGuard<Catalog>,
     ) -> Result<(TransactionSystem, PendingTransactionSystemStartup)> {
         let config = self.normalize_redo_file_layout()?;
-        let mem_pool_for_purge = pools.mem.clone();
         let pool_guards = pools.pool_guards();
 
         let (purge_tx, purge_rx) = flume::unbounded();
@@ -291,7 +312,6 @@ impl TrxSysConfig {
                 purge_rx,
                 cleanup_tx,
                 cleanup_rx,
-                mem_pool: mem_pool_for_purge,
                 pool_guards,
             },
         ))
@@ -305,7 +325,6 @@ pub(crate) struct PendingTransactionSystemStartup {
     purge_rx: Receiver<Purge>,
     cleanup_tx: Sender<TrxCleanupMessage>,
     cleanup_rx: Receiver<TrxCleanupMessage>,
-    mem_pool: QuiescentGuard<EvictableBufferPool>,
     pool_guards: PoolGuards,
 }
 
@@ -340,7 +359,6 @@ impl PendingTransactionSystemStartup {
         }
         let purge_threads = TransactionSystem::start_purge_threads(
             trx_sys.clone(),
-            self.mem_pool,
             self.pool_guards,
             self.purge_rx,
         );
@@ -386,6 +404,38 @@ fn validate_redo_io_depth(field: &'static str, io_depth: usize) -> Result<()> {
     }
     Err(Report::new(ConfigError::InvalidIoDepth)
         .attach(format!("{field}=0"))
+        .into())
+}
+
+#[inline]
+fn validate_purge_threads(purge_threads: usize) -> Result<()> {
+    const MIN_PURGE_THREADS: usize = 1;
+    if purge_threads >= MIN_PURGE_THREADS {
+        return Ok(());
+    }
+    Err(Report::new(ConfigError::InvalidPurgeThreads)
+        .attach(format!(
+            "purge_threads={purge_threads}, min_supported={MIN_PURGE_THREADS}"
+        ))
+        .into())
+}
+
+#[inline]
+const fn default_gc_buckets() -> usize {
+    DEFAULT_GC_BUCKETS
+}
+
+#[inline]
+fn validate_gc_buckets(gc_buckets: usize) -> Result<()> {
+    const MIN_GC_BUCKETS: usize = 1;
+    const MAX_GC_BUCKETS: usize = 256;
+    if (MIN_GC_BUCKETS..=MAX_GC_BUCKETS).contains(&gc_buckets) && gc_buckets.is_power_of_two() {
+        return Ok(());
+    }
+    Err(Report::new(ConfigError::InvalidGcBuckets)
+        .attach(format!(
+            "gc_buckets={gc_buckets}, min_supported={MIN_GC_BUCKETS}, max_supported={MAX_GC_BUCKETS}, requirement=power_of_two"
+        ))
         .into())
 }
 
@@ -442,6 +492,33 @@ mod tests {
         );
     }
 
+    fn assert_invalid_purge_threads(err: Error) {
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidPurgeThreads)
+        );
+        let report = err.to_string();
+        assert!(report.contains("purge_threads=0"), "report={report}");
+        assert!(report.contains("min_supported=1"), "report={report}");
+    }
+
+    fn assert_invalid_gc_buckets(err: Error, gc_buckets: usize) {
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidGcBuckets)
+        );
+        let report = err.to_string();
+        assert!(
+            report.contains(&format!("gc_buckets={gc_buckets}")),
+            "report={report}"
+        );
+        assert!(report.contains("min_supported=1"), "report={report}");
+        assert!(report.contains("max_supported=256"), "report={report}");
+        assert!(report.contains("power_of_two"), "report={report}");
+    }
+
     fn assert_normalize_rejects_invalid_io_depth(config: TrxSysConfig) {
         let err = match config.normalize_redo_file_layout() {
             Ok(_) => panic!("zero redo IO depth must be rejected"),
@@ -463,6 +540,8 @@ mod tests {
         assert_eq!(config.log_write_io_depth, 32);
         assert_eq!(config.recovery_io_depth, 32);
         assert_eq!(config.catalog_checkpoint_scan_io_depth, 32);
+        assert_eq!(config.gc_buckets, DEFAULT_GC_BUCKETS);
+        assert_eq!(config.gc_buckets, 32);
         assert!(!config.recovery_disable_dml_validation);
     }
 
@@ -482,6 +561,62 @@ mod tests {
     fn recovery_dml_validation_builder_sets_flag() {
         let config = TrxSysConfig::default().recovery_disable_dml_validation(true);
         assert!(config.recovery_disable_dml_validation);
+    }
+
+    #[test]
+    fn normalize_rejects_zero_purge_threads() {
+        let err = TrxSysConfig::default()
+            .purge_threads(0)
+            .normalize_redo_file_layout()
+            .expect_err("zero purge threads must be rejected");
+        assert_invalid_purge_threads(err);
+    }
+
+    #[test]
+    fn normalize_accepts_positive_purge_thread_counts() {
+        for purge_threads in [1, DEFAULT_PURGE_THREADS, 65] {
+            let config = TrxSysConfig::default()
+                .purge_threads(purge_threads)
+                .normalize_redo_file_layout()
+                .unwrap();
+            assert_eq!(config.purge_threads, purge_threads);
+        }
+    }
+
+    #[test]
+    fn normalize_accepts_supported_gc_bucket_counts() {
+        for gc_buckets in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let config = TrxSysConfig::default()
+                .gc_buckets(gc_buckets)
+                .normalize_redo_file_layout()
+                .unwrap();
+            assert_eq!(config.gc_buckets, gc_buckets);
+        }
+    }
+
+    #[test]
+    fn normalize_rejects_unsupported_gc_bucket_counts() {
+        for gc_buckets in [0, 3, 255, 257, usize::MAX] {
+            let err = TrxSysConfig::default()
+                .gc_buckets(gc_buckets)
+                .normalize_redo_file_layout()
+                .expect_err("unsupported GC bucket count must be rejected");
+            assert_invalid_gc_buckets(err, gc_buckets);
+        }
+    }
+
+    #[test]
+    fn legacy_serialized_config_defaults_gc_buckets() {
+        let serialized = toml::to_string(&TrxSysConfig::default()).unwrap();
+        assert!(serialized.contains("gc_buckets = 32"));
+        let legacy = serialized
+            .lines()
+            .filter(|line| !line.starts_with("gc_buckets ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config: TrxSysConfig = toml::from_str(&legacy).unwrap();
+        assert_eq!(config.gc_buckets, DEFAULT_GC_BUCKETS);
     }
 
     #[test]

@@ -1791,6 +1791,7 @@ mod tests {
     use crate::buffer::BufferPool;
     use crate::buffer::guard::PageSharedGuard;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableSpec};
+    use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::{RowLocation, UniqueIndex};
@@ -5611,6 +5612,94 @@ mod tests {
             let reclaimed = allocated_after < allocated_before
                 || engine.inner().mem_pool.allocated() < allocated_before;
             assert!(reclaimed, "row pages should be reclaimed after purge");
+        });
+    }
+
+    async fn assert_checkpoint_retirement_waits_for_reader(
+        purge_threads: usize,
+        log_file_stem: &str,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine_config(temp_dir.path(), log_file_stem)
+            .trx(
+                TrxSysConfig::default()
+                    .log_write_io_depth(1)
+                    .recovery_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
+                    .log_file_stem(log_file_stem)
+                    .purge_threads(purge_threads),
+            )
+            .build()
+            .await
+            .unwrap();
+        let table_id = create_table2_for_test(&engine).await;
+        let mut checkpoint_session = engine.new_session().unwrap();
+        insert_rows(
+            table_id,
+            &mut checkpoint_session,
+            0,
+            200,
+            &"retirement".repeat(128),
+        )
+        .await;
+        let insert_cts = checkpoint_session.last_cts();
+        wait_for_checkpoint_purge(&checkpoint_session, insert_cts).await;
+        wait_for_checkpoint_root_ready(&checkpoint_session, table_id).await;
+
+        let table = table_for_internal_assertion(&engine, table_id);
+        let mut reader_session = engine.new_session().unwrap();
+        let reader = reader_session.begin_trx().unwrap();
+        assert_freeze_created(
+            checkpoint_session
+                .freeze_table(table_id, usize::MAX)
+                .await
+                .unwrap(),
+        );
+        let retired_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
+        assert!(!retired_page_ids.is_empty());
+        let allocated_before_checkpoint = engine.inner().mem_pool.allocated();
+        let outcome = checkpoint_session
+            .checkpoint_table_with_wait(table_id)
+            .await
+            .unwrap();
+        let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
+            panic!("checkpoint should publish, got {outcome:?}");
+        };
+
+        checkpoint_session
+            .wait_for_purge_handoff_for_test(redo_cts)
+            .await
+            .unwrap();
+        for page_id in &retired_page_ids {
+            let page = table
+                .mem
+                .must_get_row_page_shared(&checkpoint_session.pool_guards(), *page_id)
+                .await
+                .unwrap();
+            drop(page);
+        }
+        assert_eq!(
+            engine.inner().mem_pool.allocated(),
+            allocated_before_checkpoint,
+            "checkpoint-retired pages must remain allocated while the reader pins system CTS eligibility"
+        );
+
+        reader.commit().await.unwrap();
+        checkpoint_session
+            .wait_for_purge_completion_after(redo_cts)
+            .await
+            .unwrap();
+        assert!(
+            engine.inner().mem_pool.allocated() < allocated_before_checkpoint,
+            "checkpoint-retired pages must be deallocated after the reader releases the horizon"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_retirement_waits_for_reader_in_single_and_dispatcher_modes() {
+        smol::block_on(async {
+            assert_checkpoint_retirement_waits_for_reader(1, "retire-reader-single").await;
+            assert_checkpoint_retirement_waits_for_reader(2, "retire-reader-dispatcher").await;
         });
     }
 

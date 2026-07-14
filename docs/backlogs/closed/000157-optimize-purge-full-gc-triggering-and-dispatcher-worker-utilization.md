@@ -60,3 +60,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via task 000223 purge scheduling and worker-utilization changes
+- Closed By: backlog close
+- Reference: docs/tasks/000223-optimize-purge-cycle-triggering-and-worker-utilization.md
+- Closed At: 2026-07-14

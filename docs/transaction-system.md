@@ -504,16 +504,54 @@ ids returned by that successful operation. The insert free list uses versioned
 page identities and lazily rejects removed or recycled entries.
 Same-table batches are processed sequentially in their table-affine bucket FIFO.
 
+Removing a user STS records the bucket minimum before removal and the resulting
+finite minimum or no-active outcome. Commit and rollback coalesce the minimum
+original STS from those transitions, but scheduling still scans the
+authoritative bucket atomics and timestamp upper bound. Active progress starts
+an all-bucket horizon cycle only when the fresh horizon is newer than the last
+completed horizon and the coalesced original STS is strictly below it. Progress
+from a later bucket behind an older global blocker therefore remains queued
+without launching an empty round; removal of the actual blocker later drains
+all newly eligible bucket prefixes.
+
+New system payloads independently coalesce their minimum CTS. A system payload
+forces all-bucket transaction GC only when that CTS is strictly below the fresh
+horizon. At an unchanged horizon this forced round does not implicitly repeat
+retained-root or dropped-table processing and does not republish completed
+progress. At a genuinely newer horizon it becomes a complete horizon cycle.
+An explicit full observation likewise starts a complete cycle only for a newer
+horizon, while still performing its explicitly requested housekeeping at an
+unchanged horizon.
+
 Purge publishes two monotonic coordination boundaries in order. First it
-publishes the observed oldest-active-snapshot horizon, which is sufficient for
-checkpoint cutoff and active-root readiness but does not prove reclamation.
-After full eligible undo/index work, retired-page deallocation, retained-root
-processing, and coalesced cleanup complete, it publishes completed-purge
-progress. Idle-session waits expose these as separate strict `> ts` predicates,
-request a lossy/idempotent purge observation before sleeping, and terminate on
-storage poison or engine shutdown. Reclamation tests for a no-wait checkpoint
-system CTS separately observe its ordered redo-to-purge handoff before waiting
-for a later completed purge cycle.
+publishes the freshly observed oldest-active-snapshot horizon, which is
+sufficient for checkpoint cutoff and active-root readiness but does not prove
+reclamation. Only after every operation selected by a complete horizon cycle
+succeeds does it publish completed-purge progress. Idle-session waits expose
+these as separate strict `> ts` predicates, request a lossy/idempotent purge
+observation before sleeping, and terminate on storage poison or engine
+shutdown. Reclamation tests for a no-wait checkpoint system CTS separately
+observe its ordered redo-to-purge handoff before waiting for a later completed
+purge cycle.
+
+`gc_buckets` controls the runtime transaction-GC sharding width. The default is
+32; valid values are powers of two from 1 through 256. User transactions use
+round-robin assignment across the configured slice. System retirement payloads
+do not persist a bucket identity: ordered commit handoff computes their
+table-affine bucket from the table id and the current engine's bucket count.
+The setting is immutable for one engine lifetime and may change across restart
+without a persistent-format migration.
+
+`purge_threads` is independent of `gc_buckets` and is the total number of
+threads that execute GC-bucket work. One dispatcher always owns slot zero and
+only `N - 1` executor threads are started. With `N = 1`, the dispatcher runs
+every bucket locally without allocating task or completion channels. Otherwise,
+bucket `gc_no` belongs to slot `gc_no % N`; all remote work is enqueued before
+the dispatcher executes its local share. Retirement batches are merged in
+bucket order only after every required slot succeeds, preserving the all-bucket
+undo/index-before-page-deallocation barrier. Positive worker counts may exceed
+the configured bucket count; excess executor slots remain idle and still join
+normally at shutdown.
 
 #### MemIndex Eviction
 

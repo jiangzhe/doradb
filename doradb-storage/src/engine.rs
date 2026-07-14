@@ -920,6 +920,7 @@ mod tests {
         assert!(config_str.contains("recovery_io_depth"));
         assert!(config_str.contains("recovery_disable_dml_validation"));
         assert!(config_str.contains("catalog_checkpoint_scan_io_depth"));
+        assert!(config_str.contains("gc_buckets"));
         assert!(config_str.contains("log_dir"));
         assert!(config_str.contains("log_file_stem"));
         assert!(!config_str.contains("max_io_depth"));

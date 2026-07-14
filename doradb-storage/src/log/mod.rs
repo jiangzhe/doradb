@@ -1536,7 +1536,7 @@ where
                 FastHashMap::default();
             for trx in mem::take(&mut sync_group.trx_list) {
                 let trx = trx.commit();
-                if let Some(gc_no) = trx.gc_no() {
+                if let Some(gc_no) = trx.gc_no(self.trx_sys.config.gc_buckets) {
                     // User undo payloads and system checkpoint page payloads
                     // share the same ordered purge handoff.
                     committed_trx_list.entry(gc_no).or_default().push(trx);
