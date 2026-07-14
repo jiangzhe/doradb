@@ -38,9 +38,7 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{
-    DataIntegrityError, Error, InternalError, OperationError, OperationResult, Result,
-};
+use crate::error::{DataIntegrityError, Error, InternalError, Result};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
@@ -1015,14 +1013,6 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
         builder.push(index_no, index);
     }
     Ok(builder.publish())
-}
-
-#[inline]
-fn index_mutation_reached_outcome(result: &OperationResult<()>) -> bool {
-    match result {
-        Ok(()) => true,
-        Err(report) => report.current_context() != &OperationError::IndexMutation,
-    }
 }
 
 #[inline]

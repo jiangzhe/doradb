@@ -1907,7 +1907,8 @@ mod tests {
             map.read_latch(row_idx).is_none(),
             "raw frozen-page image delete requires purged row undo"
         );
-        let mut access = RowWriteAccess::new(page, ctx, row_idx);
+        let dirty = std::sync::atomic::AtomicBool::new(false);
+        let mut access = RowWriteAccess::new(page, ctx, &dirty, row_idx);
         access.delete_row();
     }
 

@@ -900,7 +900,8 @@ mod tests {
 
         thread::scope(|scope| {
             let writer = scope.spawn(|| {
-                let mut access = RowWriteAccess::new(&page, &ctx, 1);
+                let dirty = std::sync::atomic::AtomicBool::new(false);
+                let mut access = RowWriteAccess::new(&page, &ctx, &dirty, 1);
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 access.delete_row();

@@ -2,9 +2,8 @@ use super::{
     DeleteInternal, DmlValidationDomain, DmlValidator, InsertRowIntoPage, UpdateRowInplace,
     UpdateUniqueMvcc,
     hot::{HotRowDeleter, HotRowUpdater, RowInserter},
-    index_key_is_changed, index_key_replace, index_mutation_reached_outcome,
-    missing_secondary_index, read_latest_index_key, row_len, unique_key_from_full_row,
-    validate_page_row_range,
+    index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
+    row_len, unique_key_from_full_row, validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
@@ -418,7 +417,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         // TODO: we should retry or wait for notification if rollback happens on a page
         // in transition state. This will be handled in a future task.
         let row_idx = page.row_idx(entry.row_id);
-        let mut access = RowWriteAccess::new(page, ctx, row_idx);
+        let mut access = RowWriteAccess::new(page, ctx, page_guard.dirty_flag(), row_idx);
         access.rollback_first_undo(metadata, entry);
         Ok(())
     }
@@ -990,7 +989,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             FindOldVersion::WriteConflict => Ok(LinkForUniqueIndex::WriteConflict),
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 let (page_ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(page, page_ctx, page.row_idx(new_id));
+                let mut new_access = RowWriteAccess::new(
+                    page,
+                    page_ctx,
+                    new_guard.dirty_flag(),
+                    page.row_idx(new_id),
+                );
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
@@ -1792,7 +1796,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 .await
                 .attach("catalog insert MVCC secondary index claim")?;
         }
-        page_guard.set_dirty();
         Ok(row_id)
     }
 
@@ -1927,13 +1930,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                 &index_change_cols,
                             )
                             .await;
-                        if index_mutation_reached_outcome(&result) {
-                            page_guard.set_dirty();
-                        }
                         result.attach("update MVCC key-change index update")?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     }
-                    page_guard.set_dirty();
                     return Ok(UpdateUniqueMvcc::Updated(row_id));
                 }
                 UpdateRowInplace::RowDeleted(input) | UpdateRowInplace::RowNotFound(input) => {
@@ -1975,9 +1974,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                 &new_guard,
                             )
                             .await;
-                        if index_mutation_reached_outcome(&result) {
-                            new_guard.set_dirty();
-                        }
                         result.attach("update MVCC moved-row index update")?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     }
@@ -1986,9 +1982,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             rt, effects, old_row_id, new_row_id, &new_guard,
                         )
                         .await;
-                    if index_mutation_reached_outcome(&result) {
-                        new_guard.set_dirty();
-                    }
                     result.attach("update MVCC moved-row index update")?;
                     return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                 }
@@ -2492,7 +2485,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 DeleteInternal::Ok(page_guard) => {
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard)
                         .await?;
-                    page_guard.set_dirty();
                     return Ok(DeleteMvcc::Deleted);
                 }
             }

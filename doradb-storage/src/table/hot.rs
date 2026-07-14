@@ -65,7 +65,15 @@ impl<'m, 'r> RowInserter<'m, 'r> {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new_with_state_guard(page, page_ctx, row_idx, state_guard);
+        let mut access = RowWriteAccess::new_with_state_guard(
+            page,
+            page_ctx,
+            page_guard.dirty_flag(),
+            row_idx,
+            state_guard,
+        );
+        // Row slot reservation above has already modified the page.
+        access.mark_dirty();
         let res = access.lock_undo(
             self.rt,
             effects,
@@ -246,6 +254,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
             let mut access = RowWriteAccess::new_with_state_guard(
                 page,
                 page_ctx,
+                page_guard.dirty_flag(),
                 page.row_idx(row_id),
                 state_guard,
             );
@@ -530,7 +539,6 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                 })
                 .collect::<Vec<_>>()
         };
-        old_guard.set_dirty(); // mark as dirty page.
         PreparedHotMoveUpdate {
             row: new_row,
             index_change_cols,

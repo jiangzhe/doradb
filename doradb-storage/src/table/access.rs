@@ -31,8 +31,8 @@ use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
     DmlValidationDomain, DmlValidator, InsertRowIntoPage, MemTable, RowPageDescriptor, Table,
     TableRootSnapshot, TableRuntimeLayout, UpdateRowInplace, UpdateUniqueMvcc,
-    index_key_is_changed, index_key_replace, index_mutation_reached_outcome, read_latest_index_key,
-    row_len, unique_key_from_full_row,
+    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
+    unique_key_from_full_row,
 };
 use crate::trx::row::{
     FindOldVersion, IndexCandidateRecheck, ReadAllRows, ReadLatestRow, RowReadAccess,
@@ -1604,7 +1604,8 @@ impl<'a> UserTableAccessor<'a> {
         };
         let metadata = self.metadata();
         let (page_ctx, page) = new_guard.ctx_and_page();
-        let mut new_access = RowWriteAccess::new(page, page_ctx, page.row_idx(new_id));
+        let mut new_access =
+            RowWriteAccess::new(page, page_ctx, new_guard.dirty_flag(), page.row_idx(new_id));
         let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
@@ -1694,7 +1695,12 @@ impl<'a> UserTableAccessor<'a> {
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
                 let (page_ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(page, page_ctx, page.row_idx(new_id));
+                let mut new_access = RowWriteAccess::new(
+                    page,
+                    page_ctx,
+                    new_guard.dirty_flag(),
+                    page.row_idx(new_id),
+                );
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
@@ -2709,7 +2715,6 @@ impl<'a> UserTableAccessor<'a> {
                 .attach("full-table update cold replacement index claim")?;
         }
         let inserted = InsertedRow::new(new_guard.page_id(), new_row_id);
-        new_guard.set_dirty();
         Ok(inserted)
     }
 
@@ -2746,7 +2751,6 @@ impl<'a> UserTableAccessor<'a> {
                     .await
                     .attach("full-table update hot key change")?;
                 }
-                page_guard.set_dirty();
                 Ok(None)
             }
             UpdateRowInplace::RowDeleted(_) | UpdateRowInplace::RowNotFound(_) => {
@@ -2797,9 +2801,6 @@ impl<'a> UserTableAccessor<'a> {
                     .await
                 };
                 let inserted = InsertedRow::new(new_guard.page_id(), new_row_id);
-                if index_mutation_reached_outcome(&result) {
-                    new_guard.set_dirty();
-                }
                 result.attach("full-table update hot move index update")?;
                 Ok(Some(inserted))
             }
@@ -2999,7 +3000,6 @@ impl<'a> UserTableAccessor<'a> {
                 .await
                 .attach("insert MVCC secondary index claim")?;
         }
-        page_guard.set_dirty(); // mark as dirty page.
         Ok(row_id)
     }
 
@@ -3201,7 +3201,6 @@ impl<'a> UserTableAccessor<'a> {
                                 .await
                                 .attach("update MVCC cold replacement index claim")?;
                             }
-                            new_guard.set_dirty();
                             return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                         }
                         Ok(RowLocation::RowPage(page_id)) => {
@@ -3247,13 +3246,9 @@ impl<'a> UserTableAccessor<'a> {
                                 &root_snapshot,
                             )
                             .await;
-                        if index_mutation_reached_outcome(&result) {
-                            page_guard.set_dirty(); // mark as dirty page.
-                        }
                         result.attach("update MVCC key-change index update")?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     } // otherwise, do nothing
-                    page_guard.set_dirty(); // mark as dirty page.
                     return Ok(UpdateUniqueMvcc::Updated(row_id));
                 }
                 UpdateRowInplace::RowDeleted(input) | UpdateRowInplace::RowNotFound(input) => {
@@ -3295,9 +3290,6 @@ impl<'a> UserTableAccessor<'a> {
                             )
                             .await;
                         // old guard is already marked inside.
-                        if index_mutation_reached_outcome(&result) {
-                            new_guard.set_dirty(); // mark as dirty page.
-                        }
                         result.attach("update MVCC moved-row index update")?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     } else {
@@ -3311,9 +3303,6 @@ impl<'a> UserTableAccessor<'a> {
                                 &root_snapshot,
                             )
                             .await;
-                        if index_mutation_reached_outcome(&result) {
-                            new_guard.set_dirty(); // mark as dirty page.
-                        }
                         result.attach("update MVCC moved-row index update")?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     }
@@ -3459,7 +3448,6 @@ impl<'a> UserTableAccessor<'a> {
                     // or index GC removes it after it is no longer visible.
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard, &root_snapshot)
                         .await?;
-                    page_guard.set_dirty(); // mark as dirty.
                     return Ok(DeleteMvcc::Deleted);
                 }
             }
@@ -6209,6 +6197,77 @@ mod tests {
                 trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(10), &[0]).await,
                 Ok(SelectMvcc::NotFound)
             ));
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_update_mvcc_cold_duplicate_marks_replacement_page_dirty() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "full_update_cold_dirty")
+                    .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 2, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 100, 1, "hot").await;
+
+            let replacement_page = session.load_active_insert_page(table_id).unwrap();
+            session.save_active_insert_page(table_id, replacement_page);
+            let table = table_for_internal_assertion(&engine, table_id);
+            let page_guard = table
+                .mem
+                .get_row_page_versioned_shared(&session.pool_guards(), replacement_page)
+                .await
+                .unwrap()
+                .unwrap();
+            page_guard.bf().set_dirty(false);
+            assert!(!page_guard.bf().is_dirty());
+            drop(page_guard);
+
+            let mut trx = session.begin_trx().unwrap();
+            let result: Result<()> = trx
+                .exec(async |stmt| {
+                    stmt.table_update_mvcc(table_id, |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        Ok((id == 0).then(|| {
+                            vec![UpdateCol {
+                                idx: 0,
+                                val: Val::from(1i32),
+                            }]
+                        }))
+                    })
+                    .await?;
+                    Ok(())
+                })
+                .await;
+            assert_eq!(
+                result.unwrap_err().operation_error(),
+                Some(OperationError::DuplicateKey)
+            );
+
+            let page_guard = table
+                .mem
+                .get_row_page_versioned_shared(&session.pool_guards(), replacement_page)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                page_guard.bf().is_dirty(),
+                "failed cold replacement must leave its row page dirty"
+            );
+            drop(page_guard);
+
+            assert_eq!(scan_table_i32s(&mut trx, table_id).await, vec![0, 1, 100]);
+            for id in [0, 1, 100] {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0]).await,
+                    Ok(SelectMvcc::Found(_))
+                ));
+            }
             trx.commit().await.unwrap();
         });
     }
