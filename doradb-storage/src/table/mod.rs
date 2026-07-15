@@ -51,7 +51,7 @@ use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::{TrxContext, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem::take;
@@ -158,17 +158,10 @@ impl Table {
 
     /// Ensures a foreground operation may access this table after logical locks.
     #[inline]
-    pub(crate) fn check_foreground_live(&self, operation: &'static str) -> Result<()> {
-        self.check_foreground_live_report()
-            .map_err(|report| Error::from(report.attach(format!("operation={operation}"))))
-    }
-
-    /// Returns the table-lifecycle report before the public operation boundary.
-    #[inline]
-    pub(crate) fn check_foreground_live_report(&self) -> OperationResult<()> {
+    pub(crate) fn check_foreground_live(&self) -> OperationResult<()> {
         self.lifecycle
             .check_foreground_live()
-            .map_err(|report| report.attach(format!("table_id={}", self.table_id())))
+            .attach_with(|| format!("table_id={}", self.table_id()))
     }
 
     /// Acquires the reversible metadata-change gate for future index DDL.
@@ -326,10 +319,10 @@ impl Table {
     pub(crate) fn root_snapshot<'ctx>(
         &self,
         proof: &TrxReadProof<'ctx>,
-    ) -> Result<TableRootSnapshot<'ctx>> {
-        Ok(self.with_active_root(proof, |root| {
+    ) -> TableRootSnapshot<'ctx> {
+        self.with_active_root(proof, |root| {
             TableRootSnapshot::from_active_root(root, proof)
-        }))
+        })
     }
 
     /// Returns the deletion buffer tracking persisted-row tombstones.
@@ -495,46 +488,17 @@ impl Table {
             .await
     }
 
-    #[inline]
-    fn missing_pool_guard(&self, operation: &'static str, role: &'static str) -> Error {
-        Report::new(InternalError::PoolGuardMissing)
-            .attach(format!(
-                "operation={operation}, table_id={}, missing {role} pool guard",
-                self.table_id()
-            ))
-            .into()
-    }
-
-    #[inline]
-    fn stale_block_index_leaf(&self, operation: &'static str) -> Error {
-        Report::new(InternalError::BlockIndexLeafStale)
-            .attach(format!(
-                "operation={operation}, table_id={}, stale block-index leaf lock",
-                self.table_id()
-            ))
-            .into()
-    }
-
-    #[inline]
-    fn meta_pool_guard<'a>(
-        &self,
-        guards: &'a PoolGuards,
-        operation: &'static str,
-    ) -> Result<&'a PoolGuard> {
-        guards
-            .try_guard(PoolRole::Meta)
-            .ok_or_else(|| self.missing_pool_guard(operation, "meta"))
-    }
-
     /// Returns total number of row pages.
     #[inline]
-    pub(crate) async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
+    pub(crate) async fn total_row_pages(&self, guards: &PoolGuards) -> Result<usize> {
         let mut res = 0usize;
         let pivot_row_id = self.mem.pivot_row_id();
         let meta_pool_guard = guards.meta_guard();
         let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
-        cursor.seek(pivot_row_id).await;
-        while let Some(leaf) = cursor.next().await {
+        cursor.seek(pivot_row_id).await?;
+        while let Some(leaf) = cursor.next().await? {
+            // A cursor leaf is protected by its held parent and cannot be stale
+            // before this immediate shared-lock conversion.
             let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());
             res += g
@@ -544,7 +508,7 @@ impl Table {
                 .filter(|entry| entry.row_id >= pivot_row_id)
                 .count();
         }
-        res
+        Ok(res)
     }
 
     async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F) -> Result<()>
@@ -553,13 +517,23 @@ impl Table {
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let meta_pool_guard = self.meta_pool_guard(guards, "table mem scan")?;
+        let meta_pool_guard = guards.try_guard(PoolRole::Meta).ok_or_else(|| {
+            Report::new(InternalError::PoolGuardMissing).attach(format!(
+                "operation=table_mem_scan, table_id={}, missing meta pool guard",
+                self.table_id()
+            ))
+        })?;
         let pivot_row_id = self.mem.pivot_row_id();
         let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
-        cursor.seek(pivot_row_id).await;
-        while let Some(leaf) = cursor.next().await {
+        cursor.seek(pivot_row_id).await?;
+        while let Some(leaf) = cursor.next().await? {
             let Some(g) = leaf.lock_shared_async().await else {
-                return Err(self.stale_block_index_leaf("table mem scan"));
+                return Err(Report::new(InternalError::BlockIndexLeafStale)
+                    .attach(format!(
+                        "operation=table_mem_scan, table_id={}, stale block-index leaf lock",
+                        self.table_id()
+                    ))
+                    .into());
             };
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
@@ -1116,7 +1090,9 @@ fn unique_key_from_full_row(
     );
     let index_spec = metadata.idx.require_index_spec(unique_index_no)?;
     if !index_spec.unique() {
-        return Err(secondary_index_kind_mismatch(operation, "unique"));
+        return Err(Report::new(InternalError::SecondaryIndexKindMismatch)
+            .attach(format!("operation={operation}, expected=unique"))
+            .into());
     }
     let vals = index_spec
         .cols
@@ -1130,13 +1106,6 @@ fn unique_key_from_full_row(
 fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
     Report::new(InternalError::SecondaryIndexOutOfBounds)
         .attach(format!("index_no={index_no}, index_count={index_count}"))
-        .into()
-}
-
-#[inline]
-fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str) -> Error {
-    Report::new(InternalError::SecondaryIndexKindMismatch)
-        .attach(format!("operation={operation}, expected={expected}"))
         .into()
 }
 
@@ -1439,7 +1408,7 @@ pub(crate) mod tests {
             return;
         }
         assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
-        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains("table_file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }

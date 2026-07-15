@@ -609,19 +609,17 @@ fn parse_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
 
 #[inline]
 fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
-    let payload = validate_block(buf, TABLE_META_BLOCK_SPEC)
-        .attach_with(|| {
-            format!(
-                "file={}, block=table-meta, block_id={page_id}",
-                FileKind::TableFile
-            )
-        })
-        .map_err(Error::from)?;
-    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|report| {
-        Error::from(report.attach(format!(
-            "file={}, block=table-meta, block_id={page_id}",
+    let payload = validate_block(buf, TABLE_META_BLOCK_SPEC).attach_with(|| {
+        format!(
+            "file={}, block=table_meta, block_id={page_id}",
             FileKind::TableFile
-        )))
+        )
+    })?;
+    let (_, meta_block) = MetaBlock::deser(payload, 0).attach_with(|| {
+        format!(
+            "file={}, block=table_meta, block_id={page_id}",
+            FileKind::TableFile
+        )
     })?;
     Ok(ParsedMeta {
         meta: TableMeta {
@@ -721,7 +719,7 @@ mod tests {
         _page: &[u8],
         _file_kind: FileKind,
         _page_id: BlockID,
-    ) -> crate::error::DataIntegrityResult<()> {
+    ) -> DataIntegrityResult<()> {
         Ok(())
     }
 
@@ -1191,8 +1189,8 @@ mod tests {
     fn assert_table_meta_corruption(err: Error, page_id: BlockID, expected: DataIntegrityError) {
         assert_eq!(err.data_integrity_error(), Some(expected));
         let report = format!("{err:?}");
-        assert!(report.contains("table-file"), "{report}");
-        assert!(report.contains("table-meta"), "{report}");
+        assert!(report.contains("table_file"), "{report}");
+        assert!(report.contains("table_meta"), "{report}");
         assert!(report.contains(&format!("block_id={page_id}")), "{report}");
     }
 

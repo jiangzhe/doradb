@@ -45,6 +45,17 @@ pub(crate) enum TableTerminal {
     Dropped = 2,
 }
 
+impl TableTerminal {
+    #[inline]
+    fn label(self) -> &'static str {
+        match self {
+            TableTerminal::Live => "live",
+            TableTerminal::Dropping => "dropping",
+            TableTerminal::Dropped => "dropped",
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublishGateState {
@@ -52,6 +63,18 @@ enum PublishGateState {
     Publishing = 1,
     ClosingPublishing = 2,
     Closed = 3,
+}
+
+impl PublishGateState {
+    #[inline]
+    fn label(self) -> &'static str {
+        match self {
+            PublishGateState::Open => "open",
+            PublishGateState::Publishing => "publishing",
+            PublishGateState::ClosingPublishing => "closing_publishing",
+            PublishGateState::Closed => "closed",
+        }
+    }
 }
 
 #[repr(u8)]
@@ -687,7 +710,8 @@ fn foreground_not_live_err(state: TableTerminal) -> Report<OperationError> {
         TableTerminal::Dropped => OperationError::TableNotFound,
     };
     Report::new(reason).attach(format!(
-        "foreground table access rejected: lifecycle_state={state:?}"
+        "foreground table access rejected: lifecycle_state={}",
+        state.label()
     ))
 }
 
@@ -700,7 +724,8 @@ fn drop_not_live_err(table_id: TableID, operation: &'static str, state: TableTer
     };
     Report::new(reason)
         .attach(format!(
-            "table lifecycle operation rejected: table_id={table_id}, operation={operation}, lifecycle_state={state:?}"
+            "table lifecycle operation rejected: table_id={table_id}, operation={operation}, lifecycle_state={}",
+            state.label()
         ))
         .into()
 }
@@ -709,7 +734,8 @@ fn drop_not_live_err(table_id: TableID, operation: &'static str, state: TableTer
 fn mark_dropped_err(table_id: TableID, state: TableTerminal) -> Error {
     Report::new(InternalError::Generic)
         .attach(format!(
-            "mark dropped requires Dropping state: table_id={table_id}, lifecycle_state={state:?}"
+            "mark dropped requires dropping state: table_id={table_id}, lifecycle_state={}",
+            state.label()
         ))
         .into()
 }
@@ -718,7 +744,8 @@ fn mark_dropped_err(table_id: TableID, state: TableTerminal) -> Error {
 fn mark_dropped_publish_err(table_id: TableID, publish: PublishGateState) -> Error {
     Report::new(InternalError::Generic)
         .attach(format!(
-            "mark dropped requires closed publish gate: table_id={table_id}, publish_state={publish:?}"
+            "mark dropped requires closed publish gate: table_id={table_id}, publish_state={}",
+            publish.label()
         ))
         .into()
 }

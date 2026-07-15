@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
-use crate::error::{Error, FatalError, OperationError, Result};
+use crate::error::{FatalError, LifecycleResult, OperationError, OperationResult, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::row::ops::{
@@ -231,11 +231,8 @@ impl<'stmt> Statement<'stmt> {
         inner: &'stmt mut TrxInner,
         attachment: &'stmt TrxAttachment,
         owner: LockOwner,
-    ) -> Result<Self> {
-        let owner_group = inner
-            .checked_lock_state()
-            .attach("operation=execute statement")?
-            .owner_group();
+    ) -> LifecycleResult<Self> {
+        let owner_group = inner.checked_lock_state()?.owner_group();
         Ok(Statement {
             inner,
             attachment,
@@ -288,104 +285,100 @@ impl<'stmt> Statement<'stmt> {
         &mut self,
         resource: LockResource,
         mode: LockMode,
-    ) -> Result<()> {
-        Ok(self
-            .stmt_locks
+    ) -> OperationResult<()> {
+        self.stmt_locks
             .acquire(self.attachment.engine().lock_manager(), resource, mode)
-            .await?)
+            .await
     }
 
     /// Acquires statement-lifetime metadata protection for a table read.
     #[inline]
-    pub(crate) async fn acquire_table_read_lock(&mut self, table_id: TableID) -> Result<()> {
+    pub(crate) async fn acquire_table_read_lock(
+        &mut self,
+        table_id: TableID,
+    ) -> OperationResult<()> {
         self.acquire_statement_lock(LockResource::TableMetadata(table_id), LockMode::Shared)
             .await
     }
 
     /// Acquires transaction-lifetime metadata protection for a table write.
+    ///
+    /// An unavailable transaction lock state crosses from Lifecycle into the
+    /// lock operation here. `change_context` retains the prerequisite frame.
     #[inline]
     pub(crate) async fn acquire_table_write_metadata_lock(
         &mut self,
         table_id: TableID,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         let lock_manager = self.attachment.engine().lock_manager();
-        Ok(self
-            .inner
+        self.inner
             .checked_lock_state_mut()
-            .attach("operation=acquire table write locks")?
+            .change_context(OperationError::LockUnavailable)
+            .attach_with(|| "phase=resolve_transaction_lock_state")?
             .acquire(
                 lock_manager,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
             )
-            .await?)
+            .await
     }
 
-    /// Acquires transaction-lifetime table-data intent for a table write.
+    /// Acquires transaction-lifetime table-data intent for a point write.
     #[inline]
-    pub(crate) async fn acquire_table_write_data_lock(&mut self, table_id: TableID) -> Result<()> {
+    pub(crate) async fn acquire_table_write_data_lock(
+        &mut self,
+        table_id: TableID,
+    ) -> OperationResult<()> {
         let lock_manager = self.attachment.engine().lock_manager();
-        Ok(self
-            .inner
+        self.inner
             .checked_lock_state_mut()
-            .attach("operation=acquire table write locks")?
+            .change_context(OperationError::LockUnavailable)
+            .attach_with(|| "phase=resolve_transaction_lock_state")?
             .acquire(
                 lock_manager,
                 LockResource::TableData(table_id),
                 LockMode::IntentExclusive,
             )
-            .await?)
+            .await
     }
 
-    /// Acquires transaction-lifetime exclusive table-data ownership.
+    /// Acquires transaction-lifetime exclusive table-data protection.
     #[inline]
-    pub(crate) async fn acquire_table_exclusive_data_lock(
+    async fn acquire_table_exclusive_data_lock(
         &mut self,
         table_id: TableID,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         let lock_manager = self.attachment.engine().lock_manager();
-        Ok(self
-            .inner
+        self.inner
             .checked_lock_state_mut()
-            .attach("operation=acquire exclusive table data lock")?
+            .change_context(OperationError::LockUnavailable)
+            .attach_with(|| "phase=resolve_transaction_lock_state")?
             .acquire(
                 lock_manager,
                 LockResource::TableData(table_id),
                 LockMode::Exclusive,
             )
-            .await?)
+            .await
     }
 
     #[inline]
-    fn table_not_found(table_id: TableID, operation: &'static str) -> Error {
-        Report::new(OperationError::TableNotFound)
-            .attach(format!("operation={operation}, table_id={table_id}"))
-            .into()
-    }
-
-    #[inline]
-    fn resolve_user_table(
-        &mut self,
-        table_id: TableID,
-        operation: &'static str,
-    ) -> Result<Arc<Table>> {
-        if is_catalog_table(table_id) {
-            return Err(Self::table_not_found(table_id, operation));
+    fn resolve_user_table(&mut self, table_id: TableID) -> OperationResult<Arc<Table>> {
+        if !is_catalog_table(table_id) {
+            if let Some(table) = self.inner.cached_user_table(table_id) {
+                return Ok(table);
+            }
+            if let Some(table) = self.attachment.cached_user_table(table_id) {
+                self.inner.cache_user_table(&table);
+                return Ok(table);
+            }
+            let engine = self.attachment.engine();
+            if let Some(table) = engine.catalog().get_table_now(table_id) {
+                self.attachment.cache_user_table(&table);
+                self.inner.cache_user_table(&table);
+                return Ok(table);
+            }
         }
-        if let Some(table) = self.inner.cached_user_table(table_id) {
-            return Ok(table);
-        }
-        if let Some(table) = self.attachment.cached_user_table(table_id) {
-            self.inner.cache_user_table(&table);
-            return Ok(table);
-        }
-        let engine = self.attachment.engine();
-        let Some(table) = engine.catalog().get_table_now(table_id) else {
-            return Err(Self::table_not_found(table_id, operation));
-        };
-        self.attachment.cache_user_table(&table);
-        self.inner.cache_user_table(&table);
-        Ok(table)
+        Err(Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}")))
     }
 
     /// Scans the catalog-owned user table's row store by table id.
@@ -403,15 +396,23 @@ impl<'stmt> Statement<'stmt> {
     where
         F: FnMut(Vec<Val>) -> bool,
     {
-        let table = self.resolve_user_table(table_id, "table_scan_mvcc")?;
-        self.acquire_table_read_lock(table_id).await?;
-        table.check_foreground_live("table_scan_mvcc")?;
+        const OPERATION: &str = "table_scan_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_read_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
         table
             .accessor_with_layout(&layout)
             .table_scan_mvcc(rt, read_set, row_action)
             .await
+            .map_err(|err| err.attach(format!("operation={OPERATION}, table_id={table_id}")))
     }
 
     /// Sequentially update callback-selected rows using latest modification reads.
@@ -429,11 +430,22 @@ impl<'stmt> Statement<'stmt> {
     where
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<Option<Vec<UpdateCol>>>,
     {
-        let table = self.resolve_user_table(table_id, "table_update_mvcc")?;
-        self.acquire_table_write_metadata_lock(table_id).await?;
-        table.check_foreground_live("table_update_mvcc")?;
-        self.acquire_table_exclusive_data_lock(table_id).await?;
-        table.check_foreground_live("table_update_mvcc")?;
+        const OPERATION: &str = "table_update_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_exclusive_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         let validate_updates = !self.disable_dml_validation;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -454,9 +466,16 @@ impl<'stmt> Statement<'stmt> {
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
-        let table = self.resolve_user_table(table_id, "table_lookup_unique_mvcc")?;
-        self.acquire_table_read_lock(table_id).await?;
-        table.check_foreground_live("table_lookup_unique_mvcc")?;
+        const OPERATION: &str = "table_lookup_unique_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_read_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
         table
@@ -476,9 +495,16 @@ impl<'stmt> Statement<'stmt> {
         key_vals: &[Val],
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
-        let table = self.resolve_user_table(table_id, "table_index_lookup_mvcc")?;
-        self.acquire_table_read_lock(table_id).await?;
-        table.check_foreground_live("table_index_lookup_mvcc")?;
+        const OPERATION: &str = "table_index_lookup_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_read_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
         table
@@ -501,14 +527,21 @@ impl<'stmt> Statement<'stmt> {
     where
         R: RangeBounds<&'r [Val]>,
     {
-        let table = self.resolve_user_table(table_id, "table_index_scan_mvcc")?;
-        self.acquire_table_read_lock(table_id).await?;
-        table.check_foreground_live("table_index_scan_mvcc")?;
+        const OPERATION: &str = "table_index_scan_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_read_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_index_scan(index_no, &range, read_set)
-                .with_foreground_context("table_index_scan_mvcc", table_id)?;
+                .with_foreground_context(OPERATION, table_id)?;
         }
         let rt = self.runtime();
         table
@@ -522,16 +555,25 @@ impl<'stmt> Statement<'stmt> {
     /// Strong table-runtime access is internal and operation-local.
     #[inline]
     pub async fn table_insert_mvcc(&mut self, table_id: TableID, cols: Vec<Val>) -> Result<RowID> {
-        let table = self.resolve_user_table(table_id, "table_insert_mvcc")?;
-        self.acquire_table_write_metadata_lock(table_id).await?;
-        table.check_foreground_live("table_insert_mvcc")?;
+        const OPERATION: &str = "table_insert_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_full_row(&cols)
-                .with_foreground_context("table_insert_mvcc", table_id)?;
+                .with_foreground_context(OPERATION, table_id)?;
         }
-        self.acquire_table_write_data_lock(table_id).await?;
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -549,20 +591,29 @@ impl<'stmt> Statement<'stmt> {
         unique_index_no: usize,
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
-        let table = self.resolve_user_table(table_id, "table_upsert_unique_mvcc")?;
-        self.acquire_table_write_metadata_lock(table_id).await?;
-        table.check_foreground_live("table_upsert_unique_mvcc")?;
+        const OPERATION: &str = "table_upsert_unique_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             let validator = DmlValidator::new(layout.metadata());
             validator
                 .validate_full_row(&cols)
-                .with_foreground_context("table_upsert_unique_mvcc", table_id)?;
+                .with_foreground_context(OPERATION, table_id)?;
             validator
                 .validate_unique_index(unique_index_no)
-                .with_foreground_context("table_upsert_unique_mvcc", table_id)?;
+                .with_foreground_context(OPERATION, table_id)?;
         }
-        self.acquire_table_write_data_lock(table_id).await?;
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -581,20 +632,29 @@ impl<'stmt> Statement<'stmt> {
         key_vals: &[Val],
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
-        let table = self.resolve_user_table(table_id, "table_update_unique_mvcc")?;
-        self.acquire_table_write_metadata_lock(table_id).await?;
-        table.check_foreground_live("table_update_unique_mvcc")?;
+        const OPERATION: &str = "table_update_unique_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             let validator = DmlValidator::new(layout.metadata());
             validator
                 .validate_unique_key(index_no, key_vals)
-                .with_foreground_context("table_update_unique_mvcc", table_id)?;
+                .with_foreground_context(OPERATION, table_id)?;
             validator
                 .validate_sparse_update(&update)
-                .with_foreground_context("table_update_unique_mvcc", table_id)?;
+                .with_foreground_context(OPERATION, table_id)?;
         }
-        self.acquire_table_write_data_lock(table_id).await?;
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -613,16 +673,25 @@ impl<'stmt> Statement<'stmt> {
         key_vals: &[Val],
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
-        let table = self.resolve_user_table(table_id, "table_delete_unique_mvcc")?;
-        self.acquire_table_write_metadata_lock(table_id).await?;
-        table.check_foreground_live("table_delete_unique_mvcc")?;
+        const OPERATION: &str = "table_delete_unique_mvcc";
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))?;
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_unique_key(index_no, key_vals)
-                .with_foreground_context("table_delete_unique_mvcc", table_id)?;
+                .with_foreground_context(OPERATION, table_id)?;
         }
-        self.acquire_table_write_data_lock(table_id).await?;
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -637,14 +706,19 @@ impl<'stmt> Statement<'stmt> {
         table: &CatalogTable,
         cols: Vec<Val>,
     ) -> Result<RowID> {
-        self.acquire_table_write_metadata_lock(table.table_id())
-            .await?;
+        const OPERATION: &str = "catalog_insert_mvcc";
+        let table_id = table.table_id();
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         if !self.disable_dml_validation {
             DmlValidator::new(table.metadata())
                 .validate_full_row(&cols)
-                .with_foreground_context("catalog_insert_mvcc", table.table_id())?;
+                .with_foreground_context(OPERATION, table_id)?;
         }
-        self.acquire_table_write_data_lock(table.table_id()).await?;
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table.insert_mvcc(rt, effects, cols).await
     }
@@ -658,14 +732,19 @@ impl<'stmt> Statement<'stmt> {
         key_vals: &[Val],
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
-        self.acquire_table_write_metadata_lock(table.table_id())
-            .await?;
+        const OPERATION: &str = "catalog_delete_primary_key_mvcc";
+        let table_id = table.table_id();
+        self.acquire_table_write_metadata_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         if !self.disable_dml_validation {
             DmlValidator::new(table.metadata())
                 .validate_primary_key(index_no, key_vals)
-                .with_foreground_context("catalog_delete_primary_key_mvcc", table.table_id())?;
+                .with_foreground_context(OPERATION, table_id)?;
         }
-        self.acquire_table_write_data_lock(table.table_id()).await?;
+        self.acquire_table_write_data_lock(table_id)
+            .await
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .delete_unique_mvcc(rt, effects, index_no, key_vals, log_by_key)
@@ -736,7 +815,7 @@ pub(crate) mod tests {
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{FatalError, InternalError, OperationError};
+    use crate::error::{ErrorKind, FatalError, InternalError, LifecycleError, OperationError};
     use crate::id::TrxID;
     use crate::lock::LockManager;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
@@ -802,11 +881,11 @@ pub(crate) mod tests {
 
     #[inline]
     fn trx_lock_owner(trx: &mut Transaction) -> Result<LockOwner> {
-        let checkout = trx.checkout("read transaction lock owner")?;
+        let checkout = trx.checkout()?;
         Ok(checkout
             .inner()
             .checked_lock_state()
-            .attach("operation=read transaction lock owner")?
+            .attach("operation=read_transaction_lock_owner")?
             .owner())
     }
 
@@ -816,13 +895,16 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<bool> {
-        let mut checkout = trx.checkout("try acquire transaction lock")?;
+        let mut checkout = trx.checkout()?;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
         let lock_manager = attachment.engine().lock_manager();
         try_acquire_owner_lock_state(
             inner
                 .checked_lock_state_mut()
-                .attach("operation=try acquire transaction lock")?,
+                .change_context(OperationError::LockUnavailable)
+                .attach_with(|| {
+                    "operation=try_acquire_transaction_lock, phase=resolve_transaction_lock_state"
+                })?,
             lock_manager,
             resource,
             mode,
@@ -941,6 +1023,108 @@ pub(crate) mod tests {
 
             let err = res.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_missing_table_preserves_typed_context() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_table_scan_missing_context").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let table_id = TableID::new(91_225);
+
+            let err = trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            let rendered = format!("{err:?}");
+            assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
+            assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[inline]
+    fn assert_lock_state_lifecycle_error(err: Report<LifecycleError>, trx_id: TrxID, reason: &str) {
+        assert_eq!(*err.current_context(), LifecycleError::TransactionDiscarded);
+        assert!(err.downcast_ref::<InternalError>().is_none());
+        let rendered = format!("{err:?}");
+        assert!(rendered.contains(&format!("trx_id={trx_id}")));
+        assert!(rendered.contains(&format!("reason={reason}")));
+    }
+
+    #[test]
+    fn test_checked_lock_state_reports_lifecycle_reasons() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_checked_lock_state_lifecycle").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+
+            trx.exec(async |stmt| {
+                stmt.inner.active = false;
+                assert_lock_state_lifecycle_error(
+                    stmt.inner.checked_lock_state().err().unwrap(),
+                    trx_id,
+                    "transaction_inactive",
+                );
+                assert_lock_state_lifecycle_error(
+                    stmt.inner.checked_lock_state_mut().err().unwrap(),
+                    trx_id,
+                    "transaction_inactive",
+                );
+                stmt.inner.active = true;
+
+                let lock_state = stmt.inner.lock_state.take();
+                assert_lock_state_lifecycle_error(
+                    stmt.inner.checked_lock_state().err().unwrap(),
+                    trx_id,
+                    "lock_state_missing",
+                );
+                assert_lock_state_lifecycle_error(
+                    stmt.inner.checked_lock_state_mut().err().unwrap(),
+                    trx_id,
+                    "lock_state_missing",
+                );
+                stmt.inner.lock_state = lock_state;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_write_lock_stacks_operation_over_lifecycle_error() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_table_write_lock_error_stack").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+
+            trx.exec(async |stmt| {
+                stmt.inner.active = false;
+                let err = stmt
+                    .acquire_table_write_metadata_lock(TableID::new(91_226))
+                    .await
+                    .unwrap_err();
+                stmt.inner.active = true;
+
+                assert_eq!(*err.current_context(), OperationError::LockUnavailable);
+                assert_eq!(
+                    err.downcast_ref::<LifecycleError>().copied(),
+                    Some(LifecycleError::TransactionDiscarded)
+                );
+                assert!(err.downcast_ref::<InternalError>().is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
             trx.rollback().await.unwrap();
         });
     }

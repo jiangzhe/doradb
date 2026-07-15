@@ -1495,14 +1495,8 @@ async fn run_trx_cleanup_job(job: TrxCleanupJob) {
         trx_id,
         reason,
     } = job;
-    let operation = match reason {
-        TrxCleanupReason::HandleDrop => "cleanup dropped transaction handle",
-        TrxCleanupReason::ShutdownDrain => "cleanup shutdown abandoned transaction",
-    };
-    let (entry, session) = match engine
-        .session_registry
-        .resolve_trx(session_id, trx_id, operation)
-    {
+    let _ = reason;
+    let (entry, session) = match engine.session_registry.resolve_trx(session_id, trx_id) {
         Ok(parts) => parts,
         Err(_) => return,
     };
@@ -1510,7 +1504,7 @@ async fn run_trx_cleanup_job(job: TrxCleanupJob) {
         TrxEntryState::Abandoned => {
             let trx_sys = engine.trx_sys.clone();
             let attachment = TrxAttachment::new(engine, session, trx_id);
-            let claim = match TrxCompletionClaim::cleanup(entry, attachment, operation) {
+            let claim = match TrxCompletionClaim::cleanup(entry, attachment) {
                 Ok(claim) => claim,
                 Err(_) => return,
             };
@@ -1682,11 +1676,7 @@ pub(crate) mod tests {
         let engine = trx.engine().expect("test transaction must have engine");
         let (entry, _session) = engine
             .session_registry
-            .resolve_trx(
-                trx.session_id,
-                trx.trx_id(),
-                "capture transaction cleanup state",
-            )
+            .resolve_trx(trx.session_id, trx.trx_id())
             .expect("test transaction must resolve");
         let status = {
             let inner_slot = entry.inner.lock();

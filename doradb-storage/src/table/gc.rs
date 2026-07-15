@@ -1,9 +1,7 @@
 use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
-use crate::error::{
-    DataIntegrityError, DataIntegrityResultExt, Error, FileKind, InternalError, Result,
-};
+use crate::error::{DataIntegrityError, Error, InternalError, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::{
@@ -13,7 +11,7 @@ use crate::index::{
 use crate::session::SessionPin;
 use crate::trx::TrxReadProof;
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::sync::Arc;
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
@@ -150,20 +148,6 @@ enum DeleteOverlayProof {
     ColdRowValues(Vec<Val>),
 }
 
-#[inline]
-fn invalid_lwc_payload(
-    file_kind: FileKind,
-    block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
-    let message = message.into();
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
-        ))
-        .into()
-}
-
 impl Table {
     /// Full-scan cleanup for user-table secondary MemIndex entries.
     ///
@@ -182,11 +166,15 @@ impl Table {
         let trx_sys = session.engine.trx_sys.clone();
         let pool_guards = session.pool_guards();
         loop {
-            let mut trx = session.begin_trx("cleanup secondary mem indexes")?;
+            let mut trx = session
+                .begin_trx()
+                .attach("operation=cleanup_secondary_mem_indexes")?;
             let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let cleanup_res = {
-                let checkout = trx.checkout("cleanup secondary mem indexes")?;
+                let checkout = trx
+                    .checkout()
+                    .attach("operation=cleanup_secondary_mem_indexes")?;
                 let proof = checkout.inner().ctx().read_proof();
                 let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts, &proof)?;
                 if !snapshot.is_visible_to(cleanup_sts) {
@@ -572,15 +560,16 @@ impl Table {
             .await?;
         let block = persisted.block();
         if block.row_shape_fingerprint() != row.row_shape_fingerprint() {
-            return Err(invalid_lwc_payload(
-                FileKind::TableFile,
-                row.block_id(),
-                "row shape fingerprint mismatch",
-            ));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, \
+                     reason=row_shape_fingerprint_mismatch"
+                ))
+                .into());
         }
-        block
+        Ok(block
             .decode_row_values(metadata.col.as_ref(), row.row_idx(), &read_set)
-            .with_block_context(file_kind, "lwc-block", block_id)
+            .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))?)
     }
 }
 
@@ -632,7 +621,7 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
 #[cfg(test)]
 mod tests {
     use crate::catalog::IndexNo;
-    use crate::error::{DataIntegrityError, OperationError};
+    use crate::error::{DataIntegrityError, LifecycleError};
     use crate::id::{RowID, TrxID};
     use crate::index::{IndexInsert, NonUniqueIndex, UniqueIndex};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
@@ -705,11 +694,11 @@ mod tests {
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
                 .unwrap_err();
-            let operation_error = err.operation_error();
+            let lifecycle_error = err.lifecycle_error();
             let was_in_trx = session.in_trx().unwrap();
 
             trx.rollback().await.unwrap();
-            assert_eq!(operation_error, Some(OperationError::ExistingTransaction));
+            assert_eq!(lifecycle_error, Some(LifecycleError::ExistingTransaction));
             assert!(was_in_trx);
             assert!(!session.in_trx().unwrap());
         });
@@ -1288,7 +1277,7 @@ mod tests {
                 .unwrap_err();
             assert_table_data_integrity(
                 err,
-                "lwc-block",
+                "lwc_block",
                 block_id,
                 DataIntegrityError::InvalidPayload,
             );

@@ -1,7 +1,7 @@
 # Error Handling Specification
 
 Status: Draft  
-Current implementation snapshot: 2026-07-15
+Current implementation snapshot: 2026-07-16
 
 ## Purpose
 
@@ -69,11 +69,11 @@ it can produce.
 | Domain | Result type | Meaning | Principal modules |
 | --- | --- | --- | --- |
 | Configuration | `ConfigResult<T>` | Invalid startup, static configuration, paths, or durable layout | `conf`, engine/bootstrap, file setup, log configuration |
-| Operation | `OperationResult<T>` | A valid request cannot complete in the current logical state | `lock`, `catalog`, `session`, `trx`, table DML/lifecycle |
+| Operation | `OperationResult<T>` | A valid request cannot complete in the current logical state | `lock`, `catalog`, table DML and operation orchestration |
 | Resource | `ResourceResult<T>` | Memory, buffer, file, or other capacity exhaustion | `buffer`, file allocation, indexes, log, transaction runtime |
 | IO | `Report<IoError>` and `BackendResult<T>` | OS, backend, short-IO, or transport failures | `io`, `file`, `buffer`, `log`, recovery streams |
 | Data integrity | `DataIntegrityResult<T>` | Invalid or corrupted persisted bytes and recovery invariants | `serde`, `value`, `file`, `log`, `lwc`, persisted indexes, catalog/table recovery |
-| Lifecycle | `LifecycleResult<T>` | Shutdown, admission closure, or another clean lifecycle rejection | `engine`, `session`, buffer/log lifecycle, transaction attachment |
+| Lifecycle | `LifecycleResult<T>` | Shutdown, admission closure, unavailable runtime state, or another clean lifecycle rejection | `engine`, `session`, buffer/log lifecycle, transaction attachment |
 | Internal | `InternalResult<T>` | Violated runtime, construction, or ownership invariants | `component`, `buffer`, `index`, `table`, `trx`, recovery internals |
 | Fatal | `FatalResult<T>` | A failure that poisons runtime admission or prevents safe continuation | engine poison, log/checkpoint/catalog writes, transaction rollback/purge |
 
@@ -121,6 +121,14 @@ Use report context and attachments for different purposes:
   assigned a new meaning to the source failure.
 - `attach` and `attach_with` add operation names, phases, identifiers, values,
   expected/actual details, or other diagnostic facts.
+- Prefer `attach_with` when building an attachment requires allocation or
+  formatting, so successful results do not pay error-path construction cost.
+  Use `attach` directly for static strings and for reports that already exist
+  only on an error path.
+- Use lowercase snake_case for stable dimension values in printable
+  attachments, such as `operation=table_scan_mvcc` and
+  `phase=resolve_lock_state`. Identifiers and measured values retain their
+  natural rendering.
 - Typed attachments should be used when later code must inspect the data.
   Printable strings are suitable for diagnostic-only details.
 
@@ -213,6 +221,88 @@ The source `DmlValidationError` remains in the report. A conversion must state
 why the target domain is appropriate; it must not exist only to satisfy a
 function signature.
 
+The main intent and core logic of a helper determine its outer error domain;
+a prerequisite step does not. When a lifecycle or internal prerequisite fails
+before an Operation-domain action, retain the prerequisite context underneath
+an Operation context that describes the action that could not proceed. Frame
+order should read from the core operation down through each prerequisite to
+the original producer.
+
+At an error-domain boundary over a `Result`, follow `change_context` with
+`attach_with` for the boundary-owned operation, phase, identifier, or other
+necessary diagnostic. If the boundary already owns a materialized `Report`,
+use `Report::attach`; there is no success path, and `Report` does not expose
+`attach_with`. If the source and target contexts fully describe the conversion
+and there is no additional fact to attach, an adjacent comment must explain
+why the message is intentionally omitted.
+
+A helper may itself be the consuming-domain boundary. For example, resolving
+transaction-owned lock state is a Lifecycle check, while failure to acquire a
+table write lock is meaningful to its caller as an Operation failure. Keep the
+helper and stack the Operation context directly over the Lifecycle report:
+
+```rust
+async fn acquire_table_write_metadata_lock(
+    &mut self,
+    table_id: TableID,
+) -> OperationResult<()> {
+    let lock_manager = self.attachment.engine().lock_manager();
+    let lock_state = self
+        .inner
+        .checked_lock_state_mut()
+        .change_context(OperationError::LockUnavailable)
+        .attach_with(|| "phase=resolve_transaction_lock_state")?;
+    lock_state
+        .acquire(
+            lock_manager,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+        )
+        .await
+}
+```
+
+If lock-state resolution fails, the report contains
+`OperationError::LockUnavailable` over
+`LifecycleError::TransactionDiscarded`. An ordinary lock-manager failure is
+already Operation-domain and does not acquire artificial Lifecycle context.
+The semantic caller adds its operation and table context lazily:
+
+```rust
+self.acquire_table_write_metadata_lock(table_id)
+    .await
+    .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+```
+
+Do not remove such a helper by expanding its two domains into every caller,
+and do not convert the Lifecycle report to public `Error` before applying the
+Operation context.
+
+Runtime admission is lifecycle-owned core logic. Shutdown remains its native
+Lifecycle failure; a poison health check is a Fatal prerequisite that is
+stacked under `LifecycleError::RuntimeUnavailable`:
+
+```rust
+pub(crate) fn acquire_admission(&self) -> LifecycleResult<EngineAdmission<'_>> {
+    let admission = self
+        .lifecycle
+        .admit()
+        .attach_with(|| "phase=acquire_engine_lifecycle_admission")?;
+    self.engine_poisoner
+        .ensure_healthy()
+        .change_context(LifecycleError::RuntimeUnavailable)
+        .attach_with(|| "phase=check_engine_health")?;
+    Ok(admission)
+}
+```
+
+Shutdown produces `ErrorKind::Lifecycle` with `LifecycleError::Shutdown`.
+Poison-blocked admission produces `ErrorKind::Lifecycle` with
+`LifecycleError::RuntimeUnavailable`, while the originating `FatalError`
+remains downcastable. A fatal error raised after admission succeeds remains a
+Fatal-domain failure; this conversion applies only while entering runtime
+access.
+
 ### 5. Use crate `Result` only at a real convergence boundary
 
 Crate `Result` is appropriate when:
@@ -228,10 +318,10 @@ failure before `?` converts it:
 ```rust
 fn run_operation() -> Result<()> {
     check_internal_state()
-        .attach("phase=resolve transaction lock state")?;
+        .attach("phase=resolve_transaction_lock_state")?;
 
     perform_lock_operation()
-        .attach("phase=acquire transaction table lock")?;
+        .attach("phase=acquire_transaction_table_lock")?;
 
     Ok(())
 }
@@ -301,10 +391,60 @@ the semantic orchestrator.
 source.map_err(|_| Report::new(OperationError::InvalidDmlInput))?;
 
 // Good: preserves the source report.
-source.change_context(OperationError::InvalidDmlInput)?;
+source
+    .change_context(OperationError::InvalidDmlInput)
+    .attach_with(|| "phase=validate_dml_input")?;
 ```
 
 Do not convert to `Error`, downcast it, and reconstruct a new typed report.
+
+### Round-tripping through the public error boundary
+
+Do not convert one typed domain into public `Error` and then call
+`change_context` to assign another internal domain. That sequence produces a
+`DomainA -> ErrorKind -> DomainB` stack in which the public classification is
+an internal transport frame rather than the final API boundary.
+
+Convert the typed source report directly:
+
+```rust
+let report = source
+    .change_context(OperationError::IndexMutation)
+    .attach_with(|| "phase=claim_secondary_index_key")?;
+```
+
+Once public `Error` has been produced at a legitimate public or mixed-domain
+boundary, it propagates only outward. Add caller-owned diagnostic attachments
+to that `Error` when necessary, but never convert it back into a typed domain
+as a shortcut.
+
+Treat `map_err` in error propagation as a review trigger. Do not use it to
+attach to or reclassify an `error-stack` typed report: doing so can obscure
+whether source frames were retained, and `ResultExt::attach_with` or
+`change_context` expresses that intent directly.
+
+One narrow exception is outward propagation of an already-public `Result<T>`
+from a genuine mixed-domain seam. Attach context there with
+`map_err(|err| err.attach(...))`. The closure runs only on failure, so
+dynamically formatted messages remain lazy. Applying `error_stack::ResultExt`
+to `Result<T, Error>` would instead create `Report<Error>` and incorrectly nest
+the public wrapper as another context frame. The durable current example is
+`Statement::table_scan_mvcc` over `TableAccessor::table_scan_mvcc`, whose lower
+call can report unrelated buffer, IO, integrity, resource, lifecycle, and
+internal failures.
+
+`Session::total_row_pages` currently has the same outward `map_err` shape over
+`Table::total_row_pages` because the row-page cursor conservatively forwards
+the generic `BufferPool` result. Production `BlockIndex` uses the fixed metadata
+pool, whose cursor reads do not perform IO and whose page-kind failure may be an
+ownership/reachability invariant. Treat this as a transitional seam, not as
+precedent for early convergence; backlog 000159 owns the proof and the final
+assertion-versus-recoverable decision.
+
+This exception is not a reason to converge an access helper early. `map_err`
+also remains appropriate for non-`error-stack` sources such as primitive
+conversion errors or a specialized transport-to-public conversion whose source
+report is explicitly preserved.
 
 ### Unexplained conversion at a legitimate boundary
 
@@ -319,6 +459,14 @@ the point at which a caller-neutral error changes domain and can encourage
 operation parameters to spread. Prefer visible `change_context` and
 `attach_with` calls at the consuming caller unless an extension represents a
 stable, reusable domain boundary rather than formatting convenience.
+
+### Low-reuse error-formatting helpers
+
+Do not introduce a helper whose only job is to construct an error from a
+provided operation name or other diagnostic dimensions when it has fewer than
+three call sites. Inline those one or two reports so the producer domain and
+attachments remain visible. Deduplicate at three or more call sites, or when a
+helper owns real classification or conversion policy beyond formatting.
 
 ### Duplicate or generic context
 
@@ -356,55 +504,34 @@ The following pieces already follow the intended direction:
   reports.
 - `LockMode`, `LockManager`, and `OwnerLockState` now preserve
   `OperationResult` through the lock module.
-
-### Confirmed lock-consumer violations
-
-The lock provider migration exposed callers that still convert too early:
-
-- `StreamStmtState::acquire_table_read_lock()` converts a pure
-  `OperationResult` into crate `Result` without owning a conversion policy.
-- Statement read-lock helpers and test lock helpers contain the same
-  `Ok(typed_call()?)` pattern.
-- Statement write-lock helpers combine `InternalResult` from
-  `checked_lock_state_mut()` with lock `OperationResult` before the statement
-  operation is attached.
-- The explicit transaction-table-lock helper chain passes operation names into
-  helpers and collapses Internal and Operation reports below the semantic lock
-  operation.
-- Session freeze, checkpoint, and explicit table-lock paths convert typed lock
-  failures without consistently attaching their operation and table context.
-- Catalog create-index, drop-index, and drop-table orchestrators attach context
-  to explicit-lock rejection but not consistently to DDL lock acquisition.
-
-Migrate these consumers one module at a time. After each module, verify and
-stop before starting the next module.
-
-Suggested order:
-
-1. `trx/stream_stmt.rs`
-2. `trx/stmt.rs`
-3. `trx/mod.rs`
-4. `session.rs`
-5. `catalog/index.rs`
-6. `catalog/table.rs`
+- Logical-lock consumers in stream, statement, transaction, session, and
+  catalog code preserve typed reports through semantic operation boundaries.
+  Cross-domain write-lock helpers stack `OperationError::LockUnavailable` over
+  the `LifecycleError::TransactionDiscarded` lock-state failure.
+- `Statement::table_scan_mvcc` owns its public operation context. Table
+  resolution and liveness remain Operation-domain; cold decode and validation
+  remain DataIntegrity-domain; the lower accessor is an intentional
+  mixed-domain convergence seam.
+- `RowPageIndexMemCursor::seek` and `next` conservatively propagate the generic
+  `BufferPool` result, and their direct consumers preserve that result. The
+  production block index uses `FixedBufferPool`; whether its page lookup can
+  fail under a valid schedule or should instead be asserted as an invariant is
+  deferred to backlog 000159.
+- Private engine, session, and transaction admission/checkout helpers return
+  `LifecycleResult`. Runtime shutdown, unavailable sessions, conflicting state
+  transitions, and discarded transactions retain Lifecycle classification;
+  poison-blocked admission retains its Fatal source frame.
+- Access-chain callers use `ResultExt::attach` or `attach_with` directly. The
+  only `map_err` calls in the migrated session/statement slice are the durable
+  table-scan convergence seam and the documented transitional row-page-count
+  seam.
 
 ### Other propagation debt
 
-The following areas require separate audits after the lock-consumer chain:
+The following areas require separate audits after the migrated slice:
 
-- Statement and stream table resolution still accept operation names and
-  construct crate `Error` below the statement operation.
-- Transaction checkout, terminal claims, session resolution, and cleanup pass
-  operation names through mechanical ownership helpers.
-- `Table::check_foreground_live(operation)` and
-  `Table::check_foreground_live_report()` form the duplicate wrapper pair
-  prohibited by the canonical-helper rule. The canonical table helper should
-  preserve `OperationResult`; semantic callers should attach operation context.
 - `DmlValidationResultExt` owns operation and table formatting that should be
   visible at foreground and recovery consumers.
-- `DataIntegrityResultExt::with_block_context` converts directly to crate
-  `Result`; each use must be classified as a real boundary or migrated to
-  typed propagation.
 - Several convenience constructors return public `Error` from internal
   invariant producers. Audit whether each constructor is used only at a true
   boundary.
@@ -414,6 +541,15 @@ The following areas require separate audits after the lock-consumer chain:
 - Calls to `CompletionErrorKind::report_error` must be checked to ensure their
   producers are genuinely mixed-domain and did not collapse a typed report
   prematurely.
+- The remaining invariant-oriented `ActiveTransactionDiscarded`,
+  `PoolGuardMissing`, and `RowPageMissing` producers encountered by this work
+  retain their existing Internal-domain behavior. Their
+  assertion-versus-recoverable modeling is deferred to
+  [backlog 000159](./backlogs/000159-reassess-invariant-oriented-table-scan-errors.md).
+- The same backlog covers cursor root, child, sibling, and re-seek access
+  through the fixed metadata pool. Future tests must exercise a reachable
+  production path; a test-only buffer implementation must not be the sole
+  justification for keeping a production failure recoverable.
 
 This inventory is representative, not a substitute for inspecting a complete
 call chain before changing it. Add newly discovered patterns here before or

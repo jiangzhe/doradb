@@ -11,7 +11,7 @@ use crate::buffer::{
 };
 use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata};
 use crate::error::{
-    DataIntegrityError, Error, InternalError, OperationError, OperationResult,
+    DataIntegrityError, Error, InternalError, InternalResult, OperationError, OperationResult,
     RecoveryDuplicateKey, Result,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
@@ -238,24 +238,19 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         self.blk_idx.pivot_row_id()
     }
 
+    // TODO(backlog 000159): prove that every caller-owned PoolGuards set must
+    // contain all table runtime roles before deciding whether absence should
+    // remain InternalError::PoolGuardMissing or become an assertion.
     #[inline]
-    fn missing_pool_guard(&self, operation: &'static str, role: &'static str) -> Error {
-        Report::new(InternalError::PoolGuardMissing)
-            .attach(format!(
-                "operation={operation}, table_id={}, missing {role} pool guard",
-                self.table_id()
-            ))
-            .into()
-    }
-
-    #[inline]
-    fn stale_block_index_leaf(&self, operation: &'static str) -> Error {
-        Report::new(InternalError::BlockIndexLeafStale)
-            .attach(format!(
-                "operation={operation}, table_id={}, stale block-index leaf lock",
-                self.table_id()
-            ))
-            .into()
+    fn missing_pool_guard(
+        &self,
+        operation: &'static str,
+        role: &'static str,
+    ) -> Report<InternalError> {
+        Report::new(InternalError::PoolGuardMissing).attach(format!(
+            "operation={operation}, table_id={}, missing {role} pool guard",
+            self.table_id()
+        ))
     }
 
     #[inline]
@@ -263,7 +258,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         guards: &'a PoolGuards,
         operation: &'static str,
-    ) -> Result<&'a PoolGuard> {
+    ) -> InternalResult<&'a PoolGuard> {
         guards
             .try_guard(PoolRole::Meta)
             .ok_or_else(|| self.missing_pool_guard(operation, "meta"))
@@ -274,26 +269,29 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         &self,
         guards: &'a PoolGuards,
         operation: &'static str,
-    ) -> Result<&'a PoolGuard> {
+    ) -> InternalResult<&'a PoolGuard> {
         guards
             .try_row_guard(self.row_pool_role)
-            .ok_or_else(|| self.missing_pool_guard(operation, "row-page"))
+            .ok_or_else(|| self.missing_pool_guard(operation, "row_page"))
     }
 
     /// Return the pool guard used by in-memory secondary indexes.
     #[inline]
-    pub(crate) fn index_pool_guard<'a>(&self, guards: &'a PoolGuards) -> Result<&'a PoolGuard> {
+    pub(crate) fn index_pool_guard<'a>(
+        &self,
+        guards: &'a PoolGuards,
+    ) -> InternalResult<&'a PoolGuard> {
         guards
             .try_guard(self.index_pool_role)
-            .ok_or_else(|| self.missing_pool_guard("secondary index access", "secondary-index"))
+            .ok_or_else(|| self.missing_pool_guard("secondary_index_access", "secondary_index"))
     }
 
     /// Destroy all mutable memory structures owned by this table runtime.
     #[inline]
     pub(crate) async fn destroy(self, guards: &PoolGuards) -> Result<()> {
-        let row_pool_guard = self.row_pool_guard(guards, "destroy mem table")?;
+        let row_pool_guard = self.row_pool_guard(guards, "destroy_mem_table")?;
         let index_pool_guard = self.index_pool_guard(guards)?;
-        let meta_pool_guard = self.meta_pool_guard(guards, "destroy mem table")?;
+        let meta_pool_guard = self.meta_pool_guard(guards, "destroy_mem_table")?;
         let MemTable {
             mem_pool,
             blk_idx,
@@ -318,7 +316,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let result = self
             .blk_idx
             .prune_checkpoint_prefix(
-                self.meta_pool_guard(guards, "unlink retired row pages")?,
+                self.meta_pool_guard(guards, "unlink_retired_row_pages")?,
                 batch.start_row_id,
                 batch.end_row_id,
                 &batch.page_ids,
@@ -334,7 +332,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         page_ids: &[PageID],
     ) -> Result<()> {
-        let row_pool_guard = self.row_pool_guard(guards, "deallocate retired row pages")?;
+        let row_pool_guard = self.row_pool_guard(guards, "deallocate_retired_row_pages")?;
         for page_id in page_ids {
             let page_guard = self
                 .mem_pool
@@ -361,7 +359,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         Ok(self
             .mem_pool()
             .get_page::<RowPage>(
-                self.row_pool_guard(guards, "get row page shared")?,
+                self.row_pool_guard(guards, "get_row_page_shared")?,
                 page_id,
                 LatchFallbackMode::Shared,
             )
@@ -379,7 +377,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
         get_page_versioned_shared::<RowPage, _>(
             self.mem_pool(),
-            self.row_pool_guard(guards, "get versioned row page shared")?,
+            self.row_pool_guard(guards, "get_versioned_row_page_shared")?,
             page_id,
         )
         .await
@@ -429,7 +427,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         Ok(self
             .mem_pool()
             .get_page::<RowPage>(
-                self.row_pool_guard(guards, "get row page exclusive")?,
+                self.row_pool_guard(guards, "get_row_page_exclusive")?,
                 page_id,
                 LatchFallbackMode::Exclusive,
             )
@@ -482,8 +480,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageSharedGuard<RowPage>> {
-        let meta_pool_guard = self.meta_pool_guard(guards, "get insert page")?;
-        let row_pool_guard = self.row_pool_guard(guards, "get insert page")?;
+        let meta_pool_guard = self.meta_pool_guard(guards, "get_insert_page")?;
+        let row_pool_guard = self.row_pool_guard(guards, "get_insert_page")?;
         self.blk_idx
             .try_get_insert_page_with_redo(
                 meta_pool_guard,
@@ -504,8 +502,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageExclusiveGuard<RowPage>> {
-        let meta_pool_guard = self.meta_pool_guard(guards, "get exclusive insert page")?;
-        let row_pool_guard = self.row_pool_guard(guards, "get exclusive insert page")?;
+        let meta_pool_guard = self.meta_pool_guard(guards, "get_exclusive_insert_page")?;
+        let row_pool_guard = self.row_pool_guard(guards, "get_exclusive_insert_page")?;
         self.blk_idx
             .get_insert_page_exclusive_with_redo(
                 meta_pool_guard,
@@ -526,8 +524,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         count: usize,
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<RowPage>> {
-        let meta_pool_guard = self.meta_pool_guard(guards, "allocate row page")?;
-        let row_pool_guard = self.row_pool_guard(guards, "allocate row page")?;
+        let meta_pool_guard = self.meta_pool_guard(guards, "allocate_row_page")?;
+        let row_pool_guard = self.row_pool_guard(guards, "allocate_row_page")?;
         self.blk_idx
             .allocate_row_page_at(
                 meta_pool_guard,
@@ -560,13 +558,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
-        let meta_pool_guard = self.meta_pool_guard(guards, "mem scan")?;
+        let meta_pool_guard = self.meta_pool_guard(guards, "mem_scan")?;
         let start_row_id = self.pivot_row_id();
         self.scan_from_with_meta_guard(
             guards,
             meta_pool_guard,
             start_row_id,
-            "mem scan",
+            "mem_scan",
             page_action,
         )
         .await
@@ -588,12 +586,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
-        let meta_pool_guard = self.meta_pool_guard(guards, "mem scan from")?;
+        let meta_pool_guard = self.meta_pool_guard(guards, "mem_scan_from")?;
         self.scan_from_with_meta_guard(
             guards,
             meta_pool_guard,
             start_row_id,
-            "mem scan from",
+            "mem_scan_from",
             page_action,
         )
         .await
@@ -609,16 +607,21 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         start_row_id: RowID,
     ) -> Result<(RowID, Vec<RowPageDescriptor>)> {
-        let operation = "snapshot original row pages";
+        let operation = "snapshot_original_row_pages";
         let meta_pool_guard = self.meta_pool_guard(guards, operation)?;
         let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
-        cursor.seek(start_row_id).await;
+        cursor.seek(start_row_id).await?;
         let mut entries = Vec::new();
         let mut upper_bound = start_row_id;
         let mut first_leaf = true;
-        while let Some(leaf) = cursor.next().await {
+        while let Some(leaf) = cursor.next().await? {
             let Some(guard) = leaf.lock_shared_async().await else {
-                return Err(self.stale_block_index_leaf(operation));
+                return Err(Report::new(InternalError::BlockIndexLeafStale)
+                    .attach(format!(
+                        "operation={operation}, table_id={}, stale block-index leaf lock",
+                        self.table_id()
+                    ))
+                    .into());
             };
             let page = guard.page();
             debug_assert!(page.is_leaf());
@@ -627,7 +630,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 first_leaf = false;
                 if leaf_entries.is_empty() {
                     if page.header.start_row_id != start_row_id {
-                        return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
+                        return Err(
+                            invalid_scan_start(self.table_id(), operation, start_row_id).into()
+                        );
                     }
                     upper_bound = page.header.end_row_id;
                     continue;
@@ -639,7 +644,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         continue;
                     }
                     Err(_) => {
-                        return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
+                        return Err(
+                            invalid_scan_start(self.table_id(), operation, start_row_id).into()
+                        );
                     }
                 }
             } else {
@@ -685,11 +692,16 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
-        cursor.seek(start_row_id).await;
+        cursor.seek(start_row_id).await?;
         let mut first_leaf = true;
-        while let Some(leaf) = cursor.next().await {
+        while let Some(leaf) = cursor.next().await? {
             let Some(g) = leaf.lock_shared_async().await else {
-                return Err(self.stale_block_index_leaf(operation));
+                return Err(Report::new(InternalError::BlockIndexLeafStale)
+                    .attach(format!(
+                        "operation={operation}, table_id={}, stale block-index leaf lock",
+                        self.table_id()
+                    ))
+                    .into());
             };
             debug_assert!(g.page().is_leaf());
             let page = g.page();
@@ -700,13 +712,15 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     if page.header.start_row_id == start_row_id {
                         return Ok(());
                     }
-                    return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
+                    return Err(invalid_scan_start(self.table_id(), operation, start_row_id).into());
                 }
                 match entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {
                     Ok(idx) => idx,
                     Err(_) if page.header.end_row_id == start_row_id => return Ok(()),
                     Err(_) => {
-                        return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
+                        return Err(
+                            invalid_scan_start(self.table_id(), operation, start_row_id).into()
+                        );
                     }
                 }
             } else {
@@ -727,7 +741,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     /// Find the current hot-row location in the in-memory block index.
     #[inline]
     pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> Result<RowLocation> {
-        let meta_pool_guard = self.meta_pool_guard(guards, "find row")?;
+        let meta_pool_guard = self.meta_pool_guard(guards, "find_row")?;
         self.blk_idx.find_mem_row(meta_pool_guard, row_id).await
     }
 
@@ -963,7 +977,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             match self.find_row(guards, old_id).await {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
                 Ok(RowLocation::LwcBlock { .. }) => {
-                    return self.catalog_lwc_error("link unique index", old_id);
+                    return self.catalog_lwc_error("link_unique_index", old_id);
                 }
                 Ok(RowLocation::RowPage(page_id)) => {
                     let Some(old_guard) = self
@@ -1201,7 +1215,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<Option<PageID>> {
         match self.find_row(guards, row_id).await? {
             RowLocation::NotFound => Ok(None),
-            RowLocation::LwcBlock { .. } => self.catalog_lwc_error("index purge", row_id),
+            RowLocation::LwcBlock { .. } => self.catalog_lwc_error("index_purge", row_id),
             RowLocation::RowPage(page_id) => Ok(Some(page_id)),
         }
     }
@@ -1394,7 +1408,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             metadata,
             primary_key_index_no,
             &cols,
-            "upsert primary key no-trx",
+            "upsert_primary_key_no_trx",
         )?;
         let current = self
             .index_lookup_unique_uncommitted(guards, key.index_no, &key.vals, |layout, row| {
@@ -1479,7 +1493,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     )));
                 }
                 RowLocation::LwcBlock { .. } => {
-                    return self.catalog_lwc_error("delete primary key no-trx", row_id);
+                    return self.catalog_lwc_error("delete_primary_key_no_trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
@@ -1589,7 +1603,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     )));
                 }
                 RowLocation::LwcBlock { .. } => {
-                    return self.catalog_lwc_error("update primary key no-trx", row_id);
+                    return self.catalog_lwc_error("update_primary_key_no_trx", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
@@ -1726,7 +1740,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             Some((row_id, _)) => match self.find_row(guards, row_id).await? {
                 RowLocation::NotFound => return Ok(None),
                 RowLocation::LwcBlock { .. } => {
-                    return self.catalog_lwc_error("unique uncommitted lookup", row_id);
+                    return self.catalog_lwc_error("unique_uncommitted_lookup", row_id);
                 }
                 RowLocation::RowPage(page_id) => {
                     let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
@@ -1799,7 +1813,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             self.metadata(),
             unique_index_no,
             &cols,
-            "upsert unique MVCC",
+            "upsert_unique_mvcc",
         )?;
         let input = RowUpdateInput::FullRow(cols);
         match self
@@ -1880,7 +1894,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         return Ok(UpdateUniqueMvcc::NotFound(input));
                     }
                     Ok(RowLocation::LwcBlock { .. }) => {
-                        return self.catalog_lwc_error("update unique MVCC", row_id);
+                        return self.catalog_lwc_error("update_unique_mvcc", row_id);
                     }
                     Ok(RowLocation::RowPage(page_id)) => {
                         let Some(page_guard) = self
@@ -2431,7 +2445,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 Some((row_id, _)) => match self.find_row(guards, row_id).await {
                     Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
                     Ok(RowLocation::LwcBlock { .. }) => {
-                        return self.catalog_lwc_error("delete unique MVCC", row_id);
+                        return self.catalog_lwc_error("delete_unique_mvcc", row_id);
                     }
                     Ok(RowLocation::RowPage(page_id)) => {
                         let Some(page_guard) = self
@@ -2727,12 +2741,15 @@ fn catalog_primary_key_payload_error(message: impl Into<String>) -> Error {
 }
 
 #[inline]
-fn invalid_scan_start(table_id: TableID, operation: &'static str, start_row_id: RowID) -> Error {
+fn invalid_scan_start(
+    table_id: TableID,
+    operation: &'static str,
+    start_row_id: RowID,
+) -> Report<InternalError> {
     Report::new(InternalError::Generic)
         .attach(format!(
             "operation={operation}, table_id={table_id}, row-page scan start is not a row-page boundary: start_row_id={start_row_id}"
         ))
-        .into()
 }
 
 #[cfg(test)]
@@ -4079,24 +4096,15 @@ mod tests {
                 test_mem_table_with_metadata(&engine, mem_table_id, indexed_payload_metadata())
                     .await;
 
-            let err = mem_table.stale_block_index_leaf("test stale block-index");
-            assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::BlockIndexLeafStale)
-            );
-            let report = format!("{err:?}");
-            assert!(report.contains("test stale block-index"), "{report}");
-            assert!(report.contains(&mem_table_id.to_string()), "{report}");
-
             let err = mem_table
-                .catalog_lwc_error::<()>("test catalog lwc", RowID::new(42))
+                .catalog_lwc_error::<()>("test_catalog_lwc", RowID::new(42))
                 .unwrap_err();
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::Generic)
             );
             let report = format!("{err:?}");
-            assert!(report.contains("test catalog lwc"), "{report}");
+            assert!(report.contains("test_catalog_lwc"), "{report}");
             assert!(report.contains("row_id=42"), "{report}");
         });
     }

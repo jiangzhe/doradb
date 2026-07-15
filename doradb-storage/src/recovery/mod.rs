@@ -1270,7 +1270,7 @@ mod tests {
             return;
         }
         assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
-        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains("table_file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
@@ -3944,7 +3944,7 @@ mod tests {
             };
             assert_table_data_integrity(
                 err,
-                "lwc-block",
+                "lwc_block",
                 block_id,
                 DataIntegrityError::ChecksumMismatch,
             );
@@ -4108,7 +4108,7 @@ mod tests {
                 };
                 assert_table_data_integrity(
                     err,
-                    "column-deletion-blob",
+                    "column_deletion_blob",
                     blob_ref.start_block_id,
                     DataIntegrityError::InvalidPayload,
                 );

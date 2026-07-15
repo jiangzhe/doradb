@@ -334,7 +334,7 @@ impl IndexRollback for CatalogTable {
         self.mem
             .require_sec_idx(key.index_no)?
             .unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("rollback unique mask deleted", "unique"))?
+            .ok_or_else(|| secondary_index_kind_mismatch("rollback_unique_mask_deleted", "unique"))?
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
             .await
@@ -353,7 +353,7 @@ impl IndexRollback for CatalogTable {
             .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback unique compare delete", "unique")
+                secondary_index_kind_mismatch("rollback_unique_compare_delete", "unique")
             })?
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
@@ -373,7 +373,7 @@ impl IndexRollback for CatalogTable {
             .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback unique compare exchange", "unique")
+                secondary_index_kind_mismatch("rollback_unique_compare_exchange", "unique")
             })?
             .bind(index_pool_guard)
             .compare_exchange(&key.vals, old_row_id, new_row_id, ts)
@@ -392,7 +392,7 @@ impl IndexRollback for CatalogTable {
             .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback non-unique mask deleted", "non-unique")
+                secondary_index_kind_mismatch("rollback_non_unique_mask_deleted", "non_unique")
             })?
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
@@ -411,7 +411,7 @@ impl IndexRollback for CatalogTable {
             .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback non-unique mask active", "non-unique")
+                secondary_index_kind_mismatch("rollback_non_unique_mask_active", "non_unique")
             })?
             .bind(index_pool_guard)
             .mask_as_active(&key.vals, row_id, ts)
@@ -431,7 +431,7 @@ impl IndexRollback for CatalogTable {
             .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback non-unique compare delete", "non-unique")
+                secondary_index_kind_mismatch("rollback_non_unique_compare_delete", "non_unique")
             })?
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)

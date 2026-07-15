@@ -17,7 +17,7 @@ use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
     catalog_table_id_from_slot, catalog_table_slot,
 };
-use crate::error::{DataIntegrityError, DataIntegrityResultExt, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
@@ -33,7 +33,7 @@ use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::QuiescentGuard;
 use crate::table::TableRedoReplayFloor;
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
@@ -700,20 +700,21 @@ impl CatalogStorage {
         let row_count = lwc_block.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
-            return Err(invalid_lwc_payload(
-                self.mtb.file_kind(),
-                entry.block_id(),
-                format!(
-                    "LWC row count {row_count} does not match index row id count {}",
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, \
+                     row_count={row_count}, index_row_id_count={}",
                     row_ids.len()
-                ),
-            ));
+                ))
+                .into());
         }
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
             let vals = lwc_block
                 .decode_full_row_values(&metadata.col, row_idx)
-                .with_block_context(file_kind, "lwc-block", block_id)?;
+                .attach_with(|| {
+                    format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                })?;
             rows.push(RowRecord { row_id, vals });
         }
         Ok(rows)
@@ -929,20 +930,6 @@ fn build_lwc_blocks_from_row_records(
 fn invalid_catalog_payload(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn invalid_lwc_payload(
-    file_kind: FileKind,
-    block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
-    let message = message.into();
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
-        ))
         .into()
 }
 

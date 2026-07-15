@@ -14,8 +14,7 @@ use super::index_stream::{NonUniqueDiskTreeCandidateStream, UniqueDiskTreeCandid
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{
-    ConfigError, DataIntegrityError, DataIntegrityResult, DataIntegrityResultExt, Error, FileKind,
-    InternalError, Result,
+    ConfigError, DataIntegrityError, DataIntegrityResult, Error, FileKind, InternalError, Result,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
@@ -33,7 +32,7 @@ use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValKind, ValType};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -362,10 +361,8 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
         file_kind: FileKind,
         block_id: BlockID,
     ) -> DataIntegrityResult<()> {
-        validate_disk_tree_block::<Self>(block).map_err(|report| {
-            report.attach(format!(
-                "file={file_kind}, block=secondary-disk-tree, block_id={block_id}"
-            ))
+        validate_disk_tree_block::<Self>(block).attach_with(|| {
+            format!("file={file_kind}, block=secondary_disk_tree, block_id={block_id}")
         })
     }
 
@@ -443,10 +440,8 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
         file_kind: FileKind,
         block_id: BlockID,
     ) -> DataIntegrityResult<()> {
-        validate_disk_tree_block::<Self>(block).map_err(|report| {
-            report.attach(format!(
-                "file={file_kind}, block=secondary-disk-tree, block_id={block_id}"
-            ))
+        validate_disk_tree_block::<Self>(block).attach_with(|| {
+            format!("file={file_kind}, block=secondary_disk_tree, block_id={block_id}")
         })
     }
 
@@ -663,8 +658,17 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     }
 
     #[inline]
-    fn node_result<T>(&self, block_id: BlockID, result: DataIntegrityResult<T>) -> Result<T> {
-        result.with_block_context(self.file_kind(), "secondary-disk-tree", block_id)
+    fn node_result<T>(
+        &self,
+        block_id: BlockID,
+        result: DataIntegrityResult<T>,
+    ) -> DataIntegrityResult<T> {
+        result.attach_with(|| {
+            format!(
+                "file={}, block=secondary_disk_tree, block_id={block_id}",
+                self.file_kind()
+            )
+        })
     }
 
     /// Read and validate one persisted block as a DiskTree node.
@@ -1686,11 +1690,12 @@ impl DiskTreeNodeCursorState {
                 // sibling subtrees and can be scanned from their lower fence.
                 0
             };
-            let branch_entries = branch_entries_from_node(node).with_block_context(
-                Self::file_kind(runtime),
-                "secondary-disk-tree",
-                block_id,
-            )?;
+            let branch_entries = branch_entries_from_node(node).attach_with(|| {
+                format!(
+                    "file={}, block=secondary_disk_tree, block_id={block_id}",
+                    Self::file_kind(runtime)
+                )
+            })?;
             if start_idx >= branch_entries.len() {
                 return Err(invalid_node_payload(Self::file_kind(runtime), block_id));
             }
@@ -2077,7 +2082,7 @@ pub(super) fn invalid_payload(message: impl Into<String>) -> Error {
 pub(super) fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(format!(
-            "file={file_kind}, block=secondary-disk-tree, block_id={block_id}"
+            "file={file_kind}, block=secondary_disk_tree, block_id={block_id}"
         ))
         .into()
 }
@@ -2099,8 +2104,9 @@ fn btree_node_from_block(block: &[u8]) -> Option<&BTreeNode> {
 /// can be computed over exactly the bytes that will be written.
 #[inline]
 fn btree_node_from_block_mut(block: &mut [u8]) -> Result<&mut BTreeNode> {
-    layout::try_mut_from_bytes::<BTreeNode>(block)
-        .map_err(|_| Report::new(InternalError::MutableBlockViewMismatch).into())
+    Ok(layout::try_mut_from_bytes::<BTreeNode>(block)
+        .change_context(InternalError::MutableBlockViewMismatch)
+        .attach_with(|| "phase=build_secondary_disk_tree_node")?)
 }
 
 #[inline]

@@ -1467,20 +1467,20 @@ pub(crate) struct RowPageIndexMemCursor<'a, P: 'static> {
 impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
     /// Seeks to the in-memory leaf that can serve `row_id`.
     #[inline]
-    pub(crate) async fn seek(&mut self, row_id: RowID) {
+    pub(crate) async fn seek(&mut self, row_id: RowID) -> Result<()> {
         loop {
             self.reset();
-            let res = self.try_find_leaf_with_parent_in_mem(row_id).await;
+            let res = self.try_find_leaf_with_parent_in_mem(row_id).await?;
             verify_continue!(res);
-            return;
+            return Ok(());
         }
     }
 
     /// Returns current in-memory leaf and advances to the next leaf.
     #[inline]
-    pub(crate) async fn next(&mut self) -> Option<FacadePageGuard<RowPageIndexNode>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<FacadePageGuard<RowPageIndexNode>>> {
         if let Some(child) = self.child.take() {
-            return Some(child.facade(false));
+            return Ok(Some(child.facade(false)));
         }
         if let Some(parent) = self.parent.as_ref() {
             let page = parent.g.page();
@@ -1492,30 +1492,34 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                 self.parent.take();
                 if row_id == INVALID_ROW_ID {
                     // the traverse is done.
-                    return None;
+                    return Ok(None);
                 }
                 // otherwise, we rerun the search on given row id to get next leaf.
-                while let Invalid = self.try_find_leaf_with_parent_in_mem(row_id).await {
+                while let Invalid = self.try_find_leaf_with_parent_in_mem(row_id).await? {
                     self.reset();
                 }
+                // A successful search always installs the located child.
                 let child = self.child.take().unwrap();
-                return Some(child.facade(false));
+                return Ok(Some(child.facade(false)));
             }
             // otherwise, we jump to next slot and get leaf node.
             let page_id = entries[next_idx].page_id;
+            // This branch is entered through `parent.as_ref()`, so the mutable
+            // parent position must still be installed.
             self.parent.as_mut().unwrap().idx = next_idx as isize; // update parent position.
             let child = self
                 .blk_idx
                 .pool
                 .get_page::<RowPageIndexNode>(self.pool_guard, page_id, LatchFallbackMode::Shared)
-                .await
-                .expect("row-page-index cursor should not ignore buffer-pool errors")
+                .await?
                 .lock_shared_async()
                 .await
+                // The held parent prevents the indexed child from being
+                // unlinked before this immediate latch conversion.
                 .unwrap();
-            return Some(child.facade(false));
+            return Ok(Some(child.facade(false)));
         }
-        None
+        Ok(None)
     }
 
     #[inline]
@@ -1525,7 +1529,7 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
     }
 
     #[inline]
-    async fn try_find_leaf_with_parent_in_mem(&mut self, row_id: RowID) -> Validation<()> {
+    async fn try_find_leaf_with_parent_in_mem(&mut self, row_id: RowID) -> Result<Validation<()>> {
         enum TraverseStep {
             Leaf,
             Branch { idx: usize, page_id: PageID },
@@ -1540,10 +1544,9 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                 self.blk_idx.root_page_id,
                 LatchFallbackMode::Shared,
             )
-            .await
-            .expect("row-page-index cursor should not ignore buffer-pool errors");
+            .await?;
         'SEARCH: loop {
-            let step = verify!(g.with_page_ref_validated(|page| {
+            let step = match g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
                     return TraverseStep::Leaf;
                 }
@@ -1557,17 +1560,24 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                     idx,
                     page_id: entries[idx].page_id,
                 }
-            }));
+            }) {
+                Valid(step) => step,
+                Invalid => return Ok(Invalid),
+            };
             if matches!(step, TraverseStep::Leaf) {
                 // share lock for read
                 if let Some(parent) = self.parent.take() {
                     self.parent = Some(parent);
                 }
-                match verify!(g.try_shared_either()) {
+                let lock_result = match g.try_shared_either() {
+                    Valid(lock_result) => lock_result,
+                    Invalid => return Ok(Invalid),
+                };
+                match lock_result {
                     Left(c) => {
                         // share lock on child succeeds
                         self.child = Some(c);
-                        return Valid(());
+                        return Ok(Valid(()));
                     }
                     Right(new_g) => {
                         // since we successfully lock parent node,
@@ -1576,7 +1586,7 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                         // NOTE: at this time, the parent is locked. That means SMO
                         // must acquire lock from top down, otherwise, deadlock will happen.
                         let Some(new_g) = new_g.lock_shared_async().await else {
-                            return Invalid;
+                            return Ok(Invalid);
                         };
                         g = new_g.facade(false);
                         continue 'SEARCH;
@@ -1584,6 +1594,7 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                 }
             }
             let TraverseStep::Branch { idx, page_id } = step else {
+                // The leaf case returns or retries in the branch above.
                 unreachable!();
             };
             let c = self
@@ -1595,11 +1606,13 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                     page_id,
                     LatchFallbackMode::Spin,
                 )
-                .await
-                .expect("row-page-index cursor should not ignore buffer-pool errors");
-            let c = verify!(c);
+                .await?;
+            let c = match c {
+                Valid(c) => c,
+                Invalid => return Ok(Invalid),
+            };
             let Some(parent_g) = g.lock_shared_async().await else {
-                return Invalid;
+                return Ok(Invalid);
             };
             self.parent = Some(ParentPosition {
                 g: parent_g,
@@ -1648,6 +1661,9 @@ fn validate_leaf_prefix(
     }
 }
 
+// TODO(backlog 000159): prove whether a published row-page-index node can be
+// absent under valid cleanup, eviction, and concurrent structural schedules
+// before changing this recoverable internal error into an assertion.
 #[inline]
 fn row_page_index_missing(page_id: PageID) -> Error {
     Report::new(InternalError::RowPageMissing)
@@ -2396,8 +2412,8 @@ mod tests {
                 }
                 let mut count = 0usize;
                 let mut cursor = blk_idx.mem_cursor(&meta_guard);
-                cursor.seek(RowID::new(0)).await;
-                while let Some(res) = cursor.next().await {
+                cursor.seek(RowID::new(0)).await.unwrap();
+                while let Some(res) = cursor.next().await.unwrap() {
                     count += 1;
                     let g = res.try_into_shared().unwrap();
                     assert!(g.page().is_leaf());
@@ -2455,8 +2471,8 @@ mod tests {
             let mut cursor_leaf_page_ids = vec![];
             let mut leaf_headers = vec![];
             let mut cursor = blk_idx.mem_cursor(&pool_guard);
-            cursor.seek(RowID::new(0)).await;
-            while let Some(res) = cursor.next().await {
+            cursor.seek(RowID::new(0)).await.unwrap();
+            while let Some(res) = cursor.next().await.unwrap() {
                 let g = res.try_into_shared().unwrap();
                 let node = g.page();
                 assert!(node.is_leaf());
@@ -2475,7 +2491,7 @@ mod tests {
             assert_eq!(leaf_headers[1].1, RowID::from(row_pages));
             assert_eq!(leaf_headers[1].2, overflow_entries);
             assert_eq!(cursor_leaf_page_ids, root_leaf_page_ids);
-            assert!(cursor.next().await.is_none());
+            assert!(cursor.next().await.unwrap().is_none());
         })
     }
 

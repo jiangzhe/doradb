@@ -1,7 +1,6 @@
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, DataIntegrityResultExt, Error, FileKind,
-    InternalError, Result,
+    DataIntegrityError, DataIntegrityResult, Error, FileKind, InternalError, Result,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -12,7 +11,7 @@ use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::id::BlockID;
 use crate::io::DirectBuf;
 use crate::quiescent::QuiescentGuard;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use futures::future::try_join_all;
 use std::mem::{self, take};
 use std::sync::Arc;
@@ -429,11 +428,9 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                 .await?;
             visit(block_id);
             let payload = validated_blob_page_payload(guard.page());
-            let header = decode_blob_page_header(payload).with_block_context(
-                file_kind,
-                "column-deletion-blob",
-                block_id,
-            )?;
+            let header = decode_blob_page_header(payload).attach_with(|| {
+                format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
+            })?;
             let used_size = header.used_size as usize;
             if offset > used_size {
                 return Err(invalid_blob_payload(
@@ -492,11 +489,9 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                 )
                 .await?;
             let payload = validated_blob_page_payload(guard.page());
-            let header = decode_blob_page_header(payload).with_block_context(
-                file_kind,
-                "column-deletion-blob",
-                block_id,
-            )?;
+            let header = decode_blob_page_header(payload).attach_with(|| {
+                format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
+            })?;
             let used_size = header.used_size as usize;
             if offset > used_size {
                 return Err(invalid_blob_payload(
@@ -542,14 +537,13 @@ pub(crate) fn validate_persisted_blob_page(
     file_kind: FileKind,
     block_id: BlockID,
 ) -> DataIntegrityResult<()> {
-    let attach_block = |report: Report<DataIntegrityError>| {
-        report.attach(format!(
-            "file={file_kind}, block=column-deletion-blob, block_id={block_id}"
-        ))
-    };
-    let payload = validate_blob_page(page).map_err(attach_block)?;
+    let payload = validate_blob_page(page).attach_with(|| {
+        format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
+    })?;
     decode_blob_page_header(payload)
-        .map_err(attach_block)
+        .attach_with(|| {
+            format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
+        })
         .map(|_| ())
 }
 
@@ -603,7 +597,7 @@ fn invalid_blob_payload(
     let message = message.into();
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(format!(
-            "file={file_kind}, block=column-deletion-blob, block_id={block_id}, {message}"
+            "file={file_kind}, block=column_deletion_blob, block_id={block_id}, {message}"
         ))
         .into()
 }

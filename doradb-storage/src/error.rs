@@ -1,4 +1,4 @@
-use crate::id::{BlockID, RowID};
+use crate::id::RowID;
 use crate::io::{
     IOBackendFailure, IOBackendOperationKind, backend_failure, backend_operation_kind,
 };
@@ -24,35 +24,8 @@ pub(crate) type ResourceResult<T> = result::Result<T, Report<ResourceError>>;
 /// Result carrying internal-invariant reports.
 pub(crate) type InternalResult<T> = result::Result<T, Report<InternalError>>;
 
-/// Fluent conversion from a data-integrity report to the storage error boundary.
-pub(crate) trait DataIntegrityResultExt<T> {
-    /// Attaches persisted-block identity and converts into the storage result type.
-    fn with_block_context(
-        self,
-        file_kind: FileKind,
-        block_kind: &str,
-        block_id: BlockID,
-    ) -> Result<T>;
-}
-
 /// Result carrying data-integrity-domain reports.
 pub(crate) type DataIntegrityResult<T> = result::Result<T, Report<DataIntegrityError>>;
-
-impl<T> DataIntegrityResultExt<T> for DataIntegrityResult<T> {
-    #[inline]
-    fn with_block_context(
-        self,
-        file_kind: FileKind,
-        block_kind: &str,
-        block_id: BlockID,
-    ) -> Result<T> {
-        self.map_err(|report| {
-            Error::from(report.attach(format!(
-                "file={file_kind}, block={block_kind}, block_id={block_id}"
-            )))
-        })
-    }
-}
 
 /// Result carrying lifecycle-domain reports.
 pub(crate) type LifecycleResult<T> = result::Result<T, Report<LifecycleError>>;
@@ -171,10 +144,18 @@ pub(crate) enum DataIntegrityError {
 /// Fieldless lifecycle-domain errors carried underneath `ErrorKind::Lifecycle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum LifecycleError {
+    #[error("runtime is unavailable")]
+    RuntimeUnavailable,
     #[error("storage engine is shut down")]
     Shutdown,
     #[error("storage engine shutdown is busy")]
     ShutdownBusy,
+    #[error("session is unavailable")]
+    SessionUnavailable,
+    #[error("existing transaction")]
+    ExistingTransaction,
+    #[error("transaction is discarded")]
+    TransactionDiscarded,
 }
 
 /// Fieldless resource-domain errors carried underneath `ErrorKind::Resource`.
@@ -203,8 +184,6 @@ pub(crate) enum OperationError {
     IndexNotFound,
     #[error("index mutation failed")]
     IndexMutation,
-    #[error("existing transaction")]
-    ExistingTransaction,
     #[error("not supported")]
     NotSupported,
     #[error("duplicate key")]
@@ -215,6 +194,8 @@ pub(crate) enum OperationError {
     InvalidDmlInput,
     #[error("invalid lock mode")]
     InvalidLockMode,
+    #[error("lock is unavailable")]
+    LockUnavailable,
     #[error("lock upgrade would block")]
     LockUpgradeWouldBlock,
     #[error("lock conversion is not supported")]
@@ -596,7 +577,7 @@ impl fmt::Display for FileKind {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            FileKind::TableFile => "table-file",
+            FileKind::TableFile => "table_file",
             FileKind::CatalogMultiTableFile => "catalog.mtb",
         })
     }
@@ -616,11 +597,11 @@ impl fmt::Display for StorageOp {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            StorageOp::BackendSetup => "backend setup",
-            StorageOp::FileCreate => "file create",
-            StorageOp::FileOpen => "file open",
-            StorageOp::FileResize => "file resize",
-            StorageOp::FileStat => "file stat",
+            StorageOp::BackendSetup => "backend_setup",
+            StorageOp::FileCreate => "file_create",
+            StorageOp::FileOpen => "file_open",
+            StorageOp::FileResize => "file_resize",
+            StorageOp::FileStat => "file_stat",
         })
     }
 }
@@ -837,6 +818,7 @@ impl Error {
 impl From<Report<ConfigError>> for Error {
     #[inline]
     fn from(report: Report<ConfigError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Config))
     }
 }
@@ -844,6 +826,7 @@ impl From<Report<ConfigError>> for Error {
 impl From<Report<DataIntegrityError>> for Error {
     #[inline]
     fn from(report: Report<DataIntegrityError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::DataIntegrity))
     }
 }
@@ -851,6 +834,7 @@ impl From<Report<DataIntegrityError>> for Error {
 impl From<Report<LifecycleError>> for Error {
     #[inline]
     fn from(report: Report<LifecycleError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Lifecycle))
     }
 }
@@ -858,6 +842,7 @@ impl From<Report<LifecycleError>> for Error {
 impl From<Report<FatalError>> for Error {
     #[inline]
     fn from(report: Report<FatalError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Fatal))
     }
 }
@@ -865,6 +850,7 @@ impl From<Report<FatalError>> for Error {
 impl From<Report<ResourceError>> for Error {
     #[inline]
     fn from(report: Report<ResourceError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Resource))
     }
 }
@@ -872,6 +858,7 @@ impl From<Report<ResourceError>> for Error {
 impl From<Report<OperationError>> for Error {
     #[inline]
     fn from(report: Report<OperationError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Operation))
     }
 }
@@ -879,6 +866,7 @@ impl From<Report<OperationError>> for Error {
 impl From<Report<IoError>> for Error {
     #[inline]
     fn from(report: Report<IoError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Io))
     }
 }
@@ -886,6 +874,7 @@ impl From<Report<IoError>> for Error {
 impl From<Report<InternalError>> for Error {
     #[inline]
     fn from(report: Report<InternalError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Internal))
     }
 }
@@ -1094,7 +1083,7 @@ mod tests {
             IoErrorKind::PermissionDenied
         );
         let output = format!("{report:?}");
-        assert!(output.contains("op=file open"));
+        assert!(output.contains("op=file_open"));
         assert!(output.contains("open denied"));
     }
 
@@ -1137,26 +1126,32 @@ mod tests {
         let output = format!("{err}");
         assert!(output.contains("io error"), "{output}");
         assert!(output.contains("permission denied"), "{output}");
-        assert!(output.contains("op=file open"), "{output}");
+        assert!(output.contains("op=file_open"), "{output}");
         assert!(output.contains("open denied"), "{output}");
     }
 
     #[test]
-    fn test_index_mutation_context_preserves_lower_error() {
-        let lower: Result<()> = Err(Error::column_storage_missing());
+    fn test_typed_index_mutation_context_preserves_lower_error() {
+        let lower: InternalResult<()> = Err(Report::new(InternalError::ColumnStorageMissing)
+            .attach("secondary index storage is unavailable"));
         let report = lower
             .change_context(OperationError::IndexMutation)
+            .attach_with(|| "phase=claim_secondary_index_key")
             .unwrap_err();
 
         assert_eq!(report.current_context(), &OperationError::IndexMutation);
         assert_eq!(
-            report.downcast_ref::<Error>().map(Error::kind),
-            Some(ErrorKind::Internal)
+            report.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ColumnStorageMissing)
         );
 
         let err: Error = report.attach("secondary index claim").into();
         assert_eq!(err.kind(), ErrorKind::Operation);
         assert_eq!(err.operation_error(), Some(OperationError::IndexMutation));
+        assert_eq!(
+            err.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ColumnStorageMissing)
+        );
         assert!(format!("{err}").contains("secondary index claim"));
     }
 

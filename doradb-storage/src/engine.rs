@@ -22,7 +22,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::session::{Session, SessionRegistry};
 use crate::trx::sys::TransactionSystem;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
-use error_stack::{Report, ensure};
+use error_stack::{Report, ResultExt, ensure};
 use event_listener::{Event, EventListener, Listener, listener};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
@@ -295,12 +295,12 @@ impl Engine {
     #[inline]
     pub fn new_session(&self) -> Result<Session> {
         let inner = self.inner();
-        inner.with_admitted_operation(|| {
+        Ok(inner.with_admitted_operation(|| {
             let id = inner.next_session_id();
             inner
                 .session_registry
                 .create_session(inner, EngineRef::new(Arc::clone(inner)), id)
-        })
+        })?)
     }
 
     /// Return the shared catalog handle.
@@ -326,7 +326,7 @@ impl Engine {
     )]
     pub(crate) fn new_ref(&self) -> Result<EngineRef> {
         let inner = self.inner();
-        inner.with_admitted_operation(|| EngineRef::new(Arc::clone(inner)))
+        Ok(inner.with_admitted_operation(|| EngineRef::new(Arc::clone(inner)))?)
     }
 
     /// Try to complete idempotent engine shutdown without waiting for active work.
@@ -538,12 +538,12 @@ impl EngineRef {
         expect(dead_code, reason = "transitional internal runtime handle")
     )]
     pub(crate) fn new_session(&self) -> Result<Session> {
-        self.0.with_admitted_operation(|| {
+        Ok(self.0.with_admitted_operation(|| {
             let id = self.0.next_session_id();
             self.0
                 .session_registry
                 .create_session(&self.0, self.clone(), id)
-        })
+        })?)
     }
 
     /// Return the shared catalog handle.
@@ -693,9 +693,15 @@ impl EngineInner {
     /// user callback, statement execution, blocking I/O, registry guard
     /// retention, or `.await` point.
     #[inline]
-    pub(crate) fn acquire_admission(&self) -> Result<EngineAdmission<'_>> {
-        let admission = self.lifecycle.admit()?;
-        self.engine_poisoner.ensure_healthy()?;
+    pub(crate) fn acquire_admission(&self) -> LifecycleResult<EngineAdmission<'_>> {
+        let admission = self
+            .lifecycle
+            .admit()
+            .attach_with(|| "phase=acquire_engine_lifecycle_admission")?;
+        self.engine_poisoner
+            .ensure_healthy()
+            .change_context(LifecycleError::RuntimeUnavailable)
+            .attach_with(|| "phase=check_engine_health")?;
         Ok(admission)
     }
 
@@ -731,7 +737,7 @@ impl EngineInner {
     /// strong pinning. The closure must not perform user callbacks, statement
     /// execution, blocking I/O, or async waits.
     #[inline]
-    pub(crate) fn with_admitted_operation<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
+    pub(crate) fn with_admitted_operation<T>(&self, f: impl FnOnce() -> T) -> LifecycleResult<T> {
         let _admission = self.acquire_admission()?;
         Ok(f())
     }
@@ -844,7 +850,9 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{ConfigError, ErrorKind, LifecycleError, OperationError, ResourceError};
+    use crate::error::{
+        ConfigError, Error, ErrorKind, LifecycleError, OperationError, ResourceError,
+    };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::{TableID, TrxID};
     use crate::lock::tests::{debug_snapshot, try_acquire};
@@ -903,6 +911,12 @@ mod tests {
             .iter()
             .filter(|entry| entry.owner == owner)
             .count()
+    }
+
+    #[inline]
+    fn assert_runtime_unavailable_after_shutdown(err: Error) {
+        assert_eq!(err.kind(), ErrorKind::Lifecycle);
+        assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
     }
 
     #[test]
@@ -1338,15 +1352,13 @@ mod tests {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
         });
     }
 
@@ -1369,15 +1381,13 @@ mod tests {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
 
             drop(engine_ref);
             engine.shutdown().unwrap();
@@ -1399,15 +1409,13 @@ mod tests {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
 
             let err = match session.begin_trx() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
 
             let err = match session
                 .lock_table(TableID::new(91_300), LockMode::Shared)
@@ -1416,8 +1424,7 @@ mod tests {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
 
             drop(session);
             engine.shutdown().unwrap();
@@ -1430,7 +1437,7 @@ mod tests {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let session_handle = engine.new_session().unwrap();
-            let session = session_handle.pin("test pinned idle session").unwrap();
+            let session = session_handle.pin().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             let err = match engine.try_shutdown() {
@@ -1491,8 +1498,7 @@ mod tests {
                 .lock_table(table_id, LockMode::Shared)
                 .await
                 .unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
 
             trx.rollback().await.unwrap();
             drop(session);
@@ -1556,7 +1562,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
         let session_handle = engine.new_session().unwrap();
-        let session = session_handle.pin("test pinned idle session").unwrap();
+        let session = session_handle.pin().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
@@ -1645,9 +1651,7 @@ mod tests {
         let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
-        let checkout = trx
-            .checkout("test engine shutdown waits for checked-out abandoned transaction")
-            .unwrap();
+        let checkout = trx.checkout().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
 
         drop(trx);
@@ -1686,10 +1690,10 @@ mod tests {
             let trx = session.begin_trx().unwrap();
 
             let err = session.close().await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
             assert_eq!(
-                err.operation_error(),
-                Some(OperationError::ExistingTransaction)
+                err.lifecycle_error(),
+                Some(LifecycleError::ExistingTransaction)
             );
             assert!(session.in_trx().unwrap());
 
@@ -1713,8 +1717,11 @@ mod tests {
             session.close().await.unwrap();
 
             let err = session.in_trx().unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Operation);
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(
+                err.lifecycle_error(),
+                Some(LifecycleError::SessionUnavailable)
+            );
             engine.shutdown().unwrap();
         });
     }
@@ -1730,8 +1737,7 @@ mod tests {
             engine.shutdown().unwrap();
 
             let err = session.in_trx().unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+            assert_runtime_unavailable_after_shutdown(err);
         });
     }
 
@@ -1791,9 +1797,7 @@ mod tests {
             trx.lock_table(table_id, LockMode::Shared).await.unwrap();
             assert!(lock_entry_count(&engine, owner) > 0);
 
-            let checkout = trx
-                .checkout("test checked-out abandoned cleanup after checkout return")
-                .unwrap();
+            let checkout = trx.checkout().unwrap();
             drop(trx);
             assert!(session.in_trx().unwrap());
             assert!(lock_entry_count(&engine, owner) > 0);
@@ -1898,12 +1902,12 @@ mod tests {
                 Err(err) => err,
             };
             let kind = err.kind();
-            let operation_error = err.operation_error();
+            let lifecycle_error = err.lifecycle_error();
 
             trx.rollback().await.unwrap();
             assert!(!session.in_trx().unwrap());
-            assert_eq!(kind, ErrorKind::Operation);
-            assert_eq!(operation_error, Some(OperationError::ExistingTransaction));
+            assert_eq!(kind, ErrorKind::Lifecycle);
+            assert_eq!(lifecycle_error, Some(LifecycleError::ExistingTransaction));
         });
     }
 

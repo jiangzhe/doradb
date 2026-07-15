@@ -10,7 +10,7 @@ use crate::log::redo::DDLRedo;
 use crate::map::FastHashSet;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::Transaction;
@@ -72,7 +72,7 @@ impl Drop for DropTableProgressGuard {
     fn drop(&mut self) {
         if self.armed {
             let _ =
-                poison_drop_table_after_gate(&self.engine, self.table_id, "drop future abandoned");
+                poison_drop_table_after_gate(&self.engine, self.table_id, "drop_future_abandoned");
         }
     }
 }
@@ -230,7 +230,7 @@ impl CreateTableProgress {
                     engine,
                     self.table_id,
                     operation,
-                    "runtime destroy",
+                    "runtime_destroy",
                     &source_debug,
                     err,
                 )
@@ -276,7 +276,7 @@ impl CreateTableProgress {
                 engine,
                 self.table_id,
                 operation,
-                "runtime destroy after root publish",
+                "runtime_destroy_after_root_publish",
                 &source_debug,
                 err,
             )
@@ -1063,10 +1063,7 @@ impl Deser for TableBriefMetadata {
             + mem::size_of::<u16>(), // next_index_no
     );
 
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, col_names) = <Vec<SemiStr>>::deser(input, start_idx)?;
         let (idx, col_types) = <Vec<ValType>>::deser(input, idx)?;
         let (idx, col_attrs) = <Vec<ColumnAttributes>>::deser(input, idx)?;
@@ -1091,10 +1088,10 @@ pub(crate) async fn create_table_for_session(
     table_spec: super::TableSpec,
     index_specs: Vec<IndexSpec>,
 ) -> Result<TableID> {
-    let ctx = SessionDdlContext::new(&session)?;
+    let ctx = SessionDdlContext::new(&session).attach("operation=create_table")?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
-    reject_user_table_primary_key_indexes(&index_specs, "create table")?;
+    reject_user_table_primary_key_indexes(&index_specs, "create_table")?;
 
     let table_id = engine.catalog().next_table_id();
     let metadata = Arc::new(TableMetadata::try_new(
@@ -1143,13 +1140,13 @@ pub(crate) async fn create_table_for_session(
     }
 
     let mut progress = CreateTableProgress::new(table_id, uninit_table_file);
-    let mut trx = match session.begin_trx("begin transaction") {
+    let mut trx = match session.begin_trx().attach("operation=create_table") {
         Ok(trx) => trx,
         Err(err) => {
             let delete_res = progress.delete_provisional_file(&engine);
             progress.phase = CreateTablePhase::Aborted;
             delete_res?;
-            return Err(err);
+            return Err(err.into());
         }
     };
 
@@ -1166,7 +1163,7 @@ pub(crate) async fn create_table_for_session(
     progress.set_catalog_transaction(trx);
     if let Err(err) = exec_res {
         return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "catalog staging", err)
+            .abort_before_catalog_commit(&engine, &guards, "catalog_staging", err)
             .await);
     }
     progress.mark_catalog_staged();
@@ -1174,33 +1171,33 @@ pub(crate) async fn create_table_for_session(
     #[cfg(test)]
     if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterCatalogStaged) {
         return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "test after catalog staging", err)
+            .abort_before_catalog_commit(&engine, &guards, "test_after_catalog_staging", err)
             .await);
     }
 
     if let Err(err) = progress.publish_file(&engine).await {
         return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "file publish", err)
+            .abort_before_catalog_commit(&engine, &guards, "file_publish", err)
             .await);
     }
 
     #[cfg(test)]
     if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterFilePublished) {
         return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "test after file publish", err)
+            .abort_before_catalog_commit(&engine, &guards, "test_after_file_publish", err)
             .await);
     }
 
     if let Err(err) = progress.build_runtime(&guards, &engine).await {
         return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "runtime build", err)
+            .abort_before_catalog_commit(&engine, &guards, "runtime_build", err)
             .await);
     }
 
     #[cfg(test)]
     if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterRuntimeBuilt) {
         return Err(progress
-            .abort_before_catalog_commit(&engine, &guards, "test after runtime build", err)
+            .abort_before_catalog_commit(&engine, &guards, "test_after_runtime_build", err)
             .await);
     }
 
@@ -1209,13 +1206,13 @@ pub(crate) async fn create_table_for_session(
 
     if let Err(err) = progress.commit_catalog().await {
         return Err(progress
-            .abort_after_root_publish_commit_error(&engine, &guards, "catalog commit", err)
+            .abort_after_root_publish_commit_error(&engine, &guards, "catalog_commit", err)
             .await);
     }
 
     if let Err(err) = progress.install_runtime(&engine) {
         return Err(progress
-            .abort_after_root_publish_commit_error(&engine, &guards, "runtime install", err)
+            .abort_after_root_publish_commit_error(&engine, &guards, "runtime_install", err)
             .await);
     }
 
@@ -1224,20 +1221,21 @@ pub(crate) async fn create_table_for_session(
 
 /// Logically drop an existing user table for a session-level DDL request.
 pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableID) -> Result<()> {
-    let ctx = SessionDdlContext::new(&session)?;
+    let ctx = SessionDdlContext::new(&session).attach("operation=drop_table")?;
     let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
     validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=drop table")?;
+        .attach("operation=drop_table")?;
     let mut table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
-        .await?;
+        .await
+        .attach_with(|| format!("operation=drop_table, table_id={table_id}"))?;
     let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
     engine.trx_sys.ensure_runtime_healthy()?;
 
-    let mut trx = session.begin_trx("begin transaction")?;
+    let mut trx = session.begin_trx().attach("operation=drop_table")?;
 
     let drain = match table.start_drop_lifecycle() {
         Ok(drain) => drain,
@@ -1260,7 +1258,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         return Err(poison_drop_table_after_gate_with_source(
             &engine,
             table_id,
-            "catalog cascade",
+            "catalog_cascade",
             err,
         )
         .into());
@@ -1347,7 +1345,7 @@ pub(crate) async fn validated_index_ddl_target(
         .catalog()
         .validate_user_table_live(table_id)
         .await
-        .map_err(|report| Error::from(report.attach(format!("operation={operation}"))))?;
+        .attach_with(|| format!("operation={operation}"))?;
     ensure_user_table_catalog_row(guards, engine, table_id, operation).await?;
     Ok(table)
 }
@@ -1403,13 +1401,13 @@ async fn validated_drop_table_target(
     engine: &EngineRef,
     table_id: TableID,
 ) -> Result<Arc<Table>> {
-    reject_non_user_table_id(table_id, "drop table")?;
+    reject_non_user_table_id(table_id, "drop_table")?;
     let Some(table) = engine.catalog().get_table(table_id).await else {
         return Err(Report::new(OperationError::TableNotFound)
             .attach(format!("drop table runtime lookup: table_id={table_id}"))
             .into());
     };
-    ensure_user_table_catalog_row(guards, engine, table_id, "drop table").await?;
+    ensure_user_table_catalog_row(guards, engine, table_id, "drop_table").await?;
     Ok(table)
 }
 
@@ -1571,7 +1569,7 @@ fn finish_drop_table_runtime_retention(
     replay_floor: TableRedoReplayFloor,
 ) -> Result<()> {
     if let Err(_err) = table.mark_dropped_lifecycle() {
-        return Err(poison_drop_table_after_gate(engine, table_id, "mark dropped").into());
+        return Err(poison_drop_table_after_gate(engine, table_id, "mark_dropped").into());
     }
     if engine
         .catalog()
@@ -1579,7 +1577,7 @@ fn finish_drop_table_runtime_retention(
     {
         return Ok(());
     }
-    Err(poison_drop_table_after_gate(engine, table_id, "runtime retention").into())
+    Err(poison_drop_table_after_gate(engine, table_id, "runtime_retention").into())
 }
 
 #[inline]
@@ -1593,6 +1591,7 @@ fn poison_create_table_after_root_publish_with_source(
     source
         .into_report()
         .change_context(*poison.current_context())
+        // This boundary already owns a failed report; `Report` has no lazy attachment API.
         .attach(format!(
             "create table failed after table-root publish: table_id={table_id}, operation={operation}"
         ))
@@ -1610,6 +1609,7 @@ fn poison_create_table_rollback_with_source(
     rollback_err
         .into_report()
         .change_context(*poison.current_context())
+        // This boundary already owns a failed report; `Report` has no lazy attachment API.
         .attach(format!(
             "create table rollback cleanup failed: table_id={table_id}, operation={operation}, source_error={source_debug}"
         ))
@@ -1628,6 +1628,7 @@ fn poison_create_table_cleanup_with_source(
     cleanup_err
         .into_report()
         .change_context(*poison.current_context())
+        // This boundary already owns a failed report; `Report` has no lazy attachment API.
         .attach(format!(
             "create table cleanup failed: table_id={table_id}, operation={operation}, cleanup_operation={cleanup_operation}, source_error={source_debug}"
         ))
@@ -1646,7 +1647,9 @@ fn poison_drop_table_after_gate(
     engine
         .trx_sys
         .poison_engine(FatalError::Poisoned)
-        .attach(drop_table_after_gate_message(table_id, operation))
+        .attach(format!(
+            "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
+        ))
 }
 
 #[inline]
@@ -1660,12 +1663,10 @@ fn poison_drop_table_after_gate_with_source(
     source
         .into_report()
         .change_context(*poison.current_context())
-        .attach(drop_table_after_gate_message(table_id, operation))
-}
-
-#[inline]
-fn drop_table_after_gate_message(table_id: TableID, operation: &'static str) -> String {
-    format!("drop table failed after lifecycle gate: table_id={table_id}, operation={operation}")
+        // This boundary already owns a failed report; `Report` has no lazy attachment API.
+        .attach(format!(
+            "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
+        ))
 }
 
 #[inline]
@@ -2506,7 +2507,7 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert_invalid_index_spec(err, "create table does not support user-table primary keys");
+            assert_invalid_index_spec(err, "create_table does not support user-table primary keys");
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
@@ -3251,7 +3252,7 @@ mod tests {
                     Some(OperationError::LockOwnerGroupConflict)
                 );
                 let rendered = err.to_string();
-                assert_eq!(rendered.matches("operation=drop table").count(), 1);
+                assert_eq!(rendered.matches("operation=drop_table").count(), 1);
                 assert!(rendered.contains(&format!("table_id={table_id}")));
 
                 assert_eq!(
@@ -3779,7 +3780,7 @@ mod tests {
                 report.contains("drop table failed after lifecycle gate: table_id="),
                 "{report}"
             );
-            assert!(report.contains("operation=catalog cascade"), "{report}");
+            assert!(report.contains("operation=catalog_cascade"), "{report}");
             assert!(
                 report.contains("drop table catalog cascade count mismatch"),
                 "{report}"

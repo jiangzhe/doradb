@@ -1,7 +1,6 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, DataIntegrityResultExt, Error, FileKind,
-    InternalError, Result,
+    DataIntegrityError, DataIntegrityResult, Error, FileKind, InternalError, Result,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -18,7 +17,7 @@ use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use blake3::Hasher;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::mem;
@@ -1345,8 +1344,17 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     #[inline]
-    fn node_result<T>(&self, block_id: BlockID, result: DataIntegrityResult<T>) -> Result<T> {
-        result.with_block_context(self.file_kind, "column-block-index", block_id)
+    fn node_result<T>(
+        &self,
+        block_id: BlockID,
+        result: DataIntegrityResult<T>,
+    ) -> DataIntegrityResult<T> {
+        result.attach_with(|| {
+            format!(
+                "file={}, block=column_block_index, block_id={block_id}",
+                self.file_kind
+            )
+        })
     }
 
     #[inline]
@@ -1359,7 +1367,7 @@ impl<'a> ColumnBlockIndex<'a> {
         let idx = prefixes
             .search_exact(entry.start_row_id)
             .map_err(|_| invalid_node_error(self.file_kind(), entry.leaf_block_id))?;
-        self.node_result(entry.leaf_block_id, node.leaf_entry_view(idx))
+        Ok(self.node_result(entry.leaf_block_id, node.leaf_entry_view(idx))?)
     }
 
     /// Finds the persisted leaf entry whose coverage contains `row_id`.
@@ -1449,10 +1457,10 @@ impl<'a> ColumnBlockIndex<'a> {
         let node = self.read_node(entry.leaf_block_id).await?;
         let view = self.read_entry_view(&node, entry)?;
         let row_set = self.node_result(entry.leaf_block_id, decode_logical_row_set(&view))?;
-        self.node_result(
+        Ok(self.node_result(
             entry.leaf_block_id,
             decode_row_ids_from_row_set(view.start_row_id, &row_set),
-        )
+        )?)
     }
 
     /// Loads validated delete deltas and authoritative row ids for one
@@ -1525,12 +1533,12 @@ impl<'a> ColumnBlockIndex<'a> {
             ));
         }
         let row_id_deltas =
-            decode_delete_rows(&payload, del_count, domain, row_set).map_err(|report| {
-                Error::from(report.attach(format!(
-                    "file={}, block=column-deletion-blob, block_id={}",
+            decode_delete_rows(&payload, del_count, domain, row_set).attach_with(|| {
+                format!(
+                    "file={}, block=column_deletion_blob, block_id={}",
                     self.file_kind(),
                     blob_ref.start_block_id
-                )))
+                )
             })?;
         Ok(LogicalDeleteSet::External {
             domain,
@@ -2133,11 +2141,7 @@ pub(crate) fn validate_persisted_column_block_index_page(
     block_id: BlockID,
 ) -> DataIntegrityResult<()> {
     validate_node_payload(page)
-        .map_err(|report| {
-            report.attach(format!(
-                "file={file_kind}, block=column-block-index, block_id={block_id}"
-            ))
-        })
+        .attach_with(|| format!("file={file_kind}, block=column_block_index, block_id={block_id}"))
         .map(|_| ())
 }
 
@@ -2161,7 +2165,7 @@ fn invalid_node_payload() -> Report<DataIntegrityError> {
 #[inline]
 fn invalid_node_error(file_kind: FileKind, block_id: BlockID) -> Error {
     Error::from(invalid_node_payload().attach(format!(
-        "file={file_kind}, block=column-block-index, block_id={block_id}"
+        "file={file_kind}, block=column_block_index, block_id={block_id}"
     )))
 }
 
@@ -2169,7 +2173,7 @@ fn invalid_node_error(file_kind: FileKind, block_id: BlockID) -> Error {
 fn invalid_blob_payload(file_kind: FileKind, block_id: BlockID) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(format!(
-            "file={file_kind}, block=column-deletion-blob, block_id={block_id}"
+            "file={file_kind}, block=column_deletion_blob, block_id={block_id}"
         ))
         .into()
 }
@@ -3217,8 +3221,8 @@ mod tests {
     fn assert_column_index_corruption(err: Error, block_id: BlockID, expected: DataIntegrityError) {
         assert_eq!(err.data_integrity_error(), Some(expected));
         let report = format!("{err:?}");
-        assert!(report.contains("table-file"), "{report}");
-        assert!(report.contains("column-block-index"), "{report}");
+        assert!(report.contains("table_file"), "{report}");
+        assert!(report.contains("column_block_index"), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
 
@@ -3313,7 +3317,7 @@ mod tests {
         .unwrap_err();
         assert_column_index_corruption(
             Error::from(err.attach(format!(
-                "file={}, block=column-block-index, block_id={}",
+                "file={}, block=column_block_index, block_id={}",
                 FileKind::TableFile,
                 test_block_id(42)
             ))),
