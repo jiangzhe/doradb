@@ -1,5 +1,5 @@
 use crate::buffer::PoolGuard;
-use crate::buffer::frame::{BufferFrame, FrameContext};
+use crate::buffer::frame::BufferFrame;
 use crate::buffer::page::{PAGE_SIZE, VersionedPageID};
 use crate::error::{
     Validation,
@@ -8,11 +8,13 @@ use crate::error::{
 use crate::id::PageID;
 use crate::latch::{GuardState, LatchFallbackMode, RawHybridGuard};
 use crate::ptr::UnsafePtr;
+use crate::recovery::RowRecoveryMap;
+use crate::row::RowPage;
+use crate::trx::ver_map::RowVersionMap;
 use either::Either;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::mem;
-use std::sync::atomic::AtomicBool;
 
 /// Typed access interface shared by page latch guards.
 pub(crate) trait PageGuard<T: 'static> {
@@ -692,21 +694,6 @@ impl<T: 'static> PageSharedGuard<T> {
         }
     }
 
-    /// Returns the frame context and typed page reference.
-    #[inline]
-    pub(crate) fn ctx_and_page(&self) -> (&FrameContext, &T) {
-        let bf = self.bf();
-        let undo_map = bf.ctx.as_ref().unwrap();
-        let page = page_ref(bf);
-        (undo_map, page)
-    }
-
-    /// Returns the frame dirty flag associated with this shared page guard.
-    #[inline]
-    pub(crate) fn dirty_flag(&self) -> &AtomicBool {
-        self.bf().dirty_flag()
-    }
-
     /// Converts this shared guard back into a facade and optionally marks dirty.
     #[inline]
     pub(crate) fn facade(self, dirty: bool) -> FacadePageGuard<T> {
@@ -720,6 +707,20 @@ impl<T: 'static> PageSharedGuard<T> {
             captured_generation: self.captured_generation,
             _marker: PhantomData,
         }
+    }
+}
+
+impl PageSharedGuard<RowPage> {
+    /// Returns the row-version map required by normal runtime operations.
+    #[inline]
+    pub(crate) fn unwrap_vmap(&self) -> &RowVersionMap {
+        self.bf().unwrap_vmap()
+    }
+
+    /// Returns the recovery map when this guard protects a recovering row page.
+    #[inline]
+    pub(crate) fn try_rmap(&self) -> Option<&RowRecoveryMap> {
+        self.bf().try_rmap()
     }
 }
 
@@ -810,19 +811,6 @@ impl<T: 'static> PageExclusiveGuard<T> {
         self.frame_mut()
     }
 
-    /// Returns mutable access to both the frame context and typed page image.
-    #[inline]
-    pub(crate) fn ctx_and_page_mut(&mut self) -> (&mut FrameContext, &mut T) {
-        let bf = self.frame_mut();
-        debug_assert_page_cast::<T>(bf);
-        let ctx = bf.ctx.as_mut().unwrap().as_mut();
-        // SAFETY: the exclusive page guard owns the latch exclusively, the
-        // retained pool guard keeps the page allocation alive, and callers only
-        // construct typed guards after validating the frame's logical page kind.
-        let page = unsafe { &mut *(bf.page.cast::<T>()) };
-        (ctx, page)
-    }
-
     /// Converts this exclusive guard back into a facade and optionally marks dirty.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
@@ -852,6 +840,26 @@ impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     pub(crate) fn is_dirty(&self) -> bool {
         self.bf().is_dirty()
+    }
+}
+
+impl PageExclusiveGuard<RowPage> {
+    /// Returns the row-version map required by normal runtime operations.
+    #[inline]
+    pub(crate) fn unwrap_vmap(&self) -> &RowVersionMap {
+        self.bf().unwrap_vmap()
+    }
+
+    /// Returns the recovery map when this guard protects a recovering row page.
+    #[inline]
+    pub(crate) fn try_rmap(&self) -> Option<&RowRecoveryMap> {
+        self.bf().try_rmap()
+    }
+
+    /// Returns the mutable recovery map for a recovering row page.
+    #[inline]
+    pub(crate) fn try_rmap_mut(&mut self) -> Option<&mut RowRecoveryMap> {
+        self.frame_mut().try_rmap_mut()
     }
 }
 

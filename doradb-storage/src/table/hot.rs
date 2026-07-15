@@ -1,4 +1,4 @@
-use crate::buffer::guard::PageSharedGuard;
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::TableMetadata;
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
@@ -9,7 +9,7 @@ use crate::row::ops::{
 use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::table::{DeleteInternal, InsertRowIntoPage, UpdateRowInplace};
 use crate::trx::TrxRuntime;
-use crate::trx::row::{LockRowForWrite, LockUndo, RowReadAccess, RowWriteAccess};
+use crate::trx::row::{LockRowForWrite, LockUndo};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
@@ -47,8 +47,8 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         debug_assert!(matches!(undo_kind, RowUndoKind::Insert));
         let page_id = page_guard.page_id();
         let versioned_page_id = page_guard.versioned_page_id();
-        let (page_ctx, page) = page_guard.ctx_and_page();
-        let ver_map = page_ctx.expect_vmap();
+        let page = page_guard.page();
+        let ver_map = page_guard.unwrap_vmap();
         let state_guard = ver_map.read_state();
         if *state_guard != RowPageState::Active {
             return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
@@ -65,13 +65,7 @@ impl<'m, 'r> RowInserter<'m, 'r> {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new_with_state_guard(
-            page,
-            page_ctx,
-            page_guard.dirty_flag(),
-            row_idx,
-            state_guard,
-        );
+        let mut access = page_guard.write_row_with_state_guard(row_idx, state_guard);
         // Row slot reservation above has already modified the page.
         access.mark_dirty();
         let res = access.lock_undo(
@@ -157,7 +151,7 @@ impl<'m, 'r> HotRowDeleter<'m, 'r> {
         log_by_key: bool,
     ) -> DeleteInternal {
         let page_id = page_guard.page_id();
-        let (_, page) = page_guard.ctx_and_page();
+        let page = page_guard.page();
         if !page.row_id_in_valid_range(row_id) {
             return DeleteInternal::NotFound;
         }
@@ -239,8 +233,8 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         row_id: RowID,
         key: Option<(usize, &[Val])>,
     ) -> LockRowForWrite<'b> {
-        let (page_ctx, page) = page_guard.ctx_and_page();
-        let ver_map = page_ctx.expect_vmap();
+        let page = page_guard.page();
+        let ver_map = page_guard.unwrap_vmap();
         loop {
             #[cfg(test)]
             {
@@ -251,13 +245,8 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
             if *state_guard == RowPageState::Transition {
                 return LockRowForWrite::RetryInTransition;
             }
-            let mut access = RowWriteAccess::new_with_state_guard(
-                page,
-                page_ctx,
-                page_guard.dirty_flag(),
-                page.row_idx(row_id),
-                state_guard,
-            );
+            let mut access =
+                page_guard.write_row_with_state_guard(page.row_idx(row_id), state_guard);
             let lock_undo = access.lock_undo(
                 self.rt,
                 effects,
@@ -344,7 +333,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         redo_key: Option<SelectKey>,
     ) -> UpdateRowInplace {
         let page_id = page_guard.page_id();
-        let (_, page) = page_guard.ctx_and_page();
+        let page = page_guard.page();
         debug_assert!(
             update.as_view().is_valid_for(self.metadata.col.as_ref()),
             "row update values must be ordered, in range, and type-compatible"
@@ -508,8 +497,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
             // move update changes RowID, the new hot row's insert undo carries
             // runtime branches back to the deleted old hot row so older
             // snapshots can still resolve the previous unique-key owner.
-            let (page_ctx, page) = old_guard.ctx_and_page();
-            let old_access = RowReadAccess::new(page, page_ctx, page.row_idx(old_id));
+            let old_access = old_guard.read_row_by_id(old_id);
             let undo_head = old_access.undo_head().expect("undo head");
             debug_assert!(self.rt.is_same_trx(undo_head));
             let old_entry = old_access.first_undo_entry().expect("old undo entry");
@@ -557,8 +545,7 @@ pub(super) fn read_hot_row_mvcc(
     key: Option<(usize, &[Val])>,
     read_set: &[usize],
 ) -> SelectMvcc {
-    let (page_ctx, page) = page_guard.ctx_and_page();
-    let access = RowReadAccess::new(page, page_ctx, page.row_idx(row_id));
+    let access = page_guard.read_row_by_id(row_id);
     match access.read_row_mvcc(rt.ctx(), metadata, read_set, key) {
         ReadRow::Ok(vals) => SelectMvcc::Found(vals),
         ReadRow::InvalidIndex | ReadRow::NotFound => SelectMvcc::NotFound,

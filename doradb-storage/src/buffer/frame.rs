@@ -44,7 +44,7 @@ pub(crate) struct BufferFrame {
     persisted_block_id: AtomicU64,
     /// Context of this buffer frame. It can store additinal contextual information
     /// about the page, e.g. undo map of row page.
-    pub(crate) ctx: Option<Box<FrameContext>>,
+    pub(super) ctx: Option<Box<FrameContext>>,
     pub(super) page: *mut Page,
 }
 
@@ -169,6 +169,36 @@ impl BufferFrame {
             create_cts,
         ))));
     }
+
+    /// Returns the runtime row-version map or panics on an invalid page state.
+    #[inline]
+    pub(super) fn unwrap_vmap(&self) -> &RowVersionMap {
+        match self.ctx.as_deref() {
+            Some(FrameContext::RowVerMap(ver)) => ver,
+            Some(FrameContext::RowRecoveryMap(_)) => {
+                panic!("row-version map required after recovery")
+            }
+            None => panic!("row page requires frame context"),
+        }
+    }
+
+    /// Returns the recovery map when this frame is still being recovered.
+    #[inline]
+    pub(super) fn try_rmap(&self) -> Option<&RowRecoveryMap> {
+        match self.ctx.as_deref() {
+            Some(FrameContext::RowRecoveryMap(rec)) => Some(rec),
+            Some(FrameContext::RowVerMap(_)) | None => None,
+        }
+    }
+
+    /// Returns mutable recovery state while the frame is exclusively latched.
+    #[inline]
+    pub(super) fn try_rmap_mut(&mut self) -> Option<&mut RowRecoveryMap> {
+        match self.ctx.as_deref_mut() {
+            Some(FrameContext::RowRecoveryMap(rec)) => Some(rec),
+            Some(FrameContext::RowVerMap(_)) | None => None,
+        }
+    }
 }
 
 impl Default for BufferFrame {
@@ -233,58 +263,21 @@ impl From<u8> for FrameKind {
 }
 
 /// Optional page-specific context stored beside a frame header.
-pub(crate) enum FrameContext {
+pub(super) enum FrameContext {
     RowVerMap(RowVersionMap),
     RowRecoveryMap(RowRecoveryMap),
 }
 
-impl FrameContext {
-    /// Returns the row-version map required by normal runtime operations.
-    ///
-    /// Recovery-time callers must use [`FrameContext::recover`] or match the
-    /// context variant directly until the page is refreshed after redo replay.
-    #[inline]
-    pub(crate) fn expect_vmap(&self) -> &RowVersionMap {
-        match self {
-            FrameContext::RowVerMap(ver) => ver,
-            FrameContext::RowRecoveryMap(_) => {
-                panic!("row-version map required after recovery")
-            }
-        }
-    }
-
-    /// Returns the recovery map when this context stores one.
-    #[inline]
-    pub(crate) fn recover(&self) -> Option<&RowRecoveryMap> {
-        match self {
-            FrameContext::RowRecoveryMap(rec) => Some(rec),
-            FrameContext::RowVerMap(_) => None,
-        }
-    }
-
-    /// Returns the mutable recovery map when this context stores one.
-    #[inline]
-    pub(crate) fn recover_mut(&mut self) -> Option<&mut RowRecoveryMap> {
-        match self {
-            FrameContext::RowRecoveryMap(rec) => Some(rec),
-            FrameContext::RowVerMap(_) => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::FrameContext;
+    use super::BufferFrame;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::id::TrxID;
-    use crate::recovery::RowRecoveryMap;
-    use crate::trx::ver_map::RowVersionMap;
     use crate::value::ValKind;
     use std::sync::Arc;
 
-    #[test]
-    fn test_expect_vmap_returns_version_map() {
-        let metadata = TableMetadata::try_new(
+    fn metadata() -> TableMetadata {
+        TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "id",
                 ValKind::I64,
@@ -292,16 +285,34 @@ mod tests {
             )],
             Vec::new(),
         )
-        .expect("valid table metadata");
-        let ctx = FrameContext::RowVerMap(RowVersionMap::new(Arc::clone(&metadata.col), 1));
+        .expect("valid table metadata")
+    }
 
-        assert!(Arc::ptr_eq(&ctx.expect_vmap().column_layout, &metadata.col));
+    #[test]
+    fn test_row_context_accessors_distinguish_runtime_and_recovery_maps() {
+        let metadata = metadata();
+        let mut frame = BufferFrame::default();
+        frame.init_undo_map(Arc::clone(&metadata.col), 1);
+
+        assert!(Arc::ptr_eq(
+            &frame.unwrap_vmap().column_layout,
+            &metadata.col
+        ));
+        assert!(frame.try_rmap().is_none());
+
+        frame.init_recover_map(TrxID::new(7));
+        assert_eq!(
+            frame.try_rmap().map(|map| map.create_cts()),
+            Some(TrxID::new(7))
+        );
+        assert!(frame.try_rmap_mut().is_some());
     }
 
     #[test]
     #[should_panic(expected = "row-version map required after recovery")]
-    fn test_expect_vmap_rejects_recovery_map() {
-        let ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(1)));
-        let _ = ctx.expect_vmap();
+    fn test_runtime_map_accessor_rejects_recovery_map() {
+        let mut frame = BufferFrame::default();
+        frame.init_recover_map(TrxID::new(1));
+        let _ = frame.unwrap_vmap();
     }
 }
