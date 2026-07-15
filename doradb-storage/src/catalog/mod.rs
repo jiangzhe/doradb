@@ -21,7 +21,7 @@ use crate::buffer::{
     ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
-use crate::error::{DataIntegrityError, Error, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, OperationError, OperationResult, Result};
 use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::BlockIndex;
@@ -525,14 +525,11 @@ impl Catalog {
     pub(crate) async fn validate_user_table_live(
         &self,
         table_id: TableID,
-        operation: &'static str,
-    ) -> Result<Arc<Table>> {
-        let Some(table) = self.get_table(table_id).await else {
-            return Err(Report::new(OperationError::TableNotFound)
-                .attach(format!("operation={operation}, table_id={table_id}"))
-                .into());
-        };
-        table.check_foreground_live(operation)?;
+    ) -> OperationResult<Arc<Table>> {
+        let table = self.get_table(table_id).await.ok_or_else(|| {
+            Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}"))
+        })?;
+        table.check_foreground_live_report()?;
         Ok(table)
     }
 

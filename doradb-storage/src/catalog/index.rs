@@ -24,7 +24,7 @@ use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::{Transaction, trx_is_committed};
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -406,7 +406,9 @@ pub(crate) async fn create_index_for_session(
     // 1. Validate the target and acquire table-local DDL exclusion before
     // deriving any new metadata or touching mutable table roots.
     precheck_index_ddl_target(&guards, &engine, table_id, "create index").await?;
-    lock_manager.reject_table_ddl_explicit_session_lock(table_id, ctx.owner, "create index")?;
+    lock_manager
+        .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
+        .attach("operation=create index")?;
     // Keep these DDL locks alive through root publish and runtime layout
     // install so foreground readers/writers cannot observe a partial index.
     let _table_locks = lock_manager
@@ -599,7 +601,9 @@ pub(crate) async fn drop_index_for_session(
     let lock_manager = engine.lock_manager();
 
     precheck_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
-    lock_manager.reject_table_ddl_explicit_session_lock(table_id, ctx.owner, "drop index")?;
+    lock_manager
+        .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
+        .attach("operation=drop index")?;
     let _table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
         .await?;

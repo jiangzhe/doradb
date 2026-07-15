@@ -5,7 +5,7 @@ use crate::index::IndexInsert;
 use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
-use crate::table::{DeletionError, DmlValidationDomain, DmlValidator, Table};
+use crate::table::{DeletionError, DmlValidationResultExt, DmlValidator, Table};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::value::Val;
 use error_stack::Report;
@@ -24,13 +24,9 @@ impl Table {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
-            DmlValidator::new(
-                metadata,
-                self.table_id(),
-                "recover_row_insert",
-                DmlValidationDomain::Recovery,
-            )
-            .validate_full_row(cols)?;
+            DmlValidator::new(metadata)
+                .validate_full_row(cols)
+                .with_recovery_context("recover_row_insert", self.table_id())?;
         }
         debug_assert!(cols.len() == metadata.col.col_count());
         debug_assert!({
@@ -63,13 +59,9 @@ impl Table {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
-            DmlValidator::new(
-                metadata,
-                self.table_id(),
-                "recover_row_update",
-                DmlValidationDomain::Recovery,
-            )
-            .validate_sparse_update(update)?;
+            DmlValidator::new(metadata)
+                .validate_sparse_update(update)
+                .with_recovery_context("recover_row_update", self.table_id())?;
         }
         let mut page_guard = self
             .mem

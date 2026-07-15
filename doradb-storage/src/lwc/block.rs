@@ -3,8 +3,7 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableColumnLayout};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, DataIntegrityResultExt, Error, FileKind,
-    InternalError, OperationError, Result,
+    DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult, Result,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -87,13 +86,15 @@ pub(crate) struct LwcBlock {
 impl LwcBlock {
     /// Validates and borrows one raw LWC payload image.
     #[inline]
-    pub(crate) fn try_from_bytes(input: &[u8]) -> Result<&Self> {
-        let block = layout::try_ref_from_bytes::<Self>(input).map_err(|_| {
-            invalid_lwc_payload(format!(
-                "LWC block payload has invalid length {}, expected {}",
-                input.len(),
-                LWC_BLOCK_PAYLOAD_SIZE
-            ))
+    pub(crate) fn try_from_bytes(input: &[u8]) -> DataIntegrityResult<&Self> {
+        let block = layout::try_ref_from_bytes::<Self>(input).map_err(|report| {
+            report
+                .change_context(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "LWC block payload has invalid length {}, expected {}",
+                    input.len(),
+                    LWC_BLOCK_PAYLOAD_SIZE
+                ))
         })?;
         block.validate_structure()?;
         Ok(block)
@@ -116,10 +117,12 @@ impl LwcBlock {
 
     /// Mutably borrows one raw LWC payload image with the expected payload size.
     #[inline]
-    pub(crate) fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
+    pub(crate) fn try_from_bytes_mut(input: &mut [u8]) -> InternalResult<&mut Self> {
         let input_len = input.len();
-        layout::try_mut_from_bytes::<Self>(input).map_err(|_| {
-            invalid_lwc_payload(format!(
+        layout::try_mut_from_bytes::<Self>(input).map_err(|report| {
+            report
+                .change_context(InternalError::LwcBlockEncodingInvariant)
+                .attach(format!(
                 "mutable LWC block payload has invalid length {input_len}, expected {LWC_BLOCK_PAYLOAD_SIZE}"
             ))
         })
@@ -131,14 +134,17 @@ impl LwcBlock {
         input: &[u8],
         file_kind: FileKind,
         block_id: BlockID,
-    ) -> Result<&Self> {
-        let payload = validate_block(input, LWC_BLOCK_SPEC).with_block_context(
-            file_kind,
-            "lwc-block",
-            block_id,
-        )?;
-        Self::try_from_bytes(payload)
-            .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))
+    ) -> DataIntegrityResult<&Self> {
+        let payload = validate_block(input, LWC_BLOCK_SPEC).map_err(|report| {
+            report.attach(format!(
+                "file={file_kind}, block=lwc-block, block_id={block_id}"
+            ))
+        })?;
+        Self::try_from_bytes(payload).map_err(|report| {
+            report.attach(format!(
+                "file={file_kind}, block=lwc-block, block_id={block_id}"
+            ))
+        })
     }
 
     /// Returns the canonical row-shape fingerprint stored in this block.
@@ -154,13 +160,13 @@ impl LwcBlock {
     }
 
     #[inline]
-    fn validate_structure(&self) -> Result<()> {
+    fn validate_structure(&self) -> DataIntegrityResult<()> {
         self.col_offsets()?.validate(self.body.len())
     }
 
     /// Returns column end offset array.
     #[inline]
-    fn col_offsets(&self) -> Result<ColOffsets<'_>> {
+    fn col_offsets(&self) -> DataIntegrityResult<ColOffsets<'_>> {
         let col_count = self.header.col_count() as usize;
         let end_idx = col_count * mem::size_of::<u16>();
         if end_idx > self.body.len() {
@@ -183,14 +189,12 @@ impl LwcBlock {
         &'a self,
         col_layout: &'a TableColumnLayout,
         col_idx: usize,
-    ) -> Result<LwcColumn<'a>> {
+    ) -> DataIntegrityResult<LwcColumn<'a>> {
         if col_idx >= col_layout.col_count() {
-            return Err(Report::new(InternalError::ColumnIndexOutOfBounds)
-                .attach(format!(
-                    "col_idx={col_idx}, col_count={}",
-                    col_layout.col_count()
-                ))
-                .into());
+            return Err(invalid_lwc_payload(format!(
+                "LWC column metadata mismatch: col_idx={col_idx}, col_count={}",
+                col_layout.col_count()
+            )));
         }
         let (start_idx, end_idx) = self.col_offsets().and_then(|offsets| {
             offsets.get(col_idx).ok_or_else(|| {
@@ -301,11 +305,11 @@ impl LwcBlock {
         row_idx: usize,
         col_idx: usize,
     ) -> DataIntegrityResult<Val> {
-        let column = self.column(col_layout, col_idx).map_err(lwc_decode_error)?;
+        let column = self.column(col_layout, col_idx)?;
         if column.is_null(row_idx) {
             return Ok(Val::Null);
         }
-        let data = column.data().map_err(lwc_decode_error)?;
+        let data = column.data()?;
         data.value(row_idx).ok_or_else(|| {
             Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!("LWC row index {row_idx} is out of range"))
@@ -377,7 +381,7 @@ impl<'a> LwcColumn<'a> {
 
     /// Parses the compressed value payload for this column.
     #[inline]
-    pub(crate) fn data(&self) -> Result<LwcData<'a>> {
+    pub(crate) fn data(&self) -> DataIntegrityResult<LwcData<'a>> {
         LwcData::from_bytes(self.kind, self.values)
     }
 
@@ -398,7 +402,7 @@ pub(crate) struct ColOffsets<'a> {
 impl ColOffsets<'_> {
     /// Validates that all column ranges are monotonic and within the body.
     #[inline]
-    pub(crate) fn validate(&self, body_len: usize) -> Result<()> {
+    pub(crate) fn validate(&self, body_len: usize) -> DataIntegrityResult<()> {
         let mut start_idx = self.data_start;
         if start_idx > body_len {
             return Err(invalid_lwc_payload(format!(
@@ -510,47 +514,13 @@ pub(crate) fn validate_persisted_lwc_block(
     input: &[u8],
     file_kind: FileKind,
     block_id: BlockID,
-) -> Result<()> {
+) -> DataIntegrityResult<()> {
     LwcBlock::try_from_persisted_bytes(input, file_kind, block_id).map(|_| ())
 }
 
-/// Converts payload decode failures into persisted-block corruption errors.
 #[inline]
-pub(crate) fn map_persisted_lwc_error(file_kind: FileKind, block_id: BlockID, err: Error) -> Error {
-    if err.data_integrity_error().is_some()
-        || err.operation_error() == Some(OperationError::NotSupported)
-    {
-        persisted_lwc_payload_error(file_kind, block_id, "invalid persisted LWC payload")
-    } else {
-        err
-    }
-}
-
-#[inline]
-fn lwc_decode_error(err: Error) -> Report<DataIntegrityError> {
-    err.into_report()
-        .change_context(DataIntegrityError::InvalidPayload)
-}
-
-#[inline]
-fn invalid_lwc_payload(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn persisted_lwc_payload_error(
-    file_kind: FileKind,
-    block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
-    let message = message.into();
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
-        ))
-        .into()
+fn invalid_lwc_payload(message: impl Into<String>) -> Report<DataIntegrityError> {
+    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
 }
 
 #[cfg(test)]
@@ -559,7 +529,7 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
-    use crate::error::{DataIntegrityError, Error, FileKind};
+    use crate::error::{DataIntegrityError, DataIntegrityResultExt, Error, FileKind};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
     };
@@ -716,23 +686,20 @@ mod tests {
         page.body[2..4].copy_from_slice(&end_offset.to_le_bytes());
 
         let err = page.column(metadata.col.as_ref(), 1);
-        assert!(err.as_ref().is_err_and(|err| {
-            err.is_kind(crate::error::ErrorKind::Internal)
-                && err
-                    .report()
-                    .downcast_ref::<crate::error::InternalError>()
-                    .copied()
-                    == Some(crate::error::InternalError::ColumnIndexOutOfBounds)
-        }));
+        assert!(
+            err.as_ref()
+                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
+        );
     }
 
     #[test]
     fn test_lwc_block_try_from_bytes_invalid_len() {
         let bytes = [0u8; LWC_BLOCK_PAYLOAD_SIZE - 1];
         let err = LwcBlock::try_from_bytes(&bytes);
-        assert!(err.as_ref().is_err_and(
-            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
-        ));
+        assert!(
+            err.as_ref()
+                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
+        );
     }
 
     #[test]
@@ -766,7 +733,11 @@ mod tests {
             Ok(_) => panic!("expected LWC checksum corruption"),
             Err(err) => err,
         };
-        assert_lwc_data_integrity(err, test_block_id(7), DataIntegrityError::ChecksumMismatch);
+        assert_lwc_data_integrity(
+            Error::from(err),
+            test_block_id(7),
+            DataIntegrityError::ChecksumMismatch,
+        );
     }
 
     #[test]
@@ -873,7 +844,11 @@ mod tests {
             Ok(_) => panic!("expected invalid persisted offsets"),
             Err(err) => err,
         };
-        assert_lwc_data_integrity(err, test_block_id(9), DataIntegrityError::InvalidPayload);
+        assert_lwc_data_integrity(
+            Error::from(err),
+            test_block_id(9),
+            DataIntegrityError::InvalidPayload,
+        );
     }
 
     #[test]

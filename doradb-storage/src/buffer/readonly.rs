@@ -738,7 +738,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                     // not contend with our own latch; revisit this synchronous
                     // path if raw readonly usage expands in the future.
                     let _ = self.invalidate_block(file.file_id(), block_id);
-                    return Err(err);
+                    return Err(Error::from(err));
                 }
                 if resident_hit {
                     self.stats.record_cache_hit();
@@ -983,13 +983,17 @@ impl ReadSubmission {
                         self.key.block_id,
                     ) {
                         drop(self.reservation.take());
-                        self.complete_inflight_once(Err(CompletionErrorKind::report_error(
-                            err,
-                            format!(
-                                "validate readonly block load: file={}, key={:?}",
-                                validation.file_kind, self.key
+                        self.pool.stats.add_completed_reads(1);
+                        self.pool.stats.add_read_errors(1);
+                        self.complete_inflight_once(Err(
+                            CompletionErrorKind::report_data_integrity(
+                                err,
+                                format!(
+                                    "validate readonly block load: file={}, key={:?}",
+                                    validation.file_kind, self.key
+                                ),
                             ),
-                        )));
+                        ));
                         return IOKind::Read;
                     }
                 }
@@ -2951,6 +2955,7 @@ pub(crate) mod tests {
             );
             let pool_guard = pool.pool_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(115)), test_block_id(8));
+            let stats_start = pool.global_stats();
 
             let pool_1 = (*pool).clone();
             let waiter1_guard = pool_guard.clone();
@@ -2993,6 +2998,9 @@ pub(crate) mod tests {
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
             wait_for(|| !global.inflights.contains_key(&key)).await;
+            let stats_delta = pool.global_stats().delta_since(stats_start);
+            assert_eq!(stats_delta.completed_reads, 1);
+            assert_eq!(stats_delta.read_errors, 1);
             drop(table_file);
             drop(fs);
         });

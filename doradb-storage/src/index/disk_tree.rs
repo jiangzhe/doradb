@@ -13,7 +13,10 @@
 use super::index_stream::{NonUniqueDiskTreeCandidateStream, UniqueDiskTreeCandidateStream};
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{ConfigError, DataIntegrityError, Error, FileKind, InternalError, Result};
+use crate::error::{
+    ConfigError, DataIntegrityError, DataIntegrityResult, DataIntegrityResultExt, Error, FileKind,
+    InternalError, Result,
+};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
@@ -30,7 +33,7 @@ use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValKind, ValType};
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -327,17 +330,15 @@ pub(crate) trait DiskTreeSpec: Copy + 'static {
     type LeafValue: BTreeValue;
 
     /// Validate a full persisted block before publishing a readonly guard.
-    fn validate_persisted_block(block: &[u8], file_kind: FileKind, block_id: BlockID)
-    -> Result<()>;
+    fn validate_persisted_block(
+        block: &[u8],
+        file_kind: FileKind,
+        block_id: BlockID,
+    ) -> DataIntegrityResult<()>;
     /// Convert a normalized logical entry into the leaf value stored on disk.
     fn leaf_value(entry: &LogicalEntry) -> Result<Self::LeafValue>;
     /// Decode one leaf slot from a validated block into a normalized entry.
-    fn leaf_entry(
-        node: &BTreeNode,
-        idx: usize,
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> Result<LogicalEntry>;
+    fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry>;
     /// Apply encoded batch operations to a sorted entry set.
     ///
     /// Implementations must return sorted unique keys because the writer builds
@@ -360,8 +361,12 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
         block: &[u8],
         file_kind: FileKind,
         block_id: BlockID,
-    ) -> Result<()> {
-        validate_disk_tree_block::<Self>(block, file_kind, block_id)
+    ) -> DataIntegrityResult<()> {
+        validate_disk_tree_block::<Self>(block).map_err(|report| {
+            report.attach(format!(
+                "file={file_kind}, block=secondary-disk-tree, block_id={block_id}"
+            ))
+        })
     }
 
     #[inline]
@@ -378,18 +383,11 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
     }
 
     #[inline]
-    fn leaf_entry(
-        node: &BTreeNode,
-        idx: usize,
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> Result<LogicalEntry> {
-        let key = node
-            .key_checked(idx)
-            .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
+    fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry> {
+        let key = node.key_checked(idx).ok_or_else(invalid_node_decode)?;
         let row_id = node.value::<BTreeU64>(idx);
         if row_id.is_deleted() {
-            return Err(invalid_node_payload(file_kind, block_id));
+            return Err(invalid_node_decode());
         }
         Ok(LogicalEntry::unique(key, row_id.to_row_id()))
     }
@@ -444,8 +442,12 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
         block: &[u8],
         file_kind: FileKind,
         block_id: BlockID,
-    ) -> Result<()> {
-        validate_disk_tree_block::<Self>(block, file_kind, block_id)
+    ) -> DataIntegrityResult<()> {
+        validate_disk_tree_block::<Self>(block).map_err(|report| {
+            report.attach(format!(
+                "file={file_kind}, block=secondary-disk-tree, block_id={block_id}"
+            ))
+        })
     }
 
     #[inline]
@@ -459,15 +461,8 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
     }
 
     #[inline]
-    fn leaf_entry(
-        node: &BTreeNode,
-        idx: usize,
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> Result<LogicalEntry> {
-        let key = node
-            .key_checked(idx)
-            .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
+    fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry> {
+        let key = node.key_checked(idx).ok_or_else(invalid_node_decode)?;
         Ok(LogicalEntry::non_unique(key))
     }
 
@@ -667,6 +662,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         self.runtime.file_kind
     }
 
+    #[inline]
+    fn node_result<T>(&self, block_id: BlockID, result: DataIntegrityResult<T>) -> Result<T> {
+        result.with_block_context(self.file_kind(), "secondary-disk-tree", block_id)
+    }
+
     /// Read and validate one persisted block as a DiskTree node.
     ///
     /// The returned guard owns the readonly-buffer reference, so callers can use
@@ -709,7 +709,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let node = guard.node();
             if node.is_leaf() {
                 return match node.search_key(key) {
-                    Ok(idx) => Ok(Some(F::leaf_entry(node, idx, self.file_kind(), block_id)?)),
+                    Ok(idx) => Ok(Some(self.node_result(block_id, F::leaf_entry(node, idx))?)),
                     Err(_) => Ok(None),
                 };
             }
@@ -736,14 +736,14 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let node = guard.node();
             if node.is_leaf() {
                 for idx in 0..node.count() {
-                    let entry = F::leaf_entry(node, idx, self.file_kind(), block_id)?;
+                    let entry = self.node_result(block_id, F::leaf_entry(node, idx))?;
                     if entries.last().is_some_and(|prev| prev.key >= entry.key) {
                         return Err(invalid_node_payload(self.file_kind(), block_id));
                     }
                     entries.push(entry);
                 }
             } else {
-                let branch_entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
+                let branch_entries = self.node_result(block_id, branch_entries_from_node(node))?;
                 for entry in branch_entries.into_iter().rev() {
                     stack.push(entry.block_id);
                 }
@@ -765,7 +765,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             if node.is_leaf() {
                 continue;
             }
-            let child_height = branch_child_height(node, self.file_kind(), block_id)?;
+            let child_height = self.node_result(block_id, branch_child_height(node))?;
             if child_height == 0 {
                 for idx in (0..node.count()).rev() {
                     let child_block_id = BlockID::from(node.value::<BTreeU64>(idx).to_u64());
@@ -813,7 +813,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let node = guard.node();
             if node.is_leaf() {
                 for idx in node.lower_bound_slot_idx(start_key)..node.count() {
-                    let entry = F::leaf_entry(node, idx, self.file_kind(), block_id)?;
+                    let entry = self.node_result(block_id, F::leaf_entry(node, idx))?;
                     if last_key
                         .as_ref()
                         .is_some_and(|prev| prev.as_slice() >= entry.key.as_slice())
@@ -829,7 +829,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 let start_idx = node
                     .lower_bound_child_entry_idx(start_key)
                     .ok_or_else(|| invalid_node_payload(self.file_kind(), block_id))?;
-                let branch_entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
+                let branch_entries = self.node_result(block_id, branch_entries_from_node(node))?;
                 if start_idx >= branch_entries.len() {
                     return Err(invalid_node_payload(self.file_kind(), block_id));
                 }
@@ -903,14 +903,14 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 // the spec's logical entry form before applying batch semantics.
                 let mut entries = Vec::with_capacity(node.count());
                 for idx in 0..node.count() {
-                    entries.push(F::leaf_entry(node, idx, self.file_kind(), block_id)?);
+                    entries.push(self.node_result(block_id, F::leaf_entry(node, idx))?);
                 }
                 let entries = F::apply_operations(&entries, operations)?;
                 return Ok(NodeRewriteResult {
                     entries: self.pack_leaf_rewrite_entries(&entries, range_upper_fence)?,
                 });
             }
-            let entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
+            let entries = self.node_result(block_id, branch_entries_from_node(node))?;
             // Flatten the branch while the guard is alive, then release it before
             // recursive children perform mutable writes through the CoW fork.
             drop(guard);
@@ -1241,14 +1241,13 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         if node.is_leaf() {
             let mut entries = Vec::with_capacity(node.count());
             for idx in 0..node.count() {
-                entries.push(F::leaf_entry(node, idx, self.file_kind(), entry.block_id)?);
+                entries.push(self.node_result(entry.block_id, F::leaf_entry(node, idx))?);
             }
             Ok(BranchEntryPayload::Leaf(entries))
         } else {
-            Ok(BranchEntryPayload::Branch(branch_entries_from_node(
-                node,
-                self.file_kind(),
+            Ok(BranchEntryPayload::Branch(self.node_result(
                 entry.block_id,
+                branch_entries_from_node(node),
             )?))
         }
     }
@@ -1687,8 +1686,11 @@ impl DiskTreeNodeCursorState {
                 // sibling subtrees and can be scanned from their lower fence.
                 0
             };
-            let branch_entries =
-                branch_entries_from_node(node, Self::file_kind(runtime), block_id)?;
+            let branch_entries = branch_entries_from_node(node).with_block_context(
+                Self::file_kind(runtime),
+                "secondary-disk-tree",
+                block_id,
+            )?;
             if start_idx >= branch_entries.len() {
                 return Err(invalid_node_payload(Self::file_kind(runtime), block_id));
             }
@@ -2080,6 +2082,11 @@ pub(super) fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Er
         .into()
 }
 
+#[inline]
+fn invalid_node_decode() -> Report<DataIntegrityError> {
+    Report::new(DataIntegrityError::InvalidPayload)
+}
+
 /// View a validated block as an immutable B-tree node image.
 #[inline]
 fn btree_node_from_block(block: &[u8]) -> Option<&BTreeNode> {
@@ -2097,13 +2104,11 @@ fn btree_node_from_block_mut(block: &mut [u8]) -> Result<&mut BTreeNode> {
 }
 
 #[inline]
-fn validate_checksum(block: &[u8], file_kind: FileKind, block_id: BlockID) -> Result<()> {
+fn validate_checksum(block: &[u8]) -> DataIntegrityResult<()> {
     if block.len() != DISK_TREE_BLOCK_SIZE {
-        return Err(invalid_node_payload(file_kind, block_id));
+        return Err(invalid_node_decode());
     }
-    validate_block_checksum(block)
-        .attach_with(|| format!("file={file_kind}, block=secondary-disk-tree, block_id={block_id}"))
-        .map_err(Error::from)?;
+    validate_block_checksum(block)?;
     Ok(())
 }
 
@@ -2112,28 +2117,23 @@ fn validate_checksum(block: &[u8], file_kind: FileKind, block_id: BlockID) -> Re
 /// Validation is intentionally layered: checksum first, then no-copy BTreeNode
 /// casting, then logical layout checks for branch pointers or spec-specific
 /// leaf values.
-fn validate_disk_tree_block<F: DiskTreeSpec>(
-    block: &[u8],
-    file_kind: FileKind,
-    block_id: BlockID,
-) -> Result<()> {
-    validate_checksum(block, file_kind, block_id)?;
-    let node =
-        btree_node_from_block(block).ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
+fn validate_disk_tree_block<F: DiskTreeSpec>(block: &[u8]) -> DataIntegrityResult<()> {
+    validate_checksum(block)?;
+    let node = btree_node_from_block(block).ok_or_else(invalid_node_decode)?;
     let valid_layout = if node.is_leaf() {
         node.validate_persisted_layout::<F::LeafValue>()
     } else {
         node.validate_persisted_layout::<BTreeU64>()
     };
     if !valid_layout {
-        return Err(invalid_node_payload(file_kind, block_id));
+        return Err(invalid_node_decode());
     }
     if !node.is_leaf() {
-        validate_branch_children(node, file_kind, block_id)?;
+        validate_branch_children(node)?;
     }
     if node.is_leaf() {
         for idx in 0..node.count() {
-            F::leaf_entry(node, idx, file_kind, block_id)?;
+            F::leaf_entry(node, idx)?;
         }
     }
     Ok(())
@@ -2143,17 +2143,13 @@ fn validate_disk_tree_block<F: DiskTreeSpec>(
 ///
 /// `SUPER_BLOCK_ID` means an empty root, not a valid child block. Once a tree has
 /// branches, every child pointer must refer to a real persisted block.
-fn validate_branch_children(
-    node: &BTreeNode,
-    file_kind: FileKind,
-    block_id: BlockID,
-) -> Result<()> {
+fn validate_branch_children(node: &BTreeNode) -> DataIntegrityResult<()> {
     if BlockID::from(node.lower_fence_value().to_u64()) == SUPER_BLOCK_ID {
-        return Err(invalid_node_payload(file_kind, block_id));
+        return Err(invalid_node_decode());
     }
     for idx in 0..node.count() {
         if BlockID::from(node.value::<BTreeU64>(idx).to_u64()) == SUPER_BLOCK_ID {
-            return Err(invalid_node_payload(file_kind, block_id));
+            return Err(invalid_node_decode());
         }
     }
     Ok(())
@@ -2251,12 +2247,12 @@ fn validate_sorted_non_unique_exact_keys(
 }
 
 #[inline]
-fn branch_child_height(node: &BTreeNode, file_kind: FileKind, block_id: BlockID) -> Result<u16> {
+fn branch_child_height(node: &BTreeNode) -> DataIntegrityResult<u16> {
     let child_height = node
         .height()
         .checked_sub(1)
-        .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
-    u16::try_from(child_height).map_err(|_| invalid_node_payload(file_kind, block_id))
+        .ok_or_else(invalid_node_decode)?;
+    u16::try_from(child_height).map_err(|_| invalid_node_decode())
 }
 
 /// Calculate a branch height from a homogeneous rewrite child-entry run.
@@ -2354,12 +2350,8 @@ fn lookup_child_block(node: &BTreeNode, key: &[u8]) -> Option<BlockID> {
 /// `BTreeNode` stores the first child in the lower fence and later children in
 /// slots. The rewrite path uses this normalized sequence when routing batch
 /// operations and rebuilding parent levels.
-fn branch_entries_from_node(
-    node: &BTreeNode,
-    file_kind: FileKind,
-    block_id: BlockID,
-) -> Result<Vec<BranchEntry>> {
-    let child_height = branch_child_height(node, file_kind, block_id)?;
+fn branch_entries_from_node(node: &BTreeNode) -> DataIntegrityResult<Vec<BranchEntry>> {
+    let child_height = branch_child_height(node)?;
     let mut entries = Vec::with_capacity(node.count() + 1);
     entries.push(BranchEntry::persisted(
         node.lower_fence_key().as_bytes().to_vec(),
@@ -2367,9 +2359,7 @@ fn branch_entries_from_node(
         child_height,
     ));
     for idx in 0..node.count() {
-        let key = node
-            .key_checked(idx)
-            .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
+        let key = node.key_checked(idx).ok_or_else(invalid_node_decode)?;
         entries.push(BranchEntry::persisted(
             key,
             BlockID::from(node.value::<BTreeU64>(idx).to_u64()),
@@ -2384,7 +2374,7 @@ mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
-    use crate::error::{DataIntegrityError, Error, ErrorKind, FileKind, InternalError};
+    use crate::error::{DataIntegrityError, ErrorKind, InternalError};
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
@@ -2417,13 +2407,6 @@ mod tests {
             )
             .expect("valid table metadata"),
         )
-    }
-
-    fn assert_disk_tree_corruption(err: Error, expected: DataIntegrityError) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
-        let report = format!("{err:?}");
-        assert!(report.contains("table-file"), "{report}");
-        assert!(report.contains("secondary-disk-tree"), "{report}");
     }
 
     fn metadata_with_varbyte_unique_index() -> Arc<TableMetadata> {
@@ -2702,7 +2685,7 @@ mod tests {
             let child_entries = if node.is_leaf() {
                 None
             } else {
-                Some(branch_entries_from_node(node, tree.file_kind(), block_id)?)
+                Some(tree.node_result(block_id, branch_entries_from_node(node))?)
             };
             summaries.push(NodeSummary {
                 is_leaf: node.is_leaf(),
@@ -2742,7 +2725,7 @@ mod tests {
             if node.is_leaf() {
                 let mut keys = Vec::with_capacity(node.count());
                 for idx in 0..node.count() {
-                    keys.push(F::leaf_entry(node, idx, tree.file_kind(), block_id)?.key);
+                    keys.push(tree.node_result(block_id, F::leaf_entry(node, idx))?.key);
                 }
                 let upper_fence = if node.has_no_upper_fence() {
                     None
@@ -2756,7 +2739,7 @@ mod tests {
                     keys,
                 });
             } else {
-                let branch_entries = branch_entries_from_node(node, tree.file_kind(), block_id)?;
+                let branch_entries = tree.node_result(block_id, branch_entries_from_node(node))?;
                 for entry in branch_entries.into_iter().rev() {
                     stack.push(entry.block_id);
                 }
@@ -3830,9 +3813,9 @@ mod tests {
             let inspect_tree = inspect_runtime.open(root, &inspect_guard);
             let root_guard = inspect_tree.read_node(root).await.unwrap();
             assert_eq!(root_guard.node().height(), 1);
-            let leaf_entries =
-                branch_entries_from_node(root_guard.node(), inspect_tree.file_kind(), root)
-                    .unwrap();
+            let leaf_entries = inspect_tree
+                .node_result(root, branch_entries_from_node(root_guard.node()))
+                .unwrap();
             assert!(leaf_entries.iter().all(|entry| entry.height == 0));
             drop(root_guard);
 
@@ -4140,32 +4123,17 @@ mod tests {
         }
         write_block_checksum(buf.data_mut());
 
-        validate_disk_tree_block::<UniqueDiskTreeSpec>(
-            buf.data(),
-            FileKind::TableFile,
-            BlockID::from(1u64),
-        )
-        .unwrap();
+        validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
 
         let mut payload_corrupted = buf.data().to_vec();
         payload_corrupted[0] ^= 0xff;
-        let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(
-            &payload_corrupted,
-            FileKind::TableFile,
-            BlockID::from(1u64),
-        )
-        .unwrap_err();
-        assert_disk_tree_corruption(err, DataIntegrityError::ChecksumMismatch);
+        let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(&payload_corrupted).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
 
         let mut footer_corrupted = buf.data().to_vec();
         let checksum_idx = checksum_offset(footer_corrupted.len());
         footer_corrupted[checksum_idx] ^= 0xff;
-        let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(
-            &footer_corrupted,
-            FileKind::TableFile,
-            BlockID::from(1u64),
-        )
-        .unwrap_err();
-        assert_disk_tree_corruption(err, DataIntegrityError::ChecksumMismatch);
+        let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(&footer_corrupted).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
     }
 }

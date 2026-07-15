@@ -1,4 +1,4 @@
-use crate::error::{DataIntegrityError, Error, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, Error, Result};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, checksum_offset, validate_block,
     write_block_checksum, write_block_header,
@@ -96,56 +96,54 @@ impl RedoBlockHeader {
 
     /// Validate common header invariants for a fixed-size block.
     #[inline]
-    pub(crate) fn validate(self, log_block_size: usize) -> Result<()> {
+    pub(crate) fn validate(self, log_block_size: usize) -> DataIntegrityResult<()> {
         if self.flags & !REDO_BLOCK_VALID_FLAGS != 0 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("block=redo-data, flags={:02x}", self.flags))
-                .into());
+                .attach(format!("block=redo-data, flags={:02x}", self.flags)));
         }
         if self.payload_len == 0 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("block=redo-data, payload_len=0")
-                .into());
+                .attach("block=redo-data, payload_len=0"));
         }
         if self.is_group_start() != (self.group_block_idx == 0) {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "block=redo-data, flags={:02x}, group_block_idx={}",
                     self.flags, self.group_block_idx
-                ))
-                .into());
+                )),
+            );
         }
         let capacity = redo_block_payload_capacity(log_block_size, self.flags)?;
         if self.payload_len_usize() > capacity {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "block=redo-data, payload_len={}, capacity={capacity}",
                     self.payload_len
-                ))
-                .into());
+                )),
+            );
         }
         Ok(())
     }
 
     /// Verify that the persisted checksum matches this complete block image.
     #[inline]
-    pub(crate) fn verify_checksum(self, block: &[u8]) -> Result<()> {
+    pub(crate) fn verify_checksum(self, block: &[u8]) -> DataIntegrityResult<()> {
         if block.len() < Self::SIZE {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "block=redo-data, invalid_block_len={}",
                     block.len()
-                ))
-                .into());
+                )),
+            );
         }
         let actual = crc32fast::hash(&block[mem::size_of::<u32>()..]);
         if actual != self.checksum {
-            return Err(Report::new(DataIntegrityError::ChecksumMismatch)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::ChecksumMismatch).attach(format!(
                     "block=redo-data, expected_checksum={:08x}, actual_checksum={actual:08x}",
                     self.checksum
-                ))
-                .into());
+                )),
+            );
         }
         Ok(())
     }
@@ -170,7 +168,10 @@ impl Deser for RedoBlockHeader {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoBlockHeader::SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, checksum) = input.deser_u32(start_idx)?;
         let (idx, flags) = input.deser_u8(idx)?;
         let (idx, payload_len) = input.deser_u16(idx)?;
@@ -227,14 +228,12 @@ impl RedoGroupStartExtension {
 
     /// Return the group payload length as `usize`.
     #[inline]
-    pub(crate) fn group_payload_len_usize(self) -> Result<usize> {
+    pub(crate) fn group_payload_len_usize(self) -> DataIntegrityResult<usize> {
         usize::try_from(self.group_payload_len).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "block=redo-data, group_payload_len={}",
-                    self.group_payload_len
-                ))
-                .into()
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=redo-data, group_payload_len={}",
+                self.group_payload_len
+            ))
         })
     }
 
@@ -246,24 +245,22 @@ impl RedoGroupStartExtension {
 
     /// Validate group-start invariants.
     #[inline]
-    pub(crate) fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> DataIntegrityResult<()> {
         if self.group_payload_len == 0 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("block=redo-data, group_payload_len=0")
-                .into());
+                .attach("block=redo-data, group_payload_len=0"));
         }
         if self.group_block_count == 0 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("block=redo-data, group_block_count=0")
-                .into());
+                .attach("block=redo-data, group_block_count=0"));
         }
         if self.min_redo_cts > self.max_redo_cts {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "block=redo-data, min_redo_cts={}, max_redo_cts={}",
                     self.min_redo_cts, self.max_redo_cts
-                ))
-                .into());
+                )),
+            );
         }
         self.group_payload_len_usize()?;
         Ok(())
@@ -289,7 +286,10 @@ impl Deser for RedoGroupStartExtension {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoGroupStartExtension::SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, group_payload_len) = input.deser_u64(start_idx)?;
         let (idx, group_block_count) = input.deser_u32(idx)?;
         let (idx, min_redo_cts) = input.deser_u64(idx)?;
@@ -453,7 +453,10 @@ impl Deser for RedoSuperBlock {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(REDO_SUPER_BLOCK_PAYLOAD_SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, file_seq) = input.deser_u32(start_idx)?;
         let (idx, slot_no) = input.deser_u32(idx)?;
         let (idx, log_block_size) = input.deser_u64(idx)?;
@@ -480,13 +483,17 @@ impl Deser for RedoSuperBlock {
 
 /// Return the payload capacity of a redo group-start block.
 #[inline]
-pub(crate) fn redo_start_block_payload_capacity(log_block_size: usize) -> Result<usize> {
+pub(crate) fn redo_start_block_payload_capacity(
+    log_block_size: usize,
+) -> DataIntegrityResult<usize> {
     redo_block_payload_capacity(log_block_size, REDO_BLOCK_GROUP_START)
 }
 
 /// Return the payload capacity of a redo continuation block.
 #[inline]
-pub(crate) fn redo_continuation_block_payload_capacity(log_block_size: usize) -> Result<usize> {
+pub(crate) fn redo_continuation_block_payload_capacity(
+    log_block_size: usize,
+) -> DataIntegrityResult<usize> {
     redo_block_payload_capacity(log_block_size, 0)
 }
 
@@ -555,29 +562,25 @@ pub(crate) fn parse_redo_super_block(
     buf: &[u8],
     expected_file_seq: u32,
     expected_slot_no: u32,
-) -> Result<RedoSuperBlock> {
+) -> DataIntegrityResult<RedoSuperBlock> {
     if buf.len() != REDO_SUPER_BLOCK_SLOT_SIZE {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "block=redo-super-block, invalid_slot_buffer_len={}",
                 buf.len()
-            ))
-            .into());
+            )),
+        );
     }
-    let payload = validate_block(buf, REDO_SUPER_BLOCK_SPEC).map_err(Error::from)?;
-    let (payload_end, super_block) = RedoSuperBlock::deser(payload, 0).map_err(|err| {
-        let reason = err
-            .data_integrity_error()
-            .unwrap_or(DataIntegrityError::InvalidPayload);
-        Error::from(Report::new(reason).attach("block=redo-super-block, section=payload"))
-    })?;
+    let payload = validate_block(buf, REDO_SUPER_BLOCK_SPEC)?;
+    let (payload_end, super_block) = RedoSuperBlock::deser(payload, 0)
+        .map_err(|report| report.attach("block=redo-super-block, section=payload"))?;
     debug_assert_eq!(payload_end, REDO_SUPER_BLOCK_PAYLOAD_SIZE);
     if payload[payload_end..].iter().any(|&byte| byte != 0) {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "block=redo-super-block, nonzero_padding_after_payload, payload_end={payload_end}"
-            ))
-            .into());
+            )),
+        );
     }
     validate_super_block_fields(&super_block, expected_file_seq, expected_slot_no)?;
     Ok(super_block)
@@ -588,13 +591,17 @@ pub(crate) fn parse_redo_super_block(
 pub(crate) fn select_redo_super_block(
     file_bytes: &[u8],
     expected_file_seq: u32,
-) -> Result<RedoSuperBlock> {
+) -> DataIntegrityResult<RedoSuperBlock> {
     let mut selected: Option<RedoSuperBlock> = None;
-    let mut first_err: Option<DataIntegrityError> = None;
+    let mut first_err: Option<Report<DataIntegrityError>> = None;
     for slot_no in 0..REDO_SUPER_BLOCK_SLOT_COUNT as u32 {
         let offset = slot_offset(slot_no);
         let Some(slot) = file_bytes.get(offset..offset + REDO_SUPER_BLOCK_SLOT_SIZE) else {
-            first_err.get_or_insert(DataIntegrityError::InvalidPayload);
+            first_err.get_or_insert_with(|| {
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "missing redo super-block slot bytes: slot_no={slot_no}, offset={offset}"
+                ))
+            });
             continue;
         };
         match parse_redo_super_block(slot, expected_file_seq, slot_no) {
@@ -606,21 +613,19 @@ pub(crate) fn select_redo_super_block(
                     selected = Some(super_block);
                 }
             }
-            Err(err) => {
-                first_err.get_or_insert(
-                    err.data_integrity_error()
-                        .unwrap_or(DataIntegrityError::InvalidPayload),
-                );
+            Err(report) => {
+                first_err.get_or_insert(report);
             }
         }
     }
-    selected.ok_or_else(|| {
-        Report::new(first_err.unwrap_or(DataIntegrityError::InvalidPayload))
+    match selected {
+        Some(super_block) => Ok(super_block),
+        None => Err(first_err
+            .unwrap_or_else(|| Report::new(DataIntegrityError::InvalidPayload))
             .attach(format!(
                 "no valid redo super-block slots: file_seq={expected_file_seq:08x}"
-            ))
-            .into()
-    })
+            ))),
+    }
 }
 
 /// Return the serialized redo block header length implied by flags.
@@ -635,21 +640,19 @@ fn redo_block_header_len_for_flags(flags: u8) -> usize {
 
 /// Return the redo block payload capacity implied by block size and flags.
 #[inline]
-fn redo_block_payload_capacity(log_block_size: usize, flags: u8) -> Result<usize> {
+fn redo_block_payload_capacity(log_block_size: usize, flags: u8) -> DataIntegrityResult<usize> {
     let header_len = redo_block_header_len_for_flags(flags);
     if log_block_size > u16::MAX as usize + header_len {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "block=redo-data, unsupported_log_block_size={log_block_size}"
-            ))
-            .into());
+            )),
+        );
     }
     log_block_size.checked_sub(header_len).ok_or_else(|| {
-        Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "block=redo-data, log_block_size={log_block_size}, flags={flags:02x}"
-            ))
-            .into()
+        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "block=redo-data, log_block_size={log_block_size}, flags={flags:02x}"
+        ))
     })
 }
 
@@ -665,34 +668,33 @@ fn validate_super_block_fields(
     super_block: &RedoSuperBlock,
     expected_file_seq: u32,
     expected_slot_no: u32,
-) -> Result<()> {
+) -> DataIntegrityResult<()> {
     if super_block.file_seq != expected_file_seq {
         return Err(Report::new(DataIntegrityError::InvalidPayload)
             .attach(format!(
                 "block=redo-super-block, expected_file_seq={expected_file_seq:08x}, actual_file_seq={:08x}",
                 super_block.file_seq
-            ))
-            .into());
+            )));
     }
     if super_block.slot_no != expected_slot_no
         || super_block.slot_no as usize >= REDO_SUPER_BLOCK_SLOT_COUNT
     {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "block=redo-super-block, expected_slot_no={expected_slot_no}, actual_slot_no={}",
                 super_block.slot_no
-            ))
-            .into());
+            )),
+        );
     }
     if super_block.log_block_size > usize::MAX as u64
         || !is_valid_aligned_size(super_block.log_block_size as usize)
     {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "block=redo-super-block, invalid_log_block_size={}",
                 super_block.log_block_size
-            ))
-            .into());
+            )),
+        );
     }
     let log_block_size = super_block.log_block_size as usize;
     if !is_valid_file_max_size(super_block.file_max_size, log_block_size) {
@@ -700,8 +702,7 @@ fn validate_super_block_fields(
             .attach(format!(
                 "block=redo-super-block, invalid_file_max_size={}, data_start={}, log_block_size={log_block_size}",
                 super_block.file_max_size, REDO_DEFAULT_DATA_START_OFFSET
-            ))
-            .into());
+            )));
     }
     validate_sealed_segment_fields(super_block)?;
     Ok(())
@@ -709,7 +710,7 @@ fn validate_super_block_fields(
 
 /// Validate durable segment metadata combinations.
 #[inline]
-fn validate_sealed_segment_fields(super_block: &RedoSuperBlock) -> Result<()> {
+fn validate_sealed_segment_fields(super_block: &RedoSuperBlock) -> DataIntegrityResult<()> {
     let durable_end_offset = super_block.durable_end_offset;
     let min_redo_cts = super_block.min_redo_cts;
     let max_redo_cts = super_block.max_redo_cts;
@@ -732,11 +733,9 @@ fn validate_sealed_segment_fields(super_block: &RedoSuperBlock) -> Result<()> {
     {
         return Ok(());
     }
-    Err(Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
+    Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
             "block=redo-super-block, invalid sealed fields: durable_end_offset={durable_end_offset}, min_redo_cts={min_redo_cts}, max_redo_cts={max_redo_cts}, file_max_size={file_max_size}"
-        ))
-        .into())
+        )))
 }
 
 /// Return true when a persisted size is usable for direct I/O.
@@ -777,8 +776,8 @@ mod tests {
         buf
     }
 
-    fn assert_integrity_error(err: Error, expected: DataIntegrityError) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
+    fn assert_integrity_error(err: Report<DataIntegrityError>, expected: DataIntegrityError) {
+        assert_eq!(*err.current_context(), expected);
     }
 
     type CorruptCase = (&'static str, Box<dyn FnOnce(&mut [u8])>, DataIntegrityError);

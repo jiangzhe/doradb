@@ -7,7 +7,7 @@
 mod state;
 
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::{Error, OperationError, Result};
+use crate::error::{OperationError, OperationResult, Result};
 use crate::id::{SessionID, TableID, TrxID};
 use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -61,7 +61,7 @@ pub enum LockMode {
 impl LockMode {
     /// Validates that this mode can be used for `resource`.
     #[inline]
-    pub(crate) fn validate_for(self, resource: LockResource) -> Result<()> {
+    pub(crate) fn validate_for(self, resource: LockResource) -> OperationResult<()> {
         validate_mode(resource, self)
     }
 
@@ -71,7 +71,7 @@ impl LockMode {
     /// decisions. `TableData(S)` and `TableData(IX)` are intentionally
     /// incomparable because the first phase does not introduce `SIX`.
     #[inline]
-    pub(crate) fn covers(self, resource: LockResource, requested: Self) -> Result<bool> {
+    pub(crate) fn covers(self, resource: LockResource, requested: Self) -> OperationResult<bool> {
         validate_mode(resource, self)?;
         validate_mode(resource, requested)?;
         Ok(mode_covers(resource, self, requested))
@@ -79,13 +79,12 @@ impl LockMode {
 
     /// Validates that this mode is allowed for explicit table-lock APIs.
     #[inline]
-    pub(crate) fn validate_explicit_table_lock(self) -> Result<()> {
+    pub(crate) fn validate_explicit_table_lock(self) -> OperationResult<()> {
         if matches!(self, LockMode::Shared | LockMode::Exclusive) {
             return Ok(());
         }
         Err(Report::new(OperationError::InvalidLockMode)
-            .attach(format!("explicit table lock mode={self:?}"))
-            .into())
+            .attach(format!("explicit table lock mode={self:?}")))
     }
 }
 
@@ -231,7 +230,7 @@ impl LockManager {
         resource: LockResource,
         mode: LockMode,
         owner: LockOwner,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         self.acquire_with_group(resource, mode, owner, None)
             .await
             .map(|_| ())
@@ -244,7 +243,7 @@ impl LockManager {
         resource: LockResource,
         mode: LockMode,
         owner: LockOwner,
-    ) -> Result<LockGrant> {
+    ) -> OperationResult<LockGrant> {
         self.acquire_with_group(resource, mode, owner, None).await
     }
 
@@ -256,7 +255,7 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
         owner_group: LockOwnerGroup,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         self.acquire_with_group(resource, mode, owner, Some(owner_group))
             .await
             .map(|_| ())
@@ -270,7 +269,7 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
         owner_group: LockOwnerGroup,
-    ) -> Result<LockGrant> {
+    ) -> OperationResult<LockGrant> {
         self.acquire_with_group(resource, mode, owner, Some(owner_group))
             .await
     }
@@ -283,7 +282,7 @@ impl LockManager {
         data_mode: LockMode,
         owner: LockOwner,
         owner_group: LockOwnerGroup,
-    ) -> Result<(Option<FreshLockGuard<'a>>, Option<FreshLockGuard<'a>>)> {
+    ) -> OperationResult<(Option<FreshLockGuard<'a>>, Option<FreshLockGuard<'a>>)> {
         let metadata_resource = LockResource::TableMetadata(table_id);
         let metadata_grant = self
             .acquire_grouped_with_grant(metadata_resource, LockMode::Shared, owner, owner_group)
@@ -306,7 +305,7 @@ impl LockManager {
         table_id: TableID,
         owner: LockOwner,
         owner_group: LockOwnerGroup,
-    ) -> Result<ScopedTableDdlLocks<'a>> {
+    ) -> OperationResult<ScopedTableDdlLocks<'a>> {
         let metadata_resource = LockResource::TableMetadata(table_id);
         let metadata_grant = self
             .acquire_grouped_with_grant(metadata_resource, LockMode::Exclusive, owner, owner_group)
@@ -338,8 +337,7 @@ impl LockManager {
         &self,
         table_id: TableID,
         owner: LockOwner,
-        operation: &'static str,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         // Table DDL uses the session owner for scoped DDL locks. If an explicit
         // session table lock already exists, reusing that owner would become a
         // same-owner conversion and scoped cleanup could not distinguish the
@@ -357,11 +355,11 @@ impl LockManager {
         if !metadata_locked && !data_locked {
             return Ok(());
         }
-        Err(Report::new(OperationError::LockOwnerGroupConflict)
-            .attach(format!(
-                "{operation} while session owns explicit table lock: table_id={table_id}, owner={owner:?}"
-            ))
-            .into())
+        Err(
+            Report::new(OperationError::LockOwnerGroupConflict).attach(format!(
+                "session owns explicit table lock: table_id={table_id}, owner={owner:?}"
+            )),
+        )
     }
 
     #[inline]
@@ -371,7 +369,7 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
         owner_group: Option<LockOwnerGroup>,
-    ) -> Result<LockGrant> {
+    ) -> OperationResult<LockGrant> {
         validate_mode(resource, mode)?;
         let (waiter, waiter_guard, grant) = {
             // Reuse the non-blocking path first. If the request must wait,
@@ -412,7 +410,7 @@ impl LockManager {
         waiter: Arc<Waiter>,
         mut waiter_guard: WaiterGuard,
         grant: LockGrant,
-    ) -> Result<LockGrant> {
+    ) -> OperationResult<LockGrant> {
         let res = self.wait_for_grant(resource, mode, owner, waiter).await;
         if res.is_ok() {
             waiter_guard.disarm_after_grant_observed();
@@ -540,7 +538,7 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
         waiter: Arc<Waiter>,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         loop {
             // Register the listener before reading the outcome to avoid losing
             // a notification that races with this waiter going back to sleep.
@@ -624,7 +622,7 @@ impl ResourceState {
         mode: LockMode,
         owner: LockOwner,
         owner_group: Option<LockOwnerGroup>,
-    ) -> Result<AcquireImmediate> {
+    ) -> OperationResult<AcquireImmediate> {
         if let Some(idx) = self.granted_idx(owner) {
             // Reentrant requests that are already covered do not create
             // duplicate granted entries.
@@ -727,7 +725,7 @@ impl ResourceState {
         mode: LockMode,
         owner: LockOwner,
         owner_group: Option<LockOwnerGroup>,
-    ) -> Result<bool> {
+    ) -> OperationResult<bool> {
         let Some(owner_group) = owner_group else {
             return Ok(false);
         };
@@ -1026,13 +1024,12 @@ fn mark_waiters(waiters: &[Arc<Waiter>], outcome: WaitOutcome) {
 }
 
 #[inline]
-fn validate_mode(resource: LockResource, mode: LockMode) -> Result<()> {
+fn validate_mode(resource: LockResource, mode: LockMode) -> OperationResult<()> {
     if mode_is_valid(resource, mode) {
         return Ok(());
     }
     Err(Report::new(OperationError::InvalidLockMode)
-        .attach(format!("resource={resource:?}, mode={mode:?}"))
-        .into())
+        .attach(format!("resource={resource:?}, mode={mode:?}")))
 }
 
 #[inline]
@@ -1145,12 +1142,10 @@ fn upgrade_would_block_err(
     held: LockMode,
     requested: LockMode,
     owner: LockOwner,
-) -> Error {
-    Report::new(OperationError::LockUpgradeWouldBlock)
-        .attach(format!(
-            "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
-        ))
-        .into()
+) -> Report<OperationError> {
+    Report::new(OperationError::LockUpgradeWouldBlock).attach(format!(
+        "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
+    ))
 }
 
 #[inline]
@@ -1159,12 +1154,10 @@ fn conversion_not_supported_err(
     held: LockMode,
     requested: LockMode,
     owner: LockOwner,
-) -> Error {
-    Report::new(OperationError::LockConversionNotSupported)
-        .attach(format!(
-            "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
-        ))
-        .into()
+) -> Report<OperationError> {
+    Report::new(OperationError::LockConversionNotSupported).attach(format!(
+        "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
+    ))
 }
 
 #[inline]
@@ -1175,22 +1168,22 @@ fn owner_group_conflict_err(
     owner: LockOwner,
     owner_group: LockOwnerGroup,
     held_owner: LockOwner,
-) -> Error {
-    Report::new(OperationError::LockOwnerGroupConflict)
-        .attach(format!(
-            "resource={resource:?}, owner={owner:?}, owner_group={owner_group:?}, \
+) -> Report<OperationError> {
+    Report::new(OperationError::LockOwnerGroupConflict).attach(format!(
+        "resource={resource:?}, owner={owner:?}, owner_group={owner_group:?}, \
              held_owner={held_owner:?}, held={held:?}, requested={requested:?}"
-        ))
-        .into()
+    ))
 }
 
 #[inline]
-fn waiter_released_err(resource: LockResource, mode: LockMode, owner: LockOwner) -> Error {
-    Report::new(OperationError::LockWaiterReleased)
-        .attach(format!(
-            "resource={resource:?}, owner={owner:?}, mode={mode:?}"
-        ))
-        .into()
+fn waiter_released_err(
+    resource: LockResource,
+    mode: LockMode,
+    owner: LockOwner,
+) -> Report<OperationError> {
+    Report::new(OperationError::LockWaiterReleased).attach(format!(
+        "resource={resource:?}, owner={owner:?}, mode={mode:?}"
+    ))
 }
 
 #[inline]
@@ -1199,12 +1192,10 @@ fn waiter_failed_err(
     mode: LockMode,
     owner: LockOwner,
     error: OperationError,
-) -> Error {
-    Report::new(error)
-        .attach(format!(
-            "resource={resource:?}, owner={owner:?}, mode={mode:?}"
-        ))
-        .into()
+) -> Report<OperationError> {
+    Report::new(error).attach(format!(
+        "resource={resource:?}, owner={owner:?}, mode={mode:?}"
+    ))
 }
 
 #[cfg(test)]
@@ -1271,7 +1262,7 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
         owner: LockOwner,
-    ) -> Result<bool> {
+    ) -> OperationResult<bool> {
         try_acquire_with_group(manager, resource, mode, owner, None)
     }
 
@@ -1283,7 +1274,7 @@ pub(crate) mod tests {
         mode: LockMode,
         owner: LockOwner,
         owner_group: LockOwnerGroup,
-    ) -> Result<bool> {
+    ) -> OperationResult<bool> {
         try_acquire_with_group(manager, resource, mode, owner, Some(owner_group))
     }
 
@@ -1294,7 +1285,7 @@ pub(crate) mod tests {
         mode: LockMode,
         owner: LockOwner,
         owner_group: Option<LockOwnerGroup>,
-    ) -> Result<bool> {
+    ) -> OperationResult<bool> {
         validate_mode(resource, mode)?;
         let mut resource_state = manager.resources.entry(resource).or_default();
         match resource_state.try_acquire_immediate(resource, mode, owner, owner_group)? {
@@ -1359,9 +1350,9 @@ pub(crate) mod tests {
         LockOwnerGroup::Session(id)
     }
 
-    fn assert_operation_err<T>(res: Result<T>, expected: OperationError) {
+    fn assert_operation_err<T>(res: OperationResult<T>, expected: OperationError) {
         let err = res.err().unwrap();
-        assert_eq!(err.operation_error(), Some(expected));
+        assert_eq!(*err.current_context(), expected);
     }
 
     fn count_entries(
@@ -1661,7 +1652,7 @@ pub(crate) mod tests {
             );
             for waiter in [first_waiter, second_waiter] {
                 let err = waiter.await.unwrap_err();
-                assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+                assert_eq!(*err.current_context(), OperationError::TableNotFound);
             }
             assert_eq!(
                 count_entries(
@@ -1704,10 +1695,7 @@ pub(crate) mod tests {
 
             assert_eq!(manager.release_owner(waiting_owner), 1);
             let err = waiter.await.unwrap_err();
-            assert_eq!(
-                err.operation_error(),
-                Some(OperationError::LockWaiterReleased)
-            );
+            assert_eq!(*err.current_context(), OperationError::LockWaiterReleased);
 
             assert_eq!(manager.release_owner(trx(TrxID::new(2))), 1);
             let snapshot = debug_snapshot(&manager);
@@ -2342,12 +2330,12 @@ pub(crate) mod tests {
             assert_eq!(manager.release_owner(trx(TrxID::new(2))), 1);
             assert_eq!(manager.release_owner(trx(TrxID::new(3))), 1);
             assert_eq!(
-                first_waiter.await.unwrap_err().operation_error(),
-                Some(OperationError::LockWaiterReleased)
+                *first_waiter.await.unwrap_err().current_context(),
+                OperationError::LockWaiterReleased
             );
             assert_eq!(
-                second_waiter.await.unwrap_err().operation_error(),
-                Some(OperationError::LockWaiterReleased)
+                *second_waiter.await.unwrap_err().current_context(),
+                OperationError::LockWaiterReleased
             );
         });
     }

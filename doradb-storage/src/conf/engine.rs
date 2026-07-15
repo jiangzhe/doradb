@@ -78,37 +78,33 @@ impl ResolvedStoragePaths {
                 input.log_file_stem
             )
         })?;
-        validate_swap_file_path_candidate("data_swap_file", input.data_swap_file).attach_with(
-            || format!("invalid data_swap_file: {}", input.data_swap_file.display()),
-        )?;
-        validate_swap_file_path_candidate("index_swap_file", input.index_swap_file).attach_with(
-            || {
+        validate_swap_file_path_candidate(input.data_swap_file).attach_with(|| {
+            format!("invalid data_swap_file: {}", input.data_swap_file.display())
+        })?;
+        validate_swap_file_path_candidate(input.index_swap_file).attach_with(|| {
+            format!(
+                "invalid index_swap_file: {}",
+                input.index_swap_file.display()
+            )
+        })?;
+
+        let storage_root = resolve_storage_root(input.storage_root)
+            .attach_with(|| format!("invalid storage_root: {}", input.storage_root.display()))?;
+        let data_dir_rel = normalize_relative_dir(input.data_dir)
+            .attach_with(|| format!("invalid data_dir: {}", input.data_dir.display()))?;
+        let log_dir_rel = normalize_relative_dir(input.log_dir)
+            .attach_with(|| format!("invalid log_dir: {}", input.log_dir.display()))?;
+        let data_swap_file_rel =
+            normalize_relative_file_path(input.data_swap_file).attach_with(|| {
+                format!("invalid data_swap_file: {}", input.data_swap_file.display())
+            })?;
+        let index_swap_file_rel =
+            normalize_relative_file_path(input.index_swap_file).attach_with(|| {
                 format!(
                     "invalid index_swap_file: {}",
                     input.index_swap_file.display()
                 )
-            },
-        )?;
-
-        let storage_root = resolve_storage_root(input.storage_root)
-            .attach_with(|| format!("invalid storage_root: {}", input.storage_root.display()))?;
-        let data_dir_rel = normalize_relative_dir(input.data_dir, "data_dir")
-            .attach_with(|| format!("invalid data_dir: {}", input.data_dir.display()))?;
-        let log_dir_rel = normalize_relative_dir(input.log_dir, "log_dir")
-            .attach_with(|| format!("invalid log_dir: {}", input.log_dir.display()))?;
-        let data_swap_file_rel =
-            normalize_relative_file_path(input.data_swap_file, "data_swap_file").attach_with(
-                || format!("invalid data_swap_file: {}", input.data_swap_file.display()),
-            )?;
-        let index_swap_file_rel =
-            normalize_relative_file_path(input.index_swap_file, "index_swap_file").attach_with(
-                || {
-                    format!(
-                        "invalid index_swap_file: {}",
-                        input.index_swap_file.display()
-                    )
-                },
-            )?;
+            })?;
 
         let data_dir = storage_root.join(&data_dir_rel);
         let catalog_file_path = data_dir.join(input.catalog_file_name);
@@ -117,9 +113,9 @@ impl ResolvedStoragePaths {
         let index_swap_file = storage_root.join(&index_swap_file_rel);
         let durable_layout = DurableStorageLayout {
             version: STORAGE_LAYOUT_VERSION,
-            data_dir: relative_dir_display(&data_dir_rel, "data_dir")?,
+            data_dir: relative_dir_display(&data_dir_rel).attach("invalid normalized data_dir")?,
             catalog_file_name: input.catalog_file_name.to_string(),
-            log_dir: relative_dir_display(&log_dir_rel, "log_dir")?,
+            log_dir: relative_dir_display(&log_dir_rel).attach("invalid normalized log_dir")?,
             log_file_stem: input.log_file_stem.to_string(),
         };
         let res = ResolvedStoragePaths {
@@ -332,13 +328,10 @@ impl ResolvedStoragePaths {
             )
         })?;
         let same_parent = path.parent() == Some(self.log_dir.as_path());
-        let swap_file_name = path_to_utf8(
-            Path::new(
-                path.file_name()
-                    .expect("swap file must resolve to a file path"),
-            ),
-            field,
-        )
+        let swap_file_name = path_to_utf8(Path::new(
+            path.file_name()
+                .expect("swap file must resolve to a file path"),
+        ))
         .attach_with(|| format!("invalid {field}: {}", path.display()))?;
         (|| {
             ensure!(
@@ -511,13 +504,13 @@ fn resolve_storage_root(storage_root: &Path) -> ConfigResult<PathBuf> {
         })
 }
 
-fn normalize_relative_dir(path: &Path, field: &str) -> ConfigResult<PathBuf> {
-    normalize_relative_path(path, field, true)
+fn normalize_relative_dir(path: &Path) -> ConfigResult<PathBuf> {
+    normalize_relative_path(path, true)
 }
 
-fn normalize_relative_file_path(path: &Path, field: &str) -> ConfigResult<PathBuf> {
-    let normalized = normalize_relative_path(path, field, false)
-        .attach_with(|| format!("invalid {field}: {}", path.display()))?;
+fn normalize_relative_file_path(path: &Path) -> ConfigResult<PathBuf> {
+    let normalized = normalize_relative_path(path, false)
+        .attach_with(|| format!("invalid relative file path: {}", path.display()))?;
     (|| {
         ensure!(
             !normalized.as_os_str().is_empty(),
@@ -525,11 +518,11 @@ fn normalize_relative_file_path(path: &Path, field: &str) -> ConfigResult<PathBu
         );
         Ok(())
     })()
-    .attach_with(|| format!("{field} must resolve to a file path"))?;
+    .attach_with(|| format!("path must resolve to a file: {}", path.display()))?;
     Ok(normalized)
 }
 
-fn normalize_relative_path(path: &Path, field: &str, allow_empty: bool) -> ConfigResult<PathBuf> {
+fn normalize_relative_path(path: &Path, allow_empty: bool) -> ConfigResult<PathBuf> {
     (|| {
         ensure!(
             !path.is_absolute(),
@@ -537,19 +530,27 @@ fn normalize_relative_path(path: &Path, field: &str, allow_empty: bool) -> Confi
         );
         Ok(())
     })()
-    .attach_with(|| format!("{field} must be relative to storage_root"))?;
+    .attach_with(|| format!("path must be relative to storage_root: {}", path.display()))?;
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::Normal(seg) => normalized.push(seg),
             Component::ParentDir => {
-                return Err(Report::new(ConfigError::PathMustNotEscapeStorageRoot)
-                    .attach(format!("{field} must not escape storage_root")));
+                return Err(
+                    Report::new(ConfigError::PathMustNotEscapeStorageRoot).attach(format!(
+                        "path must not escape storage_root: {}",
+                        path.display()
+                    )),
+                );
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(Report::new(ConfigError::PathMustBeRelativeToStorageRoot)
-                    .attach(format!("{field} must be relative to storage_root")));
+                return Err(
+                    Report::new(ConfigError::PathMustBeRelativeToStorageRoot).attach(format!(
+                        "path must be relative to storage_root: {}",
+                        path.display()
+                    )),
+                );
             }
         }
     }
@@ -560,16 +561,16 @@ fn normalize_relative_path(path: &Path, field: &str, allow_empty: bool) -> Confi
         );
         Ok(())
     })()
-    .attach_with(|| format!("{field} must not be empty"))?;
+    .attach_with(|| format!("path must not be empty: {}", path.display()))?;
     Ok(normalized)
 }
 
-fn relative_dir_display(path: &Path, field: &str) -> ConfigResult<String> {
+fn relative_dir_display(path: &Path) -> ConfigResult<String> {
     if path.as_os_str().is_empty() {
         Ok(".".to_string())
     } else {
-        Ok(path_to_utf8(path, field)
-            .attach_with(|| format!("invalid {field}: {}", path.display()))?
+        Ok(path_to_utf8(path)
+            .attach_with(|| format!("invalid relative directory: {}", path.display()))?
             .to_string())
     }
 }
@@ -606,9 +607,19 @@ mod tests {
 
     #[test]
     fn test_validate_swap_file_suffix_and_escape() {
-        validate_swap_file_path_candidate("data_swap_file", "data.swp").unwrap();
+        validate_swap_file_path_candidate("data.swp").unwrap();
 
-        let err = validate_swap_file_path_candidate("data_swap_file", "data.bin").unwrap_err();
+        let err = validate_swap_file_path_candidate("data.bin").unwrap_err();
+        assert_config_report(
+            err,
+            ConfigError::PathMustUseRequiredSuffix,
+            &[".swp", "data.bin"],
+        );
+
+        let err = EngineConfig::default()
+            .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.bin"))
+            .resolve_storage_paths()
+            .unwrap_err();
         assert_config_report(
             err,
             ConfigError::PathMustUseRequiredSuffix,

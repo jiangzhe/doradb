@@ -15,7 +15,7 @@ use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::Transaction;
 use crate::value::{Val, ValKind, ValType};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use semistr::SemiStr;
 use std::mem;
 use std::ops::Index;
@@ -1063,7 +1063,10 @@ impl Deser for TableBriefMetadata {
             + mem::size_of::<u16>(), // next_index_no
     );
 
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, col_names) = <Vec<SemiStr>>::deser(input, start_idx)?;
         let (idx, col_types) = <Vec<ValType>>::deser(input, idx)?;
         let (idx, col_attrs) = <Vec<ColumnAttributes>>::deser(input, idx)?;
@@ -1225,7 +1228,9 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
     validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
-    lock_manager.reject_table_ddl_explicit_session_lock(table_id, ctx.owner, "drop table")?;
+    lock_manager
+        .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
+        .attach("operation=drop table")?;
     let mut table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
         .await?;
@@ -1340,8 +1345,9 @@ pub(crate) async fn validated_index_ddl_target(
     reject_non_user_table_id(table_id, operation)?;
     let table = engine
         .catalog()
-        .validate_user_table_live(table_id, operation)
-        .await?;
+        .validate_user_table_live(table_id)
+        .await
+        .map_err(|report| Error::from(report.attach(format!("operation={operation}"))))?;
     ensure_user_table_catalog_row(guards, engine, table_id, operation).await?;
     Ok(table)
 }
@@ -3244,6 +3250,9 @@ mod tests {
                     err.operation_error(),
                     Some(OperationError::LockOwnerGroupConflict)
                 );
+                let rendered = err.to_string();
+                assert_eq!(rendered.matches("operation=drop table").count(), 1);
+                assert!(rendered.contains(&format!("table_id={table_id}")));
 
                 assert_eq!(
                     table_for_internal_assertion(&engine, table_id)
@@ -3865,10 +3874,7 @@ mod tests {
             let Err(waiter_err) = lock_fut.await else {
                 panic!("queued table lock waiter should fail after drop gate error");
             };
-            assert_eq!(
-                waiter_err.operation_error(),
-                Some(OperationError::TableDropping)
-            );
+            assert_eq!(*waiter_err.current_context(), OperationError::TableDropping);
             drop(root_lease);
         });
     }

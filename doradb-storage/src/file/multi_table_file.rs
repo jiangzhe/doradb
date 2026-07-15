@@ -1,9 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot};
-use crate::error::{
-    DataIntegrityError, Error, FileKind, InternalError, IoError, ResourceError, Result,
-};
+use crate::error::{Error, FileKind, InternalError, IoError, ResourceError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -531,17 +529,11 @@ fn parse_multi_table_meta_block(
             )
         })
         .map_err(Error::from)?;
-    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|err| {
-        if err.data_integrity_error().is_some() {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={}, block=multi-table-meta, block_id={page_id}",
-                    FileKind::CatalogMultiTableFile
-                ))
-                .into()
-        } else {
-            err
-        }
+    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|report| {
+        Error::from(report.attach(format!(
+            "file={}, block=multi-table-meta, block_id={page_id}",
+            FileKind::CatalogMultiTableFile
+        )))
     })?;
 
     Ok(ParsedMeta {

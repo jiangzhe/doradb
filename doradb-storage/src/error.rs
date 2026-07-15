@@ -19,6 +19,10 @@ pub type Result<T> = result::Result<T, Error>;
 pub(crate) type ConfigResult<T> = result::Result<T, Report<ConfigError>>;
 /// Result carrying operation-domain reports.
 pub(crate) type OperationResult<T> = result::Result<T, Report<OperationError>>;
+/// Result carrying resource-domain reports.
+pub(crate) type ResourceResult<T> = result::Result<T, Report<ResourceError>>;
+/// Result carrying internal-invariant reports.
+pub(crate) type InternalResult<T> = result::Result<T, Report<InternalError>>;
 
 /// Fluent conversion from a data-integrity report to the storage error boundary.
 pub(crate) trait DataIntegrityResultExt<T> {
@@ -311,8 +315,6 @@ pub(crate) enum InternalError {
     ColumnIndexPathInvariant,
     #[error("column index search type missing")]
     ColumnIndexSearchTypeMissing,
-    #[error("column index out of bounds")]
-    ColumnIndexOutOfBounds,
     #[error("secondary index out of bounds")]
     SecondaryIndexOutOfBounds,
     #[error("secondary index kind mismatch")]
@@ -515,6 +517,18 @@ impl CompletionErrorKind {
             .attach(message.into())
     }
 
+    /// Converts a data-integrity report into the completion transport domain.
+    #[inline]
+    pub(crate) fn report_data_integrity(
+        report: Report<DataIntegrityError>,
+        message: impl Into<String>,
+    ) -> Report<Self> {
+        let reason = *report.current_context();
+        report
+            .change_context(Self::DataIntegrity(reason))
+            .attach(message.into())
+    }
+
     /// Converts a storage error into a completion-domain report.
     #[inline]
     pub(crate) fn report_error(err: Error, message: impl Into<String>) -> Report<Self> {
@@ -690,6 +704,12 @@ impl Error {
         self.0
     }
 
+    /// Adds boundary context without changing the existing error classification.
+    #[inline]
+    pub(crate) fn attach(self, attachment: impl Into<String>) -> Self {
+        Error(self.0.attach(attachment.into()))
+    }
+
     /// Returns an attached report frame of type `T`, when present.
     #[inline]
     pub(crate) fn downcast_ref<T: Send + Sync + 'static>(&self) -> Option<&T> {
@@ -698,6 +718,7 @@ impl Error {
 
     /// Returns the attached data-integrity reason, when present.
     #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "test error inspection"))]
     pub(crate) fn data_integrity_error(&self) -> Option<DataIntegrityError> {
         self.downcast_ref::<DataIntegrityError>().copied()
     }
@@ -716,6 +737,7 @@ impl Error {
 
     /// Returns the attached operation reason, when present.
     #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "test error inspection"))]
     pub(crate) fn operation_error(&self) -> Option<OperationError> {
         self.downcast_ref::<OperationError>().copied()
     }

@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::OperationResult;
 use crate::lock::{LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::map::FastHashMap;
 
@@ -48,7 +48,11 @@ impl OwnerLockState {
 
     /// Returns whether the cached lock mode covers the requested mode.
     #[inline]
-    pub(crate) fn cached_covers(&self, resource: LockResource, mode: LockMode) -> Result<bool> {
+    pub(crate) fn cached_covers(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> OperationResult<bool> {
         match self.held.get(&resource).copied() {
             Some(held) => held.covers(resource, mode),
             None => {
@@ -68,7 +72,7 @@ impl OwnerLockState {
         lock_manager: &LockManager,
         resource: LockResource,
         mode: LockMode,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         if self.cached_covers(resource, mode)? {
             return Ok(());
         }
@@ -93,7 +97,7 @@ impl OwnerLockState {
         lock_manager: &LockManager,
         resource: LockResource,
         mode: LockMode,
-    ) -> Result<LockGrant> {
+    ) -> OperationResult<LockGrant> {
         if self.cached_covers(resource, mode)? {
             return Ok(LockGrant::Existing);
         }
@@ -187,9 +191,9 @@ mod tests {
             .count()
     }
 
-    fn assert_operation_err<T>(res: Result<T>, expected: OperationError) {
+    fn assert_operation_err<T>(res: OperationResult<T>, expected: OperationError) {
         let err = res.err().unwrap();
-        assert_eq!(err.operation_error(), Some(expected));
+        assert_eq!(*err.current_context(), expected);
     }
 
     #[test]

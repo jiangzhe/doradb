@@ -5,7 +5,9 @@ use crate::catalog::{
     create_table_for_session, drop_index_for_session, drop_table_for_session,
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
-use crate::error::{Error, LifecycleError, OperationError, Result};
+use crate::error::{
+    Error, InternalError, InternalResult, LifecycleError, OperationError, OperationResult, Result,
+};
 use crate::id::{SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::map::{FastDashMap, FastHashMap};
@@ -18,10 +20,7 @@ use crate::stats::{
 use crate::table::{
     CheckpointDelayReason, CheckpointOutcome, FreezeOutcome, SecondaryMemIndexCleanupStats, Table,
 };
-use crate::trx::{
-    StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
-    transaction_discarded_err,
-};
+use crate::trx::{StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState};
 use error_stack::Report;
 use futures::future::select_all;
 use parking_lot::Mutex;
@@ -192,7 +191,9 @@ impl Session {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_session_error(self.id, operation));
         }
-        let engine = self.engine.upgrade(operation)?;
+        let engine = self.engine.upgrade().map_err(|report| {
+            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id)))
+        })?;
         let admission = engine.acquire_admission()?;
         let state = engine.session_registry.pin_running(self.id, operation)?;
         drop(admission);
@@ -204,8 +205,12 @@ impl Session {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_session_error(self.id, operation));
         }
-        let engine = self.engine.upgrade(operation)?;
-        engine.ensure_admission_open_for_query(operation)?;
+        let engine = self.engine.upgrade().map_err(|report| {
+            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id)))
+        })?;
+        engine.ensure_admission_open_for_query().map_err(|report| {
+            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id)))
+        })?;
         let state = engine.session_registry.pin_running(self.id, operation)?;
         Ok(SessionQueryPin {
             engine,
@@ -238,7 +243,9 @@ impl Session {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let engine = self.engine.upgrade("close session")?;
+        let engine = self.engine.upgrade().map_err(|report| {
+            Error::from(report.attach(format!("operation=close session, session_id={}", self.id)))
+        })?;
         let _admission = engine.acquire_admission()?;
         engine.session_registry.close_idle(self.id)?;
         self.closed.store(true, Ordering::Release);
@@ -618,13 +625,20 @@ impl SessionPin {
     pub(crate) fn begin_trx(&self, operation: &'static str) -> Result<Transaction> {
         let engine = &self.engine;
         self.state
-            .begin_trx(operation, || engine.trx_sys.begin_trx(engine, &self.state))
+            .begin_trx(|| engine.trx_sys.begin_trx(engine, &self.state))
+            .map_err(|report| {
+                Error::from(
+                    report.attach(format!("operation={operation}, session_id={}", self.id())),
+                )
+            })
     }
 
     /// Returns whether the pinned session is in an active transaction.
     #[inline]
     pub(crate) fn in_trx(&self, operation: &'static str) -> Result<bool> {
-        self.state.in_trx(operation)
+        self.state.in_trx().map_err(|report| {
+            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id())))
+        })
     }
 
     /// Resolve a live user table, checking cached entries first.
@@ -641,8 +655,9 @@ impl SessionPin {
         let table = self
             .engine
             .catalog()
-            .validate_user_table_live(table_id, operation)
-            .await?;
+            .validate_user_table_live(table_id)
+            .await
+            .map_err(|report| Error::from(report.attach(format!("operation={operation}"))))?;
         self.state.cache_user_table(&table);
         Ok(table)
     }
@@ -674,8 +689,9 @@ impl SessionPin {
         let engine = &self.engine;
         engine
             .catalog()
-            .validate_user_table_live(table_id, "lock explicit table")
-            .await?;
+            .validate_user_table_live(table_id)
+            .await
+            .map_err(|report| Error::from(report.attach("operation=lock explicit table")))?;
         let lock_manager = engine.lock_manager();
         let owner = LockOwner::Session(session_id);
         let owner_group = LockOwnerGroup::Session(session_id);
@@ -684,8 +700,9 @@ impl SessionPin {
             .await?;
         engine
             .catalog()
-            .validate_user_table_live(table_id, "lock explicit table")
-            .await?;
+            .validate_user_table_live(table_id)
+            .await
+            .map_err(|report| Error::from(report.attach("operation=lock explicit table")))?;
         if let Some(guard) = data_guard.as_mut() {
             guard.disarm();
         }
@@ -757,14 +774,23 @@ impl SessionRegistry {
         let state = self
             .session_state(id)
             .ok_or_else(|| stale_session_error(id, operation))?;
-        state.ensure_running(operation)?;
+        state.ensure_running().map_err(|report| {
+            Error::from(report.attach(format!("operation={operation}, session_id={id}")))
+        })?;
         Ok(state)
     }
 
     /// Close an idle session and remove it from the registry.
     #[inline]
     pub(crate) fn close_idle(&self, id: SessionID) -> Result<()> {
-        self.modify_session_checked(id, "close session", SessionState::close_idle)
+        let state = self
+            .session_state(id)
+            .ok_or_else(|| stale_session_error(id, "close session"))?;
+        let removal = state.close_idle().map_err(|report| {
+            Error::from(report.attach(format!("operation=close session, session_id={id}")))
+        })?;
+        self.apply_removal(id, removal);
+        Ok(())
     }
 
     /// Best-effort nonblocking abandonment from public session `Drop`.
@@ -799,7 +825,11 @@ impl SessionRegistry {
         let session = self
             .session_state(session_id)
             .ok_or_else(|| stale_session_error(session_id, operation))?;
-        let entry = session.resolve_trx(trx_id, operation)?;
+        let entry = session.resolve_trx(trx_id).map_err(|report| {
+            Error::from(report.attach(format!(
+                "operation={operation}, session_id={session_id}, trx_id={trx_id}"
+            )))
+        })?;
         Ok((entry, session))
     }
 
@@ -899,21 +929,6 @@ impl SessionRegistry {
     }
 
     #[inline]
-    fn modify_session_checked(
-        &self,
-        id: SessionID,
-        operation: &'static str,
-        modify: impl FnOnce(&SessionState) -> Result<SessionRemoval>,
-    ) -> Result<()> {
-        let state = self
-            .session_state(id)
-            .ok_or_else(|| stale_session_error(id, operation))?;
-        let removal = modify(&state)?;
-        self.apply_removal(id, removal);
-        Ok(())
-    }
-
-    #[inline]
     fn apply_removal(&self, id: SessionID, removal: SessionRemoval) {
         let removed = match removal {
             SessionRemoval::Remove => self.entries.remove(&id).map(|(_, state)| state),
@@ -984,54 +999,51 @@ impl SessionState {
     }
 
     #[inline]
-    fn ensure_running(&self, operation: &'static str) -> Result<()> {
+    fn ensure_running(&self) -> OperationResult<()> {
         match &*self.lifecycle.lock() {
             SessionLifecycle::RunningIdle | SessionLifecycle::RunningActive { .. } => Ok(()),
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
-            | SessionLifecycle::Closed => Err(closed_session_error(self.id, operation)),
+            | SessionLifecycle::Closed => Err(closed_session_report(self.id)),
         }
     }
 
     #[inline]
-    fn in_trx(&self, operation: &'static str) -> Result<bool> {
+    fn in_trx(&self) -> OperationResult<bool> {
         match &*self.lifecycle.lock() {
             SessionLifecycle::RunningIdle => Ok(false),
             SessionLifecycle::RunningActive { entry } => Ok(entry.in_trx()),
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
-            | SessionLifecycle::Closed => Err(closed_session_error(self.id, operation)),
+            | SessionLifecycle::Closed => Err(closed_session_report(self.id)),
         }
     }
 
     #[inline]
-    fn active_transaction_err(&self, operation: &'static str, entry: &TrxEntry) -> Error {
-        Report::new(OperationError::ExistingTransaction)
-            .attach(format!(
-                "{operation}: session_id={}, trx_id={}, state={:?}",
-                self.id,
-                entry.trx_id(),
-                entry.inspect_state()
-            ))
-            .into()
+    fn active_transaction_err(&self, entry: &TrxEntry) -> Report<OperationError> {
+        Report::new(OperationError::ExistingTransaction).attach(format!(
+            "session_id={}, trx_id={}, state={:?}",
+            self.id,
+            entry.trx_id(),
+            entry.inspect_state()
+        ))
     }
 
     #[inline]
     fn begin_trx(
         &self,
-        operation: &'static str,
         begin: impl FnOnce() -> StartedTransaction,
-    ) -> Result<Transaction> {
+    ) -> OperationResult<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningIdle => {}
             SessionLifecycle::RunningActive { entry } => {
-                return Err(self.active_transaction_err(operation, entry));
+                return Err(self.active_transaction_err(entry));
             }
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
             | SessionLifecycle::Closed => {
-                return Err(closed_session_error(self.id, operation));
+                return Err(closed_session_report(self.id));
             }
         }
         let trx = begin();
@@ -1042,20 +1054,15 @@ impl SessionState {
     }
 
     #[inline]
-    fn close_idle(&self) -> Result<SessionRemoval> {
+    fn close_idle(&self) -> OperationResult<SessionRemoval> {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {}
             SessionLifecycle::RunningActive { entry } => {
-                return Err(
-                    self.active_transaction_err("close session with active transaction", entry)
-                );
+                return Err(self.active_transaction_err(entry));
             }
             SessionLifecycle::AbandonedActive { entry } => {
-                return Err(self.active_transaction_err(
-                    "close abandoned session with active transaction",
-                    entry,
-                ));
+                return Err(self.active_transaction_err(entry));
             }
             SessionLifecycle::Closed => return Ok(SessionRemoval::Remove),
         }
@@ -1135,7 +1142,7 @@ impl SessionState {
     }
 
     #[inline]
-    fn resolve_trx(&self, trx_id: TrxID, operation: &'static str) -> Result<Arc<TrxEntry>> {
+    fn resolve_trx(&self, trx_id: TrxID) -> InternalResult<Arc<TrxEntry>> {
         let lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningActive { entry }
@@ -1145,11 +1152,11 @@ impl SessionState {
                 Ok(Arc::clone(entry))
             }
             SessionLifecycle::RunningActive { .. } | SessionLifecycle::AbandonedActive { .. } => {
-                Err(transaction_discarded_err(operation))
+                Err(discarded_transaction_report(self.id, trx_id))
             }
             SessionLifecycle::RunningIdle
             | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed => Err(transaction_discarded_err(operation)),
+            | SessionLifecycle::Closed => Err(discarded_transaction_report(self.id, trx_id)),
         }
     }
 
@@ -1488,11 +1495,19 @@ fn table_not_found_error(table_id: TableID, operation: &'static str) -> Error {
 
 #[inline]
 fn closed_session_error(id: SessionID, operation: &'static str) -> Error {
+    Error::from(closed_session_report(id).attach(format!("operation={operation}")))
+}
+
+#[inline]
+fn closed_session_report(id: SessionID) -> Report<OperationError> {
     Report::new(OperationError::NotSupported)
-        .attach(format!(
-            "{operation}: session is closed or abandoned: session_id={id}"
-        ))
-        .into()
+        .attach(format!("session is closed or abandoned: session_id={id}"))
+}
+
+#[inline]
+fn discarded_transaction_report(id: SessionID, trx_id: TrxID) -> Report<InternalError> {
+    Report::new(InternalError::ActiveTransactionDiscarded)
+        .attach(format!("session_id={id}, trx_id={trx_id}"))
 }
 
 #[inline]
@@ -1776,7 +1791,9 @@ pub(crate) mod tests {
         fn in_trx(&self) -> Result<bool> {
             const OPERATION: &str = "test query session transaction state";
             let session = self.query_session(OPERATION)?;
-            session._state.in_trx(OPERATION)
+            session._state.in_trx().map_err(|report| {
+                Error::from(report.attach(format!("operation={OPERATION}, session_id={}", self.id)))
+            })
         }
 
         #[inline]

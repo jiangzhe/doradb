@@ -1,4 +1,4 @@
-use crate::error::{DataIntegrityError, DataIntegrityResult, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::{Report, ensure};
 use std::mem;
@@ -63,7 +63,10 @@ impl Deser for BlockIntegrityHeader {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(BLOCK_INTEGRITY_HEADER_SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, magic_word) = input.deser_byte_array::<8>(start_idx)?;
         let (idx, version) = input.deser_u64(idx)?;
         Ok((
@@ -99,7 +102,10 @@ impl Deser for BlockIntegrityTrailer {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(BLOCK_INTEGRITY_TRAILER_SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
         Ok((idx, BlockIntegrityTrailer { b3sum }))
     }

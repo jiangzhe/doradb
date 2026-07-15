@@ -110,7 +110,7 @@ macro_rules! impl_id_serde {
             fn deser<S: crate::serde::Serde + ?Sized>(
                 input: &S,
                 start_idx: usize,
-            ) -> crate::error::Result<(usize, Self)> {
+            ) -> crate::serde::DeserResult<(usize, Self)> {
                 input
                     .deser_u64(start_idx)
                     .map(|(idx, raw)| (idx, Self::new(raw)))

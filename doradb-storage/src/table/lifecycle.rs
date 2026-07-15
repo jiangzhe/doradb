@@ -1,4 +1,4 @@
-use crate::error::{Error, InternalError, OperationError, Result};
+use crate::error::{Error, InternalError, OperationError, OperationResult, Result};
 use crate::id::TableID;
 use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
@@ -242,14 +242,10 @@ impl TableLifecycle {
 
     /// Ensures a foreground operation may proceed after logical locks are held.
     #[inline]
-    pub(crate) fn check_foreground_live(
-        &self,
-        table_id: TableID,
-        operation: &'static str,
-    ) -> Result<()> {
+    pub(crate) fn check_foreground_live(&self) -> OperationResult<()> {
         match self.inspect_terminal() {
             TableTerminal::Live => Ok(()),
-            state => Err(foreground_not_live_err(table_id, operation, state)),
+            state => Err(foreground_not_live_err(state)),
         }
     }
 
@@ -684,21 +680,15 @@ fn check_terminal_for_checkpoint(state: TableTerminal) -> StdResult<(), Checkpoi
 }
 
 #[inline]
-fn foreground_not_live_err(
-    table_id: TableID,
-    operation: &'static str,
-    state: TableTerminal,
-) -> Error {
+fn foreground_not_live_err(state: TableTerminal) -> Report<OperationError> {
     let reason = match state {
         TableTerminal::Live => unreachable!("live table should not fail foreground check"),
         TableTerminal::Dropping => OperationError::TableDropping,
         TableTerminal::Dropped => OperationError::TableNotFound,
     };
-    Report::new(reason)
-        .attach(format!(
-            "foreground table access rejected: table_id={table_id}, operation={operation}, lifecycle_state={state:?}"
-        ))
-        .into()
+    Report::new(reason).attach(format!(
+        "foreground table access rejected: lifecycle_state={state:?}"
+    ))
 }
 
 #[inline]
@@ -763,16 +753,12 @@ mod tests {
             let lifecycle = TableLifecycle::new();
             lifecycle.start_drop(TABLE_ID).unwrap().wait().await;
 
-            let err = lifecycle
-                .check_foreground_live(TABLE_ID, "scan")
-                .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            let err = lifecycle.check_foreground_live().unwrap_err();
+            assert_eq!(*err.current_context(), OperationError::TableDropping);
 
             lifecycle.mark_dropped(TABLE_ID).unwrap();
-            let err = lifecycle
-                .check_foreground_live(TABLE_ID, "insert")
-                .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            let err = lifecycle.check_foreground_live().unwrap_err();
+            assert_eq!(*err.current_context(), OperationError::TableNotFound);
         });
     }
 

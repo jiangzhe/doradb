@@ -2,7 +2,7 @@ use crate::catalog::{
     ActiveIndexSpec, ColumnAttributes, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
 };
 use crate::compression::bitpacking::*;
-use crate::error::{DataIntegrityError, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult};
 use error_stack::Report;
 use semistr::SemiStr;
 use std::borrow::Cow;
@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 use std::mem;
 use std::num::NonZeroUsize;
 use zerocopy::IntoBytes;
+
+/// Result returned by byte deserializers before a format caller adds context.
+pub(crate) type DeserResult<T> = DataIntegrityResult<T>;
 
 /// Byte-level serialization and deserialization operations over contiguous buffers.
 pub trait Serde {
@@ -62,49 +65,49 @@ pub trait Serde {
     fn size(&self) -> usize;
 
     /// Deserialize a u64 value from a byte slice.
-    fn deser_u64(&self, idx: usize) -> Result<(usize, u64)>;
+    fn deser_u64(&self, idx: usize) -> DeserResult<(usize, u64)>;
 
     /// Deserialize a i64 value from a byte slice.
-    fn deser_i64(&self, idx: usize) -> Result<(usize, i64)>;
+    fn deser_i64(&self, idx: usize) -> DeserResult<(usize, i64)>;
 
     /// Deserialize a f64 value from a byte slice.
-    fn deser_f64(&self, idx: usize) -> Result<(usize, f64)>;
+    fn deser_f64(&self, idx: usize) -> DeserResult<(usize, f64)>;
 
     /// Deserialize a u32 value from a byte slice.
-    fn deser_u32(&self, idx: usize) -> Result<(usize, u32)>;
+    fn deser_u32(&self, idx: usize) -> DeserResult<(usize, u32)>;
 
     /// Deserialize a i32 value from a byte slice.
-    fn deser_i32(&self, idx: usize) -> Result<(usize, i32)>;
+    fn deser_i32(&self, idx: usize) -> DeserResult<(usize, i32)>;
 
     /// Deserialize a f32 value from a byte slice.
-    fn deser_f32(&self, idx: usize) -> Result<(usize, f32)>;
+    fn deser_f32(&self, idx: usize) -> DeserResult<(usize, f32)>;
 
     /// Deserialize a u16 value from a byte slice.
-    fn deser_u16(&self, idx: usize) -> Result<(usize, u16)>;
+    fn deser_u16(&self, idx: usize) -> DeserResult<(usize, u16)>;
 
     /// Deserialize a i16 value from a byte slice.
-    fn deser_i16(&self, idx: usize) -> Result<(usize, i16)>;
+    fn deser_i16(&self, idx: usize) -> DeserResult<(usize, i16)>;
 
     /// Deserialize a u8 value from a byte slice.
-    fn deser_u8(&self, idx: usize) -> Result<(usize, u8)>;
+    fn deser_u8(&self, idx: usize) -> DeserResult<(usize, u8)>;
 
     /// Deserialize a i8 value from a byte slice.
-    fn deser_i8(&self, idx: usize) -> Result<(usize, i8)>;
+    fn deser_i8(&self, idx: usize) -> DeserResult<(usize, i8)>;
 
     /// Deserialize bool value.
     #[inline]
-    fn deser_bool(&self, idx: usize) -> Result<(usize, bool)> {
+    fn deser_bool(&self, idx: usize) -> DeserResult<(usize, bool)> {
         self.deser_u8(idx).map(|(i, r)| (i, r != 0))
     }
 
     /// Deserialize byte slice.
-    fn deser_byte_slice(&self, idx: usize, len: usize) -> Result<(usize, &[u8])>;
+    fn deser_byte_slice(&self, idx: usize, len: usize) -> DeserResult<(usize, &[u8])>;
 
     /// Deserialize fixed size byte array.
-    fn deser_byte_array<const N: usize>(&self, idx: usize) -> Result<(usize, [u8; N])>;
+    fn deser_byte_array<const N: usize>(&self, idx: usize) -> DeserResult<(usize, [u8; N])>;
 
     /// Returns a byte slice to caller for deserialization.
-    fn deser(&self, idx: usize, len: usize) -> Result<(usize, &[u8])>;
+    fn deser(&self, idx: usize, len: usize) -> DeserResult<(usize, &[u8])>;
 }
 
 impl Serde for [u8] {
@@ -204,83 +207,115 @@ impl Serde for [u8] {
     }
 
     #[inline]
-    fn deser_u64(&self, idx: usize) -> Result<(usize, u64)> {
+    fn deser_u64(&self, idx: usize) -> DeserResult<(usize, u64)> {
         debug_assert!(idx + mem::size_of::<u64>() <= self.len());
         let end = idx + mem::size_of::<u64>();
-        let val = u64::from_le_bytes(self[idx..end].try_into()?);
+        let val = u64::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid u64 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_i64(&self, idx: usize) -> Result<(usize, i64)> {
+    fn deser_i64(&self, idx: usize) -> DeserResult<(usize, i64)> {
         debug_assert!(idx + mem::size_of::<i64>() <= self.len());
         let end = idx + mem::size_of::<i64>();
-        let val = i64::from_le_bytes(self[idx..end].try_into()?);
+        let val = i64::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid i64 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_f64(&self, idx: usize) -> Result<(usize, f64)> {
+    fn deser_f64(&self, idx: usize) -> DeserResult<(usize, f64)> {
         debug_assert!(idx + mem::size_of::<f64>() <= self.len());
         let end = idx + mem::size_of::<f64>();
-        let val = f64::from_le_bytes(self[idx..end].try_into()?);
+        let val = f64::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid f64 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_u32(&self, idx: usize) -> Result<(usize, u32)> {
+    fn deser_u32(&self, idx: usize) -> DeserResult<(usize, u32)> {
         debug_assert!(idx + mem::size_of::<u32>() <= self.len());
         let end = idx + mem::size_of::<u32>();
-        let val = u32::from_le_bytes(self[idx..end].try_into()?);
+        let val = u32::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid u32 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_i32(&self, idx: usize) -> Result<(usize, i32)> {
+    fn deser_i32(&self, idx: usize) -> DeserResult<(usize, i32)> {
         debug_assert!(idx + mem::size_of::<i32>() <= self.len());
         let end = idx + mem::size_of::<i32>();
-        let val = i32::from_le_bytes(self[idx..end].try_into()?);
+        let val = i32::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid i32 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_f32(&self, idx: usize) -> Result<(usize, f32)> {
+    fn deser_f32(&self, idx: usize) -> DeserResult<(usize, f32)> {
         debug_assert!(idx + mem::size_of::<f32>() <= self.len());
         let end = idx + mem::size_of::<f32>();
-        let val = f32::from_le_bytes(self[idx..end].try_into()?);
+        let val = f32::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid f32 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_u16(&self, idx: usize) -> Result<(usize, u16)> {
+    fn deser_u16(&self, idx: usize) -> DeserResult<(usize, u16)> {
         debug_assert!(idx + mem::size_of::<u16>() <= self.len());
         let end = idx + mem::size_of::<u16>();
-        let val = u16::from_le_bytes(self[idx..end].try_into()?);
+        let val = u16::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid u16 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_i16(&self, idx: usize) -> Result<(usize, i16)> {
+    fn deser_i16(&self, idx: usize) -> DeserResult<(usize, i16)> {
         debug_assert!(idx + mem::size_of::<i16>() <= self.len());
         let end = idx + mem::size_of::<i16>();
-        let val = i16::from_le_bytes(self[idx..end].try_into()?);
+        let val = i16::from_le_bytes(
+            self[idx..end]
+                .try_into()
+                .map_err(|_| invalid_serde_payload("invalid i16 byte width"))?,
+        );
         Ok((end, val))
     }
 
     #[inline]
-    fn deser_u8(&self, idx: usize) -> Result<(usize, u8)> {
+    fn deser_u8(&self, idx: usize) -> DeserResult<(usize, u8)> {
         debug_assert!(idx + mem::size_of::<u8>() <= self.len());
         Ok((idx + mem::size_of::<u8>(), self[idx]))
     }
 
     #[inline]
-    fn deser_i8(&self, idx: usize) -> Result<(usize, i8)> {
+    fn deser_i8(&self, idx: usize) -> DeserResult<(usize, i8)> {
         debug_assert!(idx + mem::size_of::<i8>() <= self.len());
         Ok((idx + mem::size_of::<i8>(), self[idx] as i8))
     }
 
     #[inline]
-    fn deser_byte_slice(&self, idx: usize, len: usize) -> Result<(usize, &[u8])> {
+    fn deser_byte_slice(&self, idx: usize, len: usize) -> DeserResult<(usize, &[u8])> {
         debug_assert!(idx + len <= self.len());
         let end = idx + len;
         let res = &self[idx..end];
@@ -288,7 +323,7 @@ impl Serde for [u8] {
     }
 
     #[inline]
-    fn deser_byte_array<const N: usize>(&self, idx: usize) -> Result<(usize, [u8; N])> {
+    fn deser_byte_array<const N: usize>(&self, idx: usize) -> DeserResult<(usize, [u8; N])> {
         debug_assert!(idx + N <= self.len());
         let end = idx + N;
         let mut res = [0u8; N];
@@ -297,7 +332,7 @@ impl Serde for [u8] {
     }
 
     #[inline]
-    fn deser(&self, idx: usize, len: usize) -> Result<(usize, &[u8])> {
+    fn deser(&self, idx: usize, len: usize) -> DeserResult<(usize, &[u8])> {
         debug_assert!(idx + len <= self.len());
         let end = idx + len;
         Ok((end, &self[idx..end]))
@@ -330,7 +365,7 @@ pub(crate) trait Deser: Sized {
     const MIN_BYTES_HINT: MinBytesHint = None;
 
     /// Deserialize objects from input.
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)>;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)>;
 }
 
 /// Optional lower bound for one serialized value.
@@ -352,7 +387,7 @@ impl Deser for u64 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_u64(start_idx)
     }
 }
@@ -373,7 +408,7 @@ impl Deser for i32 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<i32>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_i32(start_idx)
     }
 }
@@ -394,7 +429,7 @@ impl Deser for i64 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<i64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_i64(start_idx)
     }
 }
@@ -415,7 +450,7 @@ impl Deser for u16 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u16>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_u16(start_idx)
     }
 }
@@ -436,7 +471,7 @@ impl Deser for i16 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<i16>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_i16(start_idx)
     }
 }
@@ -457,7 +492,7 @@ impl Deser for u32 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u32>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_u32(start_idx)
     }
 }
@@ -478,7 +513,7 @@ impl Deser for u8 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_u8(start_idx)
     }
 }
@@ -499,7 +534,7 @@ impl Deser for i8 {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<i8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_i8(start_idx)
     }
 }
@@ -520,7 +555,7 @@ impl Deser for bool {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_bool(start_idx)
     }
 }
@@ -541,7 +576,7 @@ impl<const N: usize> Deser for [u8; N] {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(N);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         input.deser_byte_array(start_idx)
     }
 }
@@ -582,7 +617,7 @@ impl<T: Deser> Deser for Vec<T> {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (mut idx, len) = input.deser_u64(start_idx)?;
         let len = usize::try_from(len).map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload)
@@ -633,7 +668,7 @@ impl<T: Deser> Deser for Option<T> {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, flag) = input.deser_bool(start_idx)?;
         if flag {
             let (idx, v) = T::deser(input, idx)?;
@@ -660,7 +695,7 @@ impl<T: Deser> Deser for Box<T> {
     const MIN_BYTES_HINT: MinBytesHint = T::MIN_BYTES_HINT;
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         T::deser(input, start_idx).map(|(idx, v)| (idx, Box::new(v)))
     }
 }
@@ -691,7 +726,7 @@ impl<K: Ord + Deser, V: Deser> Deser for BTreeMap<K, V> {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (mut idx, len) = input.deser_u64(start_idx)?;
         let len = usize::try_from(len).map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload)
@@ -737,11 +772,12 @@ impl Deser for SemiStr {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u32>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, len) = input.deser_u32(start_idx)?;
         let (idx, s) = input.deser_byte_slice(idx, len as usize)?;
         // here we always validate utf-8 encoding.
-        let s = str::from_utf8(s)?;
+        let s = str::from_utf8(s)
+            .map_err(|err| invalid_serde_payload(format!("invalid UTF-8 string: {err}")))?;
         Ok((idx, SemiStr::new(s)))
     }
 }
@@ -762,7 +798,7 @@ impl Deser for IndexOrder {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, v) = input.deser_u8(start_idx)?;
         Ok((idx, IndexOrder::from(v)))
     }
@@ -786,7 +822,7 @@ impl Deser for IndexKey {
         min_bytes_hint(mem::size_of::<u16>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, col_no) = input.deser_u16(start_idx)?;
         let (idx, order) = IndexOrder::deser(input, idx)?;
         Ok((idx, IndexKey { col_no, order }))
@@ -809,7 +845,7 @@ impl Deser for IndexAttributes {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u32>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, v) = input.deser_u32(start_idx)?;
         Ok((idx, IndexAttributes::from_bits_truncate(v)))
     }
@@ -831,7 +867,7 @@ impl Deser for ColumnAttributes {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u32>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, v) = input.deser_u32(start_idx)?;
         Ok((idx, ColumnAttributes::from_bits_truncate(v)))
     }
@@ -855,7 +891,7 @@ impl Deser for IndexSpec {
         min_bytes_hint(mem::size_of::<u64>() + mem::size_of::<u32>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, cols) = <Vec<IndexKey>>::deser(input, start_idx)?;
         let (idx, attributes) = IndexAttributes::deser(input, idx)?;
         Ok((idx, IndexSpec { cols, attributes }))
@@ -880,7 +916,7 @@ impl Deser for ActiveIndexSpec {
         min_bytes_hint(mem::size_of::<u16>() + mem::size_of::<u64>() + mem::size_of::<u32>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, index_no) = input.deser_u16(start_idx)?;
         let (idx, spec) = IndexSpec::deser(input, idx)?;
         Ok((idx, ActiveIndexSpec { index_no, spec }))
@@ -901,7 +937,7 @@ impl Ser<'_> for () {
 
 impl Deser for () {
     #[inline]
-    fn deser<S: Serde + ?Sized>(_input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(_input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         Ok((start_idx, ()))
     }
 }
@@ -990,18 +1026,16 @@ impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, n_bits) = input.deser_u8(start_idx)?;
         let (idx, n_elems) = input.deser_u64(idx)?;
         let (idx, min) = T::deser(input, idx)?;
         let n_bytes = (n_elems as usize * n_bits as usize).div_ceil(8);
         if idx + n_bytes > input.size() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "FOR bitpacking payload exceeds input size: idx={idx}, n_bytes={n_bytes}, input_size={}",
                     input.size()
-                ))
-                .into());
+                )));
         }
         let (idx, packed) = input.deser(idx, n_bytes)?;
         let mut data = vec![T::ZERO; n_elems as usize];
@@ -1014,8 +1048,7 @@ impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
             32 => for_b32_unpack(packed, min, &mut data),
             _ => {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("invalid FOR bit width {n_bits}"))
-                    .into());
+                    .attach(format!("invalid FOR bit width {n_bits}")));
             }
         }
         Ok((idx, ForBitpackingDeser(data)))
@@ -1034,32 +1067,28 @@ fn validate_collection_len(
     len: usize,
     remaining: usize,
     element_min_bytes: MinBytesHint,
-) -> Result<()> {
+) -> DeserResult<()> {
     if len == 0 {
         return Ok(());
     }
     let Some(element_min_bytes) = element_min_bytes else {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "deserialize {collection} length has no minimum byte hint: len={len}"
-            ))
-            .into());
+            )),
+        );
     };
     let Some(required_bytes) = len.checked_mul(element_min_bytes.get()) else {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "deserialize {collection} length overflows minimum byte count: len={len}, min_element_bytes={}",
                 element_min_bytes.get()
-            ))
-            .into());
+            )));
     };
     if required_bytes > remaining {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "deserialize {collection} length exceeds remaining bytes by element hint: len={len}, remaining={remaining}, min_element_bytes={}, required_bytes={required_bytes}",
                 element_min_bytes.get()
-            ))
-            .into());
+            )));
     }
     Ok(())
 }
@@ -1071,6 +1100,11 @@ fn combined_min_bytes(left: MinBytesHint, right: MinBytesHint) -> MinBytesHint {
     left.get()
         .checked_add(right.get())
         .and_then(NonZeroUsize::new)
+}
+
+#[inline]
+fn invalid_serde_payload(message: impl Into<String>) -> Report<DataIntegrityError> {
+    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
 }
 
 #[cfg(test)]
@@ -1107,10 +1141,7 @@ mod tests {
 
         let err = Vec::<TestStruct>::deser(&out[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -1120,10 +1151,7 @@ mod tests {
 
         let err = Vec::<u64>::deser(&out[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -1135,10 +1163,7 @@ mod tests {
 
         let err = Vec::<u64>::deser(&input, 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -1148,10 +1173,7 @@ mod tests {
 
         let err = Vec::<NoHint>::deser(&out[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -1161,10 +1183,7 @@ mod tests {
 
         let err = Vec::<()>::deser(&out[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -1192,10 +1211,7 @@ mod tests {
 
         let err = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -1205,10 +1221,7 @@ mod tests {
 
         let err = BTreeMap::<u64, u64>::deser(&out[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -1280,7 +1293,7 @@ mod tests {
                 + mem::size_of::<u8>(),
         );
 
-        fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
             let idx = start_idx;
             let (idx, a) = input.deser_u64(idx)?;
             let (idx, b) = input.deser_u32(idx)?;
@@ -1295,7 +1308,7 @@ mod tests {
     struct NoHint;
 
     impl Deser for NoHint {
-        fn deser<S: Serde + ?Sized>(_input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        fn deser<S: Serde + ?Sized>(_input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
             Ok((start_idx, NoHint))
         }
     }
@@ -1362,56 +1375,56 @@ mod tests {
             self.size
         }
 
-        fn deser_u64(&self, idx: usize) -> Result<(usize, u64)> {
+        fn deser_u64(&self, idx: usize) -> DeserResult<(usize, u64)> {
             assert_eq!(idx, 0);
             Ok((mem::size_of::<u64>(), self.len))
         }
 
-        fn deser_i64(&self, _idx: usize) -> Result<(usize, i64)> {
+        fn deser_i64(&self, _idx: usize) -> DeserResult<(usize, i64)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_f64(&self, _idx: usize) -> Result<(usize, f64)> {
+        fn deser_f64(&self, _idx: usize) -> DeserResult<(usize, f64)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_u32(&self, _idx: usize) -> Result<(usize, u32)> {
+        fn deser_u32(&self, _idx: usize) -> DeserResult<(usize, u32)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_i32(&self, _idx: usize) -> Result<(usize, i32)> {
+        fn deser_i32(&self, _idx: usize) -> DeserResult<(usize, i32)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_f32(&self, _idx: usize) -> Result<(usize, f32)> {
+        fn deser_f32(&self, _idx: usize) -> DeserResult<(usize, f32)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_u16(&self, _idx: usize) -> Result<(usize, u16)> {
+        fn deser_u16(&self, _idx: usize) -> DeserResult<(usize, u16)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_i16(&self, _idx: usize) -> Result<(usize, i16)> {
+        fn deser_i16(&self, _idx: usize) -> DeserResult<(usize, i16)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_u8(&self, _idx: usize) -> Result<(usize, u8)> {
+        fn deser_u8(&self, _idx: usize) -> DeserResult<(usize, u8)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_i8(&self, _idx: usize) -> Result<(usize, i8)> {
+        fn deser_i8(&self, _idx: usize) -> DeserResult<(usize, i8)> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_byte_slice(&self, _idx: usize, _len: usize) -> Result<(usize, &[u8])> {
+        fn deser_byte_slice(&self, _idx: usize, _len: usize) -> DeserResult<(usize, &[u8])> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser_byte_array<const N: usize>(&self, _idx: usize) -> Result<(usize, [u8; N])> {
+        fn deser_byte_array<const N: usize>(&self, _idx: usize) -> DeserResult<(usize, [u8; N])> {
             unreachable!("fake deserialization input")
         }
 
-        fn deser(&self, _idx: usize, _len: usize) -> Result<(usize, &[u8])> {
+        fn deser(&self, _idx: usize, _len: usize) -> DeserResult<(usize, &[u8])> {
             unreachable!("fake deserialization input")
         }
     }

@@ -38,7 +38,7 @@ use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::runtime::yield_now;
 use crate::stats::BufferPoolCounters;
 use crate::{IndexPool, MemPool};
-use error_stack::{Report, ensure};
+use error_stack::{Report, ResultExt, ensure};
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
@@ -1743,7 +1743,13 @@ pub(crate) fn build_pool_with_swap_file_field(
     fs: QuiescentGuard<FileSystem>,
 ) -> Result<(EvictableBufferPool, SparseFile)> {
     config.role.assert_valid("evictable buffer pool");
-    validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)
+    validate_swap_file_path_candidate(&config.data_swap_file)
+        .attach_with(|| {
+            format!(
+                "invalid {swap_file_field_name}: {}",
+                config.data_swap_file.display()
+            )
+        })
         .map_err(Error::from)?;
     // 1. Calculate memory usage.
     let max_file_size = config.max_file_size.as_u64() as usize;
@@ -1774,8 +1780,14 @@ pub(crate) fn build_pool_with_swap_file_field(
     let arena = QuiescentArena::new(max_nbr)?;
 
     // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
-    let swap_file_path =
-        path_to_utf8(&config.data_swap_file, swap_file_field_name).map_err(Error::from)?;
+    let swap_file_path = path_to_utf8(&config.data_swap_file)
+        .attach_with(|| {
+            format!(
+                "invalid {swap_file_field_name}: {}",
+                config.data_swap_file.display()
+            )
+        })
+        .map_err(Error::from)?;
     let file = SparseFile::create_or_trunc(
         swap_file_path,
         max_file_size,

@@ -31,7 +31,7 @@ use crate::row::ops::{
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
-    ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionError, DmlValidationDomain,
+    ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionError, DmlValidationResultExt,
     DmlValidator, MemTable, RowPageDescriptor, Table, TableRootSnapshot, TableRuntimeLayout,
     UpdateUniqueMvcc, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
     unique_key_from_full_row,
@@ -2457,14 +2457,7 @@ impl<'a> UserTableAccessor<'a> {
             .snapshot_original_row_pages_from(rt.pool_guards(), root_snapshot.pivot_row_id())
             .await?;
         let mut tracker = ScanBoundaryTracker::new(upper_bound, original_pages);
-        let validator = validate_updates.then(|| {
-            DmlValidator::new(
-                self.metadata(),
-                self.table_id(),
-                "table_update_mvcc",
-                DmlValidationDomain::Foreground,
-            )
-        });
+        let validator = validate_updates.then(|| DmlValidator::new(self.metadata()));
         let column_count = self.metadata().col.col_count();
         let mut value_buffer = vec![Val::default(); column_count];
         let mut matched = 0usize;
@@ -2532,7 +2525,9 @@ impl<'a> UserTableAccessor<'a> {
                     };
                     matched += 1;
                     if let Some(validator) = validator.as_ref() {
-                        validator.validate_sparse_update(&update)?;
+                        validator
+                            .validate_sparse_update(&update)
+                            .with_foreground_context("table_update_mvcc", self.table_id())?;
                     }
                     if update.is_empty() {
                         value_buffer = lazy_row.into_reusable_buffer();
@@ -2623,7 +2618,9 @@ impl<'a> UserTableAccessor<'a> {
                 };
                 matched += 1;
                 if let Some(validator) = validator.as_ref() {
-                    validator.validate_sparse_update(&update)?;
+                    validator
+                        .validate_sparse_update(&update)
+                        .with_foreground_context("table_update_mvcc", self.table_id())?;
                 }
                 value_buffer = lazy_row.into_reusable_buffer();
                 if update.is_empty() {

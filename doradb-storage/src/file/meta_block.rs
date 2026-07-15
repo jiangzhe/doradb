@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::catalog::USER_TABLE_ID_LIMIT;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
-use crate::error::{DataIntegrityError, Error, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaBlock,
@@ -60,7 +60,10 @@ impl Deser for MetaBlock {
     );
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, pivot_row_id) = RowID::deser(input, start_idx)?;
         let (idx, heap_redo_start_ts) = TrxID::deser(input, idx)?;
         let (idx, deletion_cutoff_ts) = TrxID::deser(input, idx)?;
@@ -76,7 +79,11 @@ impl Deser for MetaBlock {
                 .iter()
                 .map(|active_index_spec| active_index_spec.index_no as usize),
         )?;
-        let schema = TableMetadata::try_from(meta)?;
+        let schema = TableMetadata::try_from(meta).map_err(|err| {
+            err.into_report()
+                .change_context(DataIntegrityError::InvalidPayload)
+                .attach("invalid persisted table metadata")
+        })?;
         Ok((
             idx,
             MetaBlock {
@@ -125,7 +132,7 @@ impl<'a> MetaBlockSerView<'a> {
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
         deletion_cutoff_ts: TrxID,
-    ) -> Result<Self> {
+    ) -> DataIntegrityResult<Self> {
         validate_secondary_index_roots(
             secondary_index_roots,
             schema.next_index_no,
@@ -196,7 +203,10 @@ impl Deser for MultiTableMetaBlockData {
     );
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, next_table_id) = TableID::deser(input, start_idx)?;
         if next_table_id > USER_TABLE_ID_LIMIT {
             return Err(invalid_payload(format!(
@@ -306,14 +316,12 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
 }
 
 #[inline]
-fn invalid_payload(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
+fn invalid_payload(message: impl Into<String>) -> Report<DataIntegrityError> {
+    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
 }
 
 #[inline]
-fn validate_alloc_map(alloc_map: &AllocMap) -> Result<()> {
+fn validate_alloc_map(alloc_map: &AllocMap) -> crate::error::DataIntegrityResult<()> {
     if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
         return Err(invalid_payload(
             "allocation map must include allocated super block",
@@ -327,7 +335,7 @@ fn validate_secondary_index_roots(
     secondary_index_roots: &[BlockID],
     next_index_no: u16,
     active_index_nos: impl IntoIterator<Item = usize>,
-) -> Result<()> {
+) -> crate::error::DataIntegrityResult<()> {
     let index_slot_count = next_index_no as usize;
     if secondary_index_roots.len() != index_slot_count {
         return Err(invalid_payload(format!(
@@ -543,10 +551,7 @@ mod tests {
         let data = serialize_meta_block_with_secondary_roots(&active_root, &secondary_index_roots);
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -566,10 +571,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -606,10 +608,7 @@ mod tests {
         assert_eq!(idx, ser_len);
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -637,10 +636,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]

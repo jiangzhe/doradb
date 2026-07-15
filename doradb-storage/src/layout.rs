@@ -1,8 +1,20 @@
-use crate::error::{DataIntegrityError, Error, Result};
 use error_stack::Report;
 use std::any::type_name;
 use std::mem;
+use std::result::Result as StdResult;
+use thiserror::Error as ThisError;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+/// Caller-neutral failures to view bytes through a zerocopy layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum LayoutError {
+    /// The byte length or alignment does not match the requested type.
+    #[error("byte layout mismatch")]
+    Mismatch,
+}
+
+/// Result carrying a caller-neutral byte-layout report.
+pub(crate) type LayoutResult<T> = StdResult<T, Report<LayoutError>>;
 
 /// Returns the byte representation of a zerocopy value.
 #[inline]
@@ -15,7 +27,7 @@ where
 
 /// Views an exact byte slice as one typed zerocopy value.
 #[inline]
-pub(crate) fn try_ref_from_bytes<T>(bytes: &[u8]) -> Result<&T>
+pub(crate) fn try_ref_from_bytes<T>(bytes: &[u8]) -> LayoutResult<&T>
 where
     T: FromBytes + KnownLayout + Immutable,
 {
@@ -30,7 +42,7 @@ where
 
 /// Views an exact mutable byte slice as one typed zerocopy value.
 #[inline]
-pub(crate) fn try_mut_from_bytes<T>(bytes: &mut [u8]) -> Result<&mut T>
+pub(crate) fn try_mut_from_bytes<T>(bytes: &mut [u8]) -> LayoutResult<&mut T>
 where
     T: FromBytes + IntoBytes + KnownLayout,
 {
@@ -45,7 +57,7 @@ where
 
 /// Views an exact byte slice as a typed zerocopy slice.
 #[inline]
-pub(crate) fn try_slice_from_bytes<T>(bytes: &[u8]) -> Result<&[T]>
+pub(crate) fn try_slice_from_bytes<T>(bytes: &[u8]) -> LayoutResult<&[T]>
 where
     [T]: FromBytes + KnownLayout<PointerMetadata = usize> + Immutable,
 {
@@ -69,7 +81,7 @@ where
 
 /// Views an exact mutable byte slice as a typed zerocopy slice.
 #[inline]
-pub(crate) fn try_slice_from_bytes_mut<T>(bytes: &mut [u8]) -> Result<&mut [T]>
+pub(crate) fn try_slice_from_bytes_mut<T>(bytes: &mut [u8]) -> LayoutResult<&mut [T]>
 where
     [T]: FromBytes + IntoBytes + KnownLayout<PointerMetadata = usize> + Immutable,
 {
@@ -121,10 +133,8 @@ where
 }
 
 #[inline]
-fn invalid_layout(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
+fn invalid_layout(message: impl Into<String>) -> Report<LayoutError> {
+    Report::new(LayoutError::Mismatch).attach(message.into())
 }
 
 #[cfg(test)]
@@ -177,20 +187,14 @@ mod tests {
     fn test_try_ref_from_bytes_rejects_wrong_len() {
         let err = try_ref_from_bytes::<LeU32>(&[0u8; 3]).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), LayoutError::Mismatch);
     }
 
     #[test]
     fn test_try_slice_from_bytes_rejects_partial_element() {
         let err = try_slice_from_bytes::<LeU32>(&[0u8; 5]).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), LayoutError::Mismatch);
     }
 
     #[test]
@@ -198,9 +202,6 @@ mod tests {
         let mut bytes = [0u8; 5];
         let err = try_slice_from_bytes_mut::<LeU32>(&mut bytes).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), LayoutError::Mismatch);
     }
 }

@@ -29,7 +29,11 @@ We rely on tooling to enforce style.
 *   **Domain Grouping**: Group functionality by domain (e.g., `buffer`, `file`, `index`).
 
 ### Error Handling
-*   **Use `crate::error::Result`**: Standardize on the project's `Result` type alias.
+*   **Typed Domain Reports**: Internal domain-specific functions should return the matching report alias, such as `ConfigResult`, `OperationResult`, `ResourceResult`, `DataIntegrityResult`, `LifecycleResult`, `FatalResult`, or `InternalResult`. Use the crate-wide `crate::error::Result` only at public API boundaries or in functions that intentionally combine several unrelated domains.
+*   **Fieldless Error Variants**: Define stable error classifications as fieldless `thiserror` variants. Put request-specific details, identifiers, values, and explanatory text in `error-stack` attachments instead of variant fields.
+*   **Context at the Caller**: Attach operation names, table or block identifiers, configuration field names, and other caller-owned context with `attach` or `attach_with` where that context becomes known. Do not pass parameters down the call stack solely so a leaf function can format an error message.
+*   **Cross-Domain Conversion**: Use `change_context` at the boundary where one domain consumes another domain's failure, then attach the consuming operation's context. Preserve the original report frames; do not convert to `crate::error::Error`, downcast it, and rebuild a new report.
+*   **Completion Transport**: Convert typed reports directly to `CompletionErrorKind` so producer attachments survive cross-thread handoff. Reserve generic crate-error conversion for genuinely mixed-domain completion producers.
 *   **Validation Pattern**: Use `crate::error::Validation<T>` for optimistic logic checks (Valid/Invalid) where failure is a normal control flow, distinct from `Result` (exceptional failures).
 *   **No Panics**: Avoid `unwrap()` / `expect()` in runtime paths.
 

@@ -1,6 +1,6 @@
 use crate::buffer::frame::BufferFrame;
 use crate::buffer::page::Page;
-use crate::error::{ResourceError, Result};
+use crate::error::{ResourceError, ResourceResult, Result};
 use crate::id::PageID;
 use error_stack::Report;
 use libc::{
@@ -42,7 +42,7 @@ pub(super) unsafe fn initialize_frame_and_page_arrays(
             Ok(ptr) => ptr as *mut Page,
             Err(err) => {
                 mmap_deallocate(frames as *mut u8, frame_total_bytes);
-                return Err(err);
+                return Err(err.into());
             }
         };
         for i in 0..capacity {
@@ -73,7 +73,7 @@ pub(super) unsafe fn deallocate_frame_and_page_arrays(
 }
 
 #[inline]
-pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
+pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> ResourceResult<*mut u8> {
     // SAFETY: the anonymous private mapping does not alias existing Rust
     // references, and all returned pointers are checked for `MAP_FAILED`
     // before being handed to callers.
@@ -88,8 +88,7 @@ pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
         );
         if memory_chunk == MAP_FAILED {
             return Err(Report::new(ResourceError::InsufficientMemory)
-                .attach(format!("mmap allocation: total_bytes={total_bytes}"))
-                .into());
+                .attach(format!("mmap allocation: total_bytes={total_bytes}")));
         }
         madvise(memory_chunk, total_bytes, MADV_HUGEPAGE);
         madvise(memory_chunk, total_bytes, MADV_DONTFORK);

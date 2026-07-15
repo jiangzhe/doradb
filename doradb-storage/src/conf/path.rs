@@ -25,10 +25,7 @@ pub(crate) fn validate_log_file_stem(file_stem: &str) -> bool {
 }
 
 /// Validate a configured swap-file path before storage-root resolution.
-pub(crate) fn validate_swap_file_path_candidate(
-    field: &str,
-    path: impl AsRef<Path>,
-) -> ConfigResult<()> {
+pub(crate) fn validate_swap_file_path_candidate(path: impl AsRef<Path>) -> ConfigResult<()> {
     let path = path.as_ref();
     (|| {
         ensure!(
@@ -37,9 +34,9 @@ pub(crate) fn validate_swap_file_path_candidate(
         );
         Ok(())
     })()
-    .attach_with(|| format!("{field} must not be empty"))?;
+    .attach_with(|| format!("swap-file path must not be empty: {}", path.display()))?;
     let path_str =
-        path_to_utf8(path, field).attach_with(|| format!("invalid {field}: {}", path.display()))?;
+        path_to_utf8(path).attach_with(|| format!("invalid swap-file path: {}", path.display()))?;
     (|| {
         ensure!(
             path_str.ends_with(SWAP_FILE_SUFFIX),
@@ -49,7 +46,7 @@ pub(crate) fn validate_swap_file_path_candidate(
     })()
     .attach_with(|| {
         format!(
-            "{field} must end with `{SWAP_FILE_SUFFIX}`: {}",
+            "swap-file path must end with `{SWAP_FILE_SUFFIX}`: {}",
             path.display()
         )
     })?;
@@ -60,13 +57,14 @@ pub(crate) fn validate_swap_file_path_candidate(
         );
         Ok(())
     })()
-    .attach_with(|| format!("{field} must resolve to a file path: {}", path.display()))?;
+    .attach_with(|| format!("swap-file path must resolve to a file: {}", path.display()))?;
     Ok(())
 }
 
 /// Convert a path to UTF-8 for configuration serialization and diagnostics.
-pub(crate) fn path_to_utf8<'a>(path: &'a Path, field: &str) -> ConfigResult<&'a str> {
+pub(crate) fn path_to_utf8(path: &Path) -> ConfigResult<&str> {
     path.to_str().ok_or_else(|| {
-        Report::new(ConfigError::PathMustBeUtf8).attach(format!("{field} must be valid UTF-8"))
+        Report::new(ConfigError::PathMustBeUtf8)
+            .attach(format!("path must be valid UTF-8: {}", path.display()))
     })
 }

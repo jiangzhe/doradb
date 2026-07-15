@@ -4799,10 +4799,7 @@ mod tests {
 
         let slot1 = &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET];
         let err = parse_redo_super_block(slot1, 3, 1).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidMagic)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidMagic);
     }
 
     #[test]
@@ -4902,10 +4899,7 @@ mod tests {
         assert!(!open.is_sealed());
         let slot1 = &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET];
         let err = parse_redo_super_block(slot1, 0, 1).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidMagic)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidMagic);
     }
 
     #[test]
