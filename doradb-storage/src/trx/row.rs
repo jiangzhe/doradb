@@ -986,6 +986,7 @@ impl<'a> RowWriteAccess<'a> {
         }
     }
 
+    /// Mark the underlying page as dirty.
     #[inline]
     pub(crate) fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);

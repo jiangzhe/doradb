@@ -761,6 +761,7 @@ mod tests {
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, SharedTrxStatus};
     use crate::value::{Val, ValKind};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::thread;
 
     struct FrozenAnalyzerFixture {
@@ -900,7 +901,7 @@ mod tests {
 
         thread::scope(|scope| {
             let writer = scope.spawn(|| {
-                let dirty = std::sync::atomic::AtomicBool::new(false);
+                let dirty = AtomicBool::new(false);
                 let mut access = RowWriteAccess::new(&page, &ctx, &dirty, 1);
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();

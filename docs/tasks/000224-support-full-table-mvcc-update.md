@@ -1,7 +1,7 @@
 ---
 id: 000224
 title: Support full-table MVCC update
-status: proposal
+status: implemented
 created: 2026-07-14
 github_issue: 848
 ---
@@ -423,6 +423,34 @@ using the backlog workflow. Do not create speculative backlog items during
 design or interrupt correctness work for deferred tuning.
 
 ## Implementation Notes
+
+- Added the public `LazyRow` accessor and `Statement::table_update_mvcc`, with
+  current-read ownership checks, lazy per-column decoding, sparse update
+  validation, selected-row counting, and statement-wide rollback on callback
+  or mutation failure.
+- Implemented one original-layout snapshot, sparse inserted-row boundary
+  tracking, bounded cold-block staging, and direct hot-page mutation. Cold rows
+  use delete plus hot insert; hot rows update in place when possible and move
+  otherwise. Existing index, undo, redo, and recovery protocols are reused.
+- Added transaction-duration `TableMetadata(S)` plus `TableData(X)` admission
+  for full-table update and scoped `TableMetadata(S)` plus `TableData(IS)`
+  admission for freeze/checkpoint, preserving ordinary DML concurrency while
+  excluding page transition from the update scan.
+- Review hardening moved shared-page dirty tracking into `RowWriteAccess`
+  mutation boundaries, with explicit marking after insert-slot reservation.
+  This ensures a failed secondary-index claim cannot leave an inserted
+  replacement page clean before statement rollback.
+- The implementation required no persistent-format or recovery-record changes.
+  Existing validation and lock-manager interfaces were sufficient, so the
+  optional dedicated validator and lock-module changes described in the impact
+  analysis were not needed. RFC-0016 is a design foundation rather than a
+  parent implementation phase; its operation mapping was updated directly, so
+  no phase-status sync applies. No actionable performance follow-up was
+  identified.
+- Verification completed with `cargo build --workspace`, 1,412 passing tests
+  from `cargo nextest run --workspace`, 1,336 passing tests from the alternate
+  `libaio` nextest run, and a passing style audit across 21 branch-diff Rust
+  files.
 
 ## Impacts
 
