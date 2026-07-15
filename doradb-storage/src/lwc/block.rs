@@ -2,20 +2,22 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableColumnLayout};
-use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, DataIntegrityResultExt, Error, FileKind,
+    InternalError, OperationError, Result,
+};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::id::BlockID;
-use crate::index::{BTreeKeyEncoder, IndexLookupCandidate};
 use crate::layout;
 use crate::lwc::{LwcData, LwcNullBitmap};
 use crate::quiescent::QuiescentGuard;
 use crate::serde::{Ser, Serde};
 use crate::value::{Val, ValKind};
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use std::mem;
 use std::sync::Arc;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -26,6 +28,7 @@ pub(crate) const LWC_BLOCK_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_S
 const LWC_BLOCK_HEADER_SIZE: usize = 32;
 const _: () = assert!(mem::size_of::<LwcBlockHeader>() == LWC_BLOCK_HEADER_SIZE);
 const _: () = assert!(mem::size_of::<LwcBlock>() == LWC_BLOCK_PAYLOAD_SIZE);
+const _: () = assert!(mem::align_of::<LwcBlock>() == 1);
 
 /// LwcBlock stores the payload of one immutable checksummed LWC block.
 ///
@@ -96,6 +99,21 @@ impl LwcBlock {
         Ok(block)
     }
 
+    /// Borrows an LWC payload that has already passed persisted-block validation.
+    ///
+    /// # Safety
+    ///
+    /// `input` must point to exactly one complete [`LwcBlock`] payload that has
+    /// passed [`validate_persisted_lwc_block`]. The bytes must remain immutable
+    /// and alive for the returned reference lifetime.
+    #[inline]
+    unsafe fn from_bytes_unchecked(input: &[u8]) -> &Self {
+        // SAFETY: the caller guarantees a complete validated payload, `LwcBlock`
+        // has alignment one, every field accepts every byte pattern, and the
+        // returned reference inherits the input slice's lifetime.
+        unsafe { &*input.as_ptr().cast::<Self>() }
+    }
+
     /// Mutably borrows one raw LWC payload image with the expected payload size.
     #[inline]
     pub(crate) fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
@@ -114,9 +132,11 @@ impl LwcBlock {
         file_kind: FileKind,
         block_id: BlockID,
     ) -> Result<&Self> {
-        let payload = validate_block(input, LWC_BLOCK_SPEC)
-            .attach_with(|| format!("file={file_kind}, block=lwc-block, block_id={block_id}"))
-            .map_err(Error::from)?;
+        let payload = validate_block(input, LWC_BLOCK_SPEC).with_block_context(
+            file_kind,
+            "lwc-block",
+            block_id,
+        )?;
         Self::try_from_bytes(payload)
             .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))
     }
@@ -125,6 +145,12 @@ impl LwcBlock {
     #[inline]
     pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         self.header.row_shape_fingerprint()
+    }
+
+    /// Returns the number of rows encoded in this block.
+    #[inline]
+    pub(crate) fn row_count(&self) -> usize {
+        self.header.row_count() as usize
     }
 
     #[inline]
@@ -205,96 +231,91 @@ impl LwcBlock {
         }
     }
 
-    /// Decodes selected values from one persisted block row in the requested
-    /// column order and maps payload failures to contextual persisted-block
-    /// corruption.
+    /// Decodes selected values from one block row in the requested column order.
     #[inline]
-    pub(crate) fn decode_persisted_row_values(
+    pub(crate) fn decode_row_values(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
         read_set: &[usize],
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> Result<Vec<Val>> {
-        self.decode_persisted_row_values_inner(
+    ) -> DataIntegrityResult<Vec<Val>> {
+        self.decode_row_values_inner(
             col_layout,
             row_idx,
             read_set.iter().copied(),
             read_set.len(),
-            file_kind,
-            block_id,
         )
     }
 
-    /// Decodes all values from one persisted block row and maps payload
-    /// failures to contextual persisted-block corruption.
+    /// Decodes the index-key columns from one block row.
     #[inline]
-    pub(crate) fn decode_persisted_full_row_values(
+    pub(crate) fn decode_index_key_values(
+        &self,
+        col_layout: &TableColumnLayout,
+        index_spec: &IndexSpec,
+        row_idx: usize,
+    ) -> DataIntegrityResult<Vec<Val>> {
+        self.decode_row_values_inner(
+            col_layout,
+            row_idx,
+            index_spec.cols.iter().map(|key| key.col_no as usize),
+            index_spec.cols.len(),
+        )
+    }
+
+    /// Decodes all values from one block row.
+    #[inline]
+    pub(crate) fn decode_full_row_values(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> Result<Vec<Val>> {
-        self.decode_persisted_row_values_inner(
+    ) -> DataIntegrityResult<Vec<Val>> {
+        self.decode_row_values_inner(
             col_layout,
             row_idx,
             0..col_layout.col_count(),
             col_layout.col_count(),
-            file_kind,
-            block_id,
         )
     }
 
     #[inline]
-    fn decode_persisted_row_values_inner(
+    fn decode_row_values_inner(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
         col_indices: impl Iterator<Item = usize>,
         capacity: usize,
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> Result<Vec<Val>> {
+    ) -> DataIntegrityResult<Vec<Val>> {
         let mut vals = Vec::with_capacity(capacity);
         for col_idx in col_indices {
-            vals.push(
-                self.decode_persisted_value(col_layout, row_idx, col_idx, file_kind, block_id)?,
-            );
+            vals.push(self.decode_value(col_layout, row_idx, col_idx)?);
         }
         Ok(vals)
     }
 
+    /// Decodes one value from a block row.
     #[inline]
-    fn decode_persisted_value(
+    pub(crate) fn decode_value(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> Result<Val> {
-        let column = self
-            .column(col_layout, col_idx)
-            .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))?;
+    ) -> DataIntegrityResult<Val> {
+        let column = self.column(col_layout, col_idx).map_err(lwc_decode_error)?;
         if column.is_null(row_idx) {
             return Ok(Val::Null);
         }
-        let data = column
-            .data()
-            .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))?;
-        data.value(row_idx)
-            .ok_or_else(|| invalid_lwc_payload(format!("LWC row index {row_idx} is out of range")))
-            .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))
+        let data = column.data().map_err(lwc_decode_error)?;
+        data.value(row_idx).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("LWC row index {row_idx} is out of range"))
+        })
     }
 }
 
 /// Borrowed validated persisted LWC block backed by a readonly-cache guard.
 pub(crate) struct PersistedLwcBlock {
     guard: ReadonlyBlockGuard,
-    file_kind: FileKind,
-    block_id: BlockID,
 }
 
 impl PersistedLwcBlock {
@@ -316,92 +337,19 @@ impl PersistedLwcBlock {
                 validate_persisted_lwc_block,
             )
             .await?;
-        Ok(PersistedLwcBlock {
-            guard,
-            file_kind,
-            block_id,
-        })
+        Ok(PersistedLwcBlock { guard })
     }
 
+    /// Returns a borrowed view of the validated LWC block payload.
     #[inline]
-    fn block(&self) -> &LwcBlock {
+    pub(crate) fn block(&self) -> &LwcBlock {
         let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
         let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        LwcBlock::try_from_bytes(&self.guard.page()[payload_start..payload_end])
-            .expect("validated readonly LWC block must have a valid payload layout")
-    }
-
-    /// Returns the number of rows encoded in the persisted block.
-    #[inline]
-    pub(crate) fn row_count(&self) -> usize {
-        self.block().header.row_count() as usize
-    }
-
-    /// Returns the row-shape fingerprint stored in the persisted block.
-    #[inline]
-    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
-        self.block().row_shape_fingerprint()
-    }
-
-    /// Decodes selected values from one row using the requested column order.
-    #[inline]
-    pub(crate) fn decode_row_values(
-        &self,
-        col_layout: &TableColumnLayout,
-        row_idx: usize,
-        read_set: &[usize],
-    ) -> Result<Vec<Val>> {
-        self.block().decode_persisted_row_values(
-            col_layout,
-            row_idx,
-            read_set,
-            self.file_kind,
-            self.block_id,
-        )
-    }
-
-    /// Decodes all values from one row in table column order.
-    #[inline]
-    pub(crate) fn decode_full_row_values(
-        &self,
-        col_layout: &TableColumnLayout,
-        row_idx: usize,
-    ) -> Result<Vec<Val>> {
-        self.block().decode_persisted_full_row_values(
-            col_layout,
-            row_idx,
-            self.file_kind,
-            self.block_id,
-        )
-    }
-
-    /// Validate a secondary-index scan candidate and decode projected row values.
-    #[inline]
-    pub(crate) fn read_index_candidate_row_values(
-        &self,
-        col_layout: &TableColumnLayout,
-        index_spec: &IndexSpec,
-        row_idx: usize,
-        encoder: &BTreeKeyEncoder,
-        candidate: &IndexLookupCandidate,
-        read_set: &[usize],
-    ) -> Result<Option<Vec<Val>>> {
-        let index_read_set = index_spec
-            .cols
-            .iter()
-            .map(|key| key.col_no as usize)
-            .collect::<Vec<_>>();
-        let key_vals = self.decode_row_values(col_layout, row_idx, &index_read_set)?;
-        let encoded = if index_spec.unique() {
-            encoder.encode(&key_vals)
-        } else {
-            encoder.encode_pair(&key_vals, Val::from(candidate.row_id))
-        };
-        if encoded.as_bytes() != candidate.encoded_key.as_bytes() {
-            return Ok(None);
-        }
-        self.decode_row_values(col_layout, row_idx, read_set)
-            .map(Some)
+        let payload = &self.guard.page()[payload_start..payload_end];
+        // SAFETY: `load` obtains the immutable shared guard through
+        // `read_validated_block` with `validate_persisted_lwc_block`, and the
+        // fixed payload range has the exact size and alignment asserted above.
+        unsafe { LwcBlock::from_bytes_unchecked(payload) }
     }
 }
 
@@ -576,6 +524,12 @@ pub(crate) fn map_persisted_lwc_error(file_kind: FileKind, block_id: BlockID, er
     } else {
         err
     }
+}
+
+#[inline]
+fn lwc_decode_error(err: Error) -> Report<DataIntegrityError> {
+    err.into_report()
+        .change_context(DataIntegrityError::InvalidPayload)
 }
 
 #[inline]
@@ -816,41 +770,56 @@ mod tests {
     }
 
     #[test]
-    fn test_lwc_block_decode_persisted_row_values() {
+    fn test_lwc_block_decode_row_values() {
         let (metadata, buf) = build_valid_persisted_lwc_block();
         let page =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
                 .unwrap();
+        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
+        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
+        // SAFETY: `try_from_persisted_bytes` above validated this exact immutable
+        // payload, including its fixed size and LWC structure.
+        let unchecked_page =
+            unsafe { LwcBlock::from_bytes_unchecked(&buf.data()[payload_start..payload_end]) };
+        assert!(std::ptr::eq(page, unchecked_page));
+
+        assert_eq!(
+            unchecked_page
+                .decode_value(metadata.col.as_ref(), 1, 0)
+                .unwrap(),
+            Val::U8(11)
+        );
+        assert_eq!(
+            unchecked_page
+                .decode_value(metadata.col.as_ref(), 1, 1)
+                .unwrap(),
+            Val::Null
+        );
         let vals = page
-            .decode_persisted_row_values(
-                metadata.col.as_ref(),
-                1,
-                &[1, 0],
-                FileKind::TableFile,
-                test_block_id(8),
-            )
+            .decode_row_values(metadata.col.as_ref(), 1, &[1, 0])
             .unwrap();
         assert_eq!(vals, vec![Val::Null, Val::U8(11)]);
         assert_eq!(
             page.row_shape_fingerprint(),
             row_shape_fingerprint_for(&[RowID::new(100), RowID::new(101), RowID::new(102)])
         );
+
+        let err = page.decode_value(metadata.col.as_ref(), 3, 0).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+
+        let err = page.decode_value(metadata.col.as_ref(), 0, 2).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
-    fn test_lwc_block_decode_persisted_full_row_values() {
+    fn test_lwc_block_decode_full_row_values() {
         let (metadata, buf) = build_valid_persisted_lwc_block();
         let page =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
                 .unwrap();
         assert_eq!(
-            page.decode_persisted_full_row_values(
-                metadata.col.as_ref(),
-                0,
-                FileKind::TableFile,
-                test_block_id(8),
-            )
-            .unwrap(),
+            page.decode_full_row_values(metadata.col.as_ref(), 0)
+                .unwrap(),
             vec![Val::U8(10), Val::I16(20)]
         );
     }
@@ -868,34 +837,18 @@ mod tests {
 
         let expected = vec![Val::U8(11), Val::Null];
         assert_eq!(
-            page.decode_persisted_full_row_values(
-                metadata.col.as_ref(),
-                1,
-                FileKind::TableFile,
-                test_block_id(8),
-            )
-            .unwrap(),
+            page.decode_full_row_values(metadata.col.as_ref(), 1)
+                .unwrap(),
             expected
         );
         assert_eq!(
-            page.decode_persisted_full_row_values(
-                indexed_metadata.col.as_ref(),
-                1,
-                FileKind::TableFile,
-                test_block_id(8),
-            )
-            .unwrap(),
+            page.decode_full_row_values(indexed_metadata.col.as_ref(), 1)
+                .unwrap(),
             expected
         );
         assert_eq!(
-            page.decode_persisted_row_values(
-                dropped_metadata.col.as_ref(),
-                1,
-                &[1, 0],
-                FileKind::TableFile,
-                test_block_id(8),
-            )
-            .unwrap(),
+            page.decode_row_values(dropped_metadata.col.as_ref(), 1, &[1, 0])
+                .unwrap(),
             vec![Val::Null, Val::U8(11)]
         );
     }
@@ -951,14 +904,14 @@ mod tests {
         let page =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(10))
                 .unwrap();
+        let err = page.decode_value(metadata.col.as_ref(), 0, 0).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
         let err = page
-            .decode_persisted_full_row_values(
-                metadata.col.as_ref(),
-                0,
-                FileKind::TableFile,
-                test_block_id(10),
-            )
+            .decode_value(metadata.col.as_ref(), 0, 0)
+            .with_block_context(FileKind::TableFile, "lwc-block", test_block_id(10))
             .unwrap_err();
+        let report = format!("{err:?}");
+        assert_eq!(report.matches("block_id=10").count(), 1, "{report}");
         assert_lwc_data_integrity(err, test_block_id(10), DataIntegrityError::InvalidPayload);
     }
 }

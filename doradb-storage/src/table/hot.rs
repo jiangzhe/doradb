@@ -65,7 +65,15 @@ impl<'m, 'r> RowInserter<'m, 'r> {
             };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
-        let mut access = RowWriteAccess::new_with_state_guard(page, page_ctx, row_idx, state_guard);
+        let mut access = RowWriteAccess::new_with_state_guard(
+            page,
+            page_ctx,
+            page_guard.dirty_flag(),
+            row_idx,
+            state_guard,
+        );
+        // Row slot reservation above has already modified the page.
+        access.mark_dirty();
         let res = access.lock_undo(
             self.rt,
             effects,
@@ -246,6 +254,7 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
             let mut access = RowWriteAccess::new_with_state_guard(
                 page,
                 page_ctx,
+                page_guard.dirty_flag(),
                 page.row_idx(row_id),
                 state_guard,
             );
@@ -299,6 +308,41 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         update: RowUpdateInput,
         log_by_key: bool,
     ) -> UpdateRowInplace {
+        let redo_key = log_by_key.then(|| SelectKey::new(index_no, key_vals.to_vec()));
+        self.update_known_row_inner(
+            effects,
+            page_guard,
+            row_id,
+            update,
+            Some((index_no, key_vals)),
+            redo_key,
+        )
+        .await
+    }
+
+    /// Update one known page/row without revalidating an index lookup key.
+    #[inline]
+    pub(super) async fn update_known_row(
+        &self,
+        effects: &mut StmtEffects,
+        page_guard: PageSharedGuard<RowPage>,
+        row_id: RowID,
+        update: RowUpdateInput,
+    ) -> UpdateRowInplace {
+        self.update_known_row_inner(effects, page_guard, row_id, update, None, None)
+            .await
+    }
+
+    #[inline]
+    async fn update_known_row_inner(
+        &self,
+        effects: &mut StmtEffects,
+        page_guard: PageSharedGuard<RowPage>,
+        row_id: RowID,
+        update: RowUpdateInput,
+        lookup_key: Option<(usize, &[Val])>,
+        redo_key: Option<SelectKey>,
+    ) -> UpdateRowInplace {
         let page_id = page_guard.page_id();
         let (_, page) = page_guard.ctx_and_page();
         debug_assert!(
@@ -310,11 +354,12 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         {
             return UpdateRowInplace::RowNotFound(update);
         }
-        // The row-page image must not change until the undo-head lock is
-        // installed. The lock path also rejects stale index candidates whose
-        // latest hot-row key no longer matches the lookup key.
+        // Modification is a current read: update the latest physical page
+        // image, never an older version reconstructed from MVCC undo. The image
+        // must remain stable until the undo-head lock is installed. The lock
+        // path also rejects stale index candidates whose latest key differs.
         let mut lock_row = self
-            .lock_for_write(effects, &page_guard, row_id, Some((index_no, key_vals)))
+            .lock_for_write(effects, &page_guard, row_id, lookup_key)
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound(update),
@@ -353,14 +398,10 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                             page_id,
                             row_id,
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
-                            kind: if log_by_key {
-                                RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
-                                    index_no,
-                                    key_vals.to_vec(),
-                                ))
-                            } else {
-                                RowRedoKind::Delete
-                            },
+                            kind: redo_key
+                                .clone()
+                                .map(RowRedoKind::DeleteByPrimaryKey)
+                                .unwrap_or(RowRedoKind::Delete),
                         };
                         effects.insert_row_redo(self.table_id, redo_entry);
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
@@ -403,14 +444,11 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                             let redo_entry = RowRedo {
                                 page_id,
                                 row_id,
-                                kind: if log_by_key {
-                                    RowRedoKind::UpdateByPrimaryKey(
-                                        SelectKey::new(index_no, key_vals.to_vec()),
-                                        redo_cols,
-                                    )
-                                } else {
-                                    RowRedoKind::Update(redo_cols)
-                                },
+                                kind: redo_key
+                                    .map(|key| {
+                                        RowRedoKind::UpdateByPrimaryKey(key, redo_cols.clone())
+                                    })
+                                    .unwrap_or(RowRedoKind::Update(redo_cols)),
                             };
                             effects.insert_row_redo(self.table_id, redo_entry);
                         }
@@ -501,7 +539,6 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                 })
                 .collect::<Vec<_>>()
         };
-        old_guard.set_dirty(); // mark as dirty page.
         PreparedHotMoveUpdate {
             row: new_row,
             index_change_cols,

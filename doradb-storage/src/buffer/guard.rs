@@ -12,6 +12,7 @@ use either::Either;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::mem;
+use std::sync::atomic::AtomicBool;
 
 /// Typed access interface shared by page latch guards.
 pub(crate) trait PageGuard<T: 'static> {
@@ -700,6 +701,12 @@ impl<T: 'static> PageSharedGuard<T> {
         (undo_map, page)
     }
 
+    /// Returns the frame dirty flag associated with this shared page guard.
+    #[inline]
+    pub(crate) fn dirty_flag(&self) -> &AtomicBool {
+        self.bf().dirty_flag()
+    }
+
     /// Converts this shared guard back into a facade and optionally marks dirty.
     #[inline]
     pub(crate) fn facade(self, dirty: bool) -> FacadePageGuard<T> {
@@ -712,15 +719,6 @@ impl<T: 'static> PageSharedGuard<T> {
             bf: self.bf,
             captured_generation: self.captured_generation,
             _marker: PhantomData,
-        }
-    }
-
-    /// Marks the frame dirty before dropping this shared guard.
-    #[inline]
-    pub(crate) fn set_dirty(self) {
-        let bf = self.bf();
-        if !bf.is_dirty() {
-            bf.set_dirty(true);
         }
     }
 }

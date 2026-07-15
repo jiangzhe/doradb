@@ -415,7 +415,22 @@ impl Session {
         max_rows: usize,
     ) -> Result<FreezeOutcome> {
         let session = self.pin("freeze table")?;
+        ensure_idle_maintenance_session(&session, "freeze table")?;
         let table = session.resolve_user_table(table_id, "freeze table").await?;
+
+        // Acquire maintenance admission before entering the freeze workflow. The
+        // grouped helper orders TableMetadata(S) before TableData(IS), excluding
+        // metadata-X DDL and data-X full-table updates while remaining compatible
+        // with ordinary IX DML. Keep the scoped guards through batch publication.
+        let lock_manager = session.engine.lock_manager();
+        let owner = LockOwner::Session(session.id());
+        let owner_group = LockOwnerGroup::Session(session.id());
+        let (_metadata_lock, _data_lock) = lock_manager
+            .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
+            .await?;
+        // Lock acquisition can wait, so the table may have started dropping since
+        // resolution. Revalidate only after both maintenance locks are granted.
+        table.check_foreground_live("freeze table")?;
         table.freeze(&session, max_rows).await
     }
 
@@ -423,10 +438,25 @@ impl Session {
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
         let session = self.pin("checkpoint table")?;
+        ensure_idle_maintenance_session(&session, "checkpoint table")?;
         let table = session
             .resolve_existing_user_table(table_id, "checkpoint table")
             .await?;
-        table.checkpoint(session).await
+
+        // Acquire maintenance admission before entering the checkpoint workflow.
+        // The grouped helper orders TableMetadata(S) before TableData(IS), excluding
+        // metadata-X DDL and data-X full-table updates while remaining compatible
+        // with ordinary IX DML. Keep the scoped guards through root publication.
+        let lock_manager = session.engine.lock_manager();
+        let owner = LockOwner::Session(session.id());
+        let owner_group = LockOwnerGroup::Session(session.id());
+        let (_metadata_lock, _data_lock) = lock_manager
+            .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
+            .await?;
+        // Lock acquisition can wait, so the table may have started dropping since
+        // resolution. Revalidate only after both maintenance locks are granted.
+        table.check_foreground_live("checkpoint table")?;
+        table.checkpoint(&session).await
     }
 
     /// Wait until retry may be useful for one self-identifying checkpoint delay.

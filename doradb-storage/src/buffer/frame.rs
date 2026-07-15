@@ -99,6 +99,12 @@ impl BufferFrame {
         self.dirty.load(Ordering::Acquire)
     }
 
+    /// Returns the atomic dirty flag for mutation-aware page accessors.
+    #[inline]
+    pub(crate) fn dirty_flag(&self) -> &AtomicBool {
+        &self.dirty
+    }
+
     /// Returns the current reuse generation for this frame slot.
     #[inline]
     pub(crate) fn generation(&self) -> u64 {

@@ -17,7 +17,7 @@ use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
     catalog_table_id_from_slot, catalog_table_slot,
 };
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResultExt, Error, FileKind, Result};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
@@ -686,14 +686,17 @@ impl CatalogStorage {
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
     ) -> Result<Vec<RowRecord>> {
-        let lwc_block = PersistedLwcBlock::load(
-            self.mtb.file_kind(),
+        let file_kind = self.mtb.file_kind();
+        let block_id = entry.block_id();
+        let persisted = PersistedLwcBlock::load(
+            file_kind,
             self.mtb.sparse_file(),
             &self.disk_pool,
             disk_pool_guard,
-            entry.block_id(),
+            block_id,
         )
         .await?;
+        let lwc_block = persisted.block();
         let row_count = lwc_block.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
@@ -708,7 +711,9 @@ impl CatalogStorage {
         }
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-            let vals = lwc_block.decode_full_row_values(&metadata.col, row_idx)?;
+            let vals = lwc_block
+                .decode_full_row_values(&metadata.col, row_idx)
+                .with_block_context(file_kind, "lwc-block", block_id)?;
             rows.push(RowRecord { row_id, vals });
         }
         Ok(rows)

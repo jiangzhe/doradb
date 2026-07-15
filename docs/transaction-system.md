@@ -247,6 +247,25 @@ deletes acquire transaction-lifetime `TableMetadata(S)` followed by
 secondary-index write undo. Repeated writes to the same table reuse the
 transaction lock cache rather than re-entering the lock manager.
 
+Sequential full-table MVCC update acquires transaction-lifetime
+`TableMetadata(S)` followed by `TableData(X)` before it captures the table root
+and original hot-page worklist or invokes its row callback. The exclusive data
+lock remains held after the statement returns, including after statement
+rollback, until the transaction commits or rolls back. It excludes freeze and
+checkpoint page-state movement while ordinary metadata-only MVCC readers remain
+admitted. A transaction that already holds `TableData(IX)` can convert to `X`
+only when conversion is immediately compatible; otherwise the operation returns
+`LockUpgradeWouldBlock` before invoking the callback.
+
+Idle-session freeze and user-table checkpoint calls acquire scoped
+`TableMetadata(S)` followed by `TableData(IS)` before entering the table-owned
+workflow. The scoped locks remain held through frozen-state publication or the
+checkpoint's final root/state publication and system-transaction completion.
+They preserve ordinary `IX` DML and explicit `S` table-reader concurrency while
+serializing page freeze/transition against full-table update `X`. Grants already
+covered by an explicit session lock are preserved when the maintenance call
+returns; only fresh maintenance grants are released.
+
 `CREATE TABLE` does not acquire a logical lock. The atomic table-id allocator
 assigns a distinct id before the operation creates its deterministic table
 file, stages catalog rows, or builds the per-id runtime. The initial table-file
@@ -259,9 +278,11 @@ per-id catalog map only after the durable catalog commit.
 under those table-local locks before crossing the terminal lifecycle gate. A
 drop that waits for an already-admitted checkpoint publisher therefore does
 not delay CREATE or DROP for unrelated table ids.
-Recovery, checkpoint, purge, and no-transaction catalog replay
-remain outside logical lock acquisition because they run at internal lifecycle
-boundaries rather than through foreground sessions and waiters.
+Recovery, purge, and no-transaction catalog replay remain outside logical lock
+acquisition because they run at internal lifecycle boundaries rather than
+through foreground sessions and waiters. User-table freeze and checkpoint are
+the maintenance exceptions described above because they must coordinate page
+state movement with full-table update.
 
 Recovery does not acquire logical locks. Recovery runs during engine startup
 before foreground sessions, user transactions, or lock waiters exist, and it

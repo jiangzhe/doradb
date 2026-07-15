@@ -3,8 +3,7 @@ use super::{
     UpdateUniqueMvcc,
     hot::{HotRowDeleter, HotRowUpdater, RowInserter},
     index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
-    row_len, unique_key_from_full_row, update_index_result_to_update_unique_mvcc,
-    validate_page_row_range,
+    row_len, unique_key_from_full_row, validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
@@ -13,7 +12,8 @@ use crate::buffer::{
 };
 use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableColumnLayout, TableMetadata};
 use crate::error::{
-    DataIntegrityError, Error, InternalError, OperationError, RecoveryDuplicateKey, Result,
+    DataIntegrityError, Error, InternalError, OperationError, OperationResult,
+    RecoveryDuplicateKey, Result,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
@@ -25,8 +25,8 @@ use crate::latch::LatchFallbackMode;
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, LinkForUniqueIndex, RowUpdateInput, RowUpdateView, SelectKey,
-    UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc,
+    DeleteMvcc, LinkForUniqueIndex, RowUpdateInput, RowUpdateView, SelectKey, UpdateCol,
+    UpdateMvcc, UpsertMvcc,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
@@ -34,7 +34,7 @@ use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::mem::take;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -59,6 +59,21 @@ pub(crate) enum NoTrxUpsertChange {
         key: SelectKey,
         cols: Vec<UpdateCol>,
     },
+}
+
+/// Snapshot descriptor for one original hot row page.
+///
+/// The descriptor contains only stable block-index identity and the reserved
+/// RowID range. Callers reopen the page when they are ready to scan it, so no
+/// block-index leaf latch or row-page guard survives the snapshot operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowPageDescriptor {
+    /// Buffer-pool page identity recorded by the row-page index.
+    pub(crate) page_id: PageID,
+    /// Inclusive first RowID reserved for the page.
+    pub(crate) start_row_id: RowID,
+    /// Exclusive RowID reservation boundary for the page.
+    pub(crate) end_row_id: RowID,
 }
 
 /// Shared in-memory table core used by both catalog and user tables.
@@ -402,7 +417,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         // TODO: we should retry or wait for notification if rollback happens on a page
         // in transition state. This will be handled in a future task.
         let row_idx = page.row_idx(entry.row_id);
-        let mut access = RowWriteAccess::new(page, ctx, row_idx);
+        let mut access = RowWriteAccess::new(page, ctx, page_guard.dirty_flag(), row_idx);
         access.rollback_first_undo(metadata, entry);
         Ok(())
     }
@@ -585,6 +600,80 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             page_action,
         )
         .await
+    }
+
+    /// Snapshot original row-page descriptors at or above an explicit boundary.
+    ///
+    /// The returned RowID is the exclusive row-page-index upper bound observed
+    /// with the descriptor list. The start must be an exact page boundary, with
+    /// the current index end accepted as an empty snapshot.
+    pub(crate) async fn snapshot_original_row_pages_from(
+        &self,
+        guards: &PoolGuards,
+        start_row_id: RowID,
+    ) -> Result<(RowID, Vec<RowPageDescriptor>)> {
+        let operation = "snapshot original row pages";
+        let meta_pool_guard = self.meta_pool_guard(guards, operation)?;
+        let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
+        cursor.seek(start_row_id).await;
+        let mut entries = Vec::new();
+        let mut upper_bound = start_row_id;
+        let mut first_leaf = true;
+        while let Some(leaf) = cursor.next().await {
+            let Some(guard) = leaf.lock_shared_async().await else {
+                return Err(self.stale_block_index_leaf(operation));
+            };
+            let page = guard.page();
+            debug_assert!(page.is_leaf());
+            let leaf_entries = page.leaf_entries();
+            let start_idx = if first_leaf {
+                first_leaf = false;
+                if leaf_entries.is_empty() {
+                    if page.header.start_row_id != start_row_id {
+                        return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
+                    }
+                    upper_bound = page.header.end_row_id;
+                    continue;
+                }
+                match leaf_entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {
+                    Ok(idx) => idx,
+                    Err(_) if page.header.end_row_id == start_row_id => {
+                        upper_bound = start_row_id;
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err(invalid_scan_start(self.table_id(), operation, start_row_id));
+                    }
+                }
+            } else {
+                0
+            };
+            entries.extend_from_slice(&leaf_entries[start_idx..]);
+            upper_bound = page.header.end_row_id;
+        }
+
+        let mut pages = Vec::with_capacity(entries.len());
+        for (idx, entry) in entries.iter().enumerate() {
+            let end_row_id = entries
+                .get(idx + 1)
+                .map(|next| next.row_id)
+                .unwrap_or(upper_bound);
+            if entry.row_id >= end_row_id {
+                return Err(Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "operation={operation}, table_id={}, invalid original row-page range: start_row_id={}, end_row_id={end_row_id}",
+                        self.table_id(),
+                        entry.row_id
+                    ))
+                    .into());
+            }
+            pages.push(RowPageDescriptor {
+                page_id: entry.page_id,
+                start_row_id: entry.row_id,
+                end_row_id,
+            });
+        }
+        Ok((upper_bound, pages))
     }
 
     async fn scan_from_with_meta_guard<F>(
@@ -815,11 +904,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-    ) -> Result<InsertIndex> {
+    ) -> OperationResult<()> {
         if self
             .metadata()
             .idx
-            .require_index_spec(key.index_no)?
+            .require_index_spec(key.index_no)
+            .change_context(OperationError::IndexMutation)?
             .unique()
         {
             self.insert_unique_index(rt, effects, key, row_id, page_guard)
@@ -899,7 +989,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             FindOldVersion::WriteConflict => Ok(LinkForUniqueIndex::WriteConflict),
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 let (page_ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(page, page_ctx, page.row_idx(new_id));
+                let mut new_access = RowWriteAccess::new(
+                    page,
+                    page_ctx,
+                    new_guard.dirty_flag(),
+                    page.row_idx(new_id),
+                );
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
@@ -920,23 +1015,26 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-    ) -> Result<InsertIndex> {
+    ) -> OperationResult<()> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
-        let index = self.require_unique_index(guards, key.index_no)?;
+        let index = self
+            .require_unique_index(guards, key.index_no)
+            .change_context(OperationError::IndexMutation)?;
         loop {
             match index
                 .insert_if_not_exists(&key.vals, row_id, false, sts)
-                .await?
+                .await
+                .change_context(OperationError::IndexMutation)?
             {
                 IndexInsert::Ok(merged) => {
                     self.push_insert_unique_index_undo(rt, effects, row_id, key, merged);
-                    return Ok(InsertIndex::Inserted);
+                    return Ok(());
                 }
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
                     debug_assert!(old_row_id != row_id);
                     if !deleted {
-                        return Ok(InsertIndex::DuplicateKey);
+                        return Err(Report::new(OperationError::DuplicateKey));
                     }
                     match self
                         .link_for_unique_index(
@@ -947,11 +1045,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             row_id,
                             page_guard,
                         )
-                        .await?
+                        .await
+                        .change_context(OperationError::IndexMutation)?
                     {
-                        LinkForUniqueIndex::DuplicateKey => return Ok(InsertIndex::DuplicateKey),
+                        LinkForUniqueIndex::DuplicateKey => {
+                            return Err(Report::new(OperationError::DuplicateKey));
+                        }
                         LinkForUniqueIndex::WriteConflict => {
-                            return Ok(InsertIndex::WriteConflict);
+                            return Err(Report::new(OperationError::WriteConflict));
                         }
                         LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
                             let index_old_row_id = if deleted {
@@ -961,17 +1062,18 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             };
                             match index
                                 .compare_exchange(&key.vals, index_old_row_id, row_id, sts)
-                                .await?
+                                .await
+                                .change_context(OperationError::IndexMutation)?
                             {
                                 IndexCompareExchange::Ok => {
                                     self.push_update_unique_index_undo(
                                         rt, effects, old_row_id, row_id, key, deleted,
                                     );
-                                    return Ok(InsertIndex::Inserted);
+                                    return Ok(());
                                 }
                                 IndexCompareExchange::NotExists => {}
                                 IndexCompareExchange::Mismatch => {
-                                    return Ok(InsertIndex::WriteConflict);
+                                    return Err(Report::new(OperationError::WriteConflict));
                                 }
                             }
                         }
@@ -988,17 +1090,19 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         effects: &mut StmtEffects,
         key: SelectKey,
         row_id: RowID,
-    ) -> Result<InsertIndex> {
+    ) -> OperationResult<()> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
         match self
-            .require_non_unique_index(guards, key.index_no)?
+            .require_non_unique_index(guards, key.index_no)
+            .change_context(OperationError::IndexMutation)?
             .insert_if_not_exists(&key.vals, row_id, false, sts)
-            .await?
+            .await
+            .change_context(OperationError::IndexMutation)?
         {
             IndexInsert::Ok(merged) => {
                 self.push_insert_non_unique_index_undo(rt, effects, row_id, key, merged);
-                Ok(InsertIndex::Inserted)
+                Ok(())
             }
             IndexInsert::DuplicateKey(..) => unreachable!(),
         }
@@ -1688,24 +1792,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             .insert_row_internal(rt, effects, cols, RowUndoKind::Insert, Vec::new())
             .await?;
         for key in keys {
-            match self
-                .insert_index(rt, effects, key, row_id, &page_guard)
-                .await?
-            {
-                InsertIndex::Inserted => (),
-                InsertIndex::DuplicateKey => {
-                    return Err(Report::new(OperationError::DuplicateKey)
-                        .attach("catalog insert MVCC secondary index claim")
-                        .into());
-                }
-                InsertIndex::WriteConflict => {
-                    return Err(Report::new(OperationError::WriteConflict)
-                        .attach("catalog insert MVCC secondary index claim")
-                        .into());
-                }
-            }
+            self.insert_index(rt, effects, key, row_id, &page_guard)
+                .await
+                .attach("catalog insert MVCC secondary index claim")?;
         }
-        page_guard.set_dirty();
         Ok(row_id)
     }
 
@@ -1831,7 +1921,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
                     debug_assert!(row_id == new_row_id);
                     if !index_change_cols.is_empty() {
-                        let res = self
+                        let result = self
                             .update_indexes_only_key_change(
                                 rt,
                                 effects,
@@ -1839,15 +1929,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                 &page_guard,
                                 &index_change_cols,
                             )
-                            .await?;
-                        page_guard.set_dirty();
-                        return update_index_result_to_update_unique_mvcc(
-                            res,
-                            new_row_id,
-                            "update MVCC key-change index update",
-                        );
+                            .await;
+                        result.attach("update MVCC key-change index update")?;
+                        return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     }
-                    page_guard.set_dirty();
                     return Ok(UpdateUniqueMvcc::Updated(row_id));
                 }
                 UpdateRowInplace::RowDeleted(input) | UpdateRowInplace::RowNotFound(input) => {
@@ -1879,7 +1964,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         )
                         .await?;
                     if !index_change_cols.is_empty() {
-                        let res = self
+                        let result = self
                             .update_indexes_may_both_change(
                                 rt,
                                 effects,
@@ -1888,25 +1973,17 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                 &index_change_cols,
                                 &new_guard,
                             )
-                            .await?;
-                        new_guard.set_dirty();
-                        return update_index_result_to_update_unique_mvcc(
-                            res,
-                            new_row_id,
-                            "update MVCC moved-row index update",
-                        );
+                            .await;
+                        result.attach("update MVCC moved-row index update")?;
+                        return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     }
-                    let res = self
+                    let result = self
                         .update_indexes_only_row_id_change(
                             rt, effects, old_row_id, new_row_id, &new_guard,
                         )
-                        .await?;
-                    new_guard.set_dirty();
-                    return update_index_result_to_update_unique_mvcc(
-                        res,
-                        new_row_id,
-                        "update MVCC moved-row index update",
-                    );
+                        .await;
+                    result.attach("update MVCC moved-row index update")?;
+                    return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                 }
             }
         }
@@ -1944,7 +2021,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &FastHashMap<usize, Val>,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         let metadata = self.metadata();
         for (index_no, index_schema) in metadata.idx.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
@@ -1952,27 +2029,19 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 let new_key = read_latest_index_key(metadata, index_no, page_guard, row_id);
                 let old_key = index_key_replace(index_schema, &new_key, index_change_cols);
                 if index_schema.unique() {
-                    match self
-                        .update_unique_index_only_key_change(
-                            rt, effects, old_key, new_key, row_id, page_guard,
-                        )
-                        .await?
-                    {
-                        UpdateIndex::Updated => (),
-                        UpdateIndex::WriteConflict => return Ok(UpdateIndex::WriteConflict),
-                        UpdateIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
-                    }
+                    self.update_unique_index_only_key_change(
+                        rt, effects, old_key, new_key, row_id, page_guard,
+                    )
+                    .await?;
                 } else {
-                    let res = self
-                        .update_non_unique_index_only_key_change(
-                            rt, effects, old_key, new_key, row_id,
-                        )
-                        .await?;
-                    debug_assert!(res.is_updated());
+                    self.update_non_unique_index_only_key_change(
+                        rt, effects, old_key, new_key, row_id,
+                    )
+                    .await?;
                 }
             }
         }
-        Ok(UpdateIndex::Updated)
+        Ok(())
     }
 
     #[inline]
@@ -1983,29 +2052,25 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_row_id: RowID,
         new_row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
         for (index_no, index_schema) in metadata.idx.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
             let key = read_latest_index_key(metadata, index_no, page_guard, new_row_id);
             if index_schema.unique() {
-                let res = self
-                    .update_unique_index_only_row_id_change(
-                        rt, effects, key, old_row_id, new_row_id,
-                    )
-                    .await?;
-                debug_assert!(res.is_updated());
+                self.update_unique_index_only_row_id_change(
+                    rt, effects, key, old_row_id, new_row_id,
+                )
+                .await?;
             } else {
-                let res = self
-                    .update_non_unique_index_only_row_id_change(
-                        rt, effects, key, old_row_id, new_row_id,
-                    )
-                    .await?;
-                debug_assert!(res.is_updated());
+                self.update_non_unique_index_only_row_id_change(
+                    rt, effects, key, old_row_id, new_row_id,
+                )
+                .await?;
             }
         }
-        Ok(UpdateIndex::Updated)
+        Ok(())
     }
 
     #[inline]
@@ -2017,7 +2082,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         new_row_id: RowID,
         index_change_cols: &FastHashMap<usize, Val>,
         page_guard: &PageSharedGuard<RowPage>,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
         for (index_no, index_schema) in metadata.idx.active_indexes() {
@@ -2026,45 +2091,29 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             if index_key_is_changed(index_schema, index_change_cols) {
                 let old_key = index_key_replace(index_schema, &key, index_change_cols);
                 if index_schema.unique() {
-                    match self
-                        .update_unique_index_key_and_row_id_change(
-                            rt, effects, old_key, key, old_row_id, new_row_id, page_guard,
-                        )
-                        .await?
-                    {
-                        UpdateIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
-                        UpdateIndex::WriteConflict => return Ok(UpdateIndex::WriteConflict),
-                        UpdateIndex::Updated => (),
-                    }
-                } else {
-                    let res = self
-                        .update_non_unique_index_key_and_row_id_change(
-                            rt, effects, old_key, key, old_row_id, new_row_id,
-                        )
-                        .await?;
-                    debug_assert!(res.is_updated());
-                }
-            } else if index_schema.unique() {
-                match self
-                    .update_unique_index_only_row_id_change(
-                        rt, effects, key, old_row_id, new_row_id,
-                    )
-                    .await?
-                {
-                    UpdateIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
-                    UpdateIndex::WriteConflict => return Ok(UpdateIndex::WriteConflict),
-                    UpdateIndex::Updated => (),
-                }
-            } else {
-                let res = self
-                    .update_non_unique_index_only_row_id_change(
-                        rt, effects, key, old_row_id, new_row_id,
+                    self.update_unique_index_key_and_row_id_change(
+                        rt, effects, old_key, key, old_row_id, new_row_id, page_guard,
                     )
                     .await?;
-                debug_assert!(res.is_updated());
+                } else {
+                    self.update_non_unique_index_key_and_row_id_change(
+                        rt, effects, old_key, key, old_row_id, new_row_id,
+                    )
+                    .await?;
+                }
+            } else if index_schema.unique() {
+                self.update_unique_index_only_row_id_change(
+                    rt, effects, key, old_row_id, new_row_id,
+                )
+                .await?;
+            } else {
+                self.update_non_unique_index_only_row_id_change(
+                    rt, effects, key, old_row_id, new_row_id,
+                )
+                .await?;
             }
         }
-        Ok(UpdateIndex::Updated)
+        Ok(())
     }
 
     #[inline]
@@ -2078,40 +2127,46 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_row_id: RowID,
         new_row_id: RowID,
         new_guard: &PageSharedGuard<RowPage>,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         debug_assert!(old_row_id != new_row_id);
         let sts = rt.sts();
         let guards = rt.pool_guards();
-        let index = self.require_unique_index(guards, new_key.index_no)?;
+        let index = self
+            .require_unique_index(guards, new_key.index_no)
+            .change_context(OperationError::IndexMutation)?;
         loop {
             match index
                 .insert_if_not_exists(&new_key.vals, new_row_id, false, sts)
-                .await?
+                .await
+                .change_context(OperationError::IndexMutation)?
             {
                 IndexInsert::Ok(merged) => {
                     debug_assert!(!merged);
                     self.push_insert_unique_index_undo(rt, effects, new_row_id, new_key, false);
                     self.defer_delete_unique_index(rt, effects, old_row_id, old_key)
-                        .await?;
-                    return Ok(UpdateIndex::Updated);
+                        .await
+                        .change_context(OperationError::IndexMutation)?;
+                    return Ok(());
                 }
                 IndexInsert::DuplicateKey(index_row_id, deleted) => {
                     debug_assert!(index_row_id != new_row_id);
                     if !deleted {
-                        return Ok(UpdateIndex::DuplicateKey);
+                        return Err(Report::new(OperationError::DuplicateKey));
                     }
                     if index_row_id == old_row_id {
                         match index
                             .compare_exchange(&new_key.vals, old_row_id.deleted(), new_row_id, sts)
-                            .await?
+                            .await
+                            .change_context(OperationError::IndexMutation)?
                         {
                             IndexCompareExchange::Ok => {
                                 self.push_update_unique_index_undo(
                                     rt, effects, old_row_id, new_row_id, new_key, true,
                                 );
                                 self.defer_delete_unique_index(rt, effects, old_row_id, old_key)
-                                    .await?;
-                                return Ok(UpdateIndex::Updated);
+                                    .await
+                                    .change_context(OperationError::IndexMutation)?;
+                                return Ok(());
                             }
                             IndexCompareExchange::Mismatch => unreachable!(),
                             IndexCompareExchange::NotExists => continue,
@@ -2126,17 +2181,21 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             new_row_id,
                             new_guard,
                         )
-                        .await?
+                        .await
+                        .change_context(OperationError::IndexMutation)?
                     {
-                        LinkForUniqueIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
+                        LinkForUniqueIndex::DuplicateKey => {
+                            return Err(Report::new(OperationError::DuplicateKey));
+                        }
                         LinkForUniqueIndex::WriteConflict => {
-                            return Ok(UpdateIndex::WriteConflict);
+                            return Err(Report::new(OperationError::WriteConflict));
                         }
                         LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
                             let index_old_row_id = index_row_id.deleted();
                             match index
                                 .compare_exchange(&new_key.vals, index_old_row_id, new_row_id, sts)
-                                .await?
+                                .await
+                                .change_context(OperationError::IndexMutation)?
                             {
                                 IndexCompareExchange::Ok => {
                                     self.push_update_unique_index_undo(
@@ -2150,11 +2209,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                     self.defer_delete_unique_index(
                                         rt, effects, old_row_id, old_key,
                                     )
-                                    .await?;
-                                    return Ok(UpdateIndex::Updated);
+                                    .await
+                                    .change_context(OperationError::IndexMutation)?;
+                                    return Ok(());
                                 }
                                 IndexCompareExchange::Mismatch => {
-                                    return Ok(UpdateIndex::WriteConflict);
+                                    return Err(Report::new(OperationError::WriteConflict));
                                 }
                                 IndexCompareExchange::NotExists => {}
                             }
@@ -2174,19 +2234,22 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         new_key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         debug_assert!(old_row_id != new_row_id);
         match self
-            .require_non_unique_index(rt.pool_guards(), new_key.index_no)?
+            .require_non_unique_index(rt.pool_guards(), new_key.index_no)
+            .change_context(OperationError::IndexMutation)?
             .insert_if_not_exists(&new_key.vals, new_row_id, false, rt.sts())
-            .await?
+            .await
+            .change_context(OperationError::IndexMutation)?
         {
             IndexInsert::Ok(merged) => {
                 debug_assert!(!merged);
                 self.push_insert_non_unique_index_undo(rt, effects, new_row_id, new_key, false);
                 self.defer_delete_non_unique_index(rt, effects, old_row_id, old_key)
-                    .await?;
-                Ok(UpdateIndex::Updated)
+                    .await
+                    .change_context(OperationError::IndexMutation)?;
+                Ok(())
             }
             IndexInsert::DuplicateKey(..) => unreachable!(),
         }
@@ -2200,16 +2263,18 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         debug_assert!(old_row_id != new_row_id);
         match self
-            .require_unique_index(rt.pool_guards(), key.index_no)?
+            .require_unique_index(rt.pool_guards(), key.index_no)
+            .change_context(OperationError::IndexMutation)?
             .compare_exchange(&key.vals, old_row_id, new_row_id, rt.sts())
-            .await?
+            .await
+            .change_context(OperationError::IndexMutation)?
         {
             IndexCompareExchange::Ok => {
                 self.push_update_unique_index_undo(rt, effects, old_row_id, new_row_id, key, false);
-                Ok(UpdateIndex::Updated)
+                Ok(())
             }
             IndexCompareExchange::Mismatch | IndexCompareExchange::NotExists => unreachable!(),
         }
@@ -2223,17 +2288,20 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         debug_assert!(old_row_id != new_row_id);
         let res = self
-            .require_non_unique_index(rt.pool_guards(), key.index_no)?
+            .require_non_unique_index(rt.pool_guards(), key.index_no)
+            .change_context(OperationError::IndexMutation)?
             .insert_if_not_exists(&key.vals, new_row_id, false, rt.sts())
-            .await?;
+            .await
+            .change_context(OperationError::IndexMutation)?;
         debug_assert!(res.is_ok());
         self.push_insert_non_unique_index_undo(rt, effects, new_row_id, key.clone(), false);
         self.defer_delete_non_unique_index(rt, effects, old_row_id, key)
-            .await?;
-        Ok(UpdateIndex::Updated)
+            .await
+            .change_context(OperationError::IndexMutation)?;
+        Ok(())
     }
 
     #[inline]
@@ -2245,24 +2313,28 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         new_key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         let sts = rt.sts();
         let guards = rt.pool_guards();
-        let index = self.require_unique_index(guards, new_key.index_no)?;
+        let index = self
+            .require_unique_index(guards, new_key.index_no)
+            .change_context(OperationError::IndexMutation)?;
         loop {
             match index
                 .insert_if_not_exists(&new_key.vals, row_id, true, sts)
-                .await?
+                .await
+                .change_context(OperationError::IndexMutation)?
             {
                 IndexInsert::Ok(merged) => {
                     self.push_insert_unique_index_undo(rt, effects, row_id, new_key, merged);
                     self.defer_delete_unique_index(rt, effects, row_id, old_key)
-                        .await?;
-                    return Ok(UpdateIndex::Updated);
+                        .await
+                        .change_context(OperationError::IndexMutation)?;
+                    return Ok(());
                 }
                 IndexInsert::DuplicateKey(index_row_id, deleted) => {
                     if !deleted {
-                        return Ok(UpdateIndex::DuplicateKey);
+                        return Err(Report::new(OperationError::DuplicateKey));
                     }
                     match self
                         .link_for_unique_index(
@@ -2273,11 +2345,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             row_id,
                             page_guard,
                         )
-                        .await?
+                        .await
+                        .change_context(OperationError::IndexMutation)?
                     {
-                        LinkForUniqueIndex::DuplicateKey => return Ok(UpdateIndex::DuplicateKey),
+                        LinkForUniqueIndex::DuplicateKey => {
+                            return Err(Report::new(OperationError::DuplicateKey));
+                        }
                         LinkForUniqueIndex::WriteConflict => {
-                            return Ok(UpdateIndex::WriteConflict);
+                            return Err(Report::new(OperationError::WriteConflict));
                         }
                         LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
                             match index
@@ -2287,7 +2362,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                     row_id,
                                     sts,
                                 )
-                                .await?
+                                .await
+                                .change_context(OperationError::IndexMutation)?
                             {
                                 IndexCompareExchange::Ok => {
                                     self.push_update_unique_index_undo(
@@ -2299,11 +2375,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                                         true,
                                     );
                                     self.defer_delete_unique_index(rt, effects, row_id, old_key)
-                                        .await?;
-                                    return Ok(UpdateIndex::Updated);
+                                        .await
+                                        .change_context(OperationError::IndexMutation)?;
+                                    return Ok(());
                                 }
                                 IndexCompareExchange::Mismatch => {
-                                    return Ok(UpdateIndex::WriteConflict);
+                                    return Err(Report::new(OperationError::WriteConflict));
                                 }
                                 IndexCompareExchange::NotExists => {}
                             }
@@ -2322,17 +2399,20 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_key: SelectKey,
         new_key: SelectKey,
         row_id: RowID,
-    ) -> Result<UpdateIndex> {
+    ) -> OperationResult<()> {
         match self
-            .require_non_unique_index(rt.pool_guards(), new_key.index_no)?
+            .require_non_unique_index(rt.pool_guards(), new_key.index_no)
+            .change_context(OperationError::IndexMutation)?
             .insert_if_not_exists(&new_key.vals, row_id, true, rt.sts())
-            .await?
+            .await
+            .change_context(OperationError::IndexMutation)?
         {
             IndexInsert::Ok(merged) => {
                 self.push_insert_non_unique_index_undo(rt, effects, row_id, new_key, merged);
                 self.defer_delete_non_unique_index(rt, effects, row_id, old_key)
-                    .await?;
-                Ok(UpdateIndex::Updated)
+                    .await
+                    .change_context(OperationError::IndexMutation)?;
+                Ok(())
             }
             IndexInsert::DuplicateKey(..) => unreachable!(),
         }
@@ -2405,7 +2485,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 DeleteInternal::Ok(page_guard) => {
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard)
                         .await?;
-                    page_guard.set_dirty();
                     return Ok(DeleteMvcc::Deleted);
                 }
             }
@@ -2699,7 +2778,7 @@ mod tests {
     use crate::id::{RowID, TableID, TrxID};
     use crate::index::{BlockIndex, NonUniqueIndex, RowLocation, UniqueIndex};
     use crate::row::RowRead;
-    use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateIndex, UpdateMvcc, UpsertMvcc};
+    use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateMvcc, UpsertMvcc};
     use crate::session::{
         Session,
         tests::{SessionTestExt, assert_checkpoint_published},
@@ -3838,7 +3917,7 @@ mod tests {
                 let page_guard = mem_table
                     .must_get_row_page_shared(rt.pool_guards(), page_id)
                     .await?;
-                let res = mem_table
+                let report = mem_table
                     .update_unique_index_only_key_change(
                         rt,
                         effects,
@@ -3847,8 +3926,9 @@ mod tests {
                         row_id,
                         &page_guard,
                     )
-                    .await?;
-                assert_eq!(res, UpdateIndex::DuplicateKey);
+                    .await
+                    .unwrap_err();
+                assert_eq!(report.current_context(), &OperationError::DuplicateKey);
                 Ok(())
             })
             .await

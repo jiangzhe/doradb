@@ -211,31 +211,6 @@ impl UpsertMvcc {
     }
 }
 
-/// Secondary-index update result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UpdateIndex {
-    // sometimes we may get back page guard to update next index.
-    Updated,
-    WriteConflict,
-    DuplicateKey,
-}
-
-impl UpdateIndex {
-    /// Returns whether the index update succeeded.
-    #[inline]
-    pub(crate) fn is_updated(&self) -> bool {
-        matches!(self, UpdateIndex::Updated)
-    }
-}
-
-/// Secondary-index insert result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InsertIndex {
-    Inserted,
-    WriteConflict,
-    DuplicateKey,
-}
-
 /// Common access to update values stored in undo records.
 pub(crate) trait UndoVal {
     /// Returns column index.
