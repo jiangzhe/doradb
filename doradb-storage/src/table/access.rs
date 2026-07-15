@@ -34,10 +34,7 @@ use crate::table::{
     index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
     unique_key_from_full_row,
 };
-use crate::trx::row::{
-    FindOldVersion, IndexCandidateRecheck, ReadAllRows, ReadLatestRow, RowReadAccess,
-    RowWriteAccess,
-};
+use crate::trx::row::{FindOldVersion, IndexCandidateRecheck, ReadLatestRow, RowReadAccess};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
@@ -738,8 +735,7 @@ impl<'a> UserTableAccessor<'a> {
                     else {
                         continue;
                     };
-                    let (page_ctx, page) = page_guard.ctx_and_page();
-                    let access = RowReadAccess::new(page, page_ctx, page.row_idx(candidate.row_id));
+                    let access = page_guard.read_row_by_id(candidate.row_id);
                     let recheck = IndexCandidateRecheck {
                         index_no,
                         unique,
@@ -1427,8 +1423,7 @@ impl<'a> UserTableAccessor<'a> {
                 }
             }
         };
-        let (ctx, page) = page_guard.ctx_and_page();
-        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+        let access = page_guard.read_row_by_id(row_id);
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
         // data or version chain. Hot row pages still have undo chains, unlike
@@ -1491,8 +1486,7 @@ impl<'a> UserTableAccessor<'a> {
                 }
             }
         };
-        let (ctx, page) = page_guard.ctx_and_page();
-        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+        let access = page_guard.read_row_by_id(row_id);
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
         // data or version chain. Hot row pages still have undo chains, unlike
@@ -1603,9 +1597,7 @@ impl<'a> UserTableAccessor<'a> {
             return Ok(LinkForUniqueIndex::DuplicateKey);
         };
         let metadata = self.metadata();
-        let (page_ctx, page) = new_guard.ctx_and_page();
-        let mut new_access =
-            RowWriteAccess::new(page, page_ctx, new_guard.dirty_flag(), page.row_idx(new_id));
+        let mut new_access = new_guard.write_row_by_id(new_id);
         let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
@@ -1686,21 +1678,14 @@ impl<'a> UserTableAccessor<'a> {
         // snapshots. If this transaction can see it, the new claim is a real
         // duplicate.
         let metadata = self.metadata();
-        let (page_ctx, page) = old_guard.ctx_and_page();
-        let old_access = RowReadAccess::new(page, page_ctx, page.row_idx(old_id));
+        let old_access = old_guard.read_row_by_id(old_id);
         match old_access.find_old_version_for_unique_key(metadata, index_no, key_vals, rt.ctx()) {
             FindOldVersion::None => Ok(LinkForUniqueIndex::NotNeeded),
             FindOldVersion::DuplicateKey => Ok(LinkForUniqueIndex::DuplicateKey),
             FindOldVersion::WriteConflict => Ok(LinkForUniqueIndex::WriteConflict),
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
-                let (page_ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(
-                    page,
-                    page_ctx,
-                    new_guard.dirty_flag(),
-                    page.row_idx(new_id),
-                );
+                let mut new_access = new_guard.write_row_by_id(new_id);
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
@@ -2402,9 +2387,8 @@ impl<'a> UserTableAccessor<'a> {
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
         self.mem_scan(guards, |page_guard| {
-            let (ctx, page) = page_guard.ctx_and_page();
-            let col_layout = ctx.expect_vmap().column_layout.as_ref();
-            for row_access in ReadAllRows::new(page, ctx) {
+            let col_layout = page_guard.unwrap_vmap().column_layout.as_ref();
+            for row_access in page_guard.read_all_rows() {
                 if !row_action(col_layout, row_access.row()) {
                     return false;
                 }
@@ -2434,8 +2418,7 @@ impl<'a> UserTableAccessor<'a> {
         }
         let metadata = self.metadata();
         self.mem_scan_from(guards, root_snapshot.pivot_row_id(), |page_guard| {
-            let (page_ctx, page) = page_guard.ctx_and_page();
-            for row_access in ReadAllRows::new(page, page_ctx) {
+            for row_access in page_guard.read_all_rows() {
                 match row_access.read_row_mvcc(rt.ctx(), metadata, read_set, None) {
                     ReadRow::InvalidIndex => unreachable!(),
                     ReadRow::NotFound => (),
@@ -2610,10 +2593,7 @@ impl<'a> UserTableAccessor<'a> {
                     .mem()
                     .must_get_row_page_shared(rt.pool_guards(), descriptor.page_id)
                     .await?;
-                let access = {
-                    let (page_ctx, page) = page_guard.ctx_and_page();
-                    RowReadAccess::new(page, page_ctx, page.row_idx(row_id))
-                };
+                let access = page_guard.read_row_by_id(row_id);
                 match access.read_latest(rt.ctx()) {
                     ReadLatestRow::Readable => (),
                     ReadLatestRow::NotFound => continue,
@@ -5310,8 +5290,7 @@ mod tests {
                 .lock_shared_async()
                 .await
                 .unwrap();
-            let (ctx, _) = page_guard.ctx_and_page();
-            let row_ver = ctx.expect_vmap();
+            let row_ver = page_guard.unwrap_vmap();
             *row_ver.write_state() = RowPageState::Transition;
 
             let insert_page_guard = engine

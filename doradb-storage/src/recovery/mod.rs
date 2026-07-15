@@ -626,16 +626,12 @@ impl<'a> RecoveryCoordinator<'a> {
             .unwrap();
 
         let create_cts = page_guard
-            .bf()
-            .ctx
-            .as_ref()
-            .and_then(|ctx| ctx.recover())
+            .try_rmap()
             .map(|rec| rec.create_cts())
             .unwrap_or(TrxID::new(0));
         let max_row_count = page_guard.page().header.max_row_count as usize;
         page_guard.bf_mut().init_undo_map(col_layout, max_row_count);
-        let (ctx, _) = page_guard.ctx_and_page_mut();
-        ctx.expect_vmap().set_create_cts(create_cts);
+        page_guard.unwrap_vmap().set_create_cts(create_cts);
         Ok(())
     }
 

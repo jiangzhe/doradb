@@ -1,5 +1,5 @@
 use crate::buffer::PoolGuards;
-use crate::buffer::guard::PageSharedGuard;
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::{
     Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, is_catalog_table,
 };
@@ -12,7 +12,6 @@ use crate::row::RowPage;
 use crate::runtime;
 use crate::table::Table;
 use crate::thread;
-use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
 use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, RetiredRowPageBatch};
@@ -1346,12 +1345,11 @@ fn purge_undo_chain_from_page(
     undo: &OwnedRowUndo,
     min_active_sts: TrxID,
 ) {
-    let (ctx, page) = page_guard.ctx_and_page();
+    let page = page_guard.page();
     if !page.row_id_in_valid_range(undo.row_id) {
         return;
     }
-    let row_idx = page.row_idx(undo.row_id);
-    let mut access = RowWriteAccess::new(page, ctx, page_guard.dirty_flag(), row_idx);
+    let mut access = page_guard.write_row_by_id(undo.row_id);
     access.purge_undo_chain(min_active_sts);
 }
 

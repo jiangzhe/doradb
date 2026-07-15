@@ -1096,8 +1096,7 @@ impl Table {
         let mut heap_redo_start_ts = None;
         self.mem_scan(&guards, |page_guard| {
             if reached_row_budget {
-                let (ctx, _) = page_guard.ctx_and_page();
-                heap_redo_start_ts = Some(ctx.expect_vmap().create_cts());
+                heap_redo_start_ts = Some(page_guard.unwrap_vmap().create_cts());
                 return false;
             }
             let page = page_guard.page();
@@ -1137,8 +1136,7 @@ impl Table {
         let mut heap_redo_start_ts = None;
         self.mem
             .scan_from(guards, start_row_id, |page_guard| {
-                let (ctx, _) = page_guard.ctx_and_page();
-                heap_redo_start_ts = Some(ctx.expect_vmap().create_cts());
+                heap_redo_start_ts = Some(page_guard.unwrap_vmap().create_cts());
                 false
             })
             .await?;
@@ -1818,7 +1816,6 @@ mod tests {
     use crate::table::tests::*;
     use crate::table::{DeleteMarker, TableLifecycle, TableTerminal};
     use crate::trx::Transaction;
-    use crate::trx::row::RowWriteAccess;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests::discard_transaction_after_fatal_rollback;
     use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind};
@@ -1831,7 +1828,6 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::task::Poll;
     use std::thread;
     use tempfile::TempDir;
@@ -1840,8 +1836,7 @@ mod tests {
         let mut states = Vec::new();
         table
             .mem_scan(guards, |page_guard| {
-                let (ctx, _) = page_guard.ctx_and_page();
-                states.push(ctx.expect_vmap().inspect_state());
+                states.push(page_guard.unwrap_vmap().inspect_state());
                 true
             })
             .await
@@ -1853,8 +1848,7 @@ mod tests {
         let mut timestamps = Vec::new();
         table
             .mem_scan(guards, |page_guard| {
-                let (ctx, _) = page_guard.ctx_and_page();
-                timestamps.push(ctx.expect_vmap().create_cts());
+                timestamps.push(page_guard.unwrap_vmap().create_cts());
                 true
             })
             .await
@@ -1895,21 +1889,19 @@ mod tests {
             .must_get_row_page_shared(guards, page_id)
             .await
             .unwrap();
-        let (ctx, _) = page_guard.ctx_and_page();
-        ctx.expect_vmap().inspect_state()
+        page_guard.unwrap_vmap().inspect_state()
     }
 
     fn delete_last_frozen_row_image(page_guard: PageSharedGuard<RowPage>) {
-        let (ctx, page) = page_guard.ctx_and_page();
-        let map = ctx.expect_vmap();
+        let page = page_guard.page();
+        let map = page_guard.unwrap_vmap();
         assert_eq!(map.inspect_state(), RowPageState::Frozen);
         let row_idx = page.header.row_count() - 1;
         assert!(
             map.read_latch(row_idx).is_none(),
             "raw frozen-page image delete requires purged row undo"
         );
-        let dirty = AtomicBool::new(false);
-        let mut access = RowWriteAccess::new(page, ctx, &dirty, row_idx);
+        let mut access = page_guard.write_row(row_idx);
         access.delete_row();
     }
 
@@ -3363,8 +3355,7 @@ mod tests {
                         .must_get_row_page_shared(&session.pool_guards(), page_id)
                         .await
                         .unwrap();
-                    let (ctx, _) = page_guard.ctx_and_page();
-                    *ctx.expect_vmap().write_state() = unexpected;
+                    *page_guard.unwrap_vmap().write_state() = unexpected;
                     drop(page_guard);
 
                     // The selected-page invariant must panic before an outcome is returned.
@@ -3906,8 +3897,10 @@ mod tests {
                 .must_get_row_page_shared(&session.pool_guards(), first_frozen_page)
                 .await
                 .unwrap();
-            let (ctx, _) = page_guard.ctx_and_page();
-            assert_eq!(ctx.expect_vmap().inspect_state(), RowPageState::Frozen);
+            assert_eq!(
+                page_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Frozen
+            );
             drop(page_guard);
             assert_eq!(
                 table.checkpoint_workflow.frozen_page_ids().unwrap(),
@@ -4195,8 +4188,7 @@ mod tests {
             let result = publication_guard.begin_transition();
             assert!(matches!(result, Err(CheckpointCancelReason::TableDropping)));
             assert!(transition_pages.iter().all(|page_guard| {
-                let (ctx, _) = page_guard.ctx_and_page();
-                ctx.expect_vmap().inspect_state() == RowPageState::Frozen
+                page_guard.unwrap_vmap().inspect_state() == RowPageState::Frozen
             }));
             drop(transition_pages);
             drop(attempt);
@@ -4565,8 +4557,11 @@ mod tests {
                     && !row_hook_mutation_started.replace(true)
                 {
                     let page_guard = row_hook_page.borrow();
-                    let (ctx, _) = page_guard.as_ref().unwrap().ctx_and_page();
-                    ctx.expect_vmap().begin_frozen_mutation();
+                    page_guard
+                        .as_ref()
+                        .unwrap()
+                        .unwrap_vmap()
+                        .begin_frozen_mutation();
                 }
             });
             let comparison_hook_page = Rc::clone(&first_frozen_page);
@@ -4578,11 +4573,12 @@ mod tests {
                     assert_eq!(version_after, version_before + 1);
                     assert!(!retained);
                     let page_guard = comparison_hook_page.borrow();
-                    let (ctx, page) = page_guard.as_ref().unwrap().ctx_and_page();
+                    let guard_ref = page_guard.as_ref().unwrap();
+                    let page = guard_ref.page();
                     let row_idx = page.header.row_count() - 1;
                     assert!(page.set_deleted(row_idx, true));
                     page.inc_approx_deleted();
-                    ctx.expect_vmap().finish_frozen_mutation();
+                    guard_ref.unwrap_vmap().finish_frozen_mutation();
                     drop(page_guard);
                     comparison_hook_page.borrow_mut().take();
                 },
@@ -4667,8 +4663,10 @@ mod tests {
             let hook_prefix_delete_done_rx = prefix_delete_done_rx.clone();
             set_test_transition_page_published_hook(move |page_id| {
                 assert_eq!(page_id, first_frozen_page_id);
-                let (ctx, _) = second_frozen_page.ctx_and_page();
-                assert_eq!(ctx.expect_vmap().inspect_state(), RowPageState::Frozen);
+                assert_eq!(
+                    second_frozen_page.unwrap_vmap().inspect_state(),
+                    RowPageState::Frozen
+                );
                 prefix_update_start_tx.send(()).unwrap();
                 prefix_delete_start_tx.send(()).unwrap();
                 suffix_delete_start_tx.send(()).unwrap();
@@ -4811,8 +4809,10 @@ mod tests {
                     hook_first_analysis_count.set(count);
                     if count == 2 {
                         let page_guard = hook_second_page.borrow_mut().take().unwrap();
-                        let (ctx, _) = page_guard.ctx_and_page();
-                        assert_eq!(ctx.expect_vmap().inspect_state(), RowPageState::Frozen);
+                        assert_eq!(
+                            page_guard.unwrap_vmap().inspect_state(),
+                            RowPageState::Frozen
+                        );
                         delete_last_frozen_row_image(page_guard);
                         hook_cross_page_delete_completed.set(true);
                     }
@@ -4918,8 +4918,8 @@ mod tests {
             let hook_ownership_status = Arc::clone(&ownership_status);
             set_test_frozen_pages_ready_hook(move || {
                 let page_guard = hook_first_page.borrow_mut().take().unwrap();
-                let (ctx, page) = page_guard.ctx_and_page();
-                let map = ctx.expect_vmap();
+                let page = page_guard.page();
+                let map = page_guard.unwrap_vmap();
                 let undo = OwnedRowUndo::new(table_id, None, page.row_id(0), RowUndoKind::Lock);
                 map.begin_frozen_mutation();
                 *map.write_latch(0) = Some(Box::new(RowUndoHead::new(
@@ -4984,8 +4984,8 @@ mod tests {
             let hook_ownership_status = Arc::clone(&ownership_status);
             set_test_stable_page_plans_refreshed_hook(move || {
                 let page_guard = hook_first_page.borrow_mut().take().unwrap();
-                let (ctx, page) = page_guard.ctx_and_page();
-                let map = ctx.expect_vmap();
+                let page = page_guard.page();
+                let map = page_guard.unwrap_vmap();
                 let undo = OwnedRowUndo::new(table_id, None, page.row_id(0), RowUndoKind::Lock);
                 map.begin_frozen_mutation();
                 *map.write_latch(0) = Some(Box::new(RowUndoHead::new(
@@ -5774,8 +5774,10 @@ mod tests {
                 .must_get_row_page_shared(&checkpoint_session.pool_guards(), frozen_page_id)
                 .await
                 .unwrap();
-            let (ctx, _) = page_guard.ctx_and_page();
-            assert_eq!(ctx.expect_vmap().inspect_state(), RowPageState::Frozen);
+            assert_eq!(
+                page_guard.unwrap_vmap().inspect_state(),
+                RowPageState::Frozen
+            );
             drop(page_guard);
             let (wait_result, rollback_result) = futures::join!(
                 checkpoint_session.wait_for_checkpoint_retry(reason),

@@ -49,7 +49,6 @@ use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
-use crate::trx::row::RowReadAccess;
 use crate::trx::undo::{IndexBranch, RowUndoKind};
 use crate::trx::{TrxContext, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
@@ -583,7 +582,7 @@ impl Table {
         cts: TrxID,
     ) -> Result<()> {
         let page_id = page_guard.page_id();
-        let (ctx, page) = page_guard.ctx_and_page_mut();
+        let page = page_guard.page();
         debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
         if !page.row_id_in_valid_range(row_id) {
@@ -596,8 +595,8 @@ impl Table {
             ));
         }
         let row_idx = page.row_idx(row_id);
-        if !ctx
-            .recover()
+        if !page_guard
+            .try_rmap()
             .ok_or_else(|| {
                 recovery_page_invariant_error("insert", page_id, row_id, cts, "missing recover map")
             })?
@@ -624,13 +623,15 @@ impl Table {
             ));
         };
         // update count field to include current row id.
-        page.update_count_to_include_row_id(row_id);
+        page_guard.page_mut().update_count_to_include_row_id(row_id);
         // insert CTS.
-        ctx.recover_mut()
+        page_guard
+            .try_rmap_mut()
             .ok_or_else(|| {
                 recovery_page_invariant_error("insert", page_id, row_id, cts, "missing recover map")
             })?
             .insert_at(row_idx, cts);
+        let page = page_guard.page_mut();
         let row_idx = page.row_idx(row_id);
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         if !row.is_deleted() {
@@ -659,7 +660,7 @@ impl Table {
         cts: TrxID,
     ) -> Result<()> {
         let page_id = page_guard.page_id();
-        let (ctx, page) = page_guard.ctx_and_page_mut();
+        let page = page_guard.page();
         // column indexes must be in range
         debug_assert!(
             {
@@ -710,8 +711,8 @@ impl Table {
                 "insufficient row page space",
             ));
         };
-        if ctx
-            .recover()
+        if page_guard
+            .try_rmap()
             .ok_or_else(|| {
                 recovery_page_invariant_error("update", page_id, row_id, cts, "missing recover map")
             })?
@@ -727,11 +728,13 @@ impl Table {
             ));
         }
         // update CTS.
-        ctx.recover_mut()
+        page_guard
+            .try_rmap_mut()
             .ok_or_else(|| {
                 recovery_page_invariant_error("update", page_id, row_id, cts, "missing recover map")
             })?
             .update_at(row_idx, cts);
+        let page = page_guard.page_mut();
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert_eq!(row_id, row.row_id());
 
@@ -750,7 +753,7 @@ impl Table {
         cts: TrxID,
     ) -> Result<()> {
         let page_id = page_guard.page_id();
-        let (ctx, page) = page_guard.ctx_and_page_mut();
+        let page = page_guard.page();
         if !page.row_id_in_valid_range(row_id) {
             return Err(recovery_page_invariant_error(
                 "delete",
@@ -771,8 +774,8 @@ impl Table {
                 "row is already deleted",
             ));
         }
-        if ctx
-            .recover()
+        if page_guard
+            .try_rmap()
             .ok_or_else(|| {
                 recovery_page_invariant_error("delete", page_id, row_id, cts, "missing recover map")
             })?
@@ -787,11 +790,13 @@ impl Table {
                 "missing recover CTS",
             ));
         }
-        ctx.recover_mut()
+        page_guard
+            .try_rmap_mut()
             .ok_or_else(|| {
                 recovery_page_invariant_error("delete", page_id, row_id, cts, "missing recover map")
             })?
             .update_at(row_idx, cts);
+        let page = page_guard.page_mut();
         page.set_deleted_exclusive(row_idx, true);
         if !was_deleted {
             page.inc_approx_deleted();
@@ -1108,8 +1113,7 @@ fn read_latest_index_key(
         .expect("active index spec must exist for latest key read");
     let mut new_key = SelectKey::null(index_no, index_spec.cols.len());
     for (pos, key) in index_spec.cols.iter().enumerate() {
-        let (ctx, page) = page_guard.ctx_and_page();
-        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+        let access = page_guard.read_row_by_id(row_id);
         let val = access.row().val(metadata.col.as_ref(), key.col_no as usize);
         new_key.vals[pos] = val;
     }

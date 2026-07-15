@@ -4,13 +4,12 @@ use super::checkpoint_workflow::{
 use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
-use crate::buffer::frame::FrameContext;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::error::{InternalError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::RowPage;
 use crate::trx::undo::{RowUndoKind, UndoStatus};
-use crate::trx::ver_map::RowPageState;
+use crate::trx::ver_map::{RowPageState, RowVersionMap};
 use crate::trx::{MAX_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
 use error_stack::Report;
 use std::mem::take;
@@ -144,7 +143,7 @@ impl Table {
         // maintenance state transition, while foreground writers do not change
         // page state or row-page identity.
         for (page_guard, page_info) in page_guards.iter().zip(pages) {
-            let (ctx, page) = page_guard.ctx_and_page();
+            let page = page_guard.page();
             assert_eq!(
                 page_guard.page_id(),
                 page_info.page_id,
@@ -158,7 +157,7 @@ impl Table {
                 self.table_id(),
                 page_info.page_id
             );
-            let state = ctx.expect_vmap().inspect_state();
+            let state = page_guard.unwrap_vmap().inspect_state();
             assert_eq!(
                 state,
                 RowPageState::Active,
@@ -175,8 +174,7 @@ impl Table {
             return false;
         }
         for (page_guard, page_info) in page_guards.iter().zip(pages) {
-            let (ctx, _) = page_guard.ctx_and_page();
-            let mut state = ctx.expect_vmap().write_state();
+            let mut state = page_guard.unwrap_vmap().write_state();
             assert_eq!(
                 *state,
                 RowPageState::Active,
@@ -234,8 +232,11 @@ impl Table {
         let page_info = batch.pages[page_idx];
         match batch.validation[page_idx] {
             state @ FrozenPageValidationState::Stable { .. } => {
-                let (ctx, _) = page_guard.ctx_and_page();
-                assert_frozen_page_state(ctx, batch.table_id, page_info.page_id);
+                assert_frozen_page_state(
+                    page_guard.unwrap_vmap(),
+                    batch.table_id,
+                    page_info.page_id,
+                );
                 debug_assert!(batch.blockers_for(page_info.page_id).is_none());
                 state
             }
@@ -265,8 +266,8 @@ impl Table {
         // page-local revalidation and fail-closed Transition publication.
         for (page_idx, page_guard) in page_guards.iter().enumerate() {
             let page_info = batch.pages[page_idx];
-            let (ctx, page) = page_guard.ctx_and_page();
-            let map = ctx.expect_vmap();
+            let page = page_guard.page();
+            let map = page_guard.unwrap_vmap();
             assert!(
                 matches!(
                     batch.validation[page_idx],
@@ -299,7 +300,7 @@ impl Table {
                 .or_else(|| {
                     scan_frozen_page(
                         page,
-                        ctx,
+                        map,
                         page_info,
                         FrozenPageScanMode::RefreshStablePlan,
                         cutoff_ts,
@@ -375,8 +376,11 @@ fn validate_frozen_pages_incrementally(
                 // Stable caches only the image-readiness proof and required
                 // cutoff. Plan freshness and current overlays are deliberately
                 // deferred to the full optimistic refresh below.
-                let (ctx, _) = page_guard.ctx_and_page();
-                assert_frozen_page_state(ctx, batch.table_id, page_info.page_id);
+                assert_frozen_page_state(
+                    page_guard.unwrap_vmap(),
+                    batch.table_id,
+                    page_info.page_id,
+                );
                 batch.validation[page_idx]
             }
             FrozenPageValidationState::Unchecked | FrozenPageValidationState::Blocked { .. } => {
@@ -423,15 +427,15 @@ fn analyze_frozen_page_readiness(
     cutoff_ts: TrxID,
 ) -> FrozenPageValidationState {
     let page_info = batch.pages[page_idx];
-    let (ctx, page) = page_guard.ctx_and_page();
-    let map = ctx.expect_vmap();
-    assert_frozen_page_state(ctx, batch.table_id, page_info.page_id);
+    let page = page_guard.page();
+    let map = page_guard.unwrap_vmap();
+    assert_frozen_page_state(map, batch.table_id, page_info.page_id);
     // This version is an equality token, not a seqlock parity value. Any
     // mutation between the samples invalidates the optimistic plan.
     let version_before = map.frozen_mutation_version();
     let analysis = scan_frozen_page(
         page,
-        ctx,
+        map,
         page_info,
         FrozenPageScanMode::EstablishReadiness {
             frozen_ts: batch.frozen_ts,
@@ -478,9 +482,9 @@ fn refresh_stable_page_plan(
     cutoff_ts: TrxID,
 ) {
     let page_info = batch.pages[page_idx];
-    let (ctx, page) = page_guard.ctx_and_page();
-    let map = ctx.expect_vmap();
-    assert_frozen_page_state(ctx, batch.table_id, page_info.page_id);
+    let page = page_guard.page();
+    let map = page_guard.unwrap_vmap();
+    assert_frozen_page_state(map, batch.table_id, page_info.page_id);
     assert!(
         matches!(
             batch.validation[page_idx],
@@ -500,7 +504,7 @@ fn refresh_stable_page_plan(
         .or_else(|| {
             scan_frozen_page(
                 page,
-                ctx,
+                map,
                 page_info,
                 FrozenPageScanMode::RefreshStablePlan,
                 cutoff_ts,
@@ -533,9 +537,9 @@ fn retain_optimistic_page_plan(
 }
 
 #[inline]
-fn assert_frozen_page_state(ctx: &FrameContext, table_id: TableID, page_id: PageID) {
+fn assert_frozen_page_state(map: &RowVersionMap, table_id: TableID, page_id: PageID) {
     assert_eq!(
-        ctx.expect_vmap().inspect_state(),
+        map.inspect_state(),
         RowPageState::Frozen,
         "optimistic preparation requires frozen page: table_id={table_id}, page_id={page_id}"
     );
@@ -571,7 +575,7 @@ fn record_frozen_page_readiness(
 
 fn scan_frozen_page(
     page: &RowPage,
-    ctx: &FrameContext,
+    map: &RowVersionMap,
     page_info: FrozenPage,
     mode: FrozenPageScanMode,
     cutoff_ts: TrxID,
@@ -585,7 +589,6 @@ fn scan_frozen_page(
     // Start from the current physical image. Undo inspection below only
     // adjusts rows whose cutoff visibility differs from that latest image.
     let mut del_bitmap = page.del_bitmap(row_count);
-    let map = ctx.expect_vmap();
     let mut required_cutoff_ts = None;
     let mut blocked = false;
     let mut blockers = Vec::new();
@@ -753,7 +756,7 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::id::RowID;
     use crate::table::test_hooks;
-    use crate::trx::row::RowWriteAccess;
+    use crate::trx::row::tests::test_row_write_access;
     use crate::trx::undo::{
         MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, UndoStatus,
     };
@@ -766,7 +769,7 @@ mod tests {
 
     struct FrozenAnalyzerFixture {
         page: RowPage,
-        ctx: FrameContext,
+        map: RowVersionMap,
         page_info: FrozenPage,
         _undo_owners: Vec<OwnedRowUndo>,
     }
@@ -830,7 +833,7 @@ mod tests {
         };
         FrozenAnalyzerFixture {
             page,
-            ctx: FrameContext::RowVerMap(row_ver),
+            map: row_ver,
             page_info,
             _undo_owners: nodes.into_iter().map(|(undo, _)| undo).collect(),
         }
@@ -841,10 +844,10 @@ mod tests {
         frozen_ts: TrxID,
         cutoff_ts: TrxID,
     ) -> FrozenPageReadinessAnalysis {
-        let observed_version = fixture.ctx.expect_vmap().frozen_mutation_version();
+        let observed_version = fixture.map.frozen_mutation_version();
         scan_frozen_page(
             &fixture.page,
-            &fixture.ctx,
+            &fixture.map,
             fixture.page_info,
             FrozenPageScanMode::EstablishReadiness { frozen_ts },
             cutoff_ts,
@@ -856,10 +859,10 @@ mod tests {
         fixture: &FrozenAnalyzerFixture,
         cutoff_ts: TrxID,
     ) -> Option<PreparedTransitionPage> {
-        let observed_version = fixture.ctx.expect_vmap().frozen_mutation_version();
+        let observed_version = fixture.map.frozen_mutation_version();
         scan_frozen_page(
             &fixture.page,
-            &fixture.ctx,
+            &fixture.map,
             fixture.page_info,
             FrozenPageScanMode::RefreshStablePlan,
             cutoff_ts,
@@ -890,7 +893,6 @@ mod tests {
         );
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         *row_ver.write_state() = RowPageState::Frozen;
-        let ctx = FrameContext::RowVerMap(row_ver);
         let page_info = FrozenPage {
             page_id: PageID::new(8),
             start_row_id: RowID::new(100),
@@ -902,20 +904,20 @@ mod tests {
         thread::scope(|scope| {
             let writer = scope.spawn(|| {
                 let dirty = AtomicBool::new(false);
-                let mut access = RowWriteAccess::new(&page, &ctx, &dirty, 1);
+                let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 access.delete_row();
             });
             entered_rx.recv().unwrap();
-            let version_before = ctx.expect_vmap().frozen_mutation_version();
+            let version_before = row_ver.frozen_mutation_version();
             assert_eq!(version_before, 1);
             test_hooks::set_test_frozen_page_scan_hook(move |_| {
                 release_tx.send(()).unwrap();
             });
             let analysis = scan_frozen_page(
                 &page,
-                &ctx,
+                &row_ver,
                 page_info,
                 FrozenPageScanMode::EstablishReadiness {
                     frozen_ts: TrxID::new(20),
@@ -924,7 +926,7 @@ mod tests {
             )
             .into_readiness_analysis(TrxID::new(20), version_before);
             writer.join().unwrap();
-            let version_after = ctx.expect_vmap().frozen_mutation_version();
+            let version_after = row_ver.frozen_mutation_version();
             assert_eq!(version_after, 2);
             assert!(analysis.plan.is_some());
             let retained_plan = (version_before == version_after).then_some(analysis.plan);

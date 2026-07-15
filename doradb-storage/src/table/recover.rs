@@ -7,7 +7,6 @@ use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
 use crate::table::{DeletionError, DmlValidationDomain, DmlValidator, Table};
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::trx::row::ReadAllRows;
 use crate::value::Val;
 use error_stack::Report;
 
@@ -128,11 +127,10 @@ impl Table {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         let index_pool_guard = self.mem.index_pool_guard(guards)?;
-        let (ctx, page) = page_guard.ctx_and_page();
         for (index_no, index_spec) in metadata.idx.active_indexes() {
             let sec_idx = layout.secondary_index(index_no)?;
             let read_set: Vec<_> = index_spec.cols.iter().map(|c| c.col_no as usize).collect();
-            for row_access in ReadAllRows::new(page, ctx) {
+            for row_access in page_guard.read_all_rows() {
                 let row_id = row_access.row().row_id();
                 match row_access.read_row_latest(metadata, &read_set, None) {
                     ReadRow::Ok(vals) => {

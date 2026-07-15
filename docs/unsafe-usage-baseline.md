@@ -8,7 +8,7 @@
 
 | module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |
 |---|---:|---:|---:|---:|---:|---:|
-| buffer | 13 | 52 | 0 | 0 | 0 | 46 |
+| buffer | 13 | 51 | 0 | 0 | 0 | 45 |
 | latch | 4 | 40 | 0 | 0 | 0 | 36 |
 | row | 3 | 6 | 0 | 0 | 0 | 6 |
 | index | 21 | 13 | 0 | 0 | 3 | 7 |
@@ -18,14 +18,14 @@
 | file | 8 | 12 | 0 | 0 | 2 | 12 |
 | log | 6 | 0 | 0 | 0 | 0 | 0 |
 | recovery | 5 | 0 | 0 | 0 | 0 | 0 |
-| **total** | **82** | **153** | **0** | **0** | **6** | **132** |
+| **total** | **82** | **152** | **0** | **0** | **6** | **131** |
 
 ## File Hotspots (top 40)
 
 | file | module | unsafe | // SAFETY: |
 |---|---|---:|---:|
 | `doradb-storage/src/latch/rwlock.rs` | latch | 20 | 17 |
-| `doradb-storage/src/buffer/guard.rs` | buffer | 15 | 15 |
+| `doradb-storage/src/buffer/guard.rs` | buffer | 14 | 14 |
 | `doradb-storage/src/latch/mutex.rs` | latch | 14 | 13 |
 | `doradb-storage/src/buffer/util.rs` | buffer | 10 | 5 |
 | `doradb-storage/src/buffer/evict.rs` | buffer | 9 | 9 |

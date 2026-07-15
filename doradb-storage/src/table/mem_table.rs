@@ -29,7 +29,7 @@ use crate::row::ops::{
     UpdateMvcc, UpsertMvcc,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
-use crate::trx::row::{FindOldVersion, ReadAllRows, RowReadAccess, RowWriteAccess};
+use crate::trx::row::FindOldVersion;
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
@@ -412,12 +412,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         let Some(page_guard) = page_guard else {
             return Ok(());
         };
-        let (ctx, page) = page_guard.ctx_and_page();
         let metadata = self.metadata();
         // TODO: we should retry or wait for notification if rollback happens on a page
         // in transition state. This will be handled in a future task.
-        let row_idx = page.row_idx(entry.row_id);
-        let mut access = RowWriteAccess::new(page, ctx, page_guard.dirty_flag(), row_idx);
+        let mut access = page_guard.write_row_by_id(entry.row_id);
         access.rollback_first_undo(metadata, entry);
         Ok(())
     }
@@ -981,20 +979,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             }
         };
         let metadata = self.metadata();
-        let (page_ctx, page) = old_guard.ctx_and_page();
-        let old_access = RowReadAccess::new(page, page_ctx, page.row_idx(old_id));
+        let old_access = old_guard.read_row_by_id(old_id);
         match old_access.find_old_version_for_unique_key(metadata, index_no, key_vals, rt.ctx()) {
             FindOldVersion::None => Ok(LinkForUniqueIndex::NotNeeded),
             FindOldVersion::DuplicateKey => Ok(LinkForUniqueIndex::DuplicateKey),
             FindOldVersion::WriteConflict => Ok(LinkForUniqueIndex::WriteConflict),
             FindOldVersion::Ok(old_row, cts, old_entry) => {
-                let (page_ctx, page) = new_guard.ctx_and_page();
-                let mut new_access = RowWriteAccess::new(
-                    page,
-                    page_ctx,
-                    new_guard.dirty_flag(),
-                    page.row_idx(new_id),
-                );
+                let mut new_access = new_guard.write_row_by_id(new_id);
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     SelectKey::new(index_no, key_vals.to_vec()),
@@ -1249,8 +1240,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 }
             }
         };
-        let (ctx, page) = page_guard.ctx_and_page();
-        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+        let access = page_guard.read_row_by_id(row_id);
         if !access.any_version_matches_key(self.metadata(), index_no, key_vals) {
             return index
                 .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
@@ -1292,8 +1282,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 }
             }
         };
-        let (ctx, page) = page_guard.ctx_and_page();
-        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+        let access = page_guard.read_row_by_id(row_id);
         if !access.any_version_matches_key(self.metadata(), index_no, key_vals) {
             return index
                 .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
@@ -1700,9 +1689,8 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
         self.scan(guards, |page_guard| {
-            let (ctx, page) = page_guard.ctx_and_page();
-            let col_layout = ctx.expect_vmap().column_layout.as_ref();
-            for row_access in ReadAllRows::new(page, ctx) {
+            let col_layout = page_guard.unwrap_vmap().column_layout.as_ref();
+            for row_access in page_guard.read_all_rows() {
                 if !row_action(col_layout, row_access.row()) {
                     return false;
                 }
@@ -1752,12 +1740,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 }
             },
         };
-        let (ctx, page) = page_guard.ctx_and_page();
+        let page = page_guard.page();
         if !page.row_id_in_valid_range(row_id) {
             return Ok(None);
         }
-        let row_layout = ctx.expect_vmap().column_layout.as_ref();
-        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
+        let row_layout = page_guard.unwrap_vmap().column_layout.as_ref();
+        let access = page_guard.read_row_by_id(row_id);
         let row = access.row();
         if row.is_deleted() {
             return Ok(None);
@@ -4155,8 +4143,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("inserted row page should validate");
-            let (ctx, _) = page_guard.ctx_and_page();
-            let row_ver = ctx.expect_vmap();
+            let row_ver = page_guard.unwrap_vmap();
             *row_ver.write_state() = RowPageState::Transition;
             drop(page_guard);
 

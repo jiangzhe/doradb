@@ -1,4 +1,4 @@
-use crate::buffer::frame::FrameContext;
+use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::id::{RowID, TableID, TrxID};
@@ -43,8 +43,13 @@ pub(crate) struct RowReadAccess<'a> {
 impl<'a> RowReadAccess<'a> {
     /// Acquire read latch for single row with offset.
     #[inline]
-    pub(crate) fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
-        let state = RowReadState::from_ctx(ctx, row_idx);
+    fn new(page_guard: &'a PageSharedGuard<RowPage>, row_idx: usize) -> Self {
+        let state = RowReadState::from_guard(page_guard, row_idx);
+        Self::from_state(page_guard.page(), row_idx, state)
+    }
+
+    #[inline]
+    fn from_state(page: &'a RowPage, row_idx: usize, state: RowReadState<'a>) -> Self {
         RowReadAccess {
             page,
             row_idx,
@@ -717,10 +722,11 @@ pub(crate) enum RowReadState<'a> {
 
 impl<'a> RowReadState<'a> {
     #[inline]
-    fn from_ctx(ctx: &'a FrameContext, row_idx: usize) -> Self {
-        match ctx {
-            FrameContext::RowVerMap(ver) => RowReadState::RowVer(ver.read_latch(row_idx)),
-            FrameContext::RowRecoveryMap(rec) => RowReadState::Recover(rec),
+    fn from_guard(page_guard: &'a PageSharedGuard<RowPage>, row_idx: usize) -> Self {
+        if let Some(rec) = page_guard.try_rmap() {
+            RowReadState::Recover(rec)
+        } else {
+            RowReadState::RowVer(page_guard.unwrap_vmap().read_latch(row_idx))
         }
     }
 }
@@ -755,10 +761,9 @@ impl IndexCandidateRecheck<'_> {
     }
 }
 
-/// Iterator over all rows in a row page using one frame context.
+/// Iterator over all rows protected by one shared row-page guard.
 pub(crate) struct ReadAllRows<'a> {
-    ctx: &'a FrameContext,
-    page: &'a RowPage,
+    page_guard: &'a PageSharedGuard<RowPage>,
     start_idx: usize,
     end_idx: usize,
 }
@@ -766,11 +771,10 @@ pub(crate) struct ReadAllRows<'a> {
 impl<'a> ReadAllRows<'a> {
     /// Create an iterator over all row indexes in the page.
     #[inline]
-    pub(crate) fn new(page: &'a RowPage, ctx: &'a FrameContext) -> Self {
-        let end_idx = page.header.row_count();
+    fn new(page_guard: &'a PageSharedGuard<RowPage>) -> Self {
+        let end_idx = page_guard.page().header.row_count();
         ReadAllRows {
-            ctx,
-            page,
+            page_guard,
             start_idx: 0,
             end_idx,
         }
@@ -786,7 +790,49 @@ impl<'a> Iterator for ReadAllRows<'a> {
             return None;
         }
         self.start_idx += 1;
-        Some(RowReadAccess::new(self.page, self.ctx, row_idx))
+        Some(self.page_guard.read_row(row_idx))
+    }
+}
+
+impl PageSharedGuard<RowPage> {
+    /// Acquires read access to one row slot.
+    #[inline]
+    pub(crate) fn read_row(&self, row_idx: usize) -> RowReadAccess<'_> {
+        RowReadAccess::new(self, row_idx)
+    }
+
+    /// Acquires read access to one row identified by its row ID.
+    #[inline]
+    pub(crate) fn read_row_by_id(&self, row_id: RowID) -> RowReadAccess<'_> {
+        self.read_row(self.page().row_idx(row_id))
+    }
+
+    /// Iterates over all populated row slots with row-aware read access.
+    #[inline]
+    pub(crate) fn read_all_rows(&self) -> ReadAllRows<'_> {
+        ReadAllRows::new(self)
+    }
+
+    /// Acquires write access to one row slot and read-locks page state.
+    #[inline]
+    pub(crate) fn write_row(&self, row_idx: usize) -> RowWriteAccess<'_> {
+        RowWriteAccess::new(self, row_idx)
+    }
+
+    /// Acquires write access to one row identified by its row ID.
+    #[inline]
+    pub(crate) fn write_row_by_id(&self, row_id: RowID) -> RowWriteAccess<'_> {
+        self.write_row(self.page().row_idx(row_id))
+    }
+
+    /// Acquires write access while retaining an existing page-state guard.
+    #[inline]
+    pub(crate) fn write_row_with_state_guard<'a>(
+        &'a self,
+        row_idx: usize,
+        state_guard: RwLockReadGuard<'a, RowPageState>,
+    ) -> RowWriteAccess<'a> {
+        RowWriteAccess::new_with_state_guard(self, row_idx, state_guard)
     }
 }
 
@@ -945,27 +991,37 @@ pub(crate) struct RowWriteAccess<'a> {
 impl<'a> RowWriteAccess<'a> {
     /// Acquire write access to one row and read-lock the page state.
     #[inline]
-    pub(crate) fn new(
-        page: &'a RowPage,
-        ctx: &'a FrameContext,
-        dirty: &'a AtomicBool,
-        row_idx: usize,
-    ) -> Self {
-        let ver_map = ctx.expect_vmap();
+    fn new(page_guard: &'a PageSharedGuard<RowPage>, row_idx: usize) -> Self {
+        let ver_map = page_guard.unwrap_vmap();
         let state_guard = ver_map.read_state();
-        Self::new_with_state_guard(page, ctx, dirty, row_idx, state_guard)
+        Self::new_with_state_guard(page_guard, row_idx, state_guard)
     }
 
     /// Acquire write access using an existing page-state guard.
     #[inline]
-    pub(crate) fn new_with_state_guard(
+    fn new_with_state_guard(
+        page_guard: &'a PageSharedGuard<RowPage>,
+        row_idx: usize,
+        state_guard: RwLockReadGuard<'a, RowPageState>,
+    ) -> Self {
+        let ver_map = page_guard.unwrap_vmap();
+        Self::from_parts(
+            page_guard.page(),
+            ver_map,
+            page_guard.bf().dirty_flag(),
+            row_idx,
+            state_guard,
+        )
+    }
+
+    #[inline]
+    fn from_parts(
         page: &'a RowPage,
-        ctx: &'a FrameContext,
+        ver_map: &'a RowVersionMap,
         dirty: &'a AtomicBool,
         row_idx: usize,
         state_guard: RwLockReadGuard<'a, RowPageState>,
     ) -> Self {
-        let ver_map = ctx.expect_vmap();
         let guard = ver_map.write_latch(row_idx);
         let frozen_version_map = if *state_guard == RowPageState::Frozen {
             // The row latch and page-state guard are already held, so a final
@@ -1413,7 +1469,7 @@ pub(crate) enum FindOldVersion {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
@@ -1472,13 +1528,34 @@ mod tests {
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(status, undo.leak())));
     }
 
-    fn test_row_write_access<'a>(
+    fn test_row_read_access<'a>(
         page: &'a RowPage,
-        ctx: &'a FrameContext,
+        row_ver: &'a RowVersionMap,
+        row_idx: usize,
+    ) -> RowReadAccess<'a> {
+        RowReadAccess::from_state(
+            page,
+            row_idx,
+            RowReadState::RowVer(row_ver.read_latch(row_idx)),
+        )
+    }
+
+    fn test_recovery_row_read_access<'a>(
+        page: &'a RowPage,
+        rec_map: &'a RowRecoveryMap,
+        row_idx: usize,
+    ) -> RowReadAccess<'a> {
+        RowReadAccess::from_state(page, row_idx, RowReadState::Recover(rec_map))
+    }
+
+    pub(crate) fn test_row_write_access<'a>(
+        page: &'a RowPage,
+        row_ver: &'a RowVersionMap,
         dirty: &'a AtomicBool,
         row_idx: usize,
     ) -> RowWriteAccess<'a> {
-        RowWriteAccess::new(page, ctx, dirty, row_idx)
+        let state_guard = row_ver.read_state();
+        RowWriteAccess::from_parts(page, row_ver, dirty, row_idx, state_guard)
     }
 
     #[test]
@@ -1489,8 +1566,7 @@ mod tests {
         let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
         status.commit_for_test(TrxID::new(10));
         install_test_undo_head(&row_ver, status);
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::Readable);
@@ -1507,18 +1583,16 @@ mod tests {
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let trx_ctx = test_trx_context(TrxID::new(1));
         install_test_undo_head(&row_ver, trx_ctx.status());
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-
         {
-            let access = RowReadAccess::new(&page, &frame_ctx, 0);
+            let access = test_row_read_access(&page, &row_ver, 0);
             assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::Readable);
         }
 
         install_test_undo_head(
-            frame_ctx.expect_vmap(),
+            &row_ver,
             Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 100)),
         );
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let access = test_row_read_access(&page, &row_ver, 0);
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
     }
 
@@ -1530,8 +1604,7 @@ mod tests {
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
         install_test_undo_head(&row_ver, Arc::clone(&status));
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
@@ -1545,19 +1618,17 @@ mod tests {
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         *row_ver.write_state() = RowPageState::Frozen;
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let row_ver = frame_ctx.expect_vmap();
         let dirty = AtomicBool::new(false);
 
         assert_eq!(row_ver.frozen_mutation_version(), 0);
         {
-            let _access = test_row_write_access(&page, &frame_ctx, &dirty, 0);
+            let _access = test_row_write_access(&page, &row_ver, &dirty, 0);
             assert_eq!(row_ver.frozen_mutation_version(), 1);
         }
         assert_eq!(row_ver.frozen_mutation_version(), 2);
 
         *row_ver.write_state() = RowPageState::Active;
-        drop(test_row_write_access(&page, &frame_ctx, &dirty, 0));
+        drop(test_row_write_access(&page, &row_ver, &dirty, 0));
         assert_eq!(row_ver.frozen_mutation_version(), 2);
     }
 
@@ -1566,22 +1637,20 @@ mod tests {
         let metadata = sparse_metadata();
         let page = row_page_with_two_rows(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
         let dirty = AtomicBool::new(false);
 
-        drop(test_row_write_access(&page, &frame_ctx, &dirty, 0));
+        drop(test_row_write_access(&page, &row_ver, &dirty, 0));
         assert!(!dirty.load(Ordering::Acquire));
 
-        let state_guard = frame_ctx.expect_vmap().read_state();
-        let access =
-            RowWriteAccess::new_with_state_guard(&page, &frame_ctx, &dirty, 0, state_guard);
+        let state_guard = row_ver.read_state();
+        let access = RowWriteAccess::from_parts(&page, &row_ver, &dirty, 0, state_guard);
         access.mark_dirty();
         drop(access);
         assert!(dirty.load(Ordering::Acquire));
 
         dirty.store(false, Ordering::Release);
         {
-            let access = test_row_write_access(&page, &frame_ctx, &dirty, 0);
+            let access = test_row_write_access(&page, &row_ver, &dirty, 0);
             let offset = page.header.var_field_offset();
             let _row = access.row_mut(offset, offset);
         }
@@ -1589,7 +1658,7 @@ mod tests {
 
         dirty.store(false, Ordering::Release);
         {
-            let mut access = test_row_write_access(&page, &frame_ctx, &dirty, 1);
+            let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
             access.delete_row();
         }
         assert!(dirty.load(Ordering::Acquire));
@@ -1601,16 +1670,15 @@ mod tests {
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         *row_ver.write_state() = RowPageState::Frozen;
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
         let dirty = AtomicBool::new(false);
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _access = test_row_write_access(&page, &frame_ctx, &dirty, 0);
+            let _access = test_row_write_access(&page, &row_ver, &dirty, 0);
             panic!("exercise unwind cleanup");
         }));
 
         assert!(result.is_err());
-        assert_eq!(frame_ctx.expect_vmap().frozen_mutation_version(), 2);
+        assert_eq!(row_ver.frozen_mutation_version(), 2);
     }
 
     #[test]
@@ -1619,13 +1687,11 @@ mod tests {
         let page = row_page_with_two_rows(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         *row_ver.write_state() = RowPageState::Frozen;
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let row_ver = frame_ctx.expect_vmap();
         let dirty = AtomicBool::new(false);
 
-        let first = test_row_write_access(&page, &frame_ctx, &dirty, 0);
+        let first = test_row_write_access(&page, &row_ver, &dirty, 0);
         assert_eq!(row_ver.frozen_mutation_version(), 1);
-        let second = test_row_write_access(&page, &frame_ctx, &dirty, 1);
+        let second = test_row_write_access(&page, &row_ver, &dirty, 1);
         assert_eq!(row_ver.frozen_mutation_version(), 2);
 
         drop(first);
@@ -1640,8 +1706,6 @@ mod tests {
         let metadata = sparse_metadata();
         let page = row_page_with_two_rows(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let row_ver = frame_ctx.expect_vmap();
         let dirty = AtomicBool::new(false);
         assert_eq!(row_ver.inspect_state(), RowPageState::Active);
 
@@ -1650,11 +1714,11 @@ mod tests {
                 .is_ok()
         );
         {
-            let _access = test_row_write_access(&page, &frame_ctx, &dirty, 0);
+            let _access = test_row_write_access(&page, &row_ver, &dirty, 0);
             page.update_col(metadata.col.as_ref(), 0, 0, &Val::from(11i32), 0, true);
         }
         {
-            let mut access = test_row_write_access(&page, &frame_ctx, &dirty, 1);
+            let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
             access.delete_row();
         }
 
@@ -1667,7 +1731,7 @@ mod tests {
         )));
         // Statement rollback and full transaction rollback share this row
         // restoration boundary, so exercise two independent rollback passes.
-        test_row_write_access(&page, &frame_ctx, &dirty, 0)
+        test_row_write_access(&page, &row_ver, &dirty, 0)
             .rollback_first_undo(&metadata, rollback_undo);
         let trx_rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
@@ -1675,7 +1739,7 @@ mod tests {
             Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 11)),
             trx_rollback_undo.leak(),
         )));
-        test_row_write_access(&page, &frame_ctx, &dirty, 0)
+        test_row_write_access(&page, &row_ver, &dirty, 0)
             .rollback_first_undo(&metadata, trx_rollback_undo);
 
         let purge_undo =
@@ -1684,7 +1748,7 @@ mod tests {
             Arc::new(SharedTrxStatus::new(TrxID::new(20))),
             purge_undo.leak(),
         )));
-        test_row_write_access(&page, &frame_ctx, &dirty, 1).purge_undo_chain(TrxID::new(21));
+        test_row_write_access(&page, &row_ver, &dirty, 1).purge_undo_chain(TrxID::new(21));
 
         assert_eq!(row_ver.frozen_mutation_version(), 0);
     }
@@ -1695,8 +1759,6 @@ mod tests {
         let page = row_page_with_two_rows(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         *row_ver.write_state() = RowPageState::Frozen;
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let row_ver = frame_ctx.expect_vmap();
         let dirty = AtomicBool::new(false);
         let repeated_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 9));
         let repeated_first_undo =
@@ -1713,13 +1775,13 @@ mod tests {
         )));
 
         {
-            let mut access = test_row_write_access(&page, &frame_ctx, &dirty, 0);
+            let mut access = test_row_write_access(&page, &row_ver, &dirty, 0);
             assert_eq!(row_ver.frozen_mutation_version(), 1);
             access.delete_row();
         }
         assert_eq!(row_ver.frozen_mutation_version(), 2);
         {
-            let mut access = test_row_write_access(&page, &frame_ctx, &dirty, 1);
+            let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
             assert_eq!(row_ver.frozen_mutation_version(), 3);
             access.delete_row();
         }
@@ -1735,7 +1797,7 @@ mod tests {
         let prepared_version = row_ver.frozen_mutation_version();
         // First model statement rollback of the current undo entry.
         {
-            let mut access = test_row_write_access(&page, &frame_ctx, &dirty, 0);
+            let mut access = test_row_write_access(&page, &row_ver, &dirty, 0);
             assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 1);
             access.rollback_first_undo(&metadata, rollback_undo);
         }
@@ -1749,7 +1811,7 @@ mod tests {
         )));
         let prepared_version = row_ver.frozen_mutation_version();
         // Then model the identical boundary reached by transaction rollback.
-        test_row_write_access(&page, &frame_ctx, &dirty, 0)
+        test_row_write_access(&page, &row_ver, &dirty, 0)
             .rollback_first_undo(&metadata, trx_rollback_undo);
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
@@ -1761,7 +1823,7 @@ mod tests {
         )));
         let prepared_version = row_ver.frozen_mutation_version();
         {
-            let mut access = test_row_write_access(&page, &frame_ctx, &dirty, 1);
+            let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);
             assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 1);
             access.purge_undo_chain(TrxID::new(21));
         }
@@ -1772,8 +1834,8 @@ mod tests {
     fn test_read_row_latest_inactive_index_returns_invalid_index() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(0)));
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let rec_map = RowRecoveryMap::new(TrxID::new(0));
+        let access = test_recovery_row_read_access(&page, &rec_map, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
         let res = access.read_row_latest(&metadata, &[0], Some((key.index_no, &key.vals)));
@@ -1800,8 +1862,7 @@ mod tests {
             Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99)),
             undo.leak(),
         )));
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
@@ -1814,8 +1875,8 @@ mod tests {
     fn test_any_version_matches_key_inactive_index_returns_false() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(0)));
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let rec_map = RowRecoveryMap::new(TrxID::new(0));
+        let access = test_recovery_row_read_access(&page, &rec_map, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
         assert!(!access.any_version_matches_key(&metadata, key.index_no, &key.vals));
@@ -1825,8 +1886,8 @@ mod tests {
     fn test_any_version_matches_key_latest_page_row_returns_true() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(0)));
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let rec_map = RowRecoveryMap::new(TrxID::new(0));
+        let access = test_recovery_row_read_access(&page, &rec_map, 0);
         let key = SelectKey::new(0, vec![Val::from(10i32)]);
 
         assert!(access.any_version_matches_key(&metadata, key.index_no, &key.vals));
@@ -1854,8 +1915,7 @@ mod tests {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
-        let frame_ctx = FrameContext::RowVerMap(row_ver);
-        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let access = test_row_read_access(&page, &row_ver, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
