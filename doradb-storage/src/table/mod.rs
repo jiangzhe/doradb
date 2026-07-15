@@ -49,7 +49,6 @@ use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
-use crate::trx::undo::{IndexBranch, RowUndoKind};
 use crate::trx::{TrxContext, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
@@ -923,35 +922,9 @@ impl SecondaryIndexScopedBuilder {
     }
 }
 
-enum InsertRowIntoPage {
-    Ok(RowID, PageSharedGuard<RowPage>),
-    NoSpaceOrFrozen(Vec<Val>, RowUndoKind, Vec<IndexBranch>),
-}
-
-enum UpdateRowInplace {
-    // We keep row page lock if there is any index change,
-    // so we can read latest values from page.
-    // The hash map stores the changed column number and its old value.
-    // for other columns in the changed index, we can read value(old and new are same)
-    // from current page.
-    Ok(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>),
-    RowNotFound(RowUpdateInput),
-    RowDeleted(RowUpdateInput),
-    WriteConflict,
-    RetryInTransition(RowUpdateInput),
-    NoFreeSpace(RowID, Vec<Val>, RowUpdateInput, PageSharedGuard<RowPage>),
-}
-
 enum UpdateUniqueMvcc {
     Updated(RowID),
     NotFound(RowUpdateInput),
-}
-
-enum DeleteInternal {
-    Ok(PageSharedGuard<RowPage>),
-    NotFound,
-    WriteConflict,
-    RetryInTransition,
 }
 
 /// Build user-table dual-tree secondary indexes from fresh MemIndex backends

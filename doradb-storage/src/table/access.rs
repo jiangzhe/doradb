@@ -1,5 +1,8 @@
 use super::{
-    hot::{HotRowDeleter, HotRowUpdater, RowInserter, read_hot_row_mvcc},
+    hot::{
+        DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
+        read_hot_row_mvcc,
+    },
     missing_secondary_index,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
@@ -28,10 +31,9 @@ use crate::row::ops::{
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
-    ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
-    DmlValidationDomain, DmlValidator, InsertRowIntoPage, MemTable, RowPageDescriptor, Table,
-    TableRootSnapshot, TableRuntimeLayout, UpdateRowInplace, UpdateUniqueMvcc,
-    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
+    ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionError, DmlValidationDomain,
+    DmlValidator, MemTable, RowPageDescriptor, Table, TableRootSnapshot, TableRuntimeLayout,
+    UpdateUniqueMvcc, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
     unique_key_from_full_row,
 };
 use crate::trx::row::{FindOldVersion, IndexCandidateRecheck, ReadLatestRow, RowReadAccess};
@@ -1147,8 +1149,10 @@ impl<'a> UserTableAccessor<'a> {
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> Result<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
-        let prepared = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-            .prepare_move_update(old_row, update, old_id, old_guard);
+        let prepared = HotRowMutator::new(self.table_id(), self.metadata(), rt, &old_guard, old_id)
+            .prepare_move_update(old_row, update);
+        // Release the old row page before awaiting replacement-row insertion.
+        drop(old_guard);
         let (new_row_id, new_guard) = self
             .insert_row_internal(
                 rt,
@@ -2708,16 +2712,11 @@ impl<'a> UserTableAccessor<'a> {
         update: Vec<UpdateCol>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<Option<InsertedRow>> {
-        match HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-            .update_known_row(
-                effects,
-                page_guard,
-                row_id,
-                RowUpdateInput::Sparse(update),
-            )
-            .await
-        {
-            UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
+        let result = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
+            .update_known_row(effects, RowUpdateInput::Sparse(update))
+            .await?;
+        match result {
+            UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
                 debug_assert_eq!(row_id, new_row_id);
                 if !index_change_cols.is_empty() {
                     self.update_indexes_only_key_change(
@@ -2738,9 +2737,6 @@ impl<'a> UserTableAccessor<'a> {
                     .attach("full-table update hot row changed after visibility")
                     .into())
             }
-            UpdateRowInplace::WriteConflict => Err(Report::new(OperationError::WriteConflict)
-                .attach("full-table update hot row write lock")
-                .into()),
             UpdateRowInplace::RetryInTransition(_) => {
                 Err(Report::new(InternalError::FullTableUpdateTransitionPage)
                     .attach(format!(
@@ -2748,7 +2744,7 @@ impl<'a> UserTableAccessor<'a> {
                     ))
                     .into())
             }
-            UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
+            UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, update) => {
                 let (new_row_id, index_change_cols, new_guard) = self
                     .move_update_for_space(
                         rt,
@@ -2756,7 +2752,7 @@ impl<'a> UserTableAccessor<'a> {
                         old_row,
                         update,
                         old_row_id,
-                        old_guard,
+                        page_guard,
                     )
                     .await?;
                 let result = if index_change_cols.is_empty() {
@@ -3204,13 +3200,11 @@ impl<'a> UserTableAccessor<'a> {
                     }
                 }
             };
-            let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-                .update_inplace(
-                    effects, page_guard, index_no, key_vals, row_id, input, log_by_key,
-                )
-                .await;
+            let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
+                .update_inplace(effects, index_no, key_vals, input, log_by_key)
+                .await?;
             match res {
-                UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
+                UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
                     debug_assert!(row_id == new_row_id);
                     if !index_change_cols.is_empty() {
                         // RowID is unchanged, but logical keys may have moved.
@@ -3234,16 +3228,13 @@ impl<'a> UserTableAccessor<'a> {
                 UpdateRowInplace::RowDeleted(input) | UpdateRowInplace::RowNotFound(input) => {
                     return Ok(UpdateUniqueMvcc::NotFound(input));
                 }
-                UpdateRowInplace::WriteConflict => {
-                    return Err(Report::new(OperationError::WriteConflict)
-                        .attach("update MVCC row-page write lock")
-                        .into());
-                }
                 UpdateRowInplace::RetryInTransition(returned_input) => {
                     input = returned_input;
+                    // Release the row page so the checkpoint transition can complete.
+                    drop(page_guard);
                     self.wait_transition_route_or_poison(rt, row_id).await?;
                 }
-                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, returned_input, old_guard) => {
+                UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, returned_input) => {
                     // In-place update failed after the old row was locked and
                     // marked deleted. Finish the move update by inserting the
                     // replacement row and then update indexes for any RowID or
@@ -3255,7 +3246,7 @@ impl<'a> UserTableAccessor<'a> {
                             old_row,
                             returned_input,
                             old_row_id,
-                            old_guard,
+                            page_guard,
                         )
                         .await?;
                     if !index_change_cols.is_empty() {
@@ -3385,7 +3376,9 @@ impl<'a> UserTableAccessor<'a> {
                                     return Ok(DeleteMvcc::Deleted);
                                 }
                                 Err(DeletionError::WriteConflict) => {
-                                    return Ok(DeleteMvcc::WriteConflict);
+                                    return Err(Report::new(OperationError::WriteConflict)
+                                        .attach("delete MVCC cold delete marker ownership")
+                                        .into());
                                 }
                                 Err(DeletionError::AlreadyDeleted) => {
                                     return Ok(DeleteMvcc::NotFound);
@@ -3413,16 +3406,17 @@ impl<'a> UserTableAccessor<'a> {
                     }
                 }
             };
-            match HotRowDeleter::new(self.table_id(), self.metadata(), rt)
-                .delete(effects, page_guard, row_id, index_no, key_vals, log_by_key)
-                .await
-            {
+            let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
+                .delete(effects, index_no, key_vals, log_by_key)
+                .await?;
+            match res {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
-                DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
+                    // Release the row page so the checkpoint transition can complete.
+                    drop(page_guard);
                     self.wait_transition_route_or_poison(rt, row_id).await?;
                 }
-                DeleteInternal::Ok(page_guard) => {
+                DeleteInternal::Ok => {
                     // Mask every secondary-index entry for this hot row. The
                     // physical index entry remains until rollback unmasks it
                     // or index GC removes it after it is no longer visible.
@@ -3658,11 +3652,11 @@ mod tests {
         SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
     };
     use crate::table::checkpoint_workflow::CheckpointPublicationGuard;
-    use crate::table::hot::{HotRowDeleter, HotRowUpdater, RowInserter};
-    use crate::table::tests::*;
-    use crate::table::{
-        CheckpointOutcome, DeleteInternal, FreezeOutcome, InsertRowIntoPage, UpdateRowInplace,
+    use crate::table::hot::{
+        DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
     };
+    use crate::table::tests::*;
+    use crate::table::{CheckpointOutcome, FreezeOutcome};
     use crate::table::{ColumnDeletionBuffer, DeleteMarker};
     use crate::trx::row::{LockRowForWrite, ReadLatestRow};
     use crate::trx::stmt::tests as stmt_tests;
@@ -4469,8 +4463,10 @@ mod tests {
 
             let mut session2 = engine.new_session().unwrap();
             let mut trx2 = session2.begin_trx().unwrap();
-            let res2 = trx_delete_row_by_id(&mut trx2, table_id, &key).await;
-            assert!(matches!(res2, Ok(DeleteMvcc::WriteConflict)));
+            let err = trx_delete_row_by_id(&mut trx2, table_id, &key)
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
             trx2.rollback().await.unwrap();
             drop(session2);
 
@@ -4560,8 +4556,10 @@ mod tests {
             })
             .await;
 
-            let res = trx_delete_row_by_id(&mut writer, table_id, &key).await;
-            assert!(matches!(res, Ok(DeleteMvcc::WriteConflict)));
+            let err = trx_delete_row_by_id(&mut writer, table_id, &key)
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
             writer.rollback().await.unwrap();
 
             expect_select_not_found_committed(table_id, &mut session, &key).await;
@@ -5335,17 +5333,21 @@ mod tests {
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();
                     let accessor = table.accessor_with_layout(&layout);
-                    let res = HotRowUpdater::new(accessor.table_id(), accessor.metadata(), rt)
-                        .update_inplace(
-                            effects,
-                            page_guard,
-                            key.index_no,
-                            &key.vals,
-                            row_id,
-                            RowUpdateInput::Sparse(update),
-                            false,
-                        )
-                        .await;
+                    let res = HotRowMutator::new(
+                        accessor.table_id(),
+                        accessor.metadata(),
+                        rt,
+                        &page_guard,
+                        row_id,
+                    )
+                    .update_inplace(
+                        effects,
+                        key.index_no,
+                        &key.vals,
+                        RowUpdateInput::Sparse(update),
+                        false,
+                    )
+                    .await?;
                     assert!(matches!(res, UpdateRowInplace::RetryInTransition(_)));
                     Err(Report::new(OperationError::NotSupported).into())
                 })
@@ -5378,9 +5380,15 @@ mod tests {
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();
                     let accessor = table.accessor_with_layout(&layout);
-                    let res = HotRowDeleter::new(accessor.table_id(), accessor.metadata(), rt)
-                        .delete(effects, page_guard, row_id, key.index_no, &key.vals, false)
-                        .await;
+                    let res = HotRowMutator::new(
+                        accessor.table_id(),
+                        accessor.metadata(),
+                        rt,
+                        &page_guard,
+                        row_id,
+                    )
+                    .delete(effects, key.index_no, &key.vals, false)
+                    .await?;
                     assert!(matches!(res, DeleteInternal::RetryInTransition));
                     Err(Report::new(OperationError::NotSupported).into())
                 })
@@ -6705,15 +6713,15 @@ mod tests {
                     // undo entry at the row's undo head. That entry is the
                     // row-level write lock and the rollback anchor that is
                     // later rewritten to Insert/Update/Delete.
-                    let mut lock_row =
-                        HotRowUpdater::new(accessor.table_id(), accessor.metadata(), rt)
-                            .lock_for_write(
-                                effects,
-                                &page_guard,
-                                row_id,
-                                Some((key.index_no, &key.vals)),
-                            )
-                            .await;
+                    let mut lock_row = HotRowMutator::new(
+                        accessor.table_id(),
+                        accessor.metadata(),
+                        rt,
+                        &page_guard,
+                        row_id,
+                    )
+                    .lock_for_write(effects, Some((key.index_no, &key.vals)))
+                    .await;
                     match &mut lock_row {
                         LockRowForWrite::Ok(access) => {
                             drop(access.take());
