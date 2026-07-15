@@ -1143,9 +1143,13 @@ pub(crate) async fn create_table_for_session(
     let mut trx = match session.begin_trx().attach("operation=create_table") {
         Ok(trx) => trx,
         Err(err) => {
-            let delete_res = progress.delete_provisional_file(&engine);
+            let err = match progress.delete_provisional_file(&engine) {
+                Ok(()) => err,
+                Err(cleanup_err) => err.attach(cleanup_err).attach(format!(
+                    "create table provisional-file cleanup failed: table_id={table_id}"
+                )),
+            };
             progress.phase = CreateTablePhase::Aborted;
-            delete_res?;
             return Err(err.into());
         }
     };

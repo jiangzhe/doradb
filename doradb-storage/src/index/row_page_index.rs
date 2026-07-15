@@ -1566,9 +1566,6 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
             };
             if matches!(step, TraverseStep::Leaf) {
                 // share lock for read
-                if let Some(parent) = self.parent.take() {
-                    self.parent = Some(parent);
-                }
                 let lock_result = match g.try_shared_either() {
                     Valid(lock_result) => lock_result,
                     Invalid => return Ok(Invalid),
