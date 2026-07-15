@@ -459,7 +459,6 @@ pub(crate) enum Delete {
 pub enum DeleteMvcc {
     Deleted,
     NotFound,
-    WriteConflict,
 }
 
 impl DeleteMvcc {

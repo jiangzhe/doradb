@@ -1,7 +1,6 @@
 use super::{
-    DeleteInternal, DmlValidationDomain, DmlValidator, InsertRowIntoPage, UpdateRowInplace,
-    UpdateUniqueMvcc,
-    hot::{HotRowDeleter, HotRowUpdater, RowInserter},
+    DmlValidationDomain, DmlValidator, UpdateUniqueMvcc,
+    hot::{DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace},
     index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
     row_len, unique_key_from_full_row, validate_page_row_range,
 };
@@ -1900,13 +1899,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     Err(err) => return Err(err),
                 },
             };
-            let res = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-                .update_inplace(
-                    effects, page_guard, index_no, key_vals, row_id, input, log_by_key,
-                )
-                .await;
+            let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
+                .update_inplace(effects, index_no, key_vals, input, log_by_key)
+                .await?;
             match res {
-                UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
+                UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
                     debug_assert!(row_id == new_row_id);
                     if !index_change_cols.is_empty() {
                         let result = self
@@ -1926,11 +1923,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 UpdateRowInplace::RowDeleted(input) | UpdateRowInplace::RowNotFound(input) => {
                     return Ok(UpdateUniqueMvcc::NotFound(input));
                 }
-                UpdateRowInplace::WriteConflict => {
-                    return Err(Report::new(OperationError::WriteConflict)
-                        .attach("update MVCC row-page write lock")
-                        .into());
-                }
                 UpdateRowInplace::RetryInTransition(returned_input) => {
                     let _ = returned_input;
                     // Standalone/catalog MemTable owns hot row-store state
@@ -1940,7 +1932,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         .attach("standalone MemTable update observed TRANSITION row page")
                         .into());
                 }
-                UpdateRowInplace::NoFreeSpace(old_row_id, old_row, returned_input, old_guard) => {
+                UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, returned_input) => {
                     let (new_row_id, index_change_cols, new_guard) = self
                         .move_update_for_space(
                             rt,
@@ -1948,7 +1940,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                             old_row,
                             returned_input,
                             old_row_id,
-                            old_guard,
+                            page_guard,
                         )
                         .await?;
                     if !index_change_cols.is_empty() {
@@ -1987,8 +1979,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> Result<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
-        let prepared = HotRowUpdater::new(self.table_id(), self.metadata(), rt)
-            .prepare_move_update(old_row, update, old_id, old_guard);
+        let prepared = HotRowMutator::new(self.table_id(), self.metadata(), rt, &old_guard, old_id)
+            .prepare_move_update(old_row, update);
+        // Release the old row page before awaiting replacement-row insertion.
+        drop(old_guard);
         let (new_row_id, new_guard) = self
             .insert_row_internal(
                 rt,
@@ -2456,21 +2450,18 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     Err(err) => return Err(err),
                 },
             };
-            match HotRowDeleter::new(self.table_id(), self.metadata(), rt)
-                .delete(effects, page_guard, row_id, index_no, key_vals, log_by_key)
-                .await
-            {
+            let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
+                .delete(effects, index_no, key_vals, log_by_key)
+                .await?;
+            match res {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
-                DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
                     // Standalone/catalog MemTable owns hot row-store state
                     // only. Without user-table column storage and checkpoint
                     // route publication, TRANSITION is not a valid state here.
-                    return Err(Report::new(InternalError::Generic)
-                        .attach("standalone MemTable delete observed TRANSITION row page")
-                        .into());
+                    unreachable!("standalone MemTable delete observed TRANSITION row page");
                 }
-                DeleteInternal::Ok(page_guard) => {
+                DeleteInternal::Ok => {
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard)
                         .await?;
                     return Ok(DeleteMvcc::Deleted);

@@ -1,5 +1,6 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::TableMetadata;
+use crate::error::{OperationError, OperationResult};
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
@@ -7,14 +8,41 @@ use crate::row::ops::{
     ReadRow, RowUpdateInput, SelectKey, SelectMvcc, UndoCol, UpdateCol, UpdateRow,
 };
 use crate::row::{RowPage, RowRead, var_len_for_insert};
-use crate::table::{DeleteInternal, InsertRowIntoPage, UpdateRowInplace};
 use crate::trx::TrxRuntime;
 use crate::trx::row::{LockRowForWrite, LockUndo};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::value::Val;
+use error_stack::Report;
 use std::mem::replace;
+
+/// Result of inserting a row into one hot row page.
+pub(super) enum InsertRowIntoPage {
+    Ok(RowID, PageSharedGuard<RowPage>),
+    NoSpaceOrFrozen(Vec<Val>, RowUndoKind, Vec<IndexBranch>),
+}
+
+/// Result of updating one hot row in place.
+pub(super) enum UpdateRowInplace {
+    // The caller keeps the row page lock if there is any index change,
+    // so it can read latest values from page.
+    // The hash map stores the changed column number and its old value.
+    // for other columns in the changed index, we can read value(old and new are same)
+    // from current page.
+    Ok(RowID, FastHashMap<usize, Val>),
+    RowNotFound(RowUpdateInput),
+    RowDeleted(RowUpdateInput),
+    RetryInTransition(RowUpdateInput),
+    NoFreeSpaceOrFrozen(RowID, Vec<Val>, RowUpdateInput),
+}
+
+/// Result of deleting one hot row.
+pub(super) enum DeleteInternal {
+    Ok,
+    NotFound,
+    RetryInTransition,
+}
 
 /// Hot row-page insert context shared by catalog and user-table accessors.
 pub(super) struct RowInserter<'m, 'r> {
@@ -121,80 +149,6 @@ impl<'m, 'r> RowInserter<'m, 'r> {
     }
 }
 
-/// Hot row-page delete context shared by catalog and user-table accessors.
-pub(super) struct HotRowDeleter<'m, 'r> {
-    metadata: &'m TableMetadata,
-    table_id: TableID,
-    rt: TrxRuntime<'r>,
-}
-
-impl<'m, 'r> HotRowDeleter<'m, 'r> {
-    /// Create a hot-row deleter for one metadata snapshot and transaction.
-    #[inline]
-    pub(super) fn new(table_id: TableID, metadata: &'m TableMetadata, rt: TrxRuntime<'r>) -> Self {
-        Self {
-            metadata,
-            table_id,
-            rt,
-        }
-    }
-
-    /// Delete one hot row after validating that the row belongs to the page.
-    #[inline]
-    pub(super) async fn delete(
-        &self,
-        effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
-        row_id: RowID,
-        index_no: usize,
-        key_vals: &[Val],
-        log_by_key: bool,
-    ) -> DeleteInternal {
-        let page_id = page_guard.page_id();
-        let page = page_guard.page();
-        if !page.row_id_in_valid_range(row_id) {
-            return DeleteInternal::NotFound;
-        }
-        // The undo-head lock is the conflict check for hot delete. Once the
-        // lock is owned, the row-page delete bit becomes the latest image and
-        // the same undo entry is rewritten to `Delete`.
-        let mut lock_row = HotRowUpdater::new(self.table_id, self.metadata, self.rt)
-            .lock_for_write(effects, &page_guard, row_id, Some((index_no, key_vals)))
-            .await;
-        match &mut lock_row {
-            LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
-            LockRowForWrite::WriteConflict => DeleteInternal::WriteConflict,
-            LockRowForWrite::RetryInTransition => DeleteInternal::RetryInTransition,
-            LockRowForWrite::Ok(access) => {
-                let mut access = access
-                    .take()
-                    .expect("successful hot-row write lock must provide row write access");
-                if access.row().is_deleted() {
-                    return DeleteInternal::NotFound;
-                }
-                access.delete_row();
-                // update LOCK entry to DELETE entry.
-                effects.update_last_row_undo(RowUndoKind::Delete);
-                drop(access); // unlock row.
-                drop(lock_row);
-                // hold page lock in order to update index later.
-                // create redo log.
-                let redo_entry = RowRedo {
-                    page_id,
-                    row_id,
-                    kind: if log_by_key {
-                        RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
-                    } else {
-                        RowRedoKind::Delete
-                    },
-                };
-                effects.insert_row_redo(self.table_id, redo_entry);
-                DeleteInternal::Ok(page_guard)
-            }
-        }
-    }
-}
-
 /// Prepared replacement state for a hot-row move update.
 pub(super) struct PreparedHotMoveUpdate {
     /// Replacement row values to insert as the new hot row.
@@ -205,34 +159,44 @@ pub(super) struct PreparedHotMoveUpdate {
     pub(super) index_branches: Vec<IndexBranch>,
 }
 
-/// Hot row-page update context shared by catalog and user-table accessors.
-pub(super) struct HotRowUpdater<'m, 'r> {
+/// Hot row-page mutation context shared by catalog and user-table accessors.
+pub(super) struct HotRowMutator<'m, 'r, 'g> {
     metadata: &'m TableMetadata,
     table_id: TableID,
     rt: TrxRuntime<'r>,
+    page_guard: &'g PageSharedGuard<RowPage>,
+    row_id: RowID,
 }
 
-impl<'m, 'r> HotRowUpdater<'m, 'r> {
-    /// Create a hot-row updater for one metadata snapshot and transaction.
+impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
+    /// Create a hot-row mutator for one page row, metadata snapshot, and transaction.
     #[inline]
-    pub(super) fn new(table_id: TableID, metadata: &'m TableMetadata, rt: TrxRuntime<'r>) -> Self {
+    pub(super) fn new(
+        table_id: TableID,
+        metadata: &'m TableMetadata,
+        rt: TrxRuntime<'r>,
+        page_guard: &'g PageSharedGuard<RowPage>,
+        row_id: RowID,
+    ) -> Self {
         Self {
             metadata,
             table_id,
             rt,
+            page_guard,
+            row_id,
         }
     }
 
     /// Lock a hot row by installing a provisional row undo entry.
     #[expect(clippy::await_holding_lock, reason = "clippy false positive")]
     #[inline]
-    pub(super) async fn lock_for_write<'b>(
+    pub(super) async fn lock_for_write(
         &self,
         effects: &mut StmtEffects,
-        page_guard: &'b PageSharedGuard<RowPage>,
-        row_id: RowID,
         key: Option<(usize, &[Val])>,
-    ) -> LockRowForWrite<'b> {
+    ) -> LockRowForWrite<'g> {
+        let page_guard = self.page_guard;
+        let row_id = self.row_id;
         let page = page_guard.page();
         let ver_map = page_guard.unwrap_vmap();
         loop {
@@ -281,32 +245,75 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         }
     }
 
+    /// Delete the hot row after validating that it belongs to the page.
+    #[inline]
+    pub(super) async fn delete(
+        &self,
+        effects: &mut StmtEffects,
+        index_no: usize,
+        key_vals: &[Val],
+        log_by_key: bool,
+    ) -> OperationResult<DeleteInternal> {
+        let page_guard = self.page_guard;
+        let row_id = self.row_id;
+        let page_id = page_guard.page_id();
+        let page = page_guard.page();
+        if !page.row_id_in_valid_range(row_id) {
+            return Ok(DeleteInternal::NotFound);
+        }
+        // The undo-head lock is the conflict check for hot delete. Once the
+        // lock is owned, the row-page delete bit becomes the latest image and
+        // the same undo entry is rewritten to `Delete`.
+        let mut lock_row = self
+            .lock_for_write(effects, Some((index_no, key_vals)))
+            .await;
+        match &mut lock_row {
+            LockRowForWrite::InvalidIndex => Ok(DeleteInternal::NotFound),
+            LockRowForWrite::WriteConflict => Err(Report::new(OperationError::WriteConflict)
+                .attach("delete MVCC row-page write lock")),
+            LockRowForWrite::RetryInTransition => Ok(DeleteInternal::RetryInTransition),
+            LockRowForWrite::Ok(access) => {
+                let mut access = access
+                    .take()
+                    .expect("successful hot-row write lock must provide row write access");
+                if access.row().is_deleted() {
+                    return Ok(DeleteInternal::NotFound);
+                }
+                access.delete_row();
+                // update LOCK entry to DELETE entry.
+                effects.update_last_row_undo(RowUndoKind::Delete);
+                drop(access); // unlock row.
+                drop(lock_row);
+                // The caller retains the page lock in order to update indexes later.
+                // create redo log.
+                let redo_entry = RowRedo {
+                    page_id,
+                    row_id,
+                    kind: if log_by_key {
+                        RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
+                    } else {
+                        RowRedoKind::Delete
+                    },
+                };
+                effects.insert_row_redo(self.table_id, redo_entry);
+                Ok(DeleteInternal::Ok)
+            }
+        }
+    }
+
     /// Update a locked hot row in place, or report move-update state.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "hot row updates require row, key, update, and logging context"
-    )]
     #[inline]
     pub(super) async fn update_inplace(
         &self,
         effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
         index_no: usize,
         key_vals: &[Val],
-        row_id: RowID,
         update: RowUpdateInput,
         log_by_key: bool,
-    ) -> UpdateRowInplace {
+    ) -> OperationResult<UpdateRowInplace> {
         let redo_key = log_by_key.then(|| SelectKey::new(index_no, key_vals.to_vec()));
-        self.update_known_row_inner(
-            effects,
-            page_guard,
-            row_id,
-            update,
-            Some((index_no, key_vals)),
-            redo_key,
-        )
-        .await
+        self.update_known_row_inner(effects, update, Some((index_no, key_vals)), redo_key)
+            .await
     }
 
     /// Update one known page/row without revalidating an index lookup key.
@@ -314,11 +321,9 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
     pub(super) async fn update_known_row(
         &self,
         effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
-        row_id: RowID,
         update: RowUpdateInput,
-    ) -> UpdateRowInplace {
-        self.update_known_row_inner(effects, page_guard, row_id, update, None, None)
+    ) -> OperationResult<UpdateRowInplace> {
+        self.update_known_row_inner(effects, update, None, None)
             .await
     }
 
@@ -326,12 +331,12 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
     async fn update_known_row_inner(
         &self,
         effects: &mut StmtEffects,
-        page_guard: PageSharedGuard<RowPage>,
-        row_id: RowID,
         update: RowUpdateInput,
         lookup_key: Option<(usize, &[Val])>,
         redo_key: Option<SelectKey>,
-    ) -> UpdateRowInplace {
+    ) -> OperationResult<UpdateRowInplace> {
+        let page_guard = self.page_guard;
+        let row_id = self.row_id;
         let page_id = page_guard.page_id();
         let page = page_guard.page();
         debug_assert!(
@@ -341,19 +346,18 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         if row_id < page.header.start_row_id
             || row_id >= page.header.start_row_id + page.header.max_row_count as u64
         {
-            return UpdateRowInplace::RowNotFound(update);
+            return Ok(UpdateRowInplace::RowNotFound(update));
         }
         // Modification is a current read: update the latest physical page
         // image, never an older version reconstructed from MVCC undo. The image
         // must remain stable until the undo-head lock is installed. The lock
         // path also rejects stale index candidates whose latest key differs.
-        let mut lock_row = self
-            .lock_for_write(effects, &page_guard, row_id, lookup_key)
-            .await;
+        let mut lock_row = self.lock_for_write(effects, lookup_key).await;
         match &mut lock_row {
-            LockRowForWrite::InvalidIndex => UpdateRowInplace::RowNotFound(update),
-            LockRowForWrite::WriteConflict => UpdateRowInplace::WriteConflict,
-            LockRowForWrite::RetryInTransition => UpdateRowInplace::RetryInTransition(update),
+            LockRowForWrite::InvalidIndex => Ok(UpdateRowInplace::RowNotFound(update)),
+            LockRowForWrite::WriteConflict => Err(Report::new(OperationError::WriteConflict)
+                .attach("update MVCC row-page write lock")),
+            LockRowForWrite::RetryInTransition => Ok(UpdateRowInplace::RetryInTransition(update)),
             LockRowForWrite::Ok(access) => {
                 let mut access = access
                     .take()
@@ -362,88 +366,90 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
                 if access.row().is_deleted() {
                     drop(access);
                     drop(lock_row);
-                    return UpdateRowInplace::RowDeleted(update);
+                    return Ok(UpdateRowInplace::RowDeleted(update));
                 }
-                match access.update_row(self.metadata.col.as_ref(), update.as_view(), frozen) {
-                    UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
-                        // The hot row cannot be updated in place because the
-                        // page has no reusable space or has been frozen for
-                        // tuple movement. Convert this statement into a move
-                        // update: delete the old RowID with undo, insert the
-                        // replacement as a new hot RowID, and connect unique
-                        // owners with runtime branches when older snapshots
-                        // may still need the old version.
-                        //
-                        // Mark page data as deleted.
-                        access.delete_row();
-                        // Update LOCK entry to DELETE entry.
-                        effects.update_last_row_undo(RowUndoKind::Delete);
-                        drop(access); // unlock row
-                        drop(lock_row);
-                        // Here we do not unlock page because we need to perform out-of-place
-                        // update and link undo entries of two rows via index branches.
-                        // The re-lock of current undo is required.
-                        let redo_entry = RowRedo {
-                            page_id,
-                            row_id,
-                            // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
-                            kind: redo_key
-                                .clone()
-                                .map(RowRedoKind::DeleteByPrimaryKey)
-                                .unwrap_or(RowRedoKind::Delete),
-                        };
-                        effects.insert_row_redo(self.table_id, redo_entry);
-                        UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
-                    }
-                    UpdateRow::Ok(mut row) => {
-                        // In-place update keeps the RowID stable. Changed new
-                        // values are moved into redo on the successful path.
-                        let mut index_change_cols = FastHashMap::default();
-                        // perform in-place update.
-                        let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
-                        for UpdateCol { idx, val } in update {
-                            if let Some((old_val, var_offset)) =
-                                row.different(self.metadata.col.as_ref(), idx, &val)
-                            {
-                                // we also check whether the value change is related to any index,
-                                // so we can update index later.
-                                if self.metadata.idx.index_columns().contains(&idx) {
-                                    index_change_cols.insert(idx, old_val.clone());
-                                }
-                                // actual update
-                                row.update_col(self.metadata.col.as_ref(), idx, &val);
-                                // record undo and redo
-                                undo_cols.push(UndoCol {
-                                    idx,
-                                    val: old_val,
-                                    var_offset,
-                                });
-                                redo_cols.push(UpdateCol { idx, val });
-                            }
-                        }
-                        // The provisional row lock now becomes the operation
-                        // kind that MVCC reads and rollback will interpret.
-                        effects.update_last_row_undo(RowUndoKind::Update(undo_cols));
-                        drop(access); // unlock the row.
-                        drop(lock_row);
-                        // we may still need this page if we'd like to update index.
-                        if !redo_cols.is_empty() {
-                            // A no-op update still used a row lock, but only a
-                            // real value change needs redo.
+                Ok(
+                    match access.update_row(self.metadata.col.as_ref(), update.as_view(), frozen) {
+                        UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
+                            // The hot row cannot be updated in place because the
+                            // page has no reusable space or has been frozen for
+                            // tuple movement. Convert this statement into a move
+                            // update: delete the old RowID with undo, insert the
+                            // replacement as a new hot RowID, and connect unique
+                            // owners with runtime branches when older snapshots
+                            // may still need the old version.
+                            //
+                            // Mark page data as deleted.
+                            access.delete_row();
+                            // Update LOCK entry to DELETE entry.
+                            effects.update_last_row_undo(RowUndoKind::Delete);
+                            drop(access); // unlock row
+                            drop(lock_row);
+                            // Here we do not unlock page because we need to perform out-of-place
+                            // update and link undo entries of two rows via index branches.
+                            // The re-lock of current undo is required.
                             let redo_entry = RowRedo {
                                 page_id,
                                 row_id,
+                                // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
                                 kind: redo_key
-                                    .map(|key| {
-                                        RowRedoKind::UpdateByPrimaryKey(key, redo_cols.clone())
-                                    })
-                                    .unwrap_or(RowRedoKind::Update(redo_cols)),
+                                    .clone()
+                                    .map(RowRedoKind::DeleteByPrimaryKey)
+                                    .unwrap_or(RowRedoKind::Delete),
                             };
                             effects.insert_row_redo(self.table_id, redo_entry);
+                            UpdateRowInplace::NoFreeSpaceOrFrozen(row_id, old_row, update)
                         }
-                        UpdateRowInplace::Ok(row_id, index_change_cols, page_guard)
-                    }
-                }
+                        UpdateRow::Ok(mut row) => {
+                            // In-place update keeps the RowID stable. Changed new
+                            // values are moved into redo on the successful path.
+                            let mut index_change_cols = FastHashMap::default();
+                            // perform in-place update.
+                            let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
+                            for UpdateCol { idx, val } in update {
+                                if let Some((old_val, var_offset)) =
+                                    row.different(self.metadata.col.as_ref(), idx, &val)
+                                {
+                                    // we also check whether the value change is related to any index,
+                                    // so we can update index later.
+                                    if self.metadata.idx.index_columns().contains(&idx) {
+                                        index_change_cols.insert(idx, old_val.clone());
+                                    }
+                                    // actual update
+                                    row.update_col(self.metadata.col.as_ref(), idx, &val);
+                                    // record undo and redo
+                                    undo_cols.push(UndoCol {
+                                        idx,
+                                        val: old_val,
+                                        var_offset,
+                                    });
+                                    redo_cols.push(UpdateCol { idx, val });
+                                }
+                            }
+                            // The provisional row lock now becomes the operation
+                            // kind that MVCC reads and rollback will interpret.
+                            effects.update_last_row_undo(RowUndoKind::Update(undo_cols));
+                            drop(access); // unlock the row.
+                            drop(lock_row);
+                            // we may still need this page if we'd like to update index.
+                            if !redo_cols.is_empty() {
+                                // A no-op update still used a row lock, but only a
+                                // real value change needs redo.
+                                let redo_entry = RowRedo {
+                                    page_id,
+                                    row_id,
+                                    kind: redo_key
+                                        .map(|key| {
+                                            RowRedoKind::UpdateByPrimaryKey(key, redo_cols.clone())
+                                        })
+                                        .unwrap_or(RowRedoKind::Update(redo_cols)),
+                                };
+                                effects.insert_row_redo(self.table_id, redo_entry);
+                            }
+                            UpdateRowInplace::Ok(row_id, index_change_cols)
+                        }
+                    },
+                )
             }
         }
     }
@@ -454,9 +460,9 @@ impl<'m, 'r> HotRowUpdater<'m, 'r> {
         &self,
         old_row: Vec<Val>,
         update: RowUpdateInput,
-        old_id: RowID,
-        old_guard: PageSharedGuard<RowPage>,
     ) -> PreparedHotMoveUpdate {
+        let old_guard = self.page_guard;
+        let old_id = self.row_id;
         // Build the replacement hot row and remember indexed old values. The
         // caller already turned the old hot row's first undo entry into
         // `Delete`, so this path is logically delete-old plus insert-new.
