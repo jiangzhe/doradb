@@ -2767,6 +2767,8 @@ mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::ver_map::RowPageState;
     use crate::value::{Val, ValKind};
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -4105,7 +4107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_table_transition_retry_is_internal_error() {
+    fn test_mem_table_transition_update_errors_and_delete_panics() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -4165,18 +4167,26 @@ mod tests {
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let err = trx
-                .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(mem_table_id).await?;
-                    stmt.acquire_table_write_data_lock(mem_table_id).await?;
-                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                    mem_table
-                        .delete_unique_mvcc(rt, effects, key.index_no, &key.vals, false)
-                        .await
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Internal);
+            let panic = AssertUnwindSafe(trx.exec(async |stmt| {
+                stmt.acquire_table_write_metadata_lock(mem_table_id).await?;
+                stmt.acquire_table_write_data_lock(mem_table_id).await?;
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                mem_table
+                    .delete_unique_mvcc(rt, effects, key.index_no, &key.vals, false)
+                    .await
+            }))
+            .catch_unwind()
+            .await
+            .expect_err("standalone MemTable delete must reject a transition page");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            assert!(
+                message.contains("standalone MemTable delete observed TRANSITION row page"),
+                "unexpected panic: {message}"
+            );
             trx.rollback().await.unwrap();
         });
     }
