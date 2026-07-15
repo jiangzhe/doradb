@@ -101,10 +101,13 @@ impl Deser for ValType {
         min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let idx = start_idx;
         let (idx, kind) = input.deser_u8(idx)?;
-        let kind = ValKind::try_from(kind)?;
+        let kind = ValKind::decode(kind)?;
         let (idx, nullable) = input.deser_u8(idx)?;
         Ok((
             idx,
@@ -153,20 +156,9 @@ impl ValKind {
         !matches!(self, ValKind::VarByte)
     }
 
-    /// Create a value type with nullable setting.
+    /// Decodes one persisted value-kind code before a public error boundary is chosen.
     #[inline]
-    pub fn nullable(self, nullable: bool) -> ValType {
-        ValType {
-            kind: self,
-            nullable,
-        }
-    }
-}
-
-impl TryFrom<u8> for ValKind {
-    type Error = Error;
-    #[inline]
-    fn try_from(value: u8) -> Result<Self> {
+    pub(crate) fn decode(value: u8) -> crate::error::DataIntegrityResult<Self> {
         let res = match value {
             1 => ValKind::I8,
             2 => ValKind::U8,
@@ -181,11 +173,27 @@ impl TryFrom<u8> for ValKind {
             11 => ValKind::VarByte,
             _ => {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("invalid value kind code {value}"))
-                    .into());
+                    .attach(format!("invalid value kind code {value}")));
             }
         };
         Ok(res)
+    }
+
+    /// Create a value type with nullable setting.
+    #[inline]
+    pub fn nullable(self, nullable: bool) -> ValType {
+        ValType {
+            kind: self,
+            nullable,
+        }
+    }
+}
+
+impl TryFrom<u8> for ValKind {
+    type Error = Error;
+    #[inline]
+    fn try_from(value: u8) -> Result<Self> {
+        Self::decode(value).map_err(Error::from)
     }
 }
 
@@ -658,12 +666,15 @@ impl Deser for Val {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, c) = input.deser_u8(start_idx)?;
         if c == 0 {
             return Ok((idx, Val::Null));
         }
-        let kind = ValKind::try_from(c)?;
+        let kind = ValKind::decode(c)?;
         match kind {
             ValKind::I8 => {
                 let (idx, v) = input.deser_i8(idx)?;

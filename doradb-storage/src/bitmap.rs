@@ -1,4 +1,3 @@
-use crate::error::Result;
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use parking_lot::Mutex;
 use std::iter::once;
@@ -594,7 +593,10 @@ impl Deser for AllocMap {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>() * 3);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, len) = input.deser_u64(start_idx)?;
         let (idx, allocated) = input.deser_u64(idx)?;
         let (mut idx, free_unit_idx) = input.deser_u64(idx)?;

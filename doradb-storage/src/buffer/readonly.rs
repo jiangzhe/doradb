@@ -738,7 +738,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                     // not contend with our own latch; revisit this synchronous
                     // path if raw readonly usage expands in the future.
                     let _ = self.invalidate_block(file.file_id(), block_id);
-                    return Err(err);
+                    return Err(Error::from(err));
                 }
                 if resident_hit {
                     self.stats.record_cache_hit();
@@ -983,13 +983,15 @@ impl ReadSubmission {
                         self.key.block_id,
                     ) {
                         drop(self.reservation.take());
-                        self.complete_inflight_once(Err(CompletionErrorKind::report_error(
-                            err,
-                            format!(
-                                "validate readonly block load: file={}, key={:?}",
-                                validation.file_kind, self.key
+                        self.complete_inflight_once(Err(
+                            CompletionErrorKind::report_data_integrity(
+                                err,
+                                format!(
+                                    "validate readonly block load: file={}, key={:?}",
+                                    validation.file_kind, self.key
+                                ),
                             ),
-                        )));
+                        ));
                         return IOKind::Read;
                     }
                 }

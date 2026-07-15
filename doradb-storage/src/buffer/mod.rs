@@ -44,7 +44,7 @@ use crate::component::{
 };
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
-use crate::error::{FileKind, Result};
+use crate::error::{DataIntegrityResult, FileKind, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::{BlockID, PageID};
 use crate::io::Completion;
@@ -66,7 +66,7 @@ pub(crate) const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
 pub(crate) type PageIOCompletion = Completion<PageID>;
 
 /// Validation callback for one persisted readonly-cache block image.
-pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> Result<()>;
+pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> DataIntegrityResult<()>;
 
 #[derive(Default)]
 struct BufferPoolStatsCounters {

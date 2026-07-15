@@ -604,11 +604,9 @@ impl WeakEngineRef {
 
     /// Upgrade weak engine reachability for one admitted public operation.
     #[inline]
-    pub(crate) fn upgrade(&self, operation: &'static str) -> Result<EngineRef> {
+    pub(crate) fn upgrade(&self) -> LifecycleResult<EngineRef> {
         self.0.upgrade().map(EngineRef::new).ok_or_else(|| {
-            Report::new(LifecycleError::Shutdown)
-                .attach(format!("{operation}: engine is no longer reachable"))
-                .into()
+            Report::new(LifecycleError::Shutdown).attach("engine is no longer reachable")
         })
     }
 
@@ -618,8 +616,8 @@ impl WeakEngineRef {
     /// transaction must be able to commit or roll back while owner shutdown is
     /// waiting for active transactions to finish before component teardown.
     #[inline]
-    pub(crate) fn upgrade_for_terminal(&self, operation: &'static str) -> Result<EngineRef> {
-        self.upgrade(operation)
+    pub(crate) fn upgrade_for_terminal(&self) -> LifecycleResult<EngineRef> {
+        self.upgrade()
     }
 
     /// Best-effort upgrade for nonblocking cleanup hints from `Drop`.
@@ -708,13 +706,11 @@ impl EngineInner {
     /// observable after a fatal storage error. Real operations must use
     /// [`Self::acquire_admission`].
     #[inline]
-    pub(crate) fn ensure_admission_open_for_query(&self, operation: &'static str) -> Result<()> {
+    pub(crate) fn ensure_admission_open_for_query(&self) -> LifecycleResult<()> {
         if self.lifecycle.state() == EngineLifecycleState::Running {
             return Ok(());
         }
-        Err(Report::new(LifecycleError::Shutdown)
-            .attach(format!("{operation}: engine admission is closed"))
-            .into())
+        Err(Report::new(LifecycleError::Shutdown).attach("engine admission is closed"))
     }
 
     /// Returns whether owner-side shutdown has started.
@@ -1073,10 +1069,7 @@ mod tests {
 
             drop(session);
             let err = wait_task.await.unwrap_err();
-            assert_eq!(
-                err.operation_error(),
-                Some(OperationError::LockWaiterReleased)
-            );
+            assert_eq!(*err.current_context(), OperationError::LockWaiterReleased);
             assert_eq!(engine.lock_manager().release_owner(blocking_owner), 1);
         });
     }

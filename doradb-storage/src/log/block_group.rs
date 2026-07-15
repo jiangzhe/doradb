@@ -339,7 +339,10 @@ impl Deser for TrxLog {
         min_bytes_hint(mem::size_of::<u64>() + MIN_TRX_LOG_FRAME_LEN);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (frame_start, data_len) = input.deser_u64(start_idx)?;
         let data_len = usize::try_from(data_len).map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload)
@@ -353,11 +356,11 @@ impl Deser for TrxLog {
                 .attach(format!("block=redo-trx, frame_start={frame_start}"))
         })?;
         if data_len > remaining {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "block=redo-trx, trx_data_len={data_len}, remaining_group_body={remaining}"
-                ))
-                .into());
+                )),
+            );
         }
         // A frame too small to hold an empty transaction record is always
         // corrupt and would otherwise fail later with less useful context.
@@ -365,8 +368,7 @@ impl Deser for TrxLog {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
                     "block=redo-trx, trx_data_len={data_len}, min_trx_frame_len={MIN_TRX_LOG_FRAME_LEN}"
-                ))
-                .into());
+                )));
         }
         let frame_end = frame_start + data_len;
         let (_, frame) = input.deser(frame_start, data_len)?;
@@ -375,12 +377,12 @@ impl Deser for TrxLog {
         // The length prefix is authoritative: nested payload parsers must
         // consume exactly the advertised frame, with no trailing garbage.
         if idx != frame.len() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "block=redo-trx, trx_frame_len={}, consumed={idx}",
                     frame.len()
-                ))
-                .into());
+                )),
+            );
         }
         Ok((
             frame_end,
@@ -474,10 +476,7 @@ mod tests {
 
         let err = TrxLog::deser(&bytes[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -490,10 +489,7 @@ mod tests {
 
         let err = TrxLog::deser(&bytes[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -505,10 +501,7 @@ mod tests {
 
         let err = TrxLog::deser(&bytes[..], 0).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
     #[test]

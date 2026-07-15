@@ -7,10 +7,10 @@ use crate::index::{
 };
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::row::ops::SelectMvcc;
-use crate::table::{DmlValidationDomain, DmlValidator, Table, TableRuntimeLayout};
+use crate::table::{DmlValidationResultExt, DmlValidator, Table, TableRuntimeLayout};
 use crate::trx::{Transaction, TrxCheckout, TrxRuntime};
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
@@ -32,7 +32,8 @@ impl StreamStmtState {
         let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
         let owner_group = checkout
             .inner()
-            .checked_lock_state(operation)?
+            .checked_lock_state()
+            .attach_with(|| format!("operation={operation}"))?
             .owner_group();
         let stmt_locks = match owner_group {
             Some(owner_group) => OwnerLockState::new_grouped(stmt_owner, owner_group),
@@ -51,13 +52,14 @@ impl StreamStmtState {
 
     #[inline]
     async fn acquire_table_read_lock(&mut self, table_id: TableID) -> Result<()> {
-        self.stmt_locks
+        Ok(self
+            .stmt_locks
             .acquire(
                 self.checkout.attachment().engine().lock_manager(),
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
             )
-            .await
+            .await?)
     }
 
     #[inline]
@@ -273,13 +275,9 @@ impl<'trx> StreamStmt<'trx> {
         table.check_foreground_live(INDEX_SCAN_STREAM_OPERATION)?;
         let layout = table.layout_snapshot();
         if !self.disable_validation {
-            DmlValidator::new(
-                layout.metadata(),
-                table_id,
-                INDEX_SCAN_STREAM_OPERATION,
-                DmlValidationDomain::Foreground,
-            )
-            .validate_index_scan(index_no, &range, read_set)?;
+            DmlValidator::new(layout.metadata())
+                .validate_index_scan(index_no, &range, read_set)
+                .with_foreground_context(INDEX_SCAN_STREAM_OPERATION, table_id)?;
         }
         let index = layout.secondary_index(index_no)?;
         let unique = index.is_unique();

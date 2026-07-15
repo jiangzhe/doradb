@@ -209,7 +209,7 @@ impl TrxSysConfig {
     #[inline]
     pub(crate) fn file_prefix(&self) -> ConfigResult<String> {
         let file_prefix = self.log_dir.join(&self.log_file_stem);
-        Ok(path_to_utf8(&file_prefix, "redo log path")
+        Ok(path_to_utf8(&file_prefix)
             .attach_with(|| format!("invalid redo log path: {}", file_prefix.display()))?
             .to_owned())
     }
@@ -256,12 +256,10 @@ impl TrxSysConfig {
     fn normalize_redo_file_layout(mut self) -> Result<Self> {
         validate_purge_threads(self.purge_threads)?;
         validate_gc_buckets(self.gc_buckets)?;
-        validate_redo_io_depth("log_write_io_depth", self.log_write_io_depth)?;
-        validate_redo_io_depth("recovery_io_depth", self.recovery_io_depth)?;
-        validate_redo_io_depth(
-            "catalog_checkpoint_scan_io_depth",
-            self.catalog_checkpoint_scan_io_depth,
-        )?;
+        validate_redo_io_depth(self.log_write_io_depth).attach("invalid log_write_io_depth")?;
+        validate_redo_io_depth(self.recovery_io_depth).attach("invalid recovery_io_depth")?;
+        validate_redo_io_depth(self.catalog_checkpoint_scan_io_depth)
+            .attach("invalid catalog_checkpoint_scan_io_depth")?;
         let configured_log_block_size = self.log_block_size.as_u64() as usize;
         validate_redo_log_block_size(configured_log_block_size)?;
         let log_block_size = align_to_sector_size(configured_log_block_size);
@@ -382,7 +380,7 @@ impl Supplier<TransactionSystemWorkers> for TransactionSystem {
 fn normalize_redo_file_max_size(
     requested_file_max_size: usize,
     log_block_size: usize,
-) -> Result<usize> {
+) -> ConfigResult<usize> {
     let min_file_max_size = REDO_DEFAULT_DATA_START_OFFSET
         .checked_add(log_block_size)
         .ok_or_else(invalid_log_file_max_size)?;
@@ -398,26 +396,24 @@ fn normalize_redo_file_max_size(
 }
 
 #[inline]
-fn validate_redo_io_depth(field: &'static str, io_depth: usize) -> Result<()> {
+fn validate_redo_io_depth(io_depth: usize) -> ConfigResult<()> {
     if io_depth != 0 {
         return Ok(());
     }
-    Err(Report::new(ConfigError::InvalidIoDepth)
-        .attach(format!("{field}=0"))
-        .into())
+    Err(Report::new(ConfigError::InvalidIoDepth).attach("io_depth=0"))
 }
 
 #[inline]
-fn validate_purge_threads(purge_threads: usize) -> Result<()> {
+fn validate_purge_threads(purge_threads: usize) -> ConfigResult<()> {
     const MIN_PURGE_THREADS: usize = 1;
     if purge_threads >= MIN_PURGE_THREADS {
         return Ok(());
     }
-    Err(Report::new(ConfigError::InvalidPurgeThreads)
-        .attach(format!(
+    Err(
+        Report::new(ConfigError::InvalidPurgeThreads).attach(format!(
             "purge_threads={purge_threads}, min_supported={MIN_PURGE_THREADS}"
-        ))
-        .into())
+        )),
+    )
 }
 
 #[inline]
@@ -426,7 +422,7 @@ const fn default_gc_buckets() -> usize {
 }
 
 #[inline]
-fn validate_gc_buckets(gc_buckets: usize) -> Result<()> {
+fn validate_gc_buckets(gc_buckets: usize) -> ConfigResult<()> {
     const MIN_GC_BUCKETS: usize = 1;
     const MAX_GC_BUCKETS: usize = 256;
     if (MIN_GC_BUCKETS..=MAX_GC_BUCKETS).contains(&gc_buckets) && gc_buckets.is_power_of_two() {
@@ -435,27 +431,24 @@ fn validate_gc_buckets(gc_buckets: usize) -> Result<()> {
     Err(Report::new(ConfigError::InvalidGcBuckets)
         .attach(format!(
             "gc_buckets={gc_buckets}, min_supported={MIN_GC_BUCKETS}, max_supported={MAX_GC_BUCKETS}, requirement=power_of_two"
-        ))
-        .into())
+        )))
 }
 
 #[inline]
-fn validate_redo_log_block_size(log_block_size: usize) -> Result<()> {
+fn validate_redo_log_block_size(log_block_size: usize) -> ConfigResult<()> {
     if (STORAGE_SECTOR_SIZE..=MAX_REDO_LOG_BLOCK_SIZE).contains(&log_block_size) {
         return Ok(());
     }
     Err(Report::new(ConfigError::InvalidLogBlockSize)
         .attach(format!(
             "log_block_size={log_block_size}, min_supported={STORAGE_SECTOR_SIZE}, max_supported={MAX_REDO_LOG_BLOCK_SIZE}"
-        ))
-        .into())
+        )))
 }
 
 #[inline]
-fn invalid_log_file_max_size() -> Error {
+fn invalid_log_file_max_size() -> Report<ConfigError> {
     Report::new(ConfigError::InvalidLogFileMaxSize)
         .attach("redo file max size cannot be represented after log-block alignment")
-        .into()
 }
 
 #[inline]

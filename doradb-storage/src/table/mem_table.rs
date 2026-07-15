@@ -1,5 +1,5 @@
 use super::{
-    DmlValidationDomain, DmlValidator, UpdateUniqueMvcc,
+    DmlValidationResultExt, DmlValidator, UpdateUniqueMvcc,
     hot::{DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace},
     index_key_is_changed, index_key_replace, missing_secondary_index, read_latest_index_key,
     row_len, unique_key_from_full_row, validate_page_row_range,
@@ -1312,13 +1312,9 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     ) -> Result<(PageID, RowID)> {
         let metadata = self.metadata();
         if !disable_dml_validation {
-            DmlValidator::new(
-                metadata,
-                self.table_id(),
-                "insert_no_trx",
-                DmlValidationDomain::Recovery,
-            )
-            .validate_full_row(cols)?;
+            DmlValidator::new(metadata)
+                .validate_full_row(cols)
+                .with_recovery_context("insert_no_trx", self.table_id())?;
         }
         debug_assert!(cols.len() == self.metadata().col.col_count());
         debug_assert!({
@@ -1386,14 +1382,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         })?;
         let primary_key_index_no = primary_key.index_no();
         if !disable_dml_validation {
-            let validator = DmlValidator::new(
-                metadata,
-                self.table_id(),
-                "upsert_primary_key_no_trx",
-                DmlValidationDomain::Recovery,
-            );
-            validator.validate_full_row(&cols)?;
-            validator.validate_unique_index(primary_key_index_no)?;
+            let validator = DmlValidator::new(metadata);
+            validator
+                .validate_full_row(&cols)
+                .with_recovery_context("upsert_primary_key_no_trx", self.table_id())?;
+            validator
+                .validate_unique_index(primary_key_index_no)
+                .with_recovery_context("upsert_primary_key_no_trx", self.table_id())?;
         }
         let key = unique_key_from_full_row(
             metadata,

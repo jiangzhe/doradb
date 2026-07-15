@@ -35,7 +35,7 @@ use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::thread;
 use crate::{IndexPool, MemPool};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use flume::{Receiver, RecvError, Selector, SendError, TryRecvError};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -2119,7 +2119,8 @@ pub(crate) fn build_file_system(
 
 #[inline]
 fn path_to_string(path: &Path, field: &str) -> String {
-    path_to_utf8(path, field)
+    path_to_utf8(path)
+        .attach_with(|| format!("invalid {field}: {}", path.display()))
         .expect("table file system paths are validated during construction")
         .to_owned()
 }

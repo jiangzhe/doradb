@@ -1,4 +1,4 @@
-use crate::error::{DataIntegrityError, Error, Result};
+use crate::error::DataIntegrityError;
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
@@ -102,13 +102,14 @@ impl Deser for RowRedoKind {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
         let code = RowRedoCode::try_from(code).map_err(|_| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("invalid row redo code {code}")),
-            )
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("invalid row redo code {code}"))
         })?;
         match code {
             RowRedoCode::Insert => {
@@ -164,7 +165,10 @@ impl Deser for RowRedo {
         min_bytes_hint(mem::size_of::<PageID>() + mem::size_of::<RowID>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, page_id) = input.deser_u64(start_idx)?;
         let (idx, row_id) = RowID::deser(input, idx)?;
         let (idx, kind) = RowRedoKind::deser(input, idx)?;
@@ -331,13 +335,14 @@ impl Deser for DDLRedo {
         min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<TableID>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
         let code = DDLRedoCode::try_from(code).map_err(|_| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("invalid DDL redo code {code}")),
-            )
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("invalid DDL redo code {code}"))
         })?;
         match code {
             DDLRedoCode::CreateTable => {
@@ -476,7 +481,10 @@ impl Deser for RedoLogs {
         min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, ddl) = Option::<Box<DDLRedo>>::deser(input, start_idx)?;
         let (idx, dml) = BTreeMap::<TableID, TableDML>::deser(input, idx)?;
         Ok((idx, RedoLogs { ddl, dml }))
@@ -532,14 +540,15 @@ impl Deser for RedoHeader {
         min_bytes_hint(mem::size_of::<TrxID>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, cts) = TrxID::deser(input, start_idx)?;
         let (idx, code) = u8::deser(input, idx)?;
         let trx_kind = RedoTrxKind::try_from(code).map_err(|_| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("invalid redo transaction kind code {code}")),
-            )
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("invalid redo transaction kind code {code}"))
         })?;
         Ok((idx, RedoHeader { cts, trx_kind }))
     }
@@ -680,7 +689,10 @@ impl Deser for TableDML {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(data: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        data: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, rows) = BTreeMap::<RowID, RowRedo>::deser(data, start_idx)?;
         Ok((idx, TableDML { rows }))
     }
@@ -1241,18 +1253,20 @@ mod tests {
     fn test_row_redo_kind_deser_invalid_code() {
         let buf = [255u8];
         let res = RowRedoKind::deser(&buf[..], 0);
-        assert!(res.as_ref().is_err_and(
-            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
-        ));
+        assert!(
+            res.as_ref()
+                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
+        );
     }
 
     #[test]
     fn test_ddl_redo_deser_invalid_code() {
         let buf = [255u8];
         let res = DDLRedo::deser(&buf[..], 0);
-        assert!(res.as_ref().is_err_and(
-            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
-        ));
+        assert!(
+            res.as_ref()
+                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
+        );
     }
 
     #[test]
@@ -1260,8 +1274,9 @@ mod tests {
         let mut buf = [0u8; 9];
         buf[8] = 255;
         let res = RedoHeader::deser(&buf[..], 0);
-        assert!(res.as_ref().is_err_and(
-            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
-        ));
+        assert!(
+            res.as_ref()
+                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
+        );
     }
 }

@@ -54,7 +54,10 @@ impl Deser for SuperBlockHeader {
     );
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, magic_word) = input.deser_byte_array::<8>(start_idx)?;
         let (idx, version) = input.deser_u64(idx)?;
         let (idx, slot_no) = input.deser_u64(idx)?;
@@ -92,7 +95,10 @@ impl Deser for SuperBlockBody {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<BlockID>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, meta_block_id) = input.deser_u64(start_idx)?;
         Ok((
             idx,
@@ -116,7 +122,10 @@ impl Deser for SuperBlockFooter {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(SUPER_BLOCK_FOOTER_SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::serde::DeserResult<(usize, Self)> {
         let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
         let (idx, checkpoint_cts) = TrxID::deser(input, idx)?;
         Ok((

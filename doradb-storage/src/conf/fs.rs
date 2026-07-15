@@ -102,8 +102,7 @@ fn validate_data_dir(data_dir: &Path) -> ConfigResult<PathBuf> {
         Ok(())
     })()
     .attach_with(|| "data_dir must not be empty".to_string())?;
-    path_to_utf8(data_dir, "data_dir")
-        .attach_with(|| format!("invalid data_dir: {}", data_dir.display()))?;
+    path_to_utf8(data_dir).attach_with(|| format!("invalid data_dir: {}", data_dir.display()))?;
     (|| {
         ensure!(
             !data_dir

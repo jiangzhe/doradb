@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::table::TableMetadata;
-use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
+use crate::error::{DataIntegrityResult, Error, FileKind, InternalError, ResourceError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -113,7 +113,7 @@ impl ActiveRoot {
 
     /// Build meta-block serialization view for the current active root.
     #[inline]
-    pub(crate) fn meta_block_ser_view(&self) -> Result<MetaBlockSerView<'_>> {
+    pub(crate) fn meta_block_ser_view(&self) -> DataIntegrityResult<MetaBlockSerView<'_>> {
         MetaBlockSerView::new(
             self.metadata.ser_view(),
             self.column_block_index_root,
@@ -617,17 +617,11 @@ fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<Tab
             )
         })
         .map_err(Error::from)?;
-    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|err| {
-        if err.data_integrity_error().is_some() {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={}, block=table-meta, block_id={page_id}",
-                    FileKind::TableFile
-                ))
-                .into()
-        } else {
-            err
-        }
+    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|report| {
+        Error::from(report.attach(format!(
+            "file={}, block=table-meta, block_id={page_id}",
+            FileKind::TableFile
+        )))
     })?;
     Ok(ParsedMeta {
         meta: TableMeta {
@@ -723,7 +717,11 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
-    fn accept_any_page(_page: &[u8], _file_kind: FileKind, _page_id: BlockID) -> Result<()> {
+    fn accept_any_page(
+        _page: &[u8],
+        _file_kind: FileKind,
+        _page_id: BlockID,
+    ) -> crate::error::DataIntegrityResult<()> {
         Ok(())
     }
 

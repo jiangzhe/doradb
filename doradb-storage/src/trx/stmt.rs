@@ -9,13 +9,13 @@ use crate::row::ops::{
     DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 use crate::session::TrxAttachment;
-use crate::table::{DmlValidationDomain, DmlValidator, LazyRow, Table};
+use crate::table::{DmlValidationResultExt, DmlValidator, LazyRow, Table};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
 use crate::trx::{FatalRollbackRetention, TrxEffects, TrxInner, TrxRuntime};
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::mem;
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -232,7 +232,10 @@ impl<'stmt> Statement<'stmt> {
         attachment: &'stmt TrxAttachment,
         owner: LockOwner,
     ) -> Result<Self> {
-        let owner_group = inner.checked_lock_state("execute statement")?.owner_group();
+        let owner_group = inner
+            .checked_lock_state()
+            .attach("operation=execute statement")?
+            .owner_group();
         Ok(Statement {
             inner,
             attachment,
@@ -286,9 +289,10 @@ impl<'stmt> Statement<'stmt> {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<()> {
-        self.stmt_locks
+        Ok(self
+            .stmt_locks
             .acquire(self.attachment.engine().lock_manager(), resource, mode)
-            .await
+            .await?)
     }
 
     /// Acquires statement-lifetime metadata protection for a table read.
@@ -305,28 +309,32 @@ impl<'stmt> Statement<'stmt> {
         table_id: TableID,
     ) -> Result<()> {
         let lock_manager = self.attachment.engine().lock_manager();
-        self.inner
-            .checked_lock_state_mut("acquire table write locks")?
+        Ok(self
+            .inner
+            .checked_lock_state_mut()
+            .attach("operation=acquire table write locks")?
             .acquire(
                 lock_manager,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
             )
-            .await
+            .await?)
     }
 
     /// Acquires transaction-lifetime table-data intent for a table write.
     #[inline]
     pub(crate) async fn acquire_table_write_data_lock(&mut self, table_id: TableID) -> Result<()> {
         let lock_manager = self.attachment.engine().lock_manager();
-        self.inner
-            .checked_lock_state_mut("acquire table write locks")?
+        Ok(self
+            .inner
+            .checked_lock_state_mut()
+            .attach("operation=acquire table write locks")?
             .acquire(
                 lock_manager,
                 LockResource::TableData(table_id),
                 LockMode::IntentExclusive,
             )
-            .await
+            .await?)
     }
 
     /// Acquires transaction-lifetime exclusive table-data ownership.
@@ -336,14 +344,16 @@ impl<'stmt> Statement<'stmt> {
         table_id: TableID,
     ) -> Result<()> {
         let lock_manager = self.attachment.engine().lock_manager();
-        self.inner
-            .checked_lock_state_mut("acquire exclusive table data lock")?
+        Ok(self
+            .inner
+            .checked_lock_state_mut()
+            .attach("operation=acquire exclusive table data lock")?
             .acquire(
                 lock_manager,
                 LockResource::TableData(table_id),
                 LockMode::Exclusive,
             )
-            .await
+            .await?)
     }
 
     #[inline]
@@ -496,13 +506,9 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_index_scan_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            DmlValidator::new(
-                layout.metadata(),
-                table_id,
-                "table_index_scan_mvcc",
-                DmlValidationDomain::Foreground,
-            )
-            .validate_index_scan(index_no, &range, read_set)?;
+            DmlValidator::new(layout.metadata())
+                .validate_index_scan(index_no, &range, read_set)
+                .with_foreground_context("table_index_scan_mvcc", table_id)?;
         }
         let rt = self.runtime();
         table
@@ -521,13 +527,9 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_insert_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            DmlValidator::new(
-                layout.metadata(),
-                table_id,
-                "table_insert_mvcc",
-                DmlValidationDomain::Foreground,
-            )
-            .validate_full_row(&cols)?;
+            DmlValidator::new(layout.metadata())
+                .validate_full_row(&cols)
+                .with_foreground_context("table_insert_mvcc", table_id)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -552,14 +554,13 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_upsert_unique_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            let validator = DmlValidator::new(
-                layout.metadata(),
-                table_id,
-                "table_upsert_unique_mvcc",
-                DmlValidationDomain::Foreground,
-            );
-            validator.validate_full_row(&cols)?;
-            validator.validate_unique_index(unique_index_no)?;
+            let validator = DmlValidator::new(layout.metadata());
+            validator
+                .validate_full_row(&cols)
+                .with_foreground_context("table_upsert_unique_mvcc", table_id)?;
+            validator
+                .validate_unique_index(unique_index_no)
+                .with_foreground_context("table_upsert_unique_mvcc", table_id)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -585,14 +586,13 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_update_unique_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            let validator = DmlValidator::new(
-                layout.metadata(),
-                table_id,
-                "table_update_unique_mvcc",
-                DmlValidationDomain::Foreground,
-            );
-            validator.validate_unique_key(index_no, key_vals)?;
-            validator.validate_sparse_update(&update)?;
+            let validator = DmlValidator::new(layout.metadata());
+            validator
+                .validate_unique_key(index_no, key_vals)
+                .with_foreground_context("table_update_unique_mvcc", table_id)?;
+            validator
+                .validate_sparse_update(&update)
+                .with_foreground_context("table_update_unique_mvcc", table_id)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -618,13 +618,9 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_delete_unique_mvcc")?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
-            DmlValidator::new(
-                layout.metadata(),
-                table_id,
-                "table_delete_unique_mvcc",
-                DmlValidationDomain::Foreground,
-            )
-            .validate_unique_key(index_no, key_vals)?;
+            DmlValidator::new(layout.metadata())
+                .validate_unique_key(index_no, key_vals)
+                .with_foreground_context("table_delete_unique_mvcc", table_id)?;
         }
         self.acquire_table_write_data_lock(table_id).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -644,13 +640,9 @@ impl<'stmt> Statement<'stmt> {
         self.acquire_table_write_metadata_lock(table.table_id())
             .await?;
         if !self.disable_dml_validation {
-            DmlValidator::new(
-                table.metadata(),
-                table.table_id(),
-                "catalog_insert_mvcc",
-                DmlValidationDomain::Foreground,
-            )
-            .validate_full_row(&cols)?;
+            DmlValidator::new(table.metadata())
+                .validate_full_row(&cols)
+                .with_foreground_context("catalog_insert_mvcc", table.table_id())?;
         }
         self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -669,13 +661,9 @@ impl<'stmt> Statement<'stmt> {
         self.acquire_table_write_metadata_lock(table.table_id())
             .await?;
         if !self.disable_dml_validation {
-            DmlValidator::new(
-                table.metadata(),
-                table.table_id(),
-                "catalog_delete_primary_key_mvcc",
-                DmlValidationDomain::Foreground,
-            )
-            .validate_primary_key(index_no, key_vals)?;
+            DmlValidator::new(table.metadata())
+                .validate_primary_key(index_no, key_vals)
+                .with_foreground_context("catalog_delete_primary_key_mvcc", table.table_id())?;
         }
         self.acquire_table_write_data_lock(table.table_id()).await?;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -799,9 +787,10 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<()> {
-        stmt.stmt_locks
+        Ok(stmt
+            .stmt_locks
             .acquire(stmt.attachment.engine().lock_manager(), resource, mode)
-            .await
+            .await?)
     }
 
     #[inline]
@@ -816,7 +805,8 @@ pub(crate) mod tests {
         let checkout = trx.checkout("read transaction lock owner")?;
         Ok(checkout
             .inner()
-            .checked_lock_state("read transaction lock owner")?
+            .checked_lock_state()
+            .attach("operation=read transaction lock owner")?
             .owner())
     }
 
@@ -830,7 +820,9 @@ pub(crate) mod tests {
         let (inner, attachment) = checkout.inner_and_attachment_mut();
         let lock_manager = attachment.engine().lock_manager();
         try_acquire_owner_lock_state(
-            inner.checked_lock_state_mut("try acquire transaction lock")?,
+            inner
+                .checked_lock_state_mut()
+                .attach("operation=try acquire transaction lock")?,
             lock_manager,
             resource,
             mode,

@@ -38,7 +38,7 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{DataIntegrityError, Error, InternalError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, OperationResult, Result};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
@@ -159,8 +159,16 @@ impl Table {
     /// Ensures a foreground operation may access this table after logical locks.
     #[inline]
     pub(crate) fn check_foreground_live(&self, operation: &'static str) -> Result<()> {
+        self.check_foreground_live_report()
+            .map_err(|report| Error::from(report.attach(format!("operation={operation}"))))
+    }
+
+    /// Returns the table-lifecycle report before the public operation boundary.
+    #[inline]
+    pub(crate) fn check_foreground_live_report(&self) -> OperationResult<()> {
         self.lifecycle
-            .check_foreground_live(self.table_id(), operation)
+            .check_foreground_live()
+            .map_err(|report| report.attach(format!("table_id={}", self.table_id())))
     }
 
     /// Acquires the reversible metadata-change gate for future index DDL.
