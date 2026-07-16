@@ -1,11 +1,11 @@
 ---
 name: issue
-description: Automate GitHub Issues lifecycle workflows with deterministic scripts. Use when creating, triaging, assigning, updating, linking, or closing issues in this repository, especially when converting planning documents in docs/tasks or docs/rfcs into trackable GitHub issues with required type labels and default priority handling.
+description: Create and list GitHub Issues with deterministic scripts. Use when validating planning-document paths, converting docs/tasks or docs/rfcs into trackable GitHub issues with required type labels and default priority handling, or listing existing issues in this repository.
 ---
 
 # GitHub Issue Automation
 
-Use these scripts for all issue operations. Avoid interactive `gh` prompts.
+Use these scripts for issue creation and listing. Avoid interactive `gh` prompts.
 Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
 ## Enforce Document-First Creation
@@ -90,93 +90,6 @@ Use `--label` repeatedly for multiple labels:
 
 ```bash
 tools/issue.rs list-issues --label type:task --label priority:high
-```
-
-## Update Issue
-
-```bash
-tools/issue.rs update-issue \
-  --issue 123 \
-  --add-label "priority:high" \
-  --comment "Refined acceptance criteria."
-```
-
-Supported update operations:
-- Add/remove labels
-- Add/remove assignees
-- Replace body (`--body` or `--body-file`)
-- Add comment
-
-For multiline comments, markdown, Rust code, or text containing backticks, prefer `--comment-file` over inline `--comment`.
-Default safe pattern: write the text to a temp file with a quoted heredoc such as `<<'EOF'`, then pass that file path.
-
-## Close Issue
-
-```bash
-tools/issue.rs close-issue \
-  --issue 123 \
-  --comment "Completed in PR #456."
-```
-
-Use `--comment-file` when the close comment is longer than a short phrase or contains markdown/backticks.
-
-## Resolve RFC Issue (Precheck + Explicit Close)
-
-Use RFC-specific resolve flow instead of direct close when closing RFC issues:
-
-```bash
-tools/issue.rs resolve-rfc \
-  --doc docs/rfcs/0006-example.md
-```
-
-This runs RFC resolve precheck only (no closure).
-
-To close explicitly after precheck passes:
-
-```bash
-tools/issue.rs resolve-rfc \
-  --doc docs/rfcs/0006-example.md \
-  --issue 456 \
-  --close \
-  --comment "RFC implemented and synchronized."
-```
-
-Use `--comment-file` for longer resolve comments or any text that includes markdown/backticks.
-
-Rules:
-- `resolve-rfc` must validate all sub-task/docs/backlog prechecks before closure.
-- No automatic issue closure from `rfc resolve`; closure requires explicit `--close`.
-- For legacy RFC docs without parseable phase tracking, use `--allow-legacy`.
-
-## Optional PR Bridge
-
-Generate a canonical close-link snippet:
-
-```bash
-tools/issue.rs link-pr-guidance --issue 123
-```
-
-Use the snippet in PR body (for example: `Fixes #123`).
-
-Or create PR directly from current branch with default close-link body:
-
-```bash
-tools/issue.rs create-pr-from-branch --issue 123 --push --assignee "@me"
-```
-
-Default body includes `Closes #123`.
-Assignee must be `@me`.
-If `--title` is omitted, title is auto-derived from changed planning docs in `base...head`:
-- if both task and RFC docs are present, RFC is preferred.
-- if only RFC docs are present, use RFC title with a suitable type prefix (default `feat:`).
-- if only task docs are present, use task title with a suitable type prefix (default `chore:`).
-- explicit `--title` always overrides auto title.
-Before creating PR, workflow must check for uncommitted changes.
-If dirty changes exist, developer must explicitly decide to:
-1. manually commit selected changes, or
-2. ignore and proceed with explicit override:
-```bash
-tools/issue.rs create-pr-from-branch --issue 123 --push --assignee "@me" --allow-dirty
 ```
 
 ## Reference

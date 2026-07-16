@@ -98,11 +98,6 @@ Complete all items:
 ```bash
 tools/rfc.rs precheck-rfc-resolve --doc docs/rfcs/0006-example.md
 ```
-8. Close RFC issue only via explicit issue command:
-```bash
-tools/issue.rs resolve-rfc --doc docs/rfcs/0006-example.md --issue <id> --close --comment "Completed"
-```
-Use `--comment-file <path>` instead of inline `--comment` when the close text is multiline or contains markdown/backticks.
 
 ## Legacy Fallback Mode
 

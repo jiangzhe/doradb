@@ -1,6 +1,6 @@
 ---
 name: style-audit
-description: Audit branch-diff Rust files, or explicitly requested file/directory Rust targets, for Doradb coding style using deterministic tooling and concise read-only review. Use when asked to check coding style, run a style audit/style auditor, validate task-branch Rust changes before PR or during task resolve, or report style violations in branch-modified files.
+description: Audit branch-diff Rust files, or explicitly requested file/directory Rust targets, for Doradb coding style using deterministic tooling and concise read-only review. Use when asked to check coding style, run a style audit/style auditor, validate task-branch Rust changes during task resolve, or report style violations in branch-modified files.
 ---
 
 # Style Audit Workflow

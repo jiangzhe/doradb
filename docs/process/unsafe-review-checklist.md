@@ -1,6 +1,6 @@
 # Unsafe Review Checklist
 
-Use this checklist for every PR that touches `unsafe` blocks/functions in:
+Use this checklist for every change that touches `unsafe` blocks/functions in:
 `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}`.
 
 Policy reference:
@@ -41,7 +41,7 @@ Hook behavior (`.githooks/pre-commit`):
    - [ ] Pointer/lifetime/alignment assumptions are explicit and consistent with surrounding APIs.
 
 4. Regression control
-   - [ ] Net-new unsafe usage is justified in PR description.
+   - [ ] Net-new unsafe usage is justified in the change description.
    - [ ] If target modules are affected, baseline inventory is re-run:
          `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
    - [ ] Any unexpected metric increase is explained.

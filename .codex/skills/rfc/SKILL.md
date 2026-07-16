@@ -1,6 +1,6 @@
 ---
 name: rfc
-description: Design and resolve RFC documents through evidence-gated multi-round workflow. Use when planning large architectural/program-level changes in docs/rfcs, enforcing goal/scope/direction clarity, explicit first-principles/long-term/original-fit proposal lenses with rationale, draft-to-formal progression, and resolve-time synchronization with task/backlog outcomes before issue closure.
+description: Design and resolve RFC documents through evidence-gated multi-round workflow. Use when planning large architectural/program-level changes in docs/rfcs, enforcing goal/scope/direction clarity, explicit first-principles/long-term/original-fit proposal lenses with rationale, draft-to-formal progression, and resolve-time synchronization with task/backlog outcomes plus readiness validation.
 ---
 
 # RFC Workflow
@@ -145,13 +145,10 @@ Use `rfc resolve` only after implementation tasks and tests are complete.
      - `Deferral Context`: why the work is deferred now, what current implementation learned, and what future planning should revisit or prefer.
 5. Resolve related backlogs with explicit per-item confirmation.
 6. Update RFC status to `implemented` (or `superseded` if applicable).
-7. Run strict precheck before any issue closure action:
+7. Run the strict completion precheck:
 ```bash
 tools/rfc.rs precheck-rfc-resolve --doc docs/rfcs/0006-example.md
 ```
-8. Do not close issues automatically from `rfc resolve`.
-   - Issue closure must be explicit via `$issue` skill and `tools/issue.rs resolve-rfc ... --close`.
-   - Use `--comment-file` for longer close comments or any text that includes markdown, Rust code, or backticks.
 
 For legacy RFC docs that do not follow parseable modern phase format, use fallback:
 ```bash
