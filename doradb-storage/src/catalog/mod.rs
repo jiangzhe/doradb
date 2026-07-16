@@ -529,7 +529,7 @@ impl Catalog {
         let table = self.get_table(table_id).await.ok_or_else(|| {
             Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}"))
         })?;
-        table.check_foreground_live_report()?;
+        table.check_foreground_live()?;
         Ok(table)
     }
 

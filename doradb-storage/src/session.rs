@@ -6,7 +6,8 @@ use crate::catalog::{
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
-    Error, InternalError, InternalResult, LifecycleError, OperationError, OperationResult, Result,
+    Error, InternalError, InternalResult, LifecycleError, LifecycleResult, OperationError,
+    OperationResult, Result,
 };
 use crate::id::{SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
@@ -21,7 +22,7 @@ use crate::table::{
     CheckpointDelayReason, CheckpointOutcome, FreezeOutcome, SecondaryMemIndexCleanupStats, Table,
 };
 use crate::trx::{StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use futures::future::select_all;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,11 +106,15 @@ pub(crate) struct SessionDdlContext {
 impl SessionDdlContext {
     /// Creates DDL admission context from a pinned idle session.
     #[inline]
-    pub(crate) fn new(session: &SessionPin) -> Result<Self> {
-        if session.in_trx("session DDL")? {
-            return Err(Report::new(OperationError::NotSupported)
-                .attach("implicit commit due to DDL")
-                .into());
+    pub(crate) fn new(session: &SessionPin) -> OperationResult<Self> {
+        if session
+            .in_trx()
+            .change_context(OperationError::NotSupported)
+            .attach_with(|| "phase=inspect_session_lifecycle")?
+        {
+            return Err(
+                Report::new(OperationError::NotSupported).attach("implicit commit due to DDL")
+            );
         }
         let id = session.id();
         let pool_guards = session.pool_guards();
@@ -187,31 +192,35 @@ impl Session {
 
     /// Returns a pinned operation view of this session.
     #[inline]
-    pub(crate) fn pin(&self, operation: &'static str) -> Result<SessionPin> {
+    pub(crate) fn pin(&self) -> LifecycleResult<SessionPin> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(closed_session_error(self.id, operation));
+            return Err(closed_session_report(self.id));
         }
-        let engine = self.engine.upgrade().map_err(|report| {
-            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id)))
-        })?;
-        let admission = engine.acquire_admission()?;
-        let state = engine.session_registry.pin_running(self.id, operation)?;
+        let engine = self
+            .engine
+            .upgrade()
+            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))?;
+        let admission = engine
+            .acquire_admission()
+            .attach_with(|| format!("session_id={}", self.id))?;
+        let state = engine.session_registry.pin_running(self.id)?;
         drop(admission);
         Ok(SessionPin { engine, state })
     }
 
     #[inline]
-    fn query_session(&self, operation: &'static str) -> Result<SessionQueryPin> {
+    fn query_session(&self) -> LifecycleResult<SessionQueryPin> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(closed_session_error(self.id, operation));
+            return Err(closed_session_report(self.id));
         }
-        let engine = self.engine.upgrade().map_err(|report| {
-            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id)))
+        let engine = self
+            .engine
+            .upgrade()
+            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", self.id))?;
+        engine.ensure_admission_open_for_query().attach_with(|| {
+            format!("session_id={}, phase=check_engine_query_admission", self.id)
         })?;
-        engine.ensure_admission_open_for_query().map_err(|report| {
-            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id)))
-        })?;
-        let state = engine.session_registry.pin_running(self.id, operation)?;
+        let state = engine.session_registry.pin_running(self.id)?;
         Ok(SessionQueryPin {
             engine,
             _state: state,
@@ -226,15 +235,15 @@ impl Session {
     /// in-flight DDL rows that have not installed a user-table runtime.
     #[inline]
     pub fn list_table_ids(&self) -> Result<Vec<TableID>> {
-        let session = self.query_session("list table ids")?;
+        let session = self.query_session().attach("operation=list_table_ids")?;
         Ok(session.engine.catalog().list_user_table_ids_now())
     }
 
     /// Begin a new transaction if the session is currently idle.
     #[inline]
     pub fn begin_trx(&mut self) -> Result<Transaction> {
-        let session = self.pin("begin transaction")?;
-        session.begin_trx("begin transaction")
+        let session = self.pin().attach("operation=begin_transaction")?;
+        Ok(session.begin_trx().attach("operation=begin_transaction")?)
     }
 
     /// Close this session when it has no active transaction.
@@ -243,11 +252,19 @@ impl Session {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let engine = self.engine.upgrade().map_err(|report| {
-            Error::from(report.attach(format!("operation=close session, session_id={}", self.id)))
+        let engine = self.engine.upgrade().attach_with(|| {
+            format!(
+                "operation=close_session, session_id={}, phase=upgrade_engine_runtime",
+                self.id
+            )
         })?;
-        let _admission = engine.acquire_admission()?;
-        engine.session_registry.close_idle(self.id)?;
+        let _admission = engine
+            .acquire_admission()
+            .attach_with(|| format!("operation=close_session, session_id={}", self.id))?;
+        engine
+            .session_registry
+            .close_idle(self.id)
+            .attach("operation=close_session")?;
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -259,7 +276,7 @@ impl Session {
         table_spec: TableSpec,
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
-        let session = self.pin("session DDL")?;
+        let session = self.pin().attach("operation=create_table")?;
         create_table_for_session(session, table_spec, index_specs).await
     }
 
@@ -270,21 +287,21 @@ impl Session {
         table_id: TableID,
         index_spec: IndexSpec,
     ) -> Result<IndexNo> {
-        let session = self.pin("session DDL")?;
+        let session = self.pin().attach("operation=create_index")?;
         create_index_for_session(session, table_id, index_spec).await
     }
 
     /// Logically drop an active secondary index from an existing user table.
     #[inline]
     pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
-        let session = self.pin("session DDL")?;
+        let session = self.pin().attach("operation=drop_index")?;
         drop_index_for_session(session, table_id, index_no).await
     }
 
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
-        let session = self.pin("session DDL")?;
+        let session = self.pin().attach("operation=drop_table")?;
         drop_table_for_session(session, table_id).await
     }
 
@@ -296,8 +313,8 @@ impl Session {
     /// truncation planning.
     #[inline]
     pub async fn checkpoint_catalog(&mut self) -> Result<()> {
-        let session = self.pin("checkpoint catalog")?;
-        if session.in_trx("checkpoint catalog")? {
+        let session = self.pin().attach("operation=checkpoint_catalog")?;
+        if session.in_trx().attach("operation=checkpoint_catalog")? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("catalog checkpoint requires an idle session")
                 .into());
@@ -319,8 +336,13 @@ impl Session {
     pub async fn checkpoint_catalog_and_truncate_redo_log(
         &mut self,
     ) -> Result<CatalogRedoMaintenanceOutcome> {
-        let session = self.pin("checkpoint catalog and truncate redo log")?;
-        if session.in_trx("checkpoint catalog and truncate redo log")? {
+        let session = self
+            .pin()
+            .attach("operation=checkpoint_catalog_and_truncate_redo_log")?;
+        if session
+            .in_trx()
+            .attach("operation=checkpoint_catalog_and_truncate_redo_log")?
+        {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("combined catalog checkpoint and redo truncation requires an idle session")
                 .into());
@@ -340,8 +362,8 @@ impl Session {
     /// summarized in the returned outcome and can be retried by a later call.
     #[inline]
     pub async fn truncate_redo_log(&mut self) -> Result<RedoTruncationOutcome> {
-        let session = self.pin("truncate redo log")?;
-        if session.in_trx("truncate redo log")? {
+        let session = self.pin().attach("operation=truncate_redo_log")?;
+        if session.in_trx().attach("operation=truncate_redo_log")? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("redo log truncation requires an idle session")
                 .into());
@@ -357,7 +379,9 @@ impl Session {
     /// snapshots to compute deltas.
     #[inline]
     pub fn transaction_system_stats(&self) -> Result<TransactionSystemStats> {
-        let session = self.query_session("query transaction system stats")?;
+        let session = self
+            .query_session()
+            .attach("operation=query_transaction_system_stats")?;
         let engine = &session.engine;
         Ok(transaction_system_stats_snapshot(
             engine.trx_sys.trx_sys_stats(),
@@ -372,7 +396,9 @@ impl Session {
     /// snapshots to compute deltas.
     #[inline]
     pub fn storage_io_stats(&self) -> Result<StorageIoStats> {
-        let session = self.query_session("query storage io stats")?;
+        let session = self
+            .query_session()
+            .attach("operation=query_storage_io_stats")?;
         let engine = &session.engine;
         Ok(storage_io_stats_snapshot(
             engine.table_fs.io_backend_stats(),
@@ -388,7 +414,9 @@ impl Session {
     /// snapshots and callers can compare snapshots to compute deltas.
     #[inline]
     pub fn buffer_pool_stats(&self) -> Result<BufferPoolStats> {
-        let session = self.query_session("query buffer pool stats")?;
+        let session = self
+            .query_session()
+            .attach("operation=query_buffer_pool_stats")?;
         let engine = &session.engine;
         Ok(BufferPoolStats {
             meta: buffer_pool_runtime_stats_snapshot(
@@ -421,9 +449,12 @@ impl Session {
         table_id: TableID,
         max_rows: usize,
     ) -> Result<FreezeOutcome> {
-        let session = self.pin("freeze table")?;
-        ensure_idle_maintenance_session(&session, "freeze table")?;
-        let table = session.resolve_user_table(table_id, "freeze table").await?;
+        let session = self.pin().attach("operation=freeze_table")?;
+        ensure_idle_maintenance_session(&session).attach("operation=freeze_table")?;
+        let table = session
+            .resolve_user_table(table_id)
+            .await
+            .attach("operation=freeze_table")?;
 
         // Acquire maintenance admission before entering the freeze workflow. The
         // grouped helper orders TableMetadata(S) before TableData(IS), excluding
@@ -434,21 +465,25 @@ impl Session {
         let owner_group = LockOwnerGroup::Session(session.id());
         let (_metadata_lock, _data_lock) = lock_manager
             .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
-            .await?;
+            .await
+            .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))?;
         // Lock acquisition can wait, so the table may have started dropping since
         // resolution. Revalidate only after both maintenance locks are granted.
-        table.check_foreground_live("freeze table")?;
+        table
+            .check_foreground_live()
+            .attach("operation=freeze_table")?;
         table.freeze(&session, max_rows).await
     }
 
     /// Persist eligible state using the table-owned canonical frozen batch.
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
-        let session = self.pin("checkpoint table")?;
-        ensure_idle_maintenance_session(&session, "checkpoint table")?;
+        let session = self.pin().attach("operation=checkpoint_table")?;
+        ensure_idle_maintenance_session(&session).attach("operation=checkpoint_table")?;
         let table = session
-            .resolve_existing_user_table(table_id, "checkpoint table")
-            .await?;
+            .resolve_existing_user_table(table_id)
+            .await
+            .attach("operation=checkpoint_table")?;
 
         // Acquire maintenance admission before entering the checkpoint workflow.
         // The grouped helper orders TableMetadata(S) before TableData(IS), excluding
@@ -459,10 +494,13 @@ impl Session {
         let owner_group = LockOwnerGroup::Session(session.id());
         let (_metadata_lock, _data_lock) = lock_manager
             .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
-            .await?;
+            .await
+            .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))?;
         // Lock acquisition can wait, so the table may have started dropping since
         // resolution. Revalidate only after both maintenance locks are granted.
-        table.check_foreground_live("checkpoint table")?;
+        table
+            .check_foreground_live()
+            .attach("operation=checkpoint_table")?;
         table.checkpoint(&session).await
     }
 
@@ -471,8 +509,8 @@ impl Session {
     /// Completion means the observed predicate is satisfied or obsolete; a
     /// later checkpoint attempt can still encounter a different delay.
     pub async fn wait_for_checkpoint_retry(&self, reason: CheckpointDelayReason) -> Result<()> {
-        let session = self.pin("wait for checkpoint retry")?;
-        ensure_idle_maintenance_session(&session, "wait for checkpoint retry")?;
+        let session = self.pin().attach("operation=wait_for_checkpoint_retry")?;
+        ensure_idle_maintenance_session(&session).attach("operation=wait_for_checkpoint_retry")?;
         let table_id = match reason {
             CheckpointDelayReason::ActiveRoot { table_id, .. }
             | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
@@ -513,8 +551,8 @@ impl Session {
     /// This boundary is published before physical purge work completes and is
     /// suitable for checkpoint cutoff and active-snapshot readiness decisions.
     pub async fn wait_for_gc_horizon_after(&self, ts: TrxID) -> Result<TrxID> {
-        let session = self.pin("wait for GC horizon")?;
-        ensure_idle_maintenance_session(&session, "wait for GC horizon")?;
+        let session = self.pin().attach("operation=wait_for_gc_horizon")?;
+        ensure_idle_maintenance_session(&session).attach("operation=wait_for_gc_horizon")?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon).await
     }
 
@@ -523,28 +561,33 @@ impl Session {
     /// The returned boundary is published only after eligible undo/index,
     /// retired-page, retained-root, and coalesced cleanup work completes.
     pub async fn wait_for_purge_completion_after(&self, ts: TrxID) -> Result<TrxID> {
-        let session = self.pin("wait for purge completion")?;
-        ensure_idle_maintenance_session(&session, "wait for purge completion")?;
+        let session = self.pin().attach("operation=wait_for_purge_completion")?;
+        ensure_idle_maintenance_session(&session).attach("operation=wait_for_purge_completion")?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::PurgeCompletion).await
     }
 
     /// Wait until ordered commit payloads through `ts` reach purge coordination.
     #[cfg(test)]
     pub(crate) async fn wait_for_purge_handoff_for_test(&self, ts: TrxID) -> Result<()> {
-        let session = self.pin("wait for purge handoff")?;
-        ensure_idle_maintenance_session(&session, "wait for purge handoff")?;
+        let session = self.pin().attach("operation=wait_for_purge_handoff")?;
+        ensure_idle_maintenance_session(&session).attach("operation=wait_for_purge_handoff")?;
         wait_for_purge_handoff(&session, ts).await
     }
 
     /// Returns total number of hot row pages for an existing user table.
     #[inline]
     pub async fn total_row_pages(&self, table_id: TableID) -> Result<usize> {
-        let session = self.pin("count table row pages")?;
+        let session = self.pin().attach("operation=count_table_row_pages")?;
         let table = session
-            .resolve_user_table(table_id, "count table row pages")
-            .await?;
+            .resolve_user_table(table_id)
+            .await
+            .attach("operation=count_table_row_pages")?;
         let guards = session.pool_guards();
-        Ok(table.total_row_pages(&guards).await)
+        table.total_row_pages(&guards).await.map_err(|err| {
+            err.attach(format!(
+                "operation=count_table_row_pages, table_id={table_id}"
+            ))
+        })
     }
 
     /// Full-scan cleanup for an existing user table's secondary MemIndex entries.
@@ -554,10 +597,13 @@ impl Session {
         table_id: TableID,
         clean_live_entries: bool,
     ) -> Result<SecondaryMemIndexCleanupStats> {
-        let session = self.pin("cleanup secondary mem indexes")?;
+        let session = self
+            .pin()
+            .attach("operation=cleanup_secondary_mem_indexes")?;
         let table = session
-            .resolve_user_table(table_id, "cleanup secondary mem indexes")
-            .await?;
+            .resolve_user_table(table_id)
+            .await
+            .attach("operation=cleanup_secondary_mem_indexes")?;
         table
             .cleanup_secondary_mem_indexes(session, clean_live_entries)
             .await
@@ -566,16 +612,22 @@ impl Session {
     /// Acquires an explicit session-lifetime table lock.
     #[inline]
     pub async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
-        mode.validate_explicit_table_lock()?;
-        let session = self.pin("lock explicit table")?;
-        session.lock_table(table_id, mode).await
+        mode.validate_explicit_table_lock()
+            .attach_with(|| format!("operation=lock_explicit_table, table_id={table_id}"))?;
+        let session = self.pin().attach("operation=lock_explicit_table")?;
+        Ok(session
+            .lock_table(table_id, mode)
+            .await
+            .attach_with(|| format!("operation=lock_explicit_table, table_id={table_id}"))?)
     }
 
     /// Releases an explicit session-lifetime table lock when no transaction is active.
     #[inline]
     pub fn unlock_table(&self, table_id: TableID) -> Result<()> {
-        let session = self.pin("unlock explicit table")?;
-        session.unlock_table(table_id)
+        let session = self.pin().attach("operation=unlock_explicit_table")?;
+        Ok(session
+            .unlock_table(table_id)
+            .attach_with(|| format!("operation=unlock_explicit_table, table_id={table_id}"))?)
     }
 }
 
@@ -622,23 +674,16 @@ impl SessionPin {
 
     /// Begin a new transaction from this already pinned session operation.
     #[inline]
-    pub(crate) fn begin_trx(&self, operation: &'static str) -> Result<Transaction> {
+    pub(crate) fn begin_trx(&self) -> LifecycleResult<Transaction> {
         let engine = &self.engine;
         self.state
             .begin_trx(|| engine.trx_sys.begin_trx(engine, &self.state))
-            .map_err(|report| {
-                Error::from(
-                    report.attach(format!("operation={operation}, session_id={}", self.id())),
-                )
-            })
     }
 
     /// Returns whether the pinned session is in an active transaction.
     #[inline]
-    pub(crate) fn in_trx(&self, operation: &'static str) -> Result<bool> {
-        self.state.in_trx().map_err(|report| {
-            Error::from(report.attach(format!("operation={operation}, session_id={}", self.id())))
-        })
+    pub(crate) fn in_trx(&self) -> LifecycleResult<bool> {
+        self.state.in_trx()
     }
 
     /// Resolve a live user table, checking cached entries first.
@@ -646,18 +691,16 @@ impl SessionPin {
     pub(crate) async fn resolve_user_table(
         &self,
         table_id: TableID,
-        operation: &'static str,
-    ) -> Result<Arc<Table>> {
+    ) -> OperationResult<Arc<Table>> {
         if let Some(table) = self.state.cached_user_table(table_id) {
-            table.check_foreground_live(operation)?;
+            table.check_foreground_live()?;
             return Ok(table);
         }
         let table = self
             .engine
             .catalog()
             .validate_user_table_live(table_id)
-            .await
-            .map_err(|report| Error::from(report.attach(format!("operation={operation}"))))?;
+            .await?;
         self.state.cache_user_table(&table);
         Ok(table)
     }
@@ -667,8 +710,7 @@ impl SessionPin {
     pub(crate) async fn resolve_existing_user_table(
         &self,
         table_id: TableID,
-        operation: &'static str,
-    ) -> Result<Arc<Table>> {
+    ) -> OperationResult<Arc<Table>> {
         if let Some(table) = self.state.cached_user_table(table_id) {
             return Ok(table);
         }
@@ -677,32 +719,30 @@ impl SessionPin {
             .catalog()
             .get_table(table_id)
             .await
-            .ok_or_else(|| table_not_found_error(table_id, operation))?;
+            .ok_or_else(|| {
+                Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}"))
+            })?;
         self.state.cache_user_table(&table);
         Ok(table)
     }
 
     /// Acquires an explicit session-lifetime table lock from this pinned session.
     #[inline]
-    pub(crate) async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
+    pub(crate) async fn lock_table(
+        &self,
+        table_id: TableID,
+        mode: LockMode,
+    ) -> OperationResult<()> {
         let session_id = self.id();
         let engine = &self.engine;
-        engine
-            .catalog()
-            .validate_user_table_live(table_id)
-            .await
-            .map_err(|report| Error::from(report.attach("operation=lock explicit table")))?;
+        engine.catalog().validate_user_table_live(table_id).await?;
         let lock_manager = engine.lock_manager();
         let owner = LockOwner::Session(session_id);
         let owner_group = LockOwnerGroup::Session(session_id);
         let (mut metadata_guard, mut data_guard) = lock_manager
             .acquire_grouped_table_locks(table_id, mode, owner, owner_group)
             .await?;
-        engine
-            .catalog()
-            .validate_user_table_live(table_id)
-            .await
-            .map_err(|report| Error::from(report.attach("operation=lock explicit table")))?;
+        engine.catalog().validate_user_table_live(table_id).await?;
         if let Some(guard) = data_guard.as_mut() {
             guard.disarm();
         }
@@ -714,11 +754,14 @@ impl SessionPin {
 
     /// Releases an explicit session-lifetime table lock from this pinned session.
     #[inline]
-    pub(crate) fn unlock_table(&self, table_id: TableID) -> Result<()> {
-        if self.in_trx("unlock explicit table")? {
+    pub(crate) fn unlock_table(&self, table_id: TableID) -> OperationResult<()> {
+        if self
+            .in_trx()
+            .change_context(OperationError::LockUnavailable)
+            .attach_with(|| "phase=inspect_session_lifecycle")?
+        {
             return Err(Report::new(OperationError::NotSupported)
-                .attach("unlock table while session has an active transaction")
-                .into());
+                .attach("unlock table while session has an active transaction"));
         }
         let owner = LockOwner::Session(self.id());
         let lock_manager = self.engine.lock_manager();
@@ -766,29 +809,25 @@ impl SessionRegistry {
 
     /// Pin a running session state for one operation.
     #[inline]
-    pub(crate) fn pin_running(
-        &self,
-        id: SessionID,
-        operation: &'static str,
-    ) -> Result<Arc<SessionState>> {
+    pub(crate) fn pin_running(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
         let state = self
             .session_state(id)
-            .ok_or_else(|| stale_session_error(id, operation))?;
-        state.ensure_running().map_err(|report| {
-            Error::from(report.attach(format!("operation={operation}, session_id={id}")))
-        })?;
+            .ok_or_else(|| closed_session_report(id).attach("reason=session_missing"))?;
+        state
+            .ensure_running()
+            .attach_with(|| format!("session_id={id}"))?;
         Ok(state)
     }
 
     /// Close an idle session and remove it from the registry.
     #[inline]
-    pub(crate) fn close_idle(&self, id: SessionID) -> Result<()> {
+    pub(crate) fn close_idle(&self, id: SessionID) -> LifecycleResult<()> {
         let state = self
             .session_state(id)
-            .ok_or_else(|| stale_session_error(id, "close session"))?;
-        let removal = state.close_idle().map_err(|report| {
-            Error::from(report.attach(format!("operation=close session, session_id={id}")))
-        })?;
+            .ok_or_else(|| closed_session_report(id).attach("reason=session_missing"))?;
+        let removal = state
+            .close_idle()
+            .attach_with(|| format!("session_id={id}"))?;
         self.apply_removal(id, removal);
         Ok(())
     }
@@ -820,16 +859,18 @@ impl SessionRegistry {
         &self,
         session_id: SessionID,
         trx_id: TrxID,
-        operation: &'static str,
-    ) -> Result<(Arc<TrxEntry>, Arc<SessionState>)> {
-        let session = self
-            .session_state(session_id)
-            .ok_or_else(|| stale_session_error(session_id, operation))?;
-        let entry = session.resolve_trx(trx_id).map_err(|report| {
-            Error::from(report.attach(format!(
-                "operation={operation}, session_id={session_id}, trx_id={trx_id}"
-            )))
+    ) -> LifecycleResult<(Arc<TrxEntry>, Arc<SessionState>)> {
+        let session = self.session_state(session_id).ok_or_else(|| {
+            Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                "session_id={session_id}, trx_id={trx_id}, reason=session_missing"
+            ))
         })?;
+        let entry = session
+            .resolve_trx(trx_id)
+            .change_context(LifecycleError::TransactionDiscarded)
+            .attach_with(|| {
+                format!("session_id={session_id}, trx_id={trx_id}, phase=resolve_transaction_entry")
+            })?;
         Ok((entry, session))
     }
 
@@ -999,7 +1040,7 @@ impl SessionState {
     }
 
     #[inline]
-    fn ensure_running(&self) -> OperationResult<()> {
+    fn ensure_running(&self) -> LifecycleResult<()> {
         match &*self.lifecycle.lock() {
             SessionLifecycle::RunningIdle | SessionLifecycle::RunningActive { .. } => Ok(()),
             SessionLifecycle::AbandonedIdle
@@ -1009,7 +1050,7 @@ impl SessionState {
     }
 
     #[inline]
-    fn in_trx(&self) -> OperationResult<bool> {
+    fn in_trx(&self) -> LifecycleResult<bool> {
         match &*self.lifecycle.lock() {
             SessionLifecycle::RunningIdle => Ok(false),
             SessionLifecycle::RunningActive { entry } => Ok(entry.in_trx()),
@@ -1020,12 +1061,12 @@ impl SessionState {
     }
 
     #[inline]
-    fn active_transaction_err(&self, entry: &TrxEntry) -> Report<OperationError> {
-        Report::new(OperationError::ExistingTransaction).attach(format!(
-            "session_id={}, trx_id={}, state={:?}",
+    fn active_transaction_err(&self, entry: &TrxEntry) -> Report<LifecycleError> {
+        Report::new(LifecycleError::ExistingTransaction).attach(format!(
+            "session_id={}, trx_id={}, state={}",
             self.id,
             entry.trx_id(),
-            entry.inspect_state()
+            entry.inspect_state().label()
         ))
     }
 
@@ -1033,7 +1074,7 @@ impl SessionState {
     fn begin_trx(
         &self,
         begin: impl FnOnce() -> StartedTransaction,
-    ) -> OperationResult<Transaction> {
+    ) -> LifecycleResult<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningIdle => {}
@@ -1054,7 +1095,7 @@ impl SessionState {
     }
 
     #[inline]
-    fn close_idle(&self) -> OperationResult<SessionRemoval> {
+    fn close_idle(&self) -> LifecycleResult<SessionRemoval> {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {}
@@ -1151,12 +1192,14 @@ impl SessionState {
             {
                 Ok(Arc::clone(entry))
             }
-            SessionLifecycle::RunningActive { .. } | SessionLifecycle::AbandonedActive { .. } => {
-                Err(discarded_transaction_report(self.id, trx_id))
-            }
-            SessionLifecycle::RunningIdle
+            SessionLifecycle::RunningActive { .. }
+            | SessionLifecycle::AbandonedActive { .. }
+            | SessionLifecycle::RunningIdle
             | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed => Err(discarded_transaction_report(self.id, trx_id)),
+            | SessionLifecycle::Closed => {
+                Err(Report::new(InternalError::ActiveTransactionDiscarded)
+                    .attach(format!("session_id={}, trx_id={trx_id}", self.id)))
+            }
         }
     }
 
@@ -1405,11 +1448,15 @@ impl TrxAttachment {
 }
 
 #[inline]
-fn ensure_idle_maintenance_session(session: &SessionPin, operation: &'static str) -> Result<()> {
-    if session.in_trx(operation)? {
-        return Err(Report::new(OperationError::NotSupported)
-            .attach(format!("{operation} requires an idle session"))
-            .into());
+fn ensure_idle_maintenance_session(session: &SessionPin) -> OperationResult<()> {
+    if session
+        .in_trx()
+        .change_context(OperationError::NotSupported)
+        .attach_with(|| "phase=inspect_session_lifecycle")?
+    {
+        return Err(
+            Report::new(OperationError::NotSupported).attach("maintenance requires idle session")
+        );
     }
     Ok(())
 }
@@ -1487,34 +1534,8 @@ async fn wait_for_purge_handoff(session: &SessionPin, ts: TrxID) -> Result<()> {
 }
 
 #[inline]
-fn table_not_found_error(table_id: TableID, operation: &'static str) -> Error {
-    Report::new(OperationError::TableNotFound)
-        .attach(format!("operation={operation}, table_id={table_id}"))
-        .into()
-}
-
-#[inline]
-fn closed_session_error(id: SessionID, operation: &'static str) -> Error {
-    Error::from(closed_session_report(id).attach(format!("operation={operation}")))
-}
-
-#[inline]
-fn closed_session_report(id: SessionID) -> Report<OperationError> {
-    Report::new(OperationError::NotSupported)
-        .attach(format!("session is closed or abandoned: session_id={id}"))
-}
-
-#[inline]
-fn discarded_transaction_report(id: SessionID, trx_id: TrxID) -> Report<InternalError> {
-    Report::new(InternalError::ActiveTransactionDiscarded)
-        .attach(format!("session_id={id}, trx_id={trx_id}"))
-}
-
-#[inline]
-fn stale_session_error(id: SessionID, operation: &'static str) -> Error {
-    Report::new(LifecycleError::Shutdown)
-        .attach(format!("{operation}: session is missing: session_id={id}"))
-        .into()
+fn closed_session_report(id: SessionID) -> Report<LifecycleError> {
+    Report::new(LifecycleError::SessionUnavailable).attach(format!("session_id={id}"))
 }
 
 #[cfg(test)]
@@ -1554,9 +1575,19 @@ pub(crate) mod tests {
         REDO_DEFAULT_DATA_START_OFFSET + 4 * TRUNCATE_TEST_LOG_BLOCK_SIZE;
 
     #[inline]
-    fn assert_lifecycle_shutdown(err: Error) {
+    fn assert_runtime_unavailable_after_shutdown(err: Error) {
         assert_eq!(err.kind(), ErrorKind::Lifecycle);
         assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+    }
+
+    #[inline]
+    fn assert_runtime_unavailable_after_fatal(err: Error, fatal: FatalError) {
+        assert_eq!(err.kind(), ErrorKind::Lifecycle);
+        assert_eq!(
+            err.lifecycle_error(),
+            Some(LifecycleError::RuntimeUnavailable)
+        );
+        assert_eq!(err.downcast_ref::<FatalError>().copied(), Some(fatal));
     }
 
     #[inline]
@@ -1734,8 +1765,8 @@ pub(crate) mod tests {
         let mut count = 0usize;
         let pivot_row_id = table.pivot_row_id();
         let mut cursor = table.blk_idx().mem_cursor(guards.meta_guard());
-        cursor.seek(pivot_row_id).await;
-        while let Some(leaf) = cursor.next().await {
+        cursor.seek(pivot_row_id).await.unwrap();
+        while let Some(leaf) = cursor.next().await.unwrap() {
             let guard = leaf.lock_shared_async().await.unwrap();
             count += guard
                 .page()
@@ -1789,16 +1820,19 @@ pub(crate) mod tests {
     impl SessionTestExt for Session {
         #[inline]
         fn in_trx(&self) -> Result<bool> {
-            const OPERATION: &str = "test query session transaction state";
-            let session = self.query_session(OPERATION)?;
-            session._state.in_trx().map_err(|report| {
-                Error::from(report.attach(format!("operation={OPERATION}, session_id={}", self.id)))
-            })
+            const OPERATION: &str = "test_query_session_transaction_state";
+            let session = self
+                .query_session()
+                .attach_with(|| format!("operation={OPERATION}"))?;
+            Ok(session
+                ._state
+                .in_trx()
+                .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))?)
         }
 
         #[inline]
         fn pool_guards(&self) -> PoolGuards {
-            self.pin("test session pool guards")
+            self.pin()
                 .expect("test session must be running")
                 .state
                 .pool_guards()
@@ -1807,22 +1841,18 @@ pub(crate) mod tests {
 
         #[inline]
         fn engine(&self) -> EngineRef {
-            self.pin("test session engine")
-                .expect("test session must be running")
-                .engine
+            self.pin().expect("test session must be running").engine
         }
 
         #[inline]
         fn last_cts(&self) -> TrxID {
-            let session = self
-                .pin("test session last commit timestamp")
-                .expect("test session must be running");
+            let session = self.pin().expect("test session must be running");
             TrxID::new(session.state.last_cts.load(Ordering::SeqCst))
         }
 
         #[inline]
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID> {
-            self.pin("load active insert page")
+            self.pin()
                 .expect("test session must be running")
                 .state
                 .load_active_insert_page(table_id)
@@ -1830,7 +1860,7 @@ pub(crate) mod tests {
 
         #[inline]
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID) {
-            self.pin("save active insert page")
+            self.pin()
                 .expect("test session must be running")
                 .state
                 .save_active_insert_page(table_id, page_id);
@@ -1859,7 +1889,7 @@ pub(crate) mod tests {
             .unwrap();
             trx.commit().await.unwrap();
 
-            let pin = session.pin("test session table cache").unwrap();
+            let pin = session.pin().unwrap();
             let cached_page = {
                 let cache = pin.state.table_cache.lock();
                 let entry = cache.get(&table_id).unwrap();
@@ -1911,7 +1941,7 @@ pub(crate) mod tests {
             let row_page_count = catalog_row_page_count(&catalog_tables, &guards1).await;
             assert!(row_page_count > 0);
             {
-                let pin = session1.pin("test catalog session cache").unwrap();
+                let pin = session1.pin().unwrap();
                 assert!(
                     pin.state
                         .table_cache
@@ -1928,7 +1958,7 @@ pub(crate) mod tests {
                 catalog_row_page_count(&catalog_tables, &guards2).await,
                 row_page_count
             );
-            let pin = session2.pin("test catalog session cache").unwrap();
+            let pin = session2.pin().unwrap();
             assert!(
                 pin.state
                     .table_cache
@@ -3167,10 +3197,18 @@ pub(crate) mod tests {
                 .close_idle(session.id())
                 .unwrap();
 
-            assert_lifecycle_shutdown(session.list_table_ids().unwrap_err());
-            assert_lifecycle_shutdown(session.transaction_system_stats().unwrap_err());
-            assert_lifecycle_shutdown(session.storage_io_stats().unwrap_err());
-            assert_lifecycle_shutdown(session.buffer_pool_stats().unwrap_err());
+            for err in [
+                session.list_table_ids().unwrap_err(),
+                session.transaction_system_stats().unwrap_err(),
+                session.storage_io_stats().unwrap_err(),
+                session.buffer_pool_stats().unwrap_err(),
+            ] {
+                assert_eq!(err.kind(), ErrorKind::Lifecycle);
+                assert_eq!(
+                    err.lifecycle_error(),
+                    Some(LifecycleError::SessionUnavailable)
+                );
+            }
         });
     }
 
@@ -3187,10 +3225,12 @@ pub(crate) mod tests {
 
             engine.shutdown().unwrap();
 
-            assert_lifecycle_shutdown(session.list_table_ids().unwrap_err());
-            assert_lifecycle_shutdown(session.transaction_system_stats().unwrap_err());
-            assert_lifecycle_shutdown(session.storage_io_stats().unwrap_err());
-            assert_lifecycle_shutdown(session.buffer_pool_stats().unwrap_err());
+            assert_runtime_unavailable_after_shutdown(session.list_table_ids().unwrap_err());
+            assert_runtime_unavailable_after_shutdown(
+                session.transaction_system_stats().unwrap_err(),
+            );
+            assert_runtime_unavailable_after_shutdown(session.storage_io_stats().unwrap_err());
+            assert_runtime_unavailable_after_shutdown(session.buffer_pool_stats().unwrap_err());
         });
     }
 
@@ -3214,18 +3254,10 @@ pub(crate) mod tests {
             assert!(session.buffer_pool_stats().is_ok());
 
             let err = session.truncate_redo_log().await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
-                Some(FatalError::RedoWrite)
-            );
+            assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);
 
             let err = session.checkpoint_catalog().await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
-                Some(FatalError::RedoWrite)
-            );
+            assert_runtime_unavailable_after_fatal(err, FatalError::RedoWrite);
         });
     }
 }

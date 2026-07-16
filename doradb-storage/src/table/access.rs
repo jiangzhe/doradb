@@ -10,7 +10,7 @@ use crate::buffer::page::INVALID_PAGE_ID;
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResultExt, Error, FileKind, InternalError, OperationError,
+    DataIntegrityError, DataIntegrityResult, Error, FileKind, InternalError, OperationError,
     OperationResult, Result,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -72,9 +72,11 @@ impl LazyRowSource<'_> {
                 row_idx,
                 file_kind,
                 block_id,
-            } => block
+            } => Ok(block
                 .decode_value(column_layout, *row_idx, column_no)
-                .with_block_context(*file_kind, "lwc-block", *block_id),
+                .attach_with(|| {
+                    format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                })?),
             LazyRowSource::Hot {
                 access,
                 column_layout,
@@ -444,11 +446,11 @@ impl<'a> UserTableAccessor<'a> {
     }
 
     #[inline]
-    fn root_snapshot<'ctx>(&self, ctx: &'ctx TrxContext) -> Result<TableRootSnapshot<'ctx>> {
+    fn root_snapshot<'ctx>(&self, ctx: &'ctx TrxContext) -> TableRootSnapshot<'ctx> {
         let proof = ctx.read_proof();
-        Ok(self.storage.with_active_root(&proof, |root| {
+        self.storage.with_active_root(&proof, |root| {
             TableRootSnapshot::from_active_root(root, &proof)
-        }))
+        })
     }
 
     #[inline]
@@ -488,8 +490,8 @@ impl<'a> UserTableAccessor<'a> {
     }
 
     #[inline]
-    fn lwc_deletion_buffer(&self) -> Result<&ColumnDeletionBuffer> {
-        Ok(self.storage.deletion_buffer())
+    fn lwc_deletion_buffer(&self) -> &ColumnDeletionBuffer {
+        self.storage.deletion_buffer()
     }
     #[inline]
     fn table_id(&self) -> TableID {
@@ -601,7 +603,7 @@ impl<'a> UserTableAccessor<'a> {
                     row_idx,
                     row_shape_fingerprint,
                 } => {
-                    let deletion_buffer = self.lwc_deletion_buffer()?;
+                    let deletion_buffer = self.lwc_deletion_buffer();
                     if let Some(marker) = deletion_buffer.get(row_id) {
                         match marker {
                             DeleteMarker::Committed(ts) => {
@@ -675,7 +677,7 @@ impl<'a> UserTableAccessor<'a> {
                     row_idx,
                     row_shape_fingerprint,
                 } => {
-                    let deletion_buffer = self.lwc_deletion_buffer()?;
+                    let deletion_buffer = self.lwc_deletion_buffer();
                     if let Some(marker) = deletion_buffer.get(candidate.row_id) {
                         match marker {
                             DeleteMarker::Committed(ts) => {
@@ -706,12 +708,15 @@ impl<'a> UserTableAccessor<'a> {
                             FileKind::TableFile,
                             block_id,
                             "row shape fingerprint mismatch",
-                        ));
+                        )
+                        .into());
                     }
                     let index_spec = self.metadata().idx.require_index_spec(index_no)?;
                     let key_vals = block
                         .decode_index_key_values(self.metadata().col.as_ref(), index_spec, row_idx)
-                        .with_block_context(file_kind, "lwc-block", block_id)?;
+                        .attach_with(|| {
+                            format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                        })?;
                     let encoded = if index_spec.unique() {
                         encoder.encode(&key_vals)
                     } else {
@@ -722,7 +727,9 @@ impl<'a> UserTableAccessor<'a> {
                     }
                     let vals = block
                         .decode_row_values(self.metadata().col.as_ref(), row_idx, read_set)
-                        .with_block_context(file_kind, "lwc-block", block_id)?;
+                        .attach_with(|| {
+                            format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                        })?;
                     return Ok(SelectMvcc::Found(vals));
                 }
                 RowLocation::RowPage(page_id) => {
@@ -798,11 +805,12 @@ impl<'a> UserTableAccessor<'a> {
                 FileKind::TableFile,
                 block_id,
                 "row shape fingerprint mismatch",
-            ));
+            )
+            .into());
         }
-        block
+        Ok(block
             .decode_row_values(self.metadata().col.as_ref(), row_idx, read_set)
-            .with_block_context(file_kind, "lwc-block", block_id)
+            .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))?)
     }
 
     #[inline]
@@ -824,11 +832,12 @@ impl<'a> UserTableAccessor<'a> {
                 FileKind::TableFile,
                 block_id,
                 "row shape fingerprint mismatch",
-            ));
+            )
+            .into());
         }
-        block
+        Ok(block
             .decode_full_row_values(self.metadata().col.as_ref(), row_idx)
-            .with_block_context(file_kind, "lwc-block", block_id)
+            .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))?)
     }
 
     async fn scan_cold_lwc_mvcc<F>(
@@ -849,7 +858,7 @@ impl<'a> UserTableAccessor<'a> {
         }
 
         let storage = self.column_storage();
-        let deletion_buffer = self.lwc_deletion_buffer()?;
+        let deletion_buffer = self.lwc_deletion_buffer();
         let column_layout = self.metadata().col.as_ref();
         let reader_sts = rt.sts();
         let reader_status = rt.status();
@@ -884,7 +893,12 @@ impl<'a> UserTableAccessor<'a> {
                 }
                 let vals = block
                     .decode_row_values(column_layout, row_idx, read_set)
-                    .with_block_context(file_kind, "lwc-block", entry.block_id())?;
+                    .attach_with(|| {
+                        format!(
+                            "file={file_kind}, block=lwc_block, block_id={}",
+                            entry.block_id()
+                        )
+                    })?;
                 if !row_action(vals) {
                     return Ok(false);
                 }
@@ -971,7 +985,7 @@ impl<'a> UserTableAccessor<'a> {
     where
         F: FnOnce(&[Val]) -> bool,
     {
-        let deletion_buffer = self.lwc_deletion_buffer()?;
+        let deletion_buffer = self.lwc_deletion_buffer();
         // Cold rows are immutable, so their write visibility is tracked by the
         // column deletion buffer rather than by a row-page undo chain. A marker
         // committed at or before this writer's snapshot means the row is gone
@@ -1537,7 +1551,7 @@ impl<'a> UserTableAccessor<'a> {
         // visibility decides between duplicate, link, and write conflict.
         match self.find_row_location(rt.pool_guards(), row_id).await? {
             RowLocation::LwcBlock { .. } => {
-                let deletion_buffer = self.lwc_deletion_buffer()?;
+                let deletion_buffer = self.lwc_deletion_buffer();
                 Ok(deletion_buffer.get(row_id).is_some())
             }
             RowLocation::RowPage(_) | RowLocation::NotFound => Ok(false),
@@ -1558,7 +1572,7 @@ impl<'a> UserTableAccessor<'a> {
         row_idx: usize,
         row_shape_fingerprint: u128,
     ) -> Result<LinkForUniqueIndex> {
-        let deletion_buffer = self.lwc_deletion_buffer()?;
+        let deletion_buffer = self.lwc_deletion_buffer();
         // Convert the CDB marker into the delete timestamp carried by a cold
         // terminal unique branch. `None` below means the old cold owner is
         // still visible to this statement, either because there is no marker or
@@ -2413,7 +2427,7 @@ impl<'a> UserTableAccessor<'a> {
         F: FnMut(Vec<Val>) -> bool,
     {
         let guards = rt.pool_guards();
-        let root_snapshot = self.root_snapshot(rt.ctx())?;
+        let root_snapshot = self.root_snapshot(rt.ctx());
         if !self
             .scan_cold_lwc_mvcc(guards, rt, read_set, &root_snapshot, &mut row_action)
             .await?
@@ -2451,7 +2465,7 @@ impl<'a> UserTableAccessor<'a> {
     {
         // Step 1: Freeze the statement's cold root and original hot-page shape
         // before any replacement rows can change scan boundaries.
-        let root_snapshot = self.root_snapshot(rt.ctx())?;
+        let root_snapshot = self.root_snapshot(rt.ctx());
         let (upper_bound, original_pages) = self
             .mem()
             .snapshot_original_row_pages_from(rt.pool_guards(), root_snapshot.pivot_row_id())
@@ -2468,7 +2482,7 @@ impl<'a> UserTableAccessor<'a> {
         // that established the hot-region pivot.
         if column_root != SUPER_BLOCK_ID && pivot_row_id != RowID::new(0) {
             let storage = self.column_storage();
-            let deletion_buffer = self.lwc_deletion_buffer()?;
+            let deletion_buffer = self.lwc_deletion_buffer();
             let column_layout = self.metadata().col.as_ref();
             let reader_status = rt.status();
             let file_kind = storage.file().file_kind();
@@ -2652,7 +2666,7 @@ impl<'a> UserTableAccessor<'a> {
             old_row,
             update,
         } = pending;
-        let deletion_buffer = self.lwc_deletion_buffer()?;
+        let deletion_buffer = self.lwc_deletion_buffer();
         self.debug_assert_table_write_lock_held(rt);
         match deletion_buffer.put_ref(row_id, rt.status(), rt.sts()) {
             Ok(()) => (),
@@ -2958,7 +2972,7 @@ impl<'a> UserTableAccessor<'a> {
                 .all(|(idx, val)| self.metadata().col.col_type_match(idx, val))
         });
         let keys = self.metadata().idx.keys_for_insert(&cols);
-        let root_snapshot = self.root_snapshot(rt.ctx())?;
+        let root_snapshot = self.root_snapshot(rt.ctx());
         // Insert always creates a hot RowStore row. The insert undo head makes
         // the new row invisible to older snapshots and is also the rollback
         // handle if any following index insert fails.
@@ -2989,7 +3003,7 @@ impl<'a> UserTableAccessor<'a> {
             self.metadata(),
             unique_index_no,
             &cols,
-            "upsert unique MVCC",
+            "upsert_unique_mvcc",
         )?;
         let input = RowUpdateInput::FullRow(cols);
         match self
@@ -3056,7 +3070,7 @@ impl<'a> UserTableAccessor<'a> {
             "row update values must be ordered, in range, and type-compatible"
         );
         loop {
-            let root_snapshot = self.root_snapshot(rt.ctx())?;
+            let root_snapshot = self.root_snapshot(rt.ctx());
             let lookup_root = self.snapshot_secondary_root(&root_snapshot, index_no)?;
             let index = self.require_unique_index(rt.pool_guards(), index_no, lookup_root)?;
             let (page_guard, row_id) = match index.lookup(key_vals, rt.sts()).await? {
@@ -3098,7 +3112,7 @@ impl<'a> UserTableAccessor<'a> {
                                         .into());
                                 }
                             };
-                            let deletion_buffer = self.lwc_deletion_buffer()?;
+                            let deletion_buffer = self.lwc_deletion_buffer();
                             // The read above is only validation. This put_ref() is
                             // the definitive ownership claim and rechecks the CDB
                             // state under the map entry to catch races with other
@@ -3302,7 +3316,7 @@ impl<'a> UserTableAccessor<'a> {
             key_vals
         ));
         loop {
-            let root_snapshot = self.root_snapshot(rt.ctx())?;
+            let root_snapshot = self.root_snapshot(rt.ctx());
             let lookup_root = self.snapshot_secondary_root(&root_snapshot, index_no)?;
             let index = self.require_unique_index(rt.pool_guards(), index_no, lookup_root)?;
             let (page_guard, row_id) = match index.lookup(key_vals, rt.sts()).await? {
@@ -3331,7 +3345,7 @@ impl<'a> UserTableAccessor<'a> {
                             if !index_key_matches(&index_keys, index_no, key_vals)? {
                                 return Ok(DeleteMvcc::NotFound);
                             }
-                            let deletion_buffer = self.lwc_deletion_buffer()?;
+                            let deletion_buffer = self.lwc_deletion_buffer();
                             self.debug_assert_table_write_lock_held(rt);
                             match deletion_buffer.put_ref(row_id, rt.status(), rt.sts()) {
                                 Ok(()) => {
@@ -3474,20 +3488,18 @@ fn invalid_lwc_payload(
     file_kind: FileKind,
     block_id: BlockID,
     message: impl Into<String>,
-) -> Error {
+) -> Report<DataIntegrityError> {
     let message = message.into();
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
-        ))
-        .into()
+    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+        "file={file_kind}, block=lwc_block, block_id={block_id}, {message}"
+    ))
 }
 
 fn persisted_delete_set_for_scan(
     file_kind: FileKind,
     entry: &ColumnLeafEntry,
     delete_deltas: Vec<u32>,
-) -> Result<FastHashSet<RowID>> {
+) -> DataIntegrityResult<FastHashSet<RowID>> {
     let mut deleted = FastHashSet::default();
     for delta in delete_deltas {
         let row_id = entry
@@ -3524,7 +3536,7 @@ fn validate_cold_scan_entry(
     entry: &ColumnLeafEntry,
     block: &LwcBlock,
     row_ids: &[RowID],
-) -> Result<()> {
+) -> DataIntegrityResult<()> {
     if usize::from(entry.row_count()) != row_ids.len() || block.row_count() != row_ids.len() {
         return Err(invalid_lwc_payload(
             file_kind,
@@ -3635,7 +3647,7 @@ mod tests {
     use crate::error::{
         CompletionErrorKind, DataIntegrityError, FatalError, InternalError, OperationError, Result,
     };
-    use crate::id::{PageID, RowID, TableID, TrxID};
+    use crate::id::{PageID, RowID, SessionID, TableID, TrxID};
     use crate::index::{RowLocation, UniqueIndex};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::latch::LatchFallbackMode;
@@ -4288,7 +4300,56 @@ mod tests {
             };
             assert_table_data_integrity(
                 err,
-                "lwc-block",
+                "lwc_block",
+                block_id,
+                DataIntegrityError::ChecksumMismatch,
+            );
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_preserves_cold_data_integrity_context() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let pool_guards = session.pool_guards();
+            let entry = snapshot
+                .index(pool_guards.disk_guard())
+                .collect_leaf_entries()
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("checkpointed table should have one cold entry");
+            let block_id = entry.block_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            corrupt_page_checksum(table_file_path, block_id);
+            let _ = table
+                .disk_pool()
+                .invalidate_block(table.file().sparse_file().file_id(), block_id);
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0, 1], |_| true).await)
+                .await
+                .unwrap_err();
+
+            let rendered = format!("{err:?}");
+            assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
+            assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
+            assert_table_data_integrity(
+                err,
+                "lwc_block",
                 block_id,
                 DataIntegrityError::ChecksumMismatch,
             );
@@ -4333,7 +4394,7 @@ mod tests {
             };
             assert_table_data_integrity(
                 err,
-                "column-block-index",
+                "column_block_index",
                 entry.leaf_block_id,
                 DataIntegrityError::InvalidPayload,
             );
@@ -4378,7 +4439,7 @@ mod tests {
             };
             assert_table_data_integrity(
                 err,
-                "column-block-index",
+                "column_block_index",
                 entry.leaf_block_id,
                 DataIntegrityError::InvalidPayload,
             );
@@ -4423,7 +4484,7 @@ mod tests {
             };
             assert_table_data_integrity(
                 err,
-                "lwc-block",
+                "lwc_block",
                 entry.block_id(),
                 DataIntegrityError::InvalidPayload,
             );
@@ -6390,6 +6451,73 @@ mod tests {
                 vec![0, 1, 2, 3, 4, 100, 101, 102]
             );
             trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_dropping_table_preserves_typed_context() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            table.start_drop_lifecycle().unwrap().wait().await;
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            let rendered = format!("{err:?}");
+            assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
+            assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
+            trx.rollback().await.unwrap();
+            table.mark_dropped_lifecycle().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_scan_mvcc_read_lock_failure_preserves_lock_context() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let resource = LockResource::TableMetadata(table_id);
+            let blocker = LockOwner::Session(SessionID::new(91_225));
+            engine
+                .lock_manager()
+                .acquire(resource, LockMode::Exclusive, blocker)
+                .await
+                .unwrap();
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let mut scan_fut = Box::pin(
+                trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await),
+            );
+            assert!(matches!(
+                futures::poll!(scan_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            engine.lock_manager().release_and_fail_waiters(
+                resource,
+                blocker,
+                OperationError::TableDropping,
+            );
+
+            let err = scan_fut.await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            let rendered = format!("{err:?}");
+            assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
+            assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
+            assert!(rendered.contains("resource=table_metadata"), "{rendered}");
+            assert!(rendered.contains("mode=shared"), "{rendered}");
+            trx.rollback().await.unwrap();
         });
     }
 

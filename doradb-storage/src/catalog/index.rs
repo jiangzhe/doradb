@@ -6,10 +6,7 @@ use crate::catalog::{
     IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
 };
 use crate::engine::EngineRef;
-use crate::error::{
-    DataIntegrityError, DataIntegrityResultExt, Error, FatalError, InternalError, OperationError,
-    Result,
-};
+use crate::error::{DataIntegrityError, Error, FatalError, InternalError, OperationError, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
@@ -397,26 +394,29 @@ pub(crate) async fn create_index_for_session(
     table_id: TableID,
     index_spec: IndexSpec,
 ) -> Result<IndexNo> {
-    let ctx = SessionDdlContext::new(&session)?;
+    let ctx = SessionDdlContext::new(&session).attach("operation=create_index")?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
-    reject_user_table_primary_key_index(&index_spec, "create index")?;
+    reject_user_table_primary_key_index(&index_spec, "create_index")?;
 
     // 1. Validate the target and acquire table-local DDL exclusion before
     // deriving any new metadata or touching mutable table roots.
-    precheck_index_ddl_target(&guards, &engine, table_id, "create index").await?;
+    precheck_index_ddl_target(&guards, &engine, table_id, "create_index").await?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=create index")?;
+        .attach("operation=create_index")?;
     // Keep these DDL locks alive through root publish and runtime layout
     // install so foreground readers/writers cannot observe a partial index.
     let _table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
-        .await?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "create index").await?;
+        .await
+        .attach_with(|| format!("operation=create_index, table_id={table_id}"))?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "create_index").await?;
     engine.trx_sys.ensure_runtime_healthy()?;
-    table.check_foreground_live("create index")?;
+    table
+        .check_foreground_live()
+        .attach("operation=create_index")?;
 
     // 2. Exclude table and catalog checkpoints while catalog metadata,
     // table-file roots, and runtime layout are temporarily out of sync.
@@ -447,7 +447,7 @@ pub(crate) async fn create_index_for_session(
 
     // 4. Start the implicit DDL transaction and let the progress state own all
     // rollback/destroy transitions from this point onward.
-    let trx = session.begin_trx("begin transaction")?;
+    let trx = session.begin_trx().attach("operation=create_index")?;
     let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
     let build_ts = progress.build_ts();
 
@@ -564,7 +564,7 @@ pub(crate) async fn create_index_for_session(
         Ok(_table_file) => {}
         Err(err) => {
             return progress
-                .cleanup_after_catalog_commit_failure("table root publish", err)
+                .cleanup_after_catalog_commit_failure("table_root_publish", err)
                 .await;
         }
     }
@@ -575,13 +575,13 @@ pub(crate) async fn create_index_for_session(
         Ok(layout) => layout,
         Err(err) => {
             return progress
-                .cleanup_after_catalog_commit_failure("runtime layout install", err)
+                .cleanup_after_catalog_commit_failure("runtime_layout_install", err)
                 .await;
         }
     };
     if let Err(err) = table.install_runtime_layout(old_layout.generation(), new_layout) {
         return progress
-            .cleanup_after_catalog_commit_failure("runtime layout install", err)
+            .cleanup_after_catalog_commit_failure("runtime_layout_install", err)
             .await;
     }
     progress.mark_installed();
@@ -595,21 +595,24 @@ pub(crate) async fn drop_index_for_session(
     table_id: TableID,
     index_no: IndexNo,
 ) -> Result<()> {
-    let ctx = SessionDdlContext::new(&session)?;
+    let ctx = SessionDdlContext::new(&session).attach("operation=drop_index")?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
 
-    precheck_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
+    precheck_index_ddl_target(&guards, &engine, table_id, "drop_index").await?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=drop index")?;
+        .attach("operation=drop_index")?;
     let _table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
-        .await?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
+        .await
+        .attach_with(|| format!("operation=drop_index, table_id={table_id}"))?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop_index").await?;
     engine.trx_sys.ensure_runtime_healthy()?;
-    table.check_foreground_live("drop index")?;
+    table
+        .check_foreground_live()
+        .attach("operation=drop_index")?;
 
     let _table_metadata_lease = table.begin_metadata_change().await?;
     let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
@@ -621,7 +624,7 @@ pub(crate) async fn drop_index_for_session(
     let old_index_spec = old_metadata
         .idx
         .index_spec(index_no_usize)
-        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive metadata slot"))?
+        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive_metadata_slot"))?
         .clone();
     old_layout.secondary_index(index_no_usize)?;
 
@@ -648,7 +651,7 @@ pub(crate) async fn drop_index_for_session(
         index_no_usize,
     )?;
 
-    let trx = session.begin_trx("begin transaction")?;
+    let trx = session.begin_trx().attach("operation=drop_index")?;
     let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);
     progress.stage_layout(new_layout);
     progress.execute_catalog_update(&old_index_spec).await?;
@@ -662,7 +665,7 @@ pub(crate) async fn drop_index_for_session(
         Ok(_table_file) => {}
         Err(err) => {
             return progress
-                .cleanup_after_catalog_commit_failure("table root publish", err)
+                .cleanup_after_catalog_commit_failure("table_root_publish", err)
                 .await;
         }
     }
@@ -671,13 +674,13 @@ pub(crate) async fn drop_index_for_session(
         Ok(layout) => layout,
         Err(err) => {
             return progress
-                .cleanup_after_catalog_commit_failure("runtime layout install", err)
+                .cleanup_after_catalog_commit_failure("runtime_layout_install", err)
                 .await;
         }
     };
     if let Err(err) = table.install_runtime_layout(old_generation, new_layout) {
         return progress
-            .cleanup_after_catalog_commit_failure("runtime layout install", err)
+            .cleanup_after_catalog_commit_failure("runtime_layout_install", err)
             .await;
     }
     progress.mark_installed();
@@ -689,7 +692,7 @@ pub(crate) async fn drop_index_for_session(
             IndexDdlKind::Drop,
             table_id,
             index_no,
-            "retired secondary-index cleanup",
+            "retired_secondary_index_cleanup",
             err,
         )
         .into());
@@ -909,7 +912,7 @@ fn validate_drop_index_root_shape(
         return Err(drop_index_not_found(
             table_id,
             index_no as IndexNo,
-            "inactive metadata slot",
+            "inactive_metadata_slot",
         ));
     }
     for (slot_no, root) in active_root
@@ -1014,7 +1017,9 @@ async fn collect_create_index_cold_rows(
             }
             let key = block
                 .decode_row_values(&metadata.col, row_idx, &read_set)
-                .with_block_context(file_kind, "lwc-block", block_id)?;
+                .attach_with(|| {
+                    format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                })?;
             rows.push(CreateIndexRowEntry { key, row_id });
         }
     }
@@ -1305,14 +1310,14 @@ fn build_dropped_index_runtime_layout(
         return Err(drop_index_not_found(
             table_id,
             index_no as IndexNo,
-            "runtime slot out of range",
+            "runtime_slot_out_of_range",
         ));
     };
     if slot.is_none() {
         return Err(drop_index_not_found(
             table_id,
             index_no as IndexNo,
-            "inactive runtime slot",
+            "inactive_runtime_slot",
         ));
     }
     *slot = None;
@@ -1477,13 +1482,14 @@ fn poison_index_after_catalog_commit_with_source(
     source: Error,
 ) -> Report<FatalError> {
     let operation_name = match kind {
-        IndexDdlKind::Create => "create index",
-        IndexDdlKind::Drop => "drop index",
+        IndexDdlKind::Create => "create_index",
+        IndexDdlKind::Drop => "drop_index",
     };
     let poison = engine.trx_sys.poison_engine(FatalError::Poisoned);
     source
         .into_report()
         .change_context(*poison.current_context())
+        // This boundary already owns a failed report; `Report` has no lazy attachment API.
         .attach(format!(
             "{operation_name} failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
         ))
@@ -1891,7 +1897,7 @@ mod tests {
             );
             let report = format!("{err:?}");
             assert!(
-                report.contains("create index does not support user-table primary keys"),
+                report.contains("create_index does not support user-table primary keys"),
                 "{report}"
             );
             assert_root_metadata_unchanged(&root_before, &table);

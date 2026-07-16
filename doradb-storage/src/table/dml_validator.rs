@@ -3,7 +3,7 @@ use crate::error::{DataIntegrityError, DataIntegrityResult, OperationError, Oper
 use crate::id::TableID;
 use crate::row::ops::{RowUpdateView, UpdateCol};
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::ops::{Bound, RangeBounds};
 use std::result::Result as StdResult;
 use thiserror::Error as ThisError;
@@ -28,9 +28,6 @@ pub(crate) enum DmlValidationError {
     PrimaryKey,
 }
 
-/// Result carrying caller-neutral DML validation reports.
-pub(crate) type DmlValidationResult<T> = StdResult<T, Report<DmlValidationError>>;
-
 /// Caller-owned conversion from neutral DML validation into an operation domain.
 pub(crate) trait DmlValidationResultExt<T> {
     /// Classifies caller-supplied DML as invalid foreground input.
@@ -48,6 +45,9 @@ pub(crate) trait DmlValidationResultExt<T> {
     ) -> DataIntegrityResult<T>;
 }
 
+/// Result carrying caller-neutral DML validation reports.
+pub(crate) type DmlValidationResult<T> = StdResult<T, Report<DmlValidationError>>;
+
 impl<T> DmlValidationResultExt<T> for DmlValidationResult<T> {
     #[inline]
     fn with_foreground_context(
@@ -55,11 +55,8 @@ impl<T> DmlValidationResultExt<T> for DmlValidationResult<T> {
         operation: &'static str,
         table_id: TableID,
     ) -> OperationResult<T> {
-        self.map_err(|report| {
-            report
-                .change_context(OperationError::InvalidDmlInput)
-                .attach(format!("operation={operation}, table_id={table_id}"))
-        })
+        self.change_context(OperationError::InvalidDmlInput)
+            .attach_with(|| format!("operation={operation}, table_id={table_id}"))
     }
 
     #[inline]
@@ -68,11 +65,8 @@ impl<T> DmlValidationResultExt<T> for DmlValidationResult<T> {
         operation: &'static str,
         table_id: TableID,
     ) -> DataIntegrityResult<T> {
-        self.map_err(|report| {
-            report
-                .change_context(DataIntegrityError::InvalidPayload)
-                .attach(format!("operation={operation}, table_id={table_id}"))
-        })
+        self.change_context(DataIntegrityError::InvalidPayload)
+            .attach_with(|| format!("operation={operation}, table_id={table_id}"))
     }
 }
 

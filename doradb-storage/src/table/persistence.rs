@@ -7,8 +7,8 @@ use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
-    ConfigError, DataIntegrityError, DataIntegrityResultExt, Error, ErrorKind, FatalError,
-    InternalError, LifecycleError, OperationError, Result,
+    ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, LifecycleError,
+    OperationError, Result,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
@@ -30,7 +30,7 @@ use crate::table::{
 };
 use crate::trx::RetiredRowPageBatch;
 use crate::value::{Val, ValKind, ValType};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use futures::future::select_all;
 use std::collections::BTreeSet;
 
@@ -882,7 +882,9 @@ impl Table {
                     let active = &secondary_sidecar.indexes[sidecar_pos];
                     let key = block
                         .decode_row_values(metadata.col.as_ref(), row_idx, active.key_cols.as_ref())
-                        .with_block_context(file_kind, "lwc-block", block_id)?;
+                        .attach_with(|| {
+                            format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                        })?;
                     (active.index_no, key)
                 };
                 secondary_sidecar.add_deleted_key_at(sidecar_pos, index_no, row_id, key)?;
@@ -1287,7 +1289,7 @@ impl Table {
         attempt: &mut CheckpointAttempt<'_>,
     ) -> Result<CheckpointOutcome> {
         let table_id = self.table_id();
-        if session.in_trx(CHECKPOINT_REQUIRES_IDLE_SESSION)? {
+        if session.in_trx()? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach(CHECKPOINT_REQUIRES_IDLE_SESSION)
                 .into());
@@ -2189,9 +2191,8 @@ mod tests {
             trx.exec(async |stmt| {
                 let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                 let proof = rt.read_proof();
-                let snapshot = table_for_internal_assertion(&engine, table_id)
-                    .root_snapshot(&proof)
-                    .unwrap();
+                let snapshot =
+                    table_for_internal_assertion(&engine, table_id).root_snapshot(&proof);
                 let _effects_addr = effects as *mut _;
                 table_for_internal_assertion(&engine, table_id).with_active_root(
                     &proof,
@@ -2975,7 +2976,7 @@ mod tests {
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_table_data_integrity(
                 err,
-                "column-block-index",
+                "column_block_index",
                 entry.leaf_block_id,
                 DataIntegrityError::InvalidPayload,
             );
@@ -3045,7 +3046,7 @@ mod tests {
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_table_data_integrity(
                 err,
-                "column-block-index",
+                "column_block_index",
                 entry.leaf_block_id,
                 DataIntegrityError::InvalidPayload,
             );
@@ -3678,7 +3679,7 @@ mod tests {
                 .await
                 .unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-            let pin = session.pin("test active-root readiness").unwrap();
+            let pin = session.pin().unwrap();
             assert!(table.active_root_checkpoint_delay(&pin).is_none());
         });
     }
@@ -3725,7 +3726,7 @@ mod tests {
                 .wait_for_gc_horizon_after(active_root_effective_ts)
                 .await
                 .unwrap();
-            let pin = session.pin("test active-root readiness").unwrap();
+            let pin = session.pin().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             assert!(table.active_root_checkpoint_delay(&pin).is_none());
         });
@@ -3796,9 +3797,8 @@ mod tests {
                 .exec(async |stmt| {
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                     let proof = rt.read_proof();
-                    let snapshot = table_for_internal_assertion(&engine, table_id)
-                        .root_snapshot(&proof)
-                        .unwrap();
+                    let snapshot =
+                        table_for_internal_assertion(&engine, table_id).root_snapshot(&proof);
                     let _effects_addr = effects as *mut _;
                     assert!(snapshot.root_ts() < rt.sts());
                     assert_eq!(snapshot.effective_ts(), effective_ts);
@@ -3812,7 +3812,7 @@ mod tests {
                 .wait_for_gc_horizon_after(effective_ts)
                 .await
                 .unwrap();
-            let pin = session.pin("test active-root readiness").unwrap();
+            let pin = session.pin().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             assert!(table.active_root_checkpoint_delay(&pin).is_none());
         });
@@ -3844,7 +3844,12 @@ mod tests {
             assert!(session.in_trx().unwrap());
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
-            assert!(format!("{err:?}").contains("checkpoint table requires an idle session"));
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("maintenance requires idle session"),
+                "{report}"
+            );
+            assert!(report.contains("operation=checkpoint_table"), "{report}");
             assert!(session.in_trx().unwrap());
 
             checkpoint_trx.rollback().await.unwrap();

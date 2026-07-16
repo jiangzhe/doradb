@@ -1074,7 +1074,7 @@ mod tests {
                 .map(IoError::kind),
             Some(IoErrorKind::NotFound)
         );
-        assert!(format!("{err:?}").contains("op=file open"));
+        assert!(format!("{err:?}").contains("op=file_open"));
         let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_FILE_ID).unwrap();
         drop(file);
         let file = SparseFile::open(&file_path, UNTRACKED_FILE_ID).unwrap();
@@ -1101,7 +1101,7 @@ mod tests {
                 .map(IoError::kind),
             Some(IoErrorKind::NotFound)
         );
-        assert!(format!("{err:?}").contains("op=file create"));
+        assert!(format!("{err:?}").contains("op=file_create"));
     }
 
     #[test]

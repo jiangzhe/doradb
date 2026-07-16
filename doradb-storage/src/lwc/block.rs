@@ -16,7 +16,7 @@ use crate::lwc::{LwcData, LwcNullBitmap};
 use crate::quiescent::QuiescentGuard;
 use crate::serde::{Ser, Serde};
 use crate::value::{Val, ValKind};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::mem;
 use std::sync::Arc;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -87,15 +87,15 @@ impl LwcBlock {
     /// Validates and borrows one raw LWC payload image.
     #[inline]
     pub(crate) fn try_from_bytes(input: &[u8]) -> DataIntegrityResult<&Self> {
-        let block = layout::try_ref_from_bytes::<Self>(input).map_err(|report| {
-            report
-                .change_context(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+        let block = layout::try_ref_from_bytes::<Self>(input)
+            .change_context(DataIntegrityError::InvalidPayload)
+            .attach_with(|| {
+                format!(
                     "LWC block payload has invalid length {}, expected {}",
                     input.len(),
                     LWC_BLOCK_PAYLOAD_SIZE
-                ))
-        })?;
+                )
+            })?;
         block.validate_structure()?;
         Ok(block)
     }
@@ -119,13 +119,13 @@ impl LwcBlock {
     #[inline]
     pub(crate) fn try_from_bytes_mut(input: &mut [u8]) -> InternalResult<&mut Self> {
         let input_len = input.len();
-        layout::try_mut_from_bytes::<Self>(input).map_err(|report| {
-            report
-                .change_context(InternalError::LwcBlockEncodingInvariant)
-                .attach(format!(
-                "mutable LWC block payload has invalid length {input_len}, expected {LWC_BLOCK_PAYLOAD_SIZE}"
-            ))
-        })
+        layout::try_mut_from_bytes::<Self>(input)
+            .change_context(InternalError::LwcBlockEncodingInvariant)
+            .attach_with(|| {
+                format!(
+                    "mutable LWC block payload has invalid length {input_len}, expected {LWC_BLOCK_PAYLOAD_SIZE}"
+                )
+            })
     }
 
     /// Validates a full persisted LWC block image and returns its payload view.
@@ -135,16 +135,10 @@ impl LwcBlock {
         file_kind: FileKind,
         block_id: BlockID,
     ) -> DataIntegrityResult<&Self> {
-        let payload = validate_block(input, LWC_BLOCK_SPEC).map_err(|report| {
-            report.attach(format!(
-                "file={file_kind}, block=lwc-block, block_id={block_id}"
-            ))
-        })?;
-        Self::try_from_bytes(payload).map_err(|report| {
-            report.attach(format!(
-                "file={file_kind}, block=lwc-block, block_id={block_id}"
-            ))
-        })
+        let payload = validate_block(input, LWC_BLOCK_SPEC)
+            .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))?;
+        Self::try_from_bytes(payload)
+            .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))
     }
 
     /// Returns the canonical row-shape fingerprint stored in this block.
@@ -529,7 +523,7 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
-    use crate::error::{DataIntegrityError, DataIntegrityResultExt, Error, FileKind};
+    use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
     };
@@ -540,6 +534,7 @@ mod tests {
     use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer, LwcPrimitiveSer};
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
+    use error_stack::ResultExt;
 
     fn row_shape_fingerprint_for(row_ids: &[RowID]) -> u128 {
         let start_row_id = row_ids.first().unwrap().as_u64();
@@ -557,8 +552,8 @@ mod tests {
     fn assert_lwc_data_integrity(err: Error, block_id: BlockID, expected: DataIntegrityError) {
         assert_eq!(err.data_integrity_error(), Some(expected));
         let report = format!("{err:?}");
-        assert!(report.contains("table-file"), "{report}");
-        assert!(report.contains("lwc-block"), "{report}");
+        assert!(report.contains("table_file"), "{report}");
+        assert!(report.contains("lwc_block"), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
 
@@ -883,10 +878,20 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
         let err = page
             .decode_value(metadata.col.as_ref(), 0, 0)
-            .with_block_context(FileKind::TableFile, "lwc-block", test_block_id(10))
+            .attach_with(|| {
+                format!(
+                    "file={}, block=lwc_block, block_id={}",
+                    FileKind::TableFile,
+                    test_block_id(10)
+                )
+            })
             .unwrap_err();
         let report = format!("{err:?}");
         assert_eq!(report.matches("block_id=10").count(), 1, "{report}");
-        assert_lwc_data_integrity(err, test_block_id(10), DataIntegrityError::InvalidPayload);
+        assert_lwc_data_integrity(
+            err.into(),
+            test_block_id(10),
+            DataIntegrityError::InvalidPayload,
+        );
     }
 }

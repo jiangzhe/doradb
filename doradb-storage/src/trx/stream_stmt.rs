@@ -1,6 +1,6 @@
 use crate::buffer::EvictableBufferPool;
 use crate::catalog::is_catalog_table;
-use crate::error::{Error, OperationError, Result};
+use crate::error::{OperationError, OperationResult, Result};
 use crate::id::TableID;
 use crate::index::{
     BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, OwnedSecondaryIndexCandidateStream,
@@ -25,24 +25,11 @@ struct StreamStmtState {
 
 impl StreamStmtState {
     #[inline]
-    fn new(trx: &mut Transaction, operation: &'static str) -> Result<Self> {
-        let mut checkout = trx.checkout(operation)?;
-        let trx_id = checkout.inner().trx_id();
-        let stmt_no = checkout.inner_mut().next_stmt_no()?;
-        let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
-        let owner_group = checkout
-            .inner()
-            .checked_lock_state()
-            .attach_with(|| format!("operation={operation}"))?
-            .owner_group();
-        let stmt_locks = match owner_group {
-            Some(owner_group) => OwnerLockState::new_grouped(stmt_owner, owner_group),
-            None => OwnerLockState::new(stmt_owner),
-        };
-        Ok(Self {
+    fn new(checkout: TrxCheckout, stmt_locks: OwnerLockState) -> Self {
+        Self {
             checkout,
             stmt_locks,
-        })
+        }
     }
 
     #[inline]
@@ -51,41 +38,35 @@ impl StreamStmtState {
     }
 
     #[inline]
-    async fn acquire_table_read_lock(&mut self, table_id: TableID) -> Result<()> {
-        Ok(self
-            .stmt_locks
+    async fn acquire_table_read_lock(&mut self, table_id: TableID) -> OperationResult<()> {
+        self.stmt_locks
             .acquire(
                 self.checkout.attachment().engine().lock_manager(),
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
             )
-            .await?)
+            .await
     }
 
     #[inline]
-    fn resolve_user_table(
-        &mut self,
-        table_id: TableID,
-        operation: &'static str,
-    ) -> Result<Arc<Table>> {
-        if is_catalog_table(table_id) {
-            return Err(table_not_found(table_id, operation));
+    fn resolve_user_table(&mut self, table_id: TableID) -> OperationResult<Arc<Table>> {
+        if !is_catalog_table(table_id) {
+            let (inner, attachment) = self.checkout.inner_and_attachment_mut();
+            if let Some(table) = inner.cached_user_table(table_id) {
+                return Ok(table);
+            }
+            if let Some(table) = attachment.cached_user_table(table_id) {
+                inner.cache_user_table(&table);
+                return Ok(table);
+            }
+            let engine = attachment.engine();
+            if let Some(table) = engine.catalog().get_table_now(table_id) {
+                attachment.cache_user_table(&table);
+                inner.cache_user_table(&table);
+                return Ok(table);
+            }
         }
-        let (inner, attachment) = self.checkout.inner_and_attachment_mut();
-        if let Some(table) = inner.cached_user_table(table_id) {
-            return Ok(table);
-        }
-        if let Some(table) = attachment.cached_user_table(table_id) {
-            inner.cache_user_table(&table);
-            return Ok(table);
-        }
-        let engine = attachment.engine();
-        let Some(table) = engine.catalog().get_table_now(table_id) else {
-            return Err(table_not_found(table_id, operation));
-        };
-        attachment.cache_user_table(&table);
-        inner.cache_user_table(&table);
-        Ok(table)
+        Err(Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}")))
     }
 }
 
@@ -269,10 +250,38 @@ impl<'trx> StreamStmt<'trx> {
     where
         R: RangeBounds<&'r [Val]>,
     {
-        let mut stmt_state = StreamStmtState::new(self.trx, INDEX_SCAN_STREAM_OPERATION)?;
-        let table = stmt_state.resolve_user_table(table_id, INDEX_SCAN_STREAM_OPERATION)?;
-        stmt_state.acquire_table_read_lock(table_id).await?;
-        table.check_foreground_live(INDEX_SCAN_STREAM_OPERATION)?;
+        let mut checkout = self
+            .trx
+            .checkout()
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
+        let trx_id = checkout.inner().trx_id();
+        let stmt_no = checkout
+            .inner_mut()
+            .next_stmt_no()
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
+        let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
+        let owner_group = checkout
+            .inner()
+            .checked_lock_state()
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?
+            .owner_group();
+        let stmt_locks = match owner_group {
+            Some(owner_group) => OwnerLockState::new_grouped(stmt_owner, owner_group),
+            None => OwnerLockState::new(stmt_owner),
+        };
+        let mut stmt_state = StreamStmtState::new(checkout, stmt_locks);
+        let table = stmt_state
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
+        stmt_state
+            .acquire_table_read_lock(table_id)
+            .await
+            .attach_with(|| {
+                format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}")
+            })?;
+        table
+            .check_foreground_live()
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
         let layout = table.layout_snapshot();
         if !self.disable_validation {
             DmlValidator::new(layout.metadata())
@@ -302,11 +311,4 @@ impl<'trx> StreamStmt<'trx> {
         };
         Ok(IndexScanMvccStream::new(state))
     }
-}
-
-#[inline]
-fn table_not_found(table_id: TableID, operation: &'static str) -> Error {
-    Report::new(OperationError::TableNotFound)
-        .attach(format!("operation={operation}, table_id={table_id}"))
-        .into()
 }

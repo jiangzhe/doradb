@@ -15,6 +15,7 @@ use error_stack::Report;
 use event_listener::Event;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -45,6 +46,18 @@ pub(crate) enum LockResource {
     TableData(TableID),
 }
 
+impl fmt::Display for LockResource {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockResource::TableMetadata(table_id) => {
+                write!(f, "table_metadata({table_id})")
+            }
+            LockResource::TableData(table_id) => write!(f, "table_data({table_id})"),
+        }
+    }
+}
+
 /// Logical lock mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockMode {
@@ -59,6 +72,16 @@ pub enum LockMode {
 }
 
 impl LockMode {
+    #[inline]
+    fn label(self) -> &'static str {
+        match self {
+            LockMode::IntentShared => "intent_shared",
+            LockMode::IntentExclusive => "intent_exclusive",
+            LockMode::Shared => "shared",
+            LockMode::Exclusive => "exclusive",
+        }
+    }
+
     /// Validates that this mode can be used for `resource`.
     #[inline]
     pub(crate) fn validate_for(self, resource: LockResource) -> OperationResult<()> {
@@ -84,7 +107,14 @@ impl LockMode {
             return Ok(());
         }
         Err(Report::new(OperationError::InvalidLockMode)
-            .attach(format!("explicit table lock mode={self:?}")))
+            .attach(format!("explicit table lock mode={self}")))
+    }
+}
+
+impl fmt::Display for LockMode {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -99,11 +129,35 @@ pub(crate) enum LockOwner {
     Statement(TrxID, StmtNo),
 }
 
+impl fmt::Display for LockOwner {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockOwner::Session(session_id) => write!(f, "session(session_id={session_id})"),
+            LockOwner::Transaction(trx_id) => write!(f, "transaction(trx_id={trx_id})"),
+            LockOwner::Statement(trx_id, stmt_no) => {
+                write!(f, "statement(trx_id={trx_id},stmt_no={stmt_no})")
+            }
+        }
+    }
+}
+
 /// Logical owner group for locks created by the same client session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum LockOwnerGroup {
     /// Owners associated with one engine-local session.
     Session(SessionID),
+}
+
+impl fmt::Display for LockOwnerGroup {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockOwnerGroup::Session(session_id) => {
+                write!(f, "session(session_id={session_id})")
+            }
+        }
+    }
 }
 
 /// Whether an acquisition created a new granted lock entry.
@@ -1029,7 +1083,7 @@ fn validate_mode(resource: LockResource, mode: LockMode) -> OperationResult<()> 
         return Ok(());
     }
     Err(Report::new(OperationError::InvalidLockMode)
-        .attach(format!("resource={resource:?}, mode={mode:?}")))
+        .attach(format!("resource={resource}, mode={mode}")))
 }
 
 #[inline]
@@ -1144,7 +1198,7 @@ fn upgrade_would_block_err(
     owner: LockOwner,
 ) -> Report<OperationError> {
     Report::new(OperationError::LockUpgradeWouldBlock).attach(format!(
-        "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
+        "resource={resource}, owner={owner}, held={held}, requested={requested}"
     ))
 }
 
@@ -1156,7 +1210,7 @@ fn conversion_not_supported_err(
     owner: LockOwner,
 ) -> Report<OperationError> {
     Report::new(OperationError::LockConversionNotSupported).attach(format!(
-        "resource={resource:?}, owner={owner:?}, held={held:?}, requested={requested:?}"
+        "resource={resource}, owner={owner}, held={held}, requested={requested}"
     ))
 }
 
@@ -1170,8 +1224,8 @@ fn owner_group_conflict_err(
     held_owner: LockOwner,
 ) -> Report<OperationError> {
     Report::new(OperationError::LockOwnerGroupConflict).attach(format!(
-        "resource={resource:?}, owner={owner:?}, owner_group={owner_group:?}, \
-             held_owner={held_owner:?}, held={held:?}, requested={requested:?}"
+        "resource={resource}, owner={owner}, owner_group={owner_group}, \
+             held_owner={held_owner}, held={held}, requested={requested}"
     ))
 }
 
@@ -1181,9 +1235,8 @@ fn waiter_released_err(
     mode: LockMode,
     owner: LockOwner,
 ) -> Report<OperationError> {
-    Report::new(OperationError::LockWaiterReleased).attach(format!(
-        "resource={resource:?}, owner={owner:?}, mode={mode:?}"
-    ))
+    Report::new(OperationError::LockWaiterReleased)
+        .attach(format!("resource={resource}, owner={owner}, mode={mode}"))
 }
 
 #[inline]
@@ -1193,9 +1246,7 @@ fn waiter_failed_err(
     owner: LockOwner,
     error: OperationError,
 ) -> Report<OperationError> {
-    Report::new(error).attach(format!(
-        "resource={resource:?}, owner={owner:?}, mode={mode:?}"
-    ))
+    Report::new(error).attach(format!("resource={resource}, owner={owner}, mode={mode}"))
 }
 
 #[cfg(test)]
