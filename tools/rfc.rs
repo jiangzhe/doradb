@@ -55,7 +55,7 @@ Subcommands:\n\
   create-rfc-doc        Create docs/rfcs RFC doc from template\n\
   validate-rfc-doc      Validate RFC structure and evidence gates\n\
   extract-rfc-tracking  Extract implementation phase/task/backlog tracking as JSON\n\
-  precheck-rfc-resolve  Strict resolve readiness checks for RFC issue closure\n"
+  precheck-rfc-resolve  Strict RFC resolve readiness checks\n"
 }
 
 fn next_rfc_id_usage() -> &'static str {

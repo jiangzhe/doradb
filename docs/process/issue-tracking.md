@@ -2,7 +2,7 @@
 
 **IMPORTANT**: This project uses a "Document-First" approach for all significant work.
 - **Planning**: All work must be documented in `docs/tasks/` or `docs/rfcs/` *before* implementation.
-- **Tracking**: Use **GitHub Issues** via `gh` CLI for assignment and state tracking.
+- **Tracking**: Use **GitHub Issues** via `gh` CLI for creation and read-only tracking.
 
 ## Planning: Tasks & RFCs
 
@@ -32,17 +32,11 @@ Backlog files use:
 gh issue list --state open -S "no:assignee" --json number,title,labels,body
 
 # Create new issues (Labels replace strict types/priorities)
-gh issue create --title "Issue title" --body "Description" --label "type:bug,priority:high"
-gh issue create --title "Subtask" --body "Related to #123" --label "type:task"
-
-# Claim a task (Assign to self)
-gh issue edit <number> --add-assignee "@me"
+gh issue create --title "Issue title" --body "Description" --label "type:bug,priority:high" --assignee "@me"
+gh issue create --title "Subtask" --body "Related to #123" --label "type:task" --assignee "@me"
 
 # Check your current tasks
 gh issue list --assignee "@me" --state open --json number,title
-
-# Complete work
-gh issue close <number> --comment "Completed"
 ```
 
 ## Handle Body-Too-Long Problem
@@ -117,6 +111,7 @@ gh issue create \
   --title "Epic: Refactor Database Layer" \
   --body "High-level goal for the refactoring." \
   --label "type:epic" \
+  --assignee "@me" \
   --json number -q .number
 # Output: 42 (Assume this is the ID)
 ```
@@ -129,24 +124,14 @@ Create individual tasks and link them to the Epic by adding `Part of #<EpicID>` 
 gh issue create \
   --title "Design Schema" \
   --body "Define new tables. Part of #42" \
-  --label "type:task"
+  --label "type:task" \
+  --assignee "@me"
 
 gh issue create \
   --title "Migration Script" \
   --body "Write SQL migration. Part of #42" \
-  --label "type:task"
-```
-
-#### 3. (Optional) Advanced: Create a Task List in Epic
-For better visibility, you can update the Epic's body to verify the list of sub-issues.
-
-```bash
-# Update Epic body to include a tracking list
-gh issue edit 42 --body "High-level goal.
-
-### Subtasks
-- [ ] #43 Design Schema
-- [ ] #44 Migration Script"
+  --label "type:task" \
+  --assignee "@me"
 ```
 
 ### Epic Rules
@@ -175,44 +160,6 @@ gh issue edit 42 --body "High-level goal.
     *   Perform implementation and bug fixes.
     *   Update the new branch with these changes.
 
-5.  **PR**:
-    *   Fire a Pull Request once code on the new branch is finalized.
-    *   Link to the related issue using `Fixes #<issue id>` or `Closes #<issue id>` in PR body.
-    *   Optional helper:
-```bash
-tools/issue.rs create-pr-from-branch --issue <issue-id> --push --assignee "@me"
-```
-    *   If `--title` is omitted, helper auto-derives PR title from changed planning docs (`base...head`):
-        1. prefer RFC title when both task and RFC docs are included,
-        2. otherwise use task/RFC title with suitable type prefix (`feat:`/`fix:`/`docs:`/`perf:`/`chore:`).
-        3. explicit `--title` overrides auto title.
-    *   If uncommitted changes are present, decide explicitly:
-        1. commit selected changes manually, or
-        2. rerun with `--allow-dirty` to ignore:
-```bash
-tools/issue.rs create-pr-from-branch --issue <issue-id> --push --assignee "@me" --allow-dirty
-```
-    *   Ensure CI succeeds and code review is passed.
-
-6.  **Merge**:
-    *   Squash all commits.
-    *   Merge to the `main` branch.
-
-7.  **Close**:
-    *   Close the issue.
-    *   For RFC issues, run strict precheck first:
-```bash
-tools/issue.rs resolve-rfc --doc docs/rfcs/0006-example.md
-```
-    *   Then close explicitly only when precheck passes:
-```bash
-tools/issue.rs resolve-rfc \
-  --doc docs/rfcs/0006-example.md \
-  --issue <issue-id> \
-  --close \
-  --comment "RFC implemented and synchronized."
-```
-
 ## CLI Rules & Data Format
 
 - **JSON Output**: Always use `--json` when listing issues to get machine-readable output.
@@ -226,10 +173,8 @@ Run `gh <command> --help` to see all available flags for any command.
 
 ## Important Rules
 
-- ✅ Use `gh` CLI for ALL task tracking interactions.
-- ✅ Always claim an issue (`--add-assignee "@me"`) before starting code modification.
+- ✅ Use `gh` CLI for issue creation and read-only tracking.
 - ✅ Use **Labels** strictly to define Type and Priority.
 - ✅ Link related work by mentioning "Ref #<number>" in the issue body.
-- ✅ RFC issue closure must use `tools/issue.rs resolve-rfc` precheck before explicit close.
 - ❌ Do NOT create markdown TODO lists in source code.
-- ❌ Do NOT commit issue state; only commit code. Issue state is handled via API.
+- ❌ Issue mutation after creation is outside this workflow.
