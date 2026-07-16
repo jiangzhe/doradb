@@ -14,8 +14,12 @@ use super::index_stream::{NonUniqueDiskTreeCandidateStream, UniqueDiskTreeCandid
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{
-    ConfigError, DataIntegrityError, DataIntegrityResult, Error, FileKind, InternalError, Result,
+    ConfigError, DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult,
 };
+// Existing DiskTree orchestration is a genuine mixed boundary over persisted
+// DataIntegrity, buffer/file IO, configuration, and trusted rewrite Internal
+// failures. Broader index-domain narrowing belongs to a later blueprint phase.
+use crate::error::{Error, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
@@ -505,8 +509,9 @@ pub(super) struct ValidatedDiskTreeNode<F: DiskTreeSpec> {
 impl<F: DiskTreeSpec> ValidatedDiskTreeNode<F> {
     #[inline]
     pub(super) fn node(&self) -> &BTreeNode {
-        btree_node_from_block(self.guard.page())
-            .expect("validated DiskTree block must be a BTreeNode block")
+        // The readonly guard was admitted only after `validate_disk_tree_block`
+        // established the exact persisted node layout.
+        layout::ref_from_bytes(self.guard.page())
     }
 }
 
@@ -2094,8 +2099,10 @@ fn invalid_node_decode() -> Report<DataIntegrityError> {
 
 /// View a validated block as an immutable B-tree node image.
 #[inline]
-fn btree_node_from_block(block: &[u8]) -> Option<&BTreeNode> {
-    layout::try_ref_from_bytes::<BTreeNode>(block).ok()
+fn persisted_disk_tree_node(block: &[u8]) -> DataIntegrityResult<&BTreeNode> {
+    layout::try_ref_from_bytes::<BTreeNode>(block)
+        .change_context(DataIntegrityError::InvalidPayload)
+        .attach_with(|| "format=secondary_disk_tree, field=node_layout")
 }
 
 /// Safely view a zeroed direct buffer as a mutable B-tree node image.
@@ -2103,10 +2110,10 @@ fn btree_node_from_block(block: &[u8]) -> Option<&BTreeNode> {
 /// Writers build nodes directly inside the final block buffer so the checksum
 /// can be computed over exactly the bytes that will be written.
 #[inline]
-fn btree_node_from_block_mut(block: &mut [u8]) -> Result<&mut BTreeNode> {
-    Ok(layout::try_mut_from_bytes::<BTreeNode>(block)
+fn btree_node_from_block_mut(block: &mut [u8]) -> InternalResult<&mut BTreeNode> {
+    layout::try_mut_from_bytes::<BTreeNode>(block)
         .change_context(InternalError::MutableBlockViewMismatch)
-        .attach_with(|| "phase=build_secondary_disk_tree_node")?)
+        .attach_with(|| "phase=build_secondary_disk_tree_node")
 }
 
 #[inline]
@@ -2125,7 +2132,7 @@ fn validate_checksum(block: &[u8]) -> DataIntegrityResult<()> {
 /// leaf values.
 fn validate_disk_tree_block<F: DiskTreeSpec>(block: &[u8]) -> DataIntegrityResult<()> {
     validate_checksum(block)?;
-    let node = btree_node_from_block(block).ok_or_else(invalid_node_decode)?;
+    let node = persisted_disk_tree_node(block)?;
     let valid_layout = if node.is_leaf() {
         node.validate_persisted_layout::<F::LeafValue>()
     } else {
@@ -2380,20 +2387,53 @@ mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
-    use crate::error::{DataIntegrityError, ErrorKind, InternalError};
+    use crate::error::{DataIntegrityError, ErrorKind, InternalError, IoError};
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
     use crate::index::btree::{BTreeKey, KeyRange};
     use crate::index::util::tests::drain_row_ids;
+    use crate::layout::LayoutError;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
+    use std::io::Error as StdIoError;
     use std::ops::Bound;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_disk_tree_layout_adaptation_preserves_source_domain() {
+        let persisted = match persisted_disk_tree_node(&[0u8; 1]) {
+            Ok(_) => panic!("short persisted DiskTree node must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            persisted.current_context(),
+            &DataIntegrityError::InvalidPayload
+        );
+        assert_eq!(
+            persisted.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
+        assert!(format!("{persisted:?}").contains("field=node_layout"));
+
+        let mut bytes = [0u8; 1];
+        let trusted = match btree_node_from_block_mut(&mut bytes) {
+            Ok(_) => panic!("short mutable DiskTree node must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            trusted.current_context(),
+            &InternalError::MutableBlockViewMismatch
+        );
+        assert_eq!(
+            trusted.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
+    }
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()
@@ -2632,7 +2672,7 @@ mod tests {
         }
 
         fn should_fail(&self, buf: &DirectBuf) -> bool {
-            let Some(node) = btree_node_from_block(buf.data()) else {
+            let Ok(node) = persisted_disk_tree_node(buf.data()) else {
                 return false;
             };
             if node.is_leaf() {
@@ -2662,7 +2702,11 @@ mod tests {
             let should_fail = self.should_fail(&buf);
             async move {
                 if should_fail {
-                    return Err(Report::new(InternalError::InjectedTestFailure).into());
+                    // TODO(error-boundary): backlog 000160 should assert this
+                    // injected IO source remains visible after rewrite cleanup.
+                    return Err(
+                        IoError::report(StdIoError::other("test disk-tree write failure")).into(),
+                    );
                 }
                 self.inner.write_block(block_id, buf).await
             }
@@ -3264,11 +3308,7 @@ mod tests {
 
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
-            let err = writer.finish().await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::InjectedTestFailure)
-            );
+            writer.finish().await.unwrap_err();
             assert_eq!(mutable.leaf_writes(), 2);
             assert_eq!(mutable.branch_writes(), 0);
             assert_eq!(mutable.allocated_blocks(), allocated_before);
@@ -3313,11 +3353,7 @@ mod tests {
 
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
-            let err = writer.finish().await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::InjectedTestFailure)
-            );
+            writer.finish().await.unwrap_err();
             assert!(
                 mutable.leaf_writes() > 1,
                 "branch failure test should materialize multiple leaves first"

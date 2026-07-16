@@ -74,6 +74,7 @@ it can produce.
 | IO | `Report<IoError>` and `BackendResult<T>` | OS, backend, short-IO, or transport failures | `io`, `file`, `buffer`, `log`, recovery streams |
 | Data integrity | `DataIntegrityResult<T>` | Invalid or corrupted persisted bytes and recovery invariants | `serde`, `value`, `file`, `log`, `lwc`, persisted indexes, catalog/table recovery |
 | Lifecycle | `LifecycleResult<T>` | Shutdown, admission closure, unavailable runtime state, or another clean lifecycle rejection | `engine`, `session`, buffer/log lifecycle, transaction attachment |
+| Runtime | `RuntimeResult<T>` | Recoverable runtime-infrastructure failure before a worker or handoff exists | `thread`, component construction, recovery and transaction startup |
 | Internal | `InternalResult<T>` | Violated runtime, construction, or ownership invariants | `component`, `buffer`, `index`, `table`, `trx`, recovery internals |
 | Fatal | `FatalResult<T>` | A failure that poisons runtime admission or prevents safe continuation | engine poison, log/checkpoint/catalog writes, transaction rollback/purge |
 
@@ -404,15 +405,15 @@ caller-neutral failures, subsystem-local transport, optimistic control flow,
 or expected operation outcomes. Their semantic consumer chooses a main domain
 only when an error interpretation is required.
 
-### Proposed Runtime domain
+### Runtime domain
 
-The first bottom-up task should add a Runtime domain for recoverable runtime
+The Runtime domain represents recoverable runtime
 infrastructure failures that are neither clean Lifecycle rejection, proven
 capacity-specific Resource exhaustion, nor violated Internal invariants. The
-initial API is:
+established API is:
 
 ```rust
-// Defined by the thread module.
+// Defined by the central error module.
 pub(crate) type RuntimeResult<T> =
     std::result::Result<T, error_stack::Report<RuntimeError>>;
 
@@ -427,17 +428,19 @@ pub enum ErrorKind {
 }
 ```
 
-`thread::spawn_named` should return
+`thread::spawn_named` returns
 `RuntimeResult<std::thread::JoinHandle<()>>`. A `std::io::Error` returned by
-`std::thread::Builder::spawn` should first become an IO report, then acquire
+`std::thread::Builder::spawn` first becomes an IO report, then acquires
 `RuntimeError::BackgroundSpawn` with `change_context`, retaining the IO source
 and attaching the requested thread name. Do not classify all spawn failures as
 Resource merely because some operating systems use a capacity-related error
 code.
 
-`CompletionErrorKind::Runtime` is not part of the initial change because a
+`CompletionErrorKind::Runtime` does not exist because a
 spawn failure occurs before a worker or completion handoff exists. Add that
 transport case only when a Runtime report must actually cross such a handoff.
+`CompletionErrorKind::from_error` asserts this invariant instead of silently
+transporting a Runtime report as Internal.
 
 Runtime may later adopt variants currently classified as `InternalError`, but
 only after the owning module proves that the failure represents a recoverable
@@ -448,7 +451,7 @@ preselect variants for migration.
 
 | Module | Target ownership and boundary | Current migration focus |
 | --- | --- | --- |
-| `error` | Defines main domains, public `ErrorKind`, report conversions, and completion transport. Runtime is a proposed addition, not current behavior. | Keep transport conversion exhaustive as domains are implemented; keep public wrappers out of internal round trips. |
+| `error` | Defines main domains, public `ErrorKind`, report conversions, and completion transport. Runtime is an established public classification with lossless typed-report conversion. | Keep transport conversion exhaustive as domains are implemented; keep public wrappers out of internal round trips. |
 | `id` | DataIntegrity only when persisted identifiers are deserialized; ordinary ID operations are infallible. | Preserve `DeserResult` instead of introducing public `Result` into ID helpers. |
 | `bitmap` | DataIntegrity for persisted bitmap deserialization; bitmap mutation and iteration are infallible under their documented bounds. | Keep bounds and shape preconditions as assertions rather than recoverable storage errors. |
 | `layout` | `LayoutResult` is caller-neutral. Persisted consumers map mismatch to DataIntegrity, configuration consumers to Config, and trusted-memory consumers to Internal or an assertion. | Audit every conversion at its semantic consumer; do not give generic layout helpers a main domain. |
@@ -461,7 +464,7 @@ preselect variants for migration.
 | `map`, `memcmp`, `ptr`, `free_list` | Pure data structures and control-flow primitives. Exhaustion or absence is returned neutrally for the caller to interpret. | Keep these modules free of storage-wide error policy. |
 | `notify`, `obs`, `stats` | Notification, observability, and data-reporting primitives; no native recoverable storage domain. | Keep shutdown and waiter policy in their lifecycle-owning callers. |
 | `runtime`, `quiescent` | Infallible execution and lifetime primitives under documented contracts; contract violations are assertions. | Do not use Runtime merely because the module is named `runtime`; Runtime is for recoverable infrastructure failure. |
-| `thread` | Runtime, initially `RuntimeError::BackgroundSpawn`; the IO source remains in the report. | Replace the unconditional spawn `unwrap` and propagate `RuntimeResult` through component construction. |
+| `thread` | Produces Runtime, initially `RuntimeError::BackgroundSpawn`; the central error module owns the domain type and alias, and the IO source remains in the report. | Keep named-thread creation on the canonical fallible helper and add caller-owned phase context only at construction or planning boundaries. |
 
 ### Construction and infrastructure
 
@@ -509,7 +512,7 @@ preselect variants for migration.
 
 Future tasks should migrate one dependency layer at a time:
 
-1. add Runtime/thread handling and audit pure formats and primitives;
+1. add Runtime/thread handling and audit pure formats and primitives (established);
 2. replace component-topology errors with assertions;
 3. refine IO, file, buffer, log, and lock boundaries;
 4. refine row and index producers;
@@ -671,10 +674,32 @@ The following pieces already follow the intended direction:
 
 - Public `Error`, `ErrorKind`, and typed `From<Report<DomainError>>`
   conversions preserve source report frames.
-- Main domain result aliases exist for configuration, operation, resource,
-  data integrity, lifecycle, fatal, and internal errors.
+- Main domain result aliases exist in the central error module for
+  configuration, operation, resource, data integrity, lifecycle, runtime,
+  fatal, and internal errors.
+- Named-thread creation returns `RuntimeResult`, retains its IO source, and
+  attaches the thread name at the canonical spawn boundary. Component builds,
+  recovery planning, and transaction startup preserve that report while
+  adding only their owned phase context.
+- File-system, evictor, recovery read-ahead, transaction log, purge, and
+  cleanup startup propagate spawn failures as public Runtime errors.
+  Multi-worker transaction and purge startup reclaims already-started workers
+  before returning, while rollback join panics remain secondary diagnostics on
+  the initiating Runtime report.
+- Completion transport has no Runtime variant. It rejects an accidental
+  Runtime report before the generic Internal fallback because spawn failure
+  precedes worker handoff.
 - `LayoutResult`, `DmlValidationResult`, and `BackendResult` model
   caller-neutral or subsystem-local failures.
+- Latch fallback parsing and trusted row-vector/LWC construction retain Config
+  and Internal reports until genuine convergence. Persisted LWC,
+  column-block-index, and disk-tree layout consumers retain Layout source
+  frames beneath DataIntegrity; trusted mutable layout consumers retain them
+  beneath Internal.
+- `LwcCode::decode` is the sole typed tag decoder. `ValKind::try_from(u8)`
+  remains an intentional public trait convergence boundary, and
+  `PersistedLwcBlock::load` remains a mixed read/completion and validation
+  convergence boundary.
 - Completion paths use `CompletionErrorKind` rather than requiring `Error` to
   be cloneable across waiters.
 - `WeakEngineRef` lifecycle upgrades, catalog live-table validation,
@@ -708,11 +733,14 @@ The following pieces already follow the intended direction:
 
 The following areas require separate audits after the migrated slice:
 
+- Critical-workflow fault injection still uses several generic Internal test
+  reports or lacks initiating-source assertions. Explicit B-tree callback
+  propagation coverage, DiskTree rewrite IO-source assertions, recovery
+  transport coverage, and poison-with-source behavior are deferred to
+  [backlog 000160](./backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md);
+  they are not established by Task 000226.
 - `DmlValidationResultExt` owns operation and table formatting that should be
   visible at foreground and recovery consumers.
-- Runtime is not implemented yet. `thread::spawn_named` still unwraps
-  background spawn failure; the first bottom-up task should introduce
-  `RuntimeError::BackgroundSpawn`, `RuntimeResult`, and `ErrorKind::Runtime`.
 - Component registry, dependency, shelf, and builder-topology violations still
   return public Internal errors. Replace those paths with assertions and retire
   their obsolete error variants and convenience constructors.

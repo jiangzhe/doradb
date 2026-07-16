@@ -174,10 +174,7 @@ impl StmtEffects {
         sts: TrxID,
     ) -> Result<()> {
         #[cfg(test)]
-        if tests::test_force_stmt_index_rollback_error_enabled() {
-            use crate::error::InternalError;
-            return Err(Report::new(InternalError::InjectedTestFailure).into());
-        }
+        tests::maybe_force_stmt_index_rollback_error()?;
         self.index_undo
             .rollback(table_cache, pool_guards, sts)
             .await
@@ -837,8 +834,15 @@ pub(crate) mod tests {
         TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.set(enabled));
     }
 
-    pub(super) fn test_force_stmt_index_rollback_error_enabled() -> bool {
-        TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.get())
+    pub(super) fn maybe_force_stmt_index_rollback_error() -> Result<()> {
+        if TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.get()) {
+            // TODO(error-boundary): backlog 000160 should replace this generic
+            // hook with a statement rollback source-domain failure.
+            return Err(Report::new(InternalError::Generic)
+                .attach("test statement index rollback failure")
+                .into());
+        }
+        Ok(())
     }
 
     #[inline]

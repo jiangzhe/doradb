@@ -294,10 +294,14 @@ impl Table {
             // cutoff, and full mutation version; otherwise rebuild while the
             // page remains exclusively state-locked.
             let version = map.frozen_mutation_version();
-            let plan = batch.prepared[page_idx]
+            let prepared = batch.prepared[page_idx]
                 .take()
-                .filter(|plan| plan.matches(page_info, cutoff_ts, version))
-                .or_else(|| {
+                .filter(|plan| plan.matches(page_info, cutoff_ts, version));
+            let plan = match prepared {
+                Some(plan) => plan,
+                None => {
+                    #[cfg(test)]
+                    test_hooks::run_test_locked_page_plan_rebuild_hook(page_info.page_id);
                     scan_frozen_page(
                         page,
                         map,
@@ -306,8 +310,9 @@ impl Table {
                         cutoff_ts,
                     )
                     .into_plan(cutoff_ts, version)
-                })
-                .expect("stable frozen page must yield a transition plan under its state lock");
+                    .expect("stable frozen page must yield a transition plan under its state lock")
+                }
+            };
             *state = RowPageState::Transition;
             self.install_transition_markers(&plan)?;
             batch.prepared[page_idx] = Some(plan);

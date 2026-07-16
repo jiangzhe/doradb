@@ -7,13 +7,12 @@ pub(crate) use block::*;
 use crate::bitmap::Bitmap;
 use crate::catalog::TableColumnLayout;
 use crate::compression::*;
-use crate::error::{DataIntegrityError, DataIntegrityResult, Error, InternalError, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
 use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::id::RowID;
 use crate::io::DirectBuf;
 use crate::layout;
-use crate::row::RowPage;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues, ValArrayRef};
 use crate::serde::{ForBitpackingSer, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
@@ -55,50 +54,66 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::I16 => {
                         let input = flat_lwc_payload(input, len, 2, "LWC flat i16 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 2]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 2]>(input),
+                            "flat_i16_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatI16(FlatI16(input)))
                     }
                     ValKind::U16 => {
                         let input = flat_lwc_payload(input, len, 2, "LWC flat u16 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 2]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 2]>(input),
+                            "flat_u16_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatU16(FlatU16(input)))
                     }
                     ValKind::I32 => {
                         let input = flat_lwc_payload(input, len, 4, "LWC flat i32 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 4]>(input),
+                            "flat_i32_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatI32(FlatI32(input)))
                     }
                     ValKind::U32 => {
                         let input = flat_lwc_payload(input, len, 4, "LWC flat u32 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 4]>(input),
+                            "flat_u32_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatU32(FlatU32(input)))
                     }
                     ValKind::F32 => {
                         let input = flat_lwc_payload(input, len, 4, "LWC flat f32 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 4]>(input),
+                            "flat_f32_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatF32(FlatF32(input)))
                     }
                     ValKind::I64 => {
                         let input = flat_lwc_payload(input, len, 8, "LWC flat i64 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 8]>(input),
+                            "flat_i64_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatI64(FlatI64(input)))
                     }
                     ValKind::U64 => {
                         let input = flat_lwc_payload(input, len, 8, "LWC flat u64 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 8]>(input),
+                            "flat_u64_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatU64(FlatU64(input)))
                     }
                     ValKind::F64 => {
                         let input = flat_lwc_payload(input, len, 8, "LWC flat f64 payload")?;
-                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let input = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 8]>(input),
+                            "flat_f64_payload",
+                        )?;
                         LwcData::Primitive(LwcPrimitive::FlatF64(FlatF64(input)))
                     }
                     ValKind::VarByte => {
@@ -118,8 +133,10 @@ impl<'a> LwcData<'a> {
                             ));
                         }
                         let (offset_bytes, data) = input.split_at(offset_bytes_len);
-                        let offsets = layout::try_slice_from_bytes::<[u8; 4]>(offset_bytes)
-                            .change_context(DataIntegrityError::InvalidPayload)?;
+                        let offsets = persisted_lwc_layout(
+                            layout::try_slice_from_bytes::<[u8; 4]>(offset_bytes),
+                            "varbyte_offsets",
+                        )?;
                         LwcData::Bytes(LwcBytes { offsets, data })
                     }
                 }
@@ -198,8 +215,10 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4I32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)
-                                    .change_context(DataIntegrityError::InvalidPayload)?;
+                                let data = persisted_lwc_layout(
+                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
+                                    "for_bitpacking_i32_u16_units",
+                                )?;
                                 LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -218,8 +237,10 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4U32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)
-                                    .change_context(DataIntegrityError::InvalidPayload)?;
+                                let data = persisted_lwc_layout(
+                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
+                                    "for_bitpacking_u32_u16_units",
+                                )?;
                                 LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -238,13 +259,17 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4I64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)
-                                    .change_context(DataIntegrityError::InvalidPayload)?;
+                                let data = persisted_lwc_layout(
+                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
+                                    "for_bitpacking_i64_u16_units",
+                                )?;
                                 LwcPrimitive::ForBp16I64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = layout::try_slice_from_bytes::<[u8; 4]>(data)
-                                    .change_context(DataIntegrityError::InvalidPayload)?;
+                                let data = persisted_lwc_layout(
+                                    layout::try_slice_from_bytes::<[u8; 4]>(data),
+                                    "for_bitpacking_i64_u32_units",
+                                )?;
                                 LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -263,13 +288,17 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4U64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)
-                                    .change_context(DataIntegrityError::InvalidPayload)?;
+                                let data = persisted_lwc_layout(
+                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
+                                    "for_bitpacking_u64_u16_units",
+                                )?;
                                 LwcPrimitive::ForBp16U64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = layout::try_slice_from_bytes::<[u8; 4]>(data)
-                                    .change_context(DataIntegrityError::InvalidPayload)?;
+                                let data = persisted_lwc_layout(
+                                    layout::try_slice_from_bytes::<[u8; 4]>(data),
+                                    "for_bitpacking_u64_u32_units",
+                                )?;
                                 LwcPrimitive::ForBp32U64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -397,23 +426,6 @@ pub(crate) enum LwcCode {
     /// See `ForBitpackingSer` for serialization details.
     ForBitpacking = 3,
     // todo: dict, fsst.
-}
-
-impl TryFrom<u8> for LwcCode {
-    type Error = Error;
-    #[inline]
-    fn try_from(value: u8) -> Result<Self> {
-        let res = match value {
-            1 => LwcCode::Flat,
-            3 => LwcCode::ForBitpacking,
-            _ => {
-                return Err(invalid_compressed_payload(format!(
-                    "invalid LWC code {value}"
-                )));
-            }
-        };
-        Ok(res)
-    }
 }
 
 impl LwcCode {
@@ -659,9 +671,9 @@ impl<'a> LwcPrimitiveSer<'a> {
     /// Creates a borrowed varbyte flat serializer.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved new_bytes"))]
-    pub(crate) fn new_bytes(offsets: &[u32], data: &[u8]) -> Result<Self> {
+    pub(crate) fn new_bytes(offsets: &[u32], data: &[u8]) -> InternalResult<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
-            return Err(invalid_compressed_payload(
+            return Err(lwc_builder_misuse(
                 "LWC bytes offsets must be non-empty and start at zero",
             ));
         }
@@ -673,9 +685,9 @@ impl<'a> LwcPrimitiveSer<'a> {
 
     /// Creates an owned varbyte flat serializer.
     #[inline]
-    pub(crate) fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> Result<Self> {
+    pub(crate) fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> InternalResult<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
-            return Err(invalid_compressed_payload(
+            return Err(lwc_builder_misuse(
                 "LWC bytes offsets must be non-empty and start at zero",
             ));
         }
@@ -881,15 +893,12 @@ impl<'a> LwcBuilder<'a> {
         &self.row_ids
     }
 
-    /// Appends all non-deleted rows from `page` if the block still fits.
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved row-page LWC build"))]
-    pub(crate) fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
-        let view = page.vector_view(self.col_layout);
-        self.append_view(page, view)
-    }
-
     /// Appends one decoded row if the block still fits.
-    pub(crate) fn append_row_values(&mut self, row_id: RowID, vals: &[Val]) -> Result<bool> {
+    pub(crate) fn append_row_values(
+        &mut self,
+        row_id: RowID,
+        vals: &[Val],
+    ) -> InternalResult<bool> {
         let snapshot = self.snapshot_state();
         match self.append_row_values_inner(row_id, vals) {
             Ok(true) => Ok(true),
@@ -907,11 +916,11 @@ impl<'a> LwcBuilder<'a> {
     /// Appends rows described by `view` if the block still fits.
     pub(crate) fn append_view(
         &mut self,
-        page: &RowPage,
         view: PageVectorView<'_, '_>,
-    ) -> Result<bool> {
+        start_row_id: RowID,
+    ) -> InternalResult<bool> {
         let snapshot = self.snapshot_state();
-        match self.append_view_inner(page, view) {
+        match self.append_view_inner(view, start_row_id) {
             Ok(true) => Ok(true),
             Ok(false) => {
                 self.rollback(snapshot);
@@ -924,11 +933,15 @@ impl<'a> LwcBuilder<'a> {
         }
     }
 
-    fn append_view_inner(&mut self, page: &RowPage, view: PageVectorView<'_, '_>) -> Result<bool> {
+    fn append_view_inner(
+        &mut self,
+        view: PageVectorView<'_, '_>,
+        start_row_id: RowID,
+    ) -> InternalResult<bool> {
         let mut new_row_ids = Vec::with_capacity(view.rows_non_deleted());
         for (start_idx, end_idx) in view.range_non_deleted() {
             for idx in start_idx..end_idx {
-                new_row_ids.push(page.row_id(idx));
+                new_row_ids.push(start_row_id + idx as u64);
             }
         }
         self.scan_page_stats(&view, &new_row_ids)?;
@@ -940,7 +953,7 @@ impl<'a> LwcBuilder<'a> {
         Ok(true)
     }
 
-    fn append_row_values_inner(&mut self, row_id: RowID, vals: &[Val]) -> Result<bool> {
+    fn append_row_values_inner(&mut self, row_id: RowID, vals: &[Val]) -> InternalResult<bool> {
         self.scan_row_value_stats(vals)?;
         self.buffer.append_row_values(self.col_layout, vals)?;
         self.row_ids.push(row_id);
@@ -951,11 +964,10 @@ impl<'a> LwcBuilder<'a> {
     }
 
     /// Builds a persisted LWC block with the supplied row-shape fingerprint.
-    pub(crate) fn build(&self, row_shape_fingerprint: u128) -> Result<DirectBuf> {
+    pub(crate) fn build(&self, row_shape_fingerprint: u128) -> InternalResult<DirectBuf> {
         if self.buffer.is_empty() {
             return Err(Report::new(InternalError::LwcBuilderMisuse)
-                .attach("cannot build an empty LWC block")
-                .into());
+                .attach("cannot build an empty LWC block"));
         }
         let row_count = self.buffer.len();
         if row_count > u16::MAX as usize {
@@ -969,7 +981,7 @@ impl<'a> LwcBuilder<'a> {
             let column = self
                 .buffer
                 .column(col_idx)
-                .ok_or_else(column_scan_shape_mismatch)?;
+                .ok_or_else(|| Report::new(InternalError::ColumnScanShapeMismatch))?;
             let mut data = Vec::new();
             if let Some(bitmap) = column.null_bitmap {
                 let bytes = bitmap_to_bytes(bitmap, row_count);
@@ -1082,7 +1094,11 @@ impl<'a> LwcBuilder<'a> {
         }
     }
 
-    fn scan_page_stats(&mut self, view: &PageVectorView<'_, '_>, row_ids: &[RowID]) -> Result<()> {
+    fn scan_page_stats(
+        &mut self,
+        view: &PageVectorView<'_, '_>,
+        row_ids: &[RowID],
+    ) -> InternalResult<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
@@ -1168,9 +1184,9 @@ impl<'a> LwcBuilder<'a> {
         Ok(())
     }
 
-    fn scan_row_value_stats(&mut self, vals: &[Val]) -> Result<()> {
+    fn scan_row_value_stats(&mut self, vals: &[Val]) -> InternalResult<()> {
         if vals.len() != self.col_layout.col_count() {
-            return Err(column_scan_shape_mismatch());
+            return Err(Report::new(InternalError::ColumnScanShapeMismatch));
         }
         for (col_idx, val) in vals.iter().enumerate() {
             if val.is_null() {
@@ -1188,7 +1204,7 @@ impl<'a> LwcBuilder<'a> {
                 (ValKind::F32, Val::F32(_))
                 | (ValKind::F64, Val::F64(_))
                 | (ValKind::VarByte, Val::VarByte(_)) => {}
-                _ => return Err(column_scan_shape_mismatch()),
+                _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
             }
         }
         Ok(())
@@ -1234,7 +1250,7 @@ impl<'a> LwcBuilder<'a> {
         }
     }
 
-    fn estimate_size(&self) -> Result<usize> {
+    fn estimate_size(&self) -> InternalResult<usize> {
         let row_count = self.buffer.len();
         let mut total = LWC_BLOCK_HEADER_SIZE;
         total += mem::size_of::<u16>() * self.col_layout.col_count();
@@ -1487,11 +1503,10 @@ pub(crate) struct LwcNullBitmapSer<'a> {
 impl<'a> LwcNullBitmapSer<'a> {
     /// Creates a null bitmap serializer after validating the length prefix fits.
     #[inline]
-    pub(crate) fn new(bytes: &'a [u8]) -> Result<Self> {
+    pub(crate) fn new(bytes: &'a [u8]) -> InternalResult<Self> {
         if bytes.len() > u16::MAX as usize {
-            return Err(invalid_compressed_payload(
-                "LWC null bitmap payload length exceeds u16::MAX",
-            ));
+            return Err(lwc_block_encoding_invariant()
+                .attach("LWC null bitmap payload length exceeds u16::MAX"));
         }
         Ok(LwcNullBitmapSer { bytes })
     }
@@ -1567,23 +1582,28 @@ impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
 impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
 
 #[inline]
-fn invalid_compressed_payload(message: impl Into<String>) -> Error {
-    invalid_compressed_payload_report(message).into()
-}
-
-#[inline]
 fn invalid_compressed_payload_report(message: impl Into<String>) -> Report<DataIntegrityError> {
     Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
 }
 
 #[inline]
-fn lwc_block_encoding_invariant() -> Error {
-    Report::new(InternalError::LwcBlockEncodingInvariant).into()
+fn persisted_lwc_layout<T>(
+    result: layout::LayoutResult<T>,
+    field: &'static str,
+) -> DataIntegrityResult<T> {
+    result
+        .change_context(DataIntegrityError::InvalidPayload)
+        .attach_with(|| format!("format=lwc_column_payload, field={field}"))
 }
 
 #[inline]
-fn column_scan_shape_mismatch() -> Error {
-    Report::new(InternalError::ColumnScanShapeMismatch).into()
+fn lwc_block_encoding_invariant() -> Report<InternalError> {
+    Report::new(InternalError::LwcBlockEncodingInvariant)
+}
+
+#[inline]
+fn lwc_builder_misuse(message: impl Into<String>) -> Report<InternalError> {
+    Report::new(InternalError::LwcBuilderMisuse).attach(message.into())
 }
 
 #[inline]
@@ -1776,13 +1796,13 @@ fn estimate_columns_size(
     buffer: &ScanBuffer,
     stats: &[LwcColumnStats],
     row_count: usize,
-) -> Result<usize> {
+) -> InternalResult<usize> {
     let mut total = 0usize;
     debug_assert!(stats.len() == col_layout.col_count());
     for (col_idx, st) in stats.iter().enumerate() {
         let column = buffer
             .column(col_idx)
-            .ok_or_else(column_scan_shape_mismatch)?;
+            .ok_or_else(|| Report::new(InternalError::ColumnScanShapeMismatch))?;
         if column.null_bitmap.is_some() {
             total += mem::size_of::<u16>() + row_count.div_ceil(8);
         }
@@ -1797,7 +1817,7 @@ fn estimate_column_payload(
     values: &ScanColumnValues<'_>,
     stats: &LwcColumnStats,
     row_count: usize,
-) -> Result<usize> {
+) -> InternalResult<usize> {
     let size = match (kind, values) {
         (ValKind::I8, ScanColumnValues::I8(_)) => {
             estimate_i64_payload(stats, row_count, mem::size_of::<i8>())
@@ -1836,7 +1856,7 @@ fn estimate_column_payload(
                 + (count + 1) * mem::size_of::<u32>()
                 + data.len()
         }
-        _ => return Err(column_scan_shape_mismatch()),
+        _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
     };
     Ok(size)
 }
@@ -2295,14 +2315,16 @@ mod tests {
     #[test]
     fn test_lwc_bytes_invalid() {
         let err = LwcPrimitiveSer::new_bytes(&[], &[]);
-        assert!(err.as_ref().is_err_and(
-            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
-        ));
+        assert!(
+            err.as_ref()
+                .is_err_and(|err| err.current_context() == &InternalError::LwcBuilderMisuse)
+        );
 
         let err = LwcPrimitiveSer::new_bytes(&[1, 2], &[0u8]);
-        assert!(err.as_ref().is_err_and(
-            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
-        ));
+        assert!(
+            err.as_ref()
+                .is_err_and(|err| err.current_context() == &InternalError::LwcBuilderMisuse)
+        );
 
         let offsets = vec![0u32, 0];
         let bytes = vec![];
@@ -2408,7 +2430,8 @@ mod tests {
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
         assert!(builder.is_empty());
         assert!(builder.row_count() == 0);
-        let appended = builder.append_row_page(&page).unwrap();
+        let view = page.vector_view(metadata.col.as_ref());
+        let appended = builder.append_view(view, page.header.start_row_id).unwrap();
         assert!(appended);
         let expected_fingerprint = row_shape_fingerprint_for(builder.row_ids(), 100, 110);
         let buf = builder.build(expected_fingerprint).unwrap();
@@ -2482,7 +2505,12 @@ mod tests {
         }
 
         let mut page_builder = LwcBuilder::new(metadata.col.as_ref());
-        assert!(page_builder.append_row_page(&page).unwrap());
+        let view = page.vector_view(metadata.col.as_ref());
+        assert!(
+            page_builder
+                .append_view(view, page.header.start_row_id)
+                .unwrap()
+        );
         let mut direct_builder = LwcBuilder::new(metadata.col.as_ref());
         for (offset, vals) in rows.iter().enumerate() {
             assert!(
@@ -2532,7 +2560,8 @@ mod tests {
         assert!(matches!(page.delete(RowID::new(4)), Delete::Ok));
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
-        assert!(builder.append_row_page(&page).unwrap());
+        let view = page.vector_view(metadata.col.as_ref());
+        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
 
         let stats = builder.stats[0].snapshot();
         assert!(stats.initialized);
@@ -2563,7 +2592,8 @@ mod tests {
         }
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
-        assert!(builder.append_row_page(&page).unwrap());
+        let view = page.vector_view(metadata.col.as_ref());
+        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
 
         let snapshot = builder.snapshot_state();
         let expected_row_count = builder.row_count();
@@ -2591,7 +2621,8 @@ mod tests {
                 InsertRow::Ok(_)
             ));
         }
-        assert!(builder.append_row_page(&page).unwrap());
+        let view = page.vector_view(metadata.col.as_ref());
+        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
 
         builder.rollback(snapshot);
 
@@ -2639,9 +2670,14 @@ mod tests {
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
         builder.buffer = ScanBuffer::new(metadata.col.as_ref(), &[0]);
 
-        let res = builder.append_row_page(&page);
+        let view = page.vector_view(metadata.col.as_ref());
+        let res = builder.append_view(view, page.header.start_row_id);
 
-        assert!(res.is_err());
+        let err = res.expect_err("column shape mismatch must fail");
+        assert_eq!(
+            err.current_context(),
+            &InternalError::ColumnScanShapeMismatch
+        );
         assert_eq!(builder.row_count(), 0);
         assert!(builder.row_ids().is_empty());
         assert!(
@@ -2724,7 +2760,8 @@ mod tests {
         }
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
-        assert!(builder.append_row_page(&page).unwrap());
+        let view = page.vector_view(metadata.col.as_ref());
+        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
         let buf = builder
             .build(row_shape_fingerprint_for(builder.row_ids(), 10, 13))
             .unwrap();

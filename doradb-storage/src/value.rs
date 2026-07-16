@@ -1,9 +1,12 @@
-use crate::error::{DataIntegrityError, Error, Result};
+// Intentional public trait convergence: `ValKind::try_from(u8)` must expose the
+// crate error while forwarding its sole DataIntegrity report; internal decoders
+// retain `DataIntegrityResult` and do not cross this boundary.
+use crate::error::{DataIntegrityError, DataIntegrityResult, Error, Result};
 use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
 };
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use ordered_float::OrderedFloat;
 use serde::de::{Error as DeError, Visitor};
@@ -101,10 +104,7 @@ impl Deser for ValType {
         min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let idx = start_idx;
         let (idx, kind) = input.deser_u8(idx)?;
         let kind = ValKind::decode(kind)?;
@@ -158,7 +158,7 @@ impl ValKind {
 
     /// Decodes one persisted value-kind code before a public error boundary is chosen.
     #[inline]
-    pub(crate) fn decode(value: u8) -> crate::error::DataIntegrityResult<Self> {
+    pub(crate) fn decode(value: u8) -> DataIntegrityResult<Self> {
         let res = match value {
             1 => ValKind::I8,
             2 => ValKind::U8,
@@ -666,10 +666,7 @@ impl Deser for Val {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, c) = input.deser_u8(start_idx)?;
         if c == 0 {
             return Ok((idx, Val::Null));
@@ -1369,7 +1366,19 @@ fn fail_long_bytes<T, E: DeError>() -> StdResult<T, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
     use std::f64::consts::PI as PI_F64;
+
+    #[test]
+    fn test_val_kind_try_from_preserves_data_integrity_source() {
+        let err = ValKind::try_from(u8::MAX).expect_err("invalid value-kind tag must fail");
+
+        assert_eq!(err.kind(), ErrorKind::DataIntegrity);
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
+    }
 
     #[test]
     fn test_var_len() {

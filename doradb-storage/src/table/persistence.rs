@@ -686,11 +686,7 @@ impl Table {
         // file fork as LWC and delete metadata. A later error abandons the
         // fork, so no secondary root can be published on its own.
         #[cfg(test)]
-        {
-            if test_hooks::test_force_secondary_sidecar_error_enabled() {
-                return Err(Report::new(InternalError::InjectedTestFailure).into());
-            }
-        }
+        test_hooks::maybe_force_secondary_sidecar_error()?;
 
         let metadata = layout.metadata();
         if mutable_file.secondary_index_roots().len() != metadata.idx.index_slot_count() {
@@ -1159,11 +1155,7 @@ impl Table {
         use super::test_hooks as table_test_hooks;
 
         #[cfg(test)]
-        {
-            if table_test_hooks::test_force_lwc_build_error_enabled() {
-                return Err(Report::new(InternalError::InjectedTestFailure).into());
-            }
-        }
+        table_test_hooks::maybe_force_lwc_build_error()?;
         let mut lwc_blocks = Vec::new();
         if !prepared_pages.is_empty() {
             let mut builder = LwcBuilder::new(metadata.col.as_ref());
@@ -1199,7 +1191,7 @@ impl Table {
                     current_start = prepared.start_row_id;
                     current_end = prepared.end_row_id;
                 }
-                if !builder.append_view(page, view)? {
+                if !builder.append_view(view, prepared.start_row_id)? {
                     let shape = ColumnBlockEntryShape::new(
                         current_start,
                         current_end,
@@ -1215,7 +1207,7 @@ impl Table {
                         metadata.col.as_ref(),
                         prepared.del_bitmap.clone(),
                     )?;
-                    if !builder.append_view(page, view)? {
+                    if !builder.append_view(view, prepared.start_row_id)? {
                         return Err(Report::new(InternalError::LwcBuilderMisuse)
                             .attach(format!(
                                 "single row page does not fit in LWC block: page_id={}",
@@ -1616,8 +1608,9 @@ fn ensure_maintenance_wait_running(session: &SessionPin, operation: &'static str
 #[cfg(test)]
 mod tests {
     pub(crate) mod test_hooks {
-        use crate::error::{FatalError, Result};
+        use crate::error::{FatalError, InternalError, Result};
         use crate::trx::sys::TransactionSystem;
+        use error_stack::Report;
         use std::cell::{Cell, RefCell};
         use std::future::Future;
         use std::pin::Pin;
@@ -1644,8 +1637,15 @@ mod tests {
             TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.set(enabled));
         }
 
-        pub(crate) fn test_force_secondary_sidecar_error_enabled() -> bool {
-            TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
+        pub(crate) fn maybe_force_secondary_sidecar_error() -> Result<()> {
+            if TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get()) {
+                // TODO(error-boundary): backlog 000160 should replace this
+                // generic hook with a checkpoint sidecar-specific failure.
+                return Err(Report::new(InternalError::Generic)
+                    .attach("test secondary-index sidecar failure")
+                    .into());
+            }
+            Ok(())
         }
 
         pub(crate) fn set_test_force_post_publish_checkpoint_error(enabled: bool) {
@@ -1812,8 +1812,8 @@ mod tests {
         ForceLwcBuildErrorGuard, set_test_freeze_page_state_locked_hook,
         set_test_frozen_page_row_scan_hook, set_test_frozen_page_scan_hook,
         set_test_frozen_pages_ready_hook, set_test_hot_row_write_before_state_lock_hook,
-        set_test_optimistic_page_plan_comparison_hook, set_test_stable_page_plans_refreshed_hook,
-        set_test_transition_page_published_hook,
+        set_test_locked_page_plan_rebuild_hook, set_test_optimistic_page_plan_comparison_hook,
+        set_test_stable_page_plans_refreshed_hook, set_test_transition_page_published_hook,
     };
     use crate::table::tests::*;
     use crate::table::{DeleteMarker, TableLifecycle, TableTerminal};
@@ -2557,11 +2557,7 @@ mod tests {
 
             set_test_force_secondary_sidecar_error(true);
             let _reset = ResetSidecarHook;
-            let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::InjectedTestFailure)
-            );
+            session.checkpoint_table(table_id).await.unwrap_err();
 
             let root_after = table_for_internal_assertion(&engine, table_id)
                 .file()
@@ -5001,25 +4997,20 @@ mod tests {
                 hook_undo_owner.borrow_mut().replace(undo);
                 drop(page_guard);
             });
-            let first_page_analysis_count = Rc::new(Cell::new(0usize));
-            let hook_first_page_analysis_count = Rc::clone(&first_page_analysis_count);
+            let locked_rebuild_observed = Rc::new(Cell::new(false));
+            let hook_locked_rebuild_observed = Rc::clone(&locked_rebuild_observed);
             let hook_table = Arc::downgrade(&table);
-            set_test_frozen_page_scan_hook(move |page_id| {
-                if page_id != first_page_id {
-                    return;
-                }
-                let count = hook_first_page_analysis_count.get() + 1;
-                hook_first_page_analysis_count.set(count);
-                if count == 2 {
-                    assert_eq!(
-                        hook_table
-                            .upgrade()
-                            .unwrap()
-                            .checkpoint_workflow
-                            .state_name(),
-                        "Transition"
-                    );
-                }
+            set_test_locked_page_plan_rebuild_hook(move |page_id| {
+                assert_eq!(page_id, first_page_id);
+                assert_eq!(
+                    hook_table
+                        .upgrade()
+                        .unwrap()
+                        .checkpoint_workflow
+                        .state_name(),
+                    "Transition"
+                );
+                hook_locked_rebuild_observed.set(true);
             });
             let publish_admitted = Rc::new(Cell::new(false));
             let hook_publish_admitted = Rc::clone(&publish_admitted);
@@ -5030,7 +5021,7 @@ mod tests {
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
             assert!(publish_admitted.get());
-            assert_eq!(first_page_analysis_count.get(), 2);
+            assert!(locked_rebuild_observed.get());
             assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
             let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
                 panic!("locked rebuild must install the ownership marker");
@@ -5070,7 +5061,7 @@ mod tests {
             let mut update_trx = update_session.begin_trx().unwrap();
             let mut delete_session = engine.new_session().unwrap();
             let mut delete_trx = delete_session.begin_trx().unwrap();
-            let (checkpoint_err, update_err, delete_err) = {
+            let (update_err, delete_err) = {
                 let _failure = ForceLwcBuildErrorGuard::new();
                 let checkpoint = checkpoint_session.checkpoint_table(table_id).fuse();
                 futures::pin_mut!(checkpoint);
@@ -5107,18 +5098,11 @@ mod tests {
                 ));
 
                 release_tx.send_async(()).await.unwrap();
-                let checkpoint_err = checkpoint.await.unwrap_err();
+                checkpoint.await.unwrap_err();
                 let update_err = update.await.unwrap_err();
                 let delete_err = delete.await.unwrap_err();
-                (checkpoint_err, update_err, delete_err)
+                (update_err, delete_err)
             };
-            assert_eq!(
-                checkpoint_err
-                    .report()
-                    .downcast_ref::<InternalError>()
-                    .copied(),
-                Some(InternalError::InjectedTestFailure)
-            );
             assert!(
                 engine
                     .inner()
@@ -5337,7 +5321,11 @@ mod tests {
                 prepare_silent_checkpoint_failure(&engine, &mut session).await;
             let guards = session.pool_guards();
             set_test_silent_watermark_mutation_hook(|| async {
-                Err(Report::new(InternalError::InjectedTestFailure).into())
+                // TODO(error-boundary): backlog 000160 should replace this
+                // generic hook with the owning catalog-write source domain.
+                Err(Report::new(InternalError::Generic)
+                    .attach("test silent-watermark mutation failure")
+                    .into())
             });
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();

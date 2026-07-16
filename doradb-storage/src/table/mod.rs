@@ -1159,7 +1159,9 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     pub(crate) mod test_hooks {
+        use crate::error::{InternalError, Result};
         use crate::id::PageID;
+        use error_stack::Report;
         use std::cell::{Cell, RefCell};
 
         type FreezePageHook = Box<dyn FnOnce(PageID) + 'static>;
@@ -1183,6 +1185,8 @@ pub(crate) mod tests {
             static TEST_FROZEN_PAGES_READY_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
                 const { RefCell::new(None) };
             static TEST_STABLE_PAGE_PLANS_REFRESHED_HOOK: RefCell<Option<FrozenPagePhaseHook>> =
+                const { RefCell::new(None) };
+            static TEST_LOCKED_PAGE_PLAN_REBUILD_HOOK: RefCell<Option<TransitionPageHook>> =
                 const { RefCell::new(None) };
             static TEST_TRANSITION_PAGE_PUBLISHED_HOOK: RefCell<Option<TransitionPageHook>> =
                 const { RefCell::new(None) };
@@ -1209,8 +1213,15 @@ pub(crate) mod tests {
             }
         }
 
-        pub(crate) fn test_force_lwc_build_error_enabled() -> bool {
-            TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get())
+        pub(crate) fn maybe_force_lwc_build_error() -> Result<()> {
+            if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
+                // TODO(error-boundary): backlog 000160 should replace this
+                // generic hook with an owner-specific construction failure.
+                return Err(Report::new(InternalError::Generic)
+                    .attach("test LWC build failure")
+                    .into());
+            }
+            Ok(())
         }
 
         pub(crate) fn set_test_freeze_page_state_locked_hook<F>(hook: F)
@@ -1225,6 +1236,23 @@ pub(crate) mod tests {
 
         pub(crate) fn run_test_freeze_page_state_locked_hook(page_id: PageID) {
             let hook = TEST_FREEZE_PAGE_STATE_LOCKED_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(page_id);
+            }
+        }
+
+        pub(crate) fn set_test_locked_page_plan_rebuild_hook<F>(hook: F)
+        where
+            F: FnOnce(PageID) + 'static,
+        {
+            TEST_LOCKED_PAGE_PLAN_REBUILD_HOOK.with(|slot| {
+                let old = slot.borrow_mut().replace(Box::new(hook));
+                assert!(old.is_none(), "locked page-plan hook already installed");
+            });
+        }
+
+        pub(crate) fn run_test_locked_page_plan_rebuild_hook(page_id: PageID) {
+            let hook = TEST_LOCKED_PAGE_PLAN_REBUILD_HOOK.with(|slot| slot.borrow_mut().take());
             if let Some(hook) = hook {
                 hook(page_id);
             }

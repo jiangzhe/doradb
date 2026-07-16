@@ -1,7 +1,9 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
-use crate::error::{
-    DataIntegrityError, DataIntegrityResult, Error, FileKind, InternalError, Result,
-};
+use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind, InternalError};
+// Existing ColumnBlockIndex orchestration is a genuine mixed boundary over
+// persisted DataIntegrity, buffer/file IO, and trusted rewrite Internal
+// failures. Broader index-domain narrowing belongs to a later blueprint phase.
+use crate::error::{Error, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, max_payload_len, validate_block,
@@ -1163,10 +1165,12 @@ impl ValidatedColumnBlockNode {
     }
 
     fn leaf_header_ext(&self) -> DataIntegrityResult<&ColumnBlockLeafHeaderExt> {
-        layout::try_ref_from_bytes::<ColumnBlockLeafHeaderExt>(
-            &self.data_ref()[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE],
+        persisted_column_index_layout(
+            layout::try_ref_from_bytes::<ColumnBlockLeafHeaderExt>(
+                &self.data_ref()[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE],
+            ),
+            "leaf_header_extension",
         )
-        .map_err(|_| invalid_node_payload())
     }
 
     fn leaf_prefix_plane(&self) -> DataIntegrityResult<LeafPrefixPlane<'_>> {
@@ -1187,18 +1191,24 @@ impl ValidatedColumnBlockNode {
         let plane = match search_type {
             ColumnBlockLeafSearchType::Plain => LeafPrefixPlane::Plain {
                 header_start_row_id: header.start_row_id(),
-                prefixes: layout::try_slice_from_bytes(prefix_bytes)
-                    .map_err(|_| invalid_node_payload())?,
+                prefixes: persisted_column_index_layout(
+                    layout::try_slice_from_bytes(prefix_bytes),
+                    "plain_leaf_prefixes",
+                )?,
             },
             ColumnBlockLeafSearchType::DeltaU32 => LeafPrefixPlane::DeltaU32 {
                 header_start_row_id: header.start_row_id(),
-                prefixes: layout::try_slice_from_bytes(prefix_bytes)
-                    .map_err(|_| invalid_node_payload())?,
+                prefixes: persisted_column_index_layout(
+                    layout::try_slice_from_bytes(prefix_bytes),
+                    "u32_delta_leaf_prefixes",
+                )?,
             },
             ColumnBlockLeafSearchType::DeltaU16 => LeafPrefixPlane::DeltaU16 {
                 header_start_row_id: header.start_row_id(),
-                prefixes: layout::try_slice_from_bytes(prefix_bytes)
-                    .map_err(|_| invalid_node_payload())?,
+                prefixes: persisted_column_index_layout(
+                    layout::try_slice_from_bytes(prefix_bytes),
+                    "u16_delta_leaf_prefixes",
+                )?,
             },
         };
         validate_leaf_prefixes(&plane, data)?;
@@ -1219,10 +1229,12 @@ impl ValidatedColumnBlockNode {
         let data = self.leaf_data_ref();
         let prefix_end = prefixes.prefix_bytes_len();
         let entry_bytes = leaf_entry_slice(data, prefix_end, prefix.entry_offset)?;
-        let entry_header = layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(
-            &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
-        )
-        .map_err(|_| invalid_node_payload())?;
+        let entry_header = persisted_column_index_layout(
+            layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(
+                &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
+            ),
+            "leaf_entry_header",
+        )?;
         let row_section_end =
             COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + entry_header.row_section_len() as usize;
         let row_section = &entry_bytes[COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE..row_section_end];
@@ -1240,10 +1252,12 @@ impl ValidatedColumnBlockNode {
                 if bytes.len() < COLUMN_DELETE_SECTION_HEADER_SIZE {
                     return Err(invalid_node_payload());
                 }
-                let header = layout::try_ref_from_bytes::<DeleteSectionHeader>(
-                    &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
-                )
-                .map_err(|_| invalid_node_payload())?;
+                let header = persisted_column_index_layout(
+                    layout::try_ref_from_bytes::<DeleteSectionHeader>(
+                        &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
+                    ),
+                    "delete_section_header",
+                )?;
                 if header.version != COLUMN_DELETE_SECTION_VERSION {
                     return Err(invalid_node_payload());
                 }
@@ -2163,6 +2177,16 @@ fn invalid_node_payload() -> Report<DataIntegrityError> {
 }
 
 #[inline]
+fn persisted_column_index_layout<T>(
+    result: layout::LayoutResult<T>,
+    field: &'static str,
+) -> DataIntegrityResult<T> {
+    result
+        .change_context(DataIntegrityError::InvalidPayload)
+        .attach_with(|| format!("format=column_block_index, field={field}"))
+}
+
+#[inline]
 fn invalid_node_error(file_kind: FileKind, block_id: BlockID) -> Error {
     Error::from(invalid_node_payload().attach(format!(
         "file={file_kind}, block=column_block_index, block_id={block_id}"
@@ -2181,9 +2205,10 @@ fn invalid_blob_payload(file_kind: FileKind, block_id: BlockID) -> Error {
 #[inline]
 fn validate_node_payload(page: &[u8]) -> DataIntegrityResult<&[u8]> {
     let payload = validate_block(page, COLUMN_BLOCK_INDEX_BLOCK_SPEC)?;
-    let header =
-        layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
-            .map_err(|_| invalid_node_payload())?;
+    let header = persisted_column_index_layout(
+        layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE]),
+        "node_header",
+    )?;
     let count = header.count() as usize;
     if (header.height() == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
         || (header.height() > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
@@ -2278,9 +2303,10 @@ fn leaf_entry_slice(
     if offset < prefix_end || header_end > data.len() {
         return Err(invalid_node_payload());
     }
-    let header =
-        layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(&data[offset..header_end])
-            .map_err(|_| invalid_node_payload())?;
+    let header = persisted_column_index_layout(
+        layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(&data[offset..header_end]),
+        "leaf_entry_header",
+    )?;
     let entry_len = header.entry_len() as usize;
     if entry_len < COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + header.row_section_len() as usize {
         return Err(invalid_node_payload());
@@ -2304,10 +2330,12 @@ fn validate_leaf_prefixes(prefixes: &LeafPrefixPlane<'_>, data: &[u8]) -> DataIn
     for idx in 0..prefixes.count() {
         let prefix = prefixes.prefix(idx).map_err(|_| invalid_node_payload())?;
         let entry_bytes = leaf_entry_slice(data, prefix_end, prefix.entry_offset)?;
-        let entry_header = layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(
-            &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
-        )
-        .map_err(|_| invalid_node_payload())?;
+        let entry_header = persisted_column_index_layout(
+            layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(
+                &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
+            ),
+            "leaf_entry_header",
+        )?;
         if entry_header.block_id() == SUPER_BLOCK_ID {
             return Err(invalid_node_payload());
         }
@@ -2603,10 +2631,12 @@ fn decode_delete_section_metadata(
     if bytes.len() < COLUMN_DELETE_SECTION_HEADER_SIZE {
         return Err(invalid_node_payload());
     }
-    let header = layout::try_ref_from_bytes::<DeleteSectionHeader>(
-        &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
-    )
-    .map_err(|_| invalid_node_payload())?;
+    let header = persisted_column_index_layout(
+        layout::try_ref_from_bytes::<DeleteSectionHeader>(
+            &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
+        ),
+        "delete_section_header",
+    )?;
     decode_delete_section_metadata_with_header(bytes, header, default_domain)
 }
 
@@ -3176,10 +3206,13 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
+    // Tests below inspect the existing ColumnBlockIndex public orchestration
+    // boundary over persisted DataIntegrity, buffer/file IO, and rewrite Internal.
     use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
+    use crate::layout::LayoutError;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::collections::BTreeSet;
@@ -3187,6 +3220,24 @@ mod tests {
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()
+    }
+
+    #[test]
+    fn test_column_index_layout_adaptation_preserves_layout_source() {
+        let err = match persisted_column_index_layout(
+            layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&[0u8; 1]),
+            "test_node_header",
+        ) {
+            Ok(_) => panic!("short column-index header must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
+        assert_eq!(
+            err.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
+        assert!(format!("{err:?}").contains("field=test_node_header"));
     }
 
     fn test_row_id_range(start: u64, end: u64) -> Vec<RowID> {
