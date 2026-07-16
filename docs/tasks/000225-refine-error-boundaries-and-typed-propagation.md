@@ -1,7 +1,7 @@
 ---
 id: 000225
 title: Refine error boundaries and typed propagation
-status: proposal
+status: implemented
 created: 2026-07-15
 github_issue: 853
 ---
@@ -352,6 +352,40 @@ the task's `Implementation Notes` during task resolution, not in the error
 specification.
 
 ## Implementation Notes
+
+- Completed the selected vertical migration through logical-lock consumers and
+  `Statement::table_scan_mvcc`. Operation-domain reports now remain typed
+  through reusable helpers, public statement operations own their operation
+  attachments, and direct cross-domain conversions retain their source frames.
+- Reclassified engine admission, session availability, transaction admission
+  and discard, and transaction-owned lock-state lookup as Lifecycle-domain
+  concerns. Poison-blocked admission remains Lifecycle-owned while preserving
+  the originating Fatal frame.
+- Removed `DataIntegrityResultExt::with_block_context` and migrated its direct
+  consumers to `error-stack` attachments. Caller-neutral validation and
+  persisted-data failures stay typed until their semantic or public boundary.
+- Made row-page cursor traversal and its direct consumers propagate the generic
+  `BufferPool` result. The production fixed-pool reachability proof and the
+  assertion-versus-recoverable decision remain deferred to
+  [backlog 000159](../backlogs/000159-reassess-invariant-oriented-table-scan-errors.md);
+  no synthetic failing buffer implementation was added solely to exercise an
+  unreachable production error.
+- Implementation showed that a repository-wide top-down conversion would
+  create excessive API churn. `docs/error-spec.md` now records a bottom-up
+  module blueprint, treats statement modules as outer orchestration boundaries,
+  proposes a future Runtime domain and component invariant assertions, and
+  requires cleanup failures to attach to rather than overwrite the primary
+  failure. Those future module changes are guidance, not additional task
+  implementation.
+- Review follow-ups removed a no-op cursor parent take/restore without changing
+  shared-lock traversal and preserved the original create-table transaction
+  start error when provisional-file cleanup also fails.
+- Validation completed on 2026-07-16: branch-diff style audit passed for 28
+  Rust files; `cargo nextest run --workspace` passed 1,418 tests; the `libaio`
+  pass completed 1,342 tests; and focused coverage across the 28 changed Rust
+  files was 49,055/52,644 lines (93.18%). The definition-heavy `error.rs` was
+  341/431 lines (79.12%), with aggregate coverage above the task threshold.
+  `git diff --check` also passed.
 
 ## Impacts
 
