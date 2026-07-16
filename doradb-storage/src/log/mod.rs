@@ -2416,7 +2416,8 @@ mod tests {
     use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner};
     use crate::session::tests::SessionTestExt;
     use crate::trx::MAX_SNAPSHOT_TS;
-    use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
+    use crate::trx::sys::TrxCleanupMessage;
+    use crate::trx::sys::tests::manual_log_processor_transaction_system;
     use crate::value::Val;
     use event_listener::Event;
     use futures::task::noop_waker;
@@ -2973,20 +2974,8 @@ mod tests {
         config: TrxSysConfig,
         redo_log: RedoLog,
     ) -> ManualLogProcessorHarness {
-        let (purge_tx, purge_rx) = flume::unbounded();
-        let (cleanup_tx, cleanup_rx) = flume::unbounded();
-        let trx_sys = TransactionSystem::new(
-            config,
-            engine.inner().engine_poisoner.clone(),
-            engine.inner().catalog.clone(),
-            engine.inner().table_fs.clone(),
-            CachePadded::new(redo_log),
-            MIN_SNAPSHOT_TS,
-            TransactionSystemQueues {
-                purge_tx,
-                cleanup_tx,
-            },
-        );
+        let (trx_sys, purge_rx, cleanup_rx) =
+            manual_log_processor_transaction_system(engine, config, redo_log);
         ManualLogProcessorHarness {
             trx_sys,
             _purge_rx: purge_rx,

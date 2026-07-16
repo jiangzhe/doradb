@@ -10,7 +10,9 @@ use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::engine_poison::EnginePoisoner;
-use crate::error::{CompletionErrorKind, Error, FatalError, InternalError, IoError, Result};
+use crate::error::{
+    CompletionErrorKind, Error, FatalError, InternalError, IoError, Result, RuntimeResult,
+};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
     MultiTableActiveRoot, MultiTableFile, MultiTableFileOpenOutcome, MutableMultiTableFile,
@@ -1370,7 +1372,7 @@ where
     B::SubmitBatch: Send + 'static,
 {
     /// Spawn the shared storage event loop on its dedicated thread.
-    fn start_thread(self) -> JoinHandle<()>
+    fn start_thread(self) -> RuntimeResult<JoinHandle<()>>
     where
         B: Send + 'static,
     {
@@ -1739,7 +1741,8 @@ impl Component for FileSystemWorkers {
                     index_pool_file,
                 ),
             )
-            .start_thread();
+            .start_thread()
+            .attach("component=fs_workers, phase=build_shared_storage_worker")?;
         registry.register::<Self>(FileSystemWorkersOwned {
             fs,
             handle: Mutex::new(Some(handle)),
@@ -2836,7 +2839,7 @@ pub(crate) mod tests {
             );
             let worker = builder.bind(engine_poisoner.clone(), state_machine);
             let (submission, completion) = SyncSubmission::prepare_fsync(table_file);
-            let handle = worker.start_thread();
+            let handle = worker.start_thread().unwrap();
             background_writes
                 .send(BackgroundWriteRequest::TableSync(submission))
                 .expect("test background write lane should accept fsync");

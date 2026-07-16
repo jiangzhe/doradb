@@ -3,7 +3,7 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::{
     Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, is_catalog_table,
 };
-use crate::error::{FatalError, InternalError, Result};
+use crate::error::{FatalError, InternalError, Result, RuntimeError, RuntimeResult};
 use crate::file::table_file::OldRoot;
 use crate::id::TrxID;
 use crate::map::{FastHashMap, FastHashSet};
@@ -204,17 +204,27 @@ impl TransactionSystem {
         trx_sys: QuiescentGuard<Self>,
         pool_guards: PoolGuards,
         purge_chan: Receiver<Purge>,
-    ) -> Vec<JoinHandle<()>> {
+    ) -> RuntimeResult<Vec<JoinHandle<()>>> {
         let trx_sys = trx_sys.into_sync();
-        let (mut dispatcher, executors) = Self::dispatch_purge(trx_sys.clone(), &pool_guards);
+        let (mut dispatcher, executors) = Self::dispatch_purge(trx_sys.clone(), &pool_guards)?;
         let task_trx_sys = trx_sys.clone();
-        let handle = thread::spawn_named("Purge-Dispatcher", move || {
+        let handle = match thread::spawn_named("Purge-Dispatcher", move || {
             runtime::block_on(dispatcher.purge_loop(&task_trx_sys, pool_guards, purge_chan));
-        });
+        }) {
+            Ok(handle) => handle,
+            Err(report) => {
+                // PurgeDispatcher has been dropped so executors should quit quickly.
+                return Err(reclaim_partial_purge_workers(
+                    report,
+                    executors,
+                    "rollback_purge_dispatcher_spawn",
+                ));
+            }
+        };
         let mut handles = Vec::with_capacity(executors.len() + 1);
         handles.push(handle);
         handles.extend(executors);
-        handles
+        Ok(handles)
     }
 
     /// Calculate the purge horizon from active transaction buckets.
@@ -272,7 +282,7 @@ impl TransactionSystem {
     pub(super) fn dispatch_purge(
         trx_sys: SyncQuiescentGuard<Self>,
         pool_guards: &PoolGuards,
-    ) -> (PurgeDispatcher, Vec<JoinHandle<()>>) {
+    ) -> RuntimeResult<(PurgeDispatcher, Vec<JoinHandle<()>>)> {
         let mut handles = vec![];
         let mut chans = vec![];
         for worker_slot in 1..trx_sys.config.purge_threads {
@@ -281,18 +291,27 @@ impl TransactionSystem {
             let thread_name = format!("Purge-Executor-{worker_slot}");
             let pool_guards = pool_guards.clone();
             let task_trx_sys = trx_sys.clone();
-            let handle = thread::spawn_named(thread_name, move || {
-                let mut purger = PurgeExecutor;
-                runtime::block_on(purger.purge_task_loop(
+            let handle = match thread::spawn_named(thread_name, move || {
+                runtime::block_on(purge_executor(
                     &task_trx_sys.catalog,
                     &task_trx_sys,
                     pool_guards,
                     rx,
                 ));
-            });
+            }) {
+                Ok(handle) => handle,
+                Err(report) => {
+                    drop(chans); // drop channels to let all executors quit.
+                    return Err(reclaim_partial_purge_workers(
+                        report,
+                        handles,
+                        "rollback_purge_executor_spawn",
+                    ));
+                }
+            };
             handles.push(handle);
         }
-        (PurgeDispatcher(chans), handles)
+        Ok((PurgeDispatcher(chans), handles))
     }
 
     /// Purge row undo logs and index entries according to given transaction
@@ -1234,31 +1253,45 @@ impl PurgeDispatcher {
     }
 }
 
-/// Worker that executes dispatched purge tasks.
-#[derive(Default)]
-pub(crate) struct PurgeExecutor;
+/// Executes dispatched purge tasks until the task channel closes.
+#[inline]
+async fn purge_executor(
+    catalog: &Catalog,
+    trx_sys: &TransactionSystem,
+    pool_guards: PoolGuards,
+    purge_chan: Receiver<PurgeTask>,
+) {
+    while let Ok(PurgeTask {
+        gc_no,
+        min_active_sts,
+        done,
+    }) = purge_chan.recv_async().await
+    {
+        let result = trx_sys
+            .purge_gc_bucket(catalog, &pool_guards, gc_no, min_active_sts)
+            .await;
+        let _ = done.send(PurgeTaskResult { gc_no, result });
+    }
+}
 
-impl PurgeExecutor {
-    #[inline]
-    async fn purge_task_loop(
-        &mut self,
-        catalog: &Catalog,
-        trx_sys: &TransactionSystem,
-        pool_guards: PoolGuards,
-        purge_chan: Receiver<PurgeTask>,
-    ) {
-        while let Ok(PurgeTask {
-            gc_no,
-            min_active_sts,
-            done,
-        }) = purge_chan.recv_async().await
-        {
-            let result = trx_sys
-                .purge_gc_bucket(catalog, &pool_guards, gc_no, min_active_sts)
-                .await;
-            let _ = done.send(PurgeTaskResult { gc_no, result });
+#[inline]
+fn reclaim_partial_purge_workers(
+    mut report: Report<RuntimeError>,
+    handles: Vec<JoinHandle<()>>,
+    phase: &'static str,
+) -> Report<RuntimeError> {
+    let mut join_panics = 0usize;
+    for handle in handles {
+        if handle.join().is_err() {
+            join_panics += 1;
         }
     }
+    if join_panics != 0 {
+        report = report.attach(format!(
+            "phase={phase}, cleanup=join_partial_purge_workers, join_panics={join_panics}"
+        ));
+    }
+    report
 }
 
 #[inline]

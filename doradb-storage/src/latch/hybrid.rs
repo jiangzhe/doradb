@@ -1,6 +1,4 @@
-use crate::error::{
-    ConfigError, Error, Result, Validation, Validation::Invalid, Validation::Valid,
-};
+use crate::error::{ConfigError, ConfigResult, Validation, Validation::Invalid, Validation::Valid};
 use error_stack::Report;
 use parking_lot::lock_api::{
     RawRwLock as RawRwLockApi, RawRwLockDowngrade as RawRwLockDowngradeAPI,
@@ -25,17 +23,17 @@ pub(crate) enum LatchFallbackMode {
 }
 
 impl FromStr for LatchFallbackMode {
-    type Err = Error;
+    type Err = Report<ConfigError>;
     #[inline]
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> ConfigResult<Self> {
         let res = match s.to_lowercase().as_str() {
             "spin" => LatchFallbackMode::Spin,
             "shared" => LatchFallbackMode::Shared,
             "exclusive" => LatchFallbackMode::Exclusive,
             _ => {
-                return Err(Report::new(ConfigError::InvalidLatchFallbackMode)
-                    .attach(format!("value={s}"))
-                    .into());
+                return Err(
+                    Report::new(ConfigError::InvalidLatchFallbackMode).attach(format!("value={s}"))
+                );
             }
         };
         Ok(res)
@@ -533,6 +531,20 @@ impl<'a> HybridGuard<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_latch_fallback_parse_keeps_config_domain() {
+        let err = "invalid"
+            .parse::<LatchFallbackMode>()
+            .expect_err("invalid fallback mode must fail");
+
+        assert_eq!(
+            err.current_context(),
+            &ConfigError::InvalidLatchFallbackMode
+        );
+        assert!(format!("{err:?}").contains("value=invalid"));
+    }
+
     #[test]
     fn test_hybrid_lock() {
         smol::block_on(async {

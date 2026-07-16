@@ -491,6 +491,7 @@ impl RowPage {
     /// Create a vectorized view on current page.
     /// The view provides vectorized access to columns.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn vector_view<'a, 'b>(
         &'a self,
         col_layout: &'b TableColumnLayout,

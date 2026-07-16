@@ -23,6 +23,5 @@
 - Testing: `docs/process/unit-test.md`
 
 ## Agent Tools
-- use `cx` for semantics code search, see `docs/process/cx-navigation.md`.
-- use `rtk` as prefix of command-line execution, except `cx`.
+- use `rtk` as prefix of command-line execution including `git` and `cargo`.
 

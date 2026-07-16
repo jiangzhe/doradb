@@ -851,18 +851,26 @@ mod tests {
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
-        ConfigError, Error, ErrorKind, LifecycleError, OperationError, ResourceError,
+        CompletionErrorKind, ConfigError, Error, ErrorKind, FatalError, LifecycleError,
+        OperationError, ResourceError, RuntimeError,
     };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::{TableID, TrxID};
+    use crate::io::{
+        IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+        install_storage_backend_test_hook,
+    };
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::session::tests::{SessionTestExt, session_registry_len};
+    use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
     use crate::trx::tests::add_pseudo_redo_log_entry;
     use smol::Timer;
     use std::fs;
+    use std::io::Error as StdIoError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Barrier, mpsc};
     use std::thread::{self, sleep};
     use std::time::{Duration, Instant};
@@ -884,6 +892,257 @@ mod tests {
             )
             .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
             .trx(TrxSysConfig::default())
+    }
+
+    struct FailInitialRedoHeaderWriteHook {
+        redo_path: PathBuf,
+        log_started: Arc<AtomicBool>,
+        failed: AtomicBool,
+    }
+
+    impl FailInitialRedoHeaderWriteHook {
+        #[inline]
+        fn new(redo_path: PathBuf, log_started: Arc<AtomicBool>) -> Self {
+            Self {
+                redo_path,
+                log_started,
+                failed: AtomicBool::new(false),
+            }
+        }
+
+        #[inline]
+        fn failed(&self) -> bool {
+            self.failed.load(Ordering::Acquire)
+        }
+    }
+
+    impl StorageBackendTestHook for FailInitialRedoHeaderWriteHook {
+        #[inline]
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if !self.log_started.load(Ordering::Acquire)
+                || op.kind() != IOKind::Write
+                || op.offset() != 0
+            {
+                return;
+            }
+            let Ok(identity) = StorageBackendFileIdentity::from_path(&self.redo_path) else {
+                return;
+            };
+            if !op.matches_file_identity(identity)
+                || self
+                    .failed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return;
+            }
+            *res = Err(StdIoError::from_raw_os_error(libc::EIO));
+        }
+    }
+
+    #[test]
+    fn test_engine_worker_spawn_failures_are_runtime_and_failure_atomic() {
+        for (worker, phase) in [
+            (
+                "IO-Thread",
+                "component=fs_workers, phase=build_shared_storage_worker",
+            ),
+            (
+                "Shared-Pool-Evictor",
+                "component=shared_pool_evictor_workers, phase=build_shared_evictor",
+            ),
+            ("Log-Thread", "phase=start_transaction_log_worker"),
+            ("Purge-Executor-1", "phase=start_transaction_purge_workers"),
+            ("Purge-Dispatcher", "phase=start_transaction_purge_workers"),
+            (
+                "Trx-Cleanup-Thread",
+                "phase=start_transaction_cleanup_worker",
+            ),
+        ] {
+            let root = TempDir::new().unwrap();
+            let (event_tx, event_rx) = mpsc::channel();
+            let _failure = fail_spawn_named_with_observer(worker, move |event| {
+                let _ = event_tx.send(event);
+            });
+
+            let err = match smol::block_on(test_engine_config_for(root.path()).build()) {
+                Ok(_) => panic!("injected worker spawn must fail engine startup"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), ErrorKind::Runtime, "worker={worker}, err={err}");
+            assert_eq!(
+                err.downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::BackgroundSpawn),
+                "worker={worker}, err={err}"
+            );
+            let output = format!("{err:?}");
+            assert!(output.contains(phase), "worker={worker}, report={output}");
+            assert_eq!(
+                output.matches(&format!("thread_name={worker}")).count(),
+                1,
+                "worker={worker}, report={output}"
+            );
+
+            let mut started = Vec::new();
+            let mut finished = Vec::new();
+            for event in event_rx.try_iter() {
+                match event {
+                    SpawnTestEvent::Started(name) => started.push(name),
+                    SpawnTestEvent::Finished(name) => finished.push(name),
+                }
+            }
+            started.sort_unstable();
+            finished.sort_unstable();
+            assert_eq!(
+                started, finished,
+                "startup returned before reclaiming all workers for failure at {worker}"
+            );
+            assert!(!started.iter().any(|name| name == worker));
+        }
+    }
+
+    #[test]
+    fn test_initial_redo_header_failure_reclaims_log_worker_before_startup_returns() {
+        let root = TempDir::new().unwrap();
+        let log_started = Arc::new(AtomicBool::new(false));
+        let hook = Arc::new(FailInitialRedoHeaderWriteHook::new(
+            root.path().join("redo.log.00000000"),
+            Arc::clone(&log_started),
+        ));
+        let _io_failure = install_storage_backend_test_hook(hook.clone());
+        let (event_tx, event_rx) = mpsc::channel();
+        let _observer = observe_spawn_named(move |event| {
+            if matches!(&event, SpawnTestEvent::Started(name) if name == "Log-Thread") {
+                log_started.store(true, Ordering::Release);
+            }
+            let _ = event_tx.send(event);
+        });
+
+        let err = match smol::block_on(test_engine_config_for(root.path()).build()) {
+            Ok(_) => panic!("initial redo-header write failure must fail engine startup"),
+            Err(err) => err,
+        };
+
+        assert!(hook.failed(), "initial redo-header write was not injected");
+        assert_eq!(err.kind(), ErrorKind::Fatal);
+        assert_eq!(
+            err.completion_error(),
+            Some(CompletionErrorKind::Fatal(FatalError::RedoWrite))
+        );
+        let output = format!("{err:?}");
+        assert!(
+            output.contains("wait for initial redo super-block write"),
+            "report={output}"
+        );
+
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        for event in event_rx.try_iter() {
+            match event {
+                SpawnTestEvent::Started(name) => started.push(name),
+                SpawnTestEvent::Finished(name) => finished.push(name),
+            }
+        }
+        started.sort_unstable();
+        finished.sort_unstable();
+        assert_eq!(
+            started, finished,
+            "startup returned before reclaiming workers after initial redo-header failure"
+        );
+        for expected in ["IO-Thread", "Log-Thread", "Shared-Pool-Evictor"] {
+            assert!(
+                started.iter().any(|name| name == expected),
+                "expected worker did not start: {expected}, started={started:?}"
+            );
+        }
+        assert!(
+            !started
+                .iter()
+                .any(|name| name.starts_with("Purge-") || name == "Trx-Cleanup-Thread"),
+            "transaction workers started before initial redo header became durable: {started:?}"
+        );
+    }
+
+    #[test]
+    fn test_partial_purge_executor_spawn_failure_reclaims_started_executor() {
+        let root = TempDir::new().unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let _failure = fail_spawn_named_with_observer("Purge-Executor-2", move |event| {
+            let _ = event_tx.send(event);
+        });
+        let config =
+            test_engine_config_for(root.path()).trx(TrxSysConfig::default().purge_threads(3));
+
+        let err = match smol::block_on(config.build()) {
+            Ok(_) => panic!("second purge-executor spawn failure must fail engine startup"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::BackgroundSpawn)
+        );
+        let output = format!("{err:?}");
+        assert!(output.contains("phase=start_transaction_purge_workers"));
+        assert_eq!(output.matches("thread_name=Purge-Executor-2").count(), 1);
+
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        for event in event_rx.try_iter() {
+            match event {
+                SpawnTestEvent::Started(name) => started.push(name),
+                SpawnTestEvent::Finished(name) => finished.push(name),
+            }
+        }
+        started.sort_unstable();
+        finished.sort_unstable();
+        assert_eq!(
+            started, finished,
+            "partial purge startup returned before reclaiming its first executor"
+        );
+        assert!(
+            started.iter().any(|name| name == "Purge-Executor-1"),
+            "first purge executor did not start: {started:?}"
+        );
+        assert!(
+            !started.iter().any(|name| name == "Purge-Executor-2"),
+            "injected second purge executor unexpectedly started: {started:?}"
+        );
+        assert!(
+            !started.iter().any(|name| name == "Purge-Dispatcher"),
+            "purge dispatcher started after executor startup failed: {started:?}"
+        );
+    }
+
+    #[test]
+    fn test_startup_rollback_join_panic_preserves_primary_runtime_report() {
+        let root = TempDir::new().unwrap();
+        let _failure = fail_spawn_named_with_observer("Purge-Dispatcher", |event| {
+            if event == SpawnTestEvent::Finished("Purge-Executor-1".to_owned()) {
+                panic!("injected purge executor join panic");
+            }
+        });
+
+        let err = match smol::block_on(test_engine_config_for(root.path()).build()) {
+            Ok(_) => panic!("injected purge dispatcher spawn must fail engine startup"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::BackgroundSpawn)
+        );
+        let output = format!("{err:?}");
+        assert_eq!(output.matches("thread_name=Purge-Dispatcher").count(), 1);
+        assert!(
+            output.contains(
+                "phase=rollback_purge_dispatcher_spawn, cleanup=join_partial_purge_workers, join_panics=1"
+            ),
+            "report={output}"
+        );
     }
 
     fn wait_until_shutdown_begins(engine: &Engine) {
@@ -2108,17 +2367,19 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (trx_sys, startup) = TrxSysConfig::default()
+            let mut config = TrxSysConfig::default()
                 .log_dir(&log_dir)
-                .log_file_stem("pending-startup-cleanup")
-                .prepare(
-                    engine.inner().engine_poisoner.clone(),
-                    engine.inner().pools(),
-                    engine.inner().table_fs.clone(),
-                    engine.inner().catalog.clone(),
-                )
-                .await
-                .unwrap();
+                .log_file_stem("pending-startup-cleanup");
+            config.validate().unwrap();
+            let (trx_sys, startup) = TransactionSystem::bootstrap(
+                config,
+                engine.inner().engine_poisoner.clone(),
+                engine.inner().pools(),
+                engine.inner().table_fs.clone(),
+                engine.inner().catalog.clone(),
+            )
+            .await
+            .unwrap();
             drop(startup);
             drop(trx_sys);
         });

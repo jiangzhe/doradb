@@ -29,6 +29,8 @@ pub(crate) type DataIntegrityResult<T> = result::Result<T, Report<DataIntegrityE
 
 /// Result carrying lifecycle-domain reports.
 pub(crate) type LifecycleResult<T> = result::Result<T, Report<LifecycleError>>;
+/// Result carrying runtime-infrastructure reports.
+pub(crate) type RuntimeResult<T> = result::Result<T, Report<RuntimeError>>;
 /// Result carrying fatal-domain reports.
 pub(crate) type FatalResult<T> = result::Result<T, Report<FatalError>>;
 /// Result carrying completion transport reports.
@@ -55,6 +57,9 @@ pub enum ErrorKind {
     /// Storage lifecycle state rejected the request.
     #[error("storage lifecycle error")]
     Lifecycle,
+    /// Recoverable runtime infrastructure could not be started.
+    #[error("storage runtime error")]
+    Runtime,
     /// An internal invariant or component construction contract was violated.
     #[error("internal storage error")]
     Internal,
@@ -156,6 +161,14 @@ pub(crate) enum LifecycleError {
     ExistingTransaction,
     #[error("transaction is discarded")]
     TransactionDiscarded,
+}
+
+/// Runtime-infrastructure failures that prevent required services from starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum RuntimeError {
+    /// The operating system rejected creation of a required background thread.
+    #[error("background thread spawn failed")]
+    BackgroundSpawn,
 }
 
 /// Fieldless resource-domain errors carried underneath `ErrorKind::Resource`.
@@ -332,9 +345,6 @@ pub(crate) enum InternalError {
     SystemTransactionRedoMissing,
     #[error("statement number overflow")]
     StatementNumberOverflow,
-    #[cfg(test)]
-    #[error("injected test failure")]
-    InjectedTestFailure,
 }
 
 /// IO-domain errors carried underneath `ErrorKind::Io`.
@@ -524,6 +534,11 @@ impl CompletionErrorKind {
         if let Some(kind) = err.completion_error() {
             return kind;
         }
+        assert_ne!(
+            err.kind(),
+            ErrorKind::Runtime,
+            "runtime spawn failures cannot cross completion transport"
+        );
         if let Some(reason) = err.downcast_ref::<IoError>().copied() {
             return Self::Io(reason.kind());
         }
@@ -871,6 +886,14 @@ impl From<Report<IoError>> for Error {
     }
 }
 
+impl From<Report<RuntimeError>> for Error {
+    #[inline]
+    fn from(report: Report<RuntimeError>) -> Self {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(report.change_context(ErrorKind::Runtime))
+    }
+}
+
 impl From<Report<InternalError>> for Error {
     #[inline]
     fn from(report: Report<InternalError>) -> Self {
@@ -1103,6 +1126,37 @@ mod tests {
             Some(IoErrorKind::WouldBlock)
         );
         assert!(format!("{err:?}").contains("not ready"));
+    }
+
+    #[test]
+    fn test_runtime_report_converts_losslessly_to_public_runtime() {
+        let report = IoError::report(StdIoError::other("spawn unavailable"))
+            .change_context(RuntimeError::BackgroundSpawn)
+            .attach("thread_name=Runtime-Conversion-Test");
+
+        let err = Error::from(report);
+
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::BackgroundSpawn)
+        );
+        assert_eq!(
+            err.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::Other)
+        );
+        assert!(format!("{err:?}").contains("thread_name=Runtime-Conversion-Test"));
+    }
+
+    #[test]
+    #[should_panic(expected = "runtime spawn failures cannot cross completion transport")]
+    fn test_completion_transport_rejects_runtime_report() {
+        let err = Error::from(
+            IoError::report(StdIoError::other("spawn unavailable"))
+                .change_context(RuntimeError::BackgroundSpawn),
+        );
+
+        let _ = CompletionErrorKind::report_error(err, "unexpected runtime completion");
     }
 
     #[test]

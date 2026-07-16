@@ -1561,12 +1561,7 @@ mod tests {
             engine.inner().table_fs.clone(),
             engine.catalog(),
         );
-        let mut recovery = engine
-            .inner()
-            .trx_sys
-            .config
-            .prepare_recovery(resources)
-            .unwrap();
+        let mut recovery = resources.prepare(&engine.inner().trx_sys.config).unwrap();
         recovery.timeline.catalog_replay_start_ts = catalog_replay_start_ts;
         recovery.timeline.replay_floor = MIN_SNAPSHOT_TS;
         recovery

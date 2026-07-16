@@ -1,4 +1,4 @@
-use crate::error::{DataIntegrityError, Error, InternalError, IoError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, IoError, Result, RuntimeResult};
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::id::TrxID;
 use crate::io::{
@@ -14,7 +14,7 @@ use crate::log::{RedoLogFileDescriptor, next_redo_file_seq};
 use crate::obs;
 use crate::serde::Deser;
 use crate::thread as doradb_thread;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use flume::{Receiver, SendTimeoutError, Sender, TryRecvError};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
@@ -273,9 +273,11 @@ impl RedoReplayPlanner {
         let suffix = self.load_replay_suffix(floor)?;
         let planned = self.plan_replay_segments(&suffix, floor)?;
 
+        let stream = RedoLogStream::from_planned_segments(planned.stream_segments, read_depth)
+            .attach("phase=plan_recovery_redo_read_ahead")?;
         Ok(PlannedRedoRecovery {
             skipped_max_recovered_cts: planned.skipped_max_recovered_cts,
-            stream: RedoLogStream::from_planned_segments(planned.stream_segments, read_depth),
+            stream,
             repair_policy: planned.repair_policy,
         })
     }
@@ -297,8 +299,10 @@ impl RedoReplayPlanner {
             .filter_map(sealed_catalog_segment_summary)
             .collect();
 
+        let stream = RedoLogStream::from_planned_segments(planned.stream_segments, read_depth)
+            .attach("phase=plan_catalog_scan_redo_read_ahead")?;
         Ok(PlannedCatalogRedoScan {
-            stream: RedoLogStream::from_planned_segments(planned.stream_segments, read_depth),
+            stream,
             sealed_segments,
         })
     }
@@ -486,7 +490,10 @@ pub(crate) struct RedoLogStream {
 impl RedoLogStream {
     /// Create a stream over an already planned redo segment sequence.
     #[inline]
-    fn from_planned_segments(segments: Vec<RedoLogSegment>, read_depth: usize) -> Self {
+    fn from_planned_segments(
+        segments: Vec<RedoLogSegment>,
+        read_depth: usize,
+    ) -> RuntimeResult<Self> {
         let state = if segments.is_empty() {
             RedoLogStreamState::Ended
         } else {
@@ -495,15 +502,15 @@ impl RedoLogStream {
         let reader = if state == RedoLogStreamState::Ended {
             None
         } else {
-            Some(RedoReadAheadWorker::spawn(segments, read_depth))
+            Some(RedoReadAheadWorker::spawn(segments, read_depth)?)
         };
-        Self {
+        Ok(Self {
             reader,
             current_segment: None,
             buffer: VecDeque::new(),
             state,
             unsealed_terminals: Vec::new(),
-        }
+        })
     }
 
     /// Refill the in-memory queue from the direct-IO stream.
@@ -932,7 +939,10 @@ struct RedoReadAheadWorker {
 
 impl RedoReadAheadWorker {
     #[inline]
-    fn spawn(segments: Vec<RedoLogSegment>, read_depth: usize) -> RedoReadAheadHandle {
+    fn spawn(
+        segments: Vec<RedoLogSegment>,
+        read_depth: usize,
+    ) -> RuntimeResult<RedoReadAheadHandle> {
         let capacity = read_depth.max(1).saturating_mul(2).max(1);
         let (items_tx, items_rx) = flume::bounded(capacity);
         let (recycle_tx, recycle_rx) = flume::bounded(capacity);
@@ -961,13 +971,13 @@ impl RedoReadAheadWorker {
                     let _ = worker.send_item(RedoReadItem::Error(err));
                 }
             }
-        });
-        RedoReadAheadHandle {
+        })?;
+        Ok(RedoReadAheadHandle {
             items: items_rx,
             recycle: recycle_tx,
             stop: stop_tx,
             join: Some(join),
-        }
+        })
     }
 
     #[inline]
@@ -1691,6 +1701,7 @@ fn append_block_payload(
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
+    use crate::error::{ErrorKind, IoError, RuntimeError};
     use crate::id::{RowID, TableID, TrxID};
     use crate::io::{
         BackendResult, BackendToken, DirectBuf, IOBackendErrorPhase, IOBackendFailure,
@@ -1705,6 +1716,7 @@ mod tests {
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };
     use crate::serde::Ser;
+    use crate::thread::fail_spawn_named;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{Error as StdIoError, Write};
     use std::num::NonZeroUsize;
@@ -1834,6 +1846,42 @@ mod tests {
             buffer: VecDeque::new(),
             state: RedoLogStreamState::Active,
             unsealed_terminals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_replay_planners_attach_owned_phase_to_read_ahead_spawn_failure() {
+        for (catalog_scan, phase) in [
+            (false, "phase=plan_recovery_redo_read_ahead"),
+            (true, "phase=plan_catalog_scan_redo_read_ahead"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let descriptor = write_stream_log_file(
+                &dir.path().join("redo.log"),
+                STORAGE_SECTOR_SIZE,
+                1,
+                &[],
+                TestSegmentSeal::Open,
+            );
+            let planner = RedoReplayPlanner::new(vec![descriptor]);
+            let _failure = fail_spawn_named("Redo-ReadAhead");
+
+            let err = if catalog_scan {
+                planner.plan_catalog_scan(TrxID::new(0), 1).err()
+            } else {
+                planner.plan_recovery(TrxID::new(0), 1).err()
+            }
+            .expect("injected read-ahead spawn must fail planning");
+
+            assert_eq!(err.kind(), ErrorKind::Runtime);
+            assert_eq!(
+                err.downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::BackgroundSpawn)
+            );
+            assert!(err.downcast_ref::<IoError>().is_some());
+            let output = format!("{err:?}");
+            assert!(output.contains(phase), "report={output}");
+            assert_eq!(output.matches("thread_name=Redo-ReadAhead").count(), 1);
         }
     }
 

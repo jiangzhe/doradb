@@ -7,7 +7,7 @@
 
 use crate::bitmap::{Bitmap, BitmapRangeFilter};
 use crate::catalog::TableColumnLayout;
-use crate::error::{Error, InternalError, Result};
+use crate::error::{InternalError, InternalResult};
 use crate::row::{RowPage, RowPageNullBitmap};
 use crate::value::{PageVar, Val, ValBuffer, ValType};
 use error_stack::Report;
@@ -80,7 +80,7 @@ impl ScanBuffer {
     /// Scan given page and extend all rows into buffer.
     /// Note: If error is returned, the state of this buffer might be invalid.
     #[inline]
-    pub(crate) fn scan<'p, 'm>(&mut self, view: PageVectorView<'p, 'm>) -> Result<()> {
+    pub(crate) fn scan<'p, 'm>(&mut self, view: PageVectorView<'p, 'm>) -> InternalResult<()> {
         let new_len = self.len + view.rows_non_deleted();
         for buf in &mut self.cols {
             let (null_bitmap, vals) = view.col(buf.col_idx);
@@ -107,7 +107,7 @@ impl ScanBuffer {
                     }
                 }
                 (None, None) => (),
-                _ => return Err(column_scan_shape_mismatch()),
+                _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
             }
             // Second, extend values
             match (&mut buf.vals, vals) {
@@ -171,7 +171,7 @@ impl ScanBuffer {
                         }
                     }
                 }
-                _ => return Err(column_scan_shape_mismatch()),
+                _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
             }
         }
         self.len = new_len;
@@ -186,21 +186,21 @@ impl ScanBuffer {
         &mut self,
         col_layout: &TableColumnLayout,
         vals: &[Val],
-    ) -> Result<()> {
+    ) -> InternalResult<()> {
         if vals.len() != col_layout.col_count() {
-            return Err(column_scan_shape_mismatch());
+            return Err(Report::new(InternalError::ColumnScanShapeMismatch));
         }
         for buf in &self.cols {
             let Some(val) = vals.get(buf.col_idx) else {
-                return Err(column_scan_shape_mismatch());
+                return Err(Report::new(InternalError::ColumnScanShapeMismatch));
             };
             let col_type = col_layout.col_type(buf.col_idx);
             if val.is_null() {
                 if !col_type.nullable {
-                    return Err(column_scan_shape_mismatch());
+                    return Err(Report::new(InternalError::ColumnScanShapeMismatch));
                 }
             } else if !val.matches_kind(col_type.kind) {
-                return Err(column_scan_shape_mismatch());
+                return Err(Report::new(InternalError::ColumnScanShapeMismatch));
             }
         }
 
@@ -352,6 +352,7 @@ pub(crate) struct PageVectorView<'p, 'm> {
 impl<'p, 'm> PageVectorView<'p, 'm> {
     /// Create a page vector view.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn new(page: &'p RowPage, col_layout: &'m TableColumnLayout) -> Self {
         let row_count = page.header.row_count();
         let del_bitmap = page.del_bitmap(row_count);
@@ -392,15 +393,13 @@ impl RowPage {
         &'p self,
         col_layout: &'m TableColumnLayout,
         del_bitmap: Vec<u64>,
-    ) -> Result<PageVectorView<'p, 'm>> {
+    ) -> InternalResult<PageVectorView<'p, 'm>> {
         let row_count = self.header.row_count();
         if del_bitmap.len() != row_count.div_ceil(64) {
-            return Err(Report::new(InternalError::LwcBuilderMisuse)
-                .attach(format!(
-                    "prepared delete bitmap shape mismatch: rows={row_count}, units={}",
-                    del_bitmap.len()
-                ))
-                .into());
+            return Err(Report::new(InternalError::LwcBuilderMisuse).attach(format!(
+                "prepared delete bitmap shape mismatch: rows={row_count}, units={}",
+                del_bitmap.len()
+            )));
         }
         Ok(PageVectorView {
             page: self,
@@ -426,12 +425,7 @@ pub(crate) enum ValArrayRef<'a> {
     VarByte(&'a [PageVar], &'a [u8]),
 }
 
-#[inline]
-fn column_scan_shape_mismatch() -> Error {
-    Report::new(InternalError::ColumnScanShapeMismatch).into()
-}
-
-fn append_scan_value(buf: &mut ValBuffer, val: &Val) -> Result<()> {
+fn append_scan_value(buf: &mut ValBuffer, val: &Val) -> InternalResult<()> {
     match (buf, val) {
         (ValBuffer::I8(vals), Val::I8(value)) => vals.push(*value),
         (ValBuffer::U8(vals), Val::U8(value)) => vals.push(*value),
@@ -463,7 +457,7 @@ fn append_scan_value(buf: &mut ValBuffer, val: &Val) -> Result<()> {
             let offset = data.len();
             offsets.push((offset, offset));
         }
-        _ => return Err(column_scan_shape_mismatch()),
+        _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
     }
     Ok(())
 }
@@ -941,9 +935,10 @@ mod tests {
             page.insert(metadata.col.as_ref(), &insert),
             InsertRow::Ok(id) if id == RowID::new(0)
         ));
-        assert!(
-            page.vector_view_with_del_bitmap(metadata.col.as_ref(), Vec::new())
-                .is_err()
-        );
+        let err = match page.vector_view_with_del_bitmap(metadata.col.as_ref(), Vec::new()) {
+            Ok(_) => panic!("wrong prepared bitmap shape must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context(), &InternalError::LwcBuilderMisuse);
     }
 }

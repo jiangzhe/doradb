@@ -3,8 +3,12 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableColumnLayout};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult, Result,
+    DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult,
 };
+// Genuine mixed-domain convergence: `PersistedLwcBlock::load` combines
+// buffer/read completion failures with persisted DataIntegrity validation, so
+// its public storage result ends typed propagation at the load boundary.
+use crate::error::Result;
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
@@ -523,6 +527,8 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
+    // Test helper inspects the intentional `PersistedLwcBlock::load` public
+    // convergence over read/completion and DataIntegrity domains.
     use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
@@ -531,6 +537,7 @@ mod tests {
     use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::DirectBuf;
+    use crate::layout::LayoutError;
     use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer, LwcPrimitiveSer};
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
@@ -547,6 +554,36 @@ mod tests {
         )
         .unwrap()
         .row_shape_fingerprint()
+    }
+
+    #[test]
+    fn test_lwc_layout_adaptation_preserves_source_for_persisted_and_mutable_views() {
+        let persisted = match LwcBlock::try_from_bytes(&[0u8; 1]) {
+            Ok(_) => panic!("short persisted LWC payload must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            persisted.current_context(),
+            &DataIntegrityError::InvalidPayload
+        );
+        assert_eq!(
+            persisted.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
+
+        let mut bytes = [0u8; 1];
+        let trusted = match LwcBlock::try_from_bytes_mut(&mut bytes) {
+            Ok(_) => panic!("short mutable LWC payload must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            trusted.current_context(),
+            &InternalError::LwcBlockEncodingInvariant
+        );
+        assert_eq!(
+            trusted.downcast_ref::<LayoutError>().copied(),
+            Some(LayoutError::Mismatch)
+        );
     }
 
     fn assert_lwc_data_integrity(err: Error, block_id: BlockID, expected: DataIntegrityError) {
@@ -594,7 +631,8 @@ mod tests {
         ));
         let buf = {
             let mut builder = LwcBuilder::new(metadata.col.as_ref());
-            assert!(builder.append_row_page(&page).unwrap());
+            let view = page.vector_view(metadata.col.as_ref());
+            assert!(builder.append_view(view, page.header.start_row_id).unwrap());
             let fingerprint = row_shape_fingerprint_for(builder.row_ids());
             builder.build(fingerprint).unwrap()
         };

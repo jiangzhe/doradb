@@ -4,12 +4,13 @@ use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::Result;
+use crate::error::{Result, RuntimeResult};
 use crate::id::PageID;
 use crate::obs;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::thread;
 use crate::{DiskPool, IndexPool, MemPool};
+use error_stack::ResultExt;
 use event_listener::{Event, EventListener, Listener};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -704,7 +705,7 @@ impl SharedEvictor {
     }
 
     #[inline]
-    fn start_thread(self) -> JoinHandle<()> {
+    fn start_thread(self) -> RuntimeResult<JoinHandle<()>> {
         thread::spawn_named("Shared-Pool-Evictor", move || self.run())
     }
 
@@ -816,7 +817,8 @@ impl Component for SharedPoolEvictorWorkers {
             Arc::clone(&wake_event),
             stats.clone(),
         )
-        .start_thread();
+        .start_thread()
+        .attach("component=shared_pool_evictor_workers, phase=build_shared_evictor")?;
 
         registry.register::<Self>(SharedPoolEvictorWorkersOwned {
             disk_pool,

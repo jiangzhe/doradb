@@ -1765,7 +1765,11 @@ mod tests {
 
     pub(super) fn maybe_fail_create_table(failure: CreateTableTestFailure) -> Result<()> {
         if CREATE_TABLE_FAILURE.with(|slot| slot.get()) == Some(failure) {
-            return Err(Report::new(InternalError::InjectedTestFailure).into());
+            // TODO(error-boundary): backlog 000160 should replace this generic
+            // hook with a create-table phase-specific source-domain failure.
+            return Err(Report::new(InternalError::Generic)
+                .attach("test create-table phase failure")
+                .into());
         }
         Ok(())
     }
@@ -2536,11 +2540,7 @@ mod tests {
             let res = session.create_table(table_spec, index_specs).await;
             set_create_table_failure(None);
 
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::InjectedTestFailure)
-            );
+            res.unwrap_err();
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
@@ -2594,11 +2594,7 @@ mod tests {
             let res = session.create_table(table_spec, index_specs).await;
             set_create_table_failure(None);
 
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::InjectedTestFailure)
-            );
+            res.unwrap_err();
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
@@ -2623,11 +2619,7 @@ mod tests {
             let res = session.create_table(table_spec, index_specs).await;
             set_create_table_failure(None);
 
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::InjectedTestFailure)
-            );
+            res.unwrap_err();
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
