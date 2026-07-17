@@ -1,6 +1,6 @@
 ---
 name: style-audit
-description: Audit branch-diff Rust files, or explicitly requested file/directory Rust targets, for Doradb coding style using deterministic tooling and concise read-only review. Use when asked to check coding style, run a style audit/style auditor, validate task-branch Rust changes during task resolve, or report style violations in branch-modified files.
+description: Audit branch-diff Rust files, or explicitly requested file/directory Rust targets, for Doradb coding style using deterministic tooling and concise read-only review. Use when asked to check coding style, run a style audit/style auditor, validate task-branch Rust changes during $task-resolve, or report style violations in branch-modified files.
 ---
 
 # Style Audit Workflow
@@ -37,7 +37,7 @@ targets check only direct `.rs` children and do not recurse.
    - `--force-path` working-tree targets when explicitly requested;
    - branch-diff modes run `cargo fmt --all -- --check`;
    - forced-path mode runs `rustfmt --edition 2024 --check <forced files>`;
-   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`;
+   - `cargo clippy --workspace --all-targets -- -D warnings`;
    - Rust style structure checks.
    - top-level private `#[cfg(test)] use` imports must move into the
      `#[cfg(test)]` module that directly uses them.

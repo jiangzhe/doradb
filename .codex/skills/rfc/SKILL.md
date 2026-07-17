@@ -114,9 +114,9 @@ signal; they should be concise, current-phase-specific, and should not duplicate
 the preceding phase's `After This Phase` text.
 
 When test strategy includes enforced timeouts or hang detection:
-- do not assume plain `cargo test` can provide it;
-- define the required runner/tooling change explicitly; and
-- use `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md` as the current follow-up when the RFC is not itself implementing test-runner changes.
+- treat `cargo-nextest` as the repository's authoritative test runner;
+- use `docs/process/unit-test.md` for the test workflow and `.config/nextest.toml` for timeout and hang-detection behavior; and
+- define runner or configuration changes only when the RFC intentionally changes the existing test workflow.
 
 Validate structure before formalization:
 ```bash
@@ -157,8 +157,9 @@ tools/rfc.rs precheck-rfc-resolve --doc docs/rfcs/0002-legacy.md --allow-legacy
 
 ## Resolve + Task Integration
 
-`task resolve` must always check RFC linkage.
-If resolved task is a sub-task of an RFC, update related RFC phase section during task resolve.
+`$task-resolve` must always check RFC linkage.
+If a resolved task is an RFC sub-task, update the related phase during
+`$task-resolve`.
 Use:
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000123-example.md

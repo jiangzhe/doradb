@@ -16,8 +16,8 @@ Backlog files use:
 - **Scope**: Narrow, well-defined changes (e.g., bug fixes, small features, refactoring).
 - **Location**: `docs/tasks/<nnnnnn>-<description>.md`
 - **Template**: Use `docs/tasks/000000-template.md`.
-- **Workflow**: Create the task doc -> Link to a `gh` issue -> Implement -> Resolve doc updates.
-- **Resolve rule**: During `task resolve`, always check whether task belongs to an RFC; if yes, sync corresponding RFC `Implementation Phases`.
+- **Workflow**: Use `$task-create` -> Link to a `gh` issue -> Implement -> Use `$task-resolve`.
+- **Resolve rule**: During `$task-resolve`, always check whether the task belongs to an RFC; if yes, sync the corresponding RFC `Implementation Phases`.
 
 ### 2. RFCs (Large/Complex)
 - **Scope**: Large architectural changes, new subsystems, or complex implementations.

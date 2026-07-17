@@ -23,5 +23,5 @@
 - Testing: `docs/process/unit-test.md`
 
 ## Agent Tools
-- use `rtk` as prefix of command-line execution including `git` and `cargo`.
+- use `rtk` to prefix `git` and `cargo` execution.
 

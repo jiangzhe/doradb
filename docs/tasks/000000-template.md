@@ -40,7 +40,7 @@ Describe implementation plan, including important changes on files, structs, tra
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve` after implementation, tests, review, and verification are completed.
+Keep this section blank in design phase. Fill this section during `$task-resolve` after implementation, tests, review, and verification are completed.
 
 ## Impacts
 
@@ -53,5 +53,5 @@ Summarize test scenarios that should be covered to verify code correctness.
 ## Open Questions
 
 Issues that can not be solved in this task scope, and possible follow-ups.
-During `task resolve`, future improvements can be added here and summarized as backlog todos under `docs/backlogs/`.
-If this task belongs to an RFC, `task resolve` must also sync related RFC phase updates.
+During `$task-resolve`, future improvements can be added here and summarized as backlog todos under `docs/backlogs/`.
+If this task belongs to an RFC, `$task-resolve` must also sync related RFC phase updates.
