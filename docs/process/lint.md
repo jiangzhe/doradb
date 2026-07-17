@@ -69,17 +69,20 @@ If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe b
 
 ## CI Enforcement
 
-CI build workflow runs the same strict clippy command:
+CI build workflow runs strict clippy for both the default backend and the
+alternate `libaio` backend:
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings
 ```
 
-This keeps local and CI lint behavior aligned.
+This keeps the default local and CI lint behavior aligned while preventing
+feature-specific lint regressions in the alternate backend.
 
 Do not use `--all-features` for `doradb-storage`: the `iouring` and `libaio`
-backend features are mutually exclusive. Validate the alternate backend with a
-separate explicit feature command when needed:
+backend features are mutually exclusive. Validate the alternate backend tests
+with a separate explicit feature command when needed:
 
 ```bash
 cargo nextest run -p doradb-storage --no-default-features --features libaio

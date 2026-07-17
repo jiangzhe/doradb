@@ -97,6 +97,8 @@ jobs:
         toolchain: stable
     - name: Clippy (default backend)
       run: cargo clippy --workspace --all-targets -- -D warnings
+    - name: Clippy (libaio backend)
+      run: cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings
 
   coverage:
     needs: changes
@@ -187,6 +189,7 @@ jobs:
         name: coverage-lcov
         path: coverage-artifact
     - name: Upload to codecov.io
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
       uses: codecov/codecov-action@v5
       with:
         files: coverage-artifact/lcov.info
