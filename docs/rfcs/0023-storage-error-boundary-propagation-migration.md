@@ -206,6 +206,15 @@ Issue Labels:
   explicit TODO comment.
 - [U8] `BackendResult` should be renamed to `IoResult` and moved from the IO
   backend module to the central error module.
+- [U9] The concrete cloneable representation used to materialize completion
+  reports remains a Phase 1 choice; the RFC must not assume erased frames can
+  be cloned generically, and Phase 1 cannot complete until the selected design
+  satisfies the required physical-frame downcast tests.
+- [U10] Removing `report_error(Error, ...)` is a migration-order dependency:
+  Phase 1 must first, or atomically, narrow every existing caller to retain a
+  typed report or explicit typed branch. This includes compiler-required
+  transaction completion paths, while the broader transaction audit remains in
+  Phase 3.
 
 ### Source Backlogs
 
@@ -320,12 +329,15 @@ pub(crate) struct CompletionErrorBridge(Arc<BridgeInner>);
 
 `BridgeInner` owns the pre-bridge canonical `Report<E>` through a private
 erased-report abstraction. It must not store public `Error`, `ErrorKind`, a
-second domain enum, or `Box<dyn Error>` that reduces typed frames to a standard
-error source. Capturing consumes the typed report, no mutable reference or
-frame-mutation API escapes, and every bridge clone shares the same immutable
-inner report. `BridgeInner` stores the pre-bridge report, not a materialized
-report containing its own bridge, so the ownership graph cannot form an Arc
-cycle. [D1], [C1], [C14], [C15], [U6]
+consumer-visible second error-domain enum, or `Box<dyn Error>` that reduces
+typed frames to a standard error source. A private representation that holds
+concrete cloneable frame values solely for materialization is allowed; it is
+not a completion domain and must not be exposed for semantic matching.
+Capturing consumes the typed report, no mutable reference or frame-mutation API
+escapes, and every bridge clone shares the same immutable inner report.
+`BridgeInner` stores the pre-bridge report, not a materialized report containing
+its own bridge, so the ownership graph cannot form an Arc cycle. [D1], [C1],
+[C14], [C15], [U6], [U9]
 
 `CompletionErrorBridge::capture(Report<E>)` is the only construction path.
 `E` satisfies a sealed `CompletionSource` contract implemented for real main
@@ -338,31 +350,41 @@ publish completion. Direct bridge-only reports are invalid by construction.
 
 `Completion<T>` stores the bridge value and fanout clones only its Arc. A
 consumer that needs an owned error-stack report asks the bridge to materialize
-one. Materialization explicitly visits the canonical report, reproduces its
-ordered main-domain context chain and required structured/printable
-attachments, then stacks a clone of `CompletionErrorBridge` as the current
-transport context. The shared canonical report remains reachable through the
-bridge so producer detail is retained for diagnostics; stable structured
-attachments required for downcast inspection are replayed into the
-materialized report. Per-waiter allocation is confined to the error path.
-[C1], [C14], [C15], [U6], [B2]
+one. The concrete materialization mechanism is a Phase 1 choice. It may use a
+closed cloneable replay schema, per-source snapshot, or equivalent checked
+design, but it must define explicit clone-and-reconstruction behavior for every
+main-domain context and structured attachment supported across completion; it
+must not assume arbitrary erased frames can be cloned. Materialization uses
+that representation to reproduce the ordered main-domain context chain and
+required structured/printable attachments, then stacks a clone of
+`CompletionErrorBridge` as the current transport context. The shared canonical
+report remains reachable through the bridge so producer detail is retained for
+diagnostics. Per-waiter allocation is confined to the error path. [C1], [C14],
+[C15], [U6], [U9], [B2]
 
-The erased holder and materializer must use explicit frame visitation. Merely
-placing `Arc<Report<_>>` behind `std::error::Error::source()` is insufficient:
-with the pinned stable `error-stack` API, a nested report is not exposed as its
-typed frame chain through `source()`, and importing ordinary sources creates
-string contexts. Public `Error::report()` must continue to contain physical,
-downcastable domain frames rather than only an opaque nested report. [C1],
-[C15]
+Explicit frame visitation may identify supported registered frame types, but
+with the pinned stable `error-stack` API it does not provide a generic way to
+clone their values. Merely placing `Arc<Report<_>>` behind
+`std::error::Error::source()` is also insufficient: a nested report is not
+exposed as its typed frame chain through `source()`, and importing ordinary
+sources creates string contexts. Public `Error::report()` must continue to
+contain physical, downcastable domain frames rather than only an opaque nested
+report. [C1], [C15], [U9]
 
 The bridge has no domain variants, `error_kind()` mapping, generic Internal
 fallback, or semantic accessor. Public conversion derives `ErrorKind` from the
 nearest real main-domain context below the bridge and adds the public context
 once. Internal and test consumers inspect the real `FatalError`, `IoError`,
 `DataIntegrityError`, or other frames instead of matching a completion variant.
-The current semantic `report_*` helpers and `report_error(Error, ...)` are
-removed; domain owners construct the real report and then capture it. [D1],
-[C1], [U5], [U6]
+Before or atomically with removing the current semantic `report_*` helpers and
+`report_error(Error, ...)`, Phase 1 narrows every caller contract that currently
+supplies a converged public `Error`. Each producer instead returns the real
+typed report or an explicit typed branch, and the completion owner captures
+that value directly. This compiler-driven slice includes readonly and evictable
+buffer completion plus transaction completion paths; it does not pull the
+broader transaction semantic audit into Phase 1. No compatibility helper that
+captures public `Error` may remain after the slice is integrated. [D1], [C1],
+[C6], [C11], [C14], [U5], [U6], [U10]
 
 Fatal classification is still made only by the durability, rollback,
 checkpoint, catalog, or poison policy owner that can determine safe
@@ -629,7 +651,10 @@ RFC. [D17], [D18]
     `notify`, `obs`, `stats`, `runtime`, `quiescent`, `thread`, `conf`,
     `component`, `engine_poison`, `io`, `file`, `buffer`, `log`, and `lock`.
     Migrate or justify raw/configuration/format/allocation/IO/completion
-    producers before their stateful consumers. [D1], [C1], [C3]-[C8], [C17]
+    producers before their stateful consumers. Also migrate the
+    compiler-required transaction call paths that publish completion failures;
+    the remaining transaction audit stays in Phase 3. [D1], [C1], [C3]-[C8],
+    [C11], [C17], [U10]
   - Goals: Establish the audit-record/checker skeleton; confirm the typed or
     neutral foundation modules; audit shared public types for paired
     crate-private typed operations and thin public trait adapters; migrate
@@ -637,7 +662,9 @@ RFC. [D17], [D18]
     remove `BackendResult`, rename conflicting raw-standard-IO aliases, and
     migrate backend traits, drivers, implementations, and test doubles;
     separate backend validation from IO setup; narrow raw-file, metadata, CoW,
-    buffer reservation, log-format, log-allocation, and worker-result paths;
+    buffer reservation, log-format, log-allocation, worker-result, and targeted
+    transaction-completion paths so every current `report_error(Error, ...)`
+    input retains a typed report or explicit typed branch; then, or atomically,
     replace `CompletionErrorKind` and report-storing fanout with the Arc-backed
     bridge, sealed typed capture, immutable erased report holder, explicit
     materialization, and real-frame public classification; migrate all
@@ -646,8 +673,8 @@ RFC. [D17], [D18]
     durability policy boundary; audit every phase-owned Internal producer;
     remove Generic constructors and catch-all mappings; replace phase-owned
     Generic producers or annotate an infeasible residue with the required
-    tracked TODO; confirm lock remains Operation-typed. [D1], [D16], [C16],
-    [C17], [U7], [U8]
+    tracked TODO; confirm lock remains Operation-typed. [D1], [D16], [C11],
+    [C16], [C17], [U7], [U8], [U10]
   - Non-goals: Reinterpret index/table/catalog foreground or recovery meaning;
     redesign public `Error`/report APIs; finalize outer transaction/recovery
     convergence.
@@ -659,19 +686,23 @@ RFC. [D17], [D18]
     [U8]
   - Phase-local Choices: Whether a proven broad crate-owned trait needs an
     associated error or a narrower responsibility interface; the concrete
-    object-safe erased-report and
-    frame-materialization implementation; the stable cloneable attachment
-    types replayed for downcast inspection; the stable inventory representation
-    used by the checker skeleton. These choices may not alter the Arc ownership,
-    semantic-free bridge, typed capture, or physical-frame requirements.
+    object-safe erased-report and frame-materialization implementation,
+    including a closed replay schema, per-source snapshot, or equivalent
+    checked representation; the exact stable cloneable attachment inventory;
+    the stable inventory representation used by the checker skeleton. A private
+    replay discriminator must remain an implementation detail rather than a
+    consumer-visible completion domain. These choices may not alter the Arc
+    ownership, semantic-free bridge, typed capture, or physical-frame
+    requirements. [U9]
   - After This Phase: Stateful storage receives typed or explicitly justified
     supplier contracts; all completion waiters share one immutable canonical
     report and materialize the same real domain chain; no caller reconstructs a
     lost IO, Resource, DataIntegrity, Lifecycle, Fatal, or Internal source from
-    a transport discriminator; every Internal producer in the phase scope has
-    an evidence-backed disposition and no unannotated Generic remains;
-    `IoResult` is the sole canonical storage IO result alias and
-    `BackendResult` is absent.
+    a transport discriminator; `report_error(Error, ...)` and every other public-
+    error completion capture path are absent; every Internal producer in the
+    phase scope has an evidence-backed disposition and no unannotated Generic
+    remains; `IoResult` is the sole canonical storage IO result alias and
+    `BackendResult` is absent. [U10]
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -777,7 +808,14 @@ classification comes from the nearest real domain, that
 attachment, and that rendering retains canonical producer detail. Tests also
 prove the bridge cannot be captured from `ErrorKind`, `RuntimeError`, or itself,
 cannot be created without a report, and exposes no semantic variant to match.
-[C1], [C14], [C15], [U5], [U6], [B2]
+These tests are the Phase 1 completion gate for the selected materialization
+representation. [C1], [C14], [C15], [U5], [U6], [U9], [B2]
+
+Phase 1 also inventories every existing `report_error(Error, ...)` caller before
+migration. Focused buffer and terminal-rollback tests compile and exercise the
+narrowed producer contracts, and a source audit verifies that no helper or
+bridge construction path accepts public `Error` after integration. [C1], [C6],
+[C11], [C14], [U10]
 
 For a shared public type with a public trait adapter, focused tests exercise the
 canonical crate-private typed operation and assert its domain context, then
