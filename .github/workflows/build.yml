@@ -64,7 +64,17 @@ jobs:
         else
           while IFS= read -r file; do
             [[ -z "$file" ]] && continue
-            if [[ "$file" == doradb-bench/* || "$file" == doradb-storage/* || "$file" == Cargo.toml || "$file" == .github/workflows/* ]]; then
+            if [[ "$file" == doradb-bench/* ||
+                  "$file" == doradb-storage/* ||
+                  "$file" == Cargo.toml ||
+                  "$file" == Cargo.lock ||
+                  "$file" == build.rs ||
+                  "$file" == rust-toolchain ||
+                  "$file" == rust-toolchain.toml ||
+                  "$file" == .cargo/* ||
+                  "$file" == .config/nextest.toml ||
+                  "$file" == .github/actions/* ||
+                  "$file" == .github/workflows/* ]]; then
               run_build="true"
               break
             fi
@@ -74,7 +84,69 @@ jobs:
         echo "run_build=${run_build}" >> "$GITHUB_OUTPUT"
         echo "run_build=${run_build}"
 
-  build:
+  clippy:
+    needs: changes
+    if: needs.changes.outputs.run_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+    - name: Clippy (default backend)
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+  coverage:
+    needs: changes
+    if: needs.changes.outputs.run_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        components: llvm-tools
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Validate with cargo llvm-cov nextest
+      env:
+        CARGO_TARGET_DIR: "target/coverage"
+        CARGO_LLVM_COV_TARGET_DIR: "target/coverage/llvm-cov-target"
+        RUST_BACKTRACE: "full"
+      run: cargo llvm-cov nextest --no-report --workspace --profile ci
+    - name: Upload coverage nextest JUnit report
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: nextest-junit-coverage
+        if-no-files-found: warn
+        overwrite: true
+        path: target/nextest/ci/junit.xml
+    - name: Generate coverage report
+      env:
+        CARGO_TARGET_DIR: "target/coverage"
+        CARGO_LLVM_COV_TARGET_DIR: "target/coverage/llvm-cov-target"
+      run: >
+        cargo llvm-cov report
+        --lcov
+        --output-path lcov.info
+        --no-default-ignore-filename-regex
+        --ignore-filename-regex '(^|/)target(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/'
+    - name: Upload LCOV report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-lcov
+        if-no-files-found: error
+        overwrite: true
+        path: lcov.info
+
+  libaio:
     needs: changes
     if: needs.changes.outputs.run_build == 'true'
     runs-on: ubuntu-22.04
@@ -87,56 +159,90 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
-        components: llvm-tools
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
-    - name: Install cargo-llvm-cov
-      uses: taiki-e/install-action@cargo-llvm-cov
-    - name: Clippy (default backend)
-      run: cargo clippy --workspace --all-targets -- -D warnings
-    - name: Validate with cargo llvm-cov nextest
-      env:
-        CARGO_TARGET_DIR: "target/coverage"
-        CARGO_LLVM_COV_TARGET_DIR: "target/coverage/llvm-cov-target"
-        RUST_BACKTRACE: "full"
-      run: cargo llvm-cov nextest --no-report --workspace --profile ci
     - name: Validate alternate libaio backend
       env:
         RUST_BACKTRACE: "full"
       run: cargo nextest run -p doradb-storage --no-default-features --features libaio --profile ci
-    - name: Upload nextest JUnit reports
+    - name: Upload libaio nextest JUnit report
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
-        name: nextest-junit
+        name: nextest-junit-libaio
         if-no-files-found: warn
-        path: |
-          target/**/nextest/ci/junit.xml
-    - name: Generate coverage report
-      env:
-        CARGO_TARGET_DIR: "target/coverage"
-        CARGO_LLVM_COV_TARGET_DIR: "target/coverage/llvm-cov-target"
-      run: >
-        cargo llvm-cov report
-        --lcov
-        --output-path lcov.info
-        --no-default-ignore-filename-regex
-        --ignore-filename-regex '(^|/)target(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/'
+        overwrite: true
+        path: target/nextest/ci/junit.xml
+
+  codecov:
+    needs: [changes, coverage]
+    if: needs.changes.outputs.run_build == 'true' && needs.coverage.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Download LCOV report
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-lcov
+        path: coverage-artifact
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v5
       with:
-        files: lcov.info
+        files: coverage-artifact/lcov.info
         token: ${{secrets.CODECOV_TOKEN}}
 
-  non-build-change:
-    needs: changes
-    if: needs.changes.outputs.run_build != 'true'
+  verify:
+    needs: [changes, clippy, coverage, libaio, codecov]
+    if: ${{ always() }}
     runs-on: ubuntu-22.04
     permissions: {}
     steps:
-    - name: Skip heavy CI for non-build delta
+    - name: Verify CI results
       env:
+        CHANGES_RESULT: ${{ needs.changes.result }}
         DIFF_RANGE: ${{ needs.changes.outputs.diff_range }}
+        RUN_BUILD: ${{ needs.changes.outputs.run_build }}
+        CLIPPY_RESULT: ${{ needs.clippy.result }}
+        COVERAGE_RESULT: ${{ needs.coverage.result }}
+        LIBAIO_RESULT: ${{ needs.libaio.result }}
+        CODECOV_RESULT: ${{ needs.codecov.result }}
       run: |
-        echo "No build changes detected in update range: ${DIFF_RANGE}"
-        echo "Compile/test jobs are intentionally skipped."
+        set -euo pipefail
+
+        if [[ "$CHANGES_RESULT" != "success" ]]; then
+          echo "Change detection did not succeed: result=${CHANGES_RESULT}"
+          exit 1
+        fi
+
+        if [[ "$RUN_BUILD" == "false" ]]; then
+          echo "No build changes detected in update range: ${DIFF_RANGE}"
+          echo "Compile/test jobs were intentionally skipped."
+          exit 0
+        fi
+
+        if [[ "$RUN_BUILD" != "true" ]]; then
+          echo "Change detection returned an invalid run_build value: ${RUN_BUILD}"
+          exit 1
+        fi
+
+        failed="false"
+        verify_result() {
+          local job="$1"
+          local result="$2"
+          if [[ "$result" != "success" ]]; then
+            echo "Required CI job did not succeed: job=${job}, result=${result}"
+            failed="true"
+          fi
+        }
+
+        verify_result "clippy" "$CLIPPY_RESULT"
+        verify_result "coverage" "$COVERAGE_RESULT"
+        verify_result "libaio" "$LIBAIO_RESULT"
+        verify_result "codecov" "$CODECOV_RESULT"
+
+        if [[ "$failed" == "true" ]]; then
+          exit 1
+        fi
+
+        echo "All required CI jobs succeeded."
