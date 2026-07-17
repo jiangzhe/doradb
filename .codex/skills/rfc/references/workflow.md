@@ -43,8 +43,8 @@ them concise and avoid repeating the previous phase's outcome as a prerequisite.
 
 If an RFC proposes enforced test timeouts or automated hang detection:
 1. Read and cite `docs/process/unit-test.md`.
-2. Do not assume plain `cargo test` has built-in timeout support.
-3. Define the runner/tooling change explicitly, or defer that work to `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md`.
+2. Treat `cargo-nextest` as the repository's authoritative test runner and `.config/nextest.toml` as the authority for timeout and hang-detection behavior.
+3. Define runner or configuration changes only when the RFC intentionally changes the existing test workflow.
 
 ## Draft Requirements (`status: draft`)
 

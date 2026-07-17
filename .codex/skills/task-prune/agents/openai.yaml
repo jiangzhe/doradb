@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Prune"
+  short_description: "Safely prune completed task worktrees"
+  default_prompt: "Use $task-prune from the main dispatch worktree to inspect cleanup candidates and remove only implemented, clean, fully pushed local task worktrees after explicit approval."

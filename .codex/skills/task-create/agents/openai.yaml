@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Create"
+  short_description: "Design implementation-ready task documents"
+  default_prompt: "Use $task-create to research a feature or bug, compare proposals through two review rounds, and create an approved implementation-ready task document in an isolated worktree."

@@ -107,6 +107,8 @@ It's different from the concept of "WAL log" in tranditional database perspectiv
 
 It does not contains "undo", therefore it does not support ARIES-style fuzzy checkpoint. The design of transactional system with logging and recovery will be introduced in a separate document.
 
+For more details, see [Redo Log](./redo-log.md).
+
 ### Secondary Index
 
 **Secondary Index** is split into a hot in-memory `MemTree` and a persistent
