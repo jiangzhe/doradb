@@ -1,7 +1,7 @@
 ---
 id: 000227
 title: Remove proven invariants from error variants
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-17
 github_issue: 858
 ---
@@ -390,6 +390,43 @@ In `docs/process/coding-guidance.md`:
   the contract more directly.
 
 ## Implementation Notes
+
+- Component topology is now infallible after the fixed engine build order has
+  established its contracts. Registry, dependency, shelf, provision, and
+  finish operations use documented release assertions with component or edge
+  diagnostics. `Component::Error` preserves `Infallible`, Runtime, Resource,
+  and genuinely mixed implementations through generic dispatch, with public
+  convergence retained in engine construction. Pure fixed and readonly buffer
+  allocation paths were narrowed to Resource errors.
+- Added `layout::mut_from_bytes` as the asserting mutable counterpart to the
+  existing trusted layout helpers. LWC and DiskTree writer paths now use it
+  after exact allocation, while persisted readers retain checked layout
+  adaptation and `LayoutError` sources beneath DataIntegrity reports.
+- Scan-buffer mutation and the LWC append, statistics, and size-estimation
+  chain are infallible under the builder-owned layout contract. Catalog
+  checkpoint rows are fully validated for count, kind, and nullability before
+  entering that chain. Capacity overflow remains a boolean rollback result.
+- Removed the eight obsolete Internal variants and their synthetic
+  impossible-state tests. The reachable fixed-width encoding failure was
+  retained and renamed to `LwcBlockEncodingContract`, with field-specific
+  attachments and normal-API coverage for the `u16` row-count limit.
+- Review found that converting LWC append operations to booleans could retry an
+  oversized first row or page after rollback with an empty builder. Explicit
+  empty-builder guards now preserve the planned single-item failure behavior:
+  catalog rows return DataIntegrity invalid-payload context and table row pages
+  return `LwcBuilderMisuse`. Regression tests cover both paths.
+- Updated the normative error specification and coding guidance for associated
+  trait errors and proven release-asserted contracts. The unsafe inventory
+  baseline date was refreshed; its contents did not change.
+- Verification completed with the mandatory branch-diff style audit over 21
+  Rust files, including formatting and Clippy with warnings denied. Source
+  audits found no retired variant or old encoding-helper names, and confirmed
+  the retained contract has the intended three producer classes. The
+  `git diff --check` validation passed. `cargo nextest run --workspace` passed
+  1,435 tests, and the alternate `libaio` validation passed 1,359 tests.
+- There were no scope or persisted-format deviations, no new deferred work,
+  no source backlog to close, and no parent RFC to synchronize. Existing
+  backlogs 000159 and 000160 remain separate non-goals as planned.
 
 ## Impacts
 
