@@ -4,13 +4,13 @@ use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::{Result, RuntimeResult};
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::id::PageID;
 use crate::obs;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::thread;
 use crate::{DiskPool, IndexPool, MemPool};
-use error_stack::ResultExt;
+use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, Listener};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -783,6 +783,7 @@ impl Component for SharedPoolEvictorWorkers {
     type Config = ();
     type Owned = SharedPoolEvictorWorkersOwned;
     type Access = SharedPoolEvictorStatsHandle;
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "shared_pool_evictor_workers";
 
@@ -791,10 +792,10 @@ impl Component for SharedPoolEvictorWorkers {
         _config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        let disk_pool = registry.dependency::<DiskPool>()?;
-        let index_pool = registry.dependency::<IndexPool>()?;
-        let mem_pool = registry.dependency::<MemPool>()?;
+    ) -> RuntimeResult<()> {
+        let disk_pool = registry.dependency::<DiskPool>();
+        let index_pool = registry.dependency::<IndexPool>();
+        let mem_pool = registry.dependency::<MemPool>();
 
         let disk_pool = disk_pool.clone_inner().into_sync();
         let index_pool = index_pool.clone_inner().into_sync();
@@ -828,7 +829,8 @@ impl Component for SharedPoolEvictorWorkers {
             wake_event,
             stats,
             evict_thread: Mutex::new(Some(handle)),
-        })
+        });
+        Ok(())
     }
 
     #[inline]
@@ -1294,12 +1296,12 @@ mod tests {
                     .unwrap();
                 builder.build::<FileSystemWorkers>(()).await.unwrap();
                 builder.build::<SharedPoolEvictorWorkers>(()).await.unwrap();
-                let registry = builder.finish().unwrap();
-                let fs = registry.dependency::<FileSystem>().unwrap();
-                let disk_pool = registry.dependency::<DiskPool>().unwrap();
-                let mem_pool = registry.dependency::<MemPool>().unwrap();
-                let index_pool = registry.dependency::<IndexPool>().unwrap();
-                let stats = registry.dependency::<SharedPoolEvictorWorkers>().unwrap();
+                let registry = builder.finish();
+                let fs = registry.dependency::<FileSystem>();
+                let disk_pool = registry.dependency::<DiskPool>();
+                let mem_pool = registry.dependency::<MemPool>();
+                let index_pool = registry.dependency::<IndexPool>();
+                let stats = registry.dependency::<SharedPoolEvictorWorkers>();
                 Self {
                     fs,
                     disk_pool,

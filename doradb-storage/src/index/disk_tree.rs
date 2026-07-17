@@ -13,9 +13,7 @@
 use super::index_stream::{NonUniqueDiskTreeCandidateStream, UniqueDiskTreeCandidateStream};
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{
-    ConfigError, DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult,
-};
+use crate::error::{ConfigError, DataIntegrityError, DataIntegrityResult, FileKind, InternalError};
 // Existing DiskTree orchestration is a genuine mixed boundary over persisted
 // DataIntegrity, buffer/file IO, configuration, and trusted rewrite Internal
 // failures. Broader index-domain narrowing belongs to a later blueprint phase.
@@ -1514,7 +1512,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             .collect::<Result<Vec<_>>>()?;
         let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
         let effective_space = {
-            let node = btree_node_from_block_mut(buf.data_mut())?;
+            let node = btree_node_from_block_mut(buf.data_mut());
             pack_fixed_entries(
                 node,
                 KnownFenceNodeParams {
@@ -1574,7 +1572,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             .collect::<Result<Vec<_>>>()?;
         let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
         let effective_space = {
-            let node = btree_node_from_block_mut(buf.data_mut())?;
+            let node = btree_node_from_block_mut(buf.data_mut());
             pack_fixed_entries(
                 node,
                 KnownFenceNodeParams {
@@ -2105,15 +2103,19 @@ fn persisted_disk_tree_node(block: &[u8]) -> DataIntegrityResult<&BTreeNode> {
         .attach_with(|| "format=secondary_disk_tree, field=node_layout")
 }
 
-/// Safely view a zeroed direct buffer as a mutable B-tree node image.
+/// View a trusted zeroed direct buffer as a mutable B-tree node image.
 ///
-/// Writers build nodes directly inside the final block buffer so the checksum
-/// can be computed over exactly the bytes that will be written.
+/// Writers allocate exactly [`DISK_TREE_BLOCK_SIZE`] bytes with
+/// `DirectBuf::zeroed`; a compile-time assertion equates that size with
+/// `BTreeNode`. Nodes are built directly inside the final block so the checksum
+/// covers exactly the bytes that will be written.
+///
+/// # Panics
+///
+/// Panics when `block` is not exactly one mutable DiskTree node block.
 #[inline]
-fn btree_node_from_block_mut(block: &mut [u8]) -> InternalResult<&mut BTreeNode> {
-    layout::try_mut_from_bytes::<BTreeNode>(block)
-        .change_context(InternalError::MutableBlockViewMismatch)
-        .attach_with(|| "phase=build_secondary_disk_tree_node")
+fn btree_node_from_block_mut(block: &mut [u8]) -> &mut BTreeNode {
+    layout::mut_from_bytes(block)
 }
 
 #[inline]
@@ -2405,7 +2407,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn test_disk_tree_layout_adaptation_preserves_source_domain() {
+    fn test_disk_tree_persisted_layout_adaptation_preserves_source_domain() {
         let persisted = match persisted_disk_tree_node(&[0u8; 1]) {
             Ok(_) => panic!("short persisted DiskTree node must fail"),
             Err(err) => err,
@@ -2419,20 +2421,6 @@ mod tests {
             Some(LayoutError::Mismatch)
         );
         assert!(format!("{persisted:?}").contains("field=node_layout"));
-
-        let mut bytes = [0u8; 1];
-        let trusted = match btree_node_from_block_mut(&mut bytes) {
-            Ok(_) => panic!("short mutable DiskTree node must fail"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            trusted.current_context(),
-            &InternalError::MutableBlockViewMismatch
-        );
-        assert_eq!(
-            trusted.downcast_ref::<LayoutError>().copied(),
-            Some(LayoutError::Mismatch)
-        );
     }
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
@@ -4159,7 +4147,7 @@ mod tests {
     fn test_disk_tree_block_checksum_trailer_rejects_corruption() {
         let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
         {
-            let node = btree_node_from_block_mut(buf.data_mut()).unwrap();
+            let node = btree_node_from_block_mut(buf.data_mut());
             node.init(0, TrxID::new(1), b"a", BTreeU64::INVALID_VALUE, &[], false);
             node.insert_at::<BTreeU64>(0, b"a", BTreeU64::from(7));
         }

@@ -179,6 +179,7 @@ impl Component for TransactionSystemWorkers {
     type Config = ();
     type Owned = TransactionSystemWorkersOwned;
     type Access = ();
+    type Error = Error;
 
     const NAME: &'static str = "trx_sys_workers";
 
@@ -188,14 +189,10 @@ impl Component for TransactionSystemWorkers {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let trx_sys = registry.dependency::<TransactionSystem>()?;
-        let startup = shelf.take::<TransactionSystem>().ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::ComponentProvisionMissing)
-                    .attach("provider=TransactionSystem, consumer=TransactionRuntime"),
-            )
-        })?;
-        registry.register::<Self>(startup.start(trx_sys).await?)
+        let trx_sys = registry.dependency::<TransactionSystem>();
+        let startup = shelf.take::<TransactionSystem>();
+        registry.register::<Self>(startup.start(trx_sys).await?);
+        Ok(())
     }
 
     #[inline]
@@ -1615,6 +1612,7 @@ impl Component for TransactionSystem {
     type Config = TrxSysConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
+    type Error = Error;
 
     const NAME: &'static str = "trx_sys";
 
@@ -1625,13 +1623,13 @@ impl Component for TransactionSystem {
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         config.validate()?;
-        let meta_pool = registry.dependency::<MetaPool>()?;
-        let index_pool = registry.dependency::<IndexPool>()?;
-        let mem_pool = registry.dependency::<MemPool>()?;
-        let table_fs = registry.dependency::<FileSystem>()?;
-        let disk_pool = registry.dependency::<DiskPool>()?;
-        let catalog = registry.dependency::<Catalog>()?;
-        let engine_poisoner = registry.dependency::<EnginePoisoner>()?;
+        let meta_pool = registry.dependency::<MetaPool>();
+        let index_pool = registry.dependency::<IndexPool>();
+        let mem_pool = registry.dependency::<MemPool>();
+        let table_fs = registry.dependency::<FileSystem>();
+        let disk_pool = registry.dependency::<DiskPool>();
+        let catalog = registry.dependency::<Catalog>();
+        let engine_poisoner = registry.dependency::<EnginePoisoner>();
 
         let (trx_sys, startup) = TransactionSystem::bootstrap(
             config,
@@ -1646,8 +1644,8 @@ impl Component for TransactionSystem {
             catalog,
         )
         .await?;
-        registry.register::<Self>(trx_sys)?;
-        shelf.put::<TransactionSystemWorkers>(startup)?;
+        registry.register::<Self>(trx_sys);
+        shelf.put::<TransactionSystemWorkers>(startup);
         TransactionSystemWorkers::build((), registry, shelf.scope::<TransactionSystemWorkers>())
             .await
     }

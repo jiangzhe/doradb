@@ -7,7 +7,7 @@ use crate::buffer::{
     BufferPool, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole, RowPoolRole,
 };
 use crate::error::Validation::Valid;
-use crate::error::{Error, ResourceError, Result, Validation};
+use crate::error::{Error, ResourceError, ResourceResult, Result, Validation};
 use crate::id::PageID;
 use crate::latch::LatchFallbackMode;
 use crate::stats::BufferPoolCounters;
@@ -33,7 +33,7 @@ impl FixedBufferPool {
     /// We separate pages and frames so that pages are always aligned
     /// to the unit of direct IO and can be flushed via libaio.
     #[inline]
-    pub(crate) fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
+    pub(crate) fn with_capacity(role: PoolRole, pool_size: usize) -> ResourceResult<Self> {
         role.assert_valid("fixed buffer pool");
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
         let arena = QuiescentArena::new(size)?;

@@ -113,6 +113,22 @@ where
     try_ref_from_bytes(bytes).expect("trusted bytes must match the requested zerocopy layout")
 }
 
+/// Views trusted exact mutable bytes as one typed zerocopy value.
+///
+/// # Panics
+///
+/// Panics when `bytes` does not have the exact size and alignment required by
+/// `T`. Callers must establish that layout before choosing this asserting
+/// helper over [`try_mut_from_bytes`].
+#[inline]
+pub(crate) fn mut_from_bytes<T>(bytes: &mut [u8]) -> &mut T
+where
+    T: FromBytes + IntoBytes + KnownLayout,
+{
+    try_mut_from_bytes(bytes)
+        .expect("trusted bytes must match the requested mutable zerocopy layout")
+}
+
 /// Views trusted exact bytes as a typed zerocopy slice.
 #[inline]
 pub(crate) fn slice_from_bytes<T>(bytes: &[u8]) -> &[T]
@@ -152,14 +168,20 @@ mod tests {
     }
 
     #[test]
-    fn test_try_mut_from_bytes_updates_bytes() {
+    fn test_mut_from_bytes_updates_bytes() {
         let mut bytes = [0u8; mem::size_of::<LeU32>()];
 
-        try_mut_from_bytes::<LeU32>(&mut bytes)
-            .unwrap()
-            .set(0x1122_3344);
+        mut_from_bytes::<LeU32>(&mut bytes).set(0x1122_3344);
 
         assert_eq!(bytes, [0x44, 0x33, 0x22, 0x11]);
+    }
+
+    #[test]
+    fn test_try_mut_from_bytes_rejects_wrong_len() {
+        let mut bytes = [0u8; 3];
+        let err = try_mut_from_bytes::<LeU32>(&mut bytes).unwrap_err();
+
+        assert_eq!(*err.current_context(), LayoutError::Mismatch);
     }
 
     #[test]

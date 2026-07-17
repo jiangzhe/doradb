@@ -3,7 +3,7 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
 use crate::buffer::page::{BufferPage, Page};
 use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
 use crate::buffer::{PoolGuard, PoolIdentity};
-use crate::error::Result;
+use crate::error::ResourceResult;
 use crate::id::PageID;
 use crate::ptr::UnsafePtr;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -75,7 +75,7 @@ pub(crate) struct ArenaInner {
 
 impl ArenaInner {
     #[inline]
-    fn new(capacity: usize) -> Result<Self> {
+    fn new(capacity: usize) -> ResourceResult<Self> {
         // SAFETY: `ArenaInner::drop` destroys initialized frames and unmaps
         // both regions exactly once after the leading keepalive box drains.
         let (frames, pages) = unsafe { initialize_frame_and_page_arrays(capacity)? };
@@ -163,7 +163,7 @@ pub(crate) struct QuiescentArena {
 impl QuiescentArena {
     /// Allocates one arena with `capacity` frame/page slots.
     #[inline]
-    pub(crate) fn new(capacity: usize) -> Result<Self> {
+    pub(crate) fn new(capacity: usize) -> ResourceResult<Self> {
         let keepalive = QuiescentBox::new(());
         let identity = keepalive.owner_identity();
         Ok(Self {

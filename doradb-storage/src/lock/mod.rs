@@ -7,7 +7,7 @@
 mod state;
 
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::{OperationError, OperationResult, Result};
+use crate::error::{OperationError, OperationResult};
 use crate::id::{SessionID, TableID, TrxID};
 use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -15,7 +15,9 @@ use error_stack::Report;
 use event_listener::Event;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::fmt;
+use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -641,6 +643,7 @@ impl Component for LockManager {
     type Config = ();
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
+    type Error = Infallible;
 
     const NAME: &'static str = "lock_manager";
 
@@ -649,8 +652,9 @@ impl Component for LockManager {
         _config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        registry.register::<Self>(Self::new())
+    ) -> StdResult<(), Self::Error> {
+        registry.register::<Self>(Self::new());
+        Ok(())
     }
 
     #[inline]

@@ -1,11 +1,13 @@
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::{FatalError, FatalResult, Result};
+use crate::error::{FatalError, FatalResult};
 use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use event_listener::{Event, EventListener};
 use parking_lot::Mutex;
+use std::convert::Infallible;
+use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// First fatal engine poison reason published to future admission checks.
@@ -133,6 +135,7 @@ impl Component for EnginePoisoner {
     type Config = ();
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
+    type Error = Infallible;
 
     const NAME: &'static str = "engine_poisoner";
 
@@ -141,8 +144,9 @@ impl Component for EnginePoisoner {
         _config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        registry.register::<Self>(Self::new())
+    ) -> StdResult<(), Self::Error> {
+        registry.register::<Self>(Self::new());
+        Ok(())
     }
 
     #[inline]

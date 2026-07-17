@@ -2,9 +2,7 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableColumnLayout};
-use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult,
-};
+use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind};
 // Genuine mixed-domain convergence: `PersistedLwcBlock::load` combines
 // buffer/read completion failures with persisted DataIntegrity validation, so
 // its public storage result ends typed propagation at the load boundary.
@@ -119,17 +117,17 @@ impl LwcBlock {
         unsafe { &*input.as_ptr().cast::<Self>() }
     }
 
-    /// Mutably borrows one raw LWC payload image with the expected payload size.
+    /// Mutably borrows a trusted, exactly sized LWC payload image.
+    ///
+    /// Writers allocate a full block and pass exactly its
+    /// [`LWC_BLOCK_PAYLOAD_SIZE`] payload bytes to this helper.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `input` is not exactly one mutable LWC payload.
     #[inline]
-    pub(crate) fn try_from_bytes_mut(input: &mut [u8]) -> InternalResult<&mut Self> {
-        let input_len = input.len();
-        layout::try_mut_from_bytes::<Self>(input)
-            .change_context(InternalError::LwcBlockEncodingInvariant)
-            .attach_with(|| {
-                format!(
-                    "mutable LWC block payload has invalid length {input_len}, expected {LWC_BLOCK_PAYLOAD_SIZE}"
-                )
-            })
+    pub(crate) fn from_bytes_mut(input: &mut [u8]) -> &mut Self {
+        layout::mut_from_bytes(input)
     }
 
     /// Validates a full persisted LWC block image and returns its payload view.
@@ -557,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lwc_layout_adaptation_preserves_source_for_persisted_and_mutable_views() {
+    fn test_lwc_persisted_layout_adaptation_preserves_source() {
         let persisted = match LwcBlock::try_from_bytes(&[0u8; 1]) {
             Ok(_) => panic!("short persisted LWC payload must fail"),
             Err(err) => err,
@@ -568,20 +566,6 @@ mod tests {
         );
         assert_eq!(
             persisted.downcast_ref::<LayoutError>().copied(),
-            Some(LayoutError::Mismatch)
-        );
-
-        let mut bytes = [0u8; 1];
-        let trusted = match LwcBlock::try_from_bytes_mut(&mut bytes) {
-            Ok(_) => panic!("short mutable LWC payload must fail"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            trusted.current_context(),
-            &InternalError::LwcBlockEncodingInvariant
-        );
-        assert_eq!(
-            trusted.downcast_ref::<LayoutError>().copied(),
             Some(LayoutError::Mismatch)
         );
     }
@@ -598,8 +582,7 @@ mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
         let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page =
-            LwcBlock::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]).unwrap();
+        let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
         page.header = LwcBlockHeader::new(11, 1, 1, 0);
         page.body[..2].copy_from_slice(&(2u16).to_le_bytes());
         write_block_checksum(buf.data_mut());
@@ -632,7 +615,7 @@ mod tests {
         let buf = {
             let mut builder = LwcBuilder::new(metadata.col.as_ref());
             let view = page.vector_view(metadata.col.as_ref());
-            assert!(builder.append_view(view, page.header.start_row_id).unwrap());
+            assert!(builder.append_view(view, page.header.start_row_id));
             let fingerprint = row_shape_fingerprint_for(builder.row_ids());
             builder.build(fingerprint).unwrap()
         };
@@ -642,7 +625,7 @@ mod tests {
     #[test]
     fn test_lwc_block() {
         let mut buf = DirectBuf::zeroed(LWC_BLOCK_PAYLOAD_SIZE);
-        let page = LwcBlock::try_from_bytes_mut(buf.data_mut()).unwrap();
+        let page = LwcBlock::from_bytes_mut(buf.data_mut());
         page.header = LwcBlockHeader::new(100, 50, 2, 7);
         assert!(page.header.row_shape_fingerprint() == 100);
         assert!(page.header.row_count() == 50);
@@ -676,7 +659,7 @@ mod tests {
         column_bytes[idx..].copy_from_slice(&values_bytes);
 
         let mut buf = DirectBuf::zeroed(LWC_BLOCK_PAYLOAD_SIZE);
-        let page = LwcBlock::try_from_bytes_mut(buf.data_mut()).unwrap();
+        let page = LwcBlock::from_bytes_mut(buf.data_mut());
         let col_offsets_len = mem::size_of::<u16>();
         let col_start = col_offsets_len;
         let col_end = col_start + column_bytes.len();
@@ -711,7 +694,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut buf = DirectBuf::zeroed(LWC_BLOCK_PAYLOAD_SIZE);
-        let page = LwcBlock::try_from_bytes_mut(buf.data_mut()).unwrap();
+        let page = LwcBlock::from_bytes_mut(buf.data_mut());
         let col_offsets_len = mem::size_of::<u16>() * 2;
         let end_offset = col_offsets_len as u16;
         page.header = LwcBlockHeader::new(1, 0, 2, 0);
@@ -736,10 +719,10 @@ mod tests {
     }
 
     #[test]
-    fn test_lwc_block_try_from_bytes_mut_roundtrip() {
+    fn test_lwc_block_from_bytes_mut_roundtrip() {
         let mut buf = DirectBuf::zeroed(LWC_BLOCK_PAYLOAD_SIZE);
         {
-            let page = LwcBlock::try_from_bytes_mut(buf.data_mut()).unwrap();
+            let page = LwcBlock::from_bytes_mut(buf.data_mut());
             page.header = LwcBlockHeader::new(11, 2, 1, 0);
             page.body[..2].copy_from_slice(&(3u16).to_le_bytes());
             page.body[2] = 0xAB;
@@ -862,8 +845,7 @@ mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
         let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page =
-            LwcBlock::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]).unwrap();
+        let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
         let invalid_end = (page.body.len() as u16).saturating_add(1);
         page.header = LwcBlockHeader::new(0, 1, 1, 0);
         page.body[..2].copy_from_slice(&invalid_end.to_le_bytes());
@@ -890,9 +872,7 @@ mod tests {
         let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
         let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
         {
-            let page =
-                LwcBlock::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])
-                    .unwrap();
+            let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
             let (start_idx, end_idx) = page.col_offsets().unwrap().get(0).unwrap();
             let column = &mut page.body[start_idx..end_idx];
             let data_len = column.len().saturating_sub(11);

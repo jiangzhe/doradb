@@ -763,6 +763,7 @@ impl Component for Catalog {
     type Config = CatalogConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
+    type Error = Error;
 
     const NAME: &'static str = "catalog";
 
@@ -772,16 +773,17 @@ impl Component for Catalog {
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let meta_pool = registry.dependency::<MetaPool>()?;
-        let table_fs = registry.dependency::<FileSystem>()?;
-        let disk_pool = registry.dependency::<DiskPool>()?;
+        let meta_pool = registry.dependency::<MetaPool>();
+        let table_fs = registry.dependency::<FileSystem>();
+        let disk_pool = registry.dependency::<DiskPool>();
         let storage = CatalogStorage::new(
             meta_pool.clone_inner(),
             table_fs.clone(),
             disk_pool.clone_inner(),
         )
         .await?;
-        registry.register::<Self>(Catalog::new(storage, config).await?)
+        registry.register::<Self>(Catalog::new(storage, config).await?);
+        Ok(())
     }
 
     #[inline]

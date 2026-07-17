@@ -854,13 +854,7 @@ fn build_lwc_blocks_from_row_records(
     rows: &[RowRecord],
 ) -> Result<Vec<PendingLwcBlock>> {
     for row in rows {
-        if row.vals.len() != metadata.col.col_count() {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint row value count {} does not match column count {}",
-                row.vals.len(),
-                metadata.col.col_count()
-            )));
-        }
+        validate_catalog_row(metadata, &row.vals, "catalog checkpoint LWC row")?;
     }
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -875,7 +869,13 @@ fn build_lwc_blocks_from_row_records(
         if builder.is_empty() {
             builder_start = Some(row.row_id);
         }
-        if !builder.append_row_values(row.row_id, &row.vals)? {
+        if !builder.append_row_values(row.row_id, &row.vals) {
+            if builder.is_empty() {
+                return Err(invalid_catalog_payload(format!(
+                    "single catalog row does not fit in LWC block: row_id={}",
+                    row.row_id
+                )));
+            }
             let start_row_id = builder_start.take().ok_or_else(|| {
                 invalid_catalog_payload("catalog LWC builder missing start row id")
             })?;
@@ -895,7 +895,7 @@ fn build_lwc_blocks_from_row_records(
 
             builder = LwcBuilder::new(&metadata.col);
             builder_start = Some(row.row_id);
-            if !builder.append_row_values(row.row_id, &row.vals)? {
+            if !builder.append_row_values(row.row_id, &row.vals) {
                 return Err(invalid_catalog_payload(format!(
                     "single catalog row does not fit in LWC block: row_id={}",
                     row.row_id
@@ -1006,7 +1006,9 @@ pub(crate) mod tests {
     use crate::buffer::{PoolGuards, PoolRole};
     use crate::catalog::USER_TABLE_ID_START;
     use crate::catalog::tests::{open_catalog_test_engine, table1, table2};
-    use crate::catalog::{CatalogCheckpointBatch, CatalogCheckpointScanStopReason};
+    use crate::catalog::{
+        CatalogCheckpointBatch, CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec,
+    };
     use crate::error::DataIntegrityError;
     use crate::file::BlockKey;
     use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
@@ -1476,10 +1478,50 @@ pub(crate) mod tests {
                 err.data_integrity_error(),
                 Some(DataIntegrityError::InvalidPayload)
             );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("single catalog row does not fit in LWC block: row_id=0"),
+                "{report}"
+            );
             assert_eq!(storage.meta_pool.allocated(), allocated_before);
 
             assert_eq!(storage.meta_pool.allocated(), allocated_before);
         });
+    }
+
+    #[test]
+    fn test_catalog_lwc_rows_are_validated_before_trusted_builder() {
+        let metadata = TableMetadata::try_new(
+            vec![ColumnSpec::new(
+                "required_u8",
+                ValKind::U8,
+                ColumnAttributes::empty(),
+            )],
+            vec![],
+        )
+        .expect("valid table metadata");
+
+        for (case, value) in [
+            ("wrong kind", Val::I16(7)),
+            ("invalid nullability", Val::Null),
+        ] {
+            let rows = [RowRecord {
+                row_id: RowID::new(0),
+                vals: vec![value],
+            }];
+            let err = match build_lwc_blocks_from_row_records(&metadata, &rows) {
+                Ok(_) => panic!("{case} must fail catalog row validation"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidPayload),
+                "case={case}"
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("catalog checkpoint LWC row"), "{report}");
+            assert!(report.contains("column_no=0"), "{report}");
+        }
     }
 
     #[cfg(debug_assertions)]

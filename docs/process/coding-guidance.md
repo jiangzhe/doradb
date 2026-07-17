@@ -30,12 +30,13 @@ We rely on tooling to enforce style.
 
 ### Error Handling
 *   **Typed Domain Reports**: Internal domain-specific functions should return the matching report alias, such as `ConfigResult`, `OperationResult`, `ResourceResult`, `DataIntegrityResult`, `LifecycleResult`, `FatalResult`, or `InternalResult`. Use the crate-wide `crate::error::Result` only at public API boundaries or in functions that intentionally combine several unrelated domains.
+*   **Crate-Owned Trait Errors**: When implementations of a crate-owned trait have different failure domains, use an associated error type and let each implementation expose its narrowest result. Keep generic dispatch typed and convert only in a caller that actually combines unrelated implementations. Use crate `Result` directly only for an externally fixed signature or an implementation that is itself mixed-domain.
 *   **Fieldless Error Variants**: Define stable error classifications as fieldless `thiserror` variants. Put request-specific details, identifiers, values, and explanatory text in `error-stack` attachments instead of variant fields.
 *   **Context at the Caller**: Attach operation names, table or block identifiers, configuration field names, and other caller-owned context with `attach` or `attach_with` where that context becomes known. Do not pass parameters down the call stack solely so a leaf function can format an error message.
 *   **Cross-Domain Conversion**: Use `change_context` at the boundary where one domain consumes another domain's failure, then attach the consuming operation's context. Preserve the original report frames; do not convert to `crate::error::Error`, downcast it, and rebuild a new report.
 *   **Completion Transport**: Convert typed reports directly to `CompletionErrorKind` so producer attachments survive cross-thread handoff. Reserve generic crate-error conversion for genuinely mixed-domain completion producers.
 *   **Validation Pattern**: Use `crate::error::Validation<T>` for optimistic logic checks (Valid/Invalid) where failure is a normal control flow, distinct from `Result` (exceptional failures).
-*   **No Panics**: Avoid `unwrap()` / `expect()` in runtime paths.
+*   **Runtime Failures vs. Contracts**: Incidental `unwrap()` / `expect()` in runtime paths remains prohibited, and external or otherwise valid runtime failures must remain typed results. A proven internal contract may use a release assertion at the narrowest owning site when its constructor, exact allocation, ownership boundary, or fixed lifecycle establishes the precondition. Document the invariant locally and include the component, edge, type/length, column, or other identifying detail in the assertion diagnostic. Do not use `debug_assert!` as the only guard for a correctness contract or treat this rule as general permission to panic.
 
 ### Concurrency & Locking
 *   **Blocking Locks**: Use `parking_lot::Mutex` and `parking_lot::RwLock` for blocking operations.

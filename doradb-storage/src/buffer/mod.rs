@@ -44,13 +44,14 @@ use crate::component::{
 };
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
-use crate::error::{DataIntegrityResult, FileKind, Result};
+use crate::error::{DataIntegrityResult, Error, FileKind, ResourceError, ResourceResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::{BlockID, PageID};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentBox;
 use crate::stats::BufferPoolCounters;
+use error_stack::Report;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -269,6 +270,7 @@ impl Component for MetaPool {
     type Config = MetaPoolConfig;
     type Owned = FixedBufferPool;
     type Access = Self;
+    type Error = Report<ResourceError>;
 
     const NAME: &'static str = "meta_pool";
 
@@ -277,11 +279,12 @@ impl Component for MetaPool {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
+    ) -> ResourceResult<()> {
         registry.register::<Self>(FixedBufferPool::with_capacity(
             PoolRole::Meta,
             config.bytes,
-        )?)
+        )?);
+        Ok(())
     }
 
     #[inline]
@@ -297,6 +300,7 @@ impl Component for IndexPool {
     type Config = IndexPoolConfig;
     type Owned = EvictableBufferPool;
     type Access = Self;
+    type Error = Error;
 
     const NAME: &'static str = "index_pool";
 
@@ -306,15 +310,16 @@ impl Component for IndexPool {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let fs = registry.dependency::<FileSystem>()?;
+        let fs = registry.dependency::<FileSystem>();
         let (pool, storage) = EvictableBufferPoolConfig::default()
             .role(PoolRole::Index)
             .max_mem_size(config.bytes)
             .max_file_size(config.max_file_size)
             .data_swap_file(config.swap_file)
             .build_index_for_engine(fs)?;
-        registry.register::<Self>(pool)?;
-        shelf.put::<FileSystemWorkers>(storage)
+        registry.register::<Self>(pool);
+        shelf.put::<FileSystemWorkers>(storage);
+        Ok(())
     }
 
     #[inline]
@@ -330,6 +335,7 @@ impl Component for MemPool {
     type Config = EvictableBufferPoolConfig;
     type Owned = EvictableBufferPool;
     type Access = Self;
+    type Error = Error;
 
     const NAME: &'static str = "mem_pool";
 
@@ -339,10 +345,11 @@ impl Component for MemPool {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let fs = registry.dependency::<FileSystem>()?;
+        let fs = registry.dependency::<FileSystem>();
         let (pool, storage) = config.role(PoolRole::Mem).build_for_engine(fs)?;
-        registry.register::<Self>(pool)?;
-        shelf.put::<FileSystemWorkers>(storage)
+        registry.register::<Self>(pool);
+        shelf.put::<FileSystemWorkers>(storage);
+        Ok(())
     }
 
     #[inline]
@@ -358,6 +365,7 @@ impl Component for DiskPool {
     type Config = DiskPoolConfig;
     type Owned = ReadonlyBufferPool;
     type Access = Self;
+    type Error = Report<ResourceError>;
 
     const NAME: &'static str = "disk_pool";
 
@@ -366,13 +374,14 @@ impl Component for DiskPool {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        let fs = registry.dependency::<FileSystem>()?;
+    ) -> ResourceResult<()> {
+        let fs = registry.dependency::<FileSystem>();
         registry.register::<Self>(ReadonlyBufferPool::with_capacity(
             PoolRole::Disk,
             config.bytes,
             fs,
-        )?)
+        )?);
+        Ok(())
     }
 
     #[inline]

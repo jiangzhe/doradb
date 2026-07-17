@@ -1,6 +1,6 @@
 use crate::buffer::frame::BufferFrame;
 use crate::buffer::page::Page;
-use crate::error::{ResourceError, ResourceResult, Result};
+use crate::error::{ResourceError, ResourceResult};
 use crate::id::PageID;
 use error_stack::Report;
 use libc::{
@@ -30,7 +30,7 @@ fn page_total_bytes(capacity: usize) -> usize {
 #[inline]
 pub(super) unsafe fn initialize_frame_and_page_arrays(
     capacity: usize,
-) -> Result<(*mut BufferFrame, *mut Page)> {
+) -> ResourceResult<(*mut BufferFrame, *mut Page)> {
     let frame_total_bytes = frame_total_bytes(capacity);
     let page_total_bytes = page_total_bytes(capacity);
     // SAFETY: this helper owns the freshly mmapped regions for the duration of
@@ -42,7 +42,7 @@ pub(super) unsafe fn initialize_frame_and_page_arrays(
             Ok(ptr) => ptr as *mut Page,
             Err(err) => {
                 mmap_deallocate(frames as *mut u8, frame_total_bytes);
-                return Err(err.into());
+                return Err(err);
             }
         };
         for i in 0..capacity {
