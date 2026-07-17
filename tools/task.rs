@@ -318,6 +318,8 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
             "purge-worktrees must run from the main dispatch worktree; current branch: {current_branch}"
         ));
     }
+    let dispatch_root = PathBuf::from(run_git_capture(&["rev-parse", "--show-toplevel"])?);
+    let managed_worktrees_dir = dispatch_root.join(".worktrees");
 
     let worktrees =
         parse_worktree_list_porcelain(&run_git_capture(&["worktree", "list", "--porcelain"])?);
@@ -333,13 +335,16 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
     };
 
     for worktree in worktrees {
-        let entry = inspect_worktree_for_purge(&worktree)?;
+        let entry = inspect_worktree_for_purge(&worktree, &managed_worktrees_dir)?;
         summary.all_worktrees.push(entry.clone());
-        if entry
-            .reasons
-            .iter()
-            .any(|reason| reason == "main_dispatch_branch")
-        {
+        if entry.reasons.iter().any(|reason| {
+            matches!(
+                reason.as_str(),
+                "main_dispatch_branch"
+                    | "outside_managed_worktree_dir"
+                    | "invalid_task_worktree_name"
+            )
+        }) {
             summary.excluded.push(entry);
         } else if entry.safe {
             summary.safe_to_purge.push(entry);
@@ -352,7 +357,7 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
         run_git_dynamic(&["fetch", "--prune", "origin"])?;
 
         for entry in summary.safe_to_purge.clone() {
-            if let Err(err) = purge_worktree_entry(&entry) {
+            if let Err(err) = purge_worktree_entry(&entry, &managed_worktrees_dir) {
                 summary.failures.push(WorktreePurgeFailure {
                     path: entry.path.clone(),
                     branch: entry.branch.clone(),
@@ -1199,11 +1204,15 @@ fn parse_worktree_list_porcelain(text: &str) -> Vec<GitWorktree> {
     out
 }
 
-fn inspect_worktree_for_purge(worktree: &GitWorktree) -> Result<WorktreePurgeEntry, String> {
+fn inspect_worktree_for_purge(
+    worktree: &GitWorktree,
+    managed_worktrees_dir: &Path,
+) -> Result<WorktreePurgeEntry, String> {
+    let worktree_path = Path::new(&worktree.path);
     let mut entry = WorktreePurgeEntry {
         path: worktree.path.clone(),
         branch: worktree.branch.clone(),
-        task_id: task_id_from_worktree_path(Path::new(&worktree.path)),
+        task_id: task_id_from_worktree_path(worktree_path),
         task_doc: None,
         task_status: None,
         clean: None,
@@ -1218,6 +1227,17 @@ fn inspect_worktree_for_purge(worktree: &GitWorktree) -> Result<WorktreePurgeEnt
         return Ok(entry);
     }
 
+    if !is_direct_child_of(worktree_path, managed_worktrees_dir) {
+        entry
+            .reasons
+            .push("outside_managed_worktree_dir".to_string());
+        return Ok(entry);
+    }
+    if entry.task_id.is_none() {
+        entry.reasons.push("invalid_task_worktree_name".to_string());
+        return Ok(entry);
+    }
+
     if worktree.locked {
         entry.reasons.push("worktree_locked".to_string());
     }
@@ -1228,7 +1248,6 @@ fn inspect_worktree_for_purge(worktree: &GitWorktree) -> Result<WorktreePurgeEnt
         return Ok(entry);
     }
 
-    let worktree_path = Path::new(&entry.path);
     entry.clean = Some(is_worktree_clean(worktree_path)?);
 
     if let Some(task_id) = entry.task_id.clone() {
@@ -1286,12 +1305,28 @@ fn inspect_worktree_for_purge(worktree: &GitWorktree) -> Result<WorktreePurgeEnt
     Ok(entry)
 }
 
-fn purge_worktree_entry(entry: &WorktreePurgeEntry) -> Result<(), String> {
+fn purge_worktree_entry(
+    entry: &WorktreePurgeEntry,
+    managed_worktrees_dir: &Path,
+) -> Result<(), String> {
+    let worktree_path = Path::new(&entry.path);
+    if !is_direct_child_of(worktree_path, managed_worktrees_dir)
+        || task_id_from_worktree_path(worktree_path).is_none()
+    {
+        return Err(format!(
+            "refusing to purge worktree outside managed task directory: {}",
+            entry.path
+        ));
+    }
     run_git_dynamic(&["worktree", "remove", &entry.path])?;
     if let Some(branch) = entry.branch.as_deref() {
         run_git_dynamic(&["branch", "-D", branch])?;
     }
     Ok(())
+}
+
+fn is_direct_child_of(path: &Path, parent: &Path) -> bool {
+    path.parent() == Some(parent)
 }
 
 fn task_id_from_worktree_path(path: &Path) -> Option<String> {
@@ -2594,12 +2629,15 @@ prunable gitdir file points to non-existent location\n\
 
     #[test]
     fn inspect_worktree_for_purge_short_circuits_locked_worktree() {
-        let entry = inspect_worktree_for_purge(&GitWorktree {
-            path: "/repo/.worktrees/000080".to_string(),
-            branch: Some("shortbranch".to_string()),
-            locked: true,
-            prunable: false,
-        })
+        let entry = inspect_worktree_for_purge(
+            &GitWorktree {
+                path: "/repo/.worktrees/000080".to_string(),
+                branch: Some("shortbranch".to_string()),
+                locked: true,
+                prunable: false,
+            },
+            Path::new("/repo/.worktrees"),
+        )
         .unwrap();
 
         assert!(!entry.safe);
@@ -2613,12 +2651,15 @@ prunable gitdir file points to non-existent location\n\
 
     #[test]
     fn inspect_worktree_for_purge_short_circuits_prunable_worktree() {
-        let entry = inspect_worktree_for_purge(&GitWorktree {
-            path: "/repo/.worktrees/000081".to_string(),
-            branch: Some("shortbranch".to_string()),
-            locked: false,
-            prunable: true,
-        })
+        let entry = inspect_worktree_for_purge(
+            &GitWorktree {
+                path: "/repo/.worktrees/000081".to_string(),
+                branch: Some("shortbranch".to_string()),
+                locked: false,
+                prunable: true,
+            },
+            Path::new("/repo/.worktrees"),
+        )
         .unwrap();
 
         assert!(!entry.safe);
@@ -2632,12 +2673,15 @@ prunable gitdir file points to non-existent location\n\
 
     #[test]
     fn inspect_worktree_for_purge_short_circuits_worktree_with_both_flags() {
-        let entry = inspect_worktree_for_purge(&GitWorktree {
-            path: "/repo/.worktrees/000082".to_string(),
-            branch: Some("shortbranch".to_string()),
-            locked: true,
-            prunable: true,
-        })
+        let entry = inspect_worktree_for_purge(
+            &GitWorktree {
+                path: "/repo/.worktrees/000082".to_string(),
+                branch: Some("shortbranch".to_string()),
+                locked: true,
+                prunable: true,
+            },
+            Path::new("/repo/.worktrees"),
+        )
         .unwrap();
 
         assert!(!entry.safe);
@@ -2670,6 +2714,63 @@ prunable gitdir file points to non-existent location\n\
             task_id_from_worktree_path(Path::new("/repo/.worktrees/task-80")),
             None
         );
+    }
+
+    #[test]
+    fn direct_child_check_requires_exact_parent() {
+        let managed_dir = Path::new("/repo/.worktrees");
+
+        assert!(is_direct_child_of(
+            Path::new("/repo/.worktrees/000080"),
+            managed_dir
+        ));
+        assert!(!is_direct_child_of(Path::new("/repo/000080"), managed_dir));
+        assert!(!is_direct_child_of(
+            Path::new("/repo/other/.worktrees/000080"),
+            managed_dir
+        ));
+    }
+
+    #[test]
+    fn inspect_worktree_for_purge_excludes_path_outside_managed_directory() {
+        for path in ["/repo/123456", "/repo/other/.worktrees/123456"] {
+            let entry = inspect_worktree_for_purge(
+                &GitWorktree {
+                    path: path.to_string(),
+                    branch: Some("shortbranch".to_string()),
+                    locked: false,
+                    prunable: false,
+                },
+                Path::new("/repo/.worktrees"),
+            )
+            .unwrap();
+
+            assert!(!entry.safe);
+            assert_eq!(entry.clean, None);
+            assert_eq!(
+                entry.reasons,
+                vec!["outside_managed_worktree_dir".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn purge_worktree_entry_rejects_path_outside_managed_directory() {
+        let entry = WorktreePurgeEntry {
+            path: "/repo/123456".to_string(),
+            branch: Some("shortbranch".to_string()),
+            task_id: Some("123456".to_string()),
+            task_doc: Some("docs/tasks/123456-example.md".to_string()),
+            task_status: Some("implemented".to_string()),
+            clean: Some(true),
+            remote_branch: Some("origin/shortbranch".to_string()),
+            pushed: Some(true),
+            safe: true,
+            reasons: Vec::new(),
+        };
+
+        let err = purge_worktree_entry(&entry, Path::new("/repo/.worktrees")).unwrap_err();
+        assert!(err.contains("outside managed task directory"));
     }
 
     #[test]

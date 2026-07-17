@@ -36,7 +36,8 @@ tools/task.rs purge-worktrees --apply
 
 ## Removal Boundary
 
-Apply mode may remove only:
+Apply mode may act only on direct children of the dispatch root matching
+`.worktrees/<six-digit-task-id>`. It may remove only:
 
 - the local worktree via `git worktree remove`;
 - the local branch via `git branch -D`.
