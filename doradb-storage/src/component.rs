@@ -1,16 +1,16 @@
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
-use crate::error::{Error, InternalError, Result};
 use crate::map::FastHashMap;
 use crate::obs;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use error_stack::Report;
 use std::any::{Any, TypeId};
+use std::fmt::Display;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One lifecycle-managed engine subsystem.
@@ -37,15 +37,21 @@ pub(crate) trait Component: Sized + 'static {
     type Config;
     type Owned: Send + Sync + 'static;
     type Access: Clone + Send + Sync + 'static;
+    /// Failure type produced while constructing this component.
+    type Error: Display;
 
     const NAME: &'static str;
 
     /// Builds and registers the component's owned runtime state.
+    ///
+    /// Each implementation retains its narrowest native error until a caller
+    /// that combines component domains, such as engine construction, converts
+    /// it to the public storage error.
     fn build(
         config: Self::Config,
         registry: &mut ComponentRegistry,
         shelf: ShelfScope<'_, Self>,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = StdResult<(), Self::Error>> + Send;
 
     /// Derives the cloneable dependency handle from the registered owner.
     fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access;
@@ -144,23 +150,29 @@ impl ComponentRegistry {
     /// Registration order is significant: later components may only depend on
     /// components that were registered earlier, and reverse registration order
     /// becomes the engine shutdown/drop order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the component name is empty or the fixed engine build
+    /// program registers the same component type more than once.
     #[inline]
-    pub(crate) fn register<C: Component>(&mut self, owned: C::Owned) -> Result<()> {
-        debug_assert!(
+    pub(crate) fn register<C: Component>(&mut self, owned: C::Owned) {
+        assert!(
             !C::NAME.is_empty(),
             "component implementations must provide a stable non-empty name"
         );
         let tid = TypeId::of::<C>();
-        if self.access_map.contains_key(&tid) {
-            return Err(Error::engine_component_already_registered());
-        }
+        assert!(
+            !self.access_map.contains_key(&tid),
+            "component {} is already registered in the fixed engine build order",
+            C::NAME
+        );
 
         let owner = QuiescentBox::new(owned);
         let access = C::access(&owner);
         self.access_map.insert(tid, Box::new(access));
         self.boxed_vec
             .push(Box::new(TypedComponentBox::<C> { owner }));
-        Ok(())
     }
 
     /// Return the cloned dependency handle for a previously registered
@@ -175,10 +187,19 @@ impl ComponentRegistry {
 
     /// Fetch a required dependency handle for a previously registered
     /// component.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed engine registration order has not registered the
+    /// requested component with the expected access type.
     #[inline]
-    pub(crate) fn dependency<C: Component>(&self) -> Result<C::Access> {
-        self.get::<C>()
-            .ok_or(Error::engine_component_missing_dependency())
+    pub(crate) fn dependency<C: Component>(&self) -> C::Access {
+        self.get::<C>().unwrap_or_else(|| {
+            panic!(
+                "component {} is missing from the fixed engine registration order",
+                C::NAME
+            )
+        })
     }
 
     /// Run explicit component shutdown in reverse registration order.
@@ -235,39 +256,44 @@ impl Shelf {
         (TypeId::of::<Up>(), TypeId::of::<Down>())
     }
 
-    fn put<Up, Down>(&mut self, provision: <Up as Supplier<Down>>::Provision) -> Result<()>
+    fn put<Up, Down>(&mut self, provision: <Up as Supplier<Down>>::Provision)
     where
         Up: Supplier<Down>,
         Down: Component,
     {
-        let old = self
-            .parts
-            .insert(Self::key::<Up, Down>(), Box::new(provision));
-        if old.is_some() {
-            return Err(Report::new(InternalError::ComponentShelfDuplicateProvision)
-                .attach(format!("edge={} -> {}", Up::NAME, Down::NAME))
-                .into());
-        }
-        Ok(())
+        let key = Self::key::<Up, Down>();
+        assert!(
+            !self.parts.contains_key(&key),
+            "component provision edge {} -> {} was published more than once",
+            Up::NAME,
+            Down::NAME
+        );
+        self.parts.insert(key, Box::new(provision));
     }
 
-    fn take<Up, Down>(&mut self) -> Option<<Up as Supplier<Down>>::Provision>
+    fn take<Up, Down>(&mut self) -> <Up as Supplier<Down>>::Provision
     where
         Up: Supplier<Down>,
         Down: Component,
     {
-        self.parts
+        let provision = self
+            .parts
             .remove(&Self::key::<Up, Down>())
-            .map(|provision| {
-                *provision
-                    .downcast::<<Up as Supplier<Down>>::Provision>()
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "invalid shelf provision type for edge {} -> {}",
-                            Up::NAME,
-                            Down::NAME
-                        )
-                    })
+            .unwrap_or_else(|| {
+                panic!(
+                    "component provision edge {} -> {} is missing from the fixed engine build order",
+                    Up::NAME,
+                    Down::NAME
+                )
+            });
+        *provision
+            .downcast::<<Up as Supplier<Down>>::Provision>()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "invalid shelf provision type for edge {} -> {}",
+                    Up::NAME,
+                    Down::NAME
+                )
             })
     }
 
@@ -300,8 +326,13 @@ pub(crate) struct ShelfScope<'a, C> {
 
 impl<'a, C: Component> ShelfScope<'a, C> {
     /// Stores a provision from the scoped component to a downstream component.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed engine build program publishes the typed edge
+    /// from `C` to `Down` more than once.
     #[inline]
-    pub(crate) fn put<Down>(&mut self, provision: <C as Supplier<Down>>::Provision) -> Result<()>
+    pub(crate) fn put<Down>(&mut self, provision: <C as Supplier<Down>>::Provision)
     where
         C: Supplier<Down>,
         Down: Component,
@@ -310,8 +341,13 @@ impl<'a, C: Component> ShelfScope<'a, C> {
     }
 
     /// Takes a provision supplied by an upstream component.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed engine build program has not published the typed
+    /// edge from `Up` to `C`, or if its stored type is inconsistent.
     #[inline]
-    pub(crate) fn take<Up>(&mut self) -> Option<<Up as Supplier<C>>::Provision>
+    pub(crate) fn take<Up>(&mut self) -> <Up as Supplier<C>>::Provision
     where
         Up: Supplier<C>,
     {
@@ -343,7 +379,10 @@ impl RegistryBuilder {
 
     /// Builds one component with the provided config.
     #[inline]
-    pub(crate) async fn build<C: Component>(&mut self, config: C::Config) -> Result<()> {
+    pub(crate) async fn build<C: Component>(
+        &mut self,
+        config: C::Config,
+    ) -> StdResult<(), C::Error> {
         let registry = self
             .registry
             .as_mut()
@@ -371,14 +410,21 @@ impl RegistryBuilder {
     }
 
     /// Finishes the builder and returns the completed registry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixed provision edge was not consumed or when the
+    /// builder's registry was unexpectedly disarmed before this consuming
+    /// call.
     #[inline]
-    pub(crate) fn finish(mut self) -> Result<ComponentRegistry> {
-        if !self.shelf.is_empty() {
-            return Err(Report::new(InternalError::ComponentShelfNotEmpty).into());
-        }
+    pub(crate) fn finish(mut self) -> ComponentRegistry {
+        assert!(
+            self.shelf.is_empty(),
+            "component shelf still contains unconsumed provisions after the fixed engine build"
+        );
         self.registry
             .take()
-            .ok_or_else(|| Report::new(InternalError::ComponentRegistryMissing).into())
+            .expect("registry builder must remain armed until finish")
     }
 }
 
@@ -532,25 +578,30 @@ impl DiskPoolConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{Error, ErrorKind, RuntimeError};
+    use error_stack::Report;
     use parking_lot::Mutex;
+    use std::convert::Infallible;
     use std::sync::Arc;
 
     struct ValueComponent;
 
     impl Component for ValueComponent {
-        type Config = ();
+        type Config = usize;
         type Owned = usize;
         type Access = usize;
+        type Error = Infallible;
 
         const NAME: &'static str = "value";
 
         #[inline]
         async fn build(
-            _config: Self::Config,
-            _registry: &mut ComponentRegistry,
+            config: Self::Config,
+            registry: &mut ComponentRegistry,
             _shelf: ShelfScope<'_, Self>,
-        ) -> Result<()> {
-            unreachable!("test-only component")
+        ) -> StdResult<(), Self::Error> {
+            registry.register::<Self>(config);
+            Ok(())
         }
 
         #[inline]
@@ -560,6 +611,42 @@ mod tests {
 
         #[inline]
         fn shutdown(_component: &Self::Owned) {}
+    }
+
+    struct FailingBuildOwned {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for FailingBuildOwned {
+        fn drop(&mut self) {
+            self.events.lock().push("drop");
+        }
+    }
+
+    struct FailingBuildComponent;
+
+    impl Component for FailingBuildComponent {
+        type Config = Arc<Mutex<Vec<&'static str>>>;
+        type Owned = FailingBuildOwned;
+        type Access = ();
+        type Error = Report<RuntimeError>;
+
+        const NAME: &'static str = "failing-build";
+
+        async fn build(
+            events: Self::Config,
+            registry: &mut ComponentRegistry,
+            _shelf: ShelfScope<'_, Self>,
+        ) -> StdResult<(), Self::Error> {
+            registry.register::<Self>(FailingBuildOwned { events });
+            Err(Report::new(RuntimeError::BackgroundSpawn))
+        }
+
+        fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+        fn shutdown(component: &Self::Owned) {
+            component.events.lock().push("shutdown");
+        }
     }
 
     struct ShutdownProbe {
@@ -576,6 +663,7 @@ mod tests {
                 type Config = ();
                 type Owned = ShutdownProbe;
                 type Access = ();
+                type Error = Infallible;
 
                 const NAME: &'static str = $name;
 
@@ -584,7 +672,7 @@ mod tests {
                     _config: Self::Config,
                     _registry: &mut ComponentRegistry,
                     _shelf: ShelfScope<'_, Self>,
-                ) -> Result<()> {
+                ) -> StdResult<(), Self::Error> {
                     unreachable!("test-only component")
                 }
 
@@ -630,6 +718,7 @@ mod tests {
         type Config = ();
         type Owned = OwnerProbe;
         type Access = AccessProbe;
+        type Error = Infallible;
 
         const NAME: &'static str = "access-order";
 
@@ -638,7 +727,7 @@ mod tests {
             _config: Self::Config,
             _registry: &mut ComponentRegistry,
             _shelf: ShelfScope<'_, Self>,
-        ) -> Result<()> {
+        ) -> StdResult<(), Self::Error> {
             unreachable!("test-only component")
         }
 
@@ -654,52 +743,56 @@ mod tests {
     }
 
     #[test]
-    fn test_component_registry_rejects_duplicate_registration() {
-        let mut registry = ComponentRegistry::new();
-        registry.register::<ValueComponent>(7).unwrap();
-        let err = registry.register::<ValueComponent>(11).unwrap_err();
-        assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::EngineComponentAlreadyRegistered)
-        );
-    }
-
-    #[test]
-    fn test_component_registry_reports_missing_dependency() {
-        let registry = ComponentRegistry::new();
-        let err = registry.dependency::<ValueComponent>().unwrap_err();
-        assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::EngineComponentMissingDependency)
-        );
-    }
-
-    #[test]
     fn test_component_registry_returns_typed_access_clone() {
         let mut registry = ComponentRegistry::new();
-        registry.register::<ValueComponent>(7).unwrap();
+        registry.register::<ValueComponent>(7);
         assert_eq!(registry.get::<ValueComponent>(), Some(7));
+        assert_eq!(registry.dependency::<ValueComponent>(), 7);
+    }
+
+    #[test]
+    fn test_registry_builder_finishes_normal_component_build() {
+        smol::block_on(async {
+            let mut builder = RegistryBuilder::new();
+            builder.build::<ValueComponent>(7).await.unwrap();
+
+            let registry = builder.finish();
+            assert_eq!(registry.dependency::<ValueComponent>(), 7);
+        });
+    }
+
+    #[test]
+    fn test_registry_builder_cleans_up_after_component_build_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut builder = RegistryBuilder::new();
+            let err = smol::block_on(builder.build::<FailingBuildComponent>(Arc::clone(&events)))
+                .unwrap_err();
+            assert_eq!(err.current_context(), &RuntimeError::BackgroundSpawn);
+            let err = Error::from(err);
+            assert_eq!(err.kind(), ErrorKind::Runtime);
+            assert_eq!(
+                err.downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::BackgroundSpawn)
+            );
+        }
+
+        assert_eq!(events.lock().as_slice(), &["shutdown", "drop"]);
     }
 
     #[test]
     fn test_component_registry_shutdown_uses_reverse_registration_order_and_is_idempotent() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ComponentRegistry::new();
-        registry
-            .register::<ShutdownA>(ShutdownProbe {
-                events: Arc::clone(&events),
-            })
-            .unwrap();
-        registry
-            .register::<ShutdownB>(ShutdownProbe {
-                events: Arc::clone(&events),
-            })
-            .unwrap();
-        registry
-            .register::<ShutdownC>(ShutdownProbe {
-                events: Arc::clone(&events),
-            })
-            .unwrap();
+        registry.register::<ShutdownA>(ShutdownProbe {
+            events: Arc::clone(&events),
+        });
+        registry.register::<ShutdownB>(ShutdownProbe {
+            events: Arc::clone(&events),
+        });
+        registry.register::<ShutdownC>(ShutdownProbe {
+            events: Arc::clone(&events),
+        });
 
         registry.shutdown_all();
         registry.shutdown_all();
@@ -711,11 +804,9 @@ mod tests {
     fn test_component_registry_drop_clears_access_before_owner_drop() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ComponentRegistry::new();
-        registry
-            .register::<AccessOrderComponent>(OwnerProbe {
-                events: Arc::clone(&events),
-            })
-            .unwrap();
+        registry.register::<AccessOrderComponent>(OwnerProbe {
+            events: Arc::clone(&events),
+        });
 
         drop(registry);
 
@@ -729,6 +820,7 @@ mod tests {
         type Config = ();
         type Owned = ();
         type Access = ();
+        type Error = Infallible;
 
         const NAME: &'static str = "up";
 
@@ -736,7 +828,7 @@ mod tests {
             _config: Self::Config,
             _registry: &mut ComponentRegistry,
             _shelf: ShelfScope<'_, Self>,
-        ) -> Result<()> {
+        ) -> StdResult<(), Self::Error> {
             unreachable!("test-only component")
         }
 
@@ -749,6 +841,7 @@ mod tests {
         type Config = ();
         type Owned = ();
         type Access = ();
+        type Error = Infallible;
 
         const NAME: &'static str = "down";
 
@@ -756,7 +849,7 @@ mod tests {
             _config: Self::Config,
             _registry: &mut ComponentRegistry,
             _shelf: ShelfScope<'_, Self>,
-        ) -> Result<()> {
+        ) -> StdResult<(), Self::Error> {
             unreachable!("test-only component")
         }
 
@@ -774,25 +867,12 @@ mod tests {
         let mut shelf = Shelf::new();
         {
             let mut up = shelf.scope::<Upstream>();
-            up.put::<Downstream>(7).unwrap();
+            up.put::<Downstream>(7);
         }
         {
             let mut down = shelf.scope::<Downstream>();
-            assert_eq!(down.take::<Upstream>(), Some(7));
-            assert_eq!(down.take::<Upstream>(), None);
+            assert_eq!(down.take::<Upstream>(), 7);
         }
         assert!(shelf.is_empty());
-    }
-
-    #[test]
-    fn test_shelf_rejects_duplicate_edge_put() {
-        let mut shelf = Shelf::new();
-        let mut up = shelf.scope::<Upstream>();
-        up.put::<Downstream>(7).unwrap();
-        let err = up.put::<Downstream>(11).unwrap_err();
-        assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::ComponentShelfDuplicateProvision)
-        );
     }
 }

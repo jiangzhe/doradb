@@ -893,74 +893,66 @@ impl<'a> LwcBuilder<'a> {
         &self.row_ids
     }
 
-    /// Appends one decoded row if the block still fits.
-    pub(crate) fn append_row_values(
-        &mut self,
-        row_id: RowID,
-        vals: &[Val],
-    ) -> InternalResult<bool> {
+    /// Appends one validated decoded row if the block still fits.
+    ///
+    /// Returns `false` and restores the previous builder state when the row
+    /// would exceed the block payload capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row was not validated against the layout supplied to
+    /// [`Self::new`].
+    pub(crate) fn append_row_values(&mut self, row_id: RowID, vals: &[Val]) -> bool {
         let snapshot = self.snapshot_state();
-        match self.append_row_values_inner(row_id, vals) {
-            Ok(true) => Ok(true),
-            Ok(false) => {
-                self.rollback(snapshot);
-                Ok(false)
-            }
-            Err(err) => {
-                self.rollback(snapshot);
-                Err(err)
-            }
+        if self.append_row_values_inner(row_id, vals) {
+            true
+        } else {
+            self.rollback(snapshot);
+            false
         }
     }
 
     /// Appends rows described by `view` if the block still fits.
+    ///
+    /// Returns `false` and restores the previous builder state when the view
+    /// would exceed the block payload capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the page view was not constructed from the layout supplied
+    /// to [`Self::new`].
     pub(crate) fn append_view(
         &mut self,
         view: PageVectorView<'_, '_>,
         start_row_id: RowID,
-    ) -> InternalResult<bool> {
+    ) -> bool {
         let snapshot = self.snapshot_state();
-        match self.append_view_inner(view, start_row_id) {
-            Ok(true) => Ok(true),
-            Ok(false) => {
-                self.rollback(snapshot);
-                Ok(false)
-            }
-            Err(err) => {
-                self.rollback(snapshot);
-                Err(err)
-            }
+        if self.append_view_inner(view, start_row_id) {
+            true
+        } else {
+            self.rollback(snapshot);
+            false
         }
     }
 
-    fn append_view_inner(
-        &mut self,
-        view: PageVectorView<'_, '_>,
-        start_row_id: RowID,
-    ) -> InternalResult<bool> {
+    fn append_view_inner(&mut self, view: PageVectorView<'_, '_>, start_row_id: RowID) -> bool {
         let mut new_row_ids = Vec::with_capacity(view.rows_non_deleted());
         for (start_idx, end_idx) in view.range_non_deleted() {
             for idx in start_idx..end_idx {
                 new_row_ids.push(start_row_id + idx as u64);
             }
         }
-        self.scan_page_stats(&view, &new_row_ids)?;
-        self.buffer.scan(view)?;
+        self.scan_page_stats(&view, &new_row_ids);
+        self.buffer.scan(view);
         self.row_ids.extend(new_row_ids);
-        if self.estimate_size()? > LWC_BLOCK_PAYLOAD_SIZE {
-            return Ok(false);
-        }
-        Ok(true)
+        self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
     }
 
-    fn append_row_values_inner(&mut self, row_id: RowID, vals: &[Val]) -> InternalResult<bool> {
-        self.scan_row_value_stats(vals)?;
-        self.buffer.append_row_values(self.col_layout, vals)?;
+    fn append_row_values_inner(&mut self, row_id: RowID, vals: &[Val]) -> bool {
+        self.scan_row_value_stats(vals);
+        self.buffer.append_row_values(self.col_layout, vals);
         self.row_ids.push(row_id);
-        if self.estimate_size()? > LWC_BLOCK_PAYLOAD_SIZE {
-            return Ok(false);
-        }
-        Ok(true)
+        self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
     }
 
     /// Builds a persisted LWC block with the supplied row-shape fingerprint.
@@ -971,17 +963,20 @@ impl<'a> LwcBuilder<'a> {
         }
         let row_count = self.buffer.len();
         if row_count > u16::MAX as usize {
-            return Err(lwc_block_encoding_invariant());
+            return Err(lwc_block_encoding_contract()
+                .attach("field=row_count")
+                .attach(format!("actual={row_count}, maximum={}", u16::MAX)));
         }
         let mut column_payloads = Vec::with_capacity(self.col_layout.col_count());
         let mut col_offsets = Vec::with_capacity(self.col_layout.col_count());
         let mut offset = mem::size_of::<u16>() * self.col_layout.col_count();
 
         for col_idx in 0..self.col_layout.col_count() {
-            let column = self
-                .buffer
-                .column(col_idx)
-                .ok_or_else(|| Report::new(InternalError::ColumnScanShapeMismatch))?;
+            let column = self.buffer.column(col_idx).unwrap_or_else(|| {
+                panic!(
+                    "LWC builder scan buffer must contain column {col_idx} from its table layout"
+                )
+            });
             let mut data = Vec::new();
             if let Some(bitmap) = column.null_bitmap {
                 let bytes = bitmap_to_bytes(bitmap, row_count);
@@ -1047,7 +1042,9 @@ impl<'a> LwcBuilder<'a> {
             data.extend_from_slice(&payload);
             offset += data.len();
             if offset > u16::MAX as usize {
-                return Err(lwc_block_encoding_invariant());
+                return Err(lwc_block_encoding_contract()
+                    .attach(format!("field=column_end_offset, column_no={col_idx}"))
+                    .attach(format!("actual={offset}, maximum={}", u16::MAX)));
             }
             col_offsets.push(offset as u16);
             column_payloads.push(data);
@@ -1063,7 +1060,7 @@ impl<'a> LwcBuilder<'a> {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
         let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page = LwcBlock::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])?;
+        let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
         page.header = header;
         let mut body_idx = 0;
         for offset in col_offsets {
@@ -1094,13 +1091,14 @@ impl<'a> LwcBuilder<'a> {
         }
     }
 
-    fn scan_page_stats(
-        &mut self,
-        view: &PageVectorView<'_, '_>,
-        row_ids: &[RowID],
-    ) -> InternalResult<()> {
+    fn scan_page_stats(&mut self, view: &PageVectorView<'_, '_>, row_ids: &[RowID]) {
+        assert_eq!(
+            row_ids.len(),
+            view.rows_non_deleted(),
+            "LWC page statistics row ids must match the page view's visible rows"
+        );
         if row_ids.is_empty() {
-            return Ok(());
+            return;
         }
         for col_idx in 0..self.col_layout.col_count() {
             let (null_bitmap, values) = view.col(col_idx);
@@ -1181,13 +1179,14 @@ impl<'a> LwcBuilder<'a> {
                 ValArrayRef::F32(_) | ValArrayRef::F64(_) | ValArrayRef::VarByte(_, _) => {}
             }
         }
-        Ok(())
     }
 
-    fn scan_row_value_stats(&mut self, vals: &[Val]) -> InternalResult<()> {
-        if vals.len() != self.col_layout.col_count() {
-            return Err(Report::new(InternalError::ColumnScanShapeMismatch));
-        }
+    fn scan_row_value_stats(&mut self, vals: &[Val]) {
+        assert_eq!(
+            vals.len(),
+            self.col_layout.col_count(),
+            "LWC statistics require a complete row validated against the builder layout"
+        );
         for (col_idx, val) in vals.iter().enumerate() {
             if val.is_null() {
                 continue;
@@ -1204,10 +1203,11 @@ impl<'a> LwcBuilder<'a> {
                 (ValKind::F32, Val::F32(_))
                 | (ValKind::F64, Val::F64(_))
                 | (ValKind::VarByte, Val::VarByte(_)) => {}
-                _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
+                _ => unreachable!(
+                    "LWC statistics value kind for column {col_idx} must match the validated row layout"
+                ),
             }
         }
-        Ok(())
     }
 
     fn update_stats_i64<T: Copy, R: Iterator<Item = (usize, usize)>>(
@@ -1223,9 +1223,12 @@ impl<'a> LwcBuilder<'a> {
                 if null_bitmap.map(|bm| bm.bitmap_get(idx)).unwrap_or(false) {
                     continue;
                 }
-                if let Some(value) = values.get(idx) {
-                    self.stats[col_idx].update_i64(decode(*value));
-                }
+                let value = values.get(idx).unwrap_or_else(|| {
+                    panic!(
+                        "LWC page statistics column {col_idx} is missing visible row index {idx}"
+                    )
+                });
+                self.stats[col_idx].update_i64(decode(*value));
             }
         }
     }
@@ -1243,19 +1246,22 @@ impl<'a> LwcBuilder<'a> {
                 if null_bitmap.map(|bm| bm.bitmap_get(idx)).unwrap_or(false) {
                     continue;
                 }
-                if let Some(value) = values.get(idx) {
-                    self.stats[col_idx].update_u64(decode(*value));
-                }
+                let value = values.get(idx).unwrap_or_else(|| {
+                    panic!(
+                        "LWC page statistics column {col_idx} is missing visible row index {idx}"
+                    )
+                });
+                self.stats[col_idx].update_u64(decode(*value));
             }
         }
     }
 
-    fn estimate_size(&self) -> InternalResult<usize> {
+    fn estimate_size(&self) -> usize {
         let row_count = self.buffer.len();
         let mut total = LWC_BLOCK_HEADER_SIZE;
         total += mem::size_of::<u16>() * self.col_layout.col_count();
-        total += estimate_columns_size(self.col_layout, &self.buffer, &self.stats, row_count)?;
-        Ok(total)
+        total += estimate_columns_size(self.col_layout, &self.buffer, &self.stats, row_count);
+        total
     }
 }
 
@@ -1505,8 +1511,9 @@ impl<'a> LwcNullBitmapSer<'a> {
     #[inline]
     pub(crate) fn new(bytes: &'a [u8]) -> InternalResult<Self> {
         if bytes.len() > u16::MAX as usize {
-            return Err(lwc_block_encoding_invariant()
-                .attach("LWC null bitmap payload length exceeds u16::MAX"));
+            return Err(lwc_block_encoding_contract()
+                .attach("field=null_bitmap_byte_length")
+                .attach(format!("actual={}, maximum={}", bytes.len(), u16::MAX)));
         }
         Ok(LwcNullBitmapSer { bytes })
     }
@@ -1597,8 +1604,8 @@ fn persisted_lwc_layout<T>(
 }
 
 #[inline]
-fn lwc_block_encoding_invariant() -> Report<InternalError> {
-    Report::new(InternalError::LwcBlockEncodingInvariant)
+fn lwc_block_encoding_contract() -> Report<InternalError> {
+    Report::new(InternalError::LwcBlockEncodingContract)
 }
 
 #[inline]
@@ -1796,20 +1803,33 @@ fn estimate_columns_size(
     buffer: &ScanBuffer,
     stats: &[LwcColumnStats],
     row_count: usize,
-) -> InternalResult<usize> {
+) -> usize {
     let mut total = 0usize;
-    debug_assert!(stats.len() == col_layout.col_count());
+    assert_eq!(
+        stats.len(),
+        col_layout.col_count(),
+        "LWC statistics columns must match the builder table layout"
+    );
     for (col_idx, st) in stats.iter().enumerate() {
         let column = buffer
             .column(col_idx)
-            .ok_or_else(|| Report::new(InternalError::ColumnScanShapeMismatch))?;
+            .unwrap_or_else(|| {
+                panic!(
+                    "LWC size estimation scan buffer must contain column {col_idx} from its table layout"
+                )
+            });
         if column.null_bitmap.is_some() {
             total += mem::size_of::<u16>() + row_count.div_ceil(8);
         }
-        total +=
-            estimate_column_payload(col_layout.val_kind(col_idx), &column.values, st, row_count)?;
+        total += estimate_column_payload(
+            col_layout.val_kind(col_idx),
+            &column.values,
+            st,
+            row_count,
+            col_idx,
+        );
     }
-    Ok(total)
+    total
 }
 
 fn estimate_column_payload(
@@ -1817,8 +1837,9 @@ fn estimate_column_payload(
     values: &ScanColumnValues<'_>,
     stats: &LwcColumnStats,
     row_count: usize,
-) -> InternalResult<usize> {
-    let size = match (kind, values) {
+    col_idx: usize,
+) -> usize {
+    match (kind, values) {
         (ValKind::I8, ScanColumnValues::I8(_)) => {
             estimate_i64_payload(stats, row_count, mem::size_of::<i8>())
         }
@@ -1856,9 +1877,10 @@ fn estimate_column_payload(
                 + (count + 1) * mem::size_of::<u32>()
                 + data.len()
         }
-        _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
-    };
-    Ok(size)
+        _ => unreachable!(
+            "LWC size estimation value kind for column {col_idx} must match its table layout"
+        ),
+    }
 }
 
 fn estimate_i64_payload(stats: &LwcColumnStats, row_count: usize, unit: usize) -> usize {
@@ -2000,7 +2022,7 @@ fn read_i8(input: &[u8]) -> DataIntegrityResult<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
-    use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind};
+    use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind, InternalError};
     use crate::file::test_block_id;
     use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
@@ -2431,7 +2453,7 @@ mod tests {
         assert!(builder.is_empty());
         assert!(builder.row_count() == 0);
         let view = page.vector_view(metadata.col.as_ref());
-        let appended = builder.append_view(view, page.header.start_row_id).unwrap();
+        let appended = builder.append_view(view, page.header.start_row_id);
         assert!(appended);
         let expected_fingerprint = row_shape_fingerprint_for(builder.row_ids(), 100, 110);
         let buf = builder.build(expected_fingerprint).unwrap();
@@ -2506,18 +2528,10 @@ mod tests {
 
         let mut page_builder = LwcBuilder::new(metadata.col.as_ref());
         let view = page.vector_view(metadata.col.as_ref());
-        assert!(
-            page_builder
-                .append_view(view, page.header.start_row_id)
-                .unwrap()
-        );
+        assert!(page_builder.append_view(view, page.header.start_row_id));
         let mut direct_builder = LwcBuilder::new(metadata.col.as_ref());
         for (offset, vals) in rows.iter().enumerate() {
-            assert!(
-                direct_builder
-                    .append_row_values(RowID::new(10 + offset as u64), vals)
-                    .unwrap()
-            );
+            assert!(direct_builder.append_row_values(RowID::new(10 + offset as u64), vals));
         }
 
         assert_eq!(direct_builder.row_ids(), page_builder.row_ids());
@@ -2525,6 +2539,59 @@ mod tests {
         let page_buf = page_builder.build(fingerprint).unwrap();
         let direct_buf = direct_builder.build(fingerprint).unwrap();
         assert_eq!(direct_buf.as_bytes(), page_buf.as_bytes());
+    }
+
+    #[test]
+    fn test_lwc_builder_append_row_values_rolls_back_on_capacity() {
+        let metadata = TableMetadata::try_new(
+            vec![ColumnSpec::new(
+                "bytes",
+                ValKind::VarByte,
+                ColumnAttributes::empty(),
+            )],
+            vec![],
+        )
+        .expect("valid table metadata");
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        assert!(builder.append_row_values(RowID::new(1), &[Val::from(Vec::from(&b"ok"[..]))]));
+
+        let oversized = Val::from(vec![0u8; LWC_BLOCK_PAYLOAD_SIZE]);
+        assert!(!builder.append_row_values(RowID::new(2), &[oversized]));
+
+        assert_eq!(builder.row_count(), 1);
+        assert_eq!(builder.row_ids(), &[RowID::new(1)]);
+        assert!(builder.build(0).is_ok());
+    }
+
+    #[test]
+    fn test_lwc_builder_reports_reachable_row_count_encoding_contract() {
+        let metadata = TableMetadata::try_new(
+            vec![ColumnSpec::new(
+                "compressible",
+                ValKind::U8,
+                ColumnAttributes::empty(),
+            )],
+            vec![],
+        )
+        .expect("valid table metadata");
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+
+        for row_no in 0..=u16::MAX {
+            assert!(builder.append_row_values(RowID::new(u64::from(row_no)), &[Val::U8(0)]));
+        }
+        assert_eq!(builder.row_count(), u16::MAX as usize + 1);
+
+        let err = match builder.build(0) {
+            Ok(_) => panic!("row count above u16::MAX must fail encoding"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.current_context(),
+            &InternalError::LwcBlockEncodingContract
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("field=row_count"), "{report}");
+        assert!(report.contains("maximum=65535"), "{report}");
     }
 
     #[test]
@@ -2561,7 +2628,7 @@ mod tests {
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
         let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
+        assert!(builder.append_view(view, page.header.start_row_id));
 
         let stats = builder.stats[0].snapshot();
         assert!(stats.initialized);
@@ -2593,7 +2660,7 @@ mod tests {
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
         let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
+        assert!(builder.append_view(view, page.header.start_row_id));
 
         let snapshot = builder.snapshot_state();
         let expected_row_count = builder.row_count();
@@ -2622,7 +2689,7 @@ mod tests {
             ));
         }
         let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
+        assert!(builder.append_view(view, page.header.start_row_id));
 
         builder.rollback(snapshot);
 
@@ -2643,49 +2710,6 @@ mod tests {
             })
             .collect();
         assert_eq!(restored_stats, expected_stats);
-    }
-
-    #[test]
-    fn test_lwc_builder_append_view_rolls_back_on_estimate_error() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::empty()),
-            ],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(1), 4, metadata.col.as_ref());
-
-        for offset in 0..2u64 {
-            let c0 = Val::U8((10 + offset) as u8);
-            let c1 = Val::I16((20 + offset) as i16);
-            assert!(matches!(
-                page.insert(metadata.col.as_ref(), &[c0, c1]),
-                InsertRow::Ok(_)
-            ));
-        }
-
-        let mut builder = LwcBuilder::new(metadata.col.as_ref());
-        builder.buffer = ScanBuffer::new(metadata.col.as_ref(), &[0]);
-
-        let view = page.vector_view(metadata.col.as_ref());
-        let res = builder.append_view(view, page.header.start_row_id);
-
-        let err = res.expect_err("column shape mismatch must fail");
-        assert_eq!(
-            err.current_context(),
-            &InternalError::ColumnScanShapeMismatch
-        );
-        assert_eq!(builder.row_count(), 0);
-        assert!(builder.row_ids().is_empty());
-        assert!(
-            builder
-                .stats
-                .iter()
-                .all(|stat| !stat.snapshot().initialized)
-        );
     }
 
     #[test]
@@ -2761,7 +2785,7 @@ mod tests {
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
         let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id).unwrap());
+        assert!(builder.append_view(view, page.header.start_row_id));
         let buf = builder
             .build(row_shape_fingerprint_for(builder.row_ids(), 10, 13))
             .unwrap();

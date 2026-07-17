@@ -812,16 +812,16 @@ impl EngineConfig {
         builder.build::<TransactionSystem>(trx_cfg).await?;
 
         resolved.persist_marker_if_missing()?;
-        let registry = builder.finish()?;
-        let engine_poisoner = registry.dependency::<EnginePoisoner>()?;
-        let catalog = registry.dependency::<Catalog>()?;
-        let trx_sys = registry.dependency::<TransactionSystem>()?;
-        let meta_pool = registry.dependency::<MetaPool>()?;
-        let index_pool = registry.dependency::<IndexPool>()?;
-        let mem_pool = registry.dependency::<MemPool>()?;
-        let table_fs = registry.dependency::<FileSystem>()?;
-        let disk_pool = registry.dependency::<DiskPool>()?;
-        let lock_manager = registry.dependency::<LockManager>()?;
+        let registry = builder.finish();
+        let engine_poisoner = registry.dependency::<EnginePoisoner>();
+        let catalog = registry.dependency::<Catalog>();
+        let trx_sys = registry.dependency::<TransactionSystem>();
+        let meta_pool = registry.dependency::<MetaPool>();
+        let index_pool = registry.dependency::<IndexPool>();
+        let mem_pool = registry.dependency::<MemPool>();
+        let table_fs = registry.dependency::<FileSystem>();
+        let disk_pool = registry.dependency::<DiskPool>();
+        let lock_manager = registry.dependency::<LockManager>();
         let engine_inner = EngineInner {
             engine_poisoner,
             catalog,

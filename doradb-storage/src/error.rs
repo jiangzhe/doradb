@@ -4,6 +4,7 @@ use crate::io::{
 };
 use error_stack::{AttachmentKind, FrameKind, Report};
 use std::array::TryFromSliceError;
+use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug, Display};
 use std::io::{self, ErrorKind as IoErrorKind};
@@ -247,18 +248,6 @@ pub(crate) enum FatalError {
 pub(crate) enum InternalError {
     #[error("internal storage error")]
     Generic,
-    #[error("component shelf duplicate provision")]
-    ComponentShelfDuplicateProvision,
-    #[error("component shelf not empty")]
-    ComponentShelfNotEmpty,
-    #[error("component registry missing")]
-    ComponentRegistryMissing,
-    #[error("component provision missing")]
-    ComponentProvisionMissing,
-    #[error("engine component already registered")]
-    EngineComponentAlreadyRegistered,
-    #[error("engine component missing dependency")]
-    EngineComponentMissingDependency,
     #[error("secondary index binding mismatch")]
     SecondaryIndexBindingMismatch,
     #[error("buffer page already allocated")]
@@ -267,8 +256,6 @@ pub(crate) enum InternalError {
     BufferPageKindMismatch,
     #[error("column storage missing")]
     ColumnStorageMissing,
-    #[error("mutable block view mismatch")]
-    MutableBlockViewMismatch,
     #[error("completion dropped")]
     CompletionDropped,
     #[error("readonly buffer mapping conflict")]
@@ -321,10 +308,8 @@ pub(crate) enum InternalError {
     CatalogRootDescriptorInvariant,
     #[error("catalog primary key missing")]
     CatalogPrimaryKeyMissing,
-    #[error("column scan shape mismatch")]
-    ColumnScanShapeMismatch,
-    #[error("LWC block encoding invariant violated")]
-    LwcBlockEncodingInvariant,
+    #[error("LWC block encoding contract is unsatisfied")]
+    LwcBlockEncodingContract,
     #[error("readonly frame index out of bounds")]
     ReadonlyFrameIndexOutOfBounds,
     #[error("readonly frame guard mismatch")]
@@ -791,18 +776,6 @@ impl Error {
         Report::new(InternalError::ColumnStorageMissing).into()
     }
 
-    /// Builds an error for duplicate engine component registration.
-    #[inline]
-    pub(crate) fn engine_component_already_registered() -> Self {
-        Report::new(InternalError::EngineComponentAlreadyRegistered).into()
-    }
-
-    /// Builds an error for a missing component dependency.
-    #[inline]
-    pub(crate) fn engine_component_missing_dependency() -> Self {
-        Report::new(InternalError::EngineComponentMissingDependency).into()
-    }
-
     #[inline]
     fn fmt_report_line(report: &Report<ErrorKind>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
@@ -899,6 +872,13 @@ impl From<Report<InternalError>> for Error {
     fn from(report: Report<InternalError>) -> Self {
         // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Internal))
+    }
+}
+
+impl From<Infallible> for Error {
+    #[inline]
+    fn from(src: Infallible) -> Self {
+        match src {}
     }
 }
 

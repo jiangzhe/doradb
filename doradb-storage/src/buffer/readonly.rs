@@ -17,7 +17,7 @@ use crate::buffer::{
 };
 use crate::error::{
     CompletionErrorKind, CompletionResult, Error, FileKind, InternalError, LifecycleError,
-    ResourceError, Result,
+    ResourceError, ResourceResult, Result,
 };
 use crate::file::fs::FileSystem;
 use crate::file::{BlockKey, SparseFile};
@@ -121,7 +121,7 @@ impl ReadonlyBufferPool {
         role: PoolRole,
         pool_size: usize,
         fs: QuiescentGuard<FileSystem>,
-    ) -> Result<Self> {
+    ) -> ResourceResult<Self> {
         Self::with_capacity_and_arbiter_builder(role, pool_size, fs, EvictionArbiter::builder())
     }
 
@@ -134,7 +134,7 @@ impl ReadonlyBufferPool {
         pool_size: usize,
         fs: QuiescentGuard<FileSystem>,
         eviction_arbiter_builder: EvictionArbiterBuilder,
-    ) -> Result<Self> {
+    ) -> ResourceResult<Self> {
         role.assert_valid("global readonly buffer pool");
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
@@ -142,8 +142,7 @@ impl ReadonlyBufferPool {
             return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
                 .attach(format!(
                     "global readonly buffer pool sizing: role={role:?}, pool_size={pool_size}, frame_plus_page={frame_plus_page}, pages={size}, min_pages={MIN_READONLY_POOL_PAGES}"
-                ))
-                .into());
+                )));
         }
         let eviction_arbiter = eviction_arbiter_builder.build(size);
         let arena = QuiescentArena::new(size)?;
@@ -1753,7 +1752,7 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
         let payload_start = write_block_header(&mut buf, LWC_BLOCK_SPEC);
         let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page = LwcBlock::try_from_bytes_mut(&mut buf[payload_start..payload_end]).unwrap();
+        let page = LwcBlock::from_bytes_mut(&mut buf[payload_start..payload_end]);
         page.header = LwcBlockHeader::new(1, 0, 0, 0);
         write_block_checksum(&mut buf);
         buf
@@ -2271,9 +2270,8 @@ pub(crate) mod tests {
         let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let res = ReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes, fs_owner.guard());
         assert!(
-            res.as_ref().is_err_and(
-                |err| err.resource_error() == Some(ResourceError::BufferPoolSizeTooSmall)
-            )
+            res.as_ref()
+                .is_err_and(|err| err.current_context() == &ResourceError::BufferPoolSizeTooSmall)
         );
     }
 
@@ -3056,8 +3054,7 @@ pub(crate) mod tests {
             {
                 let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
                 let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-                let page_view =
-                    LwcBlock::try_from_bytes_mut(&mut page[payload_start..payload_end]).unwrap();
+                let page_view = LwcBlock::from_bytes_mut(&mut page[payload_start..payload_end]);
                 let invalid_end = (page_view.body.len() as u16).saturating_add(1);
                 page_view.header = LwcBlockHeader::new(1, 1, 1, 0);
                 page_view.body[..2].copy_from_slice(&invalid_end.to_le_bytes());

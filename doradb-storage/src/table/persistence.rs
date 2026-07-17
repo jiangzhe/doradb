@@ -1191,7 +1191,7 @@ impl Table {
                     current_start = prepared.start_row_id;
                     current_end = prepared.end_row_id;
                 }
-                if !builder.append_view(view, prepared.start_row_id)? {
+                if !builder.append_view(view, prepared.start_row_id) {
                     let shape = ColumnBlockEntryShape::new(
                         current_start,
                         current_end,
@@ -1207,7 +1207,7 @@ impl Table {
                         metadata.col.as_ref(),
                         prepared.del_bitmap.clone(),
                     )?;
-                    if !builder.append_view(view, prepared.start_row_id)? {
+                    if !builder.append_view(view, prepared.start_row_id) {
                         return Err(Report::new(InternalError::LwcBuilderMisuse)
                             .attach(format!(
                                 "single row page does not fit in LWC block: page_id={}",

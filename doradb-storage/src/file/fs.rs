@@ -11,7 +11,7 @@ use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::engine_poison::EnginePoisoner;
 use crate::error::{
-    CompletionErrorKind, Error, FatalError, InternalError, IoError, Result, RuntimeResult,
+    CompletionErrorKind, Error, FatalError, IoError, Result, RuntimeError, RuntimeResult,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
@@ -1698,6 +1698,7 @@ impl Component for FileSystemWorkers {
     type Config = ();
     type Owned = FileSystemWorkersOwned;
     type Access = ();
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "fs_workers";
 
@@ -1707,30 +1708,15 @@ impl Component for FileSystemWorkers {
         _config: Self::Config,
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        let builder = shelf.take::<FileSystem>().ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::ComponentProvisionMissing)
-                    .attach("provider=FileSystem, consumer=FileSystemWorkers"),
-            )
-        })?;
-        let mem_pool_file = shelf.take::<MemPool>().ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::ComponentProvisionMissing)
-                    .attach("provider=MemPool, consumer=FileSystemWorkers"),
-            )
-        })?;
-        let index_pool_file = shelf.take::<IndexPool>().ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::ComponentProvisionMissing)
-                    .attach("provider=IndexPool, consumer=FileSystemWorkers"),
-            )
-        })?;
+    ) -> RuntimeResult<()> {
+        let builder = shelf.take::<FileSystem>();
+        let mem_pool_file = shelf.take::<MemPool>();
+        let index_pool_file = shelf.take::<IndexPool>();
 
-        let fs = registry.dependency::<FileSystem>()?;
-        let engine_poisoner = registry.dependency::<EnginePoisoner>()?;
-        let mem_pool = registry.dependency::<MemPool>()?;
-        let index_pool = registry.dependency::<IndexPool>()?;
+        let fs = registry.dependency::<FileSystem>();
+        let engine_poisoner = registry.dependency::<EnginePoisoner>();
+        let mem_pool = registry.dependency::<MemPool>();
+        let index_pool = registry.dependency::<IndexPool>();
         let handle = builder
             .bind(
                 engine_poisoner,
@@ -1746,7 +1732,8 @@ impl Component for FileSystemWorkers {
         registry.register::<Self>(FileSystemWorkersOwned {
             fs,
             handle: Mutex::new(Some(handle)),
-        })
+        });
+        Ok(())
     }
 
     #[inline]
@@ -2071,6 +2058,7 @@ impl Component for FileSystem {
     type Config = FileSystemConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
+    type Error = Error;
 
     const NAME: &'static str = "fs";
 
@@ -2081,8 +2069,9 @@ impl Component for FileSystem {
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let (fs, builder) = config.build_engine_parts()?;
-        registry.register::<Self>(fs)?;
-        shelf.put::<FileSystemWorkers>(builder)
+        registry.register::<Self>(fs);
+        shelf.put::<FileSystemWorkers>(builder);
+        Ok(())
     }
 
     #[inline]
@@ -2218,20 +2207,17 @@ pub(crate) mod tests {
 
         #[inline]
         pub(crate) fn disk_pool(&self) -> DiskPool {
-            self.registry.dependency::<DiskPool>().unwrap()
+            self.registry.dependency::<DiskPool>()
         }
 
         #[inline]
         pub(crate) fn mem_pool(&self) -> QuiescentGuard<EvictableBufferPool> {
-            self.registry.dependency::<MemPool>().unwrap().clone_inner()
+            self.registry.dependency::<MemPool>().clone_inner()
         }
 
         #[inline]
         pub(crate) fn index_pool(&self) -> QuiescentGuard<EvictableBufferPool> {
-            self.registry
-                .dependency::<IndexPool>()
-                .unwrap()
-                .clone_inner()
+            self.registry.dependency::<IndexPool>().clone_inner()
         }
     }
 
@@ -2321,8 +2307,8 @@ pub(crate) mod tests {
                 .await?;
             builder.build::<FileSystemWorkers>(()).await?;
             builder.build::<SharedPoolEvictorWorkers>(()).await?;
-            let registry = builder.finish()?;
-            let fs = registry.dependency::<FileSystem>()?;
+            let registry = builder.finish();
+            let fs = registry.dependency::<FileSystem>();
             Ok(TestFileSystem {
                 fs: Some(fs),
                 registry,
@@ -2829,8 +2815,8 @@ pub(crate) mod tests {
             .unwrap();
             let mut poison_builder = RegistryBuilder::new();
             poison_builder.build::<EnginePoisoner>(()).await.unwrap();
-            let poison_registry = poison_builder.finish().unwrap();
-            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>().unwrap();
+            let poison_registry = poison_builder.finish();
+            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>();
             let state_machine = StorageStateMachine::new(
                 fs.mem_pool().into_sync(),
                 mem_pool_file,
@@ -2891,8 +2877,8 @@ pub(crate) mod tests {
             .unwrap();
             let mut poison_builder = RegistryBuilder::new();
             poison_builder.build::<EnginePoisoner>(()).await.unwrap();
-            let poison_registry = poison_builder.finish().unwrap();
-            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>().unwrap();
+            let poison_registry = poison_builder.finish();
+            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>();
             let state_machine = StorageStateMachine::new(
                 fs.mem_pool().into_sync(),
                 mem_pool_file,

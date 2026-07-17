@@ -77,12 +77,17 @@ impl ScanBuffer {
         })
     }
 
-    /// Scan given page and extend all rows into buffer.
-    /// Note: If error is returned, the state of this buffer might be invalid.
+    /// Scan a page view built from the same column layout as this buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `view` does not have the column kinds and nullability used
+    /// to construct this buffer.
     #[inline]
-    pub(crate) fn scan<'p, 'm>(&mut self, view: PageVectorView<'p, 'm>) -> InternalResult<()> {
+    pub(crate) fn scan<'p, 'm>(&mut self, view: PageVectorView<'p, 'm>) {
         let new_len = self.len + view.rows_non_deleted();
         for buf in &mut self.cols {
+            let col_idx = buf.col_idx;
             let (null_bitmap, vals) = view.col(buf.col_idx);
             // First, extend null bitmap.
             match (buf.null_bitmap.as_mut(), null_bitmap) {
@@ -107,7 +112,9 @@ impl ScanBuffer {
                     }
                 }
                 (None, None) => (),
-                _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
+                _ => panic!(
+                    "scan buffer nullability for column {col_idx} must match its table layout"
+                ),
             }
             // Second, extend values
             match (&mut buf.vals, vals) {
@@ -171,36 +178,51 @@ impl ScanBuffer {
                         }
                     }
                 }
-                _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
+                _ => unreachable!(
+                    "scan buffer value kind for column {col_idx} must match its table layout"
+                ),
             }
         }
         self.len = new_len;
-        Ok(())
     }
 
     /// Append one decoded row into the scan buffer.
     ///
     /// Null values still append a type-specific placeholder so column value
     /// buffers stay row-aligned with the null bitmap, matching row-page scans.
-    pub(crate) fn append_row_values(
-        &mut self,
-        col_layout: &TableColumnLayout,
-        vals: &[Val],
-    ) -> InternalResult<()> {
-        if vals.len() != col_layout.col_count() {
-            return Err(Report::new(InternalError::ColumnScanShapeMismatch));
-        }
+    ///
+    /// # Panics
+    ///
+    /// Panics when `vals` is not a complete row already validated against
+    /// `col_layout`, or when the layout differs from the one used to construct
+    /// this buffer.
+    pub(crate) fn append_row_values(&mut self, col_layout: &TableColumnLayout, vals: &[Val]) {
+        assert_eq!(
+            vals.len(),
+            col_layout.col_count(),
+            "decoded row value count must match the trusted table layout"
+        );
         for buf in &self.cols {
-            let Some(val) = vals.get(buf.col_idx) else {
-                return Err(Report::new(InternalError::ColumnScanShapeMismatch));
-            };
+            let val = vals.get(buf.col_idx).unwrap_or_else(|| {
+                panic!(
+                    "scan buffer column {} must exist in the trusted decoded row",
+                    buf.col_idx
+                )
+            });
             let col_type = col_layout.col_type(buf.col_idx);
             if val.is_null() {
-                if !col_type.nullable {
-                    return Err(Report::new(InternalError::ColumnScanShapeMismatch));
-                }
-            } else if !val.matches_kind(col_type.kind) {
-                return Err(Report::new(InternalError::ColumnScanShapeMismatch));
+                assert!(
+                    col_type.nullable,
+                    "scan buffer column {} must not receive null for a non-nullable layout",
+                    buf.col_idx
+                );
+            } else {
+                assert!(
+                    val.matches_kind(col_type.kind),
+                    "scan buffer column {} value kind must match {:?}",
+                    buf.col_idx,
+                    col_type.kind
+                );
             }
         }
 
@@ -220,9 +242,8 @@ impl ScanBuffer {
                     null_bitmap.bitmap_unset(row_idx);
                 }
             }
-            append_scan_value(&mut buf.vals, val)?;
+            append_scan_value(&mut buf.vals, val, buf.col_idx);
         }
-        Ok(())
     }
 
     /// Clear the buffer.
@@ -425,7 +446,7 @@ pub(crate) enum ValArrayRef<'a> {
     VarByte(&'a [PageVar], &'a [u8]),
 }
 
-fn append_scan_value(buf: &mut ValBuffer, val: &Val) -> InternalResult<()> {
+fn append_scan_value(buf: &mut ValBuffer, val: &Val, col_idx: usize) {
     match (buf, val) {
         (ValBuffer::I8(vals), Val::I8(value)) => vals.push(*value),
         (ValBuffer::U8(vals), Val::U8(value)) => vals.push(*value),
@@ -457,9 +478,10 @@ fn append_scan_value(buf: &mut ValBuffer, val: &Val) -> InternalResult<()> {
             let offset = data.len();
             offsets.push((offset, offset));
         }
-        _ => return Err(Report::new(InternalError::ColumnScanShapeMismatch)),
+        _ => unreachable!(
+            "scan buffer value kind for column {col_idx} must match the validated decoded row"
+        ),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -580,8 +602,7 @@ mod tests {
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         );
         let view = page.vector_view(metadata.col.as_ref());
-        let res = scanner.scan(view);
-        assert!(res.is_ok());
+        scanner.scan(view);
         assert!(scanner.len() == 98);
         scanner.clear();
         assert!(scanner.is_empty());
@@ -649,9 +670,7 @@ mod tests {
         assert!(matches!(page.delete(RowID::new(2)), Delete::Ok));
 
         let mut scanner = ScanBuffer::new(metadata.col.as_ref(), &[0]);
-        scanner
-            .scan(page.vector_view(metadata.col.as_ref()))
-            .unwrap();
+        scanner.scan(page.vector_view(metadata.col.as_ref()));
 
         assert_eq!(scanner.len(), 4);
         let col = scanner.column(0).unwrap();
@@ -773,7 +792,7 @@ mod tests {
         let mut scanner =
             ScanBuffer::new(metadata.col.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let view = page.vector_view(metadata.col.as_ref());
-        scanner.scan(view).unwrap();
+        scanner.scan(view);
         assert_eq!(scanner.len(), 5);
 
         scanner.truncate(3);

@@ -1,7 +1,7 @@
 # Error Handling Specification
 
 Status: Draft  
-Current implementation snapshot: 2026-07-16
+Current implementation snapshot: 2026-07-17
 
 ## Purpose
 
@@ -65,6 +65,14 @@ attachments.
 
 Internal code should use the narrowest result type that describes the errors
 it can produce.
+
+Crate-owned traits follow the same rule. When implementations have different
+failure domains, give the trait an associated error type and let each
+implementation expose its narrowest native report. The generic dispatcher
+must preserve that type; conversion to public `Error` belongs in the caller
+that actually combines unrelated implementations. Use crate `Result` directly
+only when an external trait fixes the signature or the implementation itself
+is a genuine mixed-domain seam.
 
 | Domain | Result type | Meaning | Principal modules |
 | --- | --- | --- | --- |
@@ -385,6 +393,21 @@ perform that conversion explicitly while retaining both the original frames
 and the cleanup report; a safety escalation is not permission to silently
 substitute the secondary error.
 
+### 9. Assert proven internal contracts at their owner
+
+A condition proven by a trusted constructor, exact allocation, ownership
+boundary, or fixed lifecycle is represented by an infallible API plus a
+release assertion at the narrowest owning site. Its diagnostic must identify
+the component, supplier edge, layout type or length, or column position needed
+to locate the broken contract. Do not use `debug_assert!` as the sole guard for
+a correctness contract.
+
+A condition reachable through external, persisted, replayed, configuration,
+resource, or otherwise valid runtime input remains a typed result at the first
+boundary that can validate it. Tests exercise that real validation boundary;
+they must not gain access to private state solely to manufacture an impossible
+error, and an obsolete synthetic error test is not replaced with a panic test.
+
 ## Draft Module Error-Domain Blueprint
 
 This section is the target-state blueprint for bottom-up error refactoring. It
@@ -454,12 +477,12 @@ preselect variants for migration.
 | `error` | Defines main domains, public `ErrorKind`, report conversions, and completion transport. Runtime is an established public classification with lossless typed-report conversion. | Keep transport conversion exhaustive as domains are implemented; keep public wrappers out of internal round trips. |
 | `id` | DataIntegrity only when persisted identifiers are deserialized; ordinary ID operations are infallible. | Preserve `DeserResult` instead of introducing public `Result` into ID helpers. |
 | `bitmap` | DataIntegrity for persisted bitmap deserialization; bitmap mutation and iteration are infallible under their documented bounds. | Keep bounds and shape preconditions as assertions rather than recoverable storage errors. |
-| `layout` | `LayoutResult` is caller-neutral. Persisted consumers map mismatch to DataIntegrity, configuration consumers to Config, and trusted-memory consumers to Internal or an assertion. | Audit every conversion at its semantic consumer; do not give generic layout helpers a main domain. |
+| `layout` | `LayoutResult` is caller-neutral. Persisted consumers map mismatch to DataIntegrity, configuration consumers to Config, and trusted exact-memory consumers use documented asserting helpers. | Audit every conversion at its semantic consumer; do not give generic layout helpers a main domain. |
 | `serde` | DataIntegrity for malformed, truncated, or semantically invalid persisted bytes. | Keep decoding typed through format consumers and avoid trait convenience conversions to public `Error` below a real boundary. |
 | `value` | DataIntegrity for decoded value tags and payloads; ordinary in-memory value operations are infallible. | Keep trait-required public conversions explicit and preserve the underlying DataIntegrity frame. |
 | `compression` | Compression algorithms are caller-neutral or infallible under their preconditions. The persisted format consumer assigns DataIntegrity to malformed compressed payloads. | Keep algorithm misuse asserted; do not make compression globally DataIntegrity-owned merely because LWC is its main caller. |
-| `lwc` | DataIntegrity for persisted block views, decoding, and validation; Internal for trusted builder or mutable-view misuse that remains recoverable. | Reassess builder-misuse results as assertions when construction proves the preconditions. |
-| `row` | DataIntegrity for serialized row-operation payloads; Internal for trusted row-page or vector-scan shape violations that cannot be asserted locally. | Replace public `Error` constructors in single-domain vector helpers with typed Internal reports or assertions after invariant proof. |
+| `lwc` | DataIntegrity for persisted block views, decoding, and validation; assertions for builder-owned scan shape and trusted mutable block views; Internal for genuine builder misuse and fixed-format encoding representability. | Keep `LwcBlockEncodingContract` fallible because valid highly compressible input can exceed fixed-width fields before byte capacity. |
+| `row` | DataIntegrity for serialized row-operation payloads; assertions for scan-buffer shape after the layout or catalog validator establishes it; Internal for unrelated trusted row-page misuse that remains fallible. | Validate untrusted or replayed rows before trusted vector/LWC construction and keep the downstream shape API infallible. |
 | `latch` | Config for static fallback-mode parsing; `Validation` for optimistic contention; assertions for ownership and guard invariants. | Do not turn expected validation failure into Operation or Internal errors. |
 | `map`, `memcmp`, `ptr`, `free_list` | Pure data structures and control-flow primitives. Exhaustion or absence is returned neutrally for the caller to interpret. | Keep these modules free of storage-wide error policy. |
 | `notify`, `obs`, `stats` | Notification, observability, and data-reporting primitives; no native recoverable storage domain. | Keep shutdown and waiter policy in their lifecycle-owning callers. |
@@ -471,8 +494,8 @@ preselect variants for migration.
 | Module or responsibility | Target ownership and boundary | Current migration focus |
 | --- | --- | --- |
 | `conf` | Config for supplied settings, path policy, and requested layout. Malformed existing durable state remains DataIntegrity and OS access remains IO. | Split typed validation phases instead of returning public `Result` merely because startup consumes all three. |
-| `component`: registry and shelf | Fixed-topology violations are assertions, not recoverable Internal errors. Duplicate registration or provision, missing required dependency or provision, leftover shelf state, and a missing builder registry indicate construction bugs. | Make registry/shelf operations infallible or asserting and retire the corresponding `InternalError` variants and `Error` constructors when code is changed. |
-| `component`: `Component::build` | Crate `Result` is a genuine construction boundary because individual components can fail with Config, Resource, IO, DataIntegrity, Runtime, or another subsystem domain. | Preserve each component's source report; do not wrap genuine build failures in Internal merely because the registry invokes them. |
+| `component`: registry and shelf | Fixed-topology violations are assertions, not recoverable Internal errors. Duplicate registration or provision, missing required dependency or provision, leftover shelf state, and a missing builder registry indicate construction bugs. | Keep registration order, typed supplier edges, assertion diagnostics, and lifecycle documentation synchronized. |
+| `component`: `Component::build` | `Component::Error` preserves each implementation's narrowest build domain: infallible components use `Infallible`, single-domain builders retain typed reports, and genuinely mixed builders use crate `Error`. Engine construction is the public convergence boundary across component types. | Keep `RegistryBuilder::build<C>` generic over `C::Error`; do not force the union of all component failures onto every implementation or wrap genuine build failures in Internal. |
 | `engine_poison` | Fatal producer. A later admission check may stack Lifecycle over the retained Fatal source. | Keep poison publication separate from the operation that originally failed. |
 | `io` | IO through `IoError` and `BackendResult`; Config for backend setup; `CompletionResult` for cross-thread transport only. | Decide whether the absence of a general `IoResult` alias is intentional and avoid stringifying backend reports. |
 | `file`: sparse/raw access | Config for invalid paths, IO for OS operations, and Resource for address-space or file-capacity exhaustion. | Narrow raw helpers that currently return public `Result`; attach file operation, path, offset, and size at their owning boundary. |
@@ -513,7 +536,7 @@ preselect variants for migration.
 Future tasks should migrate one dependency layer at a time:
 
 1. add Runtime/thread handling and audit pure formats and primitives (established);
-2. replace component-topology errors with assertions;
+2. preserve the established component-topology assertions;
 3. refine IO, file, buffer, log, and lock boundaries;
 4. refine row and index producers;
 5. refine table and catalog consumers;
@@ -544,6 +567,28 @@ Return `OperationResult<()>` and let the semantic caller attach context and
 convert at its boundary. This rule does not prohibit crate `Result` in a
 statement-local private orchestration chain as described above; that chain is
 itself part of the outermost operation boundary.
+
+### Forcing a top-level error onto a crate-owned trait
+
+A trait's complete implementation set may produce many unrelated domains, but
+that union does not make every implementation a mixed-domain boundary:
+
+```rust
+// Bad: an infallible or Runtime-only implementation must erase its precision.
+trait Component {
+    fn build(...) -> impl Future<Output = Result<()>>;
+}
+
+// Good: dispatch remains generic and convergence belongs to the mixed caller.
+trait Component {
+    type Error: Display;
+    fn build(...) -> impl Future<Output = std::result::Result<(), Self::Error>>;
+}
+```
+
+Choose the associated type per implementation, not from the union across all
+implementations. A specific implementation may still use public `Error` when
+its own build chain combines unrelated domains.
 
 ### Passing an operation name down for formatting
 
@@ -681,8 +726,10 @@ The following pieces already follow the intended direction:
   attaches the thread name at the canonical spawn boundary. Component builds,
   recovery planning, and transaction startup preserve that report while
   adding only their owned phase context.
-- File-system, evictor, recovery read-ahead, transaction log, purge, and
-  cleanup startup propagate spawn failures as public Runtime errors.
+- File-system and evictor components retain typed Runtime reports through
+  generic component dispatch. Recovery read-ahead, transaction log, purge,
+  and cleanup startup preserve the same report until their mixed or public
+  construction boundary converts it to a public Runtime error.
   Multi-worker transaction and purge startup reclaims already-started workers
   before returning, while rollback join panics remain secondary diagnostics on
   the initiating Runtime report.
@@ -691,11 +738,26 @@ The following pieces already follow the intended direction:
   precedes worker handoff.
 - `LayoutResult`, `DmlValidationResult`, and `BackendResult` model
   caller-neutral or subsystem-local failures.
-- Latch fallback parsing and trusted row-vector/LWC construction retain Config
-  and Internal reports until genuine convergence. Persisted LWC,
-  column-block-index, and disk-tree layout consumers retain Layout source
-  frames beneath DataIntegrity; trusted mutable layout consumers retain them
-  beneath Internal.
+- Latch fallback parsing retains Config until genuine convergence. Persisted
+  LWC, column-block-index, and DiskTree layout consumers retain Layout source
+  frames beneath DataIntegrity. Exact-sized mutable LWC and DiskTree writer
+  buffers use the asserting `layout::mut_from_bytes` contract instead of an
+  Internal layout report.
+- Fixed component registration and supplier topology is infallible under the
+  `EngineBuilder` construction order. Registry, dependency, shelf, and finish
+  operations use release assertions with component or edge diagnostics, while
+  `Component::build` uses an associated error to preserve infallible,
+  single-domain, and genuinely mixed construction outcomes until engine
+  convergence.
+- `LwcBuilder::new` establishes complete scan-buffer and statistics shape from
+  one `TableColumnLayout`. Page views from that layout and catalog rows checked
+  by `validate_catalog_row` enter an infallible append/statistics/estimate
+  chain. Catalog count, kind, and nullability failures remain DataIntegrity at
+  the validation boundary.
+- `LwcBlockEncodingContract` remains a fallible Internal representability
+  check for the persisted `u16` row count, cumulative column offsets, and null
+  bitmap length prefix. Valid compressible rows can reach that contract, so it
+  is not a proven invariant.
 - `LwcCode::decode` is the sole typed tag decoder. `ValKind::try_from(u8)`
   remains an intentional public trait convergence boundary, and
   `PersistedLwcBlock::load` remains a mixed read/completion and validation
@@ -741,9 +803,6 @@ The following areas require separate audits after the migrated slice:
   they are not established by Task 000226.
 - `DmlValidationResultExt` owns operation and table formatting that should be
   visible at foreground and recovery consumers.
-- Component registry, dependency, shelf, and builder-topology violations still
-  return public Internal errors. Replace those paths with assertions and retire
-  their obsolete error variants and convenience constructors.
 - Other convenience constructors return public `Error` from internal invariant
   producers. Audit whether each represents an assertion, a typed Internal
   report, or a true convergence boundary.
@@ -780,8 +839,9 @@ context:
   once.
 - When a failure is impossible under a production invariant, test the
   production path that establishes the invariant and keep the failure asserted
-  or infallible. Do not add a synthetic error source solely to exercise an
-  unreachable propagation branch.
+  or infallible. Do not expose or mutate private state solely to synthesize an
+  unreachable error, and do not replace its removed error test with a panic
+  test.
 - Run focused module tests, Clippy with warnings denied, and the full workspace
   test suite before completing a module stage.
 
