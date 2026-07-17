@@ -24,7 +24,6 @@ pub(crate) use self::tests::test_page_id;
 pub(crate) use evict::EvictableBufferPool;
 pub(crate) use evict::{
     EvictReadSubmission, EvictSubmission, EvictablePoolStateMachine, PoolRequest,
-    build_pool_with_swap_file_field,
 };
 pub(crate) use evictor::SharedPoolEvictorWorkers;
 pub(crate) use evictor::{EvictionArbiter, EvictionArbiterBuilder};
@@ -44,14 +43,14 @@ use crate::component::{
 };
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
-use crate::error::{DataIntegrityResult, Error, FileKind, ResourceError, ResourceResult, Result};
+use crate::error::{DataIntegrityResult, FileKind, RuntimeError, RuntimeResult};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::{BlockID, PageID};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentBox;
 use crate::stats::BufferPoolCounters;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -208,14 +207,14 @@ pub(crate) trait BufferPool: Send + Sync {
     fn allocate_page<T: BufferPage>(
         &self,
         guard: &PoolGuard,
-    ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send;
+    ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send;
 
     /// Allocate a new page at given id(offset);
     fn allocate_page_at<T: BufferPage>(
         &self,
         guard: &PoolGuard,
         page_id: PageID,
-    ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send;
+    ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send;
 
     /// Get page.
     fn get_page<T: BufferPage>(
@@ -223,7 +222,7 @@ pub(crate) trait BufferPool: Send + Sync {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<FacadePageGuard<T>>> + Send;
+    ) -> impl Future<Output = RuntimeResult<FacadePageGuard<T>>> + Send;
 
     /// Get page by versioned page identity.
     /// Returns None if page is unavailable or version mismatches.
@@ -232,7 +231,7 @@ pub(crate) trait BufferPool: Send + Sync {
         guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send;
+    ) -> impl Future<Output = RuntimeResult<Option<FacadePageGuard<T>>>> + Send;
 
     /// Deallocate page.
     fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>);
@@ -247,7 +246,19 @@ pub(crate) trait BufferPool: Send + Sync {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send;
+    ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send;
+}
+
+/// Returns the stable lowercase name used in buffer-pool diagnostics.
+#[inline]
+pub(crate) const fn pool_role_name(role: PoolRole) -> &'static str {
+    match role {
+        PoolRole::Invalid => "invalid",
+        PoolRole::Meta => "meta",
+        PoolRole::Index => "index",
+        PoolRole::Mem => "mem",
+        PoolRole::Disk => "disk",
+    }
 }
 
 /// Locks a specific page version for shared access if it is still present.
@@ -256,7 +267,7 @@ pub(crate) async fn get_page_versioned_shared<T: BufferPage, B: BufferPool>(
     pool: &B,
     guard: &PoolGuard,
     id: VersionedPageID,
-) -> Result<Option<PageSharedGuard<T>>> {
+) -> RuntimeResult<Option<PageSharedGuard<T>>> {
     let Some(guard) = pool
         .get_page_versioned::<T>(guard, id, LatchFallbackMode::Shared)
         .await?
@@ -270,7 +281,7 @@ impl Component for MetaPool {
     type Config = MetaPoolConfig;
     type Owned = FixedBufferPool;
     type Access = Self;
-    type Error = Report<ResourceError>;
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "meta_pool";
 
@@ -279,11 +290,11 @@ impl Component for MetaPool {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> ResourceResult<()> {
-        registry.register::<Self>(FixedBufferPool::with_capacity(
-            PoolRole::Meta,
-            config.bytes,
-        )?);
+    ) -> RuntimeResult<()> {
+        let pool = FixedBufferPool::with_capacity(PoolRole::Meta, config.bytes)
+            .change_context(RuntimeError::BufferPoolInit)
+            .attach("buffer_pool_type=fixed, buffer_pool_role=meta")?;
+        registry.register::<Self>(pool);
         Ok(())
     }
 
@@ -300,7 +311,7 @@ impl Component for IndexPool {
     type Config = IndexPoolConfig;
     type Owned = EvictableBufferPool;
     type Access = Self;
-    type Error = Error;
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "index_pool";
 
@@ -309,14 +320,18 @@ impl Component for IndexPool {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let fs = registry.dependency::<FileSystem>();
-        let (pool, storage) = EvictableBufferPoolConfig::default()
+        let config = EvictableBufferPoolConfig::default()
             .role(PoolRole::Index)
             .max_mem_size(config.bytes)
             .max_file_size(config.max_file_size)
-            .data_swap_file(config.swap_file)
-            .build_index_for_engine(fs)?;
+            .data_swap_file(config.swap_file);
+        let build_diagnostic = format!(
+            "config_field=index_swap_file, path={}",
+            config.data_swap_file_ref().display()
+        );
+        let (pool, storage) = EvictableBufferPool::create(config, fs).attach(build_diagnostic)?;
         registry.register::<Self>(pool);
         shelf.put::<FileSystemWorkers>(storage);
         Ok(())
@@ -335,7 +350,7 @@ impl Component for MemPool {
     type Config = EvictableBufferPoolConfig;
     type Owned = EvictableBufferPool;
     type Access = Self;
-    type Error = Error;
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "mem_pool";
 
@@ -344,9 +359,14 @@ impl Component for MemPool {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let fs = registry.dependency::<FileSystem>();
-        let (pool, storage) = config.role(PoolRole::Mem).build_for_engine(fs)?;
+        let config = config.role(PoolRole::Mem);
+        let build_diagnostic = format!(
+            "config_field=data_swap_file, path={}",
+            config.data_swap_file_ref().display()
+        );
+        let (pool, storage) = EvictableBufferPool::create(config, fs).attach(build_diagnostic)?;
         registry.register::<Self>(pool);
         shelf.put::<FileSystemWorkers>(storage);
         Ok(())
@@ -365,7 +385,7 @@ impl Component for DiskPool {
     type Config = DiskPoolConfig;
     type Owned = ReadonlyBufferPool;
     type Access = Self;
-    type Error = Report<ResourceError>;
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "disk_pool";
 
@@ -374,13 +394,12 @@ impl Component for DiskPool {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> ResourceResult<()> {
+    ) -> RuntimeResult<()> {
         let fs = registry.dependency::<FileSystem>();
-        registry.register::<Self>(ReadonlyBufferPool::with_capacity(
-            PoolRole::Disk,
-            config.bytes,
-            fs,
-        )?);
+        let pool = ReadonlyBufferPool::with_capacity(PoolRole::Disk, config.bytes, fs)
+            .change_context(RuntimeError::BufferPoolInit)
+            .attach("buffer_pool_type=readonly, buffer_pool_role=disk")?;
+        registry.register::<Self>(pool);
         Ok(())
     }
 

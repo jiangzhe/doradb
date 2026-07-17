@@ -1,10 +1,12 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
-use crate::error::{Error, Result};
+use crate::error::{InternalError, InternalResult};
 use crate::file::BlockKey;
 use crate::id::PageID;
 use crate::io::{IOSubmission, Operation};
 use crate::notify::EventNotifyOnDrop;
+use error_stack::Report;
+use std::fmt;
 use std::mem;
 use std::sync::Arc;
 use zerocopy::{FromBytes, IntoBytes, KnownLayout};
@@ -166,6 +168,19 @@ impl IOSubmission for PageIO {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferPageKindMismatch {
+    expected: &'static str,
+    actual: &'static str,
+}
+
+impl fmt::Display for BufferPageKindMismatch {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "expected {}, found {}", self.expected, self.actual)
+    }
+}
+
 /// Compile-time contract assertion for buffer-pool page images.
 #[inline]
 pub(crate) const fn assert_buffer_page<T: BufferPage>() {
@@ -176,14 +191,16 @@ pub(crate) const fn assert_buffer_page<T: BufferPage>() {
 
 /// Returns an internal error if `frame` does not contain the requested page kind.
 #[inline]
-pub(crate) fn validate_frame_page_kind<T: BufferPage>(frame: &BufferFrame) -> Result<()> {
+pub(crate) fn validate_frame_page_kind<T: BufferPage>(frame: &BufferFrame) -> InternalResult<()> {
     let actual = frame.page_kind();
     if actual == T::KIND {
         Ok(())
     } else {
-        Err(Error::buffer_page_kind_mismatch(
-            T::KIND.as_str(),
-            actual.as_str(),
-        ))
+        Err(
+            Report::new(InternalError::BufferPageKindMismatch).attach(BufferPageKindMismatch {
+                expected: T::KIND.as_str(),
+                actual: actual.as_str(),
+            }),
+        )
     }
 }

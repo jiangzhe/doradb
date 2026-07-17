@@ -812,7 +812,10 @@ mod tests {
                 Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
             }
             let err = lifecycle.begin_metadata_change(TABLE_ID).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
 
             drop(lease);
             drop_fut.await;
@@ -874,7 +877,10 @@ mod tests {
             assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
             let err = lifecycle.start_drop(TABLE_ID).unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
 
             lifecycle.mark_dropped(TABLE_ID).unwrap();
             assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropped);
@@ -979,7 +985,10 @@ mod tests {
             let err = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &single_key(1), &[0, 1])
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             assert_eq!(read_trx.commit().await.unwrap(), TrxID::new(0));
 
             let mut write_trx = session.begin_trx().unwrap();
@@ -990,7 +999,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             assert_eq!(write_trx.commit().await.unwrap(), TrxID::new(0));
 
             table.mark_dropped_lifecycle().unwrap();
@@ -1000,7 +1012,10 @@ mod tests {
                 trx_select_row_mvcc_by_id(&mut dropped_read, table_id, &single_key(1), &[0, 1])
                     .await
                     .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert_eq!(dropped_read.commit().await.unwrap(), TrxID::new(0));
 
             let mut dropped_write = session.begin_trx().unwrap();
@@ -1011,7 +1026,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert_eq!(dropped_write.commit().await.unwrap(), TrxID::new(0));
         });
     }
@@ -1060,7 +1078,10 @@ mod tests {
                 .wait()
                 .await;
             let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             assert_root_metadata_unchanged(
                 &root_before,
                 &table_for_internal_assertion(&engine, table_id),
@@ -1093,7 +1114,10 @@ mod tests {
             table.start_drop_lifecycle().unwrap().wait().await;
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             assert_root_metadata_unchanged(&root_before, &table);
             assert!(!session.in_trx().unwrap());
 
@@ -1115,7 +1139,10 @@ mod tests {
             table.mark_dropped_lifecycle().unwrap();
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert_root_metadata_unchanged(&root_before, &table);
             assert!(!session.in_trx().unwrap());
         });

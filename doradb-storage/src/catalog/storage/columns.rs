@@ -182,7 +182,8 @@ fn row_to_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> ColumnO
         table_id,
         column_no,
         column_name: SemiStr::new(column_name),
-        column_type: ValKind::try_from(column_type as u8).unwrap(),
+        column_type: ValKind::decode(column_type as u8)
+            .expect("validated catalog column row must contain a known value kind"),
         column_attributes: ColumnAttributes::from_bits_truncate(column_attributes),
     }
 }

@@ -439,9 +439,10 @@ impl<P: BufferPool> RowPageIndex<P> {
         &self,
         pool_guard: &PoolGuard,
     ) -> Result<PageExclusiveGuard<RowPageIndexNode>> {
-        self.pool
+        Ok(self
+            .pool
             .allocate_page::<RowPageIndexNode>(pool_guard)
-            .await
+            .await?)
     }
 
     /// Returns the height of the row-page index.
@@ -1702,7 +1703,9 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{ErrorKind, FatalError, IoError, ResourceError, Validation};
+    use crate::error::{
+        ErrorKind, FatalError, IoError, ResourceError, RuntimeError, RuntimeResult, Validation,
+    };
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::id::{TableID, TrxID};
     use crate::latch::LatchFallbackMode;
@@ -1842,7 +1845,7 @@ mod tests {
         fn allocate_page<T: BufferPage>(
             &self,
             guard: &PoolGuard,
-        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page(guard)
         }
 
@@ -1851,7 +1854,7 @@ mod tests {
             &self,
             guard: &PoolGuard,
             page_id: PageID,
-        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page_at(guard, page_id)
         }
 
@@ -1861,9 +1864,15 @@ mod tests {
             guard: &PoolGuard,
             page_id: PageID,
             mode: LatchFallbackMode,
-        ) -> Result<FacadePageGuard<T>> {
+        ) -> RuntimeResult<FacadePageGuard<T>> {
             if page_id == self.fail_page_id.load(Ordering::Acquire) {
-                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
+                let source = StdIoError::from_raw_os_error(libc::EIO);
+                return Err(Report::new(IoError::from(source.kind()))
+                    .attach(format!("injected row-page-index access failure: {source}"))
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach(format!(
+                        "buffer_pool_type=fixed, buffer_pool_role=index, operation=get_page, page_id={page_id}"
+                    )));
             }
             self.inner.get_page(guard, page_id, mode).await
         }
@@ -1874,9 +1883,16 @@ mod tests {
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
-        ) -> Result<Option<FacadePageGuard<T>>> {
+        ) -> RuntimeResult<Option<FacadePageGuard<T>>> {
             if id.page_id == self.fail_page_id.load(Ordering::Acquire) {
-                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
+                let source = StdIoError::from_raw_os_error(libc::EIO);
+                return Err(Report::new(IoError::from(source.kind()))
+                    .attach(format!("injected versioned row-page-index access failure: {source}"))
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach(format!(
+                        "buffer_pool_type=fixed, buffer_pool_role=index, operation=get_page_versioned, page_id={}, generation={}",
+                        id.page_id, id.generation
+                    )));
             }
             self.inner.get_page_versioned(guard, id, mode).await
         }
@@ -1893,7 +1909,7 @@ mod tests {
             p_guard: &FacadePageGuard<T>,
             page_id: PageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send {
             self.inner.get_child_page(guard, p_guard, page_id, mode)
         }
     }
@@ -2288,7 +2304,10 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
+            assert_eq!(
+                err.report().downcast_ref::<ResourceError>().copied(),
+                Some(ResourceError::BufferPoolFull)
+            );
             assert_eq!(mem_pool.allocated(), 0);
         });
     }
@@ -2320,7 +2339,10 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
+            assert_eq!(
+                err.report().downcast_ref::<ResourceError>().copied(),
+                Some(ResourceError::BufferPoolFull)
+            );
             assert_eq!(mem_pool.allocated(), 0);
         });
     }
@@ -2353,7 +2375,10 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
+            assert_eq!(
+                err.report().downcast_ref::<ResourceError>().copied(),
+                Some(ResourceError::BufferPoolFull)
+            );
             assert_eq!(mem_pool.allocated(), 0);
 
             let page = mem_pool
@@ -2760,7 +2785,18 @@ mod tests {
                 Ok(_location) => panic!("expected lookup error"),
                 Err(err) => err,
             };
-            assert!(err.is_kind(ErrorKind::Io));
+            assert!(err.is_kind(ErrorKind::Runtime));
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::BufferPageAccess)
+            );
+            assert_eq!(
+                err.report()
+                    .downcast_ref::<IoError>()
+                    .copied()
+                    .map(IoError::kind),
+                Some(StdIoError::from_raw_os_error(libc::EIO).kind())
+            );
         })
     }
 

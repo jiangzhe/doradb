@@ -1,11 +1,4 @@
-use crate::buffer::{
-    EvictableBufferPool, EvictionArbiter, EvictionArbiterBuilder, PoolRole,
-    build_pool_with_swap_file_field,
-};
-use crate::error::Result;
-use crate::file::SparseFile;
-use crate::file::fs::FileSystem;
-use crate::quiescent::QuiescentGuard;
+use crate::buffer::{EvictionArbiter, EvictionArbiterBuilder, PoolRole};
 use byte_unit::Byte;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -139,23 +132,5 @@ impl EvictableBufferPoolConfig {
             .eviction_arbiter_builder
             .dynamic_batch_bounds(min_batch, max_batch);
         self
-    }
-
-    /// Build a data buffer pool and its swap file for engine startup.
-    #[inline]
-    pub(crate) fn build_for_engine(
-        self,
-        fs: QuiescentGuard<FileSystem>,
-    ) -> Result<(EvictableBufferPool, SparseFile)> {
-        build_pool_with_swap_file_field(self, "data_swap_file", fs)
-    }
-
-    /// Build an index buffer pool and its swap file for engine startup.
-    #[inline]
-    pub(crate) fn build_index_for_engine(
-        self,
-        fs: QuiescentGuard<FileSystem>,
-    ) -> Result<(EvictableBufferPool, SparseFile)> {
-        build_pool_with_swap_file_field(self, "index_swap_file", fs)
     }
 }

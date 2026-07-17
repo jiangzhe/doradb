@@ -1,5 +1,5 @@
 use crate::catalog::CatalogCheckpointOutcome;
-use crate::error::{DataIntegrityError, ErrorKind, FatalError, Result};
+use crate::error::{CompletionErrorKind, DataIntegrityError, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::{
     discover_redo_log_files, next_redo_file_seq, obsolete_redo_log_files_below_marker,
@@ -188,7 +188,12 @@ impl TransactionSystem {
                 .await
             {
                 Ok(marker) => marker,
-                Err(err) if err.kind() == ErrorKind::Io => {
+                Err(err)
+                    if matches!(
+                        err.report().downcast_ref::<CompletionErrorKind>(),
+                        Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
+                    ) =>
+                {
                     return Err(self.poison_engine(FatalError::CheckpointWrite).into());
                 }
                 Err(err) => return Err(err),
@@ -320,7 +325,12 @@ impl TransactionSystem {
             }
             match prepared.commit(&self.catalog.storage).await {
                 Ok(outcome) => outcome,
-                Err(err) if err.kind() == ErrorKind::Io => {
+                Err(err)
+                    if matches!(
+                        err.report().downcast_ref::<CompletionErrorKind>(),
+                        Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
+                    ) =>
+                {
                     return Err(self.poison_engine(FatalError::CheckpointWrite).into());
                 }
                 Err(err) => return Err(err),
@@ -334,7 +344,12 @@ impl TransactionSystem {
                     .await
                 {
                     Ok(marker) => marker,
-                    Err(err) if err.kind() == ErrorKind::Io => {
+                    Err(err)
+                        if matches!(
+                            err.report().downcast_ref::<CompletionErrorKind>(),
+                            Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
+                        ) =>
+                    {
                         return Err(self.poison_engine(FatalError::CheckpointWrite).into());
                     }
                     Err(err) => return Err(err),
@@ -470,9 +485,9 @@ fn cleanup_obsolete_redo_files(
 ) -> Result<RedoCleanupCounts> {
     let mut counts = RedoCleanupCounts::default();
     for descriptor in obsolete_redo_log_files_below_marker(file_prefix, first_retained_file_seq)? {
-        debug_assert!(descriptor.file_seq < first_retained_file_seq);
+        debug_assert!(descriptor.seq < first_retained_file_seq);
         #[cfg(test)]
-        tests::run_redo_cleanup_before_unlink_hook(descriptor.file_seq, &descriptor.path);
+        tests::run_redo_cleanup_before_unlink_hook(descriptor.seq, &descriptor.path);
         match fs::remove_file(&descriptor.path) {
             Ok(()) => counts.removed_files = counts.removed_files.saturating_add(1),
             Err(err) if err.kind() == IoErrorKind::NotFound => {

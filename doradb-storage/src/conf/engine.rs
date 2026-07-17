@@ -1,6 +1,6 @@
-use crate::error::{ConfigError, ConfigResult, Error, Result};
+use crate::error::{ConfigError, ConfigResult, IoError, IoResult};
 use byte_unit::Byte;
-use error_stack::{Report, ResultExt, ensure};
+use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
 use std::env::current_dir;
 use std::fs::{self, OpenOptions};
@@ -52,32 +52,20 @@ pub(crate) struct ResolvedStoragePaths {
 
 impl ResolvedStoragePaths {
     fn resolve(input: StoragePathResolveInput<'_>) -> ConfigResult<Self> {
-        (|| {
-            ensure!(
-                validate_catalog_file_name(input.catalog_file_name),
-                ConfigError::InvalidCatalogFileName
+        if !validate_catalog_file_name(input.catalog_file_name) {
+            return Err(
+                Report::new(ConfigError::InvalidCatalogFileName).attach(format!(
+                    "catalog file name must be a plain `.mtb` file name: {}",
+                    input.catalog_file_name
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "catalog file name must be a plain `.mtb` file name: {}",
-                input.catalog_file_name
-            )
-        })?;
-        (|| {
-            ensure!(
-                validate_log_file_stem(input.log_file_stem),
-                ConfigError::InvalidLogFileStem
-            );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
+        }
+        if !validate_log_file_stem(input.log_file_stem) {
+            return Err(Report::new(ConfigError::InvalidLogFileStem).attach(format!(
                 "log file stem must be a plain file name without glob characters: {}",
                 input.log_file_stem
-            )
-        })?;
+            )));
+        }
         validate_swap_file_path_candidate(input.data_swap_file).attach_with(|| {
             format!("invalid data_swap_file: {}", input.data_swap_file.display())
         })?;
@@ -153,73 +141,139 @@ impl ResolvedStoragePaths {
     }
 
     /// Ensure configured storage directories and swap-file parent directories exist.
-    pub(crate) fn ensure_directories(&self) -> Result<()> {
-        fs::create_dir_all(&self.storage_root)?;
-        fs::create_dir_all(&self.data_dir)?;
-        fs::create_dir_all(&self.log_dir)?;
+    pub(crate) fn ensure_directories(&self) -> IoResult<()> {
+        fs::create_dir_all(&self.storage_root).map_err(|err| {
+            let kind = err.kind();
+            Report::new(err)
+                .change_context(IoError::from(kind))
+                .attach(format!(
+                    "create storage root directory: path={}",
+                    self.storage_root.display()
+                ))
+        })?;
+        fs::create_dir_all(&self.data_dir).map_err(|err| {
+            let kind = err.kind();
+            Report::new(err)
+                .change_context(IoError::from(kind))
+                .attach(format!(
+                    "create table data directory: path={}",
+                    self.data_dir.display()
+                ))
+        })?;
+        fs::create_dir_all(&self.log_dir).map_err(|err| {
+            let kind = err.kind();
+            Report::new(err)
+                .change_context(IoError::from(kind))
+                .attach(format!(
+                    "create redo log directory: path={}",
+                    self.log_dir.display()
+                ))
+        })?;
         if let Some(parent) = self.data_swap_file.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|err| {
+                let kind = err.kind();
+                Report::new(err)
+                    .change_context(IoError::from(kind))
+                    .attach(format!(
+                        "create data swap-file parent directory: path={}",
+                        parent.display()
+                    ))
+            })?;
         }
         if let Some(parent) = self.index_swap_file.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|err| {
+                let kind = err.kind();
+                Report::new(err)
+                    .change_context(IoError::from(kind))
+                    .attach(format!(
+                        "create index swap-file parent directory: path={}",
+                        parent.display()
+                    ))
+            })?;
         }
         Ok(())
     }
 
-    /// Validate the durable storage-layout marker when it already exists.
-    pub(crate) fn validate_marker_if_present(&self) -> Result<()> {
+    /// Validate the durable storage-layout marker and report whether it exists.
+    pub(crate) fn validate_marker_if_present(&self) -> ConfigResult<bool> {
         let marker_path = self.marker_path();
         if !marker_path.exists() {
-            return Ok(());
+            return Ok(false);
         }
-        self.validate_marker(&marker_path)
+        self.validate_marker(&marker_path)?;
+        Ok(true)
     }
 
-    /// Persist the durable storage-layout marker, or validate it if another opener created it.
-    pub(crate) fn persist_marker_if_missing(&self) -> Result<()> {
+    /// Persist the durable storage-layout marker using exclusive creation.
+    pub(crate) fn persist_marker(&self) -> IoResult<()> {
         let marker_path = self.marker_path();
-        let marker = toml::to_string(&self.durable_layout).map_err(|_| Error::internal())?;
+        let marker = self.serialize_durable_layout()?;
         match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&marker_path)
         {
             Ok(mut file) => {
-                file.write_all(marker.as_bytes())?;
+                file.write_all(marker.as_bytes()).map_err(|err| {
+                    let kind = err.kind();
+                    Report::new(err)
+                        .change_context(IoError::from(kind))
+                        .attach(format!(
+                            "write durable storage layout marker: path={}",
+                            marker_path.display()
+                        ))
+                })?;
                 Ok(())
             }
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                self.validate_marker(&marker_path)
+            Err(err) => {
+                let kind = err.kind();
+                Err(Report::new(err)
+                    .change_context(IoError::from(kind))
+                    .attach(format!(
+                        "create durable storage layout marker: path={}",
+                        marker_path.display()
+                    )))
             }
-            Err(err) => Err(err.into()),
         }
+    }
+
+    #[inline]
+    fn serialize_durable_layout(&self) -> IoResult<String> {
+        toml::to_string(&self.durable_layout).map_err(|err| {
+            Report::new(err)
+                .change_context(IoError::from(ErrorKind::InvalidData))
+                .attach("serialize durable storage layout marker")
+        })
     }
 
     fn marker_path(&self) -> PathBuf {
         self.storage_root.join(STORAGE_LAYOUT_FILE_NAME)
     }
 
-    fn validate_marker(&self, marker_path: &Path) -> Result<()> {
-        let raw = fs::read_to_string(marker_path)?;
-        let actual = parse_durable_layout(&raw).map_err(Error::from)?;
-        validate_durable_layout_match(&self.durable_layout, &actual).map_err(Error::from)?;
+    fn validate_marker(&self, marker_path: &Path) -> ConfigResult<()> {
+        let raw = fs::read_to_string(marker_path).map_err(|err| {
+            Report::new(IoError::from(err.kind()))
+                .attach(format!("{err}"))
+                .change_context(ConfigError::StorageLayoutMarkerRead)
+                .attach(format!(
+                    "read durable storage layout marker: {}",
+                    marker_path.display()
+                ))
+        })?;
+        let actual = parse_durable_layout(&raw)?;
+        validate_durable_layout_match(&self.durable_layout, &actual)?;
         Ok(())
     }
 
     fn validate_non_overlapping_paths(&self) -> ConfigResult<()> {
-        (|| {
-            ensure!(
-                self.data_swap_file != self.index_swap_file,
-                ConfigError::PathsMustNotOverlap
+        if self.data_swap_file == self.index_swap_file {
+            return Err(
+                Report::new(ConfigError::PathsMustNotOverlap).attach(format!(
+                    "swap files must not overlap each other: {}",
+                    self.data_swap_file.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "swap files must not overlap each other: {}",
-                self.data_swap_file.display()
-            )
-        })?;
+        }
         self.validate_swap_file_non_overlap("data_swap_file", &self.data_swap_file)?;
         self.validate_swap_file_non_overlap("index_swap_file", &self.index_swap_file)?;
         Ok(())
@@ -230,122 +284,90 @@ impl ResolvedStoragePaths {
     }
 
     fn validate_swap_file_non_overlap(&self, field: &str, path: &Path) -> ConfigResult<()> {
-        (|| {
-            ensure!(
-                path != self.data_dir,
-                ConfigError::PathMustNotOverlapReservedLocation
+        if path == self.data_dir {
+            return Err(
+                Report::new(ConfigError::PathMustNotOverlapReservedLocation).attach(format!(
+                    "{field} must not overlap data_dir: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| format!("{field} must not overlap data_dir: {}", path.display()))?;
-        (|| {
-            ensure!(
-                path != self.log_dir,
-                ConfigError::PathMustNotOverlapReservedLocation
+        }
+        if path == self.log_dir {
+            return Err(
+                Report::new(ConfigError::PathMustNotOverlapReservedLocation).attach(format!(
+                    "{field} must not overlap log_dir: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| format!("{field} must not overlap log_dir: {}", path.display()))?;
-        (|| {
-            ensure!(
-                self.data_dir == self.storage_root
-                    || path.parent() != Some(self.data_dir.as_path()),
-                ConfigError::PathMustNotUseReservedParentDirectory
+        }
+        if self.data_dir != self.storage_root && path.parent() == Some(self.data_dir.as_path()) {
+            return Err(
+                Report::new(ConfigError::PathMustNotUseReservedParentDirectory).attach(format!(
+                    "{field} must not use data_dir as its parent directory: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "{field} must not use data_dir as its parent directory: {}",
-                path.display()
-            )
-        })?;
-        (|| {
-            ensure!(
-                self.log_dir == self.storage_root || path.parent() != Some(self.log_dir.as_path()),
-                ConfigError::PathMustNotUseReservedParentDirectory
+        }
+        if self.log_dir != self.storage_root && path.parent() == Some(self.log_dir.as_path()) {
+            return Err(
+                Report::new(ConfigError::PathMustNotUseReservedParentDirectory).attach(format!(
+                    "{field} must not use log_dir as its parent directory: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "{field} must not use log_dir as its parent directory: {}",
-                path.display()
-            )
-        })?;
-        (|| {
-            ensure!(
-                !aliases_reserved_path(path, &self.catalog_file_path),
-                ConfigError::PathMustNotOverlapReservedLocation
+        }
+        if aliases_reserved_path(path, &self.catalog_file_path) {
+            return Err(
+                Report::new(ConfigError::PathMustNotOverlapReservedLocation).attach(format!(
+                    "{field} must not overlap catalog file: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| format!("{field} must not overlap catalog file: {}", path.display()))?;
+        }
         let marker_path = self.marker_path();
-        (|| {
-            ensure!(
-                !aliases_reserved_path(path, &marker_path),
-                ConfigError::PathMustNotOverlapReservedLocation
+        if aliases_reserved_path(path, &marker_path) {
+            return Err(
+                Report::new(ConfigError::PathMustNotOverlapReservedLocation).attach(format!(
+                    "{field} must not overlap storage marker: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "{field} must not overlap storage marker: {}",
-                path.display()
-            )
-        })?;
-        (|| {
-            ensure!(
-                !path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(
-                        |ext| ext.eq_ignore_ascii_case("tbl") || ext.eq_ignore_ascii_case("mtb")
-                    ),
-                ConfigError::PathMustNotUseDurableStorageSuffix
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tbl") || ext.eq_ignore_ascii_case("mtb"))
+        {
+            return Err(
+                Report::new(ConfigError::PathMustNotUseDurableStorageSuffix).attach(format!(
+                    "{field} must not use durable storage suffix `.tbl` or `.mtb`: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "{field} must not use durable storage suffix `.tbl` or `.mtb`: {}",
-                path.display()
-            )
-        })?;
+        }
         let log_family_base = self.log_family_base_path();
-        (|| {
-            ensure!(
-                !aliases_reserved_path(path, &log_family_base),
-                ConfigError::PathMustNotOverlapReservedLocation
+        if aliases_reserved_path(path, &log_family_base) {
+            return Err(
+                Report::new(ConfigError::PathMustNotOverlapReservedLocation).attach(format!(
+                    "{field} must not overlap redo log family: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "{field} must not overlap redo log family: {}",
-                path.display()
-            )
-        })?;
+        }
         let same_parent = path.parent() == Some(self.log_dir.as_path());
         let swap_file_name = path_to_utf8(Path::new(
             path.file_name()
                 .expect("swap file must resolve to a file path"),
         ))
         .attach_with(|| format!("invalid {field}: {}", path.display()))?;
-        (|| {
-            ensure!(
-                !same_parent || !swap_file_name.starts_with(&format!("{}.", self.log_file_stem)),
-                ConfigError::PathMustNotOverlapReservedLocation
+        if same_parent && swap_file_name.starts_with(&format!("{}.", self.log_file_stem)) {
+            return Err(
+                Report::new(ConfigError::PathMustNotOverlapReservedLocation).attach(format!(
+                    "{field} must not overlap redo log family: {}",
+                    path.display()
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "{field} must not overlap redo log family: {}",
-                path.display()
-            )
-        })?;
+        }
         Ok(())
     }
 }
@@ -474,23 +496,19 @@ fn validate_durable_layout_match(
     expected: &DurableStorageLayout,
     actual: &DurableStorageLayout,
 ) -> ConfigResult<()> {
-    (|| {
-        ensure!(actual == expected, ConfigError::StorageLayoutMismatch);
-        Ok(())
-    })()
-    .attach_with(|| format!("expected {:?}, found {:?}", expected, actual))?;
+    if actual != expected {
+        return Err(Report::new(ConfigError::StorageLayoutMismatch)
+            .attach(format!("expected {:?}, found {:?}", expected, actual)));
+    }
     Ok(())
 }
 
 fn resolve_storage_root(storage_root: &Path) -> ConfigResult<PathBuf> {
-    (|| {
-        ensure!(
-            !storage_root.as_os_str().is_empty(),
-            ConfigError::PathMustNotBeEmpty
+    if storage_root.as_os_str().is_empty() {
+        return Err(
+            Report::new(ConfigError::PathMustNotBeEmpty).attach("storage_root must not be empty")
         );
-        Ok(())
-    })()
-    .attach_with(|| "storage_root must not be empty".to_string())?;
+    }
     if storage_root.is_absolute() {
         return Ok(storage_root.to_path_buf());
     }
@@ -511,26 +529,22 @@ fn normalize_relative_dir(path: &Path) -> ConfigResult<PathBuf> {
 fn normalize_relative_file_path(path: &Path) -> ConfigResult<PathBuf> {
     let normalized = normalize_relative_path(path, false)
         .attach_with(|| format!("invalid relative file path: {}", path.display()))?;
-    (|| {
-        ensure!(
-            !normalized.as_os_str().is_empty(),
-            ConfigError::PathMustResolveToFile
-        );
-        Ok(())
-    })()
-    .attach_with(|| format!("path must resolve to a file: {}", path.display()))?;
+    if normalized.as_os_str().is_empty() {
+        return Err(Report::new(ConfigError::PathMustResolveToFile)
+            .attach(format!("path must resolve to a file: {}", path.display())));
+    }
     Ok(normalized)
 }
 
 fn normalize_relative_path(path: &Path, allow_empty: bool) -> ConfigResult<PathBuf> {
-    (|| {
-        ensure!(
-            !path.is_absolute(),
-            ConfigError::PathMustBeRelativeToStorageRoot
+    if path.is_absolute() {
+        return Err(
+            Report::new(ConfigError::PathMustBeRelativeToStorageRoot).attach(format!(
+                "path must be relative to storage_root: {}",
+                path.display()
+            )),
         );
-        Ok(())
-    })()
-    .attach_with(|| format!("path must be relative to storage_root: {}", path.display()))?;
+    }
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -554,14 +568,10 @@ fn normalize_relative_path(path: &Path, allow_empty: bool) -> ConfigResult<PathB
             }
         }
     }
-    (|| {
-        ensure!(
-            allow_empty || !normalized.as_os_str().is_empty(),
-            ConfigError::PathMustNotBeEmpty
-        );
-        Ok(())
-    })()
-    .attach_with(|| format!("path must not be empty: {}", path.display()))?;
+    if !allow_empty && normalized.as_os_str().is_empty() {
+        return Err(Report::new(ConfigError::PathMustNotBeEmpty)
+            .attach(format!("path must not be empty: {}", path.display())));
+    }
     Ok(normalized)
 }
 
@@ -578,9 +588,8 @@ fn relative_dir_display(path: &Path) -> ConfigResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ErrorKind;
     use error_stack::Report;
-    use std::fs::write;
+    use std::fs::{create_dir, write};
     use tempfile::TempDir;
 
     fn assert_config_report(err: Report<ConfigError>, expected: ConfigError, snippets: &[&str]) {
@@ -608,6 +617,9 @@ mod tests {
     #[test]
     fn test_validate_swap_file_suffix_and_escape() {
         validate_swap_file_path_candidate("data.swp").unwrap();
+
+        let err = validate_swap_file_path_candidate("").unwrap_err();
+        assert_config_report(err, ConfigError::PathMustNotBeEmpty, &["must not be empty"]);
 
         let err = validate_swap_file_path_candidate("data.bin").unwrap_err();
         assert_config_report(
@@ -645,8 +657,9 @@ mod tests {
             .resolve_storage_paths()
             .unwrap();
         initial.ensure_directories().unwrap();
-        initial.validate_marker_if_present().unwrap();
-        initial.persist_marker_if_missing().unwrap();
+        assert!(!initial.validate_marker_if_present().unwrap());
+        initial.persist_marker().unwrap();
+        assert!(initial.validate_marker_if_present().unwrap());
 
         let changed = EngineConfig::default()
             .storage_root(root.path())
@@ -655,10 +668,101 @@ mod tests {
             .unwrap();
         changed.ensure_directories().unwrap();
         let err = changed.validate_marker_if_present().unwrap_err();
-        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(err.current_context(), &ConfigError::StorageLayoutMismatch);
+    }
+
+    #[test]
+    fn test_serialize_durable_layout_is_io_typed() {
+        let root = TempDir::new().unwrap();
+        let paths = EngineConfig::default()
+            .storage_root(root.path())
+            .resolve_storage_paths()
+            .unwrap();
+
+        let marker: IoResult<String> = paths.serialize_durable_layout();
+        let actual = toml::from_str::<DurableStorageLayout>(&marker.unwrap()).unwrap();
+        assert_eq!(actual, paths.durable_layout);
+    }
+
+    #[test]
+    fn test_ensure_directories_is_io_typed() {
+        let root = TempDir::new().unwrap();
+        let storage_root = root.path().join("storage-root-file");
+        write(&storage_root, "not a directory").unwrap();
+        let paths = EngineConfig::default()
+            .storage_root(&storage_root)
+            .resolve_storage_paths()
+            .unwrap();
+
+        let err: Report<IoError> = paths.ensure_directories().unwrap_err();
+        assert_eq!(err.current_context().kind(), ErrorKind::AlreadyExists);
+        let report = format!("{err:?}");
+        assert!(report.contains("create storage root directory"), "{report}");
+        assert!(report.contains(storage_root.to_str().unwrap()), "{report}");
+    }
+
+    #[test]
+    fn test_persist_marker_reports_existing_marker_as_io() {
+        let root = TempDir::new().unwrap();
+        let paths = EngineConfig::default()
+            .storage_root(root.path())
+            .resolve_storage_paths()
+            .unwrap();
+        paths.ensure_directories().unwrap();
+        assert!(!paths.validate_marker_if_present().unwrap());
+        write(
+            paths.marker_path(),
+            paths.serialize_durable_layout().unwrap(),
+        )
+        .unwrap();
+
+        let err: Report<IoError> = paths.persist_marker().unwrap_err();
+        assert_eq!(err.current_context().kind(), ErrorKind::AlreadyExists);
+        let report = format!("{err:?}");
+        assert!(
+            report.contains("create durable storage layout marker"),
+            "{report}"
+        );
+        assert!(
+            report.contains(paths.marker_path().to_str().unwrap()),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn test_marker_read_failure_retains_io_beneath_config() {
+        let root = TempDir::new().unwrap();
+        let paths = EngineConfig::default()
+            .storage_root(root.path())
+            .resolve_storage_paths()
+            .unwrap();
+        create_dir(paths.marker_path()).unwrap();
+
+        let err = paths.validate_marker_if_present().unwrap_err();
+        assert_eq!(err.current_context(), &ConfigError::StorageLayoutMarkerRead);
         assert_eq!(
-            err.report().downcast_ref::<ConfigError>().copied(),
-            Some(ConfigError::StorageLayoutMismatch)
+            err.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(std::io::ErrorKind::IsADirectory)
+        );
+        assert!(
+            format!("{err:?}").contains(paths.marker_path().to_str().unwrap()),
+            "read failure must identify the marker path"
+        );
+    }
+
+    #[test]
+    fn test_marker_rejects_malformed_toml() {
+        let root = TempDir::new().unwrap();
+        let paths = EngineConfig::default()
+            .storage_root(root.path())
+            .resolve_storage_paths()
+            .unwrap();
+        write(paths.marker_path(), "version = [").unwrap();
+
+        let err = paths.validate_marker_if_present().unwrap_err();
+        assert_eq!(
+            err.current_context(),
+            &ConfigError::InvalidStorageLayoutMarker
         );
     }
 
@@ -685,11 +789,7 @@ log_partitions = 1
         .unwrap();
 
         let err = paths.validate_marker_if_present().unwrap_err();
-        assert!(err.is_kind(ErrorKind::Config));
-        assert_eq!(
-            err.report().downcast_ref::<ConfigError>().copied(),
-            Some(ConfigError::StorageLayoutMismatch)
-        );
+        assert_eq!(err.current_context(), &ConfigError::StorageLayoutMismatch);
     }
 
     #[test]

@@ -1375,7 +1375,7 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::DataIntegrity);
         assert_eq!(
-            err.downcast_ref::<DataIntegrityError>().copied(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidPayload)
         );
     }

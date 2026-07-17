@@ -1,16 +1,16 @@
 use super::{
-    BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
-    IOBackendQueueState, IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult,
-    SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
+    BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState,
+    IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt,
+    SubmitRetry, SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
 };
-use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
+use crate::error::{IoError, IoResult};
 use error_stack::Report;
 use io_uring::opcode::{Fsync, Read, Write};
 use io_uring::types::{CancelBuilder, FsyncFlags, Timespec};
 use io_uring::{IoUring, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
-use std::io::Error as StdIoError;
+use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
@@ -19,36 +19,11 @@ const IOURING_SYNC_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 /// Concrete io_uring context used by the storage-engine backend.
 pub(crate) struct IouringBackend {
     ring: IoUring,
-    max_events: usize,
+    io_depth: usize,
     stats: IOBackendStatsHandle,
 }
 
 impl IouringBackend {
-    /// Creates a new io_uring backend with the requested maximum concurrent IO depth.
-    #[inline]
-    pub(crate) fn new(max_events: usize) -> Result<Self> {
-        if max_events == 0 {
-            return Err(invalid_io_depth(max_events));
-        }
-        let ring_entries = max_events
-            .checked_next_power_of_two()
-            .ok_or_else(|| invalid_io_depth(max_events))?;
-        let ring_entries = u32::try_from(ring_entries).map_err(|_| invalid_io_depth(max_events))?;
-        let ring = IoUring::new(ring_entries)
-            .map_err(|err| Error::from(IoError::report_with_op(StorageOp::BackendSetup, err)))?;
-        Ok(IouringBackend {
-            ring,
-            max_events,
-            stats: IOBackendStatsHandle::default(),
-        })
-    }
-
-    /// Returns maximum concurrent events exposed to the IO scheduler.
-    #[inline]
-    fn max_events(&self) -> usize {
-        self.max_events
-    }
-
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
     #[expect(dead_code, reason = "internal io backend stats")]
@@ -105,10 +80,7 @@ impl IouringBackend {
     }
 
     #[inline]
-    fn submit_pending_sqes(
-        &mut self,
-        batch: &mut IouringSubmitBatch,
-    ) -> BackendResult<SubmitOutcome> {
+    fn submit_pending_sqes(&mut self, batch: &mut IouringSubmitBatch) -> IoResult<SubmitOutcome> {
         debug_assert!(batch.pending_sqes != 0);
 
         let mut call_count = 0usize;
@@ -144,7 +116,7 @@ impl IouringBackend {
         &mut self,
         min_nr: usize,
         observed_completions: usize,
-    ) -> BackendResult<BlockingWaitOutcome> {
+    ) -> IoResult<BlockingWaitOutcome> {
         let mut call_count = 0usize;
         let submitted = loop {
             call_count += 1;
@@ -175,14 +147,40 @@ impl IOBackend for IouringBackend {
     type Events = ();
 
     #[inline]
-    fn max_events(&self) -> usize {
-        self.max_events()
+    fn setup(io_depth: usize) -> IoResult<Self> {
+        if io_depth == 0 {
+            return Err(Report::new(IoError::from(StdIoErrorKind::InvalidInput))
+                .attach("backend=io_uring, io_depth=0, reason=io depth must be non-zero"));
+        }
+        let ring_entries = io_depth.checked_next_power_of_two().ok_or_else(|| {
+            Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
+                "backend=io_uring, io_depth={io_depth}, reason=next power of two overflow"
+            ))
+        })?;
+        let ring_entries = u32::try_from(ring_entries).map_err(|_| {
+            Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
+                "backend=io_uring, io_depth={io_depth}, ring_entries={ring_entries}, reason=ring entries exceed u32"
+            ))
+        })?;
+        let ring = IoUring::new(ring_entries).map_err(|err| {
+            Report::new(IoError::from(err.kind())).attach(format!("op=backend_setup, {err}"))
+        })?;
+        Ok(Self {
+            ring,
+            io_depth,
+            stats: IOBackendStatsHandle::default(),
+        })
+    }
+
+    #[inline]
+    fn io_depth(&self) -> usize {
+        self.io_depth
     }
 
     #[inline]
     fn new_submit_batch(&self) -> Self::SubmitBatch {
         IouringSubmitBatch {
-            staged: VecDeque::with_capacity(self.max_events()),
+            staged: VecDeque::with_capacity(self.io_depth),
             pending_sqes: 0,
         }
     }
@@ -222,7 +220,7 @@ impl IOBackend for IouringBackend {
         &mut self,
         batch: &mut Self::SubmitBatch,
         limit: usize,
-    ) -> BackendResult<SubmitAttempt> {
+    ) -> IoResult<SubmitAttempt> {
         let start = Instant::now();
         let sq_full = self.stage_pending_sqes(batch, limit);
 
@@ -264,7 +262,7 @@ impl IOBackend for IouringBackend {
         &mut self,
         _events: &mut Self::Events,
         min_nr: usize,
-    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+    ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
         {
             let cq = self.ring.completion();
             if cq.len() < min_nr {
@@ -359,13 +357,6 @@ struct SubmitOutcome {
 struct BlockingWaitOutcome {
     submitted: usize,
     call_count: usize,
-}
-
-#[inline]
-fn invalid_io_depth(max_events: usize) -> Error {
-    Report::new(ConfigError::InvalidIoDepth)
-        .attach(format!("max_events={max_events}"))
-        .into()
 }
 
 #[inline]
@@ -467,7 +458,8 @@ mod tests {
 
     #[test]
     fn test_submit_batch_reports_no_progress_when_sq_full() {
-        let mut backend = IouringBackend::new(1).unwrap();
+        let mut backend = IouringBackend::setup(1).unwrap();
+        assert_eq!(backend.io_depth(), 1);
         {
             let mut sq = backend.ring.submission();
             loop {
@@ -511,28 +503,27 @@ mod tests {
     }
 
     #[test]
-    fn test_iouring_backend_rejects_zero_depth_as_config_error() {
-        assert!(IouringBackend::new(0).as_ref().is_err_and(|err| {
-            err.is_kind(crate::error::ErrorKind::Config)
-                && err
-                    .report()
-                    .downcast_ref::<crate::error::ConfigError>()
-                    .copied()
-                    == Some(crate::error::ConfigError::InvalidIoDepth)
-        }));
+    fn test_iouring_backend_rejects_zero_depth_as_invalid_input() {
+        let err = match IouringBackend::setup(0) {
+            Ok(_) => panic!("expected invalid io depth"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
+        let report = format!("{err:?}");
+        assert!(report.contains("backend=io_uring"), "{report}");
+        assert!(report.contains("io_depth=0"), "{report}");
     }
 
     #[test]
-    fn test_iouring_backend_rejects_ring_entry_overflow_as_config_error() {
-        assert!(
-            IouringBackend::new((u32::MAX as usize) + 1)
-                .as_ref()
-                .is_err_and(|err| err.is_kind(crate::error::ErrorKind::Config)
-                    && err
-                        .report()
-                        .downcast_ref::<crate::error::ConfigError>()
-                        .copied()
-                        == Some(crate::error::ConfigError::InvalidIoDepth))
-        );
+    fn test_iouring_backend_rejects_ring_entry_overflow_as_invalid_input() {
+        let io_depth = (u32::MAX as usize) + 1;
+        let err = match IouringBackend::setup(io_depth) {
+            Ok(_) => panic!("expected invalid io depth"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
+        let report = format!("{err:?}");
+        assert!(report.contains("backend=io_uring"), "{report}");
+        assert!(report.contains(&format!("io_depth={io_depth}")), "{report}");
     }
 }

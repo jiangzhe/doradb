@@ -1,4 +1,4 @@
-use crate::error::{DataIntegrityError, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
 use crate::id::TrxID;
 use crate::io::{DirectBuf, IOBuf};
 use crate::log::format::{
@@ -7,7 +7,7 @@ use crate::log::format::{
     redo_start_block_payload_capacity,
 };
 use crate::log::redo::{RedoHeader, RedoLogs};
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 
@@ -36,7 +36,7 @@ pub(crate) struct LogBlockGroup {
 impl LogBlockGroup {
     /// Start a logical redo group with one redo-bearing transaction.
     #[inline]
-    pub(crate) fn new(log_block_size: usize, trx_log: TrxLog) -> Result<Self> {
+    pub(crate) fn new(log_block_size: usize, trx_log: TrxLog) -> DataIntegrityResult<Self> {
         let payload_len = trx_log.ser_len();
         let block_count = block_count_for_payload(log_block_size, payload_len)?;
         let cts = trx_log.header.cts;
@@ -104,7 +104,7 @@ impl LogBlockGroup {
 
     /// Materialize this logical group using caller-supplied write buffers.
     #[inline]
-    pub(crate) fn finish_with<F>(self, take_blocks: F) -> Result<Vec<DirectBuf>>
+    pub(crate) fn finish_with<F>(self, take_blocks: F) -> InternalResult<Vec<DirectBuf>>
     where
         F: FnOnce(usize) -> Vec<DirectBuf>,
     {
@@ -142,25 +142,23 @@ struct LogBlockGroupWriter<'a> {
 
 impl<'a> LogBlockGroupWriter<'a> {
     #[inline]
-    fn new(group: &'a LogBlockGroup, blocks: Vec<DirectBuf>) -> Result<Self> {
+    fn new(group: &'a LogBlockGroup, blocks: Vec<DirectBuf>) -> InternalResult<Self> {
         if blocks.len() != group.block_count {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(InternalError::RedoFormatEncoding).attach(format!(
                     "block=redo-data, expected_block_count={}, actual_block_count={}",
                     group.block_count,
                     blocks.len()
-                ))
-                .into());
+                )),
+            );
         }
         for (block_idx, block) in blocks.iter().enumerate() {
             if block.capacity() != group.log_block_size {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
-                        "block=redo-data, block_idx={block_idx}, expected_block_size={}, actual_block_size={}",
-                        group.log_block_size,
-                        block.capacity()
-                    ))
-                    .into());
+                return Err(Report::new(InternalError::RedoFormatEncoding).attach(format!(
+                    "block=redo-data, block_idx={block_idx}, expected_block_size={}, actual_block_size={}",
+                    group.log_block_size,
+                    block.capacity()
+                )));
             }
         }
         Ok(Self {
@@ -173,7 +171,7 @@ impl<'a> LogBlockGroupWriter<'a> {
     }
 
     #[inline]
-    fn finish(mut self) -> Result<Vec<DirectBuf>> {
+    fn finish(mut self) -> InternalResult<Vec<DirectBuf>> {
         self.write_payloads();
         self.finalize_blocks()?;
         Ok(self.blocks)
@@ -247,7 +245,7 @@ impl<'a> LogBlockGroupWriter<'a> {
     }
 
     #[inline]
-    fn finalize_blocks(&mut self) -> Result<()> {
+    fn finalize_blocks(&mut self) -> InternalResult<()> {
         debug_assert_eq!(
             self.payload_lens.iter().sum::<usize>(),
             self.group.payload_len
@@ -259,7 +257,7 @@ impl<'a> LogBlockGroupWriter<'a> {
     }
 
     #[inline]
-    fn finalize_block(&mut self, idx: usize) -> Result<()> {
+    fn finalize_block(&mut self, idx: usize) -> InternalResult<()> {
         let payload_len = self.payload_lens[idx];
         let capacity = self.group.block_payload_capacity(idx);
         if idx + 1 < self.group.block_count {
@@ -283,7 +281,7 @@ impl<'a> LogBlockGroupWriter<'a> {
                 RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE
             );
         }
-        patch_redo_block_checksum(self.blocks[idx].as_bytes_mut())?;
+        patch_redo_block_checksum(self.blocks[idx].as_bytes_mut());
         Ok(())
     }
 
@@ -339,10 +337,7 @@ impl Deser for TrxLog {
         min_bytes_hint(mem::size_of::<u64>() + MIN_TRX_LOG_FRAME_LEN);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (frame_start, data_len) = input.deser_u64(start_idx)?;
         let data_len = usize::try_from(data_len).map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload)
@@ -412,7 +407,10 @@ impl Ser<'_> for TrxLog {
 
 /// Return the fixed-block count for a logical payload length.
 #[inline]
-pub(crate) fn block_count_for_payload(log_block_size: usize, payload_len: usize) -> Result<usize> {
+pub(crate) fn block_count_for_payload(
+    log_block_size: usize,
+    payload_len: usize,
+) -> DataIntegrityResult<usize> {
     let start_capacity = redo_start_block_payload_capacity(log_block_size)?;
     if payload_len <= start_capacity {
         return Ok(1);
@@ -420,8 +418,7 @@ pub(crate) fn block_count_for_payload(log_block_size: usize, payload_len: usize)
     let continuation_capacity = redo_continuation_block_payload_capacity(log_block_size)?;
     if continuation_capacity == 0 {
         return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!("block=redo-data, log_block_size={log_block_size}"))
-            .into());
+            .attach(format!("block=redo-data, log_block_size={log_block_size}")));
     }
     Ok(1 + (payload_len - start_capacity).div_ceil(continuation_capacity))
 }
@@ -607,9 +604,31 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
+        assert_eq!(*err.current_context(), InternalError::RedoFormatEncoding);
+        let report = format!("{err:?}");
+        assert!(report.contains("expected_block_count=1"), "{report}");
+        assert!(report.contains("actual_block_count=0"), "{report}");
+    }
+
+    #[test]
+    fn test_log_block_group_finish_with_rejects_wrong_block_capacity() {
+        let log = simple_trx_log(TrxID::new(13));
+        let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
+
+        let err = group
+            .finish_with(|_| vec![DirectBuf::zeroed(STORAGE_SECTOR_SIZE * 2)])
+            .err()
+            .expect("wrong block capacity must be rejected");
+
+        assert_eq!(*err.current_context(), InternalError::RedoFormatEncoding);
+        let report = format!("{err:?}");
+        assert!(
+            report.contains(&format!("expected_block_size={STORAGE_SECTOR_SIZE}")),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("actual_block_size={}", STORAGE_SECTOR_SIZE * 2)),
+            "{report}"
         );
     }
 

@@ -3740,7 +3740,10 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
                 let err = res.unwrap_err();
-                assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+                assert_eq!(
+                    err.report().downcast_ref::<OperationError>().copied(),
+                    Some(OperationError::DuplicateKey)
+                );
                 trx.rollback().await.unwrap();
             }
             // write conflict
@@ -3758,7 +3761,10 @@ mod tests {
                 let res = trx_insert_row_by_id(&mut trx2, table_id, insert2).await;
                 // still dup key because circuit breaker on index search.
                 let err = res.unwrap_err();
-                assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+                assert_eq!(
+                    err.report().downcast_ref::<OperationError>().copied(),
+                    Some(OperationError::DuplicateKey)
+                );
                 trx2.rollback().await.unwrap();
                 drop(session2);
 
@@ -4062,7 +4068,10 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::WriteConflict)
+            );
             trx2.rollback().await.unwrap();
             trx1.rollback().await.unwrap();
 
@@ -4093,7 +4102,10 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::WriteConflict)
+            );
             trx2.rollback().await.unwrap();
             trx1.commit().await.unwrap();
         });
@@ -4524,7 +4536,10 @@ mod tests {
             let err = trx_delete_row_by_id(&mut trx2, table_id, &key)
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::WriteConflict)
+            );
             trx2.rollback().await.unwrap();
             drop(session2);
 
@@ -4617,7 +4632,10 @@ mod tests {
             let err = trx_delete_row_by_id(&mut writer, table_id, &key)
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::WriteConflict)
+            );
             writer.rollback().await.unwrap();
 
             expect_select_not_found_committed(table_id, &mut session, &key).await;
@@ -4772,7 +4790,10 @@ mod tests {
             )
             .await;
             let err = res.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::WriteConflict)
+            );
             writer.rollback().await.unwrap();
 
             expect_select_not_found_committed(table_id, &mut session, &key).await;
@@ -4901,7 +4922,10 @@ mod tests {
             )
             .await;
             let err = res.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::DuplicateKey)
+            );
             trx.rollback().await.unwrap();
 
             assert!(
@@ -5047,7 +5071,10 @@ mod tests {
             )
             .await;
             let err = res.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::DuplicateKey)
+            );
 
             assert_unique_index_entry(
                 &table_for_internal_assertion(&engine, table_id),
@@ -5411,7 +5438,10 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                res.unwrap_err().operation_error(),
+                res.unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::NotSupported)
             );
             trx.rollback().await.unwrap();
@@ -5452,7 +5482,10 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                res.unwrap_err().operation_error(),
+                res.unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::NotSupported)
             );
             trx.rollback().await.unwrap();
@@ -6052,7 +6085,11 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                result.unwrap_err().operation_error(),
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::InvalidDmlInput)
             );
             assert_eq!(scan_table_pairs(&mut trx, table_id).await, before_error);
@@ -6228,7 +6265,11 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                result.unwrap_err().operation_error(),
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::DuplicateKey)
             );
             assert_eq!(scan_table_i32s(&mut trx, table_id).await, vec![0, 1, 2]);
@@ -6290,7 +6331,11 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                result.unwrap_err().operation_error(),
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::DuplicateKey)
             );
 
@@ -6415,7 +6460,11 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                result.unwrap_err().operation_error(),
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::LockUpgradeWouldBlock)
             );
             assert_eq!(callbacks, 0);
@@ -6471,7 +6520,10 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             let rendered = format!("{err:?}");
             assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
@@ -6511,7 +6563,10 @@ mod tests {
             );
 
             let err = scan_fut.await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             let rendered = format!("{err:?}");
             assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
@@ -6905,7 +6960,10 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                res.unwrap_err().operation_error(),
+                res.unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::NotSupported)
             );
             trx.rollback().await.unwrap();
@@ -7302,7 +7360,10 @@ mod tests {
             .await;
             trx.rollback().await.unwrap();
             assert!(
-                res.as_ref().is_err_and(|err| err.completion_error()
+                res.as_ref().is_err_and(|err| err
+                    .report()
+                    .downcast_ref::<CompletionErrorKind>()
+                    .copied()
                     == Some(CompletionErrorKind::Io(expected_error_kind))),
                 "expected insert-page reload failure, got {res:?}"
             );
@@ -7504,7 +7565,7 @@ mod tests {
 
             let err = trx.rollback().await.unwrap_err();
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ActiveTransactionDiscarded)
             );
         });
@@ -7748,7 +7809,10 @@ mod tests {
                 Ok(_) => panic!("empty read set should fail stream construction"),
                 Err(err) => err,
             };
-            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::InvalidDmlInput)
+            );
 
             let mut stream = trx
                 .stream_stmt()
@@ -7768,7 +7832,10 @@ mod tests {
                 Ok(_) => panic!("empty read set should fail after opt-out stream"),
                 Err(err) => err,
             };
-            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::InvalidDmlInput)
+            );
             trx.commit().await.unwrap();
         });
     }
@@ -7918,7 +7985,10 @@ mod tests {
                     Ok(_) => panic!("empty read set should fail stream construction"),
                     Err(err) => err,
                 };
-                assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+                assert_eq!(
+                    err.report().downcast_ref::<OperationError>().copied(),
+                    Some(OperationError::InvalidDmlInput)
+                );
                 trx.commit().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();
@@ -7936,7 +8006,10 @@ mod tests {
                     Ok(_) => panic!("invalid stream key shape should fail stream construction"),
                     Err(err) => err,
                 };
-                assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+                assert_eq!(
+                    err.report().downcast_ref::<OperationError>().copied(),
+                    Some(OperationError::InvalidDmlInput)
+                );
                 trx.commit().await.unwrap();
 
                 let mut trx = session.begin_trx().unwrap();

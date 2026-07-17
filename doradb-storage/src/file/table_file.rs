@@ -1,7 +1,10 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::table::TableMetadata;
-use crate::error::{DataIntegrityResult, Error, FileKind, InternalError, ResourceError, Result};
+use crate::error::{
+    CompletionErrorKind, CompletionResult, DataIntegrityResult, Error, FileKind, InternalError,
+    IoResult, ResourceError, ResourceResult, Result, RuntimeResult,
+};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -113,7 +116,7 @@ impl ActiveRoot {
 
     /// Build meta-block serialization view for the current active root.
     #[inline]
-    pub(crate) fn meta_block_ser_view(&self) -> DataIntegrityResult<MetaBlockSerView<'_>> {
+    pub(crate) fn meta_block_ser_view(&self) -> MetaBlockSerView<'_> {
         MetaBlockSerView::new(
             self.metadata.ser_view(),
             self.column_block_index_root,
@@ -139,7 +142,7 @@ impl TableFile {
         initial_size: usize,
         table_id: TableID,
         trunc: bool,
-    ) -> Result<Self> {
+    ) -> IoResult<Self> {
         debug_assert!(initial_size.is_multiple_of(COW_FILE_PAGE_SIZE));
         let file = CowFile::create(
             file_path,
@@ -152,7 +155,7 @@ impl TableFile {
     }
 
     #[inline]
-    pub(super) fn open(file_path: impl AsRef<str>, table_id: TableID) -> Result<Self> {
+    pub(super) fn open(file_path: impl AsRef<str>, table_id: TableID) -> IoResult<Self> {
         let file = CowFile::open(file_path, FileID::from(table_id.as_u64()), table_codec())?;
         Ok(TableFile { file })
     }
@@ -162,7 +165,7 @@ impl TableFile {
     pub(crate) async fn load_active_root_from_pool(
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<ActiveRoot> {
+    ) -> RuntimeResult<ActiveRoot> {
         self.file
             .load_active_root_from_pool(FileKind::TableFile, disk_pool)
             .await
@@ -380,7 +383,7 @@ impl MutableTableFile {
         &mut self,
         reachable: &BTreeSet<BlockID>,
     ) -> Result<usize> {
-        self.new_root.rebuild_alloc_map_from_reachable(reachable)
+        Ok(self.new_root.rebuild_alloc_map_from_reachable(reachable)?)
     }
 
     /// Commit the modification of table file.
@@ -397,7 +400,7 @@ impl MutableTableFile {
         self,
         root_ts: TrxID,
         try_delete_if_fail: bool,
-    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+    ) -> RuntimeResult<(Arc<TableFile>, Option<OldRoot>)> {
         let MutableTableFile {
             file: table_file,
             mut new_root,
@@ -414,7 +417,8 @@ impl MutableTableFile {
                 new_root,
                 write_barrier.as_cow_write_barrier(),
             )
-            .await;
+            .await
+            .attach("file_kind=table_file");
         drop(writer_claim);
 
         match publish_res {
@@ -472,7 +476,9 @@ impl MutableTableFile {
             });
         }
 
-        try_join_all(writes).await?;
+        try_join_all(writes)
+            .await
+            .map_err(|report| Error::from_completion_report(report, "persist table LWC blocks"))?;
 
         let root = self.root();
         let column_index = ColumnBlockIndex::new(
@@ -513,21 +519,27 @@ impl MutableTableFile {
 
 impl MutableCowFile for MutableTableFile {
     #[inline]
-    fn allocate_block(&mut self) -> Result<BlockID> {
+    fn allocate_block(&mut self) -> ResourceResult<BlockID> {
         allocate_cow_block(&mut self.new_root, "table file could not allocate block")
     }
 
     #[inline]
-    fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+    fn rollback_allocated_block(&mut self, block_id: BlockID) {
         self.new_root.rollback_allocated_block(block_id)
     }
 
     #[inline]
-    async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+    async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> CompletionResult<()> {
         let write_lease = self
             .write_barrier
             .as_cow_write_barrier()
-            .begin_write(self.file.sparse_file().file_id(), block_id)?;
+            .begin_write(self.file.sparse_file().file_id(), block_id)
+            .map_err(|report| {
+                CompletionErrorKind::from_internal(
+                    report,
+                    format!("begin table CoW write barrier: block_id={block_id}"),
+                )
+            })?;
         self.file
             .file()
             .write_block_with_lease(&self.background_writes, block_id, buf, write_lease)
@@ -603,12 +615,15 @@ fn column_block_index_invariant(message: impl Into<String>) -> Error {
 }
 
 #[inline]
-fn parse_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
+fn parse_table_super_block(buf: &[u8]) -> DataIntegrityResult<SuperBlock> {
     parse_super_block(buf, TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
 }
 
 #[inline]
-fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
+fn parse_table_meta_block(
+    page_id: BlockID,
+    buf: &[u8],
+) -> DataIntegrityResult<ParsedMeta<TableMeta>> {
     let payload = validate_block(buf, TABLE_META_BLOCK_SPEC).attach_with(|| {
         format!(
             "file={}, block=table_meta, block_id={page_id}",
@@ -635,7 +650,10 @@ fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<Tab
 }
 
 #[inline]
-fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMeta>) -> Result<()> {
+fn validate_table_root(
+    meta_block_id: BlockID,
+    parsed_meta: &ParsedMeta<TableMeta>,
+) -> DataIntegrityResult<()> {
     validate_active_meta_block_id(
         &parsed_meta.alloc_map,
         meta_block_id,
@@ -645,17 +663,17 @@ fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMet
 }
 
 #[inline]
-fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
-    let meta_block = root.meta_block_ser_view()?;
+fn build_table_meta_block(root: &ActiveRoot) -> ResourceResult<DirectBuf> {
+    let meta_block = root.meta_block_ser_view();
     let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
-        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
-            .attach(format!(
+        return Err(
+            Report::new(ResourceError::StorageFileCapacityExceeded).attach(format!(
                 "table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
                 max_payload_len(COW_FILE_PAGE_SIZE)
-            ))
-            .into());
+            )),
+        );
     }
     let meta_idx = write_block_header(meta_buf.as_bytes_mut(), TABLE_META_BLOCK_SPEC);
     let meta_idx = meta_block.ser(meta_buf.as_bytes_mut(), meta_idx);
@@ -665,14 +683,14 @@ fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
 }
 
 #[inline]
-fn build_table_super_block(root: &ActiveRoot) -> Result<DirectBuf> {
+fn build_table_super_block(root: &ActiveRoot) -> DirectBuf {
     let super_block = root.super_block_ser_view();
     let mut buf = DirectBuf::zeroed(SUPER_BLOCK_SIZE);
     let ser_len = super_block.ser_len();
-    if ser_len > SUPER_BLOCK_FOOTER_OFFSET {
-        // single super block cannot hold all data
-        unimplemented!("multiple pages are required to hold super data");
-    }
+    assert!(
+        ser_len <= SUPER_BLOCK_FOOTER_OFFSET,
+        "trusted table super-block fields exceed one slot: serialized_bytes={ser_len}, slot_payload_bytes={SUPER_BLOCK_FOOTER_OFFSET}"
+    );
     let ser_idx = super_block.ser(buf.as_bytes_mut(), 0);
     debug_assert_eq!(ser_idx, ser_len);
 
@@ -683,7 +701,7 @@ fn build_table_super_block(root: &ActiveRoot) -> Result<DirectBuf> {
     };
     let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
     debug_assert_eq!(ser_idx, SUPER_BLOCK_SIZE);
-    Ok(buf)
+    buf
 }
 
 #[inline]
@@ -704,16 +722,29 @@ mod tests {
         PoolRole, ReadonlyBufferPool, global_readonly_pool_scope, table_readonly_pool,
     };
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use crate::error::InternalError;
-    use crate::error::{DataIntegrityError, Error, FileKind};
+    use crate::error::{DataIntegrityError, Error, ErrorKind, FileKind, RuntimeError};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::{BlockKey, build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
     use crate::quiescent::QuiescentBox;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
+    use std::any::Any;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn panic_message(panic: Box<dyn Any + Send>) -> String {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                panic
+                    .downcast_ref::<&'static str>()
+                    .map(|message| (*message).to_owned())
+            })
+            .expect("invariant panic must carry a string diagnostic")
+    }
 
     fn accept_any_page(
         _page: &[u8],
@@ -748,7 +779,7 @@ mod tests {
         mutable_file
             .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool)
             .await?;
-        mutable_file.commit(ts, false).await
+        Ok(mutable_file.commit(ts, false).await?)
     }
 
     #[test]
@@ -870,25 +901,33 @@ mod tests {
                 disk_pool.global_pool().clone(),
             );
             let allocated_before = mutable.root().alloc_map.allocated();
-            let err = mutable
-                .rollback_allocated_block(inherited_root)
-                .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::CowFileAllocationInvariant)
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                mutable.rollback_allocated_block(inherited_root)
+            }))
+            .unwrap_err();
+            let message = panic_message(panic);
+            assert!(
+                message.contains("CoW rollback requires current unpublished allocation"),
+                "{message}"
             );
+            assert!(message.contains(&format!("block_id={inherited_root}")));
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
 
             let fresh_block = mutable.allocate_block().unwrap();
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before + 1);
-            mutable.rollback_allocated_block(fresh_block).unwrap();
+            mutable.rollback_allocated_block(fresh_block);
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
 
-            let err = mutable.rollback_allocated_block(fresh_block).unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::CowFileAllocationInvariant)
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                mutable.rollback_allocated_block(fresh_block)
+            }))
+            .unwrap_err();
+            let message = panic_message(panic);
+            assert!(
+                message.contains("CoW rollback requires current unpublished allocation"),
+                "{message}"
             );
+            assert!(message.contains(&format!("block_id={fresh_block}")));
 
             drop(mutable);
             drop(table_file);
@@ -1187,7 +1226,15 @@ mod tests {
     }
 
     fn assert_table_meta_corruption(err: Error, page_id: BlockID, expected: DataIntegrityError) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::FileRootAccess)
+        );
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected)
+        );
         let report = format!("{err:?}");
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains("table_meta"), "{report}");

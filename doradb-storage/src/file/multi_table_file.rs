@@ -1,7 +1,10 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot};
-use crate::error::{Error, FileKind, InternalError, IoError, ResourceError, Result};
+use crate::error::{
+    CompletionResult, DataIntegrityResult, Error, FileKind, InternalError, IoResult, ResourceError,
+    ResourceResult, Result, RuntimeResult,
+};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -174,7 +177,7 @@ impl MultiTableFile {
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
-    ) -> Result<MultiTableFileOpenOutcome> {
+    ) -> IoResult<MultiTableFileOpenOutcome> {
         let file_path = file_path.as_ref();
         let file = match CowFile::create(
             file_path,
@@ -188,13 +191,7 @@ impl MultiTableFile {
                     MultiTableFile { file },
                 )));
             }
-            Err(err)
-                if err
-                    .report()
-                    .downcast_ref::<IoError>()
-                    .copied()
-                    .is_some_and(|err| err.kind() == IoErrorKind::AlreadyExists) =>
-            {
+            Err(err) if err.current_context().kind() == IoErrorKind::AlreadyExists => {
                 CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?
             }
             Err(err) => return Err(err),
@@ -210,7 +207,7 @@ impl MultiTableFile {
     pub(crate) async fn load_active_root_from_pool(
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<MultiTableActiveRoot> {
+    ) -> RuntimeResult<MultiTableActiveRoot> {
         self.file
             .load_active_root_from_pool(FileKind::CatalogMultiTableFile, disk_pool)
             .await
@@ -372,8 +369,9 @@ impl MutableMultiTableFile {
     /// Reserve the final meta block for a catalog checkpoint publication.
     #[inline]
     pub(crate) fn reserve_publish_meta_block(&mut self) -> Result<BlockID> {
-        self.new_root
-            .reserve_publish_meta_block("multi-table publish root could not allocate meta block")
+        Ok(self
+            .new_root
+            .reserve_publish_meta_block("multi-table publish root could not allocate meta block")?)
     }
 
     /// Reserve the final meta block and clear the displaced active meta block.
@@ -420,12 +418,14 @@ impl MutableMultiTableFile {
         &mut self,
         reachable: &BTreeSet<BlockID>,
     ) -> Result<usize> {
-        self.new_root.rebuild_alloc_map_from_reachable(reachable)
+        Ok(self.new_root.rebuild_alloc_map_from_reachable(reachable)?)
     }
 
     /// Commit mutable root by writing meta block then ping-pong super block.
     #[inline]
-    pub(crate) async fn commit(self) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+    pub(crate) async fn commit(
+        self,
+    ) -> RuntimeResult<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
         let MutableMultiTableFile {
             file,
             new_root,
@@ -435,7 +435,8 @@ impl MutableMultiTableFile {
         let publish_res = file
             .file()
             .publish_root(&background_writes, new_root, CowWriteBarrier::Disabled)
-            .await;
+            .await
+            .attach("file_kind=catalog.mtb");
         drop(writer_claim);
         let old_root = publish_res?;
         Ok((file, old_root))
@@ -445,7 +446,7 @@ impl MutableMultiTableFile {
     #[inline]
     pub(crate) async fn commit_prepared(
         self,
-    ) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+    ) -> RuntimeResult<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
         let MutableMultiTableFile {
             file,
             new_root,
@@ -455,7 +456,8 @@ impl MutableMultiTableFile {
         let publish_res = file
             .file()
             .publish_prepared_root(&background_writes, new_root, CowWriteBarrier::Disabled)
-            .await;
+            .await
+            .attach("file_kind=catalog.mtb");
         drop(writer_claim);
         let old_root = publish_res?;
         Ok((file, old_root))
@@ -464,7 +466,7 @@ impl MutableMultiTableFile {
 
 impl MutableCowFile for MutableMultiTableFile {
     #[inline]
-    fn allocate_block(&mut self) -> Result<BlockID> {
+    fn allocate_block(&mut self) -> ResourceResult<BlockID> {
         allocate_cow_block(
             &mut self.new_root,
             "multi-table file could not allocate block",
@@ -472,12 +474,12 @@ impl MutableCowFile for MutableMultiTableFile {
     }
 
     #[inline]
-    fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+    fn rollback_allocated_block(&mut self, block_id: BlockID) {
         self.new_root.rollback_allocated_block(block_id)
     }
 
     #[inline]
-    async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+    async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> CompletionResult<()> {
         self.file
             .file()
             .write_block(&self.background_writes, block_id, buf)
@@ -503,37 +505,31 @@ fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
 }
 
 #[inline]
-fn parse_multi_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
+fn parse_multi_table_super_block(buf: &[u8]) -> DataIntegrityResult<SuperBlock> {
     parse_super_block(buf, MULTI_TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
 }
 
 #[inline]
-fn build_multi_table_super_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
-    Ok(build_super_block(
-        root.slot_no,
-        root.root_ts,
-        root.meta_block_id,
-    ))
+fn build_multi_table_super_block(root: &MultiTableActiveRoot) -> DirectBuf {
+    build_super_block(root.slot_no, root.root_ts, root.meta_block_id)
 }
 
 #[inline]
 fn parse_multi_table_meta_block(
     page_id: BlockID,
     buf: &[u8],
-) -> Result<ParsedMeta<MultiTableMetaBlock>> {
-    let payload = validate_block(buf, MULTI_TABLE_META_BLOCK_SPEC)
-        .attach_with(|| {
-            format!(
-                "file={}, block=multi-table-meta, block_id={page_id}",
-                FileKind::CatalogMultiTableFile
-            )
-        })
-        .map_err(Error::from)?;
-    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|report| {
-        Error::from(report.attach(format!(
+) -> DataIntegrityResult<ParsedMeta<MultiTableMetaBlock>> {
+    let payload = validate_block(buf, MULTI_TABLE_META_BLOCK_SPEC).attach_with(|| {
+        format!(
             "file={}, block=multi-table-meta, block_id={page_id}",
             FileKind::CatalogMultiTableFile
-        )))
+        )
+    })?;
+    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|report| {
+        report.attach(format!(
+            "file={}, block=multi-table-meta, block_id={page_id}",
+            FileKind::CatalogMultiTableFile
+        ))
     })?;
 
     Ok(ParsedMeta {
@@ -550,7 +546,7 @@ fn parse_multi_table_meta_block(
 fn validate_multi_table_root(
     meta_block_id: BlockID,
     parsed_meta: &ParsedMeta<MultiTableMetaBlock>,
-) -> Result<()> {
+) -> DataIntegrityResult<()> {
     validate_active_meta_block_id(
         &parsed_meta.alloc_map,
         meta_block_id,
@@ -560,16 +556,16 @@ fn validate_multi_table_root(
 }
 
 #[inline]
-fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
+fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> ResourceResult<DirectBuf> {
     let meta_block = root.meta_block_ser_view();
     let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
-        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
-            .attach(format!(
+        return Err(
+            Report::new(ResourceError::StorageFileCapacityExceeded).attach(format!(
                 "multi-table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
                 max_payload_len(COW_FILE_PAGE_SIZE)
-            ))
-            .into());
+            )),
+        );
     }
     let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let idx = write_block_header(buf.as_bytes_mut(), MULTI_TABLE_META_BLOCK_SPEC);
@@ -621,7 +617,7 @@ fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID
 mod tests {
     use super::*;
     use crate::buffer::global_readonly_pool_scope;
-    use crate::error::{DataIntegrityError, Error};
+    use crate::error::{DataIntegrityError, Error, ErrorKind, RuntimeError};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::test_block_id;
     use crate::file::{build_test_fs, build_test_fs_in};
@@ -646,7 +642,15 @@ mod tests {
         page_id: BlockID,
         expected: DataIntegrityError,
     ) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::FileRootAccess)
+        );
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected)
+        );
         let report = format!("{err:?}");
         assert!(report.contains("catalog.mtb"), "{report}");
         assert!(report.contains("multi-table-meta"), "{report}");

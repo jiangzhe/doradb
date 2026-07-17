@@ -18,7 +18,7 @@ use error_stack::{Report, ResultExt};
 use flume::{Receiver, SendTimeoutError, Sender, TryRecvError};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::io::{ErrorKind as IoErrorKind, Read, Result as IoResult};
+use std::io::{ErrorKind as IoErrorKind, Read, Result as StdIoResult};
 use std::mem::take;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::resume_unwind;
@@ -188,7 +188,7 @@ impl RedoLogSegment {
     /// Build validated segment metadata by reading only the fixed super-block area.
     #[inline]
     pub(crate) fn from_descriptor(descriptor: RedoLogFileDescriptor) -> Result<Self> {
-        Self::from_path(descriptor.path, descriptor.file_seq)
+        Self::from_path(descriptor.path, descriptor.seq)
     }
 
     /// Build validated segment metadata for a path and expected sequence.
@@ -899,7 +899,7 @@ struct RedoReadCompletion {
     file_seq: u32,
     offset: usize,
     expected_bytes: usize,
-    actual_bytes: IoResult<usize>,
+    actual_bytes: StdIoResult<usize>,
     buf: DirectBuf,
 }
 
@@ -907,20 +907,26 @@ impl RedoReadCompletion {
     #[inline]
     fn validate(self) -> Result<(u32, usize, DirectBuf)> {
         let actual_bytes = self.actual_bytes.map_err(|err| {
-            Error::from(IoError::report(err).attach(format!(
-                "redo direct read failed: file_seq={:08x}, offset={}",
-                self.file_seq, self.offset
-            )))
+            Error::from(
+                Report::new(IoError::from(err.kind()))
+                    .attach(format!("{err}"))
+                    .attach(format!(
+                        "redo direct read failed: file_seq={:08x}, offset={}",
+                        self.file_seq, self.offset
+                    )),
+            )
         })?;
         if actual_bytes != self.expected_bytes {
-            return Err(
-                IoError::report_unexpected_eof(actual_bytes, self.expected_bytes)
-                    .attach(format!(
-                        "redo direct read short read: file_seq={:08x}, offset={}",
-                        self.file_seq, self.offset
-                    ))
-                    .into(),
-            );
+            return Err(Report::new(IoError::from(IoErrorKind::UnexpectedEof))
+                .attach(format!(
+                    "unexpected eof: actual_bytes={actual_bytes}, expected_bytes={}",
+                    self.expected_bytes
+                ))
+                .attach(format!(
+                    "redo direct read short read: file_seq={:08x}, offset={}",
+                    self.file_seq, self.offset
+                ))
+                .into());
         }
         Ok((self.file_seq, self.offset, self.buf))
     }
@@ -982,7 +988,7 @@ impl RedoReadAheadWorker {
 
     #[inline]
     fn run(&mut self) -> Result<bool> {
-        let backend = StorageBackend::new(self.read_depth)?;
+        let backend = StorageBackend::setup(self.read_depth)?;
         let mut driver = SubmissionDriver::new(backend);
         for segment in take(&mut self.segments) {
             if self.stopped() {
@@ -1626,7 +1632,7 @@ fn open_direct_segment_file(segment: &RedoLogSegment) -> Result<SparseFile> {
             )),
         )
     })?;
-    SparseFile::open(path, UNTRACKED_FILE_ID)
+    Ok(SparseFile::open(path, UNTRACKED_FILE_ID)?)
 }
 
 #[inline]
@@ -1701,11 +1707,11 @@ fn append_block_payload(
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
-    use crate::error::{ErrorKind, IoError, RuntimeError};
+    use crate::error::{ErrorKind, IoError, IoResult, RuntimeError};
     use crate::id::{RowID, TableID, TrxID};
     use crate::io::{
-        BackendResult, BackendToken, DirectBuf, IOBackendErrorPhase, IOBackendFailure,
-        IOBackendQueueState, IOBuf, SubmittedIoCleanup,
+        BackendToken, DirectBuf, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState, IOBuf,
+        StdIoResult, SubmittedIoCleanup,
     };
     use crate::log::block_group::LogBlockGroup;
     use crate::log::format::{
@@ -1797,7 +1803,7 @@ mod tests {
         file.write_all(&bytes).unwrap();
         file.flush().unwrap();
         RedoLogFileDescriptor {
-            file_seq,
+            seq: file_seq,
             path: path.to_path_buf(),
         }
     }
@@ -1875,10 +1881,10 @@ mod tests {
 
             assert_eq!(err.kind(), ErrorKind::Runtime);
             assert_eq!(
-                err.downcast_ref::<RuntimeError>().copied(),
+                err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::BackgroundSpawn)
             );
-            assert!(err.downcast_ref::<IoError>().is_some());
+            assert!(err.report().downcast_ref::<IoError>().is_some());
             let output = format!("{err:?}");
             assert!(output.contains(phase), "report={output}");
             assert_eq!(output.matches("thread_name=Redo-ReadAhead").count(), 1);
@@ -1886,15 +1892,15 @@ mod tests {
     }
 
     struct WaitErrorBackend {
-        max_events: usize,
+        io_depth: usize,
         inflight: VecDeque<BackendToken>,
     }
 
     impl WaitErrorBackend {
         #[inline]
-        fn new(max_events: usize) -> Self {
+        fn new(io_depth: usize) -> Self {
             Self {
-                max_events,
+                io_depth,
                 inflight: VecDeque::new(),
             }
         }
@@ -1905,12 +1911,16 @@ mod tests {
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
 
-        fn max_events(&self) -> usize {
-            self.max_events
+        fn setup(io_depth: usize) -> IoResult<Self> {
+            Ok(Self::new(io_depth))
+        }
+
+        fn io_depth(&self) -> usize {
+            self.io_depth
         }
 
         fn new_submit_batch(&self) -> Self::SubmitBatch {
-            VecDeque::with_capacity(self.max_events)
+            VecDeque::with_capacity(self.io_depth)
         }
 
         fn new_events(&self) -> Self::Events {}
@@ -1927,7 +1937,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> BackendResult<SubmitAttempt> {
+        ) -> IoResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
             let Some(submitted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
@@ -1945,7 +1955,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             _min_nr: usize,
-        ) -> BackendResult<Vec<(BackendToken, IoResult<usize>)>> {
+        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             Err(IOBackendFailure::report(
                 "recovery_test",
                 IOBackendErrorPhase::Wait,
@@ -2023,7 +2033,7 @@ mod tests {
     async fn assert_stream_corrupted(stream: &mut RedoLogStream) {
         let err = stream.try_next().await.unwrap_err();
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted),
             "{err:?}"
         );
@@ -2045,7 +2055,7 @@ mod tests {
 
     fn assert_read_after_failed(err: Error) {
         assert_eq!(
-            err.downcast_ref::<InternalError>().copied(),
+            err.report().downcast_ref::<InternalError>().copied(),
             Some(InternalError::Generic),
             "{err:?}"
         );
@@ -2079,7 +2089,7 @@ mod tests {
         RedoGroupStartExtension::new(payload_len, 1, min_cts, max_cts)
             .unwrap()
             .ser(direct_buf.as_bytes_mut(), RedoBlockHeader::SIZE);
-        patch_redo_block_checksum(direct_buf.as_bytes_mut()).unwrap();
+        patch_redo_block_checksum(direct_buf.as_bytes_mut());
         direct_buf
     }
 
@@ -2093,7 +2103,7 @@ mod tests {
         let payload_end = payload_start + header.payload_len_usize();
         assert!(payload_end < block.capacity());
         block.as_bytes_mut()[payload_end] = 1;
-        patch_redo_block_checksum(block.as_bytes_mut()).unwrap();
+        patch_redo_block_checksum(block.as_bytes_mut());
     }
 
     fn bad_checksum_final_continuation() -> DirectBuf {
@@ -2114,7 +2124,7 @@ mod tests {
             .ser(block.as_bytes_mut(), RedoBlockHeader::SIZE);
         let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
         block.as_bytes_mut()[payload_start..payload_start + start_capacity].fill(1);
-        patch_redo_block_checksum(block.as_bytes_mut()).unwrap();
+        patch_redo_block_checksum(block.as_bytes_mut());
         block
     }
 
@@ -2289,7 +2299,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted)
         );
     }
@@ -2323,7 +2333,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted)
         );
     }
@@ -2603,7 +2613,7 @@ mod tests {
 
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
         });
@@ -2627,7 +2637,7 @@ mod tests {
             RedoGroupStartExtension::new(payload_len, blocks.len(), TrxID::new(1), TrxID::new(1))
                 .unwrap()
                 .ser(blocks[0].as_bytes_mut(), RedoBlockHeader::SIZE);
-            patch_redo_block_checksum(blocks[0].as_bytes_mut()).unwrap();
+            patch_redo_block_checksum(blocks[0].as_bytes_mut());
 
             let dir = tempfile::tempdir().unwrap();
             let file_path = dir.path().join("test.log");
@@ -2641,7 +2651,7 @@ mod tests {
 
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let err = stream.try_next().await.unwrap_err();
@@ -2666,7 +2676,7 @@ mod tests {
 
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
         });

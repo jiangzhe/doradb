@@ -1,7 +1,7 @@
 use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
 use crate::error::{ConfigError, ConfigResult, Error, Result};
 use crate::file::fs::{FileSystem, StorageIOWorkerBuilder, build_file_system};
-use error_stack::{ResultExt, ensure};
+use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
@@ -54,19 +54,14 @@ impl FileSystemConfig {
 
     #[inline]
     fn validate_parts(self) -> ConfigResult<(PathBuf, String, usize)> {
-        (|| {
-            ensure!(
-                validate_catalog_file_name(&self.catalog_file_name),
-                ConfigError::InvalidCatalogFileName
+        if !validate_catalog_file_name(&self.catalog_file_name) {
+            return Err(
+                Report::new(ConfigError::InvalidCatalogFileName).attach(format!(
+                    "catalog file name must be a plain `.mtb` file name: {}",
+                    self.catalog_file_name
+                )),
             );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "catalog file name must be a plain `.mtb` file name: {}",
-                self.catalog_file_name
-            )
-        })?;
+        }
         let data_dir = validate_data_dir(&self.data_dir)
             .attach_with(|| format!("invalid data_dir: {}", self.data_dir.display()))?;
         Ok((data_dir, self.catalog_file_name, self.io_depth))
@@ -94,29 +89,58 @@ impl Default for FileSystemConfig {
 
 #[inline]
 fn validate_data_dir(data_dir: &Path) -> ConfigResult<PathBuf> {
-    (|| {
-        ensure!(
-            !data_dir.as_os_str().is_empty(),
-            ConfigError::PathMustNotBeEmpty
+    if data_dir.as_os_str().is_empty() {
+        return Err(
+            Report::new(ConfigError::PathMustNotBeEmpty).attach("data_dir must not be empty")
         );
-        Ok(())
-    })()
-    .attach_with(|| "data_dir must not be empty".to_string())?;
+    }
     path_to_utf8(data_dir).attach_with(|| format!("invalid data_dir: {}", data_dir.display()))?;
-    (|| {
-        ensure!(
-            !data_dir
-                .components()
-                .any(|component| matches!(component, PathComponent::ParentDir)),
-            ConfigError::PathMustNotContainParentTraversal
+    if data_dir
+        .components()
+        .any(|component| matches!(component, PathComponent::ParentDir))
+    {
+        return Err(
+            Report::new(ConfigError::PathMustNotContainParentTraversal).attach(format!(
+                "data_dir must not contain parent traversal: {}",
+                data_dir.display()
+            )),
         );
-        Ok(())
-    })()
-    .attach_with(|| {
-        format!(
-            "data_dir must not contain parent traversal: {}",
-            data_dir.display()
-        )
-    })?;
+    }
     Ok(data_dir.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_config_report(err: Report<ConfigError>, expected: ConfigError, snippets: &[&str]) {
+        assert_eq!(err.current_context(), &expected);
+        let output = format!("{err:?}");
+        for snippet in snippets {
+            assert!(output.contains(snippet), "missing `{snippet}` in {output}");
+        }
+    }
+
+    #[test]
+    fn test_file_system_config_validation_reports_details() {
+        let err = FileSystemConfig::default()
+            .catalog_file_name("catalog.bin")
+            .validate_parts()
+            .unwrap_err();
+        assert_config_report(
+            err,
+            ConfigError::InvalidCatalogFileName,
+            &["plain `.mtb` file name", "catalog.bin"],
+        );
+
+        let err = validate_data_dir(Path::new("")).unwrap_err();
+        assert_config_report(err, ConfigError::PathMustNotBeEmpty, &["must not be empty"]);
+
+        let err = validate_data_dir(Path::new("../data")).unwrap_err();
+        assert_config_report(
+            err,
+            ConfigError::PathMustNotContainParentTraversal,
+            &["parent traversal", "../data"],
+        );
+    }
 }

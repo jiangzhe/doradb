@@ -22,7 +22,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::session::{Session, SessionRegistry};
 use crate::trx::sys::TransactionSystem;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
-use error_stack::{Report, ResultExt, ensure};
+use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, Listener, listener};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
@@ -121,10 +121,11 @@ impl EngineLifecycle {
             let word = self.state.load(Ordering::Acquire);
             let state = EngineLifecycleState::try_from(word & LIFECYCLE_STATE_MASK)
                 .unwrap_or_else(|state| panic!("invalid engine lifecycle state: {state}"));
-            ensure!(
-                state == EngineLifecycleState::Running,
-                LifecycleError::Shutdown
-            );
+            if state != EngineLifecycleState::Running {
+                return Err(Report::new(LifecycleError::Shutdown).attach(format!(
+                    "engine lifecycle admission is closed: state={state:?}"
+                )));
+            }
             assert!(
                 Self::active_admissions_from_word(word) < MAX_ACTIVE_ADMISSIONS,
                 "engine admission count overflow"
@@ -489,7 +490,9 @@ impl Drop for Engine {
                 "event=engine_lifecycle component=engine action=shutdown_finish result=error mode=drop error={}",
                 err
             );
-            if err.lifecycle_error() == Some(LifecycleError::ShutdownBusy) {
+            if err.report().downcast_ref::<LifecycleError>().copied()
+                == Some(LifecycleError::ShutdownBusy)
+            {
                 // Fatal owner-drop violations still need to stop background
                 // workers, but the owner registry cannot be dropped while
                 // leaked runtime refs still retain component guards. This keeps
@@ -764,7 +767,7 @@ impl EngineConfig {
     #[inline]
     async fn build_inner(self) -> Result<Engine> {
         let resolved = self.resolve_storage_paths()?;
-        resolved.validate_marker_if_present()?;
+        let marker_was_present = resolved.validate_marker_if_present()?;
         // Startup prefers a small, durable-safety-focused preflight over trying
         // to exhaust every possible path conflict up front. It is acceptable for
         // later setup steps to fail, but those failures must not clobber durable
@@ -811,7 +814,13 @@ impl EngineConfig {
         builder.build::<Catalog>(catalog_cfg).await?;
         builder.build::<TransactionSystem>(trx_cfg).await?;
 
-        resolved.persist_marker_if_missing()?;
+        if marker_was_present {
+            if !resolved.validate_marker_if_present()? {
+                resolved.persist_marker()?;
+            }
+        } else {
+            resolved.persist_marker()?;
+        }
         let registry = builder.finish();
         let engine_poisoner = registry.dependency::<EnginePoisoner>();
         let catalog = registry.dependency::<Catalog>();
@@ -877,6 +886,19 @@ mod tests {
     use tempfile::TempDir;
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
+
+    #[test]
+    fn test_engine_lifecycle_rejected_admission_reports_state() {
+        let lifecycle = EngineLifecycle::new();
+        lifecycle.close_admission();
+        let err = match lifecycle.admit() {
+            Ok(_) => panic!("admission should be rejected after lifecycle closure"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context(), &LifecycleError::Shutdown);
+        let output = format!("{err:?}");
+        assert!(output.contains("state=ShuttingDown"), "{output}");
+    }
 
     fn test_engine_config_for(root: &Path) -> EngineConfig {
         EngineConfig::default()
@@ -972,7 +994,7 @@ mod tests {
 
             assert_eq!(err.kind(), ErrorKind::Runtime, "worker={worker}, err={err}");
             assert_eq!(
-                err.downcast_ref::<RuntimeError>().copied(),
+                err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::BackgroundSpawn),
                 "worker={worker}, err={err}"
             );
@@ -1027,7 +1049,7 @@ mod tests {
         assert!(hook.failed(), "initial redo-header write was not injected");
         assert_eq!(err.kind(), ErrorKind::Fatal);
         assert_eq!(
-            err.completion_error(),
+            err.report().downcast_ref::<CompletionErrorKind>().copied(),
             Some(CompletionErrorKind::Fatal(FatalError::RedoWrite))
         );
         let output = format!("{err:?}");
@@ -1081,7 +1103,7 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
-            err.downcast_ref::<RuntimeError>().copied(),
+            err.report().downcast_ref::<RuntimeError>().copied(),
             Some(RuntimeError::BackgroundSpawn)
         );
         let output = format!("{err:?}");
@@ -1132,7 +1154,7 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
-            err.downcast_ref::<RuntimeError>().copied(),
+            err.report().downcast_ref::<RuntimeError>().copied(),
             Some(RuntimeError::BackgroundSpawn)
         );
         let output = format!("{err:?}");
@@ -1175,7 +1197,10 @@ mod tests {
     #[inline]
     fn assert_runtime_unavailable_after_shutdown(err: Error) {
         assert_eq!(err.kind(), ErrorKind::Lifecycle);
-        assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::Shutdown)
+        );
     }
 
     #[test]
@@ -1549,9 +1574,17 @@ mod tests {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
             };
+            assert_eq!(err.kind(), ErrorKind::Runtime);
             assert_eq!(
-                err.resource_error(),
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::BufferPoolInit)
+            );
+            assert_eq!(
+                err.report().downcast_ref::<ResourceError>().copied(),
                 Some(ResourceError::BufferPoolSizeTooSmall)
+            );
+            assert!(
+                format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem")
             );
             assert!(!marker_path.exists());
 
@@ -1566,6 +1599,36 @@ mod tests {
                 .unwrap();
             drop(engine);
             assert!(marker_path.exists());
+        });
+    }
+
+    #[test]
+    fn test_readonly_buffer_pool_init_retains_resource_error_and_diagnostic() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
+            let err = match test_engine_config_for(root.path())
+                .file(FileSystemConfig::default().readonly_buffer_size(1usize))
+                .build()
+                .await
+            {
+                Ok(_) => panic!("undersized readonly buffer pool should fail"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), ErrorKind::Runtime);
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::BufferPoolInit)
+            );
+            assert_eq!(
+                err.report().downcast_ref::<ResourceError>().copied(),
+                Some(ResourceError::BufferPoolSizeTooSmall)
+            );
+            assert!(
+                format!("{err:?}").contains("buffer_pool_type=readonly, buffer_pool_role=disk")
+            );
+            assert!(!marker_path.exists());
         });
     }
 
@@ -1633,8 +1696,11 @@ mod tests {
                 Err(err) => err,
             };
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
-            assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ShutdownBusy)
+            );
+            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
 
             let err = match engine_ref.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
@@ -1704,8 +1770,11 @@ mod tests {
                 Err(err) => err,
             };
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
-            assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ShutdownBusy)
+            );
+            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
@@ -1727,8 +1796,11 @@ mod tests {
                 Err(err) => err,
             };
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
-            assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ShutdownBusy)
+            );
+            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
 
             trx.rollback().await.unwrap();
             drop(session);
@@ -1750,8 +1822,11 @@ mod tests {
                 Err(err) => err,
             };
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
-            assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ShutdownBusy)
+            );
+            assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
 
             let err = trx
                 .lock_table(table_id, LockMode::Shared)
@@ -1797,7 +1872,7 @@ mod tests {
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
                     .shutdown()
-                    .map_err(|err| err.lifecycle_error());
+                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
                 done_tx.send(result).unwrap();
             });
 
@@ -1830,7 +1905,7 @@ mod tests {
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
                     .shutdown()
-                    .map_err(|err| err.lifecycle_error());
+                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
                 done_tx.send(result).unwrap();
             });
 
@@ -1863,7 +1938,10 @@ mod tests {
                 started_tx.send(()).unwrap();
                 let err = smol::block_on(session.wait_for_gc_horizon_after(TrxID::new(u64::MAX)))
                     .unwrap_err();
-                assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+                assert_eq!(
+                    err.report().downcast_ref::<LifecycleError>().copied(),
+                    Some(LifecycleError::Shutdown)
+                );
             });
             started_rx.recv().unwrap();
             engine.shutdown().unwrap();
@@ -1884,7 +1962,7 @@ mod tests {
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
                     .shutdown()
-                    .map_err(|err| err.lifecycle_error());
+                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
                 done_tx.send(result).unwrap();
             });
 
@@ -1921,7 +1999,7 @@ mod tests {
             let shutdown_handle = scope.spawn(move || {
                 let result = shutdown_engine
                     .shutdown()
-                    .map_err(|err| err.lifecycle_error());
+                    .map_err(|err| err.report().downcast_ref::<LifecycleError>().copied());
                 done_tx.send(result).unwrap();
             });
 
@@ -1951,7 +2029,7 @@ mod tests {
             let err = session.close().await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
             assert_eq!(
-                err.lifecycle_error(),
+                err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::ExistingTransaction)
             );
             assert!(session.in_trx().unwrap());
@@ -1978,7 +2056,7 @@ mod tests {
             let err = session.in_trx().unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
             assert_eq!(
-                err.lifecycle_error(),
+                err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::SessionUnavailable)
             );
             engine.shutdown().unwrap();
@@ -2161,7 +2239,7 @@ mod tests {
                 Err(err) => err,
             };
             let kind = err.kind();
-            let lifecycle_error = err.lifecycle_error();
+            let lifecycle_error = err.report().downcast_ref::<LifecycleError>().copied();
 
             trx.rollback().await.unwrap();
             assert!(!session.in_trx().unwrap());
@@ -2320,9 +2398,11 @@ mod tests {
 
                 match (shutdown_res, new_ref_res) {
                     (Ok(()), Err(err))
-                        if err.lifecycle_error() == Some(LifecycleError::Shutdown) => {}
+                        if err.report().downcast_ref::<LifecycleError>().copied()
+                            == Some(LifecycleError::Shutdown) => {}
                     (Err(err), Ok(engine_ref))
-                        if err.lifecycle_error() == Some(LifecycleError::ShutdownBusy) =>
+                        if err.report().downcast_ref::<LifecycleError>().copied()
+                            == Some(LifecycleError::ShutdownBusy) =>
                     {
                         drop(engine_ref);
                         engine.shutdown().unwrap();

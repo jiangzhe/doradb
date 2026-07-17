@@ -13,6 +13,7 @@ mod libaio_abi;
 #[cfg(feature = "libaio")]
 mod libaio_backend;
 
+use crate::error::IoResult;
 use crate::obs;
 use flume::{Receiver, SendError, Sender};
 use std::collections::VecDeque;
@@ -558,7 +559,7 @@ where
     ) -> Self {
         let events = backend.new_events();
         let submit_batch = backend.new_submit_batch();
-        let capacity = backend.max_events();
+        let capacity = backend.io_depth();
         SubmissionDriver {
             backend,
             submitted_quarantine: SubmittedIoQuarantine::new(),
@@ -672,7 +673,7 @@ where
     /// Submits staged operations up to backend capacity and returns the count
     /// accepted by the backend.
     #[inline]
-    pub(crate) fn submit_ready(&mut self) -> BackendResult<SubmitAttempt> {
+    pub(crate) fn submit_ready(&mut self) -> IoResult<SubmitAttempt> {
         if self.staged_slots.is_empty() {
             return Ok(SubmitAttempt::Noop);
         }
@@ -716,7 +717,7 @@ where
     pub(crate) fn backoff_submit_retry_or_progress_error(
         &mut self,
         retry: SubmitRetry,
-    ) -> BackendResult<()> {
+    ) -> IoResult<()> {
         self.submit_backoff.backoff_or_progress_error(
             retry,
             IOBackendQueueState::submit(self.staged_slots.len(), self.pending_len()),
@@ -728,7 +729,7 @@ where
     /// If a previous backend wait returned several completions, this returns
     /// the next buffered completion without entering the backend wait path.
     #[inline]
-    pub(crate) fn wait_at_least_one(&mut self) -> BackendResult<CompletedSubmission<S>> {
+    pub(crate) fn wait_at_least_one(&mut self) -> IoResult<CompletedSubmission<S>> {
         match self.completed.pop_front() {
             Some(completed) => Ok(completed),
             None => {
@@ -899,7 +900,7 @@ pub(crate) fn align_to_sector_size(len: usize) -> usize {
 mod tests {
     use super::*;
     use std::fs::metadata;
-    use std::io::{Error as StdIoError, Result as IoResult};
+    use std::io::Error as StdIoError;
     use std::mem::MaybeUninit;
     use std::num::NonZeroUsize;
     use std::os::unix::fs::MetadataExt;
@@ -915,7 +916,7 @@ mod tests {
 
     impl StorageBackendFileIdentity {
         #[inline]
-        pub(crate) fn from_path(path: impl AsRef<Path>) -> IoResult<Self> {
+        pub(crate) fn from_path(path: impl AsRef<Path>) -> StdIoResult<Self> {
             let md = metadata(path)?;
             Ok(Self {
                 dev: md.dev(),
@@ -924,7 +925,7 @@ mod tests {
         }
 
         #[inline]
-        fn from_fd(fd: RawFd) -> IoResult<Self> {
+        fn from_fd(fd: RawFd) -> StdIoResult<Self> {
             // SAFETY: `fstat` initializes the output struct on success and does
             // not take ownership of the borrowed raw fd.
             unsafe {
@@ -1111,7 +1112,7 @@ mod tests {
     }
 
     struct DriverBackend {
-        max_events: usize,
+        io_depth: usize,
         submit_results: VecDeque<SubmitAttempt>,
         inflight: VecDeque<BackendToken>,
         panic_on_wait: bool,
@@ -1119,9 +1120,9 @@ mod tests {
 
     impl DriverBackend {
         #[inline]
-        fn new(max_events: usize) -> Self {
+        fn new(io_depth: usize) -> Self {
             DriverBackend {
-                max_events,
+                io_depth,
                 submit_results: VecDeque::new(),
                 inflight: VecDeque::new(),
                 panic_on_wait: false,
@@ -1130,11 +1131,11 @@ mod tests {
 
         #[inline]
         fn with_submit_outcomes(
-            max_events: usize,
+            io_depth: usize,
             submit_results: impl Into<VecDeque<SubmitAttempt>>,
         ) -> Self {
             DriverBackend {
-                max_events,
+                io_depth,
                 submit_results: submit_results.into(),
                 inflight: VecDeque::new(),
                 panic_on_wait: false,
@@ -1142,9 +1143,9 @@ mod tests {
         }
 
         #[inline]
-        fn wait_panics(max_events: usize) -> Self {
+        fn wait_panics(io_depth: usize) -> Self {
             DriverBackend {
-                max_events,
+                io_depth,
                 submit_results: VecDeque::new(),
                 inflight: VecDeque::new(),
                 panic_on_wait: true,
@@ -1157,12 +1158,16 @@ mod tests {
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
 
-        fn max_events(&self) -> usize {
-            self.max_events
+        fn setup(io_depth: usize) -> IoResult<Self> {
+            Ok(Self::new(io_depth))
+        }
+
+        fn io_depth(&self) -> usize {
+            self.io_depth
         }
 
         fn new_submit_batch(&self) -> Self::SubmitBatch {
-            VecDeque::with_capacity(self.max_events)
+            VecDeque::with_capacity(self.io_depth)
         }
 
         fn new_events(&self) -> Self::Events {}
@@ -1179,7 +1184,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> BackendResult<SubmitAttempt> {
+        ) -> IoResult<SubmitAttempt> {
             let allowed = limit.min(batch.len());
             let submit_result = self.submit_results.pop_front().unwrap_or_else(|| {
                 NonZeroUsize::new(allowed).map_or(SubmitAttempt::Noop, SubmitAttempt::Submitted)
@@ -1204,7 +1209,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(!self.panic_on_wait, "backend wait must not be called");
             assert!(
                 self.inflight.len() >= min_nr,
@@ -1278,7 +1283,7 @@ mod tests {
     }
 
     struct CleanupBackend {
-        max_events: usize,
+        io_depth: usize,
         submit_results: VecDeque<usize>,
         inflight: VecDeque<BackendToken>,
         prepared_drops: Arc<AtomicUsize>,
@@ -1289,14 +1294,14 @@ mod tests {
     impl CleanupBackend {
         #[inline]
         fn new(
-            max_events: usize,
+            io_depth: usize,
             submit_results: impl Into<VecDeque<usize>>,
             cleanup: SubmittedIoCleanup,
             prepared_drops: Arc<AtomicUsize>,
             cleanup_submitted: Arc<AtomicUsize>,
         ) -> Self {
             Self {
-                max_events,
+                io_depth,
                 submit_results: submit_results.into(),
                 inflight: VecDeque::new(),
                 prepared_drops,
@@ -1311,12 +1316,22 @@ mod tests {
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
 
-        fn max_events(&self) -> usize {
-            self.max_events
+        fn setup(io_depth: usize) -> IoResult<Self> {
+            Ok(Self::new(
+                io_depth,
+                VecDeque::new(),
+                SubmittedIoCleanup::DropAfterBackend,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ))
+        }
+
+        fn io_depth(&self) -> usize {
+            self.io_depth
         }
 
         fn new_submit_batch(&self) -> Self::SubmitBatch {
-            VecDeque::with_capacity(self.max_events)
+            VecDeque::with_capacity(self.io_depth)
         }
 
         fn new_events(&self) -> Self::Events {}
@@ -1336,7 +1351,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> BackendResult<SubmitAttempt> {
+        ) -> IoResult<SubmitAttempt> {
             let allowed = limit.min(batch.len());
             let scripted = self.submit_results.pop_front().unwrap_or(allowed);
             let submit_count = scripted.min(allowed);
@@ -1356,7 +1371,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             _min_nr: usize,
-        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             panic!("cleanup tests must not wait for completions")
         }
 

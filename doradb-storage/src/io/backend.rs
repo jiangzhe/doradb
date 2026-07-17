@@ -1,4 +1,4 @@
-use crate::error::IoError;
+use crate::error::{IoError, IoResult};
 use error_stack::Report;
 use libc::{EAGAIN, EBUSY};
 use std::fmt;
@@ -15,9 +15,6 @@ pub(crate) const DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT: Duration = Duration::fro
 
 /// Standard IO result returned by backend completion paths.
 pub(crate) type StdIoResult<T> = StdResult<T, StdIoError>;
-
-/// Result returned by backend submit and wait progress paths.
-pub(crate) type BackendResult<T> = StdResult<T, Report<IoError>>;
 
 /// Transient submit pressure reported by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +223,7 @@ impl SubmitRetryBackoff {
         &mut self,
         retry: SubmitRetry,
         queue_state: IOBackendQueueState,
-    ) -> BackendResult<()> {
+    ) -> IoResult<()> {
         let now = Instant::now();
         let started_at = match self.started_at {
             Some(started_at) => started_at,
@@ -638,13 +635,15 @@ impl IOBackendStatsHandle {
 ///
 /// This keeps libaio-specific `*mut *mut iocb` layout and future io_uring
 /// submission queue layout out of the IO scheduler.
-pub(crate) trait IOBackend {
+pub(crate) trait IOBackend: Sized {
     type Prepared;
     type SubmitBatch;
     type Events;
 
-    /// Returns maximum concurrent submitted operations supported by this backend.
-    fn max_events(&self) -> usize;
+    /// Set up one backend with the requested concurrent IO depth.
+    fn setup(io_depth: usize) -> IoResult<Self>;
+    /// Returns the configured concurrent IO depth.
+    fn io_depth(&self) -> usize;
     /// Allocates one empty backend-owned submit batch.
     fn new_submit_batch(&self) -> Self::SubmitBatch;
     /// Allocates one backend-owned completion-event buffer.
@@ -661,13 +660,13 @@ pub(crate) trait IOBackend {
         &mut self,
         batch: &mut Self::SubmitBatch,
         limit: usize,
-    ) -> BackendResult<SubmitAttempt>;
+    ) -> IoResult<SubmitAttempt>;
     /// Waits for at least `min_nr` completions and returns worker tokens plus results.
     fn wait_at_least(
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
-    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>>;
+    ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>>;
     /// Best-effort backend cleanup for already-submitted IO after a fatal
     /// progress failure.
     fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup;

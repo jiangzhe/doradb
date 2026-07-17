@@ -1,6 +1,6 @@
 use crate::conf::consts::SWAP_FILE_SUFFIX;
 use crate::error::{ConfigError, ConfigResult};
-use error_stack::{Report, ResultExt, ensure};
+use error_stack::{Report, ResultExt};
 use std::path::Path;
 
 /// Return whether a catalog file name is a plain `.mtb` file name.
@@ -27,37 +27,30 @@ pub(crate) fn validate_log_file_stem(file_stem: &str) -> bool {
 /// Validate a configured swap-file path before storage-root resolution.
 pub(crate) fn validate_swap_file_path_candidate(path: impl AsRef<Path>) -> ConfigResult<()> {
     let path = path.as_ref();
-    (|| {
-        ensure!(
-            !path.as_os_str().is_empty(),
-            ConfigError::PathMustNotBeEmpty
-        );
-        Ok(())
-    })()
-    .attach_with(|| format!("swap-file path must not be empty: {}", path.display()))?;
+    if path.as_os_str().is_empty() {
+        return Err(Report::new(ConfigError::PathMustNotBeEmpty).attach(format!(
+            "swap-file path must not be empty: {}",
+            path.display()
+        )));
+    }
     let path_str =
         path_to_utf8(path).attach_with(|| format!("invalid swap-file path: {}", path.display()))?;
-    (|| {
-        ensure!(
-            path_str.ends_with(SWAP_FILE_SUFFIX),
-            ConfigError::PathMustUseRequiredSuffix
+    if !path_str.ends_with(SWAP_FILE_SUFFIX) {
+        return Err(
+            Report::new(ConfigError::PathMustUseRequiredSuffix).attach(format!(
+                "swap-file path must end with `{SWAP_FILE_SUFFIX}`: {}",
+                path.display()
+            )),
         );
-        Ok(())
-    })()
-    .attach_with(|| {
-        format!(
-            "swap-file path must end with `{SWAP_FILE_SUFFIX}`: {}",
-            path.display()
-        )
-    })?;
-    (|| {
-        ensure!(
-            path.file_name().is_some(),
-            ConfigError::PathMustResolveToFile
+    }
+    if path.file_name().is_none() {
+        return Err(
+            Report::new(ConfigError::PathMustResolveToFile).attach(format!(
+                "swap-file path must resolve to a file: {}",
+                path.display()
+            )),
         );
-        Ok(())
-    })()
-    .attach_with(|| format!("swap-file path must resolve to a file: {}", path.display()))?;
+    }
     Ok(())
 }
 

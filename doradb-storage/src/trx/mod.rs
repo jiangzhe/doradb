@@ -1214,14 +1214,14 @@ impl FailedPrecommitReason {
     fn completion_report(self, message: impl Into<String>) -> Report<CompletionErrorKind> {
         match self {
             FailedPrecommitReason::Fatal(reason) => {
-                CompletionErrorKind::report_fatal(reason, message)
+                CompletionErrorKind::from_fatal(Report::new(reason), message)
             }
-            FailedPrecommitReason::Resource(reason) => Report::new(reason)
-                .change_context(CompletionErrorKind::Resource(reason))
-                .attach(message.into()),
-            FailedPrecommitReason::Shutdown => Report::new(LifecycleError::Shutdown)
-                .change_context(CompletionErrorKind::Lifecycle(LifecycleError::Shutdown))
-                .attach(message.into()),
+            FailedPrecommitReason::Resource(reason) => {
+                CompletionErrorKind::from_resource(Report::new(reason), message)
+            }
+            FailedPrecommitReason::Shutdown => {
+                CompletionErrorKind::from_lifecycle(Report::new(LifecycleError::Shutdown), message)
+            }
         }
     }
 }
@@ -3138,7 +3138,10 @@ pub(crate) mod tests {
                 .await;
             let err = res.unwrap_err();
 
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
             with_transaction_inner(&trx, "check_statement_rollback_effects", |inner| {
                 let table_redo = inner.effects.redo.dml.get(&TableID::new(12)).unwrap();
                 assert!(table_redo.rows.contains_key(&RowID::new(23)));
@@ -3221,7 +3224,10 @@ pub(crate) mod tests {
                 })
                 .await;
             assert_eq!(
-                res.unwrap_err().operation_error(),
+                res.unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::NotSupported)
             );
 
@@ -3259,7 +3265,7 @@ pub(crate) mod tests {
 
             let err = try_acquire_transaction_lock(&mut trx, data, LockMode::Shared).unwrap_err();
             assert_eq!(
-                err.operation_error(),
+                err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockConversionNotSupported)
             );
             assert_eq!(lock_entry_count(&engine, owner), 1);
@@ -3278,7 +3284,7 @@ pub(crate) mod tests {
             let err =
                 try_acquire_transaction_lock(&mut trx, metadata, LockMode::Exclusive).unwrap_err();
             assert_eq!(
-                err.operation_error(),
+                err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockUpgradeWouldBlock)
             );
             engine
@@ -3876,7 +3882,7 @@ pub(crate) mod tests {
                 Err(err) => err,
             };
             assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
+                err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RedoWrite)
             );
         });
@@ -3898,11 +3904,11 @@ pub(crate) mod tests {
             };
             assert_eq!(err.kind(), crate::error::ErrorKind::Lifecycle);
             assert_eq!(
-                err.lifecycle_error(),
+                err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::TransactionDiscarded)
             );
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ActiveTransactionDiscarded)
             );
 
@@ -3914,11 +3920,11 @@ pub(crate) mod tests {
             let err = trx.commit().await.unwrap_err();
             assert_eq!(err.kind(), crate::error::ErrorKind::Lifecycle);
             assert_eq!(
-                err.lifecycle_error(),
+                err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::TransactionDiscarded)
             );
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ActiveTransactionDiscarded)
             );
 
@@ -3930,11 +3936,11 @@ pub(crate) mod tests {
             let err = trx.rollback().await.unwrap_err();
             assert_eq!(err.kind(), crate::error::ErrorKind::Lifecycle);
             assert_eq!(
-                err.lifecycle_error(),
+                err.report().downcast_ref::<LifecycleError>().copied(),
                 Some(LifecycleError::TransactionDiscarded)
             );
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ActiveTransactionDiscarded)
             );
         });

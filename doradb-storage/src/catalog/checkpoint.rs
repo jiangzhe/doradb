@@ -3,7 +3,9 @@ use crate::catalog::{
     Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_table,
     is_user_table,
 };
-use crate::error::{DataIntegrityError, Error, ErrorKind, FatalError, Result};
+use crate::error::{
+    CompletionErrorKind, DataIntegrityError, DataIntegrityResult, FatalError, Result,
+};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
@@ -384,7 +386,12 @@ impl Catalog {
                     })
                 }
                 Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
-                Err(err) if err.kind() == ErrorKind::Io => {
+                Err(err)
+                    if matches!(
+                        err.report().downcast_ref::<CompletionErrorKind>(),
+                        Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
+                    ) =>
+                {
                     Err(trx_sys.poison_engine(FatalError::CheckpointWrite).into())
                 }
                 Err(err) => Err(err),
@@ -602,7 +609,7 @@ enum CatalogCheckpointTxnAction {
 fn drop_table_has_catalog_table_delete(
     table_id: TableID,
     dml: &BTreeMap<TableID, TableDML>,
-) -> Result<bool> {
+) -> DataIntegrityResult<bool> {
     let Some(tables_dml) = dml.get(&TABLE_ID_TABLES) else {
         return Ok(false);
     };
@@ -611,38 +618,33 @@ fn drop_table_has_catalog_table_delete(
             continue;
         };
         if key.index_no != 0 {
-            return Err(malformed_catalog_drop_table_redo(format!(
-                "catalog.tables delete key is not primary key: drop_table_id={table_id}, index_no={}, primary_key_index_no=0",
-                key.index_no
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "malformed drop-table redo: table_id={table_id}, index_no={}, expected_index_no=0",
+                    key.index_no
+                )),
+            );
         }
         if key.vals.len() != 1 {
-            return Err(malformed_catalog_drop_table_redo(format!(
-                "catalog.tables delete key value count {} does not match primary key column count 1: drop_table_id={table_id}",
-                key.vals.len()
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "malformed drop-table redo: table_id={table_id}, key_value_count={}, expected_count=1",
+                    key.vals.len()
+                )),
+            );
         }
         let Some(deleted_table_id) = key.vals[0].as_u64() else {
-            return Err(malformed_catalog_drop_table_redo(format!(
-                "catalog.tables delete key type mismatch: drop_table_id={table_id}, index_no={}",
-                key.index_no
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "malformed drop-table redo: table_id={table_id}, key value is not u64"
+                )),
+            );
         };
         if deleted_table_id == table_id.as_u64() {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-#[inline]
-fn malformed_catalog_drop_table_redo(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "malformed catalog redo for drop table: {}",
-            message.into()
-        ))
-        .into()
 }
 
 #[cfg(test)]
@@ -675,13 +677,10 @@ mod tests {
         dml
     }
 
-    fn assert_malformed_drop_table_redo(err: Error, expected: &str) {
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+    fn assert_malformed_drop_table_redo(err: Report<DataIntegrityError>, expected: &str) {
+        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
         let report = format!("{err:?}");
-        assert!(report.contains("malformed catalog redo"), "{report}");
+        assert!(report.contains("malformed drop-table redo"), "{report}");
         assert!(report.contains(expected), "{report}");
     }
 
@@ -718,7 +717,7 @@ mod tests {
         let dml = catalog_tables_delete_dml(SelectKey::new(1, vec![Val::from(table_id.as_u64())]));
         let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
 
-        assert_malformed_drop_table_redo(err, "key is not primary key");
+        assert_malformed_drop_table_redo(err, "index_no=1");
     }
 
     #[test]
@@ -730,7 +729,7 @@ mod tests {
         ));
         let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
 
-        assert_malformed_drop_table_redo(err, "key value count 2");
+        assert_malformed_drop_table_redo(err, "key_value_count=2");
     }
 
     #[test]
@@ -739,7 +738,7 @@ mod tests {
         let dml = catalog_tables_delete_dml(SelectKey::new(0, vec![Val::from(42u32)]));
         let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
 
-        assert_malformed_drop_table_redo(err, "key type mismatch");
+        assert_malformed_drop_table_redo(err, "key value is not u64");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use super::{
     RedoGroupWriteMeta, RedoLogFile, RedoLogSealMetadata,
 };
 use crate::conf::TrxSysConfig;
-use crate::error::{CompletionErrorKind, FatalError};
+use crate::error::{CompletionErrorKind, FatalError, FatalResult};
 use crate::id::TrxID;
 use crate::io::{DirectBuf, IOBackend, IOBuf, SubmitAttempt};
 use crate::log::format::{
@@ -121,7 +121,7 @@ impl LogFileSealer {
     pub(super) fn prepare_prefix_seal(
         &mut self,
         mut log_file: RedoLogFile,
-    ) -> StdResult<LogWriteSubmission, FatalError> {
+    ) -> FatalResult<LogWriteSubmission> {
         let accumulator = match log_file.seal_metadata.take() {
             // Recovery attaches accepted-prefix metadata to the file so startup
             // sealing uses the same ordered prefix barrier as normal rotation.
@@ -168,7 +168,8 @@ impl LogFileSealer {
     ) -> StdResult<(), FatalError> {
         debug_assert_eq!(write_driver.pending_len(), 0);
         debug_assert_eq!(write_driver.submitted_len(), 0);
-        let (fd, offset, buf) = build_sealed_header_write(target, self.accumulator)?;
+        let (fd, offset, buf) = build_sealed_header_write(target, self.accumulator)
+            .map_err(|report| *report.current_context())?;
         let (submission, _completion) = LogWriteSubmission::header(fd, offset, buf);
         if let Err(submission) = write_driver.push_write(submission) {
             submission.fail_unsubmitted_header(FatalError::RedoWrite);
@@ -187,7 +188,8 @@ impl LogFileSealer {
             owner: _,
             kind,
             buf,
-            poison,
+            poison: _,
+            failure,
         } = write_driver
             .wait_at_least_one()
             .map_err(|_| FatalError::RedoWrite)?;
@@ -198,9 +200,10 @@ impl LogFileSealer {
             unreachable!("active file seal submits exactly one header write");
         };
         drop(buf.expect("active file seal header write must return a buffer"));
-        if let Some(reason) = poison {
-            completion.complete(Err(CompletionErrorKind::report_fatal(
-                reason,
+        if let Some(report) = failure {
+            let reason = *report.current_context();
+            completion.complete(Err(CompletionErrorKind::from_fatal(
+                report,
                 "redo sealed super-block write failed",
             )));
             return Err(reason);
@@ -235,6 +238,7 @@ impl LogFileSealer {
             kind,
             buf,
             poison,
+            failure: _,
         } = write_driver
             .wait_at_least_one()
             .map_err(|_| FatalError::RedoSync)?;
@@ -250,7 +254,7 @@ impl LogFileSealer {
 fn prepare_seal_submission(
     log_file: RedoLogFile,
     accumulator: LogFileSealAccumulator,
-) -> StdResult<LogWriteSubmission, FatalError> {
+) -> FatalResult<LogWriteSubmission> {
     if let Some(file_seq) = accumulator.file_seq {
         debug_assert_eq!(file_seq, log_file.file_seq());
     }
@@ -264,7 +268,7 @@ fn prepare_seal_submission(
 fn build_sealed_header_write(
     target: LogFileSealTarget,
     accumulator: LogFileSealAccumulator,
-) -> StdResult<(RawFd, usize, DirectBuf), FatalError> {
+) -> FatalResult<(RawFd, usize, DirectBuf)> {
     let slot_no = inactive_slot_no(target.open_super_block.slot_no);
     let sealed = RedoSuperBlock::sealed_from_open(
         &target.open_super_block,
@@ -272,9 +276,17 @@ fn build_sealed_header_write(
         accumulator.durable_end_offset,
         accumulator.redo_range(),
     )
-    .map_err(|_| FatalError::RedoWrite)?;
+    .map_err(|report| {
+        report
+            .change_context(FatalError::RedoWrite)
+            .attach("build sealed redo super-block")
+    })?;
     let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
-    serialize_redo_super_block(buf.as_bytes_mut(), &sealed).map_err(|_| FatalError::RedoWrite)?;
+    serialize_redo_super_block(buf.as_bytes_mut(), &sealed).map_err(|report| {
+        report
+            .change_context(FatalError::RedoWrite)
+            .attach("serialize sealed redo super-block")
+    })?;
     Ok((target.fd, slot_offset(slot_no), buf))
 }
 

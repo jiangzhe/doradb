@@ -24,9 +24,9 @@ waiters without introducing a completion error domain. Internal invariant
 reports encountered by the migration are reclassified from production
 reachability evidence, and `InternalError::Generic` is replaced by a specific
 domain failure unless an explicit tracked TODO records why that is not yet
-feasible. The program has three ordered acceptance phases: foundations and
-infrastructure, stateful storage and semantic consumers, then orchestration and
-public convergence.
+feasible. The program has four ordered acceptance phases: typed infrastructure
+suppliers, completion transport and infrastructure closure, stateful storage
+and semantic consumers, then orchestration and public convergence.
 
 ## Context
 
@@ -72,7 +72,7 @@ detail. [C1], [C4], [C17], [D1], [U8]
 The crate currently declares 35 top-level modules in `lib.rs`. A production
 source scan finds 14 modules importing the public crate-level `Result`, one
 central module defining it, and 20 modules that currently use typed, neutral,
-or infallible contracts. This lexical inventory identifies audit candidates;
+or infallible contracts. This snapshot identifies review candidates;
 it does not itself prove that a use is wrong or that an unlisted module is
 complete. Each conclusion requires inspection of the producer, complete
 implementation set, transport path, and semantic consumer. [C1], [C2], [D1]
@@ -83,7 +83,8 @@ table, catalog, transaction, session, engine, and recovery are included so
 lower typed reports are not immediately erased by their callers. Every module
 must end with either a migration result or a recorded confirmation that its
 existing boundary is reasonable. The rollout remains bottom-up and is grouped
-into exactly three RFC acceptance phases. [U1], [U2], [U3], [D1]
+into exactly four RFC acceptance phases so typed supplier migration and
+completion transport have separate acceptance gates. [U1], [U2], [U11], [D1]
 
 Issue Labels:
 
@@ -190,10 +191,11 @@ Issue Labels:
 - [U2] The RFC scope was expanded to every module containing top-level errors;
   implementation must either convert each site or verify and confirm that it
   is reasonable.
-- [U3] The migration program must use three phases instead of the initially
-  discussed five-phase split.
-- [U4] The responsibility-first proposal, three-phase interpretation, and use
-  of both related backlogs as design inputs were explicitly approved.
+- [U3] An earlier design round reduced the initially discussed five-phase
+  split to three broad acceptance phases.
+- [U4] The responsibility-first proposal, the earlier three-phase
+  interpretation, and use of both related backlogs as design inputs were
+  explicitly approved.
 - [U5] Completion transport was identified as a semantic-free asynchronous
   bridge that should stack on the real report rather than duplicate its domain
   in `CompletionErrorKind` variants.
@@ -207,14 +209,20 @@ Issue Labels:
 - [U8] `BackendResult` should be renamed to `IoResult` and moved from the IO
   backend module to the central error module.
 - [U9] The concrete cloneable representation used to materialize completion
-  reports remains a Phase 1 choice; the RFC must not assume erased frames can
-  be cloned generically, and Phase 1 cannot complete until the selected design
-  satisfies the required physical-frame downcast tests.
+  reports remains a completion-transport phase choice; the RFC must not assume
+  erased frames can be cloned generically, and that phase cannot complete
+  until the selected design satisfies the required physical-frame downcast
+  tests.
 - [U10] Removing `report_error(Error, ...)` is a migration-order dependency:
-  Phase 1 must first, or atomically, narrow every existing caller to retain a
-  typed report or explicit typed branch. This includes compiler-required
-  transaction completion paths, while the broader transaction audit remains in
-  Phase 3.
+  Phase 1 must first narrow every existing caller to retain a typed report or
+  explicit typed branch before Phase 2 removes the semantic transport. This
+  includes compiler-required transaction completion paths, while the broader
+  transaction audit remains in the final orchestration phase.
+- [U11] Phase 1 task design established that foundation verification is too
+  thin as an independent task, while combining typed supplier migration with
+  completion transport makes one oversized task. The approved revision makes
+  those dependency slices separate canonical RFC phases, producing four
+  ordered phases in total.
 
 ### Source Backlogs
 
@@ -350,7 +358,7 @@ publish completion. Direct bridge-only reports are invalid by construction.
 
 `Completion<T>` stores the bridge value and fanout clones only its Arc. A
 consumer that needs an owned error-stack report asks the bridge to materialize
-one. The concrete materialization mechanism is a Phase 1 choice. It may use a
+one. The concrete materialization mechanism is a Phase 2 choice. It may use a
 closed cloneable replay schema, per-source snapshot, or equivalent checked
 design, but it must define explicit clone-and-reconstruction behavior for every
 main-domain context and structured attachment supported across completion; it
@@ -376,15 +384,17 @@ fallback, or semantic accessor. Public conversion derives `ErrorKind` from the
 nearest real main-domain context below the bridge and adds the public context
 once. Internal and test consumers inspect the real `FatalError`, `IoError`,
 `DataIntegrityError`, or other frames instead of matching a completion variant.
-Before or atomically with removing the current semantic `report_*` helpers and
-`report_error(Error, ...)`, Phase 1 narrows every caller contract that currently
-supplies a converged public `Error`. Each producer instead returns the real
-typed report or an explicit typed branch, and the completion owner captures
-that value directly. This compiler-driven slice includes readonly and evictable
-buffer completion plus transaction completion paths; it does not pull the
-broader transaction semantic audit into Phase 1. No compatibility helper that
-captures public `Error` may remain after the slice is integrated. [D1], [C1],
-[C6], [C11], [C14], [U5], [U6], [U10]
+Phase 1 first narrows every caller contract that currently supplies a converged
+public `Error`. Each producer instead returns the real typed report or an
+explicit typed branch, and a temporary typed adapter may preserve that report
+under the existing completion transport. This compiler-driven slice includes
+readonly and evictable buffer completion plus transaction completion paths; it
+does not pull the broader transaction semantic audit into Phase 1. Phase 2 then
+removes the semantic `report_*` helpers and `CompletionErrorKind`, and each
+completion owner captures the typed report directly in the bridge. No helper
+that captures public `Error` may remain after Phase 1, and no semantic
+completion compatibility adapter may remain after Phase 2. [D1], [C1], [C6],
+[C11], [C14], [U5], [U6], [U10], [U11]
 
 Fatal classification is still made only by the durability, rollback,
 checkpoint, catalog, or poison policy owner that can determine safe
@@ -411,8 +421,8 @@ an automatic retain decision. Each producer receives one of these outcomes:
    Any lower source frames remain attached.
 3. A genuinely recoverable construction or ownership contract for which no
    more accurate domain exists may retain Internal, but it uses a specific
-   `InternalError` variant and its audit record explains both production
-   reachability and why Internal is the semantic owner.
+   `InternalError` variant and its implementation evidence explains both
+   production reachability and why Internal is the semantic owner.
 
 `InternalError::Generic` is never a preferred outcome. Each touched producer
 must replace it with an existing specific domain variant, introduce a specific
@@ -426,74 +436,62 @@ conversion fallbacks are removed so a TODO cannot be hidden at a shared helper.
 The `Generic` enum variant is removed when no annotated producer remains.
 [C1], [C16], [U7]
 
-The deterministic audit rejects every unannotated production
-`InternalError::Generic` reference and reports every annotated residue as
-tracked migration debt. Test-only state mutation or a synthetic implementation
-cannot be the sole reason to keep an impossible production failure recoverable,
-and a test hook should inject the specific source-domain error exercised by its
+Implementation review must identify every production
+`InternalError::Generic` reference and treat every annotated residue as tracked
+migration debt. Test-only state mutation or a synthetic implementation cannot
+be the sole reason to keep an impossible production failure recoverable, and a
+test hook should inject the specific source-domain error exercised by its
 workflow. [D1], [D16], [B1], [B2], [U7]
 
 ### Exhaustive Module Verdict
 
-The audit covers all 35 modules declared by `lib.rs` plus the public facade.
-The following is the starting classification, not a pre-approved final
-allowlist. Each named module receives an item-level audit record and a final
-`migrated`, `verified`, or `convergence-confirmed` verdict. [C2], [U2]
+The migration reviews all 35 modules declared by `lib.rs` plus the public
+facade. The following is the starting classification, not a pre-approved final
+verdict. Each named module must reach a reviewed typed, verified, or
+convergence-confirmed outcome. [C2], [U2]
 
 | Starting state | Modules | Required outcome |
 | --- | --- | --- |
 | Central foundation | `error` | Preserve exhaustive typed/public conversions, define the canonical `IoResult`, replace semantic completion kinds with the Arc-backed bridge contract, and remove Generic convenience/fallback conversion paths. |
-| Typed, neutral, or infallible baseline | `bitmap`, `id`, `component`, `compression`, `engine_poison`, `free_list`, `latch`, `layout`, `lock`, `map`, `memcmp`, `notify`, `obs`, `ptr`, `quiescent`, `row`, `runtime`, `serde`, `stats`, `thread` | Verify the production call chains and record why no public convergence is needed. Audit callers of these modules so their typed reports are not immediately erased. |
+| Typed, neutral, or infallible baseline | `bitmap`, `id`, `component`, `compression`, `engine_poison`, `free_list`, `latch`, `layout`, `lock`, `map`, `memcmp`, `notify`, `obs`, `ptr`, `quiescent`, `row`, `runtime`, `serde`, `stats`, `thread` | Verify the production call chains and why no public convergence is needed. Review callers of these modules so their typed reports are not immediately erased. |
 | Likely intentional convergence with private-site audit | `engine`, `lwc`, `session`, `value` | Confirm public facade, external-trait, and genuinely mixed sites; narrow any private item that does not satisfy an allowed reason. For `value` and similar shared public types, confirm that the public trait is a thin adapter and internal callers use the canonical typed operation. |
 | Substantial migration candidates | `buffer`, `catalog`, `conf`, `file`, `index`, `io`, `log`, `recovery`, `table`, `trx` | Separate native producers from forwarding and orchestration, narrow signatures, remove round trips, and justify every remaining crate-level result. |
 | Public facade | `lib.rs` | Preserve the public exports while ensuring internal modules do not use the facade as a convenience error set. |
 
-The final audit record for each allowed convergence item includes its stable
-item identity, producer/forwarder/convergence role, possible native domains,
-semantic owner, justification category, and required classification/source
-tests. An external-trait entry also identifies its canonical crate-private
-typed operation and the audited internal caller set. Temporary migration
-adapters identify their removal phase and are not allowed in the final Phase 3
-baseline. [D1], [D10], [U2]
+For each allowed convergence item, implementation review establishes its role,
+possible native domains, semantic owner, and classification/source tests. A
+public external-trait adapter must identify and delegate to its canonical
+crate-private typed operation, and reusable internal callers must use that
+operation directly. Temporary migration adapters are removed by their owning
+later phase and are not allowed in the final Phase 4 source. [D1], [D10], [U2],
+[U11]
 
-For each touched `InternalError` producer, the module audit additionally
-records its reachability evidence and assertion, reclassification, or specific
+For each touched `InternalError` producer, implementation review establishes
+its reachability evidence and assertion, reclassification, or specific
 Internal-retention outcome. A remaining Generic producer is not an approved
 boundary verdict; it is tracked debt linked from its mandatory source TODO.
 [D1], [D16], [U7]
 
-### Enforcement
+### Verification During Migration
 
-The program adds a deterministic repository check backed by an explicit
-allowlist of approved production convergence sites. The check must detect new
-or stale crate-level `Error`/`Result` imports, signatures, constructors, and
-domain-to-public conversions in `doradb-storage/src`, while distinguishing
-central definitions, public facade code, tests, and explicitly approved
-external-trait or mixed-domain items. External-trait audit records additionally
-prevent their public adapters from becoming the default internal conversion
-path when a typed operation is available. It must fail standard repository
-validation when an unclassified production site appears. [U2], [U4], [D9],
-[D12], [C8]
+While error boundaries are changing, the program relies on compiler fallout,
+focused classification/source tests, strict linting, and direct source review
+instead of a maintained item inventory or convergence allowlist. Reviews must
+still reject public-error round trips, public adapters used as internal
+convenience paths, unowned broad results, Generic convenience constructors or
+catch-all mappings, and untracked production Generic producers. [U2], [U4],
+[D9], [D12], [C8], [C16]
 
-The check also rejects capture of public `Error`/`ErrorKind`, direct
-construction of a bridge without a typed canonical report, semantic matching
-on completion bridge variants, and any new completion domain enum that
-duplicates main error domains. It rejects Generic convenience constructors,
-catch-all mappings to `InternalError::Generic`, and every production Generic
-producer without the required adjacent tracked TODO. [U5], [U6], [U7], [C1],
-[C14], [C16]
+The central `IoResult` definition, absence of `BackendResult`, typed completion
+capture, and removal of semantic completion matching remain behavioral and
+source-shape acceptance requirements of their owning phases. They do not
+require a persistent phase-spanning checker while signatures and ownership
+boundaries are still moving. [C1], [C14], [C17], [U5], [U6], [U8]
 
-The check reserves `IoResult` for the central `Report<IoError>` alias. It
-rejects `BackendResult`, a second alias for the same storage-domain result, and
-local aliasing of raw `std::io::Result` as `IoResult`; raw backend payloads use
-`StdIoResult` or the explicit standard-library path. [C1], [C17], [U8]
-
-The exact representation may be a structured standalone inventory or stable
-item annotations, and the implementation may integrate with an existing
-repository audit tool or add a focused tool. This is a phase-local tooling
-choice; documentation-only enforcement is not an acceptable final result.
-Line-number-only allowlists are also rejected because unrelated edits would
-make them unstable. [D10], [D12]
+After all four phases stabilize, a separate follow-up may evaluate whether a
+deterministic audit tool provides enough regression value to justify its
+maintenance cost. This RFC does not require such a tool, inventory, allowlist,
+or standard-validation gate for implementation completion. [D10], [D12]
 
 ### Compatibility and Scope Boundaries
 
@@ -514,16 +512,19 @@ error-set framework, broad public API changes, unrelated storage algorithm
 refactors, or conversion of reachable corruption/resource/runtime failures
 into panics. [D1], [D16], [U4], [U7]
 
-### Three-Phase Tracking Model
+### Four-Phase Tracking Model
 
-The implementation uses exactly three ordered RFC acceptance phases. A phase
-is a dependency and acceptance gate, not a requirement to hide the work in one
-oversized patch. Downstream planning may create bounded supporting task docs
-inside a phase; the phase's canonical task doc tracks integration and closure,
-and all supporting work must be linked before the phase is marked complete.
-Later phases may add compiler-required adapters while an earlier contract is
-changing, but may not independently redesign or bypass an unfinished supplier
-boundary. [U3], [D1], [D10]
+The implementation uses exactly four ordered RFC acceptance phases. Typed
+supplier contracts and completion transport are separate canonical gates:
+Phase 1 may retain only explicitly tracked typed completion adapters, and Phase
+2 removes them while closing the infrastructure boundary. A phase is a
+dependency and acceptance gate, not a requirement to hide the work in one
+oversized patch. Downstream planning may still create bounded supporting task
+docs inside a phase; the phase's canonical task doc tracks integration and
+closure, and all supporting work must be linked before the phase is marked
+complete. Later phases may add compiler-required adapters while an earlier
+contract is changing, but may not independently redesign or bypass an
+unfinished supplier boundary. [U11], [D1], [D10]
 
 ## Alternatives Considered
 
@@ -586,19 +587,18 @@ boundary. [U3], [D1], [D10]
   redesign a prerequisite. [U4], [D9]
 - References: [D1], [C3], [C6], [C9], [U4]
 
-### Audit-Only Migration with Documented Broad Seams
+### Mechanical Narrowing with Documented Broad Seams
 
 - Summary: convert obvious single-domain helpers, retain existing broad
-  crate-owned traits, and document remaining public results after manual
-  review.
+  crate-owned traits, and document remaining public results without tracing
+  their complete producer and caller responsibilities.
 - Analysis: this minimizes churn and most closely implements a mechanical
-  migrate-or-confirm pass. It does not prevent a broad trait or convenience
-  conversion from reintroducing the same debt, and review-only enforcement can
-  drift as modules evolve. [C5], [C6], [C9], [C10]
-- Why Not Chosen: the stated goal is to enforce clear boundaries, not only
-  produce a one-time inventory. The selected deterministic check and targeted
-  trait rule provide that enforcement without the wholesale redesign above.
-  [U2], [U4]
+  migration. It leaves broad traits and convenience conversions in place
+  without establishing whether they own genuine convergence. [C5], [C6], [C9],
+  [C10]
+- Why Not Chosen: the selected design requires responsibility-driven producer
+  and caller review plus focused classification/source tests, without making a
+  continuously maintained audit inventory part of the migration. [U2], [U4]
 - References: [D1], [D12], [U2], [U4]
 
 ### Original Four-Module Task
@@ -614,17 +614,36 @@ boundary. [U3], [D1], [D10]
   verify conclusions. [U1], [U2]
 - References: [D1], [U1], [U2]
 
+### Three Broad RFC Phases
+
+- Summary: keep typed infrastructure suppliers and the completion bridge in one
+  foundation/infrastructure phase, followed by stateful consumers and outer
+  orchestration.
+- Analysis: this preserves the three broad architectural layers but gives the
+  first phase two independent acceptance boundaries. A single canonical task
+  becomes oversized, while extracting only foundation verification produces a
+  supporting task with little behavioral work. [D1], [C1],
+  [C4]-[C7], [C11], [C14], [U3], [U4], [U11]
+- Why Not Chosen: typed supplier contracts can be compiled and tested while the
+  semantic completion transport remains behind explicitly tracked typed
+  adapters. Making completion replacement the next canonical phase yields two
+  substantive tasks and a cleaner prerequisite for stateful consumers. [D1],
+  [D10], [U10], [U11]
+- References: [D1], [D10], [U3], [U4], [U10], [U11]
+
 ### Five or More Narrow RFC Phases
 
 - Summary: preserve one dependency slice per RFC phase, closely matching the
   seven-step order in `docs/error-spec.md`.
 - Analysis: this makes phase/task mapping direct but adds planning overhead and
-  obscures the three larger acceptance boundaries: supplier contracts,
-  semantic storage consumption, and public orchestration. [D1], [D10]
-- Why Not Chosen: the approved direction groups the same bottom-up dependency
-  order into three gates while allowing bounded supporting tasks within each
-  gate. [U3], [U4]
-- References: [D1], [D10], [U3], [U4]
+  fragments four useful acceptance boundaries: supplier contracts, completion
+  transport, semantic storage consumption, and public orchestration. [D1],
+  [D10], [U11]
+- Why Not Chosen: the approved four-phase direction gives typed suppliers and
+  completion transport separate gates without promoting every module layer to
+  its own RFC phase. Bounded supporting tasks remain available if later source
+  evidence requires them. [D1], [D10], [U11]
+- References: [D1], [D10], [U11]
 
 ## Unsafe Considerations
 
@@ -645,72 +664,115 @@ RFC. [D17], [D18]
 
 ## Implementation Phases
 
-- **Phase 1: Foundation and Infrastructure Boundaries**
+- **Phase 1: Typed Infrastructure Error Boundaries**
   - Scope: Audit `error`, `bitmap`, `id`, `layout`, `serde`, `value`,
     `compression`, `lwc`, `latch`, `map`, `memcmp`, `ptr`, `free_list`,
     `notify`, `obs`, `stats`, `runtime`, `quiescent`, `thread`, `conf`,
-    `component`, `engine_poison`, `io`, `file`, `buffer`, `log`, and `lock`.
-    Migrate or justify raw/configuration/format/allocation/IO/completion
-    producers before their stateful consumers. Also migrate the
-    compiler-required transaction call paths that publish completion failures;
-    the remaining transaction audit stays in Phase 3. [D1], [C1], [C3]-[C8],
-    [C11], [C17], [U10]
-  - Goals: Establish the audit-record/checker skeleton; confirm the typed or
-    neutral foundation modules; audit shared public types for paired
-    crate-private typed operations and thin public trait adapters; migrate
-    internal callers away from those adapters; define the central `IoResult`,
-    remove `BackendResult`, rename conflicting raw-standard-IO aliases, and
-    migrate backend traits, drivers, implementations, and test doubles;
-    separate backend validation from IO setup; narrow raw-file, metadata, CoW,
-    buffer reservation, log-format, log-allocation, worker-result, and targeted
-    transaction-completion paths so every current `report_error(Error, ...)`
-    input retains a typed report or explicit typed branch; then, or atomically,
-    replace `CompletionErrorKind` and report-storing fanout with the Arc-backed
-    bridge, sealed typed capture, immutable erased report holder, explicit
-    materialization, and real-frame public classification; migrate all
-    completion producers and consumers away from semantic completion variants
-    and public-error capture; preserve Fatal sources at the first low-level
-    durability policy boundary; audit every phase-owned Internal producer;
-    remove Generic constructors and catch-all mappings; replace phase-owned
-    Generic producers or annotate an infeasible residue with the required
-    tracked TODO; confirm lock remains Operation-typed. [D1], [D16], [C11],
-    [C16], [C17], [U7], [U8], [U10]
-  - Non-goals: Reinterpret index/table/catalog foreground or recovery meaning;
-    redesign public `Error`/report APIs; finalize outer transaction/recovery
-    convergence.
+    `component`, `io`, `file`, `buffer`, `log`, and `lock`. Migrate or justify
+    raw/configuration/format/allocation/IO and completion-supplier producers
+    before their stateful consumers. Also migrate the compiler-required
+    transaction call paths that supply completion failures; the broader
+    transaction audit stays in Phase 4. [D1], [C1], [C3]-[C8], [C11], [C17],
+    [U10], [U11]
+  - Goals: Verify typed, neutral, or infallible foundation outcomes as part of
+    the supplier migration; audit shared public types for paired crate-private
+    typed operations and thin public trait adapters; migrate internal callers away
+    from those adapters; define the central `IoResult`, remove `BackendResult`,
+    rename conflicting raw-standard-IO aliases, and migrate backend traits,
+    drivers, implementations, and test doubles; separate backend validation
+    from IO setup; narrow raw-file, metadata, CoW, buffer reservation and
+    writeback, log-format, log-allocation, worker-result, and targeted
+    transaction-completion paths; replace every `report_error(Error, ...)`
+    input with a typed report or explicit typed branch. Temporary semantic
+    completion adapters may remain only when they accept typed reports,
+    preserve the real source report below the transport context, and remain
+    explicit for removal in Phase 2. Audit every phase-owned Internal
+    producer; remove Generic constructors and catch-all mappings; replace
+    phase-owned Generic producers or annotate an infeasible residue with the
+    required tracked TODO; confirm lock remains Operation-typed. [D1], [D16],
+    [C11], [C16], [C17], [U7], [U8], [U10], [U11]
+  - Non-goals: Replace `CompletionErrorKind` or completion fanout; migrate
+    completion consumers away from transport matching; reinterpret
+    index/table/catalog foreground or recovery meaning; redesign public
+    `Error`/report APIs; finalize outer transaction/recovery convergence.
   - Prerequisites: The current `error.rs` domains and `docs/error-spec.md`
     responsibility rules remain authoritative except that this RFC supersedes
-    the specification's semantic `CompletionErrorKind` transport description
-    and backend-local `BackendResult` naming. Backend feature parity must be
-    maintained throughout the phase. [C1], [C17], [D1], [D3], [U5], [U6],
-    [U8]
+    the backend-local `BackendResult` naming and reserves the existing
+    completion transport as a temporary typed adapter boundary. Backend feature
+    parity must be maintained throughout the phase. [C1], [C17], [D1], [D3],
+    [U8], [U10], [U11]
   - Phase-local Choices: Whether a proven broad crate-owned trait needs an
-    associated error or a narrower responsibility interface; the concrete
-    object-safe erased-report and frame-materialization implementation,
-    including a closed replay schema, per-source snapshot, or equivalent
-    checked representation; the exact stable cloneable attachment inventory;
-    the stable inventory representation used by the checker skeleton. A private
-    replay discriminator must remain an implementation detail rather than a
-    consumer-visible completion domain. These choices may not alter the Arc
-    ownership, semantic-free bridge, typed capture, or physical-frame
-    requirements. [U9]
-  - After This Phase: Stateful storage receives typed or explicitly justified
-    supplier contracts; all completion waiters share one immutable canonical
-    report and materialize the same real domain chain; no caller reconstructs a
-    lost IO, Resource, DataIntegrity, Lifecycle, Fatal, or Internal source from
-    a transport discriminator; `report_error(Error, ...)` and every other public-
-    error completion capture path are absent; every Internal producer in the
-    phase scope has an evidence-backed disposition and no unannotated Generic
-    remains; `IoResult` is the sole canonical storage IO result alias and
-    `BackendResult` is absent. [U10]
-  - Task Doc: `docs/tasks/TBD.md`
+    associated error or a narrower responsibility interface, and the exact
+    typed source contexts and cloneable attachments that Phase 2 must support.
+    A temporary adapter may not accept public `Error`/`ErrorKind`, create a new
+    semantic domain, or reconstruct a typed report from a public error. [D1],
+    [U9], [U10], [U11]
+  - After This Phase: Infrastructure producers expose typed or explicitly
+    justified supplier contracts; every completion owner receives a typed
+    report or explicit typed branch before its temporary transport adapter;
+    `report_error(Error, ...)` and every other public-error completion input are
+    absent; every remaining semantic completion adapter is explicit for
+    removal in Phase 2; every Internal producer in the phase scope has an
+    evidence-backed disposition and no unannotated Generic remains; `IoResult`
+    is the sole canonical storage IO result alias and `BackendResult` is absent.
+    [U8], [U10], [U11]
+  - Task Doc: `docs/tasks/000228-typed-infrastructure-error-boundaries.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
     - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
 
-- **Phase 2: Stateful Storage and Semantic Consumers**
+- **Phase 2: Completion Bridge and Infrastructure Closure**
+  - Scope: Replace completion transport in `error` and `io::completion`, then
+    migrate every existing completion producer and consumer in `engine_poison`,
+    `file`, `buffer`, `log`, and the compiler-required transaction paths.
+    Compiler fallout in recovery, catalog, table, or engine code is limited to
+    consuming the new transport without reinterpreting storage semantics. [D1],
+    [C1], [C3], [C5]-[C7], [C10]-[C14], [U5], [U6], [U11]
+  - Goals: Replace `CompletionErrorKind` and report-storing fanout with the
+    Arc-backed `CompletionErrorBridge`, sealed typed capture, immutable erased
+    canonical report holder, explicit physical-frame materialization, and
+    real-frame public classification; select and implement a checked closed
+    replay schema, per-source snapshot, or equivalent private representation
+    for every stabilized main-domain context and required cloneable
+    attachment; migrate all completion producers and consumers away from
+    semantic transport variants; preserve Fatal sources at the first
+    durability or poison policy boundary and through every waiter; remove all
+    Phase 1 completion adapters. [D1], [C1], [C3], [C6], [C7], [C11], [C14],
+    [C15], [U5], [U6], [U9], [U11]
+  - Non-goals: Reinterpret row/index/table/catalog foreground, checkpoint, or
+    recovery meaning; redesign public `Error`/report APIs; broaden the
+    transaction audit beyond compiler-required completion paths; finalize
+    repository-wide orchestration convergence.
+  - Prerequisites: Phase 1 has stabilized every completion supplier as a typed
+    report or explicit typed branch, removed public-error capture inputs, and
+    preserved every source context and attachment that must survive fanout.
+    Both backend configurations pass with the central `IoResult` contract.
+    [D1], [C17], [U8], [U10], [U11]
+  - Phase-local Choices: The concrete object-safe erased-report and
+    frame-materialization implementation; closed replay schema versus
+    per-source snapshot or an equivalent checked representation; the final
+    cloneable attachment registry; and the private replay discriminator shape.
+    These choices may not alter Arc ownership, semantic-free typed capture,
+    physical-frame downcasts, or the prohibition on a consumer-visible
+    completion domain. [U5], [U6], [U9]
+  - After This Phase: All completion waiters share one immutable canonical
+    report and materialize the same real domain chain; no caller reconstructs a
+    lost IO, Resource, DataIntegrity, Lifecycle, Fatal, or Internal source from
+    a transport discriminator; `CompletionErrorKind`, semantic completion
+    matching, public-error capture, and every temporary Phase 1 adapter are
+    absent; Fatal completion and engine-poison paths retain their initiating
+    source frames; stateful storage receives stable typed suppliers and one
+    semantic-free completion bridge. [U5], [U6], [U10], [U11]
+  - Task Doc: `docs/tasks/TBD.md`
+  - Task Issue: `#0`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
+  - Related Backlogs:
+    - `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
+
+- **Phase 3: Stateful Storage and Semantic Consumers**
   - Scope: Audit `row`, `index`, `table`, and `catalog`, including their
     responsibility-specific use of LWC, file, buffer, log, and lock suppliers.
     Migrate reusable hot/persisted producers before foreground, checkpoint, and
@@ -730,9 +792,10 @@ RFC. [D17], [D18]
   - Non-goals: Change index/table persistence formats or checkpoint semantics;
     redesign public statement/session APIs; classify a generic producer as
     Fatal merely because one coordinator may poison on its failure.
-  - Prerequisites: Phase 1 supplier contracts and completion cases used by
-    these modules are stable, and the Arc-backed bridge preserves typed source
-    frames without temporary public reconstruction.
+  - Prerequisites: Phase 2 has closed the infrastructure boundary: supplier
+    contracts and completion cases used by these modules are stable, and the
+    Arc-backed bridge preserves typed source frames without temporary public
+    reconstruction.
   - Phase-local Choices: Exact decomposition or associated-error shape for
     index traits; which proven fixed-pool failures become assertions versus
     specific typed Internal reports; which blocked invariant proof or domain
@@ -749,38 +812,33 @@ RFC. [D17], [D18]
   - Related Backlogs:
     - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
 
-- **Phase 3: Orchestration, Public Convergence, and Enforcement**
+- **Phase 4: Orchestration, Public Convergence, and Documentation Closure**
   - Scope: Audit `trx`, `recovery`, `session`, `engine`, statement/stream
-    facades, and `lib.rs`; then rescan every top-level module and finalize the
-    approved convergence inventory and deterministic enforcement check. [D1],
-    [D2], [D7], [D8], [C2], [C11]-[C13]
+    facades, and `lib.rs`; then review every top-level module against the final
+    responsibility model. [D1], [D2], [D7], [D8], [C2], [C11]-[C13]
   - Goals: Narrow reusable transaction, rollback, purge, retention, recovery
     stream, planning, replay, admission, and construction helpers; preserve
     genuine mixed startup and public operation boundaries; remove all temporary
-    phase adapters; enforce the final allowlist in standard validation; add
-    critical classification/source-frame/fault-injection coverage, including
-    outer consumers of the Arc-backed bridge; audit and reclassify the remaining
-    transaction/recovery/session/engine Internal producers; require structured
-    TODOs for any infeasible Generic residue and surface them in the final
-    audit; update the implementation
-    snapshot, completion contract, and module blueprint in
-    `docs/error-spec.md`; resolve the source backlogs when their acceptance
+    phase adapters; add critical classification/source-frame/fault-injection
+    coverage, including outer consumers of the Arc-backed bridge; audit and
+    reclassify the remaining transaction/recovery/session/engine Internal
+    producers; require structured TODOs for any infeasible Generic residue;
+    update the implementation snapshot, completion contract, and module
+    blueprint in `docs/error-spec.md`; resolve the source backlogs when their acceptance
     criteria are met. [D1], [D16], [C16], [U7]
   - Non-goals: Remove the public storage error wrapper, add a new generic
     error-set architecture, or alter public operation/lifecycle behavior solely
     to simplify typing.
-  - Prerequisites: Phase 2 has fixed the foreground-versus-recovery semantic
+  - Prerequisites: Phase 3 has fixed the foreground-versus-recovery semantic
     boundaries and no lower module requires an unclassified public-result
     adapter.
-  - Phase-local Choices: Standalone versus existing-tool integration for the
-    deterministic check; the stable syntax of approved-item records; the exact
-    grouping of focused fault-injection tests. The final mechanism must be
-    automated and line-number independent.
+  - Phase-local Choices: The exact grouping of focused fault-injection tests
+    and the clearest final documentation of approved public and mixed-domain
+    convergence sites.
   - After This Phase: Every production top-level error site is typed or
     explicitly approved, every module has a final verdict, bridge and Fatal
-    conversions retain their initiating sources for every waiter, and new
-    unclassified public convergence or unannotated Generic Internal production
-    fails repository validation.
+    conversions retain their initiating sources for every waiter, and the
+    implementation snapshot reflects the stabilized boundary model.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -808,23 +866,24 @@ classification comes from the nearest real domain, that
 attachment, and that rendering retains canonical producer detail. Tests also
 prove the bridge cannot be captured from `ErrorKind`, `RuntimeError`, or itself,
 cannot be created without a report, and exposes no semantic variant to match.
-These tests are the Phase 1 completion gate for the selected materialization
+These tests are the Phase 2 completion gate for the selected materialization
 representation. [C1], [C14], [C15], [U5], [U6], [U9], [B2]
 
-Phase 1 also inventories every existing `report_error(Error, ...)` caller before
+Phase 1 reviews every existing `report_error(Error, ...)` caller during
 migration. Focused buffer and terminal-rollback tests compile and exercise the
-narrowed producer contracts, and a source audit verifies that no helper or
-bridge construction path accepts public `Error` after integration. [C1], [C6],
-[C11], [C14], [U10]
+narrowed producer contracts, and source review verifies that no temporary
+completion adapter accepts public `Error`. Phase 2 verifies that bridge
+construction accepts only permitted typed reports and that the semantic
+transport and adapters are absent. [C1], [C6], [C11], [C14], [U10], [U11]
 
 For a shared public type with a public trait adapter, focused tests exercise the
 canonical crate-private typed operation and assert its domain context, then
 exercise the public adapter and assert the public classification plus retained
-domain frame. The production caller audit confirms reusable internal code uses
+domain frame. Production caller review confirms reusable internal code uses
 the typed operation instead of the public adapter. [C8], [D1]
 
 The IO alias migration is compiled and exercised with both backend feature
-configurations. A source audit verifies that `IoResult` has exactly one type
+configurations. Source review verifies that `IoResult` has exactly one type
 definition in `error.rs`, `BackendResult` has no remaining references, and raw
 standard IO results are not imported as `IoResult`. Existing focused backend
 tests continue to assert the same `IoError` context and backend attachments;
@@ -836,7 +895,7 @@ the invariant. A reachable failure reclassified from Internal is tested at its
 real boundary for the new specific domain context and retained source frames.
 Tests must not expose private state or add a synthetic trait implementation
 merely to manufacture an impossible error, and removed synthetic error tests
-are not replaced with panic tests. The deterministic audit verifies that every
+are not replaced with panic tests. Source review verifies that every
 remaining production `InternalError::Generic` expression has the required
 adjacent `TODO(error-boundary)` fields and tracking reference; tests may not use
 Generic as a convenient substitute for the source domain a workflow is meant
@@ -860,8 +919,7 @@ described above. [D11], [D12], [D17], [D18]
 
 The RFC is implementation-complete only when:
 
-1. all modules in the exhaustive verdict table have a final item-level audit
-   outcome;
+1. all modules in the exhaustive verdict table have a reviewed final outcome;
 2. every production crate-level `Error`/`Result` site is central, public,
    external-trait-fixed, or an evidenced mixed convergence site;
 3. every approved external-trait adapter delegates to a canonical typed
@@ -883,11 +941,10 @@ The RFC is implementation-complete only when:
 8. the semantic `CompletionErrorKind`, generic public-error completion capture,
    transport-domain matching, and Runtime completion path are absent;
 9. every Fatal conversion has producer-set evidence and retained-source tests;
-10. no temporary migration allowlist entry remains;
-11. the deterministic check is part of standard repository validation;
-12. both IO backend configurations pass focused, workspace, and strict lint
+10. no temporary migration adapter remains;
+11. both IO backend configurations pass focused, workspace, and strict lint
    validation; and
-13. `docs/error-spec.md` and source backlogs [B1]/[B2] are synchronized with the
+12. `docs/error-spec.md` and source backlogs [B1]/[B2] are synchronized with the
    actual implementation outcomes.
 
 ## Consequences
@@ -907,12 +964,10 @@ The RFC is implementation-complete only when:
   whose current absence of public errors is confirmed as correct.
 - Targeted trait changes remove interface-forced convergence without requiring
   a wholesale internal error architecture rewrite.
-- Automated enforcement prevents the migration inventory from becoming a
-  stale one-time document.
 - Internal invariant sites become explicit proof obligations, and ambiguous
   Generic reports either gain a real domain or remain visible as tracked debt.
-- Three acceptance phases preserve bottom-up ordering while keeping the RFC
-  comprehensible.
+- Four acceptance phases preserve bottom-up ordering while giving typed
+  suppliers and completion transport separate, substantive closure gates.
 
 ### Negative
 
@@ -922,8 +977,8 @@ The RFC is implementation-complete only when:
   that currently use the same spelling for raw `std::io::Result`.
 - Associated-error or responsibility-interface changes can increase generic
   complexity around buffer, file, and index code.
-- A stable convergence checker and inventory add maintenance work and must
-  avoid false positives from tests, aliases, macros, and backend-specific code.
+- Without a maintained convergence checker, regression prevention relies on
+  focused tests, strict linting, and responsibility-aware source review.
 - Source-preservation tests may require focused fault-injection hooks at real
   policy boundaries.
 - Proving invariant reachability and introducing specific domain variants adds
@@ -934,9 +989,9 @@ The RFC is implementation-complete only when:
 - Each waiter that consumes a failure materializes a small owned report and the
   erased frame visitor must explicitly preserve required context and attachment
   types as the error model evolves.
-- Three RFC gates are broader than individual implementation tasks, so phase
-  tracking must link supporting tasks carefully rather than treating one large
-  change as indivisible.
+- Four RFC gates remain broader than individual source modules, so any further
+  supporting tasks must be linked carefully rather than treating one gate as
+  indivisible.
 
 ## Open Questions
 
@@ -949,11 +1004,8 @@ direction:
 2. Which private object-safe report visitor/materializer representation best
    replays ordered contexts and registered structured attachments without
    introducing a second semantic domain enum?
-3. Should the deterministic convergence check use a standalone structured
-   inventory or stable annotations consumed by an existing repository audit
-   tool?
-4. Which bounded supporting task documents are required inside each of the
-   three canonical phase gates?
+3. Do Phases 3 or 4 require bounded supporting task documents after their
+   detailed source audits, or can each remain one canonical task?
 
 ## Future Work
 
@@ -964,6 +1016,9 @@ direction:
 - Broader buffer/file/index ownership or performance redesign remains separate
   unless it is the minimum change required to stop interface-forced error
   convergence.
+- After all error boundaries stabilize, a separate follow-up may evaluate
+  whether deterministic audit automation provides enough regression value to
+  justify a maintained inventory or allowlist.
 - Persistent-format, checkpoint, recovery, and transaction semantic changes
   remain governed by their existing RFCs.
 

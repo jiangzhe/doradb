@@ -375,12 +375,12 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         page_id: VersionedPageID,
     ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        get_page_versioned_shared::<RowPage, _>(
+        Ok(get_page_versioned_shared::<RowPage, _>(
             self.mem_pool(),
             self.row_pool_guard(guards, "get_versioned_row_page_shared")?,
             page_id,
         )
-        .await
+        .await?)
     }
 
     /// Roll back one row undo record against hot row state or cold-row hooks.
@@ -3120,7 +3120,10 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::WriteConflict)
+            );
             trx2.rollback().await.unwrap();
             trx1.commit().await.unwrap();
         });
@@ -3282,7 +3285,7 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -3318,7 +3321,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
 
@@ -3350,7 +3353,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
 
@@ -3414,7 +3417,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
         });
@@ -3549,7 +3552,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
 
@@ -3642,7 +3645,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::UnexpectedRecoveryDuplicateKey)
             );
         });
@@ -4100,7 +4103,7 @@ mod tests {
                 .catalog_lwc_error::<()>("test_catalog_lwc", RowID::new(42))
                 .unwrap_err();
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::Generic)
             );
             let report = format!("{err:?}");
@@ -4248,7 +4251,7 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::PoolGuardMissing)
             );
         });
@@ -4360,7 +4363,10 @@ mod tests {
                 Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
                 Err(err) => err,
             };
-            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
+            assert_eq!(
+                err.report().downcast_ref::<ResourceError>().copied(),
+                Some(ResourceError::BufferPoolFull)
+            );
             assert_eq!(pool.allocated(), 0);
         });
     }

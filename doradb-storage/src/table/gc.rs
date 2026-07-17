@@ -694,7 +694,7 @@ mod tests {
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
                 .unwrap_err();
-            let lifecycle_error = err.lifecycle_error();
+            let lifecycle_error = err.report().downcast_ref::<LifecycleError>().copied();
             let was_in_trx = session.in_trx().unwrap();
 
             trx.rollback().await.unwrap();

@@ -1,7 +1,10 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::{ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier};
-use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
+use crate::error::{
+    CompletionResult, DataIntegrityError, DataIntegrityResult, FileKind, InternalError,
+    InternalResult, IoError, IoResult, ResourceError, ResourceResult, RuntimeError, RuntimeResult,
+};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
 use crate::file::{BlockKey, SparseFile, fsync_direct, write_direct, write_direct_with_lease};
@@ -9,11 +12,10 @@ use crate::id::{BlockID, FileID, TrxID};
 use crate::io::{DirectBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::MAX_SNAPSHOT_TS;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
-use std::io;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::{NonNull, null_mut};
@@ -34,17 +36,17 @@ pub(crate) const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub(crate) trait MutableCowFile {
     /// Allocate one unpublished block id from the mutable root.
-    fn allocate_block(&mut self) -> Result<BlockID>;
+    fn allocate_block(&mut self) -> ResourceResult<BlockID>;
 
     /// Roll back one unpublished block id allocated by this mutable writer.
-    fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()>;
+    fn rollback_allocated_block(&mut self, block_id: BlockID);
 
     /// Write one CoW block into the backing file.
     fn write_block(
         &self,
         block_id: BlockID,
         buf: DirectBuf,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = CompletionResult<()>> + Send;
 }
 
 /// File wrapper that can own one mutable CoW writer claim.
@@ -78,7 +80,7 @@ impl<'a> CowWriteBarrier<'a> {
         self,
         file_id: FileID,
         block_id: BlockID,
-    ) -> Result<Option<ReadonlyWriteLease>> {
+    ) -> InternalResult<Option<ReadonlyWriteLease>> {
         match self {
             CowWriteBarrier::ReadonlyPool(pool) => {
                 begin_write_barrier(pool.clone(), file_id, block_id).map(Some)
@@ -257,7 +259,7 @@ impl<M> MutableCowRoot<M> {
     pub(crate) fn rebuild_alloc_map_from_reachable(
         &mut self,
         reachable: &BTreeSet<BlockID>,
-    ) -> Result<usize> {
+    ) -> InternalResult<usize> {
         let old_allocated = self.root.alloc_map.allocated();
         let rebuilt = AllocMap::new(self.root.alloc_map.len());
         assert!(rebuilt.allocate_at(usize::from(SUPER_BLOCK_ID)));
@@ -268,8 +270,7 @@ impl<M> MutableCowRoot<M> {
                     .attach(format!(
                         "reachable block id exceeds allocation map: block_id={block_id}, alloc_map_len={}",
                         rebuilt.len()
-                    ))
-                    .into());
+                    )));
             }
             if *block_id != SUPER_BLOCK_ID {
                 let allocated = rebuilt.allocate_at(idx);
@@ -278,13 +279,13 @@ impl<M> MutableCowRoot<M> {
         }
         let meta_block_idx = usize::from(self.root.meta_block_id);
         if meta_block_idx >= rebuilt.len() {
-            return Err(Report::new(InternalError::CowFileAllocationInvariant)
-                .attach(format!(
+            return Err(
+                Report::new(InternalError::CowFileAllocationInvariant).attach(format!(
                     "meta block id exceeds allocation map: block_id={}, alloc_map_len={}",
                     self.root.meta_block_id,
                     rebuilt.len()
-                ))
-                .into());
+                )),
+            );
         }
         let _ = rebuilt.allocate_at(meta_block_idx);
         let new_allocated = rebuilt.allocated();
@@ -305,7 +306,7 @@ impl<M> MutableCowRoot<M> {
     pub(crate) fn reserve_publish_meta_block(
         &mut self,
         capacity_context: &'static str,
-    ) -> Result<BlockID> {
+    ) -> ResourceResult<BlockID> {
         self.root.block_reclamation_until_effective_ts_installed();
         let meta_block_id = allocate_cow_block(self, capacity_context)?;
         self.root.meta_block_id = meta_block_id;
@@ -329,40 +330,30 @@ impl<M> MutableCowRoot<M> {
     /// allocation bit keeps the future published root from marking an abandoned
     /// block as live.
     #[inline]
-    pub(crate) fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
-        if block_id == SUPER_BLOCK_ID {
-            return Err(Report::new(InternalError::CowFileAllocationInvariant)
-                .attach(format!("cannot roll back super block id {block_id}"))
-                .into());
-        }
-        let idx = usize::try_from(block_id.as_u64()).map_err(|_| {
-            Error::from(
-                Report::new(InternalError::CowFileAllocationInvariant)
-                    .attach(format!("block_id={block_id}")),
-            )
-        })?;
-        if idx >= self.root.alloc_map.len() {
-            return Err(Report::new(InternalError::CowFileAllocationInvariant)
-                .attach(format!(
-                    "block_id={block_id}, alloc_map_len={}",
-                    self.root.alloc_map.len()
-                ))
-                .into());
-        }
-        if !self.unpublished_blocks.contains(&block_id) {
-            return Err(Report::new(InternalError::CowFileAllocationInvariant)
-                .attach(format!(
-                    "block_id={block_id} was not allocated by this mutable root"
-                ))
-                .into());
-        }
-        if !self.root.alloc_map.deallocate(idx) {
-            return Err(Report::new(InternalError::CowFileAllocationInvariant)
-                .attach(format!("block_id={block_id} allocation bit was not set"))
-                .into());
-        }
-        self.unpublished_blocks.remove(&block_id);
-        Ok(())
+    pub(crate) fn rollback_allocated_block(&mut self, block_id: BlockID) {
+        assert!(
+            block_id != SUPER_BLOCK_ID,
+            "CoW rollback cannot release reserved super block: block_id={block_id}"
+        );
+        let idx = usize::try_from(block_id.as_u64())
+            .expect("CoW rollback block id exceeds platform index width");
+        assert!(
+            idx < self.root.alloc_map.len(),
+            "CoW rollback block id exceeds allocation map: block_id={block_id}, alloc_map_len={}",
+            self.root.alloc_map.len()
+        );
+        assert!(
+            self.unpublished_blocks.contains(&block_id),
+            "CoW rollback requires current unpublished allocation: block_id={block_id}"
+        );
+        assert!(
+            self.root.alloc_map.deallocate(idx),
+            "CoW rollback allocation bit was not set: block_id={block_id}"
+        );
+        assert!(
+            self.unpublished_blocks.remove(&block_id),
+            "CoW rollback ownership marker disappeared: block_id={block_id}"
+        );
     }
 }
 
@@ -384,15 +375,15 @@ pub(crate) struct ParsedMeta<M> {
 #[derive(Clone, Copy)]
 pub(crate) struct CowCodec<M> {
     /// Parse one super-block image.
-    pub(crate) parse_super_block: fn(&[u8]) -> Result<SuperBlock>,
+    pub(crate) parse_super_block: fn(&[u8]) -> DataIntegrityResult<SuperBlock>,
     /// Parse one meta-block image.
-    pub(crate) parse_meta_block: fn(BlockID, &[u8]) -> Result<ParsedMeta<M>>,
+    pub(crate) parse_meta_block: fn(BlockID, &[u8]) -> DataIntegrityResult<ParsedMeta<M>>,
     /// Validate root invariants after parsing one meta block.
-    pub(crate) validate_root: fn(BlockID, &ParsedMeta<M>) -> Result<()>,
+    pub(crate) validate_root: fn(BlockID, &ParsedMeta<M>) -> DataIntegrityResult<()>,
     /// Build one meta-block image from active root.
-    pub(crate) build_meta_block: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
+    pub(crate) build_meta_block: fn(&ActiveRoot<M>) -> ResourceResult<DirectBuf>,
     /// Build one super-block image from active root.
-    pub(crate) build_super_block: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
+    pub(crate) build_super_block: fn(&ActiveRoot<M>) -> DirectBuf,
 }
 
 /// Generic copy-on-write file abstraction shared by table and multi-table files.
@@ -419,7 +410,7 @@ impl<M> CowFile<M> {
         file_id: FileID,
         codec: CowCodec<M>,
         trunc: bool,
-    ) -> Result<Self> {
+    ) -> IoResult<Self> {
         let file = if trunc {
             SparseFile::create_or_trunc(file_path, initial_size, file_id)
         } else {
@@ -442,7 +433,7 @@ impl<M> CowFile<M> {
         file_path: impl AsRef<str>,
         file_id: FileID,
         codec: CowCodec<M>,
-    ) -> Result<Self> {
+    ) -> IoResult<Self> {
         let file = SparseFile::open(file_path, file_id)?;
         Ok(CowFile {
             file: Arc::new(file),
@@ -505,7 +496,7 @@ impl<M> CowFile<M> {
         background_writes: &IOClient<BackgroundWriteRequest>,
         block_id: BlockID,
         buf: DirectBuf,
-    ) -> Result<()> {
+    ) -> CompletionResult<()> {
         self.write_block_with_lease(background_writes, block_id, buf, None)
             .await
     }
@@ -519,7 +510,7 @@ impl<M> CowFile<M> {
         block_id: BlockID,
         buf: DirectBuf,
         write_lease: Option<ReadonlyWriteLease>,
-    ) -> Result<()> {
+    ) -> CompletionResult<()> {
         debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
         let offset = usize::from(block_id) * COW_FILE_PAGE_SIZE;
         write_direct_with_lease(
@@ -548,7 +539,7 @@ impl<M> CowFile<M> {
         background_writes: &IOClient<BackgroundWriteRequest>,
         offset: usize,
         buf: DirectBuf,
-    ) -> Result<()> {
+    ) -> CompletionResult<()> {
         write_direct(
             self.block_key(offset),
             Arc::clone(&self.file),
@@ -592,28 +583,56 @@ impl<M> CowFile<M> {
         &self,
         file_kind: FileKind,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<ActiveRoot<M>> {
-        let _ = disk_pool.invalidate_block(self.file.file_id(), SUPER_BLOCK_ID);
+    ) -> RuntimeResult<ActiveRoot<M>> {
+        let file_id = self.file.file_id();
+        let _ = disk_pool.invalidate_block(file_id, SUPER_BLOCK_ID);
         let pool_guard = disk_pool.pool_guard();
         let super_block_guard = disk_pool
             .read_block(file_kind, &self.file, &pool_guard, SUPER_BLOCK_ID)
-            .await?;
-        let super_block =
-            Self::pick_super_block(super_block_guard.page(), self.codec.parse_super_block)?;
+            .await
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=read_super_block, block_id={SUPER_BLOCK_ID}"
+                )
+            })?;
+        let super_block = Self::pick_super_block(
+            super_block_guard.page(),
+            self.codec.parse_super_block,
+        )
+        .change_context(RuntimeError::FileRootAccess)
+        .attach_with(|| {
+            format!(
+                "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=validate_super_block, block_id={SUPER_BLOCK_ID}"
+            )
+        })?;
         drop(super_block_guard);
 
-        let _ = disk_pool.invalidate_block(self.file.file_id(), super_block.body.meta_block_id);
+        let meta_block_id = super_block.body.meta_block_id;
+        let _ = disk_pool.invalidate_block(file_id, meta_block_id);
         let meta_block_guard = disk_pool
-            .read_block(
-                file_kind,
-                &self.file,
-                &pool_guard,
-                super_block.body.meta_block_id,
-            )
-            .await?;
-        let parsed_meta =
-            (self.codec.parse_meta_block)(super_block.body.meta_block_id, meta_block_guard.page())?;
-        (self.codec.validate_root)(super_block.body.meta_block_id, &parsed_meta)?;
+            .read_block(file_kind, &self.file, &pool_guard, meta_block_id)
+            .await
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=read_meta_block, block_id={meta_block_id}"
+                )
+            })?;
+        let parsed_meta = (self.codec.parse_meta_block)(meta_block_id, meta_block_guard.page())
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=parse_meta_block, block_id={meta_block_id}"
+                )
+            })?;
+        (self.codec.validate_root)(meta_block_id, &parsed_meta)
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=load_file_root, file_kind={file_kind}, file_id={file_id}, phase=validate_root, block_id={meta_block_id}"
+                )
+            })?;
         drop(meta_block_guard);
 
         Ok(ActiveRoot::from_parts(
@@ -637,8 +656,14 @@ impl<M> CowFile<M> {
         background_writes: &IOClient<BackgroundWriteRequest>,
         mut new_root: MutableCowRoot<M>,
         write_barrier: CowWriteBarrier<'_>,
-    ) -> Result<Option<OldCowRoot<M>>> {
-        new_root.reserve_publish_meta_block("publish root could not allocate meta block")?;
+    ) -> RuntimeResult<Option<OldCowRoot<M>>> {
+        let file_id = self.file.file_id();
+        new_root
+            .reserve_publish_meta_block("publish root could not allocate meta block")
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!("operation=publish_file_root, file_id={file_id}, phase=reserve_meta_block")
+            })?;
         self.publish_prepared_root(background_writes, new_root, write_barrier)
             .await
     }
@@ -654,25 +679,63 @@ impl<M> CowFile<M> {
         background_writes: &IOClient<BackgroundWriteRequest>,
         new_root: MutableCowRoot<M>,
         write_barrier: CowWriteBarrier<'_>,
-    ) -> Result<Option<OldCowRoot<M>>> {
-        self.validate_prepared_publish_root(&new_root)?;
+    ) -> RuntimeResult<Option<OldCowRoot<M>>> {
+        let file_id = self.file.file_id();
         let meta_block_id = new_root.root.meta_block_id;
-        let meta_buf = (self.codec.build_meta_block)(&new_root.root)?;
-        let write_lease = write_barrier.begin_write(self.file.file_id(), meta_block_id)?;
+        self.validate_prepared_publish_root(&new_root)
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=publish_file_root, file_id={file_id}, phase=validate_prepared_root, block_id={meta_block_id}"
+                )
+            })?;
+        let meta_buf = (self.codec.build_meta_block)(&new_root.root)
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=publish_file_root, file_id={file_id}, phase=encode_meta_block, block_id={meta_block_id}"
+                )
+            })?;
+        let write_lease = write_barrier
+            .begin_write(file_id, meta_block_id)
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=publish_file_root, file_id={file_id}, phase=begin_meta_write_barrier, block_id={meta_block_id}"
+                )
+            })?;
         self.write_block_with_lease(background_writes, meta_block_id, meta_buf, write_lease)
-            .await?;
+            .await
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=publish_file_root, file_id={file_id}, phase=write_meta_block, block_id={meta_block_id}"
+                )
+            })?;
 
-        let super_buf = (self.codec.build_super_block)(&new_root.root)?;
+        let super_buf = (self.codec.build_super_block)(&new_root.root);
         let offset = new_root.root.slot_no as usize * super_buf.capacity();
         self.write_at_offset(background_writes, offset, super_buf)
-            .await?;
+            .await
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=publish_file_root, file_id={file_id}, phase=write_super_block, block_id={SUPER_BLOCK_ID}, slot_no={}",
+                    new_root.root.slot_no
+                )
+            })?;
 
-        fsync_direct(Arc::clone(&self.file), background_writes).await?;
+        fsync_direct(Arc::clone(&self.file), background_writes)
+            .await
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!("operation=publish_file_root, file_id={file_id}, phase=fsync")
+            })?;
         Ok(self.swap_active_root(new_root.root))
     }
 
     #[inline]
-    fn validate_prepared_publish_root(&self, new_root: &MutableCowRoot<M>) -> Result<()> {
+    fn validate_prepared_publish_root(&self, new_root: &MutableCowRoot<M>) -> InternalResult<()> {
         let meta_block_id = new_root.root.meta_block_id;
         let meta_idx = usize::from(meta_block_id);
         if meta_block_id == SUPER_BLOCK_ID
@@ -680,12 +743,10 @@ impl<M> CowFile<M> {
             || !new_root.root.alloc_map.is_allocated(meta_idx)
             || !new_root.unpublished_blocks.contains(&meta_block_id)
         {
-            return Err(Report::new(InternalError::CowFileAllocationInvariant)
-                .attach(format!(
+            return Err(Report::new(InternalError::CowFileAllocationInvariant).attach(format!(
                     "prepared publish meta block is not an unpublished allocation: block_id={meta_block_id}, alloc_map_len={}",
                     new_root.root.alloc_map.len()
-                ))
-                .into());
+                )));
         }
         Ok(())
     }
@@ -700,8 +761,8 @@ impl<M> CowFile<M> {
     #[inline]
     fn pick_super_block(
         buf: &[u8],
-        parse_super_block: fn(&[u8]) -> Result<SuperBlock>,
-    ) -> Result<SuperBlock> {
+        parse_super_block: fn(&[u8]) -> DataIntegrityResult<SuperBlock>,
+    ) -> DataIntegrityResult<SuperBlock> {
         debug_assert!(buf.len() == SUPER_BLOCK_SIZE * 2);
         let first = parse_super_block(&buf[..SUPER_BLOCK_SIZE]);
         let second = parse_super_block(&buf[SUPER_BLOCK_SIZE..]);
@@ -789,11 +850,9 @@ unsafe impl<M> Sync for OldCowRoot<M> {}
 pub(crate) fn allocate_cow_block<M>(
     root: &mut MutableCowRoot<M>,
     capacity_context: &'static str,
-) -> Result<BlockID> {
+) -> ResourceResult<BlockID> {
     root.try_allocate_block().ok_or_else(|| {
-        Error::from(
-            Report::new(ResourceError::StorageFileCapacityExceeded).attach(capacity_context),
-        )
+        Report::new(ResourceError::StorageFileCapacityExceeded).attach(capacity_context)
     })
 }
 
@@ -804,39 +863,75 @@ pub(crate) fn validate_active_meta_block_id(
     meta_block_id: BlockID,
     file_kind: FileKind,
     block_kind: &'static str,
-) -> Result<()> {
+) -> DataIntegrityResult<()> {
+    let super_block_idx = usize::from(SUPER_BLOCK_ID);
+    if super_block_idx >= alloc_map.len() || !alloc_map.is_allocated(super_block_idx) {
+        return Err(
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "file={file_kind}, block={block_kind}, reserved_super_block_id={SUPER_BLOCK_ID}, alloc_map_len={}",
+                alloc_map.len()
+            )),
+        );
+    }
     let meta_block_idx = usize::from(meta_block_id);
     if meta_block_idx == usize::from(SUPER_BLOCK_ID)
         || meta_block_idx >= alloc_map.len()
         || !alloc_map.is_allocated(meta_block_idx)
     {
-        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
                 "file={file_kind}, block={block_kind}, block_id={meta_block_id}"
-            ))
-            .into());
+            )),
+        );
     }
     Ok(())
 }
 
 #[inline]
-fn remove_file_by_fd(fd: RawFd) -> io::Result<()> {
+fn remove_file_by_fd(fd: RawFd) -> IoResult<()> {
     let proc_path = format!("/proc/self/fd/{}", fd);
-    let real_path = fs::read_link(&proc_path)?;
-    fs::remove_file(real_path)
+    let real_path = fs::read_link(&proc_path).map_err(|err| {
+        Report::new(IoError::from(err.kind())).attach(format!("op=file_remove, {err}"))
+    })?;
+    fs::remove_file(real_path).map_err(|err| {
+        Report::new(IoError::from(err.kind())).attach(format!("op=file_remove, {err}"))
+    })
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ActiveRoot, MutableCowRoot, SUPER_BLOCK_ID};
+    use super::{ActiveRoot, MutableCowRoot, SUPER_BLOCK_ID, validate_active_meta_block_id};
     use crate::bitmap::AllocMap;
-    use crate::error::InternalError;
+    use crate::error::{DataIntegrityError, FileKind, InternalError};
     use crate::id::{BlockID, TrxID};
     use crate::map::FastHashMap;
     use std::collections::BTreeSet;
     use std::sync::{Mutex, OnceLock};
 
     static OLD_ROOT_DROPS: OnceLock<Mutex<FastHashMap<usize, usize>>> = OnceLock::new();
+
+    #[test]
+    fn validate_active_root_rejects_unallocated_reserved_super_block() {
+        let alloc_map = AllocMap::new(8);
+        let meta_block_id = BlockID::new(2);
+        assert!(alloc_map.allocate_at(usize::from(meta_block_id)));
+
+        let err = validate_active_meta_block_id(
+            &alloc_map,
+            meta_block_id,
+            FileKind::TableFile,
+            "table-meta",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("reserved_super_block_id=0"), "{report}");
+        assert!(report.contains("alloc_map_len=8"), "{report}");
+    }
 
     #[test]
     fn rebuild_alloc_map_keeps_current_meta_block_allocated() {
@@ -902,7 +997,7 @@ pub(crate) mod tests {
             .unwrap_err();
 
         assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
+            err.downcast_ref::<InternalError>().copied(),
             Some(InternalError::CowFileAllocationInvariant)
         );
     }

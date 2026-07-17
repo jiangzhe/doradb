@@ -2143,7 +2143,10 @@ impl<'a> ColumnBlockIndex<'a> {
         dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
             .copy_from_slice(node.data_ref());
         write_block_checksum(buf.data_mut());
-        mutable_file.write_block(block_id, buf).await
+        mutable_file
+            .write_block(block_id, buf)
+            .await
+            .map_err(|report| Error::from_completion_report(report, "write column block node"))
     }
 }
 
@@ -3270,7 +3273,10 @@ mod tests {
     }
 
     fn assert_column_index_corruption(err: Error, block_id: BlockID, expected: DataIntegrityError) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected)
+        );
         let report = format!("{err:?}");
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains("column_block_index"), "{report}");

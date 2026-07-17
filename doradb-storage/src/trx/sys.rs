@@ -514,7 +514,7 @@ impl TerminalRollbackCleanupJob {
             Ok(()) => self.completion.complete(Ok(())),
             Err(err) => self
                 .completion
-                .complete(Err(CompletionErrorKind::report_error(
+                .complete(Err(CompletionErrorKind::from_fatal(
                     err,
                     format!("terminal rollback cleanup failed: {}", self.operation),
                 ))),
@@ -1049,15 +1049,11 @@ impl TransactionSystem {
                 (cts, Some(waiter))
             }
         };
-        let waiter = match waiter {
-            Some(waiter) => waiter,
-            None => {
-                return Err(Error::from(
-                    Report::new(InternalError::Generic)
-                        .attach("async commit was queued without a completion waiter"),
-                ));
-            }
-        };
+        // `wait_sync=true` is passed to both enqueue outcomes above, and both
+        // constructors create the waiter before returning ownership here.
+        let waiter = waiter.expect(
+            "async prepared commit requested a completion waiter but enqueue returned none",
+        );
         waiter.wait_result().await.map_err(|report| {
             Error::from_completion_report(
                 report,
@@ -1284,8 +1280,9 @@ impl TransactionSystem {
         &self,
         claim: TrxCompletionClaim,
     ) -> Result<()> {
-        self.rollback_claim(claim, "cleanup abandoned transaction")
-            .await
+        Ok(self
+            .rollback_claim(claim, "cleanup abandoned transaction")
+            .await?)
     }
 
     #[inline]
@@ -1293,7 +1290,7 @@ impl TransactionSystem {
         &self,
         claim: TrxCompletionClaim,
         operation: &'static str,
-    ) -> Result<()> {
+    ) -> FatalResult<()> {
         let (entry, mut inner, attachment) = claim.into_parts();
         self.rollback_inner(entry.as_ref(), &mut inner, &attachment, operation)
             .await
@@ -1305,36 +1302,48 @@ impl TransactionSystem {
         entry: &TrxEntry,
         inner: &mut TrxInner,
         attachment: &TrxAttachment,
-        _operation: &'static str,
-    ) -> Result<()> {
+        operation: &'static str,
+    ) -> FatalResult<()> {
         let sts = inner.sts();
         let gc_no = inner.gc_no();
         let status = inner.ctx().status();
         let pool_guards = attachment.pool_guards().clone();
         let mut table_cache = TableCache::new(&self.catalog);
-        if inner
+        if let Err(err) = inner
             .index_undo_mut()
             .rollback(&mut table_cache, &pool_guards, sts)
             .await
-            .is_err()
         {
             entry.publish_state(TrxEntryState::Failed);
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
-            return Err(self.poison_engine(FatalError::RollbackAccess).into());
+            let _ = self.poison_engine(FatalError::RollbackAccess);
+            // TODO(error-boundary): blocked=index undo rollback still returns public Error;
+            // owner=typed index rollback source in RFC-0023 Phase 3;
+            // tracking=docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md.
+            return Err(err
+                .into_report()
+                .change_context(FatalError::RollbackAccess)
+                .attach(format!("{operation}: index undo rollback failed")));
         }
-        if inner
+        if let Err(err) = inner
             .row_undo_mut()
             .rollback(&mut table_cache, &pool_guards)
             .await
-            .is_err()
         {
             entry.publish_state(TrxEntryState::Failed);
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
-            return Err(self.poison_engine(FatalError::RollbackAccess).into());
+            let _ = self.poison_engine(FatalError::RollbackAccess);
+            // TODO(error-boundary): blocked=row undo rollback still returns public Error;
+            // owner=typed row rollback source in RFC-0023 Phase 3;
+            // tracking=docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md.
+            return Err(err
+                .into_report()
+                .change_context(FatalError::RollbackAccess)
+                .attach(format!("{operation}: row undo rollback failed")));
         }
         inner.effects_mut().clear_for_rollback();
         self.record_rollback_for_purge(gc_no, sts);
@@ -2186,7 +2195,7 @@ pub(crate) mod tests {
 
             let err = res.unwrap_err();
             assert_eq!(
-                err.resource_error(),
+                err.report().downcast_ref::<ResourceError>().copied(),
                 Some(ResourceError::StorageFileCapacityExceeded)
             );
             engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
@@ -2249,7 +2258,7 @@ pub(crate) mod tests {
             ));
             let err = engine.inner().trx_sys.commit_sys(sys_trx).unwrap_err();
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::SystemTransactionRedoMissing)
             );
             engine.inner().trx_sys.ensure_runtime_healthy().unwrap();
@@ -2282,7 +2291,7 @@ pub(crate) mod tests {
             let err = trx.commit().await.unwrap_err();
 
             assert_eq!(
-                err.completion_error(),
+                err.report().downcast_ref::<CompletionErrorKind>().copied(),
                 Some(CompletionErrorKind::Resource(
                     ResourceError::StorageFileCapacityExceeded
                 )),

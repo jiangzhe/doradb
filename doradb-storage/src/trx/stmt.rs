@@ -1026,7 +1026,10 @@ pub(crate) mod tests {
                 .await;
 
             let err = res.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::InvalidDmlInput)
+            );
             trx.rollback().await.unwrap();
         });
     }
@@ -1045,7 +1048,10 @@ pub(crate) mod tests {
                 .unwrap_err();
 
             assert_eq!(err.kind(), ErrorKind::Operation);
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             let rendered = format!("{err:?}");
             assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
@@ -1200,7 +1206,7 @@ pub(crate) mod tests {
 
             let err = trx.commit().await.unwrap_err();
             assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
+                err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ActiveTransactionDiscarded)
             );
         });
