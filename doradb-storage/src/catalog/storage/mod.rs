@@ -870,6 +870,12 @@ fn build_lwc_blocks_from_row_records(
             builder_start = Some(row.row_id);
         }
         if !builder.append_row_values(row.row_id, &row.vals) {
+            if builder.is_empty() {
+                return Err(invalid_catalog_payload(format!(
+                    "single catalog row does not fit in LWC block: row_id={}",
+                    row.row_id
+                )));
+            }
             let start_row_id = builder_start.take().ok_or_else(|| {
                 invalid_catalog_payload("catalog LWC builder missing start row id")
             })?;
@@ -1471,6 +1477,11 @@ pub(crate) mod tests {
             assert_eq!(
                 err.data_integrity_error(),
                 Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("single catalog row does not fit in LWC block: row_id=0"),
+                "{report}"
             );
             assert_eq!(storage.meta_pool.allocated(), allocated_before);
 

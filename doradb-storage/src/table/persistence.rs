@@ -1192,6 +1192,14 @@ impl Table {
                     current_end = prepared.end_row_id;
                 }
                 if !builder.append_view(view, prepared.start_row_id) {
+                    if builder.is_empty() {
+                        return Err(Report::new(InternalError::LwcBuilderMisuse)
+                            .attach(format!(
+                                "single row page does not fit in LWC block: page_id={}",
+                                prepared.page_id
+                            ))
+                            .into());
+                    }
                     let shape = ColumnBlockEntryShape::new(
                         current_start,
                         current_end,
@@ -2222,6 +2230,75 @@ mod tests {
             .await
             .unwrap();
             trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_build_lwc_blocks_rejects_oversized_first_page() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "oversized-first-lwc-page").await;
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "payload",
+                        ValKind::VarByte,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let metadata = table.metadata();
+            let guards = session.pool_guards();
+            let page_guard = table
+                .mem
+                .try_get_insert_page(&guards, 1, None)
+                .await
+                .unwrap();
+            let page = page_guard.page();
+            let payload_len =
+                page.header.var_field_offset() - usize::from(page.header.fix_field_end);
+            let values = [Val::from(vec![0xab; payload_len])];
+            assert!(page.insert(metadata.col.as_ref(), &values).is_ok());
+            let prepared = PreparedTransitionPage {
+                page_id: page_guard.page_id(),
+                start_row_id: page.header.start_row_id,
+                end_row_id: page.header.start_row_id + u64::from(page.header.max_row_count),
+                cutoff_ts: TrxID::new(1),
+                observed_version: 0,
+                required_cutoff_ts: None,
+                del_bitmap: page.del_bitmap(page.header.row_count()),
+                overlay_markers: Vec::new(),
+            };
+            let page_id = prepared.page_id;
+            drop(page_guard);
+
+            let err = match table
+                .build_lwc_blocks(
+                    &metadata,
+                    &guards,
+                    &[Some(prepared)],
+                    None::<fn(&RowPage, usize, RowID) -> Result<()>>,
+                )
+                .await
+            {
+                Ok(_) => panic!("oversized first row page should fail LWC block build"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::Internal);
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::LwcBuilderMisuse)
+            );
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("single row page does not fit in LWC block"),
+                "{report}"
+            );
+            assert!(report.contains(&format!("page_id={page_id}")), "{report}");
         });
     }
 
