@@ -1391,13 +1391,19 @@ pub(crate) mod tests {
     fn assert_catalog_data_integrity(err: Error) {
         let report = format!("{err:?}");
         if matches!(
-            err.completion_error(),
+            err.report().downcast_ref::<CompletionErrorKind>().copied(),
             Some(CompletionErrorKind::DataIntegrity(_))
         ) {
             assert!(report.contains("propagate from other threads"), "{report}");
             assert!(report.contains("wait for"), "{report}");
         } else {
-            assert!(err.data_integrity_error().is_some(), "{report}");
+            assert!(
+                err.report()
+                    .downcast_ref::<DataIntegrityError>()
+                    .copied()
+                    .is_some(),
+                "{report}"
+            );
         }
     }
 
@@ -1504,7 +1510,7 @@ pub(crate) mod tests {
             index_ddl_metadata_reconcilable(TableID::new(42), &catalog_metadata, &file_metadata)
                 .unwrap_err();
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
         let report = format!("{err:?}");
@@ -1579,7 +1585,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
             );
             let report = format!("{err:?}");

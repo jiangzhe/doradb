@@ -260,10 +260,6 @@ impl<T: 'static> FacadePageGuard<T> {
 
     /// Returns the logical page id stored in the guarded frame.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "test-only facade page identity")
-    )]
     pub(crate) fn page_id(&self) -> PageID {
         self.bf().page_id
     }

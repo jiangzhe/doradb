@@ -196,6 +196,7 @@ mod tests {
         let err = ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(RowID::new(42), false))
             .unwrap_err();
         let duplicate = err
+            .report()
             .downcast_ref::<RecoveryDuplicateKey>()
             .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
         assert_eq!(duplicate.index_no, 3);
@@ -263,7 +264,7 @@ mod tests {
             let assert_invalid_root = |err: Error, reason: &str| {
                 let report = format!("{err:?}");
                 assert_eq!(
-                    err.data_integrity_error(),
+                    err.report().downcast_ref::<DataIntegrityError>().copied(),
                     Some(DataIntegrityError::InvalidRootInvariant),
                     "{report}"
                 );
@@ -369,7 +370,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -390,7 +391,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");

@@ -8,16 +8,17 @@ use self::prefix::{LogPrefixEntry, LogPrefixId, LogPrefixKind, LogPrefixTracker}
 pub(crate) use self::seal::LogFileSealer;
 use crate::conf::TrxSysConfig;
 use crate::error::{
-    CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, InternalError,
-    IoError, ResourceError, Result,
+    CompletionErrorKind, ConfigError, DataIntegrityError, DataIntegrityResult, Error, FatalError,
+    InternalError, InternalResult, IoError, IoResult, ResourceError, ResourceResult, Result,
+    RuntimeError, RuntimeResult,
 };
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
-    BackendResult, CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats,
-    IOBackendStatsHandle, IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver,
-    SubmitAttempt, SubmitRetry, backend_failure, backend_report_summary,
+    CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats, IOBackendStatsHandle,
+    IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver, SubmitAttempt,
+    SubmitRetry, attach_backend_operation_kind, backend_failure, backend_report_summary,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -40,12 +41,12 @@ use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::io::Result as IoResult;
+use std::io::{ErrorKind as IoErrorKind, Result as StdIoResult};
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::result::Result as StdResult;
-use std::str::{FromStr, from_utf8};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -79,7 +80,7 @@ impl RedoLogFile {
 
     /// Allocate an append range in this redo file.
     #[inline]
-    pub(crate) fn alloc(&self, len: usize) -> Result<(usize, usize)> {
+    pub(crate) fn alloc(&self, len: usize) -> ResourceResult<(usize, usize)> {
         self.file.alloc(len)
     }
 
@@ -243,7 +244,7 @@ struct CreatedLogFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RedoLogFileDescriptor {
     /// Sequence number parsed from the 8-hex file suffix.
-    pub(crate) file_seq: u32,
+    pub(crate) seq: u32,
     /// Full path to the discovered redo log file.
     pub(crate) path: PathBuf,
 }
@@ -337,7 +338,7 @@ impl RedoLogFinalizer {
         self,
         purge_tx: Sender<Purge>,
     ) -> Result<(RedoLog, Arc<Completion<()>>)> {
-        let ctx = StorageBackend::new(self.log_write_io_depth)?;
+        let ctx = StorageBackend::setup(self.log_write_io_depth)?;
         let mut file_seq = self.next_file_seq;
         let (
             CreatedLogFile {
@@ -503,8 +504,8 @@ impl LogWriteSubmission {
     fn fail_unsubmitted_header(mut self, reason: FatalError) {
         let _ = self.operation.take_buf();
         if let LogWriteKind::Header { completion } = self.kind {
-            completion.complete(Err(CompletionErrorKind::report_fatal(
-                reason,
+            completion.complete(Err(CompletionErrorKind::from_fatal(
+                Report::new(reason),
                 "redo header write was not submitted",
             )));
         }
@@ -532,6 +533,7 @@ struct LogWriteCompletion {
     kind: LogWriteKind,
     buf: Option<DirectBuf>,
     poison: Option<FatalError>,
+    failure: Option<Report<FatalError>>,
 }
 
 /// Driver wrapper for redo log write submissions.
@@ -579,7 +581,7 @@ where
     }
 
     #[inline]
-    fn submit_ready(&mut self) -> BackendResult<SubmitAttempt> {
+    fn submit_ready(&mut self) -> IoResult<SubmitAttempt> {
         self.driver.submit_ready()
     }
 
@@ -605,12 +607,12 @@ where
     }
 
     #[inline]
-    fn backoff_submit_retry_or_progress_error(&mut self, retry: SubmitRetry) -> BackendResult<()> {
+    fn backoff_submit_retry_or_progress_error(&mut self, retry: SubmitRetry) -> IoResult<()> {
         self.driver.backoff_submit_retry_or_progress_error(retry)
     }
 
     #[inline]
-    fn wait_at_least_one(&mut self) -> BackendResult<LogWriteCompletion> {
+    fn wait_at_least_one(&mut self) -> IoResult<LogWriteCompletion> {
         self.driver
             .wait_at_least_one()
             .map(log_write_completion_from_completed)
@@ -663,7 +665,7 @@ pub(crate) struct RedoLog {
 impl RedoLog {
     /// Create a logical fixed-block group for one transaction's redo log.
     #[inline]
-    fn new_log_group(&self, data: TrxLog) -> Result<LogBlockGroup> {
+    fn new_log_group(&self, data: TrxLog) -> DataIntegrityResult<LogBlockGroup> {
         LogBlockGroup::new(self.log_block_size, data)
     }
 
@@ -671,7 +673,7 @@ impl RedoLog {
     fn rotate_log_file(&self, group_commit_g: &mut MutexGuard<'_, GroupCommit>) -> Result<()> {
         let Some(old_log_file) = group_commit_g.log_file.take() else {
             return Err(Error::from(
-                Report::new(InternalError::Generic)
+                Report::new(InternalError::CurrentRedoLogFileMissing)
                     .attach("redo log rotation requires current log file"),
             ));
         };
@@ -740,7 +742,7 @@ impl RedoLog {
                     end_offset,
                 ),
                 Err(err)
-                    if err.resource_error() == Some(ResourceError::StorageFileCapacityExceeded) =>
+                    if *err.current_context() == ResourceError::StorageFileCapacityExceeded =>
                 {
                     // Rotate log file and try again.
                     if self.rotate_log_file(group_commit_g).is_err() {
@@ -766,8 +768,8 @@ impl RedoLog {
                             end_offset,
                         ),
                         Err(err)
-                            if err.resource_error()
-                                == Some(ResourceError::StorageFileCapacityExceeded) =>
+                            if *err.current_context()
+                                == ResourceError::StorageFileCapacityExceeded =>
                         {
                             return Err(EnqueuePrecommitError {
                                 trx: Box::new(trx),
@@ -1112,7 +1114,7 @@ where
         self.shutdown = true;
         let fatal = *err.current_context();
         let reason = FailedPrecommitReason::Fatal(fatal);
-        self.fail_prefix_entries(fatal);
+        self.fail_prefix_entries_with_report(fatal, Some(err));
 
         let mut queued = Vec::new();
         {
@@ -1137,8 +1139,18 @@ where
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn fail_prefix_entries(&mut self, fatal: FatalError) {
+        self.fail_prefix_entries_with_report(fatal, None);
+    }
+
+    #[inline]
+    fn fail_prefix_entries_with_report(
+        &mut self,
+        fatal: FatalError,
+        mut source_report: Option<Report<FatalError>>,
+    ) {
         let reason = FailedPrecommitReason::Fatal(fatal);
         let mut recycle = Vec::new();
         for entry in &mut self.prefix.entries {
@@ -1147,6 +1159,7 @@ where
                     write,
                     ready,
                     failure,
+                    failure_report,
                     ..
                 } => {
                     if let Some(mut submission) = write.take() {
@@ -1155,6 +1168,9 @@ where
                     }
                     if !*ready || failure.is_none() {
                         *failure = Some(fatal);
+                    }
+                    if failure_report.is_none() {
+                        *failure_report = source_report.take();
                     }
                 }
                 LogPrefixKind::Group { group } => {
@@ -1441,11 +1457,12 @@ where
             Ok(submission) => {
                 *write = Some(submission);
             }
-            Err(reason) => {
+            Err(report) => {
+                let reason = *report.current_context();
                 *failure = Some(reason);
                 *ready = true;
-                let err = self.trx_sys.poison_engine(reason);
-                self.fail_pending(sealer, err);
+                let _ = self.trx_sys.poison_engine(reason);
+                self.fail_pending(sealer, report);
             }
         }
     }
@@ -1733,12 +1750,16 @@ where
                 retained
             );
         }
-        let poison = self.trx_sys.poison_engine_with_context(
+        let _ = self.trx_sys.poison_engine_with_context(
             reason,
             "redo",
             format!("backend progress failure: {error}"),
         );
-        self.fail_pending(sealer, poison);
+        self.fail_pending(
+            sealer,
+            err.change_context(reason)
+                .attach("redo backend progress failure"),
+        );
     }
 
     #[inline]
@@ -1766,14 +1787,15 @@ where
             kind,
             buf,
             poison,
+            failure,
         } = completion;
         match kind {
             LogWriteKind::Header { completion } => {
                 drop(buf.expect("redo header write completion must return a buffer"));
                 let Some(owner) = owner else {
-                    if let Some(source) = poison {
-                        completion.complete(Err(CompletionErrorKind::report_fatal(
-                            source,
+                    if let Some(report) = failure {
+                        completion.complete(Err(CompletionErrorKind::from_fatal(
+                            report,
                             "redo header write failed",
                         )));
                     } else {
@@ -1785,7 +1807,7 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo header request must carry a prefix entry id");
-                self.complete_header_request(prefix_id, poison);
+                self.complete_header_request(prefix_id, failure);
                 if self.fail_pending_if_poisoned(sealer, poison) {
                     return true;
                 }
@@ -1850,16 +1872,30 @@ where
     }
 
     #[inline]
-    fn complete_header_request(&mut self, prefix_id: LogPrefixId, poison: Option<FatalError>) {
+    fn complete_header_request(
+        &mut self,
+        prefix_id: LogPrefixId,
+        report: Option<Report<FatalError>>,
+    ) {
         let entry = self
             .prefix
             .entry_mut(prefix_id)
             .expect("redo header completion must match one prefix entry");
-        let LogPrefixKind::Header { ready, failure, .. } = &mut entry.kind else {
+        let LogPrefixKind::Header {
+            ready,
+            failure,
+            failure_report,
+            ..
+        } = &mut entry.kind
+        else {
             panic!("redo header completion matched non-header prefix entry");
         };
+        let poison = report.as_ref().map(|failure| *failure.current_context());
         if failure.is_none() {
             *failure = poison;
+        }
+        if failure_report.is_none() {
+            *failure_report = report;
         }
         *ready = true;
     }
@@ -1976,13 +2012,11 @@ where
 
 /// Return the next redo log file sequence.
 #[inline]
-pub(crate) fn next_redo_file_seq(file_seq: u32) -> Result<u32> {
+pub(crate) fn next_redo_file_seq(file_seq: u32) -> DataIntegrityResult<u32> {
     file_seq.checked_add(1).ok_or_else(|| {
-        Error::from(
-            Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
-                "redo log file family has terminal sequence {file_seq:08x}; cannot create next file"
-            )),
-        )
+        Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
+            "redo log file family has terminal sequence {file_seq:08x}; cannot create next file"
+        ))
     })
 }
 
@@ -1992,20 +2026,24 @@ pub(crate) fn discover_redo_log_files(
     file_prefix: &str,
     first_retained_file_seq: u32,
     desc: bool,
-) -> Result<Vec<RedoLogFileDescriptor>> {
-    let files = collect_redo_log_family_files(file_prefix)?
+) -> RuntimeResult<Vec<RedoLogFileDescriptor>> {
+    let mut files = collect_redo_log_family_files(file_prefix)?
         .into_iter()
-        .filter(|(seq, _)| *seq >= first_retained_file_seq)
+        .filter(|descriptor| descriptor.seq >= first_retained_file_seq)
         .collect::<Vec<_>>();
-    validate_redo_log_file_sequences(file_prefix, first_retained_file_seq, &files)?;
-    let mut res = files
-        .into_iter()
-        .map(|(file_seq, path)| RedoLogFileDescriptor { file_seq, path })
-        .collect::<Vec<_>>();
+    validate_redo_log_file_sequences(file_prefix, first_retained_file_seq, &files).map_err(
+        |report| {
+            report
+                .change_context(RuntimeError::RedoLogDiscovery)
+                .attach(format!(
+                    "phase=validate_redo_log_family, file_prefix={file_prefix}"
+                ))
+        },
+    )?;
     if desc {
-        res.reverse();
+        files.reverse();
     }
-    Ok(res)
+    Ok(files)
 }
 
 /// List present redo files below the durable first-retained marker.
@@ -2013,82 +2051,54 @@ pub(crate) fn discover_redo_log_files(
 pub(crate) fn obsolete_redo_log_files_below_marker(
     file_prefix: &str,
     first_retained_file_seq: u32,
-) -> Result<Vec<RedoLogFileDescriptor>> {
+) -> RuntimeResult<Vec<RedoLogFileDescriptor>> {
     Ok(collect_redo_log_family_files(file_prefix)?
         .into_iter()
-        .filter(|(seq, _)| *seq < first_retained_file_seq)
-        .map(|(file_seq, path)| RedoLogFileDescriptor { file_seq, path })
+        .filter(|descriptor| descriptor.seq < first_retained_file_seq)
         .collect())
 }
 
-/// Parse the eight-hex redo file sequence suffix from a redo log path.
 #[inline]
-pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
-    let file_name = file_path
-        .file_name()
-        .ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("missing log file name: {}", file_path.display())),
-            )
-        })?
-        .to_str()
-        .ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "log file name must be valid UTF-8: {}",
-                    file_path.display()
-                )),
-            )
-        })?;
-    if file_name.len() < 9 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!("log file name is too short: {file_name}"))
-            .into());
-    }
-    // last 8 bytes are hex encoded.
-    let suffix = from_utf8(&file_name.as_bytes()[file_name.len() - 8..]).map_err(|_| {
-        Error::from(
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "log file sequence suffix must be UTF-8: {file_name}"
-            )),
-        )
-    })?;
-    let file_seq = u32::from_str_radix(suffix, 16).map_err(|_| {
-        Error::from(
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("log file sequence suffix must be hex: {file_name}")),
-        )
-    })?;
-    Ok(file_seq)
-}
-
-#[inline]
-fn collect_redo_log_family_files(file_prefix: &str) -> Result<Vec<(u32, PathBuf)>> {
+fn collect_redo_log_family_files(file_prefix: &str) -> RuntimeResult<Vec<RedoLogFileDescriptor>> {
     // Collect only syntactically valid single-stream redo files. Sequence
     // contiguity is caller-specific: recovery and scan paths validate the
     // retained suffix, while post-truncation cleanup must tolerate an obsolete
     // prefix that previous cleanup attempts may have partially removed.
     let pattern = format!("{}.*", Pattern::escape(file_prefix));
     let mut files = vec![];
-    for entry in glob(&pattern).unwrap() {
-        let path = entry?;
-        let Some(suffix) = log_family_suffix(file_prefix, &path)? else {
-            continue;
+    for entry in glob(&pattern).expect("escaped redo log family glob pattern must compile") {
+        let path = entry.map_err(|err| {
+            Report::new(IoError::from(err.error().kind()))
+                .attach(format!("{err}"))
+                .change_context(RuntimeError::RedoLogDiscovery)
+                .attach(format!(
+                    "phase=enumerate_redo_log_family, file_prefix={file_prefix}, path={}",
+                    err.path().display()
+                ))
+        })?;
+        let file_seq = path
+            .to_str()
+            .and_then(|path| path.strip_prefix(file_prefix))
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .filter(|suffix| suffix.len() == 8)
+            .and_then(|suffix| u32::from_str_radix(suffix, 16).ok());
+        let Some(file_seq) = file_seq else {
+            return Err(Report::new(DataIntegrityError::InvalidRedoLogFileName)
+                .attach(format!(
+                    "path={}, expected={file_prefix}.<8-hex-sequence>",
+                    path.display()
+                ))
+                .change_context(RuntimeError::RedoLogDiscovery)
+                .attach(format!(
+                    "phase=enumerate_redo_log_family, file_prefix={file_prefix}"
+                )));
         };
-        if is_log_file_seq(suffix) {
-            let file_seq = parse_file_seq(&path)?;
-            files.push((file_seq, path));
-            continue;
-        }
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "invalid redo log file name for single-stream layout: {}",
-                path.display()
-            ))
-            .into());
+        files.push(RedoLogFileDescriptor {
+            seq: file_seq,
+            path,
+        });
     }
-    files.sort_by_key(|(seq, _)| *seq);
+    files.sort_by_key(|descriptor| descriptor.seq);
     Ok(files)
 }
 
@@ -2097,6 +2107,7 @@ fn finish_header_prefix_entry(entry: LogPrefixEntry) {
     let LogPrefixKind::Header {
         completion,
         failure,
+        failure_report,
         ..
     } = entry.kind
     else {
@@ -2105,9 +2116,14 @@ fn finish_header_prefix_entry(entry: LogPrefixEntry) {
     let Some(completion) = completion else {
         return;
     };
-    if let Some(reason) = failure {
-        completion.complete(Err(CompletionErrorKind::report_fatal(
-            reason,
+    if let Some(report) = failure_report {
+        completion.complete(Err(CompletionErrorKind::from_fatal(
+            report,
+            "redo header write failed",
+        )));
+    } else if let Some(reason) = failure {
+        completion.complete(Err(CompletionErrorKind::from_fatal(
+            Report::new(reason),
             "redo header write failed",
         )));
     } else {
@@ -2160,30 +2176,54 @@ fn log_write_completion_from_completed(
         ),
         IOKind::Fsync | IOKind::Fdatasync => None,
     };
+    let (poison, failure) = redo_io_failure(kind, completed.result, expected_len);
     LogWriteCompletion {
         owner: submission.owner,
         kind: submission.kind,
         buf,
-        poison: redo_io_poison(kind, completed.result, expected_len),
+        poison,
+        failure,
     }
 }
 
 #[inline]
-fn redo_io_poison(
+fn redo_io_failure(
     kind: IOKind,
-    result: IoResult<usize>,
+    result: StdIoResult<usize>,
     expected_len: usize,
-) -> Option<FatalError> {
-    match kind {
+) -> (Option<FatalError>, Option<Report<FatalError>>) {
+    let failure = match kind {
         IOKind::Read | IOKind::Write => match result {
             Ok(len) if len == expected_len => None,
-            Ok(_) | Err(_) => Some(FatalError::RedoWrite),
-        },
+            Ok(len) => Some(
+                Report::new(IoError::from(IoErrorKind::UnexpectedEof)).attach(format!(
+                    "unexpected eof: actual_bytes={len}, expected_bytes={expected_len}"
+                )),
+            ),
+            Err(err) => Some(Report::new(IoError::from(err.kind())).attach(format!("{err}"))),
+        }
+        .map(|report| {
+            attach_backend_operation_kind(report, Some(kind))
+                .change_context(FatalError::RedoWrite)
+                .attach("redo write durability failure")
+        }),
         IOKind::Fsync | IOKind::Fdatasync => match result {
             Ok(0) => None,
-            Ok(_) | Err(_) => Some(FatalError::RedoSync),
-        },
-    }
+            Ok(result) => Some(
+                Report::new(IoError::from(IoErrorKind::Other)).attach(format!(
+                    "unexpected io completion result: actual_result={result}, expected_result=0"
+                )),
+            ),
+            Err(err) => Some(Report::new(IoError::from(err.kind())).attach(format!("{err}"))),
+        }
+        .map(|report| {
+            attach_backend_operation_kind(report, Some(kind))
+                .change_context(FatalError::RedoSync)
+                .attach("redo sync durability failure")
+        }),
+    };
+    let poison = failure.as_ref().map(|report| *report.current_context());
+    (poison, failure)
 }
 
 #[inline]
@@ -2276,7 +2316,7 @@ fn create_log_file_with_header_completion_with_mode(
 fn prepare_initial_redo_super_block(
     log_file: &SparseFile,
     super_block: &RedoSuperBlock,
-) -> Result<(LogWriteSubmission, Arc<Completion<()>>)> {
+) -> InternalResult<(LogWriteSubmission, Arc<Completion<()>>)> {
     let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
     serialize_redo_super_block(buf.as_bytes_mut(), super_block)?;
     Ok(LogWriteSubmission::header(log_file.as_raw_fd(), 0, buf))
@@ -2300,51 +2340,53 @@ fn open_recovered_seal_file(recovered: RecoveredRedoSeal) -> Result<RedoLogFile>
 fn validate_redo_log_file_sequences(
     file_prefix: &str,
     first_retained_file_seq: u32,
-    files: &[(u32, PathBuf)],
-) -> Result<()> {
+    files: &[RedoLogFileDescriptor],
+) -> DataIntegrityResult<()> {
     if files.is_empty() {
         if first_retained_file_seq > 0 {
-            return Err(Report::new(DataIntegrityError::RedoLogSequenceGap)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
                     "no redo log files at or above first retained sequence {first_retained_file_seq:08x} in family {file_prefix}"
-                ))
-                .into());
+                )),
+            );
         }
         return Ok(());
     }
-    if let Some((first, _)) = files.first()
-        && *first != first_retained_file_seq
+    if let Some(first) = files.first()
+        && first.seq != first_retained_file_seq
     {
-        let missing_end = first.saturating_sub(1);
+        let missing_end = first.seq.saturating_sub(1);
         let missing = format_redo_sequence_range(first_retained_file_seq, missing_end);
         let missing_kind = if first_retained_file_seq == 0 {
             "redo log file prefix"
         } else {
             "first retained redo log file"
         };
-        return Err(Report::new(DataIntegrityError::RedoLogSequenceGap)
-            .attach(format!(
+        return Err(
+            Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
                 "missing {missing_kind} sequence(s) {missing} in family {file_prefix}"
-            ))
-            .into());
+            )),
+        );
     }
     for window in files.windows(2) {
-        let prev = window[0].0;
-        let next = window[1].0;
-        if next <= prev {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "duplicate redo log file sequence {next:08x} in family {file_prefix}"
-                ))
-                .into());
+        let prev = window[0].seq;
+        let next = window[1].seq;
+        assert!(
+            next >= prev,
+            "redo log family sequence validation requires sorted input: previous_sequence={prev:08x}, previous_path={}, next_sequence={next:08x}, next_path={}",
+            window[0].path.display(),
+            window[1].path.display()
+        );
+        if next == prev {
+            return Err(Report::new(DataIntegrityError::DuplicateRedoLogSequence).attach(format!(
+                "file_prefix={file_prefix}, file_sequence={next:08x}, first_path={}, second_path={}",
+                window[0].path.display(),
+                window[1].path.display()
+            )));
         }
-        let expected = prev.checked_add(1).ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
-                    "redo log file family {file_prefix} has file after terminal sequence {prev:08x}"
-                )),
-            )
-        })?;
+        let expected = prev
+            .checked_add(1)
+            .expect("strictly increasing redo sequence cannot follow u32::MAX");
         if next != expected {
             let missing_end = next - 1;
             let missing = if expected == missing_end {
@@ -2352,11 +2394,11 @@ fn validate_redo_log_file_sequences(
             } else {
                 format!("{expected:08x}..={missing_end:08x}")
             };
-            return Err(Report::new(DataIntegrityError::RedoLogSequenceGap)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
                     "missing redo log file sequence(s) {missing} in family {file_prefix}"
-                ))
-                .into());
+                )),
+            );
         }
     }
     Ok(())
@@ -2371,27 +2413,6 @@ fn format_redo_sequence_range(first: u32, last: u32) -> String {
     }
 }
 
-#[inline]
-fn log_family_suffix<'a>(file_prefix: &str, file_path: &'a Path) -> Result<Option<&'a str>> {
-    let path = file_path.to_str().ok_or_else(|| {
-        Error::from(
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "log file path must be valid UTF-8: {}",
-                file_path.display()
-            )),
-        )
-    })?;
-    let Some(suffix) = path.strip_prefix(file_prefix) else {
-        return Ok(None);
-    };
-    Ok(suffix.strip_prefix('.'))
-}
-
-#[inline]
-fn is_log_file_seq(value: &str) -> bool {
-    value.len() == 8 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2400,7 +2421,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
     use crate::error::{
-        CompletionErrorKind, DataIntegrityError, FatalError, InternalError, LifecycleError,
+        CompletionErrorKind, DataIntegrityError, ErrorKind, FatalError, InternalError,
+        LifecycleError, RuntimeError,
     };
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
@@ -2451,6 +2473,17 @@ mod tests {
             Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    fn assert_redo_discovery_data_integrity(
+        err: &Report<RuntimeError>,
+        expected: DataIntegrityError,
+    ) {
+        assert_eq!(*err.current_context(), RuntimeError::RedoLogDiscovery);
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected)
+        );
     }
 
     fn oversized_redo_log_for_test(cts: TrxID) -> TrxLog {
@@ -2508,7 +2541,7 @@ mod tests {
     ) -> (RedoLogFinalizer, RedoReplayPlanner, usize) {
         let next_file_seq = logs
             .last()
-            .map(|descriptor| next_redo_file_seq(descriptor.file_seq))
+            .map(|descriptor| next_redo_file_seq(descriptor.seq))
             .transpose()
             .unwrap()
             .unwrap_or(0);
@@ -2560,7 +2593,7 @@ mod tests {
         header_write: LogWriteSubmission,
         header_completion: &Completion<()>,
     ) {
-        let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+        let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
         assert!(write_driver.push_write(header_write).is_ok());
         assert_eq!(
             write_driver.submit_ready().unwrap(),
@@ -2571,12 +2604,14 @@ mod tests {
             kind,
             buf,
             poison,
+            failure,
         } = write_driver.wait_at_least_one().unwrap();
         match kind {
             LogWriteKind::Header { completion } => {
                 drop(buf.expect("redo header write completion must return a buffer"));
                 assert!(owner.is_none());
                 assert_eq!(poison, None);
+                assert!(failure.is_none());
                 completion.complete(Ok(()));
             }
             LogWriteKind::Group { .. } => panic!("expected redo header write completion"),
@@ -2823,7 +2858,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.downcast_ref::<FatalError>().copied(),
+            err.report().downcast_ref::<FatalError>().copied(),
             Some(expected),
             "{err:?}"
         );
@@ -2835,7 +2870,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.completion_error(),
+            err.report().downcast_ref::<CompletionErrorKind>().copied(),
             Some(CompletionErrorKind::Fatal(expected)),
             "{err:?}"
         );
@@ -2846,20 +2881,28 @@ mod tests {
 
     #[test]
     fn test_redo_sync_completion_accepts_only_zero_success_result() {
-        assert_eq!(redo_io_poison(IOKind::Fsync, Ok(0), 0), None);
-        assert_eq!(redo_io_poison(IOKind::Fdatasync, Ok(0), 0), None);
-        assert_eq!(
-            redo_io_poison(IOKind::Fsync, Ok(1), 0),
-            Some(FatalError::RedoSync)
+        let (poison, failure) = redo_io_failure(IOKind::Fsync, Ok(0), 0);
+        assert_eq!(poison, None);
+        assert!(failure.is_none());
+        let (poison, failure) = redo_io_failure(IOKind::Fdatasync, Ok(0), 0);
+        assert_eq!(poison, None);
+        assert!(failure.is_none());
+
+        let (poison, failure) = redo_io_failure(IOKind::Fsync, Ok(1), 0);
+        assert_eq!(poison, Some(FatalError::RedoSync));
+        let failure = failure.expect("nonzero sync result must retain a fatal report");
+        assert_eq!(*failure.current_context(), FatalError::RedoSync);
+        assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
+
+        let (poison, failure) = redo_io_failure(
+            IOKind::Fdatasync,
+            Err(IoError::from_raw_os_error(libc::EIO)),
+            0,
         );
-        assert_eq!(
-            redo_io_poison(
-                IOKind::Fdatasync,
-                Err(IoError::from_raw_os_error(libc::EIO)),
-                0
-            ),
-            Some(FatalError::RedoSync)
-        );
+        assert_eq!(poison, Some(FatalError::RedoSync));
+        let failure = failure.expect("sync IO failure must retain a fatal report");
+        assert_eq!(*failure.current_context(), FatalError::RedoSync);
+        assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
     }
 
     fn record_seal_group(
@@ -2890,7 +2933,7 @@ mod tests {
             .log_sync(log_sync);
         (
             manual_log_processor_harness(engine, config, redo_log),
-            LogWriteDriver::new(StorageBackend::new(1).unwrap()),
+            LogWriteDriver::new(StorageBackend::setup(1).unwrap()),
         )
     }
 
@@ -3001,8 +3044,8 @@ mod tests {
         };
 
         assert_eq!(
-            err.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::Generic),
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::CurrentRedoLogFileMissing),
             "{err:?}"
         );
     }
@@ -3089,7 +3132,7 @@ mod tests {
             let err = trx.commit().await.unwrap_err();
 
             assert_eq!(
-                err.completion_error(),
+                err.report().downcast_ref::<CompletionErrorKind>().copied(),
                 Some(CompletionErrorKind::Fatal(FatalError::RedoWrite)),
                 "{err:?}"
             );
@@ -3266,7 +3309,7 @@ mod tests {
 
             let err = trx.commit().await.unwrap_err();
             assert_eq!(
-                err.completion_error(),
+                err.report().downcast_ref::<CompletionErrorKind>().copied(),
                 Some(CompletionErrorKind::Lifecycle(LifecycleError::Shutdown)),
                 "{err:?}"
             );
@@ -3322,7 +3365,7 @@ mod tests {
 
             let err = commit_fut.await.unwrap_err();
             assert_eq!(
-                err.completion_error(),
+                err.report().downcast_ref::<CompletionErrorKind>().copied(),
                 Some(CompletionErrorKind::Fatal(FatalError::RedoSync)),
                 "{err:?}"
             );
@@ -3408,31 +3451,31 @@ mod tests {
     }
 
     struct LogTestBackend {
-        max_events: usize,
+        io_depth: usize,
         inflight: VecDeque<(BackendToken, IOKind)>,
         wait_batches: VecDeque<LogTestCompletionBatch>,
     }
 
     impl LogTestBackend {
-        fn complete_all(max_events: usize) -> Self {
+        fn complete_all(io_depth: usize) -> Self {
             Self {
-                max_events,
+                io_depth,
                 inflight: VecDeque::new(),
                 wait_batches: VecDeque::new(),
             }
         }
 
-        fn complete_one_back(max_events: usize) -> Self {
+        fn complete_one_back(io_depth: usize) -> Self {
             Self {
-                max_events,
+                io_depth,
                 inflight: VecDeque::new(),
                 wait_batches: VecDeque::from([LogTestCompletionBatch::OneBack]),
             }
         }
 
-        fn complete_all_then_wait_error(max_events: usize) -> Self {
+        fn complete_all_then_wait_error(io_depth: usize) -> Self {
             Self {
-                max_events,
+                io_depth,
                 inflight: VecDeque::new(),
                 wait_batches: VecDeque::from([
                     LogTestCompletionBatch::AllFront,
@@ -3447,12 +3490,16 @@ mod tests {
         type SubmitBatch = VecDeque<(BackendToken, IOKind)>;
         type Events = ();
 
-        fn max_events(&self) -> usize {
-            self.max_events
+        fn setup(io_depth: usize) -> IoResult<Self> {
+            Ok(Self::complete_all(io_depth))
+        }
+
+        fn io_depth(&self) -> usize {
+            self.io_depth
         }
 
         fn new_submit_batch(&self) -> Self::SubmitBatch {
-            VecDeque::with_capacity(self.max_events)
+            VecDeque::with_capacity(self.io_depth)
         }
 
         fn new_events(&self) -> Self::Events {}
@@ -3469,7 +3516,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> BackendResult<SubmitAttempt> {
+        ) -> IoResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
             let Some(accepted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
@@ -3487,7 +3534,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(
                 self.inflight.len() >= min_nr,
                 "test backend requires enough inflight work to satisfy wait"
@@ -3795,7 +3842,7 @@ mod tests {
                 .log_block_size(4096usize)
                 .log_sync(LogSync::None);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             let cts = TrxID::new(50);
 
@@ -3892,7 +3939,7 @@ mod tests {
 
             let hook = RecordingRedoWriteSubmitHook::default();
             let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(2).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(2).unwrap());
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             {
                 let mut fp = RedoLogWriter::new(
@@ -3983,7 +4030,7 @@ mod tests {
                 }));
             }
 
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(2).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(2).unwrap());
             {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
@@ -4056,7 +4103,7 @@ mod tests {
                 .log_block_size(4096usize)
                 .log_sync(LogSync::Fsync);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             let cts = TrxID::new(60);
 
@@ -4126,7 +4173,7 @@ mod tests {
                 .log_block_size(4096usize)
                 .log_sync(LogSync::None);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
 
             finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
@@ -4418,7 +4465,7 @@ mod tests {
                 .log_block_size(4096usize)
                 .log_sync(LogSync::None);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
             let mut writer =
                 RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
@@ -4469,7 +4516,7 @@ mod tests {
         assert_eq!(
             vec![0, 1, 2],
             asc.iter()
-                .map(|descriptor| descriptor.file_seq)
+                .map(|descriptor| descriptor.seq)
                 .collect::<Vec<_>>()
         );
 
@@ -4483,9 +4530,43 @@ mod tests {
         assert_eq!(
             vec![2, 1, 0],
             desc.iter()
-                .map(|descriptor| descriptor.file_seq)
+                .map(|descriptor| descriptor.seq)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_next_redo_file_seq_returns_data_integrity_report() {
+        let err = next_redo_file_seq(u32::MAX).unwrap_err();
+
+        assert_eq!(
+            *err.current_context(),
+            DataIntegrityError::RedoLogSequenceGap
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("terminal sequence ffffffff"), "{report}");
+    }
+
+    #[test]
+    fn test_validate_redo_log_file_sequences_returns_data_integrity_report() {
+        let files = [
+            RedoLogFileDescriptor {
+                seq: 0,
+                path: PathBuf::from("redo.00000000"),
+            },
+            RedoLogFileDescriptor {
+                seq: 2,
+                path: PathBuf::from("redo.00000002"),
+            },
+        ];
+        let err = validate_redo_log_file_sequences("redo", 0, &files).unwrap_err();
+
+        assert_eq!(
+            *err.current_context(),
+            DataIntegrityError::RedoLogSequenceGap
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("00000001"), "{report}");
     }
 
     #[test]
@@ -4496,14 +4577,22 @@ mod tests {
         drop(create_log_file_for_test(file_prefix, 1, 128 * 1024, 4096));
 
         let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::RedoLogSequenceGap)
-        );
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
         let report = format!("{err:?}");
         assert!(report.contains("00000000"), "{report}");
         assert!(report.contains("prefix"), "{report}");
         assert!(report.contains(file_prefix), "{report}");
+
+        let err = Error::from(err);
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::RedoLogDiscovery)
+        );
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::RedoLogSequenceGap)
+        );
     }
 
     #[test]
@@ -4515,10 +4604,7 @@ mod tests {
         drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
 
         let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::RedoLogSequenceGap)
-        );
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
         let report = format!("{err:?}");
         assert!(report.contains("00000001"), "{report}");
         assert!(report.contains(file_prefix), "{report}");
@@ -4536,7 +4622,7 @@ mod tests {
         assert_eq!(
             descriptors
                 .iter()
-                .map(|descriptor| descriptor.file_seq)
+                .map(|descriptor| descriptor.seq)
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
@@ -4560,7 +4646,7 @@ mod tests {
         assert_eq!(
             descriptors
                 .iter()
-                .map(|descriptor| descriptor.file_seq)
+                .map(|descriptor| descriptor.seq)
                 .collect::<Vec<_>>(),
             vec![3, 2]
         );
@@ -4575,10 +4661,7 @@ mod tests {
         drop(create_log_file_for_test(file_prefix, 1, 128 * 1024, 4096));
 
         let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::RedoLogSequenceGap)
-        );
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
         let report = format!("{err:?}");
         assert!(
             report.contains("first retained sequence 00000002"),
@@ -4594,10 +4677,7 @@ mod tests {
         drop(create_log_file_for_test(file_prefix, 3, 128 * 1024, 4096));
 
         let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::RedoLogSequenceGap)
-        );
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
         let report = format!("{err:?}");
         assert!(report.contains("00000002"), "{report}");
         assert!(report.contains(file_prefix), "{report}");
@@ -4612,10 +4692,7 @@ mod tests {
         drop(create_log_file_for_test(file_prefix, 4, 128 * 1024, 4096));
 
         let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::RedoLogSequenceGap)
-        );
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
         let report = format!("{err:?}");
         assert!(report.contains("00000003"), "{report}");
         assert!(report.contains(file_prefix), "{report}");
@@ -4629,15 +4706,28 @@ mod tests {
         File::create(format!("{file_prefix}.0.00000000")).unwrap();
 
         let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::InvalidRedoLogFileName);
         let report = format!("{err:?}");
-        assert!(
-            report.contains("invalid redo log file name for single-stream layout"),
-            "{report}"
-        );
+        assert!(report.contains("expected="), "{report}");
+        assert!(report.contains("<8-hex-sequence>"), "{report}");
+    }
+
+    #[test]
+    fn test_discover_redo_log_files_rejects_duplicate_numeric_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        let lower_path = format!("{file_prefix}.0000000a");
+        let upper_path = format!("{file_prefix}.0000000A");
+        File::create(&lower_path).unwrap();
+        File::create(&upper_path).unwrap();
+
+        let err = discover_redo_log_files(file_prefix, 10, false).unwrap_err();
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::DuplicateRedoLogSequence);
+        let report = format!("{err:?}");
+        assert!(report.contains("file_sequence=0000000a"), "{report}");
+        assert!(report.contains(&lower_path), "{report}");
+        assert!(report.contains(&upper_path), "{report}");
     }
 
     #[test]
@@ -4681,7 +4771,7 @@ mod tests {
             let mut stream = planned.stream;
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::LogFileCorrupted)
             );
         });
@@ -4762,7 +4852,7 @@ mod tests {
             let mut stream = planned.stream;
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::LogFileCorrupted)
             );
         });
@@ -4819,7 +4909,7 @@ mod tests {
                 .log_block_size(4096usize)
                 .log_sync(LogSync::None);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             let mut writer =
                 RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
@@ -4927,7 +5017,7 @@ mod tests {
             let group_len = blocks.iter().map(DirectBuf::capacity).sum();
             let (group_offset, _) = old_log_file.alloc(group_len).unwrap();
             assert_eq!(group_offset, REDO_DEFAULT_DATA_START_OFFSET);
-            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
             for (idx, direct_buf) in blocks.into_iter().enumerate() {
                 assert!(
                     write_driver
@@ -4949,12 +5039,14 @@ mod tests {
                 kind,
                 buf,
                 poison,
+                failure,
             } = write_driver.wait_at_least_one().unwrap();
             match kind {
                 LogWriteKind::Group { .. } => {
                     drop(buf.expect("redo group write completion must return a buffer"));
                     assert!(owner.is_none());
                     assert_eq!(poison, None);
+                    assert!(failure.is_none());
                 }
                 LogWriteKind::Header { .. } => panic!("expected redo group write completion"),
                 LogWriteKind::SealWrite { .. }
@@ -5038,11 +5130,18 @@ mod tests {
                 Ok(_) => panic!("engine startup should reject invalid redo file names"),
                 Err(err) => err,
             };
-            let report = format!("{err:?}");
-            assert!(
-                report.contains("invalid redo log file name for single-stream layout"),
-                "{report}"
+            assert_eq!(err.kind(), ErrorKind::Runtime);
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::RedoLogDiscovery)
             );
+            assert_eq!(
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRedoLogFileName)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("invalid redo log file name"), "{report}");
+            assert!(report.contains("<8-hex-sequence>"), "{report}");
         });
     }
 
@@ -5064,7 +5163,7 @@ mod tests {
                 Err(err) => err,
             };
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidMagic)
             );
         });

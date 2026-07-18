@@ -15,7 +15,7 @@ use crate::id::{BlockID, FileID};
 
 use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
 use crate::error::{
-    CompletionErrorKind, ConfigError, Error, IoError, ResourceError, Result, StorageOp,
+    CompletionErrorKind, CompletionResult, IoError, IoResult, ResourceError, ResourceResult,
 };
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
@@ -28,8 +28,8 @@ use libc::{O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fstat, ftruncate, 
 use parking_lot::RawMutex;
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use scopeguard::defer;
-use std::ffi::CString;
-use std::io::{self, Error as StdIoError};
+use std::ffi::{CStr, CString};
+use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -97,31 +97,10 @@ impl SparseFile {
         file_path: impl AsRef<str>,
         max_size: usize,
         file_id: FileID,
-    ) -> Result<SparseFile> {
-        // SAFETY: libc calls (`open`, `ftruncate`, `close`) are used with validated C string
-        // arguments and checked return codes before constructing `SparseFile`.
-        unsafe {
-            let c_string = c_string_from_path(file_path.as_ref())?;
-            let fd = open(
-                c_string.as_ptr(),
-                O_CREAT | O_RDWR | O_TRUNC | O_DIRECT,
-                0o644,
-            );
-            if fd < 0 {
-                return Err(IoError::report_with_op(
-                    StorageOp::FileCreate,
-                    StdIoError::last_os_error(),
-                )
-                .into());
-            }
-            let ret = ftruncate(fd, max_size as i64);
-            if ret < 0 {
-                let err = StdIoError::last_os_error();
-                let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(IoError::report_with_op(StorageOp::FileResize, err).into());
-            }
-            Ok(SparseFile::new(fd, 0, max_size, file_id))
-        }
+    ) -> IoResult<SparseFile> {
+        let c_string = c_string_from_path(file_path.as_ref())?;
+        let fd = create_sparse_file(&c_string, O_CREAT | O_RDWR | O_TRUNC | O_DIRECT, max_size)?;
+        Ok(SparseFile::new(fd, 0, max_size, file_id))
     }
 
     /// Create a sparse file and fail if file already exists.
@@ -131,58 +110,27 @@ impl SparseFile {
         file_path: impl AsRef<str>,
         max_size: usize,
         file_id: FileID,
-    ) -> Result<SparseFile> {
-        // SAFETY: libc calls (`open`, `ftruncate`, `close`) are issued with a
-        // validated C string and checked return codes before constructing
-        // `SparseFile`.
-        unsafe {
-            let c_string = c_string_from_path(file_path.as_ref())?;
-            let fd = open(
-                c_string.as_ptr(),
-                O_CREAT | O_RDWR | O_EXCL | O_DIRECT,
-                0o644,
-            );
-            if fd < 0 {
-                return Err(IoError::report_with_op(
-                    StorageOp::FileCreate,
-                    StdIoError::last_os_error(),
-                )
-                .into());
-            }
-            let ret = ftruncate(fd, max_size as i64);
-            if ret < 0 {
-                let err = StdIoError::last_os_error();
-                let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(IoError::report_with_op(StorageOp::FileResize, err).into());
-            }
-            Ok(SparseFile::new(fd, 0, max_size, file_id))
-        }
+    ) -> IoResult<SparseFile> {
+        let c_string = c_string_from_path(file_path.as_ref())?;
+        let fd = create_sparse_file(&c_string, O_CREAT | O_RDWR | O_EXCL | O_DIRECT, max_size)?;
+        Ok(SparseFile::new(fd, 0, max_size, file_id))
     }
 
     /// Open an existing sparse file with given maximum length.
     #[inline]
-    pub(crate) fn open(file_path: impl AsRef<str>, file_id: FileID) -> Result<SparseFile> {
-        // SAFETY: `open` is called with a validated C string, and the returned
-        // fd is checked before it is used or wrapped.
-        unsafe {
-            let c_string = c_string_from_path(file_path.as_ref())?;
-            let fd = open(c_string.as_ptr(), O_RDWR | O_DIRECT, 0o644);
-            if fd < 0 {
-                return Err(IoError::report_with_op(
-                    StorageOp::FileOpen,
-                    StdIoError::last_os_error(),
-                )
-                .into());
+    pub(crate) fn open(file_path: impl AsRef<str>, file_id: FileID) -> IoResult<SparseFile> {
+        let c_string = c_string_from_path(file_path.as_ref())?;
+        let fd = open_sparse_file(&c_string)?;
+        let (logical_size, _) = match sparse_file_size(fd) {
+            Ok((l, a)) => (l, a),
+            Err(err) => {
+                // SAFETY: the typed open supplier returned one live owned fd,
+                // and this error path has not transferred it to `SparseFile`.
+                let _ = unsafe { close(fd) };
+                return Err(err);
             }
-            let (logical_size, _) = match sparse_file_size(fd) {
-                Ok((l, a)) => (l, a),
-                Err(err) => {
-                    let _ = close(fd);
-                    return Err(IoError::report_with_op(StorageOp::FileStat, err).into());
-                }
-            };
-            Ok(SparseFile::new(fd, 0, logical_size, file_id))
-        }
+        };
+        Ok(SparseFile::new(fd, 0, logical_size, file_id))
     }
 
     /// Create a new sparse file.
@@ -206,18 +154,18 @@ impl SparseFile {
     /// Allocate enough space for data of given length to persist
     /// at end of the file.
     #[inline]
-    pub(crate) fn alloc(&self, len: usize) -> Result<(usize, usize)> {
+    pub(crate) fn alloc(&self, len: usize) -> ResourceResult<(usize, usize)> {
         let size = align_to_sector_size(len);
         loop {
             let offset = self.offset.load(Ordering::Relaxed);
             let new_offset = offset + size;
             let max_len = self.max_len.load(Ordering::Relaxed);
             if new_offset > max_len {
-                return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
-                    .attach(format!(
+                return Err(Report::new(ResourceError::StorageFileCapacityExceeded).attach(
+                    format!(
                         "sparse file allocation: requested_len={len}, aligned_len={size}, current_offset={offset}, new_offset={new_offset}, max_len={max_len}"
-                    ))
-                    .into());
+                    ),
+                ));
             }
             if self
                 .offset
@@ -236,7 +184,7 @@ impl SparseFile {
         all(feature = "iouring", test),
         expect(dead_code, reason = "pending dead-code audit")
     )]
-    pub(crate) fn extend_to(&self, max_len: usize) -> io::Result<()> {
+    pub(crate) fn extend_to(&self, max_len: usize) -> IoResult<()> {
         self.size_lock.lock();
         defer! {
             // SAFETY: this path holds `size_lock`, so the matching unlock is
@@ -254,7 +202,8 @@ impl SparseFile {
             return Ok(());
         }
         debug_assert!(retcode == -1);
-        Err(StdIoError::last_os_error())
+        let err = StdIoError::last_os_error();
+        Err(Report::new(IoError::from(err.kind())).attach(format!("op=file_resize, {err}")))
     }
 
     /// Get the logical size and allocated size of this file.
@@ -264,7 +213,7 @@ impl SparseFile {
         all(feature = "iouring", test),
         expect(dead_code, reason = "pending dead-code audit")
     )]
-    pub(crate) fn size(&self) -> io::Result<(usize, usize)> {
+    pub(crate) fn size(&self) -> IoResult<(usize, usize)> {
         sparse_file_size(self.fd)
     }
 }
@@ -339,11 +288,12 @@ impl WriteSubmission {
     pub(crate) fn fail(mut self, err: &Report<IoError>) {
         drop(self.buf);
         drop(self.write_lease.take());
-        self.completion
-            .complete(Err(CompletionErrorKind::report_backend_io(
-                err,
-                format!("submit table file write: key={:?}", self.key),
-            )));
+        let report =
+            IoError::report_backend(err, format!("submit table file write: key={:?}", self.key));
+        self.completion.complete(Err(CompletionErrorKind::from_io(
+            report,
+            "table write completion transport",
+        )));
     }
 }
 
@@ -371,22 +321,26 @@ impl PreparedWriteSubmission {
                 .expect("prepared table write must still own its direct buffer"),
         );
         self.release_write_lease();
-        self.completion
-            .complete(Err(CompletionErrorKind::report_backend_io(
-                err,
-                format!("submit table file write: key={:?}", self.key),
-            )));
+        let report =
+            IoError::report_backend(err, format!("submit table file write: key={:?}", self.key));
+        self.completion.complete(Err(CompletionErrorKind::from_io(
+            report,
+            "table write completion transport",
+        )));
     }
 
     /// Fail an accepted table write while retaining kernel-facing memory.
     #[inline]
     fn fail_backend_submitted(&mut self, err: &Report<IoError>) {
         self.release_write_lease();
-        self.completion
-            .complete(Err(CompletionErrorKind::report_backend_io(
-                err,
-                format!("complete submitted table file write: key={:?}", self.key),
-            )));
+        let report = IoError::report_backend(
+            err,
+            format!("complete submitted table file write: key={:?}", self.key),
+        );
+        self.completion.complete(Err(CompletionErrorKind::from_io(
+            report,
+            "table write completion transport",
+        )));
     }
 }
 
@@ -432,11 +386,11 @@ impl SyncSubmission {
     /// Fail a table sync before backend submission accepted it.
     #[inline]
     pub(crate) fn fail(self, err: &Report<IoError>) {
-        self.completion
-            .complete(Err(CompletionErrorKind::report_backend_io(
-                err,
-                "submit table file fsync",
-            )));
+        let report = IoError::report_backend(err, "submit table file fsync");
+        self.completion.complete(Err(CompletionErrorKind::from_io(
+            report,
+            "table fsync completion transport",
+        )));
     }
 }
 
@@ -451,21 +405,21 @@ impl PreparedSyncSubmission {
     /// Fail a prepared table sync before backend submission accepted it.
     #[inline]
     fn fail_backend_not_accepted(self, err: &Report<IoError>) {
-        self.completion
-            .complete(Err(CompletionErrorKind::report_backend_io(
-                err,
-                "submit table file fsync",
-            )));
+        let report = IoError::report_backend(err, "submit table file fsync");
+        self.completion.complete(Err(CompletionErrorKind::from_io(
+            report,
+            "table fsync completion transport",
+        )));
     }
 
     /// Fail an accepted table sync.
     #[inline]
     fn fail_backend_submitted(&mut self, err: &Report<IoError>) {
-        self.completion
-            .complete(Err(CompletionErrorKind::report_backend_io(
-                err,
-                "complete submitted table file fsync",
-            )));
+        let report = IoError::report_backend(err, "complete submitted table file fsync");
+        self.completion.complete(Err(CompletionErrorKind::from_io(
+            report,
+            "table fsync completion transport",
+        )));
     }
 }
 
@@ -578,9 +532,10 @@ impl TableFsStateMachine {
                 IOKind::Fsync
             }
             TableFsSubmission::Read(sub) => {
-                sub.fail(CompletionErrorKind::report_backend_io(
-                    err,
-                    "submit readonly table read",
+                let report = IoError::report_backend(err, "submit readonly table read");
+                sub.fail(CompletionErrorKind::from_io(
+                    report,
+                    "readonly table read completion transport",
                 ));
                 IOKind::Read
             }
@@ -605,9 +560,10 @@ impl TableFsStateMachine {
                 IOKind::Fsync
             }
             TableFsSubmission::Read(sub) => {
-                sub.fail_backend_submitted(CompletionErrorKind::report_backend_io(
-                    err,
-                    "complete submitted readonly table read",
+                let report = IoError::report_backend(err, "complete submitted readonly table read");
+                sub.fail_backend_submitted(CompletionErrorKind::from_io(
+                    report,
+                    "readonly table read completion transport",
                 ));
                 IOKind::Read
             }
@@ -636,9 +592,12 @@ impl TableFsStateMachine {
                         let result = if len == expected_len {
                             Ok(())
                         } else {
-                            Err(CompletionErrorKind::report_unexpected_eof(
-                                len,
-                                expected_len,
+                            Err(CompletionErrorKind::from_io(
+                                Report::new(IoError::from(IoErrorKind::UnexpectedEof)).attach(
+                                    format!(
+                                        "unexpected eof: actual_bytes={len}, expected_bytes={expected_len}"
+                                    ),
+                                ),
                                 format!("complete table file write: key={:?}", sub.key),
                             ))
                         };
@@ -647,8 +606,8 @@ impl TableFsStateMachine {
                     Err(err) => {
                         drop(buf);
                         sub.release_write_lease();
-                        sub.completion.complete(Err(CompletionErrorKind::report_io(
-                            err,
+                        sub.completion.complete(Err(CompletionErrorKind::from_io(
+                            Report::new(IoError::from(err.kind())).attach(format!("{err}")),
                             format!("complete table file write: key={:?}", sub.key),
                         )));
                     }
@@ -658,16 +617,14 @@ impl TableFsStateMachine {
             TableFsSubmission::Sync(sub) => {
                 match res {
                     Ok(0) => sub.completion.complete(Ok(())),
-                    Ok(result) => {
-                        sub.completion
-                            .complete(Err(CompletionErrorKind::report_unexpected_result(
-                                result,
-                                0,
-                                "complete table file fsync",
-                            )))
-                    }
-                    Err(err) => sub.completion.complete(Err(CompletionErrorKind::report_io(
-                        err,
+                    Ok(result) => sub.completion.complete(Err(CompletionErrorKind::from_io(
+                        Report::new(IoError::from(IoErrorKind::Other)).attach(format!(
+                            "unexpected io completion result: actual_result={result}, expected_result=0"
+                        )),
+                        "complete table file fsync",
+                    ))),
+                    Err(err) => sub.completion.complete(Err(CompletionErrorKind::from_io(
+                        Report::new(IoError::from(err.kind())).attach(format!("{err}")),
                         "complete table file fsync",
                     ))),
                 }
@@ -725,7 +682,7 @@ impl Deref for FixedSizeBufferFreeList {
 
 /// Return the logical size and allocated size for one sparse-file descriptor.
 #[inline]
-pub(crate) fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
+pub(crate) fn sparse_file_size(fd: RawFd) -> IoResult<(usize, usize)> {
     // SAFETY: `fstat` fully initializes `stat` on success; `assume_init_ref` is used only
     // when return code is 0.
     unsafe {
@@ -738,7 +695,8 @@ pub(crate) fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
             return Ok((logical_size, allocated_size));
         }
         debug_assert!(retcode == -1);
-        Err(StdIoError::last_os_error())
+        let err = StdIoError::last_os_error();
+        Err(Report::new(IoError::from(err.kind())).attach(format!("op=file_stat, {err}")))
     }
 }
 
@@ -753,7 +711,7 @@ pub(crate) async fn write_direct(
     offset: usize,
     buf: DirectBuf,
     background_writes: &IOClient<BackgroundWriteRequest>,
-) -> Result<()> {
+) -> CompletionResult<()> {
     write_direct_with_lease(key, file, offset, buf, background_writes, None).await
 }
 
@@ -767,7 +725,7 @@ pub(crate) async fn write_direct_with_lease(
     buf: DirectBuf,
     background_writes: &IOClient<BackgroundWriteRequest>,
     write_lease: Option<ReadonlyWriteLease>,
-) -> Result<()> {
+) -> CompletionResult<()> {
     let (submission, completion) = WriteSubmission::prepare(key, file, offset, buf, write_lease);
     if let Err(err) = background_writes
         .send_async(BackgroundWriteRequest::Table(submission))
@@ -776,13 +734,16 @@ pub(crate) async fn write_direct_with_lease(
         let BackgroundWriteRequest::Table(_submission) = err.into_inner() else {
             unreachable!("write_direct received unexpected background-write send error");
         };
-        return Err(IoError::report_send("send background table write request").into());
+        return Err(CompletionErrorKind::from_send(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                .attach("background table write request channel closed"),
+            "send background table write request",
+        ));
     }
     completion.wait_result().await.map_err(|report| {
-        Error::from_completion_report(
-            report,
-            format!("wait for table file background write: key={key:?}, offset={offset}"),
-        )
+        report.attach(format!(
+            "wait for table file background write: key={key:?}, offset={offset}"
+        ))
     })
 }
 
@@ -791,7 +752,7 @@ pub(crate) async fn write_direct_with_lease(
 pub(crate) async fn fsync_direct(
     file: Arc<SparseFile>,
     background_writes: &IOClient<BackgroundWriteRequest>,
-) -> Result<()> {
+) -> CompletionResult<()> {
     let file_id = file.file_id();
     let (submission, completion) = SyncSubmission::prepare_fsync(file);
     if let Err(err) = background_writes
@@ -801,22 +762,62 @@ pub(crate) async fn fsync_direct(
         let BackgroundWriteRequest::TableSync(_submission) = err.into_inner() else {
             unreachable!("fsync_direct received unexpected background-write send error");
         };
-        return Err(IoError::report_send("send background table fsync request").into());
+        return Err(CompletionErrorKind::from_send(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                .attach("background table fsync request channel closed"),
+            "send background table fsync request",
+        ));
     }
     completion.wait_result().await.map_err(|report| {
-        Error::from_completion_report(
-            report,
-            format!("wait for table file background fsync: file_id={file_id}"),
-        )
+        report.attach(format!(
+            "wait for table file background fsync: file_id={file_id}"
+        ))
     })
 }
 
+/// Create and size one sparse-file descriptor from an already validated path.
 #[inline]
-fn c_string_from_path(file_path: &str) -> Result<CString> {
-    CString::new(file_path).map_err(|_| {
-        Report::new(ConfigError::PathMustNotContainNul)
+fn create_sparse_file(file_path: &CStr, flags: i32, max_size: usize) -> IoResult<RawFd> {
+    // SAFETY: `file_path` is a valid NUL-terminated C string, return codes are
+    // checked, and a descriptor is closed locally if sizing fails.
+    unsafe {
+        let fd = open(file_path.as_ptr(), flags, 0o644);
+        if fd < 0 {
+            let err = StdIoError::last_os_error();
+            return Err(
+                Report::new(IoError::from(err.kind())).attach(format!("op=file_create, {err}"))
+            );
+        }
+        if ftruncate(fd, max_size as i64) < 0 {
+            let err = StdIoError::last_os_error();
+            let _ = close(fd);
+            return Err(
+                Report::new(IoError::from(err.kind())).attach(format!("op=file_resize, {err}"))
+            );
+        }
+        Ok(fd)
+    }
+}
+
+/// Open one sparse-file descriptor from an already validated path.
+#[inline]
+fn open_sparse_file(file_path: &CStr) -> IoResult<RawFd> {
+    // SAFETY: `file_path` is a valid NUL-terminated C string and the returned
+    // descriptor is published only after the return code is checked.
+    let fd = unsafe { open(file_path.as_ptr(), O_RDWR | O_DIRECT, 0o644) };
+    if fd < 0 {
+        let err = StdIoError::last_os_error();
+        return Err(Report::new(IoError::from(err.kind())).attach(format!("op=file_open, {err}")));
+    }
+    Ok(fd)
+}
+
+#[inline]
+fn c_string_from_path(file_path: &str) -> IoResult<CString> {
+    CString::new(file_path).map_err(|err| {
+        Report::new(err)
+            .change_context(IoError::from(IoErrorKind::InvalidFilename))
             .attach(format!("path={file_path}"))
-            .into()
     })
 }
 
@@ -828,6 +829,7 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::compression::BitPackable;
+    use crate::error::Error;
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
     use crate::id::TrxID;
@@ -1067,13 +1069,7 @@ mod tests {
             Ok(_) => panic!("expected open to fail before create"),
             Err(err) => err,
         };
-        assert_eq!(
-            err.report()
-                .downcast_ref::<IoError>()
-                .copied()
-                .map(IoError::kind),
-            Some(IoErrorKind::NotFound)
-        );
+        assert_eq!(err.current_context().kind(), IoErrorKind::NotFound);
         assert!(format!("{err:?}").contains("op=file_open"));
         let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_FILE_ID).unwrap();
         drop(file);
@@ -1094,41 +1090,28 @@ mod tests {
             Ok(_) => panic!("expected create to fail for missing parent"),
             Err(err) => err,
         };
-        assert_eq!(
-            err.report()
-                .downcast_ref::<IoError>()
-                .copied()
-                .map(IoError::kind),
-            Some(IoErrorKind::NotFound)
-        );
+        assert_eq!(err.current_context().kind(), IoErrorKind::NotFound);
         assert!(format!("{err:?}").contains("op=file_create"));
     }
 
     #[test]
-    fn test_sparse_file_invalid_path_maps_config_error() {
+    fn test_sparse_file_invalid_path_maps_invalid_filename_io_error() {
         let invalid_path = "bad\0path";
         let err = match SparseFile::open(invalid_path, UNTRACKED_FILE_ID) {
             Ok(_) => panic!("expected invalid path open failure"),
             Err(err) => err,
         };
-        assert!(err.is_kind(crate::error::ErrorKind::Config));
-        assert_eq!(
-            err.report()
-                .downcast_ref::<crate::error::ConfigError>()
-                .copied(),
-            Some(crate::error::ConfigError::PathMustNotContainNul)
-        );
+        assert_eq!(err.current_context().kind(), IoErrorKind::InvalidFilename);
+        assert!(err.downcast_ref::<std::ffi::NulError>().is_some());
+        assert!(format!("{err:?}").contains("path=bad\0path"));
+
         let err = match SparseFile::create_or_trunc(invalid_path, 4096, UNTRACKED_FILE_ID) {
             Ok(_) => panic!("expected invalid path create failure"),
             Err(err) => err,
         };
-        assert!(err.is_kind(crate::error::ErrorKind::Config));
-        assert_eq!(
-            err.report()
-                .downcast_ref::<crate::error::ConfigError>()
-                .copied(),
-            Some(crate::error::ConfigError::PathMustNotContainNul)
-        );
+        assert_eq!(err.current_context().kind(), IoErrorKind::InvalidFilename);
+        assert!(err.downcast_ref::<std::ffi::NulError>().is_some());
+        assert!(format!("{err:?}").contains("path=bad\0path"));
     }
 
     #[test]
@@ -1142,9 +1125,9 @@ mod tests {
             file.alloc(STORAGE_SECTOR_SIZE).unwrap(),
             (0, STORAGE_SECTOR_SIZE)
         );
-        assert!(file.alloc(STORAGE_SECTOR_SIZE).as_ref().is_err_and(
-            |err| err.resource_error() == Some(ResourceError::StorageFileCapacityExceeded)
-        ));
+        assert!(file.alloc(STORAGE_SECTOR_SIZE).as_ref().is_err_and(|err| {
+            *err.current_context() == ResourceError::StorageFileCapacityExceeded
+        }));
     }
 
     #[test]
@@ -1203,7 +1186,8 @@ mod tests {
                 Error::from_completion_report(report, "wait for table file background write")
             });
             assert!(wait_result.as_ref().is_err_and(|err| {
-                err.completion_error() == Some(CompletionErrorKind::Io(IoErrorKind::UnexpectedEof))
+                err.report().downcast_ref::<CompletionErrorKind>().copied()
+                    == Some(CompletionErrorKind::Io(IoErrorKind::UnexpectedEof))
                     && format!("{err:?}").contains("propagate from other threads")
                     && format!("{err:?}").contains("wait for table file background write")
             }));
@@ -1274,7 +1258,7 @@ mod tests {
             });
             let err = wait_result.expect_err("nonzero fsync completion should fail");
             assert_eq!(
-                err.completion_error(),
+                err.report().downcast_ref::<CompletionErrorKind>().copied(),
                 Some(CompletionErrorKind::Io(IoErrorKind::Other))
             );
             assert!(
@@ -1313,7 +1297,10 @@ mod tests {
             });
             let err = wait_result.expect_err("backend fsync completion should fail");
             assert!(
-                matches!(err.completion_error(), Some(CompletionErrorKind::Io(_))),
+                matches!(
+                    err.report().downcast_ref::<CompletionErrorKind>().copied(),
+                    Some(CompletionErrorKind::Io(_))
+                ),
                 "unexpected error: {err:?}"
             );
             assert!(

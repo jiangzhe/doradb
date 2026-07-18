@@ -133,7 +133,7 @@ impl<P: BufferPool> GenericBTree<P> {
 
     #[inline]
     async fn allocate_node(&self, pool_guard: &PoolGuard) -> Result<PageExclusiveGuard<BTreeNode>> {
-        self.pool.allocate_page::<BTreeNode>(pool_guard).await
+        Ok(self.pool.allocate_page::<BTreeNode>(pool_guard).await?)
     }
 
     #[inline]
@@ -143,9 +143,10 @@ impl<P: BufferPool> GenericBTree<P> {
         page_id: PageID,
         mode: LatchFallbackMode,
     ) -> Result<FacadePageGuard<BTreeNode>> {
-        self.pool
+        Ok(self
+            .pool
             .get_page::<BTreeNode>(pool_guard, page_id, mode)
-            .await
+            .await?)
     }
 
     /// Destroy the tree.
@@ -2453,7 +2454,10 @@ mod tests {
                     .split_root::<BTreeU64>(&pool_guard, root, true, TrxID::new(210))
                     .await
                     .expect_err("second split-root allocation should fail");
-                assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
+                assert_eq!(
+                    err.report().downcast_ref::<ResourceError>().copied(),
+                    Some(ResourceError::BufferPoolFull)
+                );
             }
 
             assert_eq!(pool.allocated(), 1);

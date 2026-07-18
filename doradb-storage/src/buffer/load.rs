@@ -5,21 +5,22 @@
 //! worker submissions on top of the shared reserve/publish contract here.
 
 use crate::buffer::page::Page;
-use crate::error::Result;
 use crate::id::PageID;
 
 /// Pool-specific lifecycle for one reserved page-load destination.
 ///
 /// A reservation owns exclusive access to the destination page until it is
-/// either published successfully or rolled back. `publish(self)` consumes the
-/// reservation so the success path cannot accidentally trigger rollback later.
+/// either published or rolled back. `publish(self)` consumes the reservation
+/// so the success path cannot accidentally trigger rollback later. Publication
+/// is infallible after reservation; implementations assert crate-owned lifecycle
+/// violations at the narrowest owning boundary.
 pub(crate) trait PageReservation {
     /// Returns the reserved page bytes for read-only inspection before publish.
     fn page(&self) -> &Page;
     /// Returns the reserved page bytes for DMA or decode before publish.
     fn page_mut(&mut self) -> &mut Page;
     /// Publishes the reserved page into the owning pool and returns its page id.
-    fn publish(self) -> Result<PageID>;
+    fn publish(self) -> PageID;
     /// Reverts the reservation and releases any pool-specific resources.
     fn rollback(self);
 }
@@ -62,7 +63,7 @@ impl<R: PageReservation> PageReservationGuard<R> {
 
     /// Consumes the guard and publishes the reserved page into its owning pool.
     #[inline]
-    pub(crate) fn publish(mut self) -> Result<PageID> {
+    pub(crate) fn publish(mut self) -> PageID {
         self.reservation
             .take()
             .expect("page reservation must hold backend state before publish")

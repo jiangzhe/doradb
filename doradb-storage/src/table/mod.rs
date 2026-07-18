@@ -1430,12 +1430,18 @@ pub(crate) mod tests {
         expected: DataIntegrityError,
     ) {
         let report = format!("{err:?}");
-        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity(expected)) {
+        if err.report().downcast_ref::<CompletionErrorKind>().copied()
+            == Some(CompletionErrorKind::DataIntegrity(expected))
+        {
             assert!(report.contains("propagate from other threads"), "{report}");
             assert!(report.contains("wait for"), "{report}");
             return;
         }
-        assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected),
+            "{report}"
+        );
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
@@ -1714,7 +1720,10 @@ pub(crate) mod tests {
     }
 
     fn assert_invalid_dml_input(err: Error) {
-        assert_eq!(err.operation_error(), Some(OperationError::InvalidDmlInput));
+        assert_eq!(
+            err.report().downcast_ref::<OperationError>().copied(),
+            Some(OperationError::InvalidDmlInput)
+        );
     }
 
     #[test]

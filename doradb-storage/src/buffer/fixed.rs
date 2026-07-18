@@ -5,13 +5,17 @@ use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
 use crate::buffer::page::{BufferPage, Page, VersionedPageID, validate_frame_page_kind};
 use crate::buffer::{
     BufferPool, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole, RowPoolRole,
+    pool_role_name,
 };
 use crate::error::Validation::Valid;
-use crate::error::{Error, ResourceError, ResourceResult, Result, Validation};
+use crate::error::{
+    InternalError, InternalResult, ResourceError, ResourceResult, RuntimeError, RuntimeResult,
+    Validation,
+};
 use crate::id::PageID;
 use crate::latch::LatchFallbackMode;
 use crate::stats::BufferPoolCounters;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::mem;
 
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
@@ -86,7 +90,7 @@ impl FixedBufferPool {
     #[inline]
     fn validate_guard_page_kind<T: BufferPage>(
         guard: FacadePageGuard<T>,
-    ) -> Result<FacadePageGuard<T>> {
+    ) -> InternalResult<FacadePageGuard<T>> {
         if let Err(err) = validate_frame_page_kind::<T>(guard.bf()) {
             if guard.is_exclusive() {
                 guard.rollback_exclusive_version_change();
@@ -118,7 +122,7 @@ impl BufferPool for FixedBufferPool {
     async fn allocate_page<T: BufferPage>(
         &self,
         guard: &PoolGuard,
-    ) -> Result<PageExclusiveGuard<T>> {
+    ) -> RuntimeResult<PageExclusiveGuard<T>> {
         match self.alloc_map.try_allocate() {
             Some(page_id) => Ok(self.arena.init_page(guard, PageID::from(page_id))),
             None => Err(Report::new(ResourceError::BufferPoolFull)
@@ -128,7 +132,11 @@ impl BufferPool for FixedBufferPool {
                     self.size,
                     self.alloc_map.allocated()
                 ))
-                .into()),
+                .change_context(RuntimeError::BufferPageAllocation)
+                .attach(format!(
+                    "buffer_pool_type=fixed, buffer_pool_role={}, operation=allocate_page",
+                    pool_role_name(self.role)
+                ))),
         }
     }
 
@@ -137,11 +145,16 @@ impl BufferPool for FixedBufferPool {
         &self,
         guard: &PoolGuard,
         page_id: PageID,
-    ) -> Result<PageExclusiveGuard<T>> {
+    ) -> RuntimeResult<PageExclusiveGuard<T>> {
         if self.alloc_map.allocate_at(usize::from(page_id)) {
             Ok(self.arena.init_page(guard, page_id))
         } else {
-            Err(Error::buffer_page_already_allocated())
+            Err(Report::new(InternalError::BufferPageAlreadyAllocated)
+                .change_context(RuntimeError::BufferPageAllocation)
+                .attach(format!(
+                    "buffer_pool_type=fixed, buffer_pool_role={}, operation=allocate_page_at, page_id={page_id}",
+                    pool_role_name(self.role)
+                )))
         }
     }
 
@@ -153,13 +166,20 @@ impl BufferPool for FixedBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Result<FacadePageGuard<T>> {
+    ) -> RuntimeResult<FacadePageGuard<T>> {
         debug_assert!(
             self.alloc_map.is_allocated(usize::from(page_id)),
             "page not allocated"
         );
         let guard = self.get_page_internal(guard, page_id, mode).await;
-        let guard = Self::validate_guard_page_kind(guard)?;
+        let guard = Self::validate_guard_page_kind(guard)
+            .change_context(RuntimeError::BufferPageAccess)
+            .attach_with(|| {
+                format!(
+                    "buffer_pool_type=fixed, buffer_pool_role={}, operation=get_page, page_id={page_id}",
+                    pool_role_name(self.role)
+                )
+            })?;
         self.stats.record_cache_hit();
         Ok(guard)
     }
@@ -170,7 +190,7 @@ impl BufferPool for FixedBufferPool {
         guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
-    ) -> Result<Option<FacadePageGuard<T>>> {
+    ) -> RuntimeResult<Option<FacadePageGuard<T>>> {
         if !self.alloc_map.is_allocated(usize::from(id.page_id)) {
             return Ok(None);
         }
@@ -182,7 +202,16 @@ impl BufferPool for FixedBufferPool {
             }
             return Ok(None);
         }
-        let g = Self::validate_guard_page_kind(g)?;
+        let g = Self::validate_guard_page_kind(g)
+            .change_context(RuntimeError::BufferPageAccess)
+            .attach_with(|| {
+                format!(
+                    "buffer_pool_type=fixed, buffer_pool_role={}, operation=get_page_versioned, page_id={}, generation={}",
+                    pool_role_name(self.role),
+                    id.page_id,
+                    id.generation
+                )
+            })?;
         self.stats.record_cache_hit();
         Ok(Some(g))
     }
@@ -210,7 +239,7 @@ impl BufferPool for FixedBufferPool {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Result<Validation<FacadePageGuard<T>>> {
+    ) -> RuntimeResult<Validation<FacadePageGuard<T>>> {
         debug_assert!(
             self.alloc_map.is_allocated(usize::from(page_id)),
             "page not allocated"
@@ -220,7 +249,15 @@ impl BufferPool for FixedBufferPool {
         // the validation make sure parent page does not change until child
         // page is acquired.
         if p_guard.validate_bool() {
-            let g = Self::validate_guard_page_kind(g)?;
+            let g = Self::validate_guard_page_kind(g)
+                .change_context(RuntimeError::BufferPageAccess)
+                .attach_with(|| {
+                    format!(
+                        "buffer_pool_type=fixed, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
+                        pool_role_name(self.role),
+                        p_guard.page_id()
+                    )
+                })?;
             self.stats.record_cache_hit();
             return Ok(Valid(g));
         }
@@ -245,7 +282,6 @@ mod tests {
     use crate::buffer::guard::PageOptimisticGuard;
     use crate::buffer::page::BufferPageKind;
     use crate::buffer::test_page_id;
-    use crate::error::ErrorKind;
     use crate::index::{BTreeNode, RowPageIndexNode};
     use crate::quiescent::QuiescentBox;
     use futures::task::noop_waker;
@@ -261,11 +297,78 @@ mod tests {
         QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Meta, 64 * 1024 * 1024).unwrap())
     }
 
-    fn assert_internal_error<T>(result: Result<T>) {
+    fn assert_internal_error<T>(result: RuntimeResult<T>) {
         match result {
             Ok(_) => panic!("expected internal buffer-page kind mismatch"),
-            Err(err) => assert!(err.is_kind(ErrorKind::Internal)),
+            Err(err) => {
+                assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
+                assert_eq!(
+                    err.downcast_ref::<InternalError>().copied(),
+                    Some(InternalError::BufferPageKindMismatch)
+                );
+                assert!(format!("{err:?}").contains("buffer_pool_type=fixed"));
+            }
         }
+    }
+
+    #[test]
+    fn test_fixed_buffer_pool_allocation_reports_runtime_context() {
+        smol::block_on(async {
+            let pool_bytes = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap(),
+            );
+            let pool_guard = pool.pool_guard();
+            let page = pool
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("single-page pool should allow its first allocation");
+            drop(page);
+
+            let err = match pool.allocate_page::<Page>(&pool_guard).await {
+                Ok(_) => panic!("single-page pool should report exhaustion"),
+                Err(err) => err,
+            };
+            assert_eq!(err.current_context(), &RuntimeError::BufferPageAllocation);
+            assert_eq!(
+                err.downcast_ref::<ResourceError>().copied(),
+                Some(ResourceError::BufferPoolFull)
+            );
+            let output = format!("{err:?}");
+            assert!(output.contains("buffer_pool_type=fixed"), "{output}");
+            assert!(output.contains("buffer_pool_role=meta"), "{output}");
+            assert!(output.contains("operation=allocate_page"), "{output}");
+        });
+    }
+
+    #[test]
+    fn test_fixed_buffer_pool_allocate_at_reports_runtime_context() {
+        smol::block_on(async {
+            let pool_bytes = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap(),
+            );
+            let pool_guard = pool.pool_guard();
+            let page_id = test_page_id(0);
+            let page = pool
+                .allocate_page_at::<Page>(&pool_guard, page_id)
+                .await
+                .expect("first explicit allocation should succeed");
+            drop(page);
+
+            let err = match pool.allocate_page_at::<Page>(&pool_guard, page_id).await {
+                Ok(_) => panic!("duplicate explicit allocation should fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.current_context(), &RuntimeError::BufferPageAllocation);
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::BufferPageAlreadyAllocated)
+            );
+            let output = format!("{err:?}");
+            assert!(output.contains("operation=allocate_page_at"), "{output}");
+            assert!(output.contains("page_id=0"), "{output}");
+        });
     }
 
     fn assert_pending_once<F: Future>(future: Pin<&mut F>) {

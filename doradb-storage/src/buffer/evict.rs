@@ -13,15 +13,15 @@ use crate::buffer::page::{
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
     BufferPool, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
-    RowPoolRole,
+    RowPoolRole, pool_role_name,
 };
 use crate::component::Supplier;
 use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, Error, InternalError, IoError, LifecycleError,
-    LifecycleResult, ResourceError, Result, Validation,
+    CompletionErrorKind, CompletionResult, DataIntegrityResult, InternalError, IoError,
+    LifecycleError, LifecycleResult, ResourceError, RuntimeError, RuntimeResult, Validation,
 };
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
@@ -38,11 +38,12 @@ use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::runtime::yield_now;
 use crate::stats::BufferPoolCounters;
 use crate::{IndexPool, MemPool};
-use error_stack::{Report, ResultExt, ensure};
+use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
+use std::io::ErrorKind as IoErrorKind;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -77,12 +78,108 @@ pub(crate) struct EvictableBufferPool {
 }
 
 impl EvictableBufferPool {
+    /// Create one evictable pool together with its storage-worker provision.
+    pub(crate) fn create(
+        config: EvictableBufferPoolConfig,
+        fs: QuiescentGuard<FileSystem>,
+    ) -> RuntimeResult<(Self, SparseFile)> {
+        config.role.assert_valid("evictable buffer pool");
+        let buffer_pool_role = match config.role {
+            PoolRole::Meta => "meta",
+            PoolRole::Index => "index",
+            PoolRole::Mem => "mem",
+            PoolRole::Disk => "disk",
+            PoolRole::Invalid => unreachable!("pool role was validated above"),
+        };
+        let build_diagnostic =
+            format!("buffer_pool_type=evictable, buffer_pool_role={buffer_pool_role}");
+        validate_swap_file_path_candidate(&config.data_swap_file)
+            .change_context(RuntimeError::BufferPoolInit)
+            .attach_with(|| build_diagnostic.clone())?;
+        // 1. Calculate memory usage.
+        let max_file_size = config.max_file_size.as_u64() as usize;
+        let max_mem_size = config.max_mem_size.as_u64() as usize;
+        let max_nbr = max_file_size / mem::size_of::<Page>();
+        // We need to hold all frames in-memory, even if many pages
+        // can not be loaded into memory at the same time.
+        let frame_total_bytes = frame_total_bytes(max_nbr);
+        assert!(
+            max_mem_size <= max_file_size,
+            "max mem size of buffer pool should be no more than max file size"
+        );
+        assert!(
+            max_mem_size > frame_total_bytes,
+            "max mem size of buffer pool can not hold all buffer frames"
+        );
+        let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
+        if max_nbr_in_mem < MIN_IN_MEM_PAGES {
+            return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
+            .attach(format!(
+                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, in_mem_pages={max_nbr_in_mem}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
+            ))
+            .change_context(RuntimeError::BufferPoolInit)
+            .attach(build_diagnostic));
+        }
+        let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
+
+        // 2. Initialize memory of frames and pages.
+        let arena = QuiescentArena::new(max_nbr)
+            .change_context(RuntimeError::BufferPoolInit)
+            .attach_with(|| build_diagnostic.clone())?;
+
+        // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
+        let swap_file_path = path_to_utf8(&config.data_swap_file)
+            .change_context(RuntimeError::BufferPoolInit)
+            .attach_with(|| build_diagnostic.clone())?;
+        let file = SparseFile::create_or_trunc(
+            swap_file_path,
+            max_file_size,
+            match config.role {
+                PoolRole::Mem => MEM_POOL_SWAP_FILE_ID,
+                PoolRole::Index => INDEX_POOL_SWAP_FILE_ID,
+                other => panic!("unsupported pool role {other:?} in swap-file persisted id"),
+            },
+        )
+        .change_context(RuntimeError::BufferPoolInit)
+        .attach(build_diagnostic)?;
+        let pool = EvictableBufferPool {
+            alloc_map: AllocMap::new(max_nbr),
+            alloc_ev: Event::new(),
+            fs,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
+            inflight_io: Arc::new(InflightIO::default()),
+            stats: BufferPoolStatsHandle::default(),
+            role: config.role,
+            arena,
+        };
+        Ok((pool, file))
+    }
+
+    #[inline]
+    fn operation_diagnostic(&self, operation: &'static str) -> String {
+        format!(
+            "buffer_pool_type=evictable, buffer_pool_role={}, operation={operation}",
+            pool_role_name(self.role)
+        )
+    }
+
+    #[inline]
+    fn page_operation_diagnostic(&self, operation: &'static str, page_id: PageID) -> String {
+        format!(
+            "{}, page_id={page_id}",
+            self.operation_diagnostic(operation)
+        )
+    }
+
     #[inline]
     fn ensure_not_shutdown(&self) -> LifecycleResult<()> {
-        ensure!(
-            !self.shutdown_flag.load(Ordering::Acquire),
-            LifecycleError::Shutdown
-        );
+        if self.shutdown_flag.load(Ordering::Acquire) {
+            return Err(Report::new(LifecycleError::Shutdown).attach(format!(
+                "buffer_pool_type=evictable, buffer_pool_role={}, state=shutdown",
+                pool_role_name(self.role)
+            )));
+        }
         Ok(())
     }
 
@@ -121,16 +218,18 @@ impl EvictableBufferPool {
     }
 
     #[inline]
-    async fn try_wait_for_io_write(&self, page_id: PageID) -> Result<()> {
+    async fn try_wait_for_io_write(&self, page_id: PageID) -> RuntimeResult<()> {
         self.inflight_io
             .wait_for_write(page_id, self.arena.frame(page_id))
             .await
+            .change_context(RuntimeError::BufferPageAccess)
+            .attach_with(|| format!("wait for evict pool writeback: page_id={page_id}"))
     }
 
     /// Try to dispatch read IO on given page.
     /// This method may not succeed, and client should retry.
     #[inline]
-    async fn try_dispatch_io_read(&self, guard: &PoolGuard, page_id: PageID) -> Result<()> {
+    async fn try_dispatch_io_read(&self, guard: &PoolGuard, page_id: PageID) -> RuntimeResult<()> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         self.stats.record_cache_miss();
         enum DispatchAction {
@@ -230,37 +329,43 @@ impl EvictableBufferPool {
                 yield_now().await;
             }
             DispatchAction::Shutdown => {
-                return Err(Report::new(LifecycleError::Shutdown).into());
+                return Err(Report::new(LifecycleError::Shutdown)
+                    .change_context(RuntimeError::BufferPageAccess));
             }
             DispatchAction::Wait(completion) => {
-                completion.wait_result().await.map_err(|report| {
-                    Error::from_completion_report(
-                        report,
-                        format!("wait for evict pool read: page_id={page_id}"),
-                    )
-                })?;
+                completion
+                    .wait_result()
+                    .await
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach_with(|| format!("wait for evict pool read: page_id={page_id}"))?;
             }
             DispatchAction::WaitForLoad(listener) => {
                 listener.await;
                 // Wakeups can come from shutdown as well as real load progress.
-                self.ensure_not_shutdown()?;
+                self.ensure_not_shutdown()
+                    .change_context(RuntimeError::BufferPageAccess)?;
                 self.in_mem.load_ev.notify(1);
             }
             DispatchAction::SendRead { req, completion } => {
                 if let Err(send_err) = self.fs.send_pool_read_async(self.role, req).await {
                     let failed_req = send_err.0;
-                    failed_req.fail(CompletionErrorKind::report_send(
+                    failed_req.fail(CompletionErrorKind::from_send(
+                        Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                            .attach("evict pool read request channel closed"),
                         "send evict pool read request",
                     ));
                     self.in_mem.load_ev.notify(1);
-                    return Err(IoError::report_send("send evict pool read request").into());
+                    return Err(Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                        .attach("send evict pool read request")
+                        .change_context(RuntimeError::BufferPageAccess));
                 }
-                completion.wait_result().await.map_err(|report| {
-                    Error::from_completion_report(
-                        report,
-                        format!("wait for dispatched evict pool read: page_id={page_id}"),
-                    )
-                })?;
+                completion
+                    .wait_result()
+                    .await
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach_with(|| {
+                        format!("wait for dispatched evict pool read: page_id={page_id}")
+                    })?;
             }
         }
         Ok(())
@@ -306,11 +411,12 @@ impl EvictableBufferPool {
         SharedEvictionDomain::new(domain_id, runtime, policy)
     }
 
-    /// Reserve a page in memory.
-    /// If this function returns true, in-mem page counter is incremented.
-    /// Caller should handle the failure of add a page into memory and decrease this number.
+    /// Reserves one in-memory page budget slot.
+    ///
+    /// Success increments the in-memory page counter. A caller that fails before
+    /// publishing the page must release that reservation.
     #[inline]
-    async fn reserve_page(&self) -> Result<()> {
+    async fn reserve_page(&self) -> LifecycleResult<()> {
         self.ensure_not_shutdown()?;
         if self.in_mem.try_inc() {
             // `reserve_page()` only acquires in-memory budget. Callers that later
@@ -359,9 +465,12 @@ impl BufferPool for EvictableBufferPool {
     async fn allocate_page<T: BufferPage>(
         &self,
         guard: &PoolGuard,
-    ) -> Result<PageExclusiveGuard<T>> {
+    ) -> RuntimeResult<PageExclusiveGuard<T>> {
         loop {
-            self.reserve_page().await?;
+            self.reserve_page()
+                .await
+                .change_context(RuntimeError::BufferPageAllocation)
+                .attach_with(|| self.operation_diagnostic("allocate_page"))?;
 
             // Now we have memory budget to allocate new page.
             match self.alloc_map.try_allocate() {
@@ -379,7 +488,9 @@ impl BufferPool for EvictableBufferPool {
                         // but we have not acquired a page id yet, so release the reservation
                         // before surfacing shutdown to the caller.
                         self.in_mem.dec();
-                        return Err(report.into());
+                        return Err(report
+                            .change_context(RuntimeError::BufferPageAllocation)
+                            .attach(self.operation_diagnostic("allocate_page")));
                     }
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
@@ -393,7 +504,9 @@ impl BufferPool for EvictableBufferPool {
                     self.in_mem.dec();
                     listener.await;
                     // Wakeups can come from shutdown as well as page deallocation.
-                    self.ensure_not_shutdown()?;
+                    self.ensure_not_shutdown()
+                        .change_context(RuntimeError::BufferPageAllocation)
+                        .attach_with(|| self.operation_diagnostic("allocate_page"))?;
                 }
             }
         }
@@ -404,15 +517,20 @@ impl BufferPool for EvictableBufferPool {
         &self,
         guard: &PoolGuard,
         page_id: PageID,
-    ) -> Result<PageExclusiveGuard<T>> {
-        self.reserve_page().await?;
+    ) -> RuntimeResult<PageExclusiveGuard<T>> {
+        self.reserve_page()
+            .await
+            .change_context(RuntimeError::BufferPageAllocation)
+            .attach_with(|| self.page_operation_diagnostic("allocate_page_at", page_id))?;
 
         if self.alloc_map.allocate_at(usize::from(page_id)) {
             self.in_mem.pin(page_id);
             Ok(self.arena.init_page(guard, page_id))
         } else {
             self.in_mem.dec();
-            Err(Error::buffer_page_already_allocated())
+            Err(Report::new(InternalError::BufferPageAlreadyAllocated)
+                .change_context(RuntimeError::BufferPageAllocation)
+                .attach(self.page_operation_diagnostic("allocate_page_at", page_id)))
         }
     }
 
@@ -422,13 +540,15 @@ impl BufferPool for EvictableBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Result<FacadePageGuard<T>> {
+    ) -> RuntimeResult<FacadePageGuard<T>> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
             if frame.kind() != FrameKind::Uninitialized {
-                validate_frame_page_kind::<T>(frame)?;
+                validate_frame_page_kind::<T>(frame)
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
             }
             match frame.kind() {
                 FrameKind::Uninitialized => {
@@ -437,7 +557,9 @@ impl BufferPool for EvictableBufferPool {
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
-                    validate_frame_page_kind::<T>(guard.bf())?;
+                    validate_frame_page_kind::<T>(guard.bf())
+                        .change_context(RuntimeError::BufferPageAccess)
+                        .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
                     self.stats.record_cache_hit();
                     return Ok(guard);
                 }
@@ -451,7 +573,9 @@ impl BufferPool for EvictableBufferPool {
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
-                    validate_frame_page_kind::<T>(guard.bf())?;
+                    validate_frame_page_kind::<T>(guard.bf())
+                        .change_context(RuntimeError::BufferPageAccess)
+                        .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
                     self.stats.record_cache_hit();
                     return Ok(guard);
                 }
@@ -460,14 +584,18 @@ impl BufferPool for EvictableBufferPool {
                     // Here we do not break the write operation,
                     // Instead, we wait for it to complete.
                     // And then, reload it in memory.
-                    self.try_wait_for_io_write(page_id).await?;
+                    self.try_wait_for_io_write(page_id)
+                        .await
+                        .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
                 }
                 FrameKind::Evicted => {
                     // The page is already on disk.
                     // This means we should let one thread to exclusively lock this page
                     // and initiate a IO read.
                     // Other threads can wait for the initiator to finish.
-                    self.try_dispatch_io_read(guard, page_id).await?;
+                    self.try_dispatch_io_read(guard, page_id)
+                        .await
+                        .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
                 }
             }
         }
@@ -479,7 +607,7 @@ impl BufferPool for EvictableBufferPool {
         guard: &PoolGuard,
         id: VersionedPageID,
         mode: LatchFallbackMode,
-    ) -> Result<Option<FacadePageGuard<T>>> {
+    ) -> RuntimeResult<Option<FacadePageGuard<T>>> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(id.page_id);
@@ -499,7 +627,15 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
-                    validate_frame_page_kind::<T>(bf)?;
+                    validate_frame_page_kind::<T>(bf)
+                        .change_context(RuntimeError::BufferPageAccess)
+                        .attach_with(|| {
+                            format!(
+                                "{}, generation={}",
+                                self.page_operation_diagnostic("get_page_versioned", id.page_id),
+                                id.generation
+                            )
+                        })?;
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
@@ -518,15 +654,39 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
-                    validate_frame_page_kind::<T>(bf)?;
+                    validate_frame_page_kind::<T>(bf)
+                        .change_context(RuntimeError::BufferPageAccess)
+                        .attach_with(|| {
+                            format!(
+                                "{}, generation={}",
+                                self.page_operation_diagnostic("get_page_versioned", id.page_id),
+                                id.generation
+                            )
+                        })?;
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
                 FrameKind::Evicting => {
-                    self.try_wait_for_io_write(id.page_id).await?;
+                    self.try_wait_for_io_write(id.page_id)
+                        .await
+                        .attach_with(|| {
+                            format!(
+                                "{}, generation={}",
+                                self.page_operation_diagnostic("get_page_versioned", id.page_id),
+                                id.generation
+                            )
+                        })?;
                 }
                 FrameKind::Evicted => {
-                    self.try_dispatch_io_read(guard, id.page_id).await?;
+                    self.try_dispatch_io_read(guard, id.page_id)
+                        .await
+                        .attach_with(|| {
+                            format!(
+                                "{}, generation={}",
+                                self.page_operation_diagnostic("get_page_versioned", id.page_id),
+                                id.generation
+                            )
+                        })?;
                 }
             }
         }
@@ -552,13 +712,21 @@ impl BufferPool for EvictableBufferPool {
         p_guard: &FacadePageGuard<T>,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Result<Validation<FacadePageGuard<T>>> {
+    ) -> RuntimeResult<Validation<FacadePageGuard<T>>> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
             if frame.kind() != FrameKind::Uninitialized {
-                validate_frame_page_kind::<T>(frame)?;
+                validate_frame_page_kind::<T>(frame)
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach_with(|| {
+                        format!(
+                            "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
+                            pool_role_name(self.role),
+                            p_guard.page_id()
+                        )
+                    })?;
             }
             match frame.kind() {
                 FrameKind::Uninitialized => {
@@ -571,7 +739,15 @@ impl BufferPool for EvictableBufferPool {
                     // page is acquired.
                     if p_guard.validate_bool() {
                         let child = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
-                        validate_frame_page_kind::<T>(child.bf())?;
+                        validate_frame_page_kind::<T>(child.bf())
+                            .change_context(RuntimeError::BufferPageAccess)
+                            .attach_with(|| {
+                                format!(
+                                    "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
+                                    pool_role_name(self.role),
+                                    p_guard.page_id()
+                                )
+                            })?;
                         self.stats.record_cache_hit();
                         return Ok(Valid(child));
                     }
@@ -600,7 +776,15 @@ impl BufferPool for EvictableBufferPool {
                     });
                     if matches!(validated, Validation::Valid(_)) {
                         if let Validation::Valid(child) = &validated {
-                            validate_frame_page_kind::<T>(child.bf())?;
+                            validate_frame_page_kind::<T>(child.bf())
+                                .change_context(RuntimeError::BufferPageAccess)
+                                .attach_with(|| {
+                                    format!(
+                                        "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
+                                        pool_role_name(self.role),
+                                        p_guard.page_id()
+                                    )
+                                })?;
                         }
                         self.stats.record_cache_hit();
                     }
@@ -608,14 +792,30 @@ impl BufferPool for EvictableBufferPool {
                 }
                 FrameKind::Evicting => {
                     // The page is being evicted to disk.
-                    self.try_wait_for_io_write(page_id).await?;
+                    self.try_wait_for_io_write(page_id)
+                        .await
+                        .attach_with(|| {
+                            format!(
+                                "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
+                                pool_role_name(self.role),
+                                p_guard.page_id()
+                            )
+                        })?;
                 }
                 FrameKind::Evicted => {
                     // The page is already on disk.
                     // This means we should let one thread to exclusively lock this page
                     // and initiate a IO read.
                     // Other threads can wait for the initiator to finish.
-                    self.try_dispatch_io_read(guard, page_id).await?;
+                    self.try_dispatch_io_read(guard, page_id)
+                        .await
+                        .attach_with(|| {
+                            format!(
+                                "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
+                                pool_role_name(self.role),
+                                p_guard.page_id()
+                            )
+                        })?;
                 }
             }
         }
@@ -685,9 +885,12 @@ impl EvictablePoolStateMachine {
         match req {
             PoolRequest::Read(req) => {
                 let page_id = req.page_id();
-                req.fail(CompletionErrorKind::report_backend_io(
-                    err,
-                    format!("submit evict pool read: page_id={page_id}"),
+                req.fail(CompletionErrorKind::from_io(
+                    IoError::report_backend(
+                        err,
+                        format!("submit evict pool read: page_id={page_id}"),
+                    ),
+                    "evict pool read completion transport",
                 ));
             }
             PoolRequest::BatchWrite(page_guards, done_ev) => {
@@ -699,8 +902,7 @@ impl EvictablePoolStateMachine {
                         IoError::report_backend(
                             err,
                             format!("submit evict pool writeback: page_id={page_id}"),
-                        )
-                        .into(),
+                        ),
                     );
                 }
                 drop(done_ev);
@@ -736,8 +938,7 @@ impl EvictablePoolStateMachine {
                     IoError::report_backend(
                         err,
                         format!("submit evict pool writeback: page_id={page_id}"),
-                    )
-                    .into(),
+                    ),
                 );
                 drop(batch_done);
                 StorageIOKind::Write
@@ -768,8 +969,7 @@ impl EvictablePoolStateMachine {
                     IoError::report_backend(
                         err,
                         format!("complete submitted evict pool writeback: page_id={page_id}"),
-                    )
-                    .into(),
+                    ),
                 );
                 drop(sub.batch_done.take());
                 StorageIOKind::Write
@@ -890,8 +1090,14 @@ impl IOStateMachine for EvictablePoolStateMachine {
                 let _ = block_key;
                 let err = match res {
                     Ok(len) if len == PAGE_SIZE => None,
-                    Ok(len) => Some(IoError::report_unexpected_eof(len, PAGE_SIZE).into()),
-                    Err(err) => Some(err.into()),
+                    Ok(len) => Some(
+                        Report::new(IoError::from(IoErrorKind::UnexpectedEof)).attach(format!(
+                            "unexpected eof: actual_bytes={len}, expected_bytes={PAGE_SIZE}"
+                        )),
+                    ),
+                    Err(err) => {
+                        Some(Report::new(IoError::from(err.kind())).attach(format!("{err}")))
+                    }
                 };
                 if let Some(err) = err {
                     self.pool
@@ -959,7 +1165,8 @@ impl EvictableRuntime {
                 self.pool.inflight_io.fail_writeback(
                     &self.pool.stats,
                     page_guard,
-                    IoError::report_send("send evict pool batch write request").into(),
+                    Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                        .attach("send evict pool batch write request"),
                 );
             }
             drop(done_ev);
@@ -1250,7 +1457,7 @@ impl PageReservation for EvictPageReservation {
     }
 
     #[inline]
-    fn publish(self) -> Result<PageID> {
+    fn publish(self) -> PageID {
         let EvictPageReservation {
             page_id,
             mut page_guard,
@@ -1267,7 +1474,7 @@ impl PageReservation for EvictPageReservation {
         }
         drop(page_guard);
         in_mem.pin(page_id);
-        Ok(page_id)
+        page_id
     }
 
     #[inline]
@@ -1406,30 +1613,32 @@ impl EvictReadSubmission {
                     "evict read submission must still own its page reservation before publish",
                 );
                 match validate_evictable_spill_checksum(reservation.page(), self.role, page_id) {
-                    Ok(()) => (*reservation).publish().map_err(|err| {
-                        CompletionErrorKind::report_error(
-                            err,
-                            format!("publish evict pool read: page_id={page_id}"),
-                        )
-                    }),
+                    Ok(()) => {
+                        let page_id = (*reservation).publish();
+                        Ok(page_id)
+                    }
                     Err(err) => {
                         drop(reservation);
-                        Err(err)
+                        Err(CompletionErrorKind::from_data_integrity(
+                            err,
+                            format!("validate evict pool read: page_id={page_id}"),
+                        ))
                     }
                 }
             }
             Ok(len) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::report_unexpected_eof(
-                    len,
-                    PAGE_SIZE,
+                Err(CompletionErrorKind::from_io(
+                    Report::new(IoError::from(IoErrorKind::UnexpectedEof)).attach(format!(
+                        "unexpected eof: actual_bytes={len}, expected_bytes={PAGE_SIZE}"
+                    )),
                     format!("complete evict pool read: page_id={page_id}"),
                 ))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::report_io(
-                    err,
+                Err(CompletionErrorKind::from_io(
+                    Report::new(IoError::from(err.kind())).attach(format!("{err}")),
                     format!("complete evict pool read: page_id={page_id}"),
                 ))
             }
@@ -1452,8 +1661,8 @@ impl Drop for EvictReadSubmission {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
-        self.complete_waiters(Err(CompletionErrorKind::report_internal(
-            InternalError::CompletionDropped,
+        self.complete_waiters(Err(CompletionErrorKind::from_internal(
+            Report::new(InternalError::CompletionDropped),
             format!(
                 "drop evict read submission before completion: page_id={}",
                 self.key
@@ -1483,9 +1692,9 @@ impl PreparedEvictReadSubmission {
     #[inline]
     fn fail_backend_not_accepted(self, err: &Report<IoError>) {
         let page_id = self.page_id();
-        self.inner.fail(CompletionErrorKind::report_backend_io(
-            err,
-            format!("submit evict pool read: page_id={page_id}"),
+        self.inner.fail(CompletionErrorKind::from_io(
+            IoError::report_backend(err, format!("submit evict pool read: page_id={page_id}")),
+            "evict pool read completion transport",
         ));
     }
 
@@ -1493,9 +1702,12 @@ impl PreparedEvictReadSubmission {
     fn fail_backend_submitted(&mut self, err: &Report<IoError>) {
         let page_id = self.page_id();
         self.inner
-            .fail_backend_submitted(CompletionErrorKind::report_backend_io(
-                err,
-                format!("complete submitted evict pool read: page_id={page_id}"),
+            .fail_backend_submitted(CompletionErrorKind::from_io(
+                IoError::report_backend(
+                    err,
+                    format!("complete submitted evict pool read: page_id={page_id}"),
+                ),
+                "evict pool read completion transport",
             ));
     }
 
@@ -1538,7 +1750,7 @@ impl Default for InflightIO {
 impl InflightIO {
     #[expect(clippy::await_holding_lock, reason = "clippy false positive")]
     #[inline]
-    async fn wait_for_write(&self, page_id: PageID, frame: &BufferFrame) -> Result<()> {
+    async fn wait_for_write(&self, page_id: PageID, frame: &BufferFrame) -> CompletionResult<()> {
         let mut g = self.map.lock();
         match g.entry(page_id) {
             Entry::Vacant(vac) => {
@@ -1555,16 +1767,7 @@ impl InflightIO {
                             completion: Some(Arc::clone(&completion)),
                         });
                         drop(g); // explicit drop guard before await.
-                        completion
-                            .wait_result()
-                            .await
-                            .map_err(|report| {
-                                Error::from_completion_report(
-                                    report,
-                                    format!("wait for evict pool writeback: page_id={page_id}"),
-                                )
-                            })
-                            .map(|_| ())?;
+                        completion.wait_result().await.map(|_| ())?;
                     }
                     // In any other kind, we let caller retry.
                     FrameKind::Cool
@@ -1588,16 +1791,7 @@ impl InflightIO {
                     .get_or_insert_with(|| Arc::new(PageIOCompletion::new()))
                     .clone();
                 drop(g); // explicitly drop guard before await.
-                completion
-                    .wait_result()
-                    .await
-                    .map_err(|report| {
-                        Error::from_completion_report(
-                            report,
-                            format!("wait for evict pool writeback: page_id={page_id}"),
-                        )
-                    })
-                    .map(|_| ())?;
+                completion.wait_result().await.map(|_| ())?;
             }
         }
         Ok(())
@@ -1636,7 +1830,7 @@ impl InflightIO {
         &self,
         stats: &BufferPoolStatsHandle,
         mut page_guard: PageExclusiveGuard<Page>,
-        err: Error,
+        err: Report<IoError>,
     ) {
         let page_id = page_guard.page_id();
         let completion = {
@@ -1669,7 +1863,7 @@ impl InflightIO {
         };
         drop(page_guard);
         if let Some(completion) = completion {
-            completion.complete(Err(CompletionErrorKind::report_error(
+            completion.complete(Err(CompletionErrorKind::from_io(
                 err,
                 format!("fail evict pool writeback: page_id={page_id}"),
             )));
@@ -1681,7 +1875,7 @@ impl InflightIO {
         &self,
         stats: &BufferPoolStatsHandle,
         page_guard: &mut PageExclusiveGuard<Page>,
-        err: Error,
+        err: Report<IoError>,
     ) {
         let page_id = page_guard.page_id();
         let completion = {
@@ -1713,7 +1907,7 @@ impl InflightIO {
             }
         };
         if let Some(completion) = completion {
-            completion.complete(Err(CompletionErrorKind::report_error(
+            completion.complete(Err(CompletionErrorKind::from_io(
                 err,
                 format!("fail submitted evict pool writeback: page_id={page_id}"),
             )));
@@ -1736,81 +1930,6 @@ pub(crate) enum PoolRequest {
     BatchWrite(Vec<PageExclusiveGuard<Page>>, Arc<EventNotifyOnDrop>),
 }
 
-/// Build one evictable pool together with the storage-worker provision it needs.
-pub(crate) fn build_pool_with_swap_file_field(
-    config: EvictableBufferPoolConfig,
-    swap_file_field_name: &'static str,
-    fs: QuiescentGuard<FileSystem>,
-) -> Result<(EvictableBufferPool, SparseFile)> {
-    config.role.assert_valid("evictable buffer pool");
-    validate_swap_file_path_candidate(&config.data_swap_file)
-        .attach_with(|| {
-            format!(
-                "invalid {swap_file_field_name}: {}",
-                config.data_swap_file.display()
-            )
-        })
-        .map_err(Error::from)?;
-    // 1. Calculate memory usage.
-    let max_file_size = config.max_file_size.as_u64() as usize;
-    let max_mem_size = config.max_mem_size.as_u64() as usize;
-    let max_nbr = max_file_size / mem::size_of::<Page>();
-    // We need to hold all frames in-memory, even if many pages
-    // can not be loaded into memory at the same time.
-    let frame_total_bytes = frame_total_bytes(max_nbr);
-    assert!(
-        max_mem_size <= max_file_size,
-        "max mem size of buffer pool should be no more than max file size"
-    );
-    assert!(
-        max_mem_size > frame_total_bytes,
-        "max mem size of buffer pool can not hold all buffer frames"
-    );
-    let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
-    if max_nbr_in_mem < MIN_IN_MEM_PAGES {
-        return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
-            .attach(format!(
-                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, in_mem_pages={max_nbr_in_mem}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
-            ))
-            .into());
-    }
-    let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
-
-    // 2. Initialize memory of frames and pages.
-    let arena = QuiescentArena::new(max_nbr)?;
-
-    // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
-    let swap_file_path = path_to_utf8(&config.data_swap_file)
-        .attach_with(|| {
-            format!(
-                "invalid {swap_file_field_name}: {}",
-                config.data_swap_file.display()
-            )
-        })
-        .map_err(Error::from)?;
-    let file = SparseFile::create_or_trunc(
-        swap_file_path,
-        max_file_size,
-        match config.role {
-            PoolRole::Mem => MEM_POOL_SWAP_FILE_ID,
-            PoolRole::Index => INDEX_POOL_SWAP_FILE_ID,
-            other => panic!("unsupported pool role {other:?} in swap-file persisted id"),
-        },
-    )?;
-    let pool = EvictableBufferPool {
-        alloc_map: AllocMap::new(max_nbr),
-        alloc_ev: Event::new(),
-        fs,
-        shutdown_flag: Arc::new(AtomicBool::new(false)),
-        in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
-        inflight_io: Arc::new(InflightIO::default()),
-        stats: BufferPoolStatsHandle::default(),
-        role: config.role,
-        arena,
-    };
-    Ok((pool, file))
-}
-
 #[inline]
 fn write_evictable_spill_checksum(page: &mut Page) {
     write_block_checksum(page);
@@ -1821,13 +1940,11 @@ fn validate_evictable_spill_checksum(
     page: &Page,
     role: PoolRole,
     page_id: PageID,
-) -> CompletionResult<()> {
+) -> DataIntegrityResult<()> {
     validate_block_checksum(page).map_err(|err| {
-        let reason = *err.current_context();
-        err.change_context(CompletionErrorKind::DataIntegrity(reason))
-            .attach(format!(
-                "validate evictable spill page checksum: role={role:?}, page_id={page_id}"
-            ))
+        err.attach(format!(
+            "validate evictable spill page checksum: role={role:?}, page_id={page_id}"
+        ))
     })
 }
 
@@ -1838,9 +1955,10 @@ pub(crate) mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::BufferPageKind;
     use crate::buffer::test_page_id;
+    use crate::component::{IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{CompletionErrorKind, ConfigError, DataIntegrityError, ErrorKind};
+    use crate::error::{CompletionErrorKind, ConfigError, DataIntegrityError, Result};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_TRAILER_SIZE, checksum_offset as block_checksum_offset,
         validate_block_checksum as validate_block_checksum_for_test,
@@ -1941,10 +2059,16 @@ pub(crate) mod tests {
         panic!("condition was not satisfied before timeout");
     }
 
-    fn assert_internal_error<T>(result: Result<T>) {
+    fn assert_internal_error<T>(result: RuntimeResult<T>) {
         match result {
             Ok(_) => panic!("expected internal buffer-page kind mismatch"),
-            Err(err) => assert!(err.is_kind(ErrorKind::Internal)),
+            Err(err) => {
+                assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
+                assert_eq!(
+                    err.downcast_ref::<InternalError>().copied(),
+                    Some(InternalError::BufferPageKindMismatch)
+                );
+            }
         }
     }
 
@@ -2107,7 +2231,7 @@ pub(crate) mod tests {
         };
         let fs_owner = build_test_fs_owner_in(&storage_root)?;
         let fs = fs_owner.guard();
-        let (pool, storage) = build_pool_with_swap_file_field(config, "data_swap_file", fs)?;
+        let (pool, storage) = EvictableBufferPool::create(config, fs)?;
         Ok((fs_owner, pool, storage))
     }
 
@@ -2191,6 +2315,92 @@ pub(crate) mod tests {
 
         pool.signal_shutdown();
         pool.signal_shutdown();
+    }
+
+    #[test]
+    fn test_evictable_reserve_page_reports_shutdown_as_lifecycle() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+
+            pool.signal_shutdown();
+            let err = pool
+                .reserve_page()
+                .await
+                .expect_err("reservation after shutdown should fail");
+            assert_eq!(err.current_context(), &LifecycleError::Shutdown);
+            let output = format!("{err:?}");
+            assert!(output.contains("buffer_pool_type=evictable"), "{output}");
+            assert!(output.contains("buffer_pool_role=mem"), "{output}");
+            assert!(output.contains("state=shutdown"), "{output}");
+        });
+    }
+
+    #[test]
+    fn test_evictable_allocate_page_stacks_runtime_over_shutdown() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let pool_guard = pool.pool_guard();
+
+            pool.signal_shutdown();
+            let err = match pool.allocate_page::<Page>(&pool_guard).await {
+                Ok(_) => panic!("allocation after shutdown should fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.current_context(), &RuntimeError::BufferPageAllocation);
+            assert_eq!(
+                err.downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::Shutdown)
+            );
+            let output = format!("{err:?}");
+            assert!(output.contains("buffer_pool_type=evictable"), "{output}");
+            assert!(output.contains("buffer_pool_role=mem"), "{output}");
+            assert!(output.contains("operation=allocate_page"), "{output}");
+        });
+    }
+
+    #[test]
+    fn test_evictable_reserve_page_waiter_wakes_with_lifecycle_shutdown() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            for _ in 0..pool.in_mem.max_count {
+                assert!(pool.in_mem.try_inc());
+            }
+
+            let mut reservation = Box::pin(pool.reserve_page());
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(matches!(reservation.as_mut().poll(&mut cx), Poll::Pending));
+
+            pool.signal_shutdown();
+            let err = reservation
+                .await
+                .expect_err("shutdown should wake a blocked reservation");
+            assert_eq!(err.current_context(), &LifecycleError::Shutdown);
+        });
     }
 
     #[test]
@@ -3134,7 +3344,7 @@ pub(crate) mod tests {
                 page_guard,
                 Arc::clone(&pool.in_mem),
             ));
-            assert_eq!(reservation.publish().unwrap(), page_id);
+            assert_eq!(reservation.publish(), page_id);
             assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Hot);
             assert_eq!(pool.in_mem.count.load(Ordering::Acquire), 1);
         });
@@ -3463,39 +3673,98 @@ pub(crate) mod tests {
 
     #[test]
     fn test_evictable_buffer_pool_build_reports_data_swap_file_label() {
-        let temp_dir = TempDir::new().unwrap();
-        let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
-        let err = match EvictableBufferPoolConfig::default()
-            .role(PoolRole::Mem)
-            .data_swap_file("data.bin")
-            .build_for_engine(fs_owner.guard())
-        {
-            Ok(_) => panic!("expected invalid storage path"),
-            Err(err) => err,
-        };
-        assert!(err.is_kind(ErrorKind::Config));
-        assert_eq!(
-            err.report().downcast_ref::<ConfigError>().copied(),
-            Some(ConfigError::PathMustUseRequiredSuffix)
-        );
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let mut builder = RegistryBuilder::new();
+            builder
+                .build::<FileSystem>(FileSystemConfig::default().data_dir(temp_dir.path()))
+                .await
+                .unwrap();
+            let err = builder
+                .build::<MemPool>(EvictableBufferPoolConfig::default().data_swap_file("data.bin"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
+            assert_eq!(
+                err.downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::PathMustUseRequiredSuffix)
+            );
+            let output = format!("{err:?}");
+            assert!(output.contains("config_field=data_swap_file, path=data.bin"));
+            assert!(output.contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
+        });
     }
 
     #[test]
     fn test_evictable_buffer_pool_build_reports_index_swap_file_label() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let mut builder = RegistryBuilder::new();
+            builder
+                .build::<FileSystem>(FileSystemConfig::default().data_dir(temp_dir.path()))
+                .await
+                .unwrap();
+            let err = builder
+                .build::<IndexPool>(IndexPoolConfig::new(
+                    TEST_INDEX_POOL_BYTES,
+                    "index.bin",
+                    TEST_INDEX_MAX_FILE_BYTES,
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
+            assert_eq!(
+                err.downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::PathMustUseRequiredSuffix)
+            );
+            let output = format!("{err:?}");
+            assert!(output.contains("config_field=index_swap_file, path=index.bin"));
+            assert!(output.contains("buffer_pool_type=evictable, buffer_pool_role=index"));
+        });
+    }
+
+    #[test]
+    fn test_evictable_buffer_pool_build_retains_resource_error_under_runtime() {
         let temp_dir = TempDir::new().unwrap();
         let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
-        let err = match EvictableBufferPoolConfig::default()
-            .role(PoolRole::Index)
-            .data_swap_file("index.bin")
-            .build_index_for_engine(fs_owner.guard())
-        {
-            Ok(_) => panic!("expected invalid storage path"),
+        let config = EvictableBufferPoolConfig::default()
+            .role(PoolRole::Mem)
+            .data_swap_file(temp_dir.path().join("data.swp"))
+            .max_mem_size(1024usize * 1024)
+            .max_file_size(2usize * 1024 * 1024);
+        let err = match EvictableBufferPool::create(config, fs_owner.guard()) {
+            Ok(_) => panic!("undersized evictable buffer pool should fail"),
             Err(err) => err,
         };
-        assert!(err.is_kind(ErrorKind::Config));
+
+        assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
         assert_eq!(
-            err.report().downcast_ref::<ConfigError>().copied(),
-            Some(ConfigError::PathMustUseRequiredSuffix)
+            err.downcast_ref::<ResourceError>().copied(),
+            Some(ResourceError::BufferPoolSizeTooSmall)
         );
+        assert!(format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
+    }
+
+    #[test]
+    fn test_evictable_buffer_pool_build_retains_io_error_under_runtime() {
+        let temp_dir = TempDir::new().unwrap();
+        let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
+        let swap_file = temp_dir.path().join("missing").join("data.swp");
+        let config = EvictableBufferPoolConfig::default()
+            .role(PoolRole::Mem)
+            .data_swap_file(swap_file)
+            .max_mem_size(32usize * 1024 * 1024)
+            .max_file_size(64usize * 1024 * 1024);
+        let err = match EvictableBufferPool::create(config, fs_owner.guard()) {
+            Ok(_) => panic!("swap file with a missing parent should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
+        assert_eq!(
+            err.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::NotFound)
+        );
+        assert!(format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
     }
 }

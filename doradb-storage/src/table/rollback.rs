@@ -650,7 +650,10 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                res.unwrap_err().operation_error(),
+                res.unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::NotSupported)
             );
             trx.rollback().await.unwrap();
@@ -760,7 +763,10 @@ mod tests {
                 })
                 .await;
             assert_eq!(
-                res.unwrap_err().operation_error(),
+                res.unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::NotSupported)
             );
             trx.rollback().await.unwrap();

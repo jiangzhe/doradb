@@ -2,15 +2,15 @@ use super::libaio_abi::{
     io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
 use super::{
-    BackendResult, BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure,
-    IOBackendQueueState, IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt,
-    SubmitRetry, SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
+    BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState,
+    IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt, SubmitRetry,
+    SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
 };
-use crate::error::{ConfigError, IoError, Result, StorageOp};
+use crate::error::{IoError, IoResult};
 use error_stack::Report;
 use libc::{EAGAIN, EINTR, EINVAL, c_long};
 use std::collections::VecDeque;
-use std::io::Error as StdIoError;
+use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
 use std::num::NonZeroUsize;
 use std::ptr::null_mut;
 use std::time::Instant;
@@ -23,47 +23,11 @@ type LibaioWaitResult = (usize, Vec<(BackendToken, StdIoResult<usize>)>);
 /// IO schedulers.
 pub(crate) struct LibaioBackend {
     ctx: io_context_t,
-    max_events: usize,
+    io_depth: usize,
     stats: IOBackendStatsHandle,
 }
 
-// SAFETY: shared references only pass the opaque kernel context to libaio
-// submit/wait syscalls and access atomics-backed stats; mutable backend state
-// lives in the kernel or behind atomics, with no thread-affine Rust data.
-unsafe impl Sync for LibaioBackend {}
-// SAFETY: `LibaioBackend` stores only the opaque kernel-owned `io_context_t`,
-// a plain `usize`, and atomics-backed stats state, so moving it between
-// threads does not invalidate any Rust-side aliasing or ownership invariants.
-unsafe impl Send for LibaioBackend {}
-
 impl LibaioBackend {
-    /// Create a new libaio context with max events(io depth).
-    #[inline]
-    pub(crate) fn new(max_events: usize) -> Result<Self> {
-        if max_events == 0 || max_events > i32::MAX as usize {
-            return Err(Report::new(ConfigError::InvalidIoDepth)
-                .attach(format!("max_events={max_events}"))
-                .into());
-        }
-        let mut ctx = null_mut();
-        // SAFETY: `ctx` points to writable storage for the kernel-owned libaio
-        // context handle, and the return code is checked before constructing
-        // the Rust backend wrapper.
-        unsafe {
-            match io_setup(max_events as i32, &mut ctx) {
-                0 => Ok(LibaioBackend {
-                    ctx,
-                    max_events,
-                    stats: IOBackendStatsHandle::default(),
-                }),
-                ret => {
-                    let err = StdIoError::from_raw_os_error(-ret);
-                    Err(IoError::report_with_op(StorageOp::BackendSetup, err).into())
-                }
-            }
-        }
-    }
-
     /// Returns a cloneable handle to backend-owned submit/wait statistics.
     #[inline]
     pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
@@ -74,7 +38,7 @@ impl LibaioBackend {
     /// Submit count will be returned, and caller need to take
     /// care of cleaning the input slice.
     #[inline]
-    fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> BackendResult<SubmitAttempt> {
+    fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> IoResult<SubmitAttempt> {
         if reqs.is_empty() || limit == 0 {
             return Ok(SubmitAttempt::Noop);
         }
@@ -124,7 +88,7 @@ impl LibaioBackend {
         &self,
         events: &mut [io_event],
         min_nr: usize,
-    ) -> BackendResult<LibaioWaitResult> {
+    ) -> IoResult<LibaioWaitResult> {
         let max_nwait = events.len();
         let mut wait_calls = 0;
         let count = loop {
@@ -169,6 +133,15 @@ impl LibaioBackend {
     }
 }
 
+// SAFETY: shared references only pass the opaque kernel context to libaio
+// submit/wait syscalls and access atomics-backed stats; mutable backend state
+// lives in the kernel or behind atomics, with no thread-affine Rust data.
+unsafe impl Sync for LibaioBackend {}
+// SAFETY: `LibaioBackend` stores only the opaque kernel-owned `io_context_t`,
+// a plain `usize`, and atomics-backed stats state, so moving it between
+// threads does not invalidate any Rust-side aliasing or ownership invariants.
+unsafe impl Send for LibaioBackend {}
+
 impl Drop for LibaioBackend {
     #[inline]
     fn drop(&mut self) {
@@ -186,21 +159,52 @@ impl IOBackend for LibaioBackend {
     type Events = Box<[io_event]>;
 
     #[inline]
-    fn max_events(&self) -> usize {
-        self.max_events
+    fn setup(io_depth: usize) -> IoResult<Self> {
+        if io_depth == 0 {
+            return Err(Report::new(IoError::from(StdIoErrorKind::InvalidInput))
+                .attach("backend=libaio, io_depth=0, reason=io depth must be non-zero"));
+        }
+        let kernel_io_depth = i32::try_from(io_depth).map_err(|_| {
+            Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
+                "backend=libaio, io_depth={io_depth}, reason=io depth exceeds i32"
+            ))
+        })?;
+        let mut ctx = null_mut();
+        // SAFETY: `ctx` points to writable storage for the kernel-owned libaio
+        // context handle, and the return code is checked before constructing
+        // the Rust backend wrapper.
+        unsafe {
+            match io_setup(kernel_io_depth, &mut ctx) {
+                0 => Ok(Self {
+                    ctx,
+                    io_depth,
+                    stats: IOBackendStatsHandle::default(),
+                }),
+                ret => {
+                    let err = StdIoError::from_raw_os_error(-ret);
+                    Err(Report::new(IoError::from(err.kind()))
+                        .attach(format!("op=backend_setup, {err}")))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn io_depth(&self) -> usize {
+        self.io_depth
     }
 
     #[inline]
     fn new_submit_batch(&self) -> Self::SubmitBatch {
         LibaioSubmitBatch {
-            staged: VecDeque::with_capacity(self.max_events),
-            prefix: Vec::with_capacity(self.max_events),
+            staged: VecDeque::with_capacity(self.io_depth),
+            prefix: Vec::with_capacity(self.io_depth),
         }
     }
 
     #[inline]
     fn new_events(&self) -> Self::Events {
-        vec![io_event::default(); self.max_events].into_boxed_slice()
+        vec![io_event::default(); self.io_depth].into_boxed_slice()
     }
 
     #[inline]
@@ -243,7 +247,7 @@ impl IOBackend for LibaioBackend {
         &mut self,
         batch: &mut Self::SubmitBatch,
         limit: usize,
-    ) -> BackendResult<SubmitAttempt> {
+    ) -> IoResult<SubmitAttempt> {
         if batch.staged.is_empty() || limit == 0 {
             return Ok(SubmitAttempt::Noop);
         }
@@ -271,7 +275,7 @@ impl IOBackend for LibaioBackend {
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
-    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+    ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
         let start = Instant::now();
         let (_wait_calls, completed) = self
             .wait_at_least_with_attempts(events, min_nr)
@@ -396,7 +400,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_submission_driver_with_libaio_backend() {
-        let ctx = LibaioBackend::new(16).unwrap();
+        let ctx = LibaioBackend::setup(16).unwrap();
+        assert_eq!(ctx.io_depth(), 16);
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file3.txt");
         let file_path = file_path.to_string_lossy().into_owned();
@@ -450,7 +455,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_submit_limit_eagain_no_panic() {
-        let ctx = LibaioBackend::new(32).unwrap();
+        let ctx = LibaioBackend::setup(32).unwrap();
         let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
         let iocb = iocb::boxed();
         let reqs = vec![iocb.as_mut_ptr()];
@@ -467,7 +472,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_submit_limit_zero_submit_reports_no_progress_retry() {
-        let ctx = LibaioBackend::new(32).unwrap();
+        let ctx = LibaioBackend::setup(32).unwrap();
         let previous = set_io_submit_hook(Some(|_, _, _| 0));
         let iocb = iocb::boxed();
         let reqs = vec![iocb.as_mut_ptr()];
@@ -483,23 +488,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_libaio_backend_rejects_zero_depth_as_config_error() {
-        let err = match LibaioBackend::new(0) {
+    fn test_libaio_backend_rejects_zero_depth_as_invalid_input() {
+        let err = match LibaioBackend::setup(0) {
             Ok(_) => panic!("expected invalid io depth"),
             Err(err) => err,
         };
-        assert!(err.is_kind(crate::error::ErrorKind::Config));
-        assert_eq!(
-            err.report()
-                .downcast_ref::<crate::error::ConfigError>()
-                .copied(),
-            Some(crate::error::ConfigError::InvalidIoDepth)
-        );
+        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
+        let report = format!("{err:?}");
+        assert!(report.contains("backend=libaio"), "{report}");
+        assert!(report.contains("io_depth=0"), "{report}");
+    }
+
+    #[test]
+    fn test_libaio_backend_rejects_i32_overflow_as_invalid_input() {
+        let io_depth = (i32::MAX as usize) + 1;
+        let err = match LibaioBackend::setup(io_depth) {
+            Ok(_) => panic!("expected invalid io depth"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
+        let report = format!("{err:?}");
+        assert!(report.contains("backend=libaio"), "{report}");
+        assert!(report.contains(&format!("io_depth={io_depth}")), "{report}");
     }
 
     #[test]
     fn test_libaio_prepare_sync_operations_use_native_opcodes() {
-        let mut backend = LibaioBackend::new(4).unwrap();
+        let mut backend = LibaioBackend::setup(4).unwrap();
 
         let mut fsync = Operation::fsync(17);
         let fsync_iocb = <LibaioBackend as IOBackend>::prepare(
@@ -555,7 +570,7 @@ pub(crate) mod tests {
             1
         }
 
-        let mut backend = LibaioBackend::new(32).unwrap();
+        let mut backend = LibaioBackend::setup(32).unwrap();
         let mut events = backend.new_events();
         let token = BackendToken::new(7, 3);
 

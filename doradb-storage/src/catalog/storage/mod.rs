@@ -17,7 +17,7 @@ use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
     catalog_table_id_from_slot, catalog_table_slot,
 };
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, Error, FileKind, Result};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
@@ -225,17 +225,21 @@ impl CatalogStorage {
                 break;
             }
             if catalog_table_slot(root.table_id) != Some(idx) {
-                return Err(invalid_catalog_payload(format!(
-                    "catalog root table id mismatch: root_table_id={}, slot_idx={idx}",
-                    root.table_id
-                )));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "catalog root table id mismatch: root_table_id={}, slot_idx={idx}",
+                        root.table_id
+                    ))
+                    .into());
             }
             if root.root_block_id.is_none() {
                 if root.pivot_row_id != RowID::new(0) {
-                    return Err(invalid_catalog_payload(format!(
-                        "empty catalog root has nonzero pivot_row_id={}",
-                        root.pivot_row_id
-                    )));
+                    return Err(Report::new(DataIntegrityError::InvalidPayload)
+                        .attach(format!(
+                            "empty catalog root has nonzero pivot_row_id={}",
+                            root.pivot_row_id
+                        ))
+                        .into());
                 }
                 continue;
             }
@@ -286,9 +290,11 @@ impl CatalogStorage {
                     checkpointed_silent_watermarks: self.checkpointed_silent_watermarks(),
                 });
             }
-            return Err(invalid_catalog_payload(format!(
-                "catalog replay start mismatch: current={current_catalog_replay_start_ts}, expected={replay_start_ts}, next={next_catalog_replay_start_ts}"
-            )));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "catalog replay start mismatch: current={current_catalog_replay_start_ts}, expected={replay_start_ts}, next={next_catalog_replay_start_ts}"
+                ))
+                .into());
         }
 
         // A scan can legitimately find no durable record at or after the
@@ -445,23 +451,25 @@ impl CatalogStorage {
         let disk_pool_guard = self.disk_pool.pool_guard();
         for (idx, table_root) in root.table_roots.iter().enumerate() {
             if catalog_table_slot(table_root.table_id) != Some(idx) {
-                return Err(invalid_catalog_root_invariant(
-                    root.root_ts,
-                    format!(
-                        "catalog table root table-id mismatch: table_id={}, slot_idx={idx}",
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach(format!(
+                        "file={}, root_ts={}, catalog table root table-id mismatch: table_id={}, slot_idx={idx}",
+                        FileKind::CatalogMultiTableFile,
+                        root.root_ts,
                         table_root.table_id
-                    ),
-                ));
+                    ))
+                    .into());
             }
             let Some(root_block_id) = table_root.checkpoint_root_block_id() else {
                 if table_root.pivot_row_id != RowID::new(0) {
-                    return Err(invalid_catalog_root_invariant(
-                        root.root_ts,
-                        format!(
-                            "empty catalog root has nonzero pivot_row_id={}",
+                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                        .attach(format!(
+                            "file={}, root_ts={}, empty catalog root has nonzero pivot_row_id={}",
+                            FileKind::CatalogMultiTableFile,
+                            root.root_ts,
                             table_root.pivot_row_id
-                        ),
-                    ));
+                        ))
+                        .into());
                 }
                 continue;
             };
@@ -508,9 +516,11 @@ impl CatalogStorage {
                     folded.fold_update(metadata, key, update)?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
-                    return Err(invalid_catalog_payload(
-                        "catalog checkpoint table op must be insert, delete-by-primary-key, or update-by-primary-key",
-                    ));
+                    return Err(Report::new(DataIntegrityError::InvalidPayload)
+                        .attach(
+                            "catalog checkpoint table op must be insert, delete-by-primary-key, or update-by-primary-key",
+                        )
+                        .into());
                 }
             }
         }
@@ -519,7 +529,7 @@ impl CatalogStorage {
             return Ok((root, false));
         }
 
-        let output_vals = folded.materialize_output_rows()?;
+        let output_vals = folded.materialize_output_rows();
         if output_vals.is_empty() {
             return Ok((
                 CatalogTableRootDesc {
@@ -543,7 +553,12 @@ impl CatalogStorage {
         let mut new_entries = Vec::with_capacity(new_pages.len());
         for page in new_pages {
             let block_id = mutable.allocate_block()?;
-            mutable.write_block(block_id, page.buf).await?;
+            mutable
+                .write_block(block_id, page.buf)
+                .await
+                .map_err(|report| {
+                    Error::from_completion_report(report, "persist catalog LWC block")
+                })?;
             new_entries.push(page.shape.with_block_id(block_id));
         }
         let pivot_row_id = RowID::new(output_rows.len() as u64);
@@ -558,8 +573,10 @@ impl CatalogStorage {
         let root_block_id = column_index
             .batch_insert(mutable, &new_entries, pivot_row_id, checkpoint_cts)
             .await?;
-        let root_block_id = NonZeroU64::new(root_block_id.into())
-            .ok_or_else(|| invalid_catalog_payload("catalog root block id resolved to zero"))?;
+        let root_block_id = NonZeroU64::new(root_block_id.into()).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("catalog root block id resolved to zero")
+        })?;
         Ok((
             CatalogTableRootDesc {
                 table_id,
@@ -616,10 +633,12 @@ impl CatalogStorage {
     ) -> Result<Vec<RowRecord>> {
         if root.root_block_id.is_none() {
             if root.pivot_row_id != RowID::new(0) {
-                return Err(invalid_catalog_payload(format!(
-                    "empty catalog root has nonzero pivot_row_id={}",
-                    root.pivot_row_id
-                )));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "empty catalog root has nonzero pivot_row_id={}",
+                        root.pivot_row_id
+                    ))
+                    .into());
             }
             return Ok(Vec::new());
         }
@@ -654,23 +673,27 @@ impl CatalogStorage {
                 .await?;
             for row in page_rows {
                 let delta = row.row_id.checked_sub(entry.start_row_id).ok_or_else(|| {
-                    invalid_catalog_payload(format!(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                         "catalog root row id precedes block start: row_id={}, start_row_id={}",
                         row.row_id, entry.start_row_id
                     ))
                 })?;
                 if delta > u32::MAX as u64 {
-                    return Err(invalid_catalog_payload(format!(
-                        "catalog root row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
-                        row.row_id, entry.start_row_id
-                    )));
+                    return Err(Report::new(DataIntegrityError::InvalidPayload)
+                        .attach(format!(
+                            "catalog root row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
+                            row.row_id, entry.start_row_id
+                        ))
+                        .into());
                 }
                 validate_catalog_row(metadata, &row.vals, "catalog checkpoint root row")?;
                 let primary_key = key_builder.key_from_row(&row.vals)?;
                 if primary_keys.contains(&primary_key) {
-                    return Err(invalid_catalog_payload(format!(
-                        "catalog root contains duplicate primary key: key={primary_key:?}"
-                    )));
+                    return Err(Report::new(DataIntegrityError::InvalidPayload)
+                        .attach(format!(
+                            "catalog root contains duplicate primary key: key={primary_key:?}"
+                        ))
+                        .into());
                 }
                 primary_keys.insert(primary_key);
                 rows.push(row);
@@ -835,14 +858,19 @@ fn must_catalog_table_slot(table_id: TableID) -> usize {
 }
 
 #[inline]
-fn catalog_table_slot_checked(table_id: TableID, catalog_table_count: usize) -> Result<usize> {
+fn catalog_table_slot_checked(
+    table_id: TableID,
+    catalog_table_count: usize,
+) -> DataIntegrityResult<usize> {
     let Some(slot) = catalog_table_slot(table_id) else {
-        return Err(invalid_catalog_payload(format!(
-            "catalog checkpoint redo table id is not in catalog range: table_id={table_id}"
-        )));
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "catalog checkpoint redo table id is not in catalog range: table_id={table_id}"
+            )),
+        );
     };
     if slot >= catalog_table_count {
-        return Err(invalid_catalog_payload(format!(
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
             "catalog checkpoint redo table id out of range: table_id={table_id}, slot={slot}, catalog_table_count={catalog_table_count}"
         )));
     }
@@ -871,18 +899,23 @@ fn build_lwc_blocks_from_row_records(
         }
         if !builder.append_row_values(row.row_id, &row.vals) {
             if builder.is_empty() {
-                return Err(invalid_catalog_payload(format!(
-                    "single catalog row does not fit in LWC block: row_id={}",
-                    row.row_id
-                )));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "single catalog row does not fit in LWC block: row_id={}",
+                        row.row_id
+                    ))
+                    .into());
             }
             let start_row_id = builder_start.take().ok_or_else(|| {
-                invalid_catalog_payload("catalog LWC builder missing start row id")
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach("catalog LWC builder missing start row id")
             })?;
             if builder_end <= start_row_id {
-                return Err(invalid_catalog_payload(format!(
-                    "catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
-                )));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
+                    ))
+                    .into());
             }
             let shape = ColumnBlockEntryShape::new(
                 start_row_id,
@@ -896,10 +929,12 @@ fn build_lwc_blocks_from_row_records(
             builder = LwcBuilder::new(&metadata.col);
             builder_start = Some(row.row_id);
             if !builder.append_row_values(row.row_id, &row.vals) {
-                return Err(invalid_catalog_payload(format!(
-                    "single catalog row does not fit in LWC block: row_id={}",
-                    row.row_id
-                )));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "single catalog row does not fit in LWC block: row_id={}",
+                        row.row_id
+                    ))
+                    .into());
             }
         }
         builder_end = row.row_id.saturating_add(1);
@@ -907,12 +942,15 @@ fn build_lwc_blocks_from_row_records(
 
     if !builder.is_empty() {
         let start_row_id = builder_start.ok_or_else(|| {
-            invalid_catalog_payload("catalog LWC builder missing final start row id")
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("catalog LWC builder missing final start row id")
         })?;
         if builder_end <= start_row_id {
-            return Err(invalid_catalog_payload(format!(
-                "final catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
-            )));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "final catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
+                ))
+                .into());
         }
         let shape = ColumnBlockEntryShape::new(
             start_row_id,
@@ -926,54 +964,29 @@ fn build_lwc_blocks_from_row_records(
     Ok(lwc_blocks)
 }
 
-#[inline]
-fn invalid_catalog_payload(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn invalid_catalog_root_invariant(root_ts: TrxID, message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidRootInvariant)
-        .attach(format!(
-            "file={}, root_ts={root_ts}, {}",
-            FileKind::CatalogMultiTableFile,
-            message.into()
-        ))
-        .into()
-}
-
-#[inline]
-fn invalid_catalog_reachable_block(
-    root_ts: TrxID,
+fn validate_catalog_reachable_block(
+    root: &MultiTableActiveRoot,
     block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
-    Report::new(DataIntegrityError::InvalidRootInvariant)
-        .attach(format!(
-            "file={}, root_ts={root_ts}, block_id={block_id}, {}",
-            FileKind::CatalogMultiTableFile,
-            message.into()
-        ))
-        .into()
-}
-
-fn validate_catalog_reachable_block(root: &MultiTableActiveRoot, block_id: BlockID) -> Result<()> {
+) -> DataIntegrityResult<()> {
     let idx = usize::from(block_id);
     if idx >= root.alloc_map.len() {
-        return Err(invalid_catalog_reachable_block(
-            root.root_ts,
-            block_id,
-            format!("alloc_map_len={}", root.alloc_map.len()),
-        ));
+        return Err(
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "file={}, root_ts={}, block_id={block_id}, alloc_map_len={}",
+                FileKind::CatalogMultiTableFile,
+                root.root_ts,
+                root.alloc_map.len()
+            )),
+        );
     }
     if !root.alloc_map.is_allocated(idx) {
-        return Err(invalid_catalog_reachable_block(
-            root.root_ts,
-            block_id,
-            "allocation bit is not set",
-        ));
+        return Err(
+            Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                "file={}, root_ts={}, block_id={block_id}, allocation bit is not set",
+                FileKind::CatalogMultiTableFile,
+                root.root_ts
+            )),
+        );
     }
     Ok(())
 }
@@ -982,19 +995,20 @@ fn validate_catalog_row(
     metadata: &TableMetadata,
     row: &[Val],
     context: &'static str,
-) -> Result<()> {
+) -> DataIntegrityResult<()> {
     if row.len() != metadata.col.col_count() {
-        return Err(invalid_catalog_payload(format!(
-            "{context} value count {} does not match column count {}",
-            row.len(),
-            metadata.col.col_count()
-        )));
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "{context} value count {} does not match column count {}",
+                row.len(),
+                metadata.col.col_count()
+            )),
+        );
     }
     for (idx, val) in row.iter().enumerate() {
         if !metadata.col.col_type_match(idx, val) {
-            return Err(invalid_catalog_payload(format!(
-                "{context} column type mismatch: column_no={idx}",
-            )));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("{context} column type mismatch: column_no={idx}")));
         }
     }
     Ok(())
@@ -1009,7 +1023,7 @@ pub(crate) mod tests {
     use crate::catalog::{
         CatalogCheckpointBatch, CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec,
     };
-    use crate::error::DataIntegrityError;
+    use crate::error::{DataIntegrityError, ErrorKind};
     use crate::file::BlockKey;
     use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
@@ -1078,6 +1092,30 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_catalog_leaf_validators_return_data_integrity_reports() {
+        let err = catalog_table_slot_checked(TABLE_ID_TABLES, 0).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+
+        let metadata = &catalog_definition_of_tables().metadata;
+        let err = validate_catalog_row(metadata, &[], "catalog test row").unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("catalog test row"), "{report}");
+
+        let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u32)]).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("table_id"), "{report}");
+        assert!(report.contains("index 0"), "{report}");
+
+        let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u64)]).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("heap_redo_start_ts"), "{report}");
+        assert!(report.contains("index 1"), "{report}");
     }
 
     async fn apply_metadata_only_checkpoint(
@@ -1302,7 +1340,7 @@ pub(crate) mod tests {
             .unwrap_err();
 
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidPayload)
         );
         let report = format!("{err:?}");
@@ -1339,7 +1377,7 @@ pub(crate) mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1387,7 +1425,7 @@ pub(crate) mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1475,7 +1513,7 @@ pub(crate) mod tests {
                 Err(err) => err,
             };
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1514,7 +1552,7 @@ pub(crate) mod tests {
                 Err(err) => err,
             };
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload),
                 "case={case}"
             );
@@ -1595,7 +1633,7 @@ pub(crate) mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1879,7 +1917,7 @@ pub(crate) mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1972,8 +2010,9 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
 
+            assert_eq!(err.kind(), ErrorKind::DataIntegrity);
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
             );
             let active_after = storage.mtb.active_root_unchecked();

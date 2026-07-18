@@ -238,11 +238,7 @@ impl<M: MutableCowFile> Drop for RewriteAllocationGuard<'_, M> {
     #[inline]
     fn drop(&mut self) {
         for block_id in self.block_ids.drain(..).rev() {
-            let res = self.mutable_file.rollback_allocated_block(block_id);
-            debug_assert!(
-                res.is_ok(),
-                "DiskTree rewrite allocation rollback failed for block_id={block_id}"
-            );
+            self.mutable_file.rollback_allocated_block(block_id);
         }
     }
 }
@@ -1096,7 +1092,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                         // pending wrapper is never written; a materialized wrapper
                         // allocated by this rewrite can be rolled back.
                         if let RewriteEntry::Block(wrapper) = &entry {
-                            self.rollback_rewritten_entry_block(mutable_file, wrapper)?;
+                            self.rollback_rewritten_entry_block(mutable_file, wrapper);
                         }
                         entry = children.remove(0);
                     }
@@ -1265,11 +1261,10 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         mutable_file: &mut M,
         entry: &BranchEntry,
-    ) -> Result<()> {
+    ) {
         if entry.rewrite_allocated {
-            mutable_file.rollback_allocated_block(entry.block_id)?;
+            mutable_file.rollback_allocated_block(entry.block_id);
         }
-        Ok(())
     }
 
     /// Retarget a rewrite entry to a different upper fence before materializing.
@@ -1295,7 +1290,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                         children.into_iter().map(RewriteEntry::Block).collect(),
                     ),
                 };
-                self.rollback_rewritten_entry_block(mutable_file, &entry)?;
+                self.rollback_rewritten_entry_block(mutable_file, &entry);
                 Ok(RewriteEntry::Pending(PendingRewriteEntry {
                     key: entry.key,
                     upper_fence,
@@ -1609,7 +1604,10 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         // Compute integrity after all node bytes, fences, values, and hints have
         // reached their final persisted representation.
         write_block_checksum(buf.data_mut());
-        mutable_file.write_block(block_id, buf).await
+        mutable_file
+            .write_block(block_id, buf)
+            .await
+            .map_err(|report| Error::from_completion_report(report, "write DiskTree node"))
     }
 }
 
@@ -2389,7 +2387,10 @@ mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
-    use crate::error::{DataIntegrityError, ErrorKind, InternalError, IoError};
+    use crate::error::{
+        CompletionErrorKind, CompletionResult, DataIntegrityError, ErrorKind, InternalError,
+        IoError, ResourceResult,
+    };
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
@@ -2674,11 +2675,11 @@ mod tests {
     }
 
     impl MutableCowFile for FailingDiskTreeWriteFile {
-        fn allocate_block(&mut self) -> Result<BlockID> {
+        fn allocate_block(&mut self) -> ResourceResult<BlockID> {
             self.inner.allocate_block()
         }
 
-        fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+        fn rollback_allocated_block(&mut self, block_id: BlockID) {
             self.inner.rollback_allocated_block(block_id)
         }
 
@@ -2686,15 +2687,17 @@ mod tests {
             &self,
             block_id: BlockID,
             buf: DirectBuf,
-        ) -> impl Future<Output = Result<()>> + Send {
+        ) -> impl Future<Output = CompletionResult<()>> + Send {
             let should_fail = self.should_fail(&buf);
             async move {
                 if should_fail {
                     // TODO(error-boundary): backlog 000160 should assert this
                     // injected IO source remains visible after rewrite cleanup.
-                    return Err(
-                        IoError::report(StdIoError::other("test disk-tree write failure")).into(),
-                    );
+                    let source = StdIoError::other("test disk-tree write failure");
+                    return Err(CompletionErrorKind::from_io(
+                        Report::new(IoError::from(source.kind())).attach(format!("{source}")),
+                        "inject DiskTree write failure",
+                    ));
                 }
                 self.inner.write_block(block_id, buf).await
             }
@@ -3454,7 +3457,10 @@ mod tests {
                             key: &malformed_exact
                         }])
                         .as_ref()
-                        .is_err_and(|err| err.data_integrity_error()
+                        .is_err_and(|err| err
+                            .report()
+                            .downcast_ref::<DataIntegrityError>()
+                            .copied()
                             == Some(DataIntegrityError::InvalidPayload))
                 );
             }
@@ -3466,7 +3472,10 @@ mod tests {
                             key: &malformed_exact
                         }])
                         .as_ref()
-                        .is_err_and(|err| err.data_integrity_error()
+                        .is_err_and(|err| err
+                            .report()
+                            .downcast_ref::<DataIntegrityError>()
+                            .copied()
                             == Some(DataIntegrityError::InvalidPayload))
                 );
             }

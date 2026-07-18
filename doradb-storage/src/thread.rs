@@ -1,5 +1,6 @@
 use crate::error::{IoError, RuntimeError, RuntimeResult};
 use crate::obs;
+use error_stack::Report;
 use std::io::Error as StdIoError;
 use std::thread::{self, Builder, JoinHandle};
 
@@ -18,7 +19,8 @@ where
     let thread_name = String::from(name);
     let requested_name = thread_name.clone();
     let spawn_error = |err: StdIoError| {
-        IoError::report(err)
+        Report::new(IoError::from(err.kind()))
+            .attach(format!("{err}"))
             .change_context(RuntimeError::BackgroundSpawn)
             .attach(format!("thread_name={requested_name}"))
     };

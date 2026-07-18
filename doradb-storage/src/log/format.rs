@@ -1,18 +1,18 @@
-use crate::error::{DataIntegrityError, DataIntegrityResult, Error, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, checksum_offset, validate_block,
     write_block_checksum, write_block_header,
 };
 use crate::id::TrxID;
 use crate::io::STORAGE_SECTOR_SIZE;
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
-use error_stack::Report;
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
+use error_stack::{Report, ResultExt};
 use std::mem;
 
 /// Magic bytes stored in every redo file super-block header.
 pub(crate) const REDO_FILE_MAGIC: [u8; 8] = *b"DREDO\0\0\0";
 /// Redo file format version for fixed-block redo data framing.
-pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 3;
+pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 4;
 /// Shared block-integrity envelope used by redo super-block slots.
 pub(crate) const REDO_SUPER_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(REDO_FILE_MAGIC, REDO_FILE_FORMAT_VERSION);
@@ -58,13 +58,17 @@ impl RedoBlockHeader {
 
     /// Build a block header before checksum patching.
     #[inline]
-    pub(crate) fn new(flags: u8, payload_len: usize, group_block_idx: usize) -> Result<Self> {
+    pub(crate) fn new(
+        flags: u8,
+        payload_len: usize,
+        group_block_idx: usize,
+    ) -> InternalResult<Self> {
         let payload_len = u16::try_from(payload_len).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload)
+            Report::new(InternalError::RedoFormatEncoding)
                 .attach(format!("block=redo-data, payload_len={payload_len}"))
         })?;
         let group_block_idx = u32::try_from(group_block_idx).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            Report::new(InternalError::RedoFormatEncoding).attach(format!(
                 "block=redo-data, group_block_idx={group_block_idx}"
             ))
         })?;
@@ -168,10 +172,7 @@ impl Deser for RedoBlockHeader {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoBlockHeader::SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, checksum) = input.deser_u32(start_idx)?;
         let (idx, flags) = input.deser_u8(idx)?;
         let (idx, payload_len) = input.deser_u16(idx)?;
@@ -212,9 +213,9 @@ impl RedoGroupStartExtension {
         group_block_count: usize,
         min_redo_cts: TrxID,
         max_redo_cts: TrxID,
-    ) -> Result<Self> {
+    ) -> InternalResult<Self> {
         let group_block_count = u32::try_from(group_block_count).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            Report::new(InternalError::RedoFormatEncoding).attach(format!(
                 "block=redo-data, group_block_count={group_block_count}"
             ))
         })?;
@@ -286,10 +287,7 @@ impl Deser for RedoGroupStartExtension {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoGroupStartExtension::SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, group_payload_len) = input.deser_u64(start_idx)?;
         let (idx, group_block_count) = input.deser_u32(idx)?;
         let (idx, min_redo_cts) = input.deser_u64(idx)?;
@@ -397,12 +395,10 @@ impl RedoSuperBlock {
         slot_no: u32,
         durable_end_offset: usize,
         redo_range: Option<(TrxID, TrxID)>,
-    ) -> Result<Self> {
+    ) -> InternalResult<Self> {
         let generation = open.generation.checked_add(1).ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach("block=redo-super-block, generation overflow while sealing"),
-            )
+            Report::new(InternalError::RedoFormatEncoding)
+                .attach("block=redo-super-block, generation overflow while sealing")
         })?;
         let (min_redo_cts, max_redo_cts) = match redo_range {
             Some((min_redo_cts, max_redo_cts)) => (min_redo_cts.as_u64(), max_redo_cts.as_u64()),
@@ -418,7 +414,9 @@ impl RedoSuperBlock {
             min_redo_cts,
             max_redo_cts,
         };
-        validate_super_block_fields(&sealed, sealed.file_seq, slot_no)?;
+        validate_super_block_fields(&sealed, sealed.file_seq, slot_no)
+            .change_context(InternalError::RedoFormatEncoding)
+            .attach("trusted sealed redo fields invalid")?;
         Ok(sealed)
     }
 }
@@ -453,10 +451,7 @@ impl Deser for RedoSuperBlock {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(REDO_SUPER_BLOCK_PAYLOAD_SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, file_seq) = input.deser_u32(start_idx)?;
         let (idx, slot_no) = input.deser_u32(idx)?;
         let (idx, log_block_size) = input.deser_u64(idx)?;
@@ -505,18 +500,16 @@ pub(crate) fn is_zero_redo_block(block: &[u8]) -> bool {
 
 /// Compute and write the redo data block checksum into the first four bytes.
 #[inline]
-pub(crate) fn patch_redo_block_checksum(block: &mut [u8]) -> Result<u32> {
-    if block.len() < RedoBlockHeader::SIZE {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
-                "block=redo-data, invalid_block_len={}",
-                block.len()
-            ))
-            .into());
-    }
+pub(crate) fn patch_redo_block_checksum(block: &mut [u8]) -> u32 {
+    assert!(
+        block.len() >= RedoBlockHeader::SIZE,
+        "trusted redo block must fit its header before checksum patching: block_len={}, header_len={}",
+        block.len(),
+        RedoBlockHeader::SIZE
+    );
     let checksum = crc32fast::hash(&block[mem::size_of::<u32>()..]);
     block.ser_u32(0, checksum);
-    Ok(checksum)
+    checksum
 }
 
 /// Return the byte offset for a super-block slot number.
@@ -530,16 +523,18 @@ pub(crate) fn slot_offset(slot_no: u32) -> usize {
 pub(crate) fn serialize_redo_super_block(
     buf: &mut [u8],
     super_block: &RedoSuperBlock,
-) -> Result<()> {
+) -> InternalResult<()> {
     if buf.len() != REDO_SUPER_BLOCK_SLOT_SIZE {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!(
+        return Err(
+            Report::new(InternalError::RedoFormatEncoding).attach(format!(
                 "block=redo-super-block, invalid_slot_buffer_len={}",
                 buf.len()
-            ))
-            .into());
+            )),
+        );
     }
-    validate_super_block_fields(super_block, super_block.file_seq, super_block.slot_no)?;
+    validate_super_block_fields(super_block, super_block.file_seq, super_block.slot_no)
+        .change_context(InternalError::RedoFormatEncoding)
+        .attach("trusted redo super-block fields invalid")?;
     buf.fill(0);
     let payload_start = write_block_header(buf, REDO_SUPER_BLOCK_SPEC);
     debug_assert_eq!(payload_start, BLOCK_INTEGRITY_HEADER_SIZE);
@@ -840,7 +835,7 @@ mod tests {
             .ser(&mut block[..], RedoBlockHeader::SIZE);
         block[payload_start..payload_start + 16].copy_from_slice(&[7u8; 16]);
 
-        let checksum = patch_redo_block_checksum(&mut block).unwrap();
+        let checksum = patch_redo_block_checksum(&mut block);
         assert_eq!(checksum, crc32fast::hash(&block[mem::size_of::<u32>()..]));
         let (_, parsed) = RedoBlockHeader::deser(&block[..RedoBlockHeader::SIZE], 0).unwrap();
         parsed.verify_checksum(&block).unwrap();
@@ -1146,6 +1141,38 @@ mod tests {
         for super_block in cases {
             let err = validate_super_block_fields(&super_block, 7, 0).unwrap_err();
             assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+        }
+    }
+
+    #[test]
+    fn redo_super_block_internal_encoding_preserves_validation_source() {
+        let invalid_slot_no = REDO_SUPER_BLOCK_SLOT_COUNT as u32;
+        let open = valid_super_block(0, 0);
+        let sealed_err = RedoSuperBlock::sealed_from_open(
+            &open,
+            invalid_slot_no,
+            REDO_DEFAULT_DATA_START_OFFSET,
+            None,
+        )
+        .unwrap_err();
+
+        let invalid = RedoSuperBlock {
+            slot_no: invalid_slot_no,
+            ..open
+        };
+        let mut buf = vec![0u8; REDO_SUPER_BLOCK_SLOT_SIZE];
+        let serialize_err = serialize_redo_super_block(&mut buf, &invalid).unwrap_err();
+
+        for (err, stage) in [
+            (sealed_err, "trusted sealed redo fields invalid"),
+            (serialize_err, "trusted redo super-block fields invalid"),
+        ] {
+            assert_eq!(*err.current_context(), InternalError::RedoFormatEncoding);
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            assert!(format!("{err:?}").contains(stage));
         }
     }
 

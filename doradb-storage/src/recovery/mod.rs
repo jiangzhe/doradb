@@ -1219,7 +1219,10 @@ mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{CompletionErrorKind, DataIntegrityError, Error, OperationError, Result};
+    use crate::error::{
+        CompletionErrorKind, DataIntegrityError, Error, ErrorKind, OperationError, Result,
+        RuntimeError,
+    };
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::MutableTableFile;
@@ -1264,12 +1267,18 @@ mod tests {
         expected: DataIntegrityError,
     ) {
         let report = format!("{err:?}");
-        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity(expected)) {
+        if err.report().downcast_ref::<CompletionErrorKind>().copied()
+            == Some(CompletionErrorKind::DataIntegrity(expected))
+        {
             assert!(report.contains("propagate from other threads"), "{report}");
             assert!(report.contains("wait for"), "{report}");
             return;
         }
-        assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected),
+            "{report}"
+        );
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
@@ -1305,7 +1314,7 @@ mod tests {
             let err = invalid_user_table_keyed_redo(table_id, &row, cts);
             let report = format!("{err:?}");
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload),
                 "{report}"
             );
@@ -1546,7 +1555,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted),
             "{err:?}"
         );
@@ -1965,7 +1974,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
         let report = format!("{err:?}");
@@ -2044,7 +2053,10 @@ mod tests {
                 .replay_log(unknown_table_dml_log(unknown_table_id, TrxID::new(10)))
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             let report = format!("{err:?}");
             assert!(report.contains("invalid recovery ordering"), "{report}");
             assert!(report.contains("replay user table DML"), "{report}");
@@ -2057,7 +2069,10 @@ mod tests {
                 ))
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             let report = format!("{err:?}");
             assert!(report.contains("invalid recovery ordering"), "{report}");
             assert!(report.contains("replay create row page"), "{report}");
@@ -2511,8 +2526,13 @@ mod tests {
                 }
                 Err(err) => err,
             };
+            assert_eq!(err.kind(), ErrorKind::Runtime);
             assert_eq!(
-                err.data_integrity_error(),
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::RedoLogDiscovery)
+            );
+            assert_eq!(
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::RedoLogSequenceGap)
             );
         });

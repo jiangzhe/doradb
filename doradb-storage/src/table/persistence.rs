@@ -7,8 +7,8 @@ use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
-    ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, LifecycleError,
-    OperationError, Result,
+    CompletionErrorKind, ConfigError, DataIntegrityError, Error, ErrorKind, FatalError,
+    InternalError, LifecycleError, OperationError, Result,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
@@ -1540,7 +1540,12 @@ impl Table {
             .await
         {
             Ok(res) => res,
-            Err(err) if err.kind() == ErrorKind::Io => {
+            Err(err)
+                if matches!(
+                    err.report().downcast_ref::<CompletionErrorKind>(),
+                    Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
+                ) =>
+            {
                 let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
                 return Err(poison.into());
             }
@@ -3916,7 +3921,10 @@ mod tests {
             let checkpoint_trx = session.begin_trx().unwrap();
             assert!(session.in_trx().unwrap());
             let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
             let report = format!("{err:?}");
             assert!(
                 report.contains("maintenance requires idle session"),

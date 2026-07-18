@@ -277,7 +277,9 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
                     .write_block(sealed.page.block_id, sealed.page.buf),
             );
         }
-        try_join_all(writes).await?;
+        try_join_all(writes).await.map_err(|report| {
+            Error::from_completion_report(report, "write column deletion blob")
+        })?;
         Ok(())
     }
 
@@ -668,7 +670,8 @@ mod tests {
             ColumnAuxBlobHeader::decode(&bytes)
                 .as_ref()
                 .is_err_and(
-                    |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+                    |err| err.report().downcast_ref::<DataIntegrityError>().copied()
+                        == Some(DataIntegrityError::InvalidPayload)
                 )
         );
     }

@@ -7,7 +7,7 @@ use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaBlock,
 };
 use crate::id::{BlockID, RowID, TableID, TrxID};
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 use std::num::NonZeroU64;
@@ -16,7 +16,7 @@ use std::num::NonZeroU64;
 pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
-pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 6;
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 7;
 /// Magic bytes stored at the beginning of every `catalog.mtb` meta block envelope.
 pub(crate) const MULTI_TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'M', b'T', b'B', b'M', b'E', b'T', b'A', 0];
@@ -60,10 +60,7 @@ impl Deser for MetaBlock {
     );
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, pivot_row_id) = RowID::deser(input, start_idx)?;
         let (idx, heap_redo_start_ts) = TrxID::deser(input, idx)?;
         let (idx, deletion_cutoff_ts) = TrxID::deser(input, idx)?;
@@ -132,16 +129,22 @@ impl<'a> MetaBlockSerView<'a> {
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
         deletion_cutoff_ts: TrxID,
-    ) -> DataIntegrityResult<Self> {
-        validate_secondary_index_roots(
+    ) -> Self {
+        let validation = validate_secondary_index_roots(
             secondary_index_roots,
             schema.next_index_no,
             schema
                 .index_specs
                 .active_indexes()
                 .map(|(index_no, _)| index_no),
-        )?;
-        Ok(MetaBlockSerView {
+        );
+        assert!(
+            validation.is_ok(),
+            "trusted table meta-block root layout must match active index metadata: secondary_root_count={}, next_index_no={}",
+            secondary_index_roots.len(),
+            schema.next_index_no
+        );
+        MetaBlockSerView {
             pivot_row_id,
             heap_redo_start_ts,
             deletion_cutoff_ts,
@@ -149,7 +152,7 @@ impl<'a> MetaBlockSerView<'a> {
             column_block_index_root,
             secondary_index_roots,
             alloc_map,
-        })
+        }
     }
 }
 
@@ -203,10 +206,7 @@ impl Deser for MultiTableMetaBlockData {
     );
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, next_table_id) = TableID::deser(input, start_idx)?;
         if next_table_id > USER_TABLE_ID_LIMIT {
             return Err(invalid_payload(format!(
@@ -321,7 +321,7 @@ fn invalid_payload(message: impl Into<String>) -> Report<DataIntegrityError> {
 }
 
 #[inline]
-fn validate_alloc_map(alloc_map: &AllocMap) -> crate::error::DataIntegrityResult<()> {
+fn validate_alloc_map(alloc_map: &AllocMap) -> DataIntegrityResult<()> {
     if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
         return Err(invalid_payload(
             "allocation map must include allocated super block",
@@ -335,7 +335,7 @@ fn validate_secondary_index_roots(
     secondary_index_roots: &[BlockID],
     next_index_no: u16,
     active_index_nos: impl IntoIterator<Item = usize>,
-) -> crate::error::DataIntegrityResult<()> {
+) -> DataIntegrityResult<()> {
     let index_slot_count = next_index_no as usize;
     if secondary_index_roots.len() != index_slot_count {
         return Err(invalid_payload(format!(
@@ -439,7 +439,7 @@ mod tests {
         );
         let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11)];
-        let ser_view = active_root.meta_block_ser_view().unwrap();
+        let ser_view = active_root.meta_block_ser_view();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -481,7 +481,7 @@ mod tests {
             .expect("valid table metadata"),
         );
         let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
-        let ser_view = active_root.meta_block_ser_view().unwrap();
+        let ser_view = active_root.meta_block_ser_view();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -509,7 +509,7 @@ mod tests {
         );
         let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11), BlockID::new(12)];
-        let ser_view = active_root.meta_block_ser_view().unwrap();
+        let ser_view = active_root.meta_block_ser_view();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -528,7 +528,7 @@ mod tests {
         let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots =
             vec![BlockID::new(11), SUPER_BLOCK_ID, BlockID::new(12)];
-        let ser_view = active_root.meta_block_ser_view().unwrap();
+        let ser_view = active_root.meta_block_ser_view();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -551,26 +551,6 @@ mod tests {
         let data = serialize_meta_block_with_secondary_roots(&active_root, &secondary_index_roots);
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_meta_block_ser_view_rejects_inactive_secondary_root() {
-        let metadata = sparse_secondary_root_metadata();
-        let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
-        let secondary_index_roots = vec![BlockID::new(11), BlockID::new(13), BlockID::new(12)];
-
-        let err = MetaBlockSerView::new(
-            active_root.metadata.ser_view(),
-            active_root.column_block_index_root,
-            &secondary_index_roots,
-            &active_root.alloc_map,
-            active_root.pivot_row_id,
-            active_root.heap_redo_start_ts,
-            active_root.deletion_cutoff_ts,
-        )
-        .err()
-        .unwrap();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
@@ -608,34 +588,6 @@ mod tests {
         assert_eq!(idx, ser_len);
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-    }
-
-    #[test]
-    fn test_meta_block_ser_view_rejects_secondary_root_count_mismatch() {
-        let metadata = Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U32,
-                    ColumnAttributes::empty(),
-                )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            )
-            .expect("valid table metadata"),
-        );
-        let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
-        let err = MetaBlockSerView::new(
-            active_root.metadata.ser_view(),
-            active_root.column_block_index_root,
-            &[],
-            &active_root.alloc_map,
-            active_root.pivot_row_id,
-            active_root.heap_redo_start_ts,
-            active_root.deletion_cutoff_ts,
-        )
-        .err()
-        .unwrap();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 

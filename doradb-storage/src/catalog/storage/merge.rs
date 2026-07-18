@@ -1,9 +1,10 @@
-use super::{RowRecord, invalid_catalog_payload, validate_catalog_row};
+use super::{RowRecord, validate_catalog_row};
 use crate::catalog::table::TableMetadata;
-use crate::error::Result;
+use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::index::{BTreeKey, BTreeKeyEncoder};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::value::{Val, ValType};
+use error_stack::Report;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::slice;
 
@@ -41,7 +42,10 @@ pub(super) struct CatalogFoldedRows {
 }
 
 impl CatalogFoldedRows {
-    pub(super) fn from_base_rows(metadata: &TableMetadata, rows: Vec<RowRecord>) -> Result<Self> {
+    pub(super) fn from_base_rows(
+        metadata: &TableMetadata,
+        rows: Vec<RowRecord>,
+    ) -> DataIntegrityResult<Self> {
         let key_builder = CatalogMergeKeyBuilder::new(metadata)?;
         let mut folded = Self {
             key_builder,
@@ -55,10 +59,12 @@ impl CatalogFoldedRows {
                     entry.insert(FoldedCatalogEntry::Base(row.vals));
                 }
                 Entry::Occupied(entry) => {
-                    return Err(invalid_catalog_payload(format!(
-                        "catalog checkpoint duplicate base primary key: key={:?}",
-                        entry.key()
-                    )));
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "catalog checkpoint duplicate base primary key: key={:?}",
+                            entry.key()
+                        )),
+                    );
                 }
             }
         }
@@ -82,7 +88,11 @@ impl CatalogFoldedRows {
             .any(|entry| !matches!(entry, FoldedCatalogEntry::Base(_)))
     }
 
-    pub(super) fn fold_insert(&mut self, metadata: &TableMetadata, vals: Vec<Val>) -> Result<()> {
+    pub(super) fn fold_insert(
+        &mut self,
+        metadata: &TableMetadata,
+        vals: Vec<Val>,
+    ) -> DataIntegrityResult<()> {
         validate_catalog_row(metadata, &vals, "catalog checkpoint insert row")?;
         let key = self.key_builder.key_from_row(&vals)?;
         match self.rows.entry(key) {
@@ -94,22 +104,28 @@ impl CatalogFoldedRows {
                     *entry.get_mut() = FoldedCatalogEntry::Update(vals);
                 }
                 FoldedCatalogEntry::Base(_) => {
-                    return Err(invalid_catalog_payload(format!(
-                        "catalog checkpoint insert primary key already exists: key={:?}",
-                        entry.key()
-                    )));
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "catalog checkpoint insert primary key already exists: key={:?}",
+                            entry.key()
+                        )),
+                    );
                 }
                 FoldedCatalogEntry::Insert(_) => {
-                    return Err(invalid_catalog_payload(format!(
-                        "invalid catalog checkpoint fold: insert + insert, key={:?}",
-                        entry.key()
-                    )));
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "invalid catalog checkpoint fold: insert + insert, key={:?}",
+                            entry.key()
+                        )),
+                    );
                 }
                 FoldedCatalogEntry::Update(_) => {
-                    return Err(invalid_catalog_payload(format!(
-                        "invalid catalog checkpoint fold: update + insert, key={:?}",
-                        entry.key()
-                    )));
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "invalid catalog checkpoint fold: update + insert, key={:?}",
+                            entry.key()
+                        )),
+                    );
                 }
             },
         }
@@ -121,10 +137,10 @@ impl CatalogFoldedRows {
         metadata: &TableMetadata,
         key: &SelectKey,
         update: &[UpdateCol],
-    ) -> Result<()> {
+    ) -> DataIntegrityResult<()> {
         let merge_key = self.key_builder.key_from_select_key(key, "update")?;
         let Some(entry) = self.rows.get_mut(&merge_key) else {
-            return Err(invalid_catalog_payload(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "catalog checkpoint update-by-primary-key target missing: index_no={}, key_vals={:?}",
                 key.index_no, key.vals
             )));
@@ -151,19 +167,21 @@ impl CatalogFoldedRows {
                 )?;
             }
             FoldedCatalogEntry::Delete => {
-                return Err(invalid_catalog_payload(format!(
-                    "invalid catalog checkpoint fold: delete + update, key={merge_key:?}"
-                )));
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "invalid catalog checkpoint fold: delete + update, key={merge_key:?}"
+                    )),
+                );
             }
         }
         Ok(())
     }
 
-    pub(super) fn fold_delete(&mut self, key: &SelectKey) -> Result<()> {
+    pub(super) fn fold_delete(&mut self, key: &SelectKey) -> DataIntegrityResult<()> {
         let merge_key = self.key_builder.key_from_select_key(key, "delete")?;
         match self.rows.entry(merge_key) {
             Entry::Vacant(_) => {
-                return Err(invalid_catalog_payload(format!(
+                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "catalog checkpoint delete-by-primary-key target missing: index_no={}, key_vals={:?}",
                     key.index_no, key.vals
                 )));
@@ -176,17 +194,19 @@ impl CatalogFoldedRows {
                     entry.remove();
                 }
                 FoldedCatalogEntry::Delete => {
-                    return Err(invalid_catalog_payload(format!(
-                        "invalid catalog checkpoint fold: delete + delete, key={:?}",
-                        entry.key()
-                    )));
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "invalid catalog checkpoint fold: delete + delete, key={:?}",
+                            entry.key()
+                        )),
+                    );
                 }
             },
         }
         Ok(())
     }
 
-    pub(super) fn materialize_output_rows(&self) -> Result<Vec<Vec<Val>>> {
+    pub(super) fn materialize_output_rows(&self) -> Vec<Vec<Val>> {
         let mut rows = Vec::new();
         for entry in self.rows.values() {
             match entry {
@@ -196,7 +216,7 @@ impl CatalogFoldedRows {
                 FoldedCatalogEntry::Delete => {}
             }
         }
-        Ok(rows)
+        rows
     }
 }
 
@@ -209,11 +229,10 @@ pub(super) struct CatalogMergeKeyBuilder {
 
 impl CatalogMergeKeyBuilder {
     #[inline]
-    pub(super) fn new(metadata: &TableMetadata) -> Result<Self> {
+    pub(super) fn new(metadata: &TableMetadata) -> DataIntegrityResult<Self> {
         let Some(primary_key) = metadata.primary_key() else {
-            return Err(invalid_catalog_payload(
-                "catalog checkpoint primary key not found",
-            ));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("catalog checkpoint primary key not found"));
         };
         let index_spec = primary_key.spec();
         let mut col_idxs = Vec::with_capacity(index_spec.cols.len());
@@ -221,7 +240,7 @@ impl CatalogMergeKeyBuilder {
         for index_key in &index_spec.cols {
             let col_idx = usize::from(index_key.col_no);
             if col_idx >= metadata.col.col_count() {
-                return Err(invalid_catalog_payload(format!(
+                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "catalog checkpoint primary key column out of range: column_no={}, column_count={}",
                     index_key.col_no,
                     metadata.col.col_count()
@@ -231,9 +250,8 @@ impl CatalogMergeKeyBuilder {
             val_types.push(metadata.col.col_type(col_idx));
         }
         if val_types.is_empty() {
-            return Err(invalid_catalog_payload(
-                "catalog checkpoint primary key has no columns",
-            ));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("catalog checkpoint primary key has no columns"));
         }
         let encoder = BTreeKeyEncoder::new(val_types.clone());
         Ok(Self {
@@ -245,7 +263,7 @@ impl CatalogMergeKeyBuilder {
     }
 
     #[inline]
-    pub(super) fn key_from_row(&self, row: &[Val]) -> Result<BTreeKey> {
+    pub(super) fn key_from_row(&self, row: &[Val]) -> DataIntegrityResult<BTreeKey> {
         self.validate_key_candidate_row(row)?;
         let key = match self.col_idxs.as_ref() {
             [idx0] => self.encoder.encode(slice::from_ref(&row[*idx0])),
@@ -262,33 +280,43 @@ impl CatalogMergeKeyBuilder {
     }
 
     #[inline]
-    fn key_from_select_key(&self, key: &SelectKey, operation: &'static str) -> Result<BTreeKey> {
+    fn key_from_select_key(
+        &self,
+        key: &SelectKey,
+        operation: &'static str,
+    ) -> DataIntegrityResult<BTreeKey> {
         self.validate_select_key(key, operation)?;
         self.key_from_key_vals(&key.vals)
     }
 
     #[inline]
-    fn key_from_key_vals(&self, vals: &[Val]) -> Result<BTreeKey> {
+    fn key_from_key_vals(&self, vals: &[Val]) -> DataIntegrityResult<BTreeKey> {
         if self.col_idxs.len() != vals.len() {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint primary key value count {} does not match column count {}",
-                vals.len(),
-                self.col_idxs.len()
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "catalog checkpoint primary key value count {} does not match column count {}",
+                    vals.len(),
+                    self.col_idxs.len()
+                )),
+            );
         }
         Ok(self.encoder.encode(vals))
     }
 
     #[inline]
-    fn validate_select_key(&self, key: &SelectKey, operation: &'static str) -> Result<()> {
+    fn validate_select_key(
+        &self,
+        key: &SelectKey,
+        operation: &'static str,
+    ) -> DataIntegrityResult<()> {
         if key.index_no != self.index_no {
-            return Err(invalid_catalog_payload(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "catalog checkpoint {operation} key is not primary key: index_no={}, primary_key_index_no={}",
                 key.index_no, self.index_no
             )));
         }
         if key.vals.len() != self.col_idxs.len() {
-            return Err(invalid_catalog_payload(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "catalog checkpoint {operation} key value count {} does not match primary key column count {}",
                 key.vals.len(),
                 self.col_idxs.len()
@@ -300,19 +328,21 @@ impl CatalogMergeKeyBuilder {
             .zip(&key.vals)
             .all(|(ty, val)| catalog_val_type_match(*ty, val))
         {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint {operation} key type mismatch: index_no={}",
-                key.index_no
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "catalog checkpoint {operation} key type mismatch: index_no={}",
+                    key.index_no
+                )),
+            );
         }
         Ok(())
     }
 
     #[inline]
-    fn validate_key_candidate_row(&self, row: &[Val]) -> Result<()> {
+    fn validate_key_candidate_row(&self, row: &[Val]) -> DataIntegrityResult<()> {
         for col_idx in &self.col_idxs {
             if *col_idx >= row.len() {
-                return Err(invalid_catalog_payload(format!(
+                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "catalog checkpoint key candidate row missing index column: column_no={}, row_value_count={}",
                     col_idx,
                     row.len()
@@ -353,9 +383,9 @@ fn apply_catalog_update_by_primary_key(
     key: &SelectKey,
     row: &mut [Val],
     update: &[UpdateCol],
-) -> Result<()> {
+) -> DataIntegrityResult<()> {
     if row.len() != metadata.col.col_count() {
-        return Err(invalid_catalog_payload(format!(
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
             "catalog checkpoint update candidate row value count {} does not match column count {}",
             row.len(),
             metadata.col.col_count()
@@ -364,35 +394,43 @@ fn apply_catalog_update_by_primary_key(
     let mut last_idx = None;
     for update_col in update {
         if update_col.idx >= metadata.col.col_count() {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update column out of range: column_no={}, column_count={}",
-                update_col.idx,
-                metadata.col.col_count()
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "catalog checkpoint update column out of range: column_no={}, column_count={}",
+                    update_col.idx,
+                    metadata.col.col_count()
+                )),
+            );
         }
         if last_idx.is_some_and(|idx| update_col.idx <= idx) {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update columns not strictly ordered: column_no={}",
-                update_col.idx
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "catalog checkpoint update columns not strictly ordered: column_no={}",
+                    update_col.idx
+                )),
+            );
         }
         if !metadata.col.col_type_match(update_col.idx, &update_col.val) {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update column type mismatch: column_no={}",
-                update_col.idx
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "catalog checkpoint update column type mismatch: column_no={}",
+                    update_col.idx
+                )),
+            );
         }
         if key_builder.contains_key_column(update_col.idx) {
-            return Err(invalid_catalog_payload(format!(
-                "catalog checkpoint update cannot change primary key column: column_no={}",
-                update_col.idx
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "catalog checkpoint update cannot change primary key column: column_no={}",
+                    update_col.idx
+                )),
+            );
         }
         row[update_col.idx] = update_col.val.clone();
         last_idx = Some(update_col.idx);
     }
     if !key_builder.row_matches_key(row, &key.vals) {
-        return Err(invalid_catalog_payload(format!(
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
             "catalog checkpoint update-by-primary-key changed stable key: index_no={}, key_vals={:?}",
             key.index_no, key.vals
         )));
@@ -454,7 +492,7 @@ mod tests {
             .fold_update(metadata, &new_key, &catalog_table_update(7))
             .unwrap();
         assert_eq!(
-            folded.materialize_output_rows().unwrap(),
+            folded.materialize_output_rows(),
             vec![catalog_table_vals(new_table_id, 7)]
         );
 
@@ -463,7 +501,7 @@ mod tests {
             .fold_insert(metadata, catalog_table_vals(new_table_id, 0))
             .unwrap();
         folded.fold_delete(&new_key).unwrap();
-        assert!(folded.materialize_output_rows().unwrap().is_empty());
+        assert!(folded.materialize_output_rows().is_empty());
         assert!(!folded.should_rewrite());
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
@@ -474,7 +512,7 @@ mod tests {
             .fold_update(metadata, &base_key, &catalog_table_update(4))
             .unwrap();
         assert_eq!(
-            folded.materialize_output_rows().unwrap(),
+            folded.materialize_output_rows(),
             vec![catalog_table_vals(base_table_id, 4)]
         );
 
@@ -483,7 +521,7 @@ mod tests {
             .fold_update(metadata, &base_key, &catalog_table_update(5))
             .unwrap();
         folded.fold_delete(&base_key).unwrap();
-        assert!(folded.materialize_output_rows().unwrap().is_empty());
+        assert!(folded.materialize_output_rows().is_empty());
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
         folded.fold_delete(&base_key).unwrap();
@@ -491,7 +529,7 @@ mod tests {
             .fold_insert(metadata, catalog_table_vals(base_table_id, 9))
             .unwrap();
         assert_eq!(
-            folded.materialize_output_rows().unwrap(),
+            folded.materialize_output_rows(),
             vec![catalog_table_vals(base_table_id, 9)]
         );
     }
@@ -509,7 +547,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            folded.materialize_output_rows().unwrap(),
+            folded.materialize_output_rows(),
             vec![
                 catalog_table_vals(table1_id, 1),
                 catalog_table_vals(table2_id, 2),
@@ -613,10 +651,7 @@ mod tests {
         let key_builder = CatalogMergeKeyBuilder::new(metadata).unwrap();
         let err = key_builder.key_from_row(&[]).unwrap_err();
 
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
         let report = format!("{err:?}");
         assert!(
             report.contains("catalog checkpoint key candidate row missing index column"),

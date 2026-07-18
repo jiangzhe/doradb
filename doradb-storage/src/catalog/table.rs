@@ -1729,7 +1729,7 @@ mod tests {
     };
     use crate::error::{
         CompletionErrorKind, ConfigError, Error, ErrorKind, FatalError, InternalError,
-        OperationError,
+        OperationError, RuntimeError,
     };
     use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
@@ -2277,12 +2277,15 @@ mod tests {
 
         let inactive = metadata.try_without_index(1).unwrap_err();
         assert_eq!(
-            inactive.operation_error(),
+            inactive.report().downcast_ref::<OperationError>().copied(),
             Some(OperationError::IndexNotFound)
         );
         let out_of_range = metadata.try_without_index(2).unwrap_err();
         assert_eq!(
-            out_of_range.operation_error(),
+            out_of_range
+                .report()
+                .downcast_ref::<OperationError>()
+                .copied(),
             Some(OperationError::IndexNotFound)
         );
     }
@@ -2568,7 +2571,18 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(err.is_kind(ErrorKind::Io), "{err:?}");
+            assert!(err.is_kind(ErrorKind::Runtime), "{err:?}");
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::FileRootAccess)
+            );
+            assert!(matches!(
+                err.report().downcast_ref::<CompletionErrorKind>(),
+                Some(CompletionErrorKind::Io(_))
+            ));
+            let report = format!("{err:?}");
+            assert!(report.contains("file_kind=table_file"), "{report}");
+            assert!(report.contains("phase=write_meta_block"), "{report}");
             assert!(hook.call_count() > 0);
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
@@ -2673,13 +2687,19 @@ mod tests {
 
             for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
                 let err = session.lock_table(table_id, mode).await.unwrap_err();
-                assert_eq!(err.operation_error(), Some(OperationError::InvalidLockMode));
+                assert_eq!(
+                    err.report().downcast_ref::<OperationError>().copied(),
+                    Some(OperationError::InvalidLockMode)
+                );
             }
 
             let mut trx = session.begin_trx().unwrap();
             for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
                 let err = trx.lock_table(table_id, mode).await.unwrap_err();
-                assert_eq!(err.operation_error(), Some(OperationError::InvalidLockMode));
+                assert_eq!(
+                    err.report().downcast_ref::<OperationError>().copied(),
+                    Some(OperationError::InvalidLockMode)
+                );
             }
             trx.rollback().await.unwrap();
         });
@@ -2817,7 +2837,7 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(
-                err.operation_error(),
+                err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockOwnerGroupConflict)
             );
             assert!(!has_lock_entry(
@@ -2856,7 +2876,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.operation_error(),
+                err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockOwnerGroupConflict)
             );
             assert!(!has_lock_resource(
@@ -2951,7 +2971,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.operation_error(),
+                err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::LockOwnerGroupConflict)
             );
             assert!(!has_lock_resource(
@@ -3099,7 +3119,10 @@ mod tests {
             ));
 
             let err = session.unlock_table(table_id).unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
 
             same_session_trx.commit().await.unwrap();
             assert!(has_lock_entry(
@@ -3142,7 +3165,10 @@ mod tests {
                 .await;
 
             let err = session.drop_table(table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             assert_eq!(
                 table_for_internal_assertion(&engine, table_id)
                     .lifecycle
@@ -3164,7 +3190,10 @@ mod tests {
             let trx = session.begin_trx().unwrap();
 
             let err = session.drop_table(table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
 
             trx.rollback().await.unwrap();
         });
@@ -3179,11 +3208,17 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let err = session.drop_table(TABLE_ID_TABLES).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
 
             let missing_user_table_id = table_id + 1000;
             let err = session.drop_table(missing_user_table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
         });
     }
 
@@ -3218,7 +3253,10 @@ mod tests {
             let mut drop_session = engine.new_session().unwrap();
             let err = drop_session.drop_table(table_id).await.unwrap_err();
 
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert_eq!(
                 table_for_internal_assertion(&engine, table_id)
                     .lifecycle
@@ -3244,7 +3282,7 @@ mod tests {
                 session.lock_table(table_id, mode).await.unwrap();
                 let err = session.drop_table(table_id).await.unwrap_err();
                 assert_eq!(
-                    err.operation_error(),
+                    err.report().downcast_ref::<OperationError>().copied(),
                     Some(OperationError::LockOwnerGroupConflict)
                 );
                 let rendered = err.to_string();
@@ -3389,7 +3427,10 @@ mod tests {
                 .lock_table(table_id, LockMode::Shared)
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             assert!(!has_lock_resource(
                 &engine,
                 lock_owner,
@@ -3476,7 +3517,10 @@ mod tests {
                 .lock_table(table_id, LockMode::Exclusive)
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableDropping)
+            );
             assert!(!has_lock_resource(
                 &engine,
                 lock_owner,
@@ -3516,7 +3560,10 @@ mod tests {
                 .lock_table(table_id, LockMode::Shared)
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert!(!has_lock_resource(
                 &engine,
                 session_owner,
@@ -3535,7 +3582,10 @@ mod tests {
                 .lock_table(table_id, LockMode::Exclusive)
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert!(!has_lock_resource(
                 &engine,
                 trx_owner,
@@ -3650,13 +3700,19 @@ mod tests {
             assert!(Path::new(&table_file_path).exists());
 
             let err = session.drop_table(table_id).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
 
             let mut stale_read = session.begin_trx().unwrap();
             let err = trx_select_row_mvcc_by_id(&mut stale_read, table_id, &single_key(1), &[0, 1])
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert_eq!(stale_read.commit().await.unwrap(), TrxID::new(0));
 
             let mut stale_write = session.begin_trx().unwrap();
@@ -3667,7 +3723,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             assert_eq!(stale_write.commit().await.unwrap(), TrxID::new(0));
 
             let (later_spec, later_indexes) = drop_table_test_spec();
@@ -3723,7 +3782,10 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             trx.rollback().await.unwrap();
         });
     }
@@ -3897,7 +3959,7 @@ mod tests {
                 "{report}"
             );
             assert_eq!(
-                err.completion_error(),
+                err.report().downcast_ref::<CompletionErrorKind>().copied(),
                 Some(CompletionErrorKind::Fatal(FatalError::RedoWrite)),
                 "{report}"
             );

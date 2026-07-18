@@ -1549,7 +1549,10 @@ pub(crate) mod tests {
     };
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{Error, ErrorKind, FatalError, LifecycleError, OperationError};
+    use crate::error::{
+        DataIntegrityError, Error, ErrorKind, FatalError, LifecycleError, OperationError,
+        RuntimeError,
+    };
     use crate::io::install_storage_backend_test_hook;
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
@@ -1577,17 +1580,23 @@ pub(crate) mod tests {
     #[inline]
     fn assert_runtime_unavailable_after_shutdown(err: Error) {
         assert_eq!(err.kind(), ErrorKind::Lifecycle);
-        assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::Shutdown)
+        );
     }
 
     #[inline]
     fn assert_runtime_unavailable_after_fatal(err: Error, fatal: FatalError) {
         assert_eq!(err.kind(), ErrorKind::Lifecycle);
         assert_eq!(
-            err.lifecycle_error(),
+            err.report().downcast_ref::<LifecycleError>().copied(),
             Some(LifecycleError::RuntimeUnavailable)
         );
-        assert_eq!(err.downcast_ref::<FatalError>().copied(), Some(fatal));
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(fatal)
+        );
     }
 
     #[inline]
@@ -2098,7 +2107,10 @@ pub(crate) mod tests {
             let trx = session.begin_trx().unwrap();
 
             let err = session.checkpoint_catalog().await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
 
             trx.rollback().await.unwrap();
         });
@@ -2132,7 +2144,10 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                horizon_err.operation_error(),
+                horizon_err
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
                 Some(OperationError::NotSupported)
             );
             let retry_err = active_session
@@ -2144,7 +2159,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                retry_err.operation_error(),
+                retry_err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::NotSupported)
             );
             trx.rollback().await.unwrap();
@@ -2210,7 +2225,10 @@ pub(crate) mod tests {
             let trx = session.begin_trx().unwrap();
 
             let err = session.truncate_redo_log().await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
 
             trx.rollback().await.unwrap();
         });
@@ -2232,7 +2250,10 @@ pub(crate) mod tests {
                 .checkpoint_catalog_and_truncate_redo_log()
                 .await
                 .unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
 
             trx.rollback().await.unwrap();
         });
@@ -2504,7 +2525,7 @@ pub(crate) mod tests {
 
             assert_eq!(err.kind(), ErrorKind::Fatal);
             assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
+                err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::CheckpointWrite)
             );
             assert!(publish_hook.call_count() > 0);
@@ -2578,7 +2599,7 @@ pub(crate) mod tests {
 
             assert_eq!(err.kind(), ErrorKind::Fatal);
             assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
+                err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::CheckpointWrite)
             );
             assert!(publish_hook.call_count() > 0);
@@ -2697,7 +2718,7 @@ pub(crate) mod tests {
             let err = maintenance_fut.await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Fatal);
             assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
+                err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RedoWrite)
             );
             assert!(
@@ -2878,7 +2899,15 @@ pub(crate) mod tests {
                 Ok(_) => panic!("engine startup should reject missing first retained redo file"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::DataIntegrity, "{err:?}");
+            assert_eq!(err.kind(), ErrorKind::Runtime, "{err:?}");
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::RedoLogDiscovery)
+            );
+            assert_eq!(
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::RedoLogSequenceGap)
+            );
         });
     }
 
@@ -2931,7 +2960,7 @@ pub(crate) mod tests {
 
             assert_eq!(err.kind(), ErrorKind::Fatal);
             assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
+                err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::CheckpointWrite)
             );
             assert!(publish_hook.call_count() > 0);
@@ -3046,7 +3075,7 @@ pub(crate) mod tests {
             let err = truncate_fut.await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Fatal);
             assert_eq!(
-                err.downcast_ref::<FatalError>().copied(),
+                err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RedoWrite)
             );
             assert!(
@@ -3205,7 +3234,7 @@ pub(crate) mod tests {
             ] {
                 assert_eq!(err.kind(), ErrorKind::Lifecycle);
                 assert_eq!(
-                    err.lifecycle_error(),
+                    err.report().downcast_ref::<LifecycleError>().copied(),
                     Some(LifecycleError::SessionUnavailable)
                 );
             }

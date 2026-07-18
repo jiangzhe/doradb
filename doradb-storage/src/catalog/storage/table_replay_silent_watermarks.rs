@@ -6,7 +6,7 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::{DataIntegrityError, Error, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, Result};
 use crate::id::{TableID, TrxID};
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
@@ -155,7 +155,7 @@ pub(super) fn catalog_definition_of_table_replay_silent_watermarks() -> &'static
 #[inline]
 pub(super) fn table_replay_silent_watermark_object_from_vals(
     vals: &[Val],
-) -> Result<SilentWatermarkObject> {
+) -> DataIntegrityResult<SilentWatermarkObject> {
     let table_id = val_u64(
         vals,
         COL_NO_TABLE_REPLAY_SILENT_WATERMARKS_TABLE_ID,
@@ -210,13 +210,11 @@ fn row_to_table_replay_silent_watermark_object(
 }
 
 #[inline]
-fn val_u64(vals: &[Val], idx: usize, name: &'static str) -> Result<u64> {
+fn val_u64(vals: &[Val], idx: usize, name: &'static str) -> DataIntegrityResult<u64> {
     vals.get(idx).and_then(Val::as_u64).ok_or_else(|| {
-        Error::from(
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "invalid table replay silent watermark {name} column at index {idx}"
-            )),
-        )
+        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "invalid table replay silent watermark {name} column at index {idx}"
+        ))
     })
 }
 

@@ -1671,7 +1671,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            err.data_integrity_error(),
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
         let report = format!("{err:?}");
@@ -1864,7 +1864,10 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::DuplicateKey)
+            );
             assert_root_metadata_unchanged(&root_before, &table);
             assert_eq!(table.layout_snapshot().generation(), old_generation);
             assert_eq!(table.metadata().idx.next_index_no(), 1);
@@ -1960,7 +1963,10 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
             trx.rollback().await.unwrap();
         });
     }
@@ -2149,13 +2155,19 @@ mod tests {
 
             let trx = session.begin_trx().unwrap();
             let err = session.drop_index(table_id, 0).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::NotSupported)
+            );
             trx.rollback().await.unwrap();
 
             let root_before = table.file().active_root_unchecked().clone();
             let old_generation = table.layout_snapshot().generation();
             let err = session.drop_index(table_id, 1).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::IndexNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::IndexNotFound)
+            );
             assert_root_metadata_unchanged(&root_before, &table);
             assert_eq!(table.layout_snapshot().generation(), old_generation);
 
@@ -2163,7 +2175,10 @@ mod tests {
             let root_before = table.file().active_root_unchecked().clone();
             let old_generation = table.layout_snapshot().generation();
             let err = session.drop_index(table_id, 0).await.unwrap_err();
-            assert_eq!(err.operation_error(), Some(OperationError::IndexNotFound));
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::IndexNotFound)
+            );
             assert_root_metadata_unchanged(&root_before, &table);
             assert_eq!(table.layout_snapshot().generation(), old_generation);
         });

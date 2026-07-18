@@ -571,7 +571,10 @@ mod tests {
     }
 
     fn assert_lwc_data_integrity(err: Error, block_id: BlockID, expected: DataIntegrityError) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected)
+        );
         let report = format!("{err:?}");
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains("lwc_block"), "{report}");

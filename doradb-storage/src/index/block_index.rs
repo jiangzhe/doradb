@@ -319,7 +319,7 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
-    use crate::error::{IoError, Validation};
+    use crate::error::{IoError, RuntimeError, RuntimeResult, Validation};
     use crate::file::test_block_id;
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -385,7 +385,7 @@ mod tests {
         fn allocate_page<T: BufferPage>(
             &self,
             guard: &PoolGuard,
-        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page(guard)
         }
 
@@ -394,7 +394,7 @@ mod tests {
             &self,
             guard: &PoolGuard,
             page_id: PageID,
-        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page_at(guard, page_id)
         }
 
@@ -404,7 +404,7 @@ mod tests {
             guard: &PoolGuard,
             page_id: PageID,
             mode: LatchFallbackMode,
-        ) -> Result<FacadePageGuard<T>> {
+        ) -> RuntimeResult<FacadePageGuard<T>> {
             // Only stall the specific spin-mode read we care about; everything
             // else should behave exactly like the wrapped fixed buffer pool.
             if mode == LatchFallbackMode::Spin
@@ -422,7 +422,7 @@ mod tests {
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<Option<FacadePageGuard<T>>>> + Send {
             self.inner.get_page_versioned(guard, id, mode)
         }
 
@@ -438,7 +438,7 @@ mod tests {
             p_guard: &FacadePageGuard<T>,
             page_id: PageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send {
             self.inner.get_child_page(guard, p_guard, page_id, mode)
         }
     }
@@ -478,7 +478,7 @@ mod tests {
         fn allocate_page<T: BufferPage>(
             &self,
             guard: &PoolGuard,
-        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page(guard)
         }
 
@@ -487,7 +487,7 @@ mod tests {
             &self,
             guard: &PoolGuard,
             page_id: PageID,
-        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page_at(guard, page_id)
         }
 
@@ -497,9 +497,15 @@ mod tests {
             guard: &PoolGuard,
             page_id: PageID,
             mode: LatchFallbackMode,
-        ) -> Result<FacadePageGuard<T>> {
+        ) -> RuntimeResult<FacadePageGuard<T>> {
             if page_id == self.fail_page_id.load(Ordering::Acquire) {
-                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
+                let source = StdIoError::from_raw_os_error(libc::EIO);
+                return Err(Report::new(IoError::from(source.kind()))
+                    .attach(format!("injected block-index page access failure: {source}"))
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach(format!(
+                        "buffer_pool_type=fixed, buffer_pool_role=index, operation=get_page, page_id={page_id}"
+                    )));
             }
             self.inner.get_page(guard, page_id, mode).await
         }
@@ -510,9 +516,16 @@ mod tests {
             guard: &PoolGuard,
             id: VersionedPageID,
             mode: LatchFallbackMode,
-        ) -> Result<Option<FacadePageGuard<T>>> {
+        ) -> RuntimeResult<Option<FacadePageGuard<T>>> {
             if id.page_id == self.fail_page_id.load(Ordering::Acquire) {
-                return Err(StdIoError::from_raw_os_error(libc::EIO).into());
+                let source = StdIoError::from_raw_os_error(libc::EIO);
+                return Err(Report::new(IoError::from(source.kind()))
+                    .attach(format!("injected versioned block-index page access failure: {source}"))
+                    .change_context(RuntimeError::BufferPageAccess)
+                    .attach(format!(
+                        "buffer_pool_type=fixed, buffer_pool_role=index, operation=get_page_versioned, page_id={}, generation={}",
+                        id.page_id, id.generation
+                    )));
             }
             self.inner.get_page_versioned(guard, id, mode).await
         }
@@ -529,7 +542,7 @@ mod tests {
             p_guard: &FacadePageGuard<T>,
             page_id: PageID,
             mode: LatchFallbackMode,
-        ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send {
+        ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send {
             self.inner.get_child_page(guard, p_guard, page_id, mode)
         }
     }

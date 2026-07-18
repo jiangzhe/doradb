@@ -3,6 +3,7 @@ use super::{
 };
 use crate::error::FatalError;
 use crate::io::Completion;
+use error_stack::Report;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,6 +78,7 @@ impl LogPrefixTracker {
                 completion: Some(completion),
                 ready: false,
                 failure: None,
+                failure_report: None,
             },
         });
     }
@@ -352,6 +354,8 @@ pub(super) enum LogPrefixKind {
         ready: bool,
         /// Fatal write failure reported when the barrier is completed.
         failure: Option<FatalError>,
+        /// Source-preserving fatal report retained for the header completion waiter.
+        failure_report: Option<Report<FatalError>>,
     },
     /// Commit group waiting for its redo write and ordered publication.
     Group { group: SyncGroup },

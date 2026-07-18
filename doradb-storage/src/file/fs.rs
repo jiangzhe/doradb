@@ -11,7 +11,7 @@ use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::engine_poison::EnginePoisoner;
 use crate::error::{
-    CompletionErrorKind, Error, FatalError, IoError, Result, RuntimeError, RuntimeResult,
+    CompletionErrorKind, Error, FatalError, IoError, IoResult, Result, RuntimeError, RuntimeResult,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
@@ -498,9 +498,10 @@ impl StorageStateMachine {
     /// Fail one deferred table-read request that never reached backend submission.
     #[inline]
     fn fail_table_read_request(&mut self, req: ReadSubmission, err: &Report<IoError>) {
-        req.fail(CompletionErrorKind::report_backend_io(
-            err,
-            "submit readonly table read",
+        let report = IoError::report_backend(err, "submit readonly table read");
+        req.fail(CompletionErrorKind::from_io(
+            report,
+            "readonly table read completion transport",
         ));
     }
 
@@ -1316,7 +1317,7 @@ where
         engine_poisoner: QuiescentGuard<EnginePoisoner>,
         state_machine: StorageStateMachine,
     ) -> StorageIOWorker<B> {
-        let io_depth = self.backend.max_events();
+        let io_depth = self.backend.io_depth();
         let submit_batch = self.backend.new_submit_batch();
         StorageIOWorker {
             backend: self.backend,
@@ -1381,7 +1382,7 @@ where
 
     #[inline]
     fn io_depth(&self) -> usize {
-        self.backend.max_events()
+        self.backend.io_depth()
     }
 
     #[inline]
@@ -1877,7 +1878,7 @@ impl FileSystem {
         table_id: TableID,
         metadata: Arc<TableMetadata>,
         trunc: bool,
-    ) -> Result<MutableTableFile> {
+    ) -> IoResult<MutableTableFile> {
         let file_path = self.user_table_file_path(table_id);
         let table_file = TableFile::create(&file_path, TABLE_FILE_INITIAL_SIZE, table_id, trunc)?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
@@ -2041,7 +2042,7 @@ impl FileSystem {
                 if let Err(err) = mutable.commit().await {
                     drop(mtb);
                     let _ = fs::remove_file(&file_path);
-                    return Err(err);
+                    return Err(err.into());
                 }
                 let _ = disk_pool;
                 Ok(mtb)
@@ -2090,7 +2091,7 @@ pub(crate) fn build_file_system(
     data_dir: PathBuf,
     catalog_file_name: String,
 ) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
-    let backend = StorageBackend::new(io_depth)?;
+    let backend = StorageBackend::setup(io_depth)?;
     let stats = backend.stats_handle();
     let (builder, table_reads, pool_reads, background_writes) =
         StorageIOWorkerBuilder::new(backend);
@@ -2150,15 +2151,15 @@ pub(crate) mod tests {
     use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{ConfigError, ErrorKind};
+    use crate::error::{ConfigError, ErrorKind, IoResult};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::table_file::TableFile;
     use crate::file::{BlockKey, UNTRACKED_FILE_ID};
     use crate::id::BlockID;
     use crate::io::{
-        BackendResult, Completion, DirectBuf, IOBackendErrorPhase, IOBackendFailure,
-        IOBackendOperationKind, IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp,
-        StorageBackendTestHook, SubmittedIoCleanup, install_storage_backend_test_hook,
+        Completion, DirectBuf, IOBackendErrorPhase, IOBackendFailure, IOBackendOperationKind,
+        IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+        SubmittedIoCleanup, install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
     use crate::table::test_user_table_id;
@@ -2578,16 +2579,16 @@ pub(crate) mod tests {
     }
 
     struct SubmittedWaitFailureBackend {
-        max_events: usize,
+        io_depth: usize,
         inflight: VecDeque<BackendToken>,
         cleanup_submitted: Arc<AtomicUsize>,
     }
 
     impl SubmittedWaitFailureBackend {
         #[inline]
-        fn new(max_events: usize, cleanup_submitted: Arc<AtomicUsize>) -> Self {
+        fn new(io_depth: usize, cleanup_submitted: Arc<AtomicUsize>) -> Self {
             Self {
-                max_events,
+                io_depth,
                 inflight: VecDeque::new(),
                 cleanup_submitted,
             }
@@ -2600,13 +2601,18 @@ pub(crate) mod tests {
         type Events = ();
 
         #[inline]
-        fn max_events(&self) -> usize {
-            self.max_events
+        fn setup(io_depth: usize) -> IoResult<Self> {
+            Ok(Self::new(io_depth, Arc::new(AtomicUsize::new(0))))
+        }
+
+        #[inline]
+        fn io_depth(&self) -> usize {
+            self.io_depth
         }
 
         #[inline]
         fn new_submit_batch(&self) -> Self::SubmitBatch {
-            VecDeque::with_capacity(self.max_events)
+            VecDeque::with_capacity(self.io_depth)
         }
 
         #[inline]
@@ -2627,7 +2633,7 @@ pub(crate) mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> BackendResult<SubmitAttempt> {
+        ) -> IoResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
             let Some(submitted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
@@ -2646,7 +2652,7 @@ pub(crate) mod tests {
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(
                 self.inflight.len() >= min_nr,
                 "test backend requires submitted work before wait failure"
@@ -2975,7 +2981,18 @@ pub(crate) mod tests {
                     Ok(_) => panic!("expected initial catalog.mtb publish failure"),
                     Err(err) => err,
                 };
-                assert_eq!(err.kind(), ErrorKind::Io, "unexpected error: {err:?}");
+                assert_eq!(err.kind(), ErrorKind::Runtime, "unexpected error: {err:?}");
+                assert_eq!(
+                    err.report().downcast_ref::<RuntimeError>().copied(),
+                    Some(RuntimeError::FileRootAccess)
+                );
+                assert!(matches!(
+                    err.report().downcast_ref::<CompletionErrorKind>(),
+                    Some(CompletionErrorKind::Io(_))
+                ));
+                let report = format!("{err:?}");
+                assert!(report.contains("file_kind=catalog.mtb"), "{report}");
+                assert!(report.contains("phase=write_meta_block"), "{report}");
             }
 
             assert!(
@@ -3052,7 +3069,18 @@ pub(crate) mod tests {
                 Err(err) => err,
             };
 
-            assert_eq!(err.kind(), ErrorKind::Io, "unexpected error: {err:?}");
+            assert_eq!(
+                err.current_context(),
+                &RuntimeError::FileRootAccess,
+                "unexpected error: {err:?}"
+            );
+            assert!(matches!(
+                err.downcast_ref::<CompletionErrorKind>(),
+                Some(CompletionErrorKind::Io(_))
+            ));
+            let report = format!("{err:?}");
+            assert!(report.contains("file_kind=table_file"), "{report}");
+            assert!(report.contains("phase=fsync"), "{report}");
             let active_root = table_file.active_root_unchecked();
             assert_eq!(active_root.slot_no, before_root.slot_no);
             assert_eq!(active_root.root_ts, before_root.root_ts);

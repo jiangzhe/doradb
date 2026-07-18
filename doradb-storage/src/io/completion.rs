@@ -130,9 +130,10 @@ mod tests {
     #[test]
     fn test_completion_error_propagates_context_only() {
         let completion = Completion::<usize>::new();
-        completion.complete(Err(
-            Report::new(CompletionErrorKind::Send).attach("original detail")
-        ));
+        completion.complete(Err(CompletionErrorKind::from_send(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe)).attach("original detail"),
+            "test send completion",
+        )));
 
         let report = completion.completed_result().unwrap().unwrap_err();
         assert_eq!(*report.current_context(), CompletionErrorKind::Send);
@@ -152,9 +153,9 @@ mod tests {
             IOBackendQueueState::submit(1, 1),
         );
         let backend_report = attach_backend_operation_kind(backend_report, Some(IOKind::Write));
-        completion.complete(Err(CompletionErrorKind::report_backend_io(
-            &backend_report,
-            "original backend context",
+        completion.complete(Err(CompletionErrorKind::from_io(
+            IoError::report_backend(&backend_report, "original backend context"),
+            "test backend completion",
         )));
 
         let report = completion.completed_result().unwrap().unwrap_err();
@@ -168,8 +169,11 @@ mod tests {
 
     #[test]
     fn test_completion_report_unexpected_eof_reports_io() {
-        let report =
-            CompletionErrorKind::report_unexpected_eof(17, 4096, "test completion short read");
+        let report = CompletionErrorKind::from_io(
+            Report::new(IoError::from(IoErrorKind::UnexpectedEof))
+                .attach("unexpected eof: actual_bytes=17, expected_bytes=4096"),
+            "test completion short read",
+        );
         assert_eq!(
             *report.current_context(),
             CompletionErrorKind::Io(IoErrorKind::UnexpectedEof)
@@ -190,7 +194,10 @@ mod tests {
         let err = StdIoError::new(IoErrorKind::PermissionDenied, "completion io denied");
         let message = format!("{}", err);
 
-        let report = CompletionErrorKind::report_io(err, "test completion io");
+        let report = CompletionErrorKind::from_io(
+            Report::new(IoError::from(err.kind())).attach(format!("{err}")),
+            "test completion io",
+        );
 
         assert_eq!(
             *report.current_context(),

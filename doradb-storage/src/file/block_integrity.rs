@@ -1,6 +1,6 @@
 use crate::error::{DataIntegrityError, DataIntegrityResult};
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
-use error_stack::{Report, ensure};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
+use error_stack::Report;
 use std::mem;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -63,10 +63,7 @@ impl Deser for BlockIntegrityHeader {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(BLOCK_INTEGRITY_HEADER_SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, magic_word) = input.deser_byte_array::<8>(start_idx)?;
         let (idx, version) = input.deser_u64(idx)?;
         Ok((
@@ -102,10 +99,7 @@ impl Deser for BlockIntegrityTrailer {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(BLOCK_INTEGRITY_TRAILER_SIZE);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
         Ok((idx, BlockIntegrityTrailer { b3sum }))
     }
@@ -152,18 +146,27 @@ pub(crate) fn write_block_checksum(buf: &mut [u8]) {
 /// shared checksum trailer without the shared magic/version header.
 #[inline]
 pub(crate) fn validate_block_checksum(buf: &[u8]) -> DataIntegrityResult<()> {
-    ensure!(
-        buf.len() >= BLOCK_INTEGRITY_TRAILER_SIZE,
-        DataIntegrityError::InvalidPayload
-    );
+    if buf.len() < BLOCK_INTEGRITY_TRAILER_SIZE {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=integrity-envelope, invalid_block_len={}, required_min_len={BLOCK_INTEGRITY_TRAILER_SIZE}",
+                buf.len()
+            )),
+        );
+    }
     let checksum_offset = checksum_offset(buf.len());
     let (_, trailer) = BlockIntegrityTrailer::deser(buf, checksum_offset)
         .map_err(|_| Report::new(DataIntegrityError::ChecksumMismatch))?;
     let b3sum = blake3::hash(&buf[..checksum_offset]);
-    ensure!(
-        b3sum.as_bytes() == &trailer.b3sum,
-        DataIntegrityError::ChecksumMismatch
-    );
+    if b3sum.as_bytes() != &trailer.b3sum {
+        return Err(
+            Report::new(DataIntegrityError::ChecksumMismatch).attach(format!(
+                "block=integrity-envelope, expected_checksum={:02x?}, actual_checksum={:02x?}",
+                trailer.b3sum,
+                b3sum.as_bytes()
+            )),
+        );
+    }
     Ok(())
 }
 
@@ -176,24 +179,33 @@ pub(crate) fn validate_block(
     buf: &[u8],
     expected: BlockIntegritySpec,
 ) -> DataIntegrityResult<&[u8]> {
-    debug_assert!(
-        buf.len() >= BLOCK_INTEGRITY_HEADER_SIZE + BLOCK_INTEGRITY_TRAILER_SIZE,
-        "validate_block expects a full persisted block image"
-    );
-    ensure!(
-        buf.len() >= BLOCK_INTEGRITY_HEADER_SIZE + BLOCK_INTEGRITY_TRAILER_SIZE,
-        DataIntegrityError::InvalidPayload
-    );
+    let required_min_len = BLOCK_INTEGRITY_HEADER_SIZE + BLOCK_INTEGRITY_TRAILER_SIZE;
+    if buf.len() < required_min_len {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=integrity-envelope, invalid_block_len={}, required_min_len={required_min_len}",
+                buf.len()
+            )),
+        );
+    }
     let (payload_start, header) = BlockIntegrityHeader::deser(buf, 0)
         .map_err(|_| Report::new(DataIntegrityError::InvalidMagic))?;
-    ensure!(
-        header.magic_word == expected.magic_word,
-        DataIntegrityError::InvalidMagic
-    );
-    ensure!(
-        header.version == expected.version,
-        DataIntegrityError::InvalidVersion
-    );
+    if header.magic_word != expected.magic_word {
+        return Err(
+            Report::new(DataIntegrityError::InvalidMagic).attach(format!(
+                "block=integrity-envelope, expected_magic={:?}, actual_magic={:?}",
+                expected.magic_word, header.magic_word
+            )),
+        );
+    }
+    if header.version != expected.version {
+        return Err(
+            Report::new(DataIntegrityError::InvalidVersion).attach(format!(
+                "block=integrity-envelope, expected_version={}, actual_version={}",
+                expected.version, header.version
+            )),
+        );
+    }
     validate_block_checksum(buf)?;
     let checksum_offset = checksum_offset(buf.len());
     Ok(&buf[payload_start..checksum_offset])
@@ -202,6 +214,18 @@ pub(crate) fn validate_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_integrity_report(
+        err: Report<DataIntegrityError>,
+        expected: DataIntegrityError,
+        snippets: &[&str],
+    ) {
+        assert_eq!(err.current_context(), &expected);
+        let output = format!("{err:?}");
+        for snippet in snippets {
+            assert!(output.contains(snippet), "missing `{snippet}` in {output}");
+        }
+    }
 
     #[test]
     fn test_block_integrity_roundtrip() {
@@ -226,7 +250,15 @@ mod tests {
         buf[checksum_idx] ^= 0xff;
 
         let err = validate_block(&buf, spec).unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
+        assert_integrity_report(
+            err,
+            DataIntegrityError::ChecksumMismatch,
+            &[
+                "block=integrity-envelope",
+                "expected_checksum",
+                "actual_checksum",
+            ],
+        );
     }
 
     #[test]
@@ -238,6 +270,57 @@ mod tests {
 
         buf[10] ^= 0xff;
         let err = validate_block_checksum(&buf).unwrap_err();
-        assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
+        assert_integrity_report(
+            err,
+            DataIntegrityError::ChecksumMismatch,
+            &[
+                "block=integrity-envelope",
+                "expected_checksum",
+                "actual_checksum",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_block_integrity_reports_rejected_envelope_details() {
+        let spec = BlockIntegritySpec::new(*b"TSTMETA\0", 7);
+        let buf = vec![0u8; BLOCK_INTEGRITY_HEADER_SIZE + BLOCK_INTEGRITY_TRAILER_SIZE - 1];
+        let err = validate_block(&buf, spec).unwrap_err();
+        assert_integrity_report(
+            err,
+            DataIntegrityError::InvalidPayload,
+            &["invalid_block_len", "required_min_len"],
+        );
+
+        let buf = vec![0u8; BLOCK_INTEGRITY_TRAILER_SIZE - 1];
+        let err = validate_block_checksum(&buf).unwrap_err();
+        assert_integrity_report(
+            err,
+            DataIntegrityError::InvalidPayload,
+            &["invalid_block_len", "required_min_len"],
+        );
+
+        let mut buf = vec![0u8; 4096];
+        write_block_header(&mut buf, spec);
+        write_block_checksum(&mut buf);
+
+        let err = validate_block(&buf, BlockIntegritySpec::new(*b"OTHER\0\0\0", spec.version))
+            .unwrap_err();
+        assert_integrity_report(
+            err,
+            DataIntegrityError::InvalidMagic,
+            &["expected_magic", "actual_magic"],
+        );
+
+        let err = validate_block(
+            &buf,
+            BlockIntegritySpec::new(spec.magic_word, spec.version + 1),
+        )
+        .unwrap_err();
+        assert_integrity_report(
+            err,
+            DataIntegrityError::InvalidVersion,
+            &["expected_version=8", "actual_version=7"],
+        );
     }
 }

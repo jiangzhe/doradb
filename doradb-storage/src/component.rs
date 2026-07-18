@@ -772,7 +772,7 @@ mod tests {
             let err = Error::from(err);
             assert_eq!(err.kind(), ErrorKind::Runtime);
             assert_eq!(
-                err.downcast_ref::<RuntimeError>().copied(),
+                err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::BackgroundSpawn)
             );
         }
