@@ -907,14 +907,11 @@ impl RedoReadCompletion {
     #[inline]
     fn validate(self) -> Result<(u32, usize, DirectBuf)> {
         let actual_bytes = self.actual_bytes.map_err(|err| {
-            Error::from(
-                Report::new(IoError::from(err.kind()))
-                    .attach(format!("{err}"))
-                    .attach(format!(
-                        "redo direct read failed: file_seq={:08x}, offset={}",
-                        self.file_seq, self.offset
-                    )),
-            )
+            let kind = err.kind();
+            Error::from(Report::new(IoError::from(kind)).attach(err).attach(format!(
+                "redo direct read failed: file_seq={:08x}, offset={}",
+                self.file_seq, self.offset
+            )))
         })?;
         if actual_bytes != self.expected_bytes {
             return Err(Report::new(IoError::from(IoErrorKind::UnexpectedEof))
@@ -1889,6 +1886,36 @@ mod tests {
             assert!(output.contains(phase), "report={output}");
             assert_eq!(output.matches("thread_name=Redo-ReadAhead").count(), 1);
         }
+    }
+
+    #[test]
+    fn test_redo_read_completion_preserves_owned_io_error() {
+        let completion = RedoReadCompletion {
+            file_seq: 0x12,
+            offset: STORAGE_SECTOR_SIZE,
+            expected_bytes: STORAGE_SECTOR_SIZE,
+            actual_bytes: Err(StdIoError::from_raw_os_error(libc::EIO)),
+            buf: DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        };
+
+        let err = match completion.validate() {
+            Ok(_) => panic!("injected redo read error must fail validation"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert_eq!(
+            err.report()
+                .downcast_ref::<StdIoError>()
+                .and_then(StdIoError::raw_os_error),
+            Some(libc::EIO)
+        );
+        let output = format!("{err:?}");
+        assert!(output.contains("file_seq=00000012"), "{output}");
+        assert!(
+            output.contains(&format!("offset={STORAGE_SECTOR_SIZE}")),
+            "{output}"
+        );
     }
 
     struct WaitErrorBackend {

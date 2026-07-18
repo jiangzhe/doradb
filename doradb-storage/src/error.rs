@@ -725,9 +725,8 @@ impl From<TryFromSliceError> for Error {
 impl From<io::Error> for Error {
     #[inline]
     fn from(src: io::Error) -> Self {
-        Report::new(IoError::from(src.kind()))
-            .attach(format!("{src}"))
-            .into()
+        let kind = src.kind();
+        Report::new(IoError::from(kind)).attach(src).into()
     }
 }
 
@@ -927,6 +926,19 @@ mod tests {
             Some(IoErrorKind::WouldBlock)
         );
         assert!(format!("{err:?}").contains("not ready"));
+    }
+
+    #[test]
+    fn test_std_io_error_conversion_preserves_owned_source() {
+        let err = Error::from(StdIoError::from_raw_os_error(libc::EIO));
+
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert_eq!(
+            err.report()
+                .downcast_ref::<StdIoError>()
+                .and_then(StdIoError::raw_os_error),
+            Some(libc::EIO)
+        );
     }
 
     #[test]

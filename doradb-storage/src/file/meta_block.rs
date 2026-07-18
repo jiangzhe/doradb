@@ -16,7 +16,7 @@ use std::num::NonZeroU64;
 pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
-pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 6;
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 7;
 /// Magic bytes stored at the beginning of every `catalog.mtb` meta block envelope.
 pub(crate) const MULTI_TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'M', b'T', b'B', b'M', b'E', b'T', b'A', 0];

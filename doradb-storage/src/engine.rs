@@ -768,6 +768,11 @@ impl EngineConfig {
     async fn build_inner(self) -> Result<Engine> {
         let resolved = self.resolve_storage_paths()?;
         let marker_was_present = resolved.validate_marker_if_present()?;
+        // Marker preflight and the post-build check below do not reserve the
+        // storage root. Another process can open or mutate the same files
+        // throughout component construction. Until
+        // `docs/backlogs/000162-single-process-storage-bootstrap-lock.md` is
+        // implemented, engine startup assumes one live owner per storage root.
         // Startup prefers a small, durable-safety-focused preflight over trying
         // to exhaust every possible path conflict up front. It is acceptable for
         // later setup steps to fail, but those failures must not clobber durable

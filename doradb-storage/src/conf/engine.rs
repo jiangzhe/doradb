@@ -195,6 +195,12 @@ impl ResolvedStoragePaths {
     }
 
     /// Validate the durable storage-layout marker and report whether it exists.
+    ///
+    /// This probe is not a cross-process synchronization boundary:
+    /// `Path::exists` suppresses metadata errors, and another process can
+    /// replace the marker before `validate_marker` reads it. Until
+    /// `docs/backlogs/000162-single-process-storage-bootstrap-lock.md` is
+    /// implemented, callers must provide exclusive storage-root ownership.
     pub(crate) fn validate_marker_if_present(&self) -> ConfigResult<bool> {
         let marker_path = self.marker_path();
         if !marker_path.exists() {

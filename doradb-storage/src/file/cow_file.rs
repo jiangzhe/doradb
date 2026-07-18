@@ -329,6 +329,21 @@ impl<M> MutableCowRoot<M> {
     /// fork. The bytes may already exist in the sparse file, but clearing the
     /// allocation bit keeps the future published root from marking an abandoned
     /// block as live.
+    ///
+    /// [`MutableCowRoot::try_allocate_block`] sets the allocation bit and records
+    /// current-fork ownership before returning an id. Exclusive mutable-root
+    /// access prevents either fact from changing concurrently. Callers retain
+    /// one-shot ownership: DiskTree rollback guards record each id immediately,
+    /// then either drain each id once on failure or disarm after transferring the
+    /// allocations to the resulting root. Allocation-map rebuilds require the
+    /// same exclusive access and run only after those guards finish. A failed
+    /// check below therefore indicates a caller bookkeeping bug, not a
+    /// recoverable storage failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `block_id` is reserved, outside this allocation map, inherited
+    /// from another root, or has already been rolled back.
     #[inline]
     pub(crate) fn rollback_allocated_block(&mut self, block_id: BlockID) {
         assert!(

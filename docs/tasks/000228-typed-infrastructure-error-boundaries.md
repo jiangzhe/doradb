@@ -1,7 +1,7 @@
 ---
 id: 000228
 title: Typed Infrastructure Error Boundaries
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-17
 github_issue: 864
 ---
@@ -115,7 +115,9 @@ tracked `TODO(error-boundary)` with a concrete follow-up reference.
 - Do not perform the broad transaction, recovery, session, engine, or public
   facade audit assigned to Phase 4. Only transaction paths required to remove
   public-error completion capture are in scope.
-- Do not redesign public `Error`, `ErrorKind`, `Result`, or persisted formats.
+- Do not otherwise redesign public `Error`, `ErrorKind`, `Result`, or persisted
+  formats. The post-review `ValKind` u32 alignment is the sole explicit
+  exception.
 - Do not add a generic error-set framework or retain a broad crate result only
   to make `?` convenient.
 - Do not introduce new unsafe code or change an existing unsafe algorithm,
@@ -285,9 +287,9 @@ revalidate a previously present marker or create a previously absent one. A
 marker-create `AlreadyExists` propagates through the ordinary IO error path and
 aborts the unpublished build.
 
-For shared public types, preserve `ValKind::decode` as the canonical
+For shared public types, preserve `ValKind::decode(u32)` as the canonical
 DataIntegrity-typed operation and change reusable internal callers, including
-catalog column conversion, to call it rather than `TryFrom`.
+catalog column conversion, to call it rather than `TryFrom<u32>`.
 
 For catalog checkpoint helpers, keep row/key/root validation and checkpoint
 folding DataIntegrity-typed until the mixed storage facade, and make final
@@ -323,26 +325,47 @@ Doc placeholder.
 
 ## Implementation Notes
 
+- The central error model now defines the sole storage-domain `IoResult` and
+  exposes public reports only through `Error::report` and `Error::into_report`.
+  `BackendResult`, `StorageOp`, public inner-error accessors, Generic fallback
+  constructors, `error_stack::ensure!`, and formatting-only report wrappers
+  were removed.
+- Completion transport now accepts only owned typed reports through explicit
+  per-domain adapters. No completion producer accepts public `Error` or
+  `ErrorKind`, and backend IO attachments remain preserved through the
+  temporary `CompletionErrorKind` boundary for Phase 2.
 - `IOBackend: Sized` owns `setup(io_depth) -> IoResult<Self>` and `io_depth()`.
   io-uring rejects zero, next-power-of-two overflow, and `u32` ring-entry
   overflow; libaio rejects zero and `i32` overflow. Both use IO `InvalidInput`
   for defensive setup validation and retain native kernel setup errors.
+- Raw file operations now return IO or Resource reports according to their
+  responsibility, while persisted super/meta/checksum helpers return
+  DataIntegrity reports. CoW allocation is Resource-typed, publication IO uses
+  Completion transport, and allocation rollback is infallible after asserting
+  current-fork, exactly-once ownership. Review of the rollback call graph
+  confirmed that DiskTree guards either drain each recorded allocation once or
+  disarm after ownership transfer; the invariant and panic contract are now
+  documented on `rollback_allocated_block`.
+- Buffer reservation publication is infallible. Readonly reservation retries
+  transient exclusive-lock misses, duplicate publication is an assertion with
+  rollback diagnostics, and the obsolete reservation errors and manual frame
+  binding helper were removed. Native IO, DataIntegrity, Lifecycle, Resource,
+  and Internal reports remain below their owning Runtime page operation.
 - `EvictableBufferPool::create` owns Config/Resource/IO convergence beneath
   `BufferPoolInit`; index and memory component builders attach their respective
   swap-file field and path without configuration-owned forwarding wrappers.
+- Buffer allocation and access add `BufferPageAllocation` or
+  `BufferPageAccess`, and CoW root load/publication adds `FileRootAccess`, only
+  at the engine-owned operation boundary. These Runtime contexts retain their
+  lower reports and attach pool/file type, role, phase, and page or block
+  identity. Direct root fsync remains Completion-typed, and the existing
+  root-publication poison policy is unchanged.
 - Redo filename and sequence validators remain DataIntegrity-typed, while
   discovery and obsolete-prefix listing return `RuntimeResult` with
   `RedoLogDiscovery` above retained IO or DataIntegrity reports.
   Block-count helpers remain `DataIntegrityResult`; initial-super-block and
   block-group materialization return `InternalResult` with
   `RedoFormatEncoding` for buffer-shape failures.
-- CoW active-root load and publication return `RuntimeResult` with
-  `FileRootAccess` above retained buffer-access, DataIntegrity, Resource,
-  Internal, or completion reports. Direct fsync remains Completion-typed, and
-  table/catalog forwarding commits attach their file kind before mixed/public
-  convergence. Checkpoint durability coordinators inspect the retained
-  `CompletionErrorKind` through the public report when applying their existing
-  Fatal-on-write-or-fsync policy; they do not match the top-level Runtime kind.
 - Storage directory creation and durable-layout marker serialization and
   persistence return `IoResult`; compatibility validation returns
   `ConfigResult<bool>`. Existing markers are revalidated after component
@@ -351,8 +374,29 @@ Doc placeholder.
 - Catalog checkpoint folding and leaf validation now return
   `DataIntegrityResult`, while mixed async storage operations retain public
   `Result`; folded-row materialization is infallible.
-- Formatting-only catalog report constructors were removed and their reports
-  are constructed at the owning validation branches.
+- The originally explored error-boundary inventory/checker was removed after
+  review because maintaining it during active boundary migration added unstable
+  overhead. RFC-0023 now relies on compiler fallout, focused tests, strict
+  linting, and direct source review during migration; a deterministic audit may
+  be reconsidered only after all phases stabilize.
+- Lower index and row undo suppliers still return public `Error` before the
+  terminal rollback owner adds Fatal context. Narrowing those stateful-storage
+  contracts is intentionally deferred to RFC-0023 Phase 3 and recorded in
+  `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`.
+- Verification passed `cargo nextest` with 1,462 default workspace tests and
+  1,387 alternate-`libaio` storage tests. Default and `libaio` Clippy passed
+  with warnings denied; the style gate passed all 66 branch-diff Rust files.
+  Focused coverage across eight representative IO, file, buffer, log, config,
+  catalog, transaction, and value consumers was 93.49% in aggregate, with
+  every target above 80%. `git diff --check` also passed.
+- Post-resolution review deliberately widened the public `ValKind`
+  representation and its `Val`/`ValType` persisted tags from u8 to u32. Storage
+  layout, table metadata, and redo format versions were bumped without a
+  compatibility path or previous-format fixture. No unsafe block or unsafe
+  contract changed. The public error inspection surface intentionally narrowed
+  to `report` and `into_report`; other error-boundary signature changes are
+  crate-private. The unsafe-usage baseline was refreshed only for the
+  implementation date.
 
 ## Impacts
 
@@ -366,13 +410,17 @@ Doc placeholder.
 | `doradb-storage/src/buffer/load.rs`, `buffer/readonly.rs` | Infallible publication, Runtime-typed readonly access, typed completion inputs, and preserved reservation lifecycle |
 | `doradb-storage/src/log/` | Raw/typed IO naming, typed format/allocation/progress contracts, source-preserving Fatal production |
 | `doradb-storage/src/catalog/storage/merge.rs`, `catalog/storage/mod.rs` | DataIntegrity-typed checkpoint folding and persisted leaf validation with mixed facade convergence |
-| `doradb-storage/src/conf/engine.rs`, `value.rs`, compiler-required catalog caller | IO-typed durable-layout setup/persistence, Config-typed marker validation, and canonical typed decode use |
+| `doradb-storage/src/conf/engine.rs`, `value.rs`, compiler-required catalog caller | IO-typed durable-layout setup/persistence, Config-typed marker validation, u32 `ValKind` representation/persisted tags, and canonical typed decode use |
 | `doradb-storage/src/trx/sys.rs` and direct completion fallout | Fatal-typed rollback cleanup and Generic disposition without broader transaction reinterpretation |
 | Foundation modules and `lock` | Read-only verification unless source review finds a Phase 1 caller erasing an existing typed contract |
 
-No persisted format change is expected. The public error module drops
-`StorageOp` without replacement; the remaining signature fallout is
-crate-private. No unsafe behavior change is expected; if implementation must
+The error-boundary migration does not otherwise change persisted formats. The
+explicit post-review `ValKind` exception breaks previous storage compatibility
+and replaces public `TryFrom<u8>` with `TryFrom<u32>`. The public error module
+drops `StorageOp`, `Error::downcast_ref`, and the domain-specific inner-error
+accessors without replacement; callers inspect the exposed `Report` instead.
+The remaining error-boundary signature fallout is crate-private. No unsafe
+behavior change is expected; if implementation must
 modify an unsafe block or unsafe contract, it must run
 `docs/process/unsafe-review-checklist.md`, preserve/add the local `// SAFETY:`
 evidence, and refresh `docs/unsafe-usage-baseline.md` with
@@ -446,10 +494,10 @@ evidence, and refresh `docs/unsafe-usage-baseline.md` with
      classification or assertion contract.
 
 6. **Shared public adapter and foundation verification**
-   - `ValKind::decode` reports DataIntegrity directly; public `TryFrom` still
-     returns the same public classification with the DataIntegrity frame; the
-     production caller review finds no reusable internal use of the public
-     adapter.
+   - `ValKind::decode(u32)` reports DataIntegrity directly; public
+     `TryFrom<u32>` still returns the same public classification with the
+     DataIntegrity frame; the production caller review finds no reusable
+     internal use of the public adapter.
    - Source review confirms lock remains Operation-typed and foundation modules
      do not immediately erase typed caller results.
    - Catalog checkpoint fold and leaf-validator tests assert DataIntegrity
@@ -475,9 +523,8 @@ evidence, and refresh `docs/unsafe-usage-baseline.md` with
      buffer/log/file/transaction consumer coverage for each changed adapter.
 ## Open Questions
 
-None for Phase 1. The object-safe erased-report holder, physical-frame replay
-representation, final cloneable attachment registry implementation, and bridge
-API-shape checks are deliberately assigned to RFC-0023 Phase 2. Phase 1 must
-preserve source reports and attachments but must not pre-implement or bypass
-that phase; Phase 2 inspects the stabilized paths before choosing its
-representation.
+No unresolved Phase 1 questions remain. RFC-0023 Phase 2 owns the object-safe
+erased-report holder, physical-frame replay representation, cloneable
+attachment registry, and completion-bridge API. Phase 3 owns the typed index
+and row rollback supplier follow-up recorded in
+`docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`.

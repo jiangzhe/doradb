@@ -6,13 +6,13 @@ use crate::file::block_integrity::{
 use crate::id::TrxID;
 use crate::io::STORAGE_SECTOR_SIZE;
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::mem;
 
 /// Magic bytes stored in every redo file super-block header.
 pub(crate) const REDO_FILE_MAGIC: [u8; 8] = *b"DREDO\0\0\0";
 /// Redo file format version for fixed-block redo data framing.
-pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 3;
+pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 4;
 /// Shared block-integrity envelope used by redo super-block slots.
 pub(crate) const REDO_SUPER_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(REDO_FILE_MAGIC, REDO_FILE_FORMAT_VERSION);
@@ -414,10 +414,9 @@ impl RedoSuperBlock {
             min_redo_cts,
             max_redo_cts,
         };
-        validate_super_block_fields(&sealed, sealed.file_seq, slot_no).map_err(|report| {
-            Report::new(InternalError::RedoFormatEncoding)
-                .attach(format!("trusted sealed redo fields invalid: {report:?}"))
-        })?;
+        validate_super_block_fields(&sealed, sealed.file_seq, slot_no)
+            .change_context(InternalError::RedoFormatEncoding)
+            .attach("trusted sealed redo fields invalid")?;
         Ok(sealed)
     }
 }
@@ -533,13 +532,9 @@ pub(crate) fn serialize_redo_super_block(
             )),
         );
     }
-    validate_super_block_fields(super_block, super_block.file_seq, super_block.slot_no).map_err(
-        |report| {
-            Report::new(InternalError::RedoFormatEncoding).attach(format!(
-                "trusted redo super-block fields invalid: {report:?}"
-            ))
-        },
-    )?;
+    validate_super_block_fields(super_block, super_block.file_seq, super_block.slot_no)
+        .change_context(InternalError::RedoFormatEncoding)
+        .attach("trusted redo super-block fields invalid")?;
     buf.fill(0);
     let payload_start = write_block_header(buf, REDO_SUPER_BLOCK_SPEC);
     debug_assert_eq!(payload_start, BLOCK_INTEGRITY_HEADER_SIZE);
@@ -1146,6 +1141,38 @@ mod tests {
         for super_block in cases {
             let err = validate_super_block_fields(&super_block, 7, 0).unwrap_err();
             assert_integrity_error(err, DataIntegrityError::InvalidPayload);
+        }
+    }
+
+    #[test]
+    fn redo_super_block_internal_encoding_preserves_validation_source() {
+        let invalid_slot_no = REDO_SUPER_BLOCK_SLOT_COUNT as u32;
+        let open = valid_super_block(0, 0);
+        let sealed_err = RedoSuperBlock::sealed_from_open(
+            &open,
+            invalid_slot_no,
+            REDO_DEFAULT_DATA_START_OFFSET,
+            None,
+        )
+        .unwrap_err();
+
+        let invalid = RedoSuperBlock {
+            slot_no: invalid_slot_no,
+            ..open
+        };
+        let mut buf = vec![0u8; REDO_SUPER_BLOCK_SLOT_SIZE];
+        let serialize_err = serialize_redo_super_block(&mut buf, &invalid).unwrap_err();
+
+        for (err, stage) in [
+            (sealed_err, "trusted sealed redo fields invalid"),
+            (serialize_err, "trusted redo super-block fields invalid"),
+        ] {
+            assert_eq!(*err.current_context(), InternalError::RedoFormatEncoding);
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            assert!(format!("{err:?}").contains(stage));
         }
     }
 

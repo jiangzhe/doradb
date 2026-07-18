@@ -20,11 +20,11 @@ docs/tasks/000228-typed-infrastructure-error-boundaries.md; docs/rfcs/0023-stora
 
 ## Scope Hint
 
-Audit and narrow index and row undo rollback supplier contracts and their stateful-storage callers; update terminal rollback Fatal conversion and the error-boundary checker.
+Audit and narrow index and row undo rollback supplier contracts and their stateful-storage callers; update terminal rollback Fatal conversion and its focused source-preservation tests.
 
 ## Acceptance Hint
 
-Terminal rollback receives typed rollback source reports or explicit typed branches, changes them directly to FatalError, retains physical source frames, contains no public ErrorKind intermediary, removes the Phase 1 TODOs, and has source-preservation and negative audit coverage.
+Terminal rollback receives typed rollback source reports or explicit typed branches, changes them directly to FatalError, retains physical source frames, contains no public ErrorKind intermediary, removes the Phase 1 TODOs, and has source-preservation coverage plus direct source verification.
 
 ## Notes (Optional)
 

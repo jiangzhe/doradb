@@ -304,8 +304,8 @@ callers use the typed operation directly, while the public trait adapter owns
 the final conversion to crate-level `Error`. The adapter must not duplicate
 parsing, validation, or mutation logic. [D1], [U2], [C8]
 
-`ValKind` is the current precedent: `ValKind::decode(u8)` returns
-`DataIntegrityResult<ValKind>`, and `TryFrom<u8>` delegates to it before
+`ValKind` is the current precedent: `ValKind::decode(u32)` returns
+`DataIntegrityResult<ValKind>`, and `TryFrom<u32>` delegates to it before
 converting the typed report to public `Error`. The audit applies this pattern to
 all shared public types and checks internal `TryFrom`/`TryInto` call sites so a
 public trait requirement does not force reusable internal callers to adopt the
@@ -496,8 +496,11 @@ or standard-validation gate for implementation completion. [D10], [D12]
 ### Compatibility and Scope Boundaries
 
 The migration preserves the public `Error`, `ErrorKind`, and `Result` contract
-and does not change persisted formats, backend submission semantics, checkpoint
-atomicity, transaction behavior, or lifecycle policy. Replacing the
+and does not itself change persisted formats, backend submission semantics,
+checkpoint atomicity, transaction behavior, or lifecycle policy. A separate
+post-Phase-1 review decision widened the public `ValKind` representation and
+its persisted tags to u32, explicitly discarding previous-format compatibility;
+that adjacent change is not an error-boundary requirement. Replacing the
 crate-private `BackendResult` alias with central `IoResult<T>` is an internal
 alias relocation, not a new error domain or public classification. Replacing
 the crate-private completion error type and storage representation is in scope,
@@ -717,11 +720,12 @@ RFC. [D17], [D18]
     is the sole canonical storage IO result alias and `BackendResult` is absent.
     [U8], [U10], [U11]
   - Task Doc: `docs/tasks/000228-typed-infrastructure-error-boundaries.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#864`
+  - Phase Status: done
+  - Implementation Summary: Implemented typed infrastructure error boundaries across IO, file, buffer, log, configuration, catalog, and targeted transaction completion paths; preserved source reports through Runtime and Completion contexts; validated both IO backends and deferred lower rollback supplier narrowing to Phase 3. [Task Resolve Sync: docs/tasks/000228-typed-infrastructure-error-boundaries.md @ 2026-07-18]
   - Related Backlogs:
     - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
+    - `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 2: Completion Bridge and Infrastructure Closure**
   - Scope: Replace completion transport in `error` and `io::completion`, then
@@ -811,6 +815,7 @@ RFC. [D17], [D18]
   - Implementation Summary: `pending`
   - Related Backlogs:
     - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
+    - `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 4: Orchestration, Public Convergence, and Documentation Closure**
   - Scope: Audit `trx`, `recovery`, `session`, `engine`, statement/stream

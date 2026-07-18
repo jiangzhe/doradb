@@ -1,4 +1,4 @@
-// Intentional public trait convergence: `ValKind::try_from(u8)` must expose the
+// Intentional public trait convergence: `ValKind::try_from(u32)` must expose the
 // crate error while forwarding its sole DataIntegrity report; internal decoders
 // retain `DataIntegrityResult` and do not cross this boundary.
 use crate::error::{DataIntegrityError, DataIntegrityResult, Error, Result};
@@ -88,25 +88,25 @@ impl ValType {
 impl Ser<'_> for ValType {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<u8>() + mem::size_of::<u8>()
+        mem::size_of::<u32>() + mem::size_of::<u8>()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = out.ser_u8(idx, self.kind as u8);
+        idx = out.ser_u32(idx, self.kind as u32);
         out.ser_u8(idx, self.nullable as u8)
     }
 }
 
 impl Deser for ValType {
     const MIN_BYTES_HINT: MinBytesHint =
-        min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u8>());
+        min_bytes_hint(mem::size_of::<u32>() + mem::size_of::<u8>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let idx = start_idx;
-        let (idx, kind) = input.deser_u8(idx)?;
+        let (idx, kind) = input.deser_u32(idx)?;
         let kind = ValKind::decode(kind)?;
         let (idx, nullable) = input.deser_u8(idx)?;
         Ok((
@@ -120,7 +120,7 @@ impl Deser for ValType {
 }
 /// Physical value kind code used in row serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum ValKind {
     I8 = 1,
     U8 = 2,
@@ -134,6 +134,7 @@ pub enum ValKind {
     F64 = 10,
     VarByte = 11,
 }
+const _: () = assert!(mem::size_of::<ValKind>() == mem::size_of::<u32>());
 
 impl ValKind {
     /// Returns the inline byte length for this kind.
@@ -158,7 +159,7 @@ impl ValKind {
 
     /// Decodes one persisted value-kind code before a public error boundary is chosen.
     #[inline]
-    pub(crate) fn decode(value: u8) -> DataIntegrityResult<Self> {
+    pub(crate) fn decode(value: u32) -> DataIntegrityResult<Self> {
         let res = match value {
             1 => ValKind::I8,
             2 => ValKind::U8,
@@ -189,10 +190,10 @@ impl ValKind {
     }
 }
 
-impl TryFrom<u8> for ValKind {
+impl TryFrom<u32> for ValKind {
     type Error = Error;
     #[inline]
-    fn try_from(value: u8) -> Result<Self> {
+    fn try_from(value: u32) -> Result<Self> {
         Self::decode(value).map_err(Error::from)
     }
 }
@@ -626,7 +627,7 @@ impl From<Vec<u8>> for Val {
 impl Ser<'_> for Val {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<u8>()
+        mem::size_of::<u32>()
             + match self {
                 Val::Null => 0, // null is encoded with code only.
                 Val::I8(_) | Val::U8(_) => 1,
@@ -640,8 +641,8 @@ impl Ser<'_> for Val {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         debug_assert!(start_idx + self.ser_len() <= out.size());
-        let code = self.kind().map(|k| k as u8).unwrap_or(0);
-        let idx = out.ser_u8(start_idx, code);
+        let code = self.kind().map(|k| k as u32).unwrap_or(0);
+        let idx = out.ser_u32(start_idx, code);
         match self {
             Val::Null => idx,
             Val::I8(v) => out.ser_i8(idx, *v),
@@ -663,11 +664,11 @@ impl Ser<'_> for Val {
 }
 
 impl Deser for Val {
-    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u32>());
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, c) = input.deser_u8(start_idx)?;
+        let (idx, c) = input.deser_u32(start_idx)?;
         if c == 0 {
             return Ok((idx, Val::Null));
         }
@@ -1371,7 +1372,7 @@ mod tests {
 
     #[test]
     fn test_val_kind_try_from_preserves_data_integrity_source() {
-        let err = ValKind::try_from(u8::MAX).expect_err("invalid value-kind tag must fail");
+        let err = ValKind::try_from(257u32).expect_err("invalid value-kind tag must fail");
 
         assert_eq!(err.kind(), ErrorKind::DataIntegrity);
         assert_eq!(
@@ -1418,7 +1419,7 @@ mod tests {
         let val = Val::Null;
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
-        assert!(buf == b"\x00");
+        assert!(buf == b"\x00\x00\x00\x00");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::Null);
@@ -1427,7 +1428,7 @@ mod tests {
         let val = Val::from(42u8);
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
-        assert!(buf == b"\x02\x2a");
+        assert!(buf == b"\x02\x00\x00\x00\x2a");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(42u8));
@@ -1437,7 +1438,7 @@ mod tests {
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
         // i8 code is 1, value -42 is 0xd6 in two's complement
-        assert!(buf == b"\x01\xd6");
+        assert!(buf == b"\x01\x00\x00\x00\xd6");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-42i8));
@@ -1446,7 +1447,7 @@ mod tests {
         let val = Val::from(1200u16);
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
-        assert!(buf == b"\x04\xb0\x04");
+        assert!(buf == b"\x04\x00\x00\x00\xb0\x04");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(1200u16));
@@ -1456,7 +1457,7 @@ mod tests {
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
         // i16 code is 3, value -1200 is 0xfb50 in two's complement (little-endian)
-        assert!(buf == b"\x03\x50\xfb");
+        assert!(buf == b"\x03\x00\x00\x00\x50\xfb");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-1200i16));
@@ -1465,7 +1466,7 @@ mod tests {
         let val = Val::from(0xdefcab12u32);
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
-        assert!(buf == b"\x06\x12\xab\xfc\xde");
+        assert!(buf == b"\x06\x00\x00\x00\x12\xab\xfc\xde");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(0xdefcab12u32));
@@ -1476,7 +1477,7 @@ mod tests {
         val.ser(&mut buf[..], 0);
         // i32 code is 5, value -0x12345678 is 0xedcba988 in two's complement (little-endian)
         // -0x12345678 = 0xedcba988
-        assert!(buf == b"\x05\x88\xa9\xcb\xed");
+        assert!(buf == b"\x05\x00\x00\x00\x88\xa9\xcb\xed");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-0x12345678i32));
@@ -1485,7 +1486,7 @@ mod tests {
         let val = Val::from(0x1234567890abcdefu64);
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
-        assert!(buf == b"\x09\xef\xcd\xab\x90\x78\x56\x34\x12");
+        assert!(buf == b"\x09\x00\x00\x00\xef\xcd\xab\x90\x78\x56\x34\x12");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(0x1234567890abcdefu64));
@@ -1496,7 +1497,7 @@ mod tests {
         val.ser(&mut buf[..], 0);
         // i64 code is 8, value -0x1234567890abcdef is 0xedcba9876f543211 in two's complement (little-endian)
         // -0x1234567890abcdef = 0xedcba9876f543211
-        assert!(buf == b"\x08\x11\x32\x54\x6f\x87\xa9\xcb\xed");
+        assert!(buf == b"\x08\x00\x00\x00\x11\x32\x54\x6f\x87\xa9\xcb\xed");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(-0x1234567890abcdefi64));
@@ -1506,7 +1507,7 @@ mod tests {
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
         // f32 code is 7, value 3.14f32 bits: 0x4048f5c3
-        assert!(buf == b"\x07\xc3\xf5\x48\x40");
+        assert!(buf == b"\x07\x00\x00\x00\xc3\xf5\x48\x40");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(f32::from_bits(0x4048_f5c3)));
@@ -1516,7 +1517,7 @@ mod tests {
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
         // f64 code is 10, value 3.141592653589793 bits: 0x400921fb54442d18
-        assert!(buf == b"\x0a\x18\x2d\x44\x54\xfb\x21\x09\x40");
+        assert!(buf == b"\x0a\x00\x00\x00\x18\x2d\x44\x54\xfb\x21\x09\x40");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(PI_F64));
@@ -1525,7 +1526,7 @@ mod tests {
         let val = Val::from(&b"hello"[..]);
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
-        assert!(buf == b"\x0b\x05\x00\x68\x65\x6c\x6c\x6f");
+        assert!(buf == b"\x0b\x00\x00\x00\x05\x00\x68\x65\x6c\x6c\x6f");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
         assert!(val == Val::from(&b"hello"[..]));
@@ -1542,9 +1543,9 @@ mod tests {
         val_type.ser(&mut buf[..], 0);
 
         // 验证序列化结果
-        assert_eq!(buf.len(), 2);
-        assert_eq!(buf[0], ValKind::I32 as u8);
-        assert_eq!(buf[1], 0); // false
+        assert_eq!(buf.len(), 5);
+        assert_eq!(&buf[..4], &(ValKind::I32 as u32).to_le_bytes());
+        assert_eq!(buf[4], 0); // false
 
         // 验证反序列化结果
         let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
@@ -1560,9 +1561,9 @@ mod tests {
         val_type.ser(&mut buf[..], 0);
 
         // 验证序列化结果
-        assert_eq!(buf.len(), 2);
-        assert_eq!(buf[0], ValKind::VarByte as u8);
-        assert_eq!(buf[1], 1); // true
+        assert_eq!(buf.len(), 5);
+        assert_eq!(&buf[..4], &(ValKind::VarByte as u32).to_le_bytes());
+        assert_eq!(buf[4], 1); // true
 
         // 验证反序列化结果
         let (_, deserialized) = ValType::deser(&buf[..], 0).unwrap();
@@ -1606,12 +1607,12 @@ mod tests {
         val_type.ser(&mut buf[..], 4); // 从位置4开始序列化
 
         // 验证序列化结果
-        assert_eq!(buf[4], ValKind::I64 as u8);
-        assert_eq!(buf[5], 1); // true
+        assert_eq!(&buf[4..8], &(ValKind::I64 as u32).to_le_bytes());
+        assert_eq!(buf[8], 1); // true
 
         // 验证反序列化结果
         let (next_pos, deserialized) = ValType::deser(&buf[..], 4).unwrap();
-        assert_eq!(next_pos, 6); // 应该前进2个字节
+        assert_eq!(next_pos, 9); // 应该前进5个字节
         assert_eq!(deserialized.kind, ValKind::I64);
         assert!(deserialized.nullable);
     }

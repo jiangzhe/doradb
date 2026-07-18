@@ -182,7 +182,11 @@ fn row_to_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> ColumnO
         table_id,
         column_no,
         column_name: SemiStr::new(column_name),
-        column_type: ValKind::decode(column_type as u8)
+        // Invariant: production catalog writers derive this field directly
+        // from `ValKind`, and checkpoint/redo preserve that u32 code without
+        // narrowing it. An unknown code therefore indicates an internal
+        // catalog writer or recovery invariant violation.
+        column_type: ValKind::decode(column_type)
             .expect("validated catalog column row must contain a known value kind"),
         column_attributes: ColumnAttributes::from_bits_truncate(column_attributes),
     }
