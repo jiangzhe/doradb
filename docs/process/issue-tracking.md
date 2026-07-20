@@ -33,7 +33,7 @@ gh issue list --state open -S "no:assignee" --json number,title,labels,body
 
 # Create new issues (Labels replace strict types/priorities)
 gh issue create --title "Issue title" --body "Description" --label "type:bug,priority:high" --assignee "@me"
-gh issue create --title "Subtask" --body "Related to #123" --label "type:task" --assignee "@me"
+gh issue create --title "Subtask" --body "Description" --label "type:task" --assignee "@me" --parent 123
 
 # Check your current tasks
 gh issue list --assignee "@me" --state open --json number,title
@@ -93,51 +93,52 @@ When creating from planning docs with no explicit type/priority from either sour
 
 ## Epic & Subtask Management
 
-**IMPORTANT**: GitHub uses flat Issues. Hierarchy is simulated using Labels and References.
-To create an Epic structure, you must **capture the Parent ID** and reference it in the children.
+GitHub supports native sub-issues. Create the RFC issue first, then pass its
+issue number with `--parent` while creating each phase task.
 
 ### Workflow: Create Epic and Children
 
 Since you are an AI, you must execute this in a sequence where you capture the output of the first command.
 
 #### 1. Create the Epic (Parent)
-Create the parent issue first and define it as an `epic`.
-**Crucial**: You must use `--json number -q .number` to extract the ID cleanly if you are scripting, or read the output carefully.
+Create the parent issue first and define it as an `epic`. Store the resulting
+issue number as `github_issue` in the RFC planning document.
 
 ```bash
-# Create Epic and capture the ID (example for bash/scripting)
-# Note: If running interactively, just create it and note the number (e.g., 42)
 gh issue create \
   --title "Epic: Refactor Database Layer" \
   --body "High-level goal for the refactoring." \
   --label "type:epic" \
-  --assignee "@me" \
-  --json number -q .number
-# Output: 42 (Assume this is the ID)
+  --assignee "@me"
 ```
 
 #### 2. Create Sub-issues (Children)
-Create individual tasks and link them to the Epic by adding `Part of #<EpicID>` in the body. This creates a bi-directional link in GitHub's timeline.
+Read the RFC document's `github_issue` value and create each phase task with
+that number as the native parent. Use one `gh issue create` command and do not
+add a textual parent reference to the body.
 
 ```bash
 # Create sub-tasks referencing the parent (e.g., #42)
 gh issue create \
   --title "Design Schema" \
-  --body "Define new tables. Part of #42" \
+  --body "Define new tables." \
   --label "type:task" \
-  --assignee "@me"
+  --assignee "@me" \
+  --parent 42
 
 gh issue create \
   --title "Migration Script" \
-  --body "Write SQL migration. Part of #42" \
+  --body "Write SQL migration." \
   --label "type:task" \
-  --assignee "@me"
+  --assignee "@me" \
+  --parent 42
 ```
 
 ### Epic Rules
 
 - ✅ **Labeling**: Always tag the parent with `type:epic` and children with `type:task` or `type:feature`.
-- ✅ **Linking**: You MUST mention `Part of #<ParentID>` in the child issue's body. This ensures the Epic's timeline shows the connections.
+- ✅ **Linking**: Pass `--parent <ParentID>` during child creation so GitHub records a native sub-issue relationship.
+- ❌ **No Duplicate Link**: Do not add `Part of #<ParentID>` to the body or link the issue again after creation.
 - ❌ **No Nested Epics**: Avoid creating Epics inside Epics (Grandparent -> Parent -> Child). Keep hierarchy flat (Epic -> Tasks) for simplicity.
 
 ## Workflow for AI Agents
