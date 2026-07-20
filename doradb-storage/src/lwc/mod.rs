@@ -963,9 +963,10 @@ impl<'a> LwcBuilder<'a> {
         }
         let row_count = self.buffer.len();
         if row_count > u16::MAX as usize {
-            return Err(lwc_block_encoding_contract()
-                .attach("field=row_count")
-                .attach(format!("actual={row_count}, maximum={}", u16::MAX)));
+            return Err(lwc_block_encoding_contract().attach(format!(
+                "field=row_count, actual={row_count}, maximum={}",
+                u16::MAX
+            )));
         }
         let mut column_payloads = Vec::with_capacity(self.col_layout.col_count());
         let mut col_offsets = Vec::with_capacity(self.col_layout.col_count());
@@ -1042,9 +1043,10 @@ impl<'a> LwcBuilder<'a> {
             data.extend_from_slice(&payload);
             offset += data.len();
             if offset > u16::MAX as usize {
-                return Err(lwc_block_encoding_contract()
-                    .attach(format!("field=column_end_offset, column_no={col_idx}"))
-                    .attach(format!("actual={offset}, maximum={}", u16::MAX)));
+                return Err(lwc_block_encoding_contract().attach(format!(
+                    "field=column_end_offset, column_no={col_idx}, actual={offset}, maximum={}",
+                    u16::MAX
+                )));
             }
             col_offsets.push(offset as u16);
             column_payloads.push(data);
@@ -1511,9 +1513,11 @@ impl<'a> LwcNullBitmapSer<'a> {
     #[inline]
     pub(crate) fn new(bytes: &'a [u8]) -> InternalResult<Self> {
         if bytes.len() > u16::MAX as usize {
-            return Err(lwc_block_encoding_contract()
-                .attach("field=null_bitmap_byte_length")
-                .attach(format!("actual={}, maximum={}", bytes.len(), u16::MAX)));
+            return Err(lwc_block_encoding_contract().attach(format!(
+                "field=null_bitmap_byte_length, actual={}, maximum={}",
+                bytes.len(),
+                u16::MAX
+            )));
         }
         Ok(LwcNullBitmapSer { bytes })
     }

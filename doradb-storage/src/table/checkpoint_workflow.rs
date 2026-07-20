@@ -3,8 +3,10 @@ use super::deletion_buffer::DeleteMarker;
 use super::lifecycle::{CheckpointPublishLease, TableLifecycle, TableTerminal};
 use crate::error::FatalError;
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::obs;
+use crate::poison::EnginePoisoner;
 use crate::trx::SharedTrxStatus;
-use crate::trx::sys::TransactionSystem;
+use error_stack::Report;
 use parking_lot::Mutex;
 use std::fmt;
 use std::mem::replace;
@@ -284,25 +286,25 @@ enum CheckpointPublicationState {
 }
 
 /// Owns checkpoint workflow, lifecycle, and fatal-failure publication state.
-pub(super) struct CheckpointPublicationGuard<'table, 'trx> {
+pub(super) struct CheckpointPublicationGuard<'table, 'poison> {
     workflow: &'table TableCheckpointWorkflow,
     lifecycle: &'table TableLifecycle,
-    trx_sys: &'trx TransactionSystem,
+    poisoner: &'poison EnginePoisoner,
     publish_lease: Option<CheckpointPublishLease<'table>>,
     state: CheckpointPublicationState,
 }
 
-impl<'table, 'trx> CheckpointPublicationGuard<'table, 'trx> {
+impl<'table, 'poison> CheckpointPublicationGuard<'table, 'poison> {
     #[inline]
     pub(super) fn new(
         workflow: &'table TableCheckpointWorkflow,
         lifecycle: &'table TableLifecycle,
-        trx_sys: &'trx TransactionSystem,
+        poisoner: &'poison EnginePoisoner,
     ) -> Self {
         Self {
             workflow,
             lifecycle,
-            trx_sys,
+            poisoner,
             publish_lease: None,
             state: CheckpointPublicationState::Initial,
         }
@@ -408,7 +410,13 @@ impl Drop for CheckpointPublicationGuard<'_, '_> {
             CheckpointPublicationState::Publishing => self.workflow.finish_publication(),
             CheckpointPublicationState::Transition { reason }
             | CheckpointPublicationState::IrreversiblePublishing { reason } => {
-                let _ = self.trx_sys.poison_engine(*reason);
+                let report = Report::new(*reason)
+                    .attach("checkpoint publication stopped after an irreversible transition");
+                obs::error!(
+                    "event=engine_poison component=table action=poison result=error error={:?}",
+                    report
+                );
+                let _ = self.poisoner.poison(report);
             }
         }
     }

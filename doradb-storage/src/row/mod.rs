@@ -5,7 +5,7 @@ pub(crate) use ops::*;
 pub(crate) use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
-use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
+use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page};
 use crate::catalog::{IndexSpec, TableColumnLayout};
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
 use crate::id::RowID;
@@ -1101,8 +1101,6 @@ impl RowPage {
         }
     }
 }
-
-impl sealed::Sealed for RowPage {}
 
 // SAFETY: `RowPage` is a native in-process page image with explicit `repr(C)`
 // layout, exactly one page of storage, no drop glue, and zero-valid atomic and

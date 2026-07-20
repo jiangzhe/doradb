@@ -2,7 +2,7 @@ use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::table::TableMetadata;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, DataIntegrityResult, Error, FileKind, InternalError,
+    CompletionErrorBridge, CompletionResult, DataIntegrityResult, Error, FileKind, InternalError,
     IoResult, ResourceError, ResourceResult, Result, RuntimeResult,
 };
 use crate::file::SparseFile;
@@ -478,7 +478,7 @@ impl MutableTableFile {
 
         try_join_all(writes)
             .await
-            .map_err(|report| Error::from_completion_report(report, "persist table LWC blocks"))?;
+            .map_err(|report| Error::from_completion_bridge(report, "persist table LWC blocks"))?;
 
         let root = self.root();
         let column_index = ColumnBlockIndex::new(
@@ -535,10 +535,9 @@ impl MutableCowFile for MutableTableFile {
             .as_cow_write_barrier()
             .begin_write(self.file.sparse_file().file_id(), block_id)
             .map_err(|report| {
-                CompletionErrorKind::from_internal(
-                    report,
-                    format!("begin table CoW write barrier: block_id={block_id}"),
-                )
+                CompletionErrorBridge::capture(report.attach(format!(
+                    "begin table CoW write barrier: block_id={block_id}"
+                )))
             })?;
         self.file
             .file()

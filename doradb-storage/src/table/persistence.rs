@@ -7,8 +7,8 @@ use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
-    CompletionErrorKind, ConfigError, DataIntegrityError, Error, ErrorKind, FatalError,
-    InternalError, LifecycleError, OperationError, Result,
+    ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, IoError,
+    LifecycleError, OperationError, Result,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
@@ -943,7 +943,7 @@ impl Table {
             trx_sys.request_purge_observation();
             let horizon_listener = trx_sys.gc_horizon_listener();
             let lifecycle_listener = self.lifecycle.listener();
-            let poison_listener = trx_sys.poison_listener();
+            let poison_listener = session.engine.poisoner.listener();
             let shutdown_listener = session.engine.shutdown_listener();
 
             ensure_maintenance_wait_running(session, "wait for active-root checkpoint retry")?;
@@ -1026,7 +1026,7 @@ impl Table {
                         continue;
                     }
                     listeners.push(self.lifecycle.listener());
-                    listeners.push(trx_sys.poison_listener());
+                    listeners.push(session.engine.poisoner.listener());
                     listeners.push(session.engine.shutdown_listener());
 
                     ensure_maintenance_wait_running(
@@ -1052,7 +1052,7 @@ impl Table {
                     let listeners = vec![
                         trx_sys.gc_horizon_listener(),
                         self.lifecycle.listener(),
-                        trx_sys.poison_listener(),
+                        session.engine.poisoner.listener(),
                         session.engine.shutdown_listener(),
                     ];
                     ensure_maintenance_wait_running(
@@ -1275,7 +1275,7 @@ impl Table {
             .inspect_err(|err| {
                 if err.kind() == ErrorKind::Fatal {
                     obs::error!(
-                        "event=checkpoint_publish component=table table_id={} action=publish result=error error={}",
+                        "event=checkpoint_publish component=table table_id={} action=poison result=error error={}",
                         table_id,
                         err
                     );
@@ -1352,8 +1352,11 @@ impl Table {
                 heap_redo_start_ts
             }
         };
-        let mut publication_guard =
-            CheckpointPublicationGuard::new(&self.checkpoint_workflow, &self.lifecycle, &trx_sys);
+        let mut publication_guard = CheckpointPublicationGuard::new(
+            &self.checkpoint_workflow,
+            &self.lifecycle,
+            &session.engine.poisoner,
+        );
         if !pages.is_empty() {
             let transition_pages = self
                 .load_frozen_pages_for_transition(&pool_guards, &pages)
@@ -1488,13 +1491,21 @@ impl Table {
                     .await
             }
             .await
-            .map_err(|_| Error::from(trx_sys.poison_engine(FatalError::CatalogWrite)))?;
+            .map_err(|err| {
+                let report = err
+                    .into_fatal_report(FatalError::CatalogWrite)
+                    .attach("catalog silent-watermark update failed");
+                Error::from(session.engine.poisoner.poison(report))
+            })?;
             publication_guard.set_failure_reason(FatalError::CheckpointWrite);
             #[cfg(test)]
-            test_hooks::maybe_force_checkpoint_commit_error(&trx_sys);
-            let redo_cts = trx_sys
-                .commit_sys(sys_trx)
-                .map_err(|_| Error::from(trx_sys.poison_engine(FatalError::CheckpointWrite)))?;
+            test_hooks::maybe_force_checkpoint_commit_error(&session.engine.poisoner);
+            let redo_cts = trx_sys.commit_sys(sys_trx).map_err(|err| {
+                let report = err
+                    .into_fatal_report(FatalError::CheckpointWrite)
+                    .attach("commit silent table checkpoint redo failed");
+                Error::from(session.engine.poisoner.poison(report))
+            })?;
             publication_guard.finish();
             return Ok(CheckpointOutcome::Published {
                 checkpoint_ts,
@@ -1540,14 +1551,11 @@ impl Table {
             .await
         {
             Ok(res) => res,
-            Err(err)
-                if matches!(
-                    err.report().downcast_ref::<CompletionErrorKind>(),
-                    Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
-                ) =>
-            {
-                let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
-                return Err(poison.into());
+            Err(err) if err.report().downcast_ref::<IoError>().is_some() => {
+                let report = err
+                    .into_fatal_report(FatalError::CheckpointWrite)
+                    .attach("table checkpoint root publication IO failure");
+                return Err(session.engine.poisoner.poison(report).into());
             }
             Err(err) => return Err(err),
         };
@@ -1557,15 +1565,21 @@ impl Table {
             .await;
         #[cfg(test)]
         if test_hooks::test_force_post_publish_checkpoint_error_enabled() {
-            let poison = trx_sys.poison_engine(FatalError::CheckpointWrite);
+            let poison = session.engine.poisoner.poison(
+                Report::new(FatalError::CheckpointWrite)
+                    .attach("forced post-publication table checkpoint failure"),
+            );
             return Err(poison.into());
         }
 
         #[cfg(test)]
-        test_hooks::maybe_force_checkpoint_commit_error(&trx_sys);
-        let redo_cts = trx_sys
-            .commit_sys(sys_trx)
-            .map_err(|_| Error::from(trx_sys.poison_engine(FatalError::CheckpointWrite)))?;
+        test_hooks::maybe_force_checkpoint_commit_error(&session.engine.poisoner);
+        let redo_cts = trx_sys.commit_sys(sys_trx).map_err(|err| {
+            let report = err
+                .into_fatal_report(FatalError::CheckpointWrite)
+                .attach("commit table checkpoint redo failed");
+            Error::from(session.engine.poisoner.poison(report))
+        })?;
         publication_guard.finish();
         Ok(CheckpointOutcome::Published {
             checkpoint_ts,
@@ -1609,7 +1623,7 @@ fn silent_watermark_floor(
 
 #[inline]
 fn ensure_maintenance_wait_running(session: &SessionPin, operation: &'static str) -> Result<()> {
-    session.engine.trx_sys.ensure_runtime_healthy()?;
+    session.engine.poisoner.ensure_healthy()?;
     if session.engine.shutdown_started() {
         return Err(Report::new(LifecycleError::Shutdown)
             .attach(format!("{operation}: engine shutdown started"))
@@ -1622,7 +1636,7 @@ fn ensure_maintenance_wait_running(session: &SessionPin, operation: &'static str
 mod tests {
     pub(crate) mod test_hooks {
         use crate::error::{FatalError, InternalError, Result};
-        use crate::trx::sys::TransactionSystem;
+        use crate::poison::EnginePoisoner;
         use error_stack::Report;
         use std::cell::{Cell, RefCell};
         use std::future::Future;
@@ -1699,9 +1713,12 @@ mod tests {
             }
         }
 
-        pub(crate) fn maybe_force_checkpoint_commit_error(trx_sys: &TransactionSystem) {
+        pub(crate) fn maybe_force_checkpoint_commit_error(poisoner: &EnginePoisoner) {
             if TEST_FORCE_CHECKPOINT_COMMIT_ERROR.with(Cell::get) {
-                let _ = trx_sys.poison_engine(FatalError::CheckpointWrite);
+                let _ = poisoner.poison(
+                    Report::new(FatalError::CheckpointWrite)
+                        .attach("forced table checkpoint commit failure"),
+                );
             }
         }
 
@@ -3157,7 +3174,7 @@ mod tests {
                 matches!(outcome, CheckpointOutcome::Published { silent: false, .. }),
                 "{outcome:?}"
             );
-            assert!(engine.inner().trx_sys.poison_error().is_none());
+            assert!(engine.inner().poisoner.poison_error().is_none());
 
             let new_root = table.file().active_root_unchecked().clone();
             assert!(new_root.pivot_row_id > old_root.pivot_row_id);
@@ -4269,7 +4286,7 @@ mod tests {
             let mut publication_guard = CheckpointPublicationGuard::new(
                 &table.checkpoint_workflow,
                 &table.lifecycle,
-                &engine.inner().trx_sys,
+                &engine.inner().poisoner,
             );
             let result = publication_guard.begin_transition();
             assert!(matches!(result, Err(CheckpointCancelReason::TableDropping)));
@@ -4414,7 +4431,7 @@ mod tests {
             let workflow = TableCheckpointWorkflow::new();
             let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
             let guard =
-                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().poisoner);
 
             drop(guard);
 
@@ -4435,7 +4452,7 @@ mod tests {
             let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
             let mut guard =
-                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().poisoner);
             assert!(guard.begin_publishing(attempt.source()).unwrap());
 
             let duplicate = catch_unwind(AssertUnwindSafe(|| {
@@ -4449,7 +4466,7 @@ mod tests {
 
             let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
             let mut guard =
-                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().poisoner);
             let finish = catch_unwind(AssertUnwindSafe(|| guard.finish()));
             assert!(finish.is_err());
             drop(guard);
@@ -4470,7 +4487,7 @@ mod tests {
             let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
             let mut guard =
-                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().poisoner);
             assert!(guard.begin_publishing(attempt.source()).unwrap());
             assert_eq!(workflow.state_name(), "Publishing");
 
@@ -4493,7 +4510,7 @@ mod tests {
             let attempt = workflow.begin_checkpoint(&lifecycle).unwrap();
             let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
             let mut guard =
-                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().trx_sys);
+                CheckpointPublicationGuard::new(&workflow, &lifecycle, &engine.inner().poisoner);
             assert!(guard.begin_publishing(attempt.source()).unwrap());
 
             guard.finish();
@@ -5191,7 +5208,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::CheckpointWrite)
@@ -5374,7 +5391,7 @@ mod tests {
         assert!(
             engine
                 .inner()
-                .trx_sys
+                .poisoner
                 .poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::CatalogWrite)
@@ -5459,7 +5476,7 @@ mod tests {
 
             let poison = engine
                 .inner()
-                .trx_sys
+                .poisoner
                 .poison_error()
                 .expect("cancelled silent mutation should poison storage");
             assert_eq!(*poison.current_context(), FatalError::CatalogWrite);
@@ -6337,7 +6354,7 @@ mod tests {
             assert!(res.is_err());
             let poison = engine
                 .inner()
-                .trx_sys
+                .poisoner
                 .poison_error()
                 .expect("transition publication guard should poison storage");
             assert_eq!(*poison.current_context(), FatalError::CheckpointWrite);

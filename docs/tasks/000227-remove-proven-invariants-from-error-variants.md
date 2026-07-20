@@ -223,7 +223,7 @@ In `doradb-storage/src/component.rs`:
   construction failures still cross their associated error boundary.
 
 Propagate the topology and build-error signatures through `engine.rs`,
-`engine_poison.rs`,
+`poison.rs`,
 `buffer/mod.rs`, `buffer/evictor.rs`, `file/fs.rs`, `lock/mod.rs`,
 `catalog/mod.rs`, and `trx/sys.rs`. Remove only `?`, `Ok(())`, or test
 `unwrap()` plumbing made obsolete by the new return types; preserve all
@@ -451,7 +451,7 @@ Primary invariant and error-definition modules:
 Direct component-signature consumers:
 
 - `doradb-storage/src/engine.rs`
-- `doradb-storage/src/engine_poison.rs`
+- `doradb-storage/src/poison.rs`
 - `doradb-storage/src/buffer/mod.rs`
 - `doradb-storage/src/buffer/evictor.rs`
 - `doradb-storage/src/file/fs.rs`

@@ -721,30 +721,35 @@ impl<M> CowFile<M> {
             })?;
         self.write_block_with_lease(background_writes, meta_block_id, meta_buf, write_lease)
             .await
-            .change_context(RuntimeError::FileRootAccess)
-            .attach_with(|| {
-                format!(
+            .map_err(|bridge| {
+                bridge
+                    .replace_context(RuntimeError::FileRootAccess)
+                    .attach(format!(
                     "operation=publish_file_root, file_id={file_id}, phase=write_meta_block, block_id={meta_block_id}"
-                )
+                ))
             })?;
 
         let super_buf = (self.codec.build_super_block)(&new_root.root);
         let offset = new_root.root.slot_no as usize * super_buf.capacity();
         self.write_at_offset(background_writes, offset, super_buf)
             .await
-            .change_context(RuntimeError::FileRootAccess)
-            .attach_with(|| {
-                format!(
+            .map_err(|bridge| {
+                bridge
+                    .replace_context(RuntimeError::FileRootAccess)
+                    .attach(format!(
                     "operation=publish_file_root, file_id={file_id}, phase=write_super_block, block_id={SUPER_BLOCK_ID}, slot_no={}",
                     new_root.root.slot_no
-                )
+                ))
             })?;
 
         fsync_direct(Arc::clone(&self.file), background_writes)
             .await
-            .change_context(RuntimeError::FileRootAccess)
-            .attach_with(|| {
-                format!("operation=publish_file_root, file_id={file_id}, phase=fsync")
+            .map_err(|bridge| {
+                bridge
+                    .replace_context(RuntimeError::FileRootAccess)
+                    .attach(format!(
+                        "operation=publish_file_root, file_id={file_id}, phase=fsync"
+                    ))
             })?;
         Ok(self.swap_active_root(new_root.root))
     }

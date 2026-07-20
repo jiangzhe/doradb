@@ -1607,7 +1607,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file
             .write_block(block_id, buf)
             .await
-            .map_err(|report| Error::from_completion_report(report, "write DiskTree node"))
+            .map_err(|report| Error::from_completion_bridge(report, "write DiskTree node"))
     }
 }
 
@@ -2388,7 +2388,7 @@ mod tests {
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
     use crate::error::{
-        CompletionErrorKind, CompletionResult, DataIntegrityError, ErrorKind, InternalError,
+        CompletionErrorBridge, CompletionResult, DataIntegrityError, ErrorKind, InternalError,
         IoError, ResourceResult,
     };
     use crate::file::block_integrity::checksum_offset;
@@ -2694,9 +2694,9 @@ mod tests {
                     // TODO(error-boundary): backlog 000160 should assert this
                     // injected IO source remains visible after rewrite cleanup.
                     let source = StdIoError::other("test disk-tree write failure");
-                    return Err(CompletionErrorKind::from_io(
-                        Report::new(IoError::from(source.kind())).attach(format!("{source}")),
-                        "inject DiskTree write failure",
+                    return Err(CompletionErrorBridge::capture(
+                        Report::new(IoError::from(source.kind()))
+                            .attach(format!("inject DiskTree write failure: {source}")),
                     ));
                 }
                 self.inner.write_block(block_id, buf).await

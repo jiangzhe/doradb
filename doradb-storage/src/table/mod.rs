@@ -1121,7 +1121,7 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        CompletionErrorKind, DataIntegrityError, Error, FatalError, FileKind, OperationError,
+        CompletionErrorBridge, DataIntegrityError, Error, FatalError, FileKind, OperationError,
         Result,
     };
     use crate::file::SparseFile;
@@ -1141,7 +1141,7 @@ pub(crate) mod tests {
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::quiescent::QuiescentGuard;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-    use crate::session::Session;
+    use crate::session::{Session, tests::SessionTestExt};
     use crate::table::{
         CheckpointPublishLease, DeleteMarker, FreezeOutcome, FrozenPageBatchInfo, Table,
         TableCheckpointRootMutationLease, TableRuntimeLayout,
@@ -1430,16 +1430,16 @@ pub(crate) mod tests {
         expected: DataIntegrityError,
     ) {
         let report = format!("{err:?}");
-        if err.report().downcast_ref::<CompletionErrorKind>().copied()
-            == Some(CompletionErrorKind::DataIntegrity(expected))
-        {
-            assert!(report.contains("propagate from other threads"), "{report}");
-            assert!(report.contains("wait for"), "{report}");
-            return;
-        }
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(expected),
+            "{report}"
+        );
+        assert!(!report.contains("propagate from other threads"), "{report}");
+        assert!(
+            err.report()
+                .downcast_ref::<CompletionErrorBridge>()
+                .is_none(),
             "{report}"
         );
         assert!(report.contains("table_file"), "{report}");
@@ -1455,7 +1455,7 @@ pub(crate) mod tests {
         assert!(
             engine
                 .inner()
-                .trx_sys
+                .poisoner
                 .poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::CheckpointWrite)
@@ -1724,6 +1724,36 @@ pub(crate) mod tests {
             err.report().downcast_ref::<OperationError>().copied(),
             Some(OperationError::InvalidDmlInput)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "block-index column route requires disk pool guard")]
+    fn test_block_index_column_route_panics_without_disk_pool_guard() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                lightweight_test_engine(&temp_dir, "block_index_disk_guard_invariant").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let session = engine.new_session().unwrap();
+            let guards = session.pool_guards();
+
+            table
+                .mem
+                .blk_idx
+                .update_column_root(RowID::new(1), BlockID::new(77))
+                .await;
+            let _ = table
+                .mem
+                .blk_idx
+                .find_row(
+                    guards.meta_guard(),
+                    None,
+                    RowID::new(0),
+                    Some(&table.storage),
+                )
+                .await;
+        });
     }
 
     #[test]

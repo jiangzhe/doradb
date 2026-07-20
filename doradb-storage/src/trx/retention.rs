@@ -1,9 +1,10 @@
 use crate::catalog::CatalogCheckpointOutcome;
-use crate::error::{CompletionErrorKind, DataIntegrityError, FatalError, Result};
+use crate::error::{DataIntegrityError, FatalError, IoError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::{
     discover_redo_log_files, next_redo_file_seq, obsolete_redo_log_files_below_marker,
 };
+use crate::obs;
 use crate::recovery::stream::{
     RedoReplayPlanner, RedoRetentionSegment, RedoRetentionSegmentState, RedoSegmentCtsRange,
 };
@@ -172,7 +173,7 @@ impl TransactionSystem {
         // Session admission happens before the async gate waits above. Recheck
         // here so poison published while truncation was queued prevents marker
         // publication and physical redo cleanup.
-        self.ensure_runtime_healthy()?;
+        self.poisoner.ensure_healthy()?;
         let plan = self.plan_redo_truncation()?;
         let previous_first_retained_file_seq = plan.first_retained_file_seq;
         let target_marker = match plan.candidates.last() {
@@ -188,13 +189,15 @@ impl TransactionSystem {
                 .await
             {
                 Ok(marker) => marker,
-                Err(err)
-                    if matches!(
-                        err.report().downcast_ref::<CompletionErrorKind>(),
-                        Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
-                    ) =>
-                {
-                    return Err(self.poison_engine(FatalError::CheckpointWrite).into());
+                Err(err) if err.report().downcast_ref::<IoError>().is_some() => {
+                    let report = err
+                        .into_fatal_report(FatalError::CheckpointWrite)
+                        .attach("publish redo retention marker IO failure");
+                    obs::error!(
+                        "event=engine_poison component=redo_retention action=poison result=error error={:?}",
+                        report
+                    );
+                    return Err(self.poisoner.poison(report).into_report().into());
                 }
                 Err(err) => return Err(err),
             }
@@ -233,7 +236,7 @@ impl TransactionSystem {
         // Session admission happened before these async waits. Recheck after
         // the gates so queued storage poison cannot publish metadata or unlink
         // redo files.
-        self.ensure_runtime_healthy()?;
+        self.poisoner.ensure_healthy()?;
 
         // 2. Scan exactly one catalog checkpoint batch and prepare, but do not
         // commit, the projected catalog root. Keeping the root mutable lets the
@@ -325,13 +328,15 @@ impl TransactionSystem {
             }
             match prepared.commit(&self.catalog.storage).await {
                 Ok(outcome) => outcome,
-                Err(err)
-                    if matches!(
-                        err.report().downcast_ref::<CompletionErrorKind>(),
-                        Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
-                    ) =>
-                {
-                    return Err(self.poison_engine(FatalError::CheckpointWrite).into());
+                Err(err) if err.report().downcast_ref::<IoError>().is_some() => {
+                    let report = err
+                        .into_fatal_report(FatalError::CheckpointWrite)
+                        .attach("commit combined catalog checkpoint IO failure");
+                    obs::error!(
+                        "event=engine_poison component=redo_retention action=poison result=error error={:?}",
+                        report
+                    );
+                    return Err(self.poisoner.poison(report).into_report().into());
                 }
                 Err(err) => return Err(err),
             }
@@ -344,13 +349,15 @@ impl TransactionSystem {
                     .await
                 {
                     Ok(marker) => marker,
-                    Err(err)
-                        if matches!(
-                            err.report().downcast_ref::<CompletionErrorKind>(),
-                            Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
-                        ) =>
-                    {
-                        return Err(self.poison_engine(FatalError::CheckpointWrite).into());
+                    Err(err) if err.report().downcast_ref::<IoError>().is_some() => {
+                        let report = err
+                            .into_fatal_report(FatalError::CheckpointWrite)
+                            .attach("publish combined redo retention marker IO failure");
+                        obs::error!(
+                            "event=engine_poison component=redo_retention action=poison result=error error={:?}",
+                            report
+                        );
+                        return Err(self.poisoner.poison(report).into_report().into());
                     }
                     Err(err) => return Err(err),
                 };

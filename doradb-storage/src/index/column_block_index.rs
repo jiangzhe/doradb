@@ -2146,7 +2146,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file
             .write_block(block_id, buf)
             .await
-            .map_err(|report| Error::from_completion_report(report, "write column block node"))
+            .map_err(|report| Error::from_completion_bridge(report, "write column block node"))
     }
 }
 

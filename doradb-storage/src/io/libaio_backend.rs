@@ -2,9 +2,8 @@ use super::libaio_abi::{
     io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
 use super::{
-    BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState,
-    IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt, SubmitRetry,
-    SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
+    Backend, BackendError, BackendResult, BackendStatsHandle, BackendToken, IOKind, Operation,
+    StdIoResult, SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup,
 };
 use crate::error::{IoError, IoResult};
 use error_stack::Report;
@@ -15,22 +14,25 @@ use std::num::NonZeroUsize;
 use std::ptr::null_mut;
 use std::time::Instant;
 
+/// Canonical name used in libaio backend diagnostics.
+pub(crate) const BACKEND_NAME: &str = "libaio";
+
 type LibaioWaitResult = (usize, Vec<(BackendToken, StdIoResult<usize>)>);
 
 /// Concrete libaio context used by the current storage-engine backend.
 ///
-/// This type implements the generic [`IOBackend`] contract used by the storage
+/// This type implements the generic [`Backend`] contract used by the storage
 /// IO schedulers.
 pub(crate) struct LibaioBackend {
     ctx: io_context_t,
     io_depth: usize,
-    stats: IOBackendStatsHandle,
+    stats: BackendStatsHandle,
 }
 
 impl LibaioBackend {
     /// Returns a cloneable handle to backend-owned submit/wait statistics.
     #[inline]
-    pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
+    pub(crate) fn stats_handle(&self) -> BackendStatsHandle {
         self.stats.clone()
     }
 
@@ -38,7 +40,7 @@ impl LibaioBackend {
     /// Submit count will be returned, and caller need to take
     /// care of cleaning the input slice.
     #[inline]
-    fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> IoResult<SubmitAttempt> {
+    fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> BackendResult<SubmitAttempt> {
         if reqs.is_empty() || limit == 0 {
             return Ok(SubmitAttempt::Noop);
         }
@@ -49,21 +51,22 @@ impl LibaioBackend {
             if errcode == EAGAIN {
                 let reason = SubmitRetryReason::from_raw_errno(errcode)
                     .expect("EAGAIN must convert to submit retry reason");
-                return Ok(SubmitAttempt::Retry(SubmitRetry::new("libaio", reason, 1)));
+                return Ok(SubmitAttempt::Retry(SubmitRetry::new(reason, 1)));
             }
             let err = StdIoError::from_raw_os_error(errcode);
-            let queue_state = IOBackendQueueState::submit(reqs.len(), batch_size);
             let err = if errcode == EINVAL {
-                IOBackendFailure::report_with_note(
-                    "libaio",
-                    IOBackendErrorPhase::Submit,
+                BackendError::submit_with_note(
+                    BACKEND_NAME,
                     err,
                     1,
-                    queue_state,
-                    "native libaio IO_CMD_FSYNC/IO_CMD_FDSYNC may be unsupported by this kernel",
+                    reqs.len(),
+                    batch_size,
+                    Some(
+                        "native libaio IO_CMD_FSYNC/IO_CMD_FDSYNC may be unsupported by this kernel",
+                    ),
                 )
             } else {
-                IOBackendFailure::report("libaio", IOBackendErrorPhase::Submit, err, 1, queue_state)
+                BackendError::submit(BACKEND_NAME, err, 1, reqs.len(), batch_size)
             };
             return Err(err);
         }
@@ -72,7 +75,6 @@ impl LibaioBackend {
             // accepted no iocbs. Keep the staged batch intact and enter the
             // bounded retry/progress-failure path.
             return Ok(SubmitAttempt::Retry(SubmitRetry::new(
-                "libaio",
                 SubmitRetryReason::NoProgress,
                 1,
             )));
@@ -88,7 +90,7 @@ impl LibaioBackend {
         &self,
         events: &mut [io_event],
         min_nr: usize,
-    ) -> IoResult<LibaioWaitResult> {
+    ) -> BackendResult<LibaioWaitResult> {
         let max_nwait = events.len();
         let mut wait_calls = 0;
         let count = loop {
@@ -105,13 +107,7 @@ impl LibaioBackend {
                     continue;
                 }
                 let err = StdIoError::from_raw_os_error(errcode);
-                return Err(IOBackendFailure::report(
-                    "libaio",
-                    IOBackendErrorPhase::Wait,
-                    err,
-                    wait_calls,
-                    IOBackendQueueState::unknown(),
-                ));
+                return Err(BackendError::wait(BACKEND_NAME, err, wait_calls));
             }
             break ret as usize;
         };
@@ -153,7 +149,7 @@ impl Drop for LibaioBackend {
     }
 }
 
-impl IOBackend for LibaioBackend {
+impl Backend for LibaioBackend {
     type Prepared = Box<iocb>;
     type SubmitBatch = LibaioSubmitBatch;
     type Events = Box<[io_event]>;
@@ -161,12 +157,15 @@ impl IOBackend for LibaioBackend {
     #[inline]
     fn setup(io_depth: usize) -> IoResult<Self> {
         if io_depth == 0 {
-            return Err(Report::new(IoError::from(StdIoErrorKind::InvalidInput))
-                .attach("backend=libaio, io_depth=0, reason=io depth must be non-zero"));
+            return Err(
+                Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
+                    "backend={BACKEND_NAME}, io_depth=0, reason=io depth must be non-zero"
+                )),
+            );
         }
         let kernel_io_depth = i32::try_from(io_depth).map_err(|_| {
             Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
-                "backend=libaio, io_depth={io_depth}, reason=io depth exceeds i32"
+                "backend={BACKEND_NAME}, io_depth={io_depth}, reason=io depth exceeds i32"
             ))
         })?;
         let mut ctx = null_mut();
@@ -178,7 +177,7 @@ impl IOBackend for LibaioBackend {
                 0 => Ok(Self {
                     ctx,
                     io_depth,
-                    stats: IOBackendStatsHandle::default(),
+                    stats: BackendStatsHandle::default(),
                 }),
                 ret => {
                     let err = StdIoError::from_raw_os_error(-ret);
@@ -247,7 +246,7 @@ impl IOBackend for LibaioBackend {
         &mut self,
         batch: &mut Self::SubmitBatch,
         limit: usize,
-    ) -> IoResult<SubmitAttempt> {
+    ) -> BackendResult<SubmitAttempt> {
         if batch.staged.is_empty() || limit == 0 {
             return Ok(SubmitAttempt::Noop);
         }
@@ -275,7 +274,7 @@ impl IOBackend for LibaioBackend {
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
-    ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
         let start = Instant::now();
         let (_wait_calls, completed) = self
             .wait_at_least_with_attempts(events, min_nr)
@@ -285,10 +284,8 @@ impl IOBackend for LibaioBackend {
                 self.stats.record_wait_completions(completed.len());
             })
             .inspect_err(|err| {
-                self.stats.record_submit_and_wait(
-                    backend_call_count(err),
-                    start.elapsed().as_nanos() as usize,
-                );
+                self.stats
+                    .record_submit_and_wait(err.call_count(), start.elapsed().as_nanos() as usize);
             })?;
         Ok(completed)
     }
@@ -464,7 +461,6 @@ pub(crate) mod tests {
         let SubmitAttempt::Retry(retry) = submit_result else {
             panic!("expected submit retry");
         };
-        assert_eq!(retry.backend(), "libaio");
         assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
         assert_eq!(retry.raw_errno(), Some(EAGAIN));
         assert_eq!(retry.call_count(), 1);
@@ -481,7 +477,6 @@ pub(crate) mod tests {
         let SubmitAttempt::Retry(retry) = submit_result else {
             panic!("expected submit retry");
         };
-        assert_eq!(retry.backend(), "libaio");
         assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
         assert_eq!(retry.raw_errno(), None);
         assert_eq!(retry.call_count(), 1);
@@ -517,11 +512,8 @@ pub(crate) mod tests {
         let mut backend = LibaioBackend::setup(4).unwrap();
 
         let mut fsync = Operation::fsync(17);
-        let fsync_iocb = <LibaioBackend as IOBackend>::prepare(
-            &mut backend,
-            BackendToken::new(1, 2),
-            &mut fsync,
-        );
+        let fsync_iocb =
+            <LibaioBackend as Backend>::prepare(&mut backend, BackendToken::new(1, 2), &mut fsync);
         assert_eq!(fsync_iocb.aio_lio_opcode, io_iocb_cmd::IO_CMD_FSYNC as u16);
         assert_eq!(fsync_iocb.aio_fildes, 17);
         assert_eq!(fsync_iocb.buf, null_mut());
@@ -529,7 +521,7 @@ pub(crate) mod tests {
         assert_eq!(fsync_iocb.offset, 0);
 
         let mut fdatasync = Operation::fdatasync(19);
-        let fdatasync_iocb = <LibaioBackend as IOBackend>::prepare(
+        let fdatasync_iocb = <LibaioBackend as Backend>::prepare(
             &mut backend,
             BackendToken::new(1, 3),
             &mut fdatasync,
@@ -578,7 +570,7 @@ pub(crate) mod tests {
         let previous = set_io_getevents_hook(Some(eintr_then_one_completion));
         let baseline = backend.stats_handle().snapshot();
         let completions =
-            <LibaioBackend as IOBackend>::wait_at_least(&mut backend, &mut events, 1).unwrap();
+            <LibaioBackend as Backend>::wait_at_least(&mut backend, &mut events, 1).unwrap();
         set_io_getevents_hook(previous);
 
         assert_eq!(IO_GETEVENTS_CALLS.load(Ordering::SeqCst), 2);

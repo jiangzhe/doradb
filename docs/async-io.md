@@ -67,14 +67,17 @@ That is the shared contract across both supported backends.
 
 ## Backend Contract
 
-`crate::io::IOBackend` is the backend boundary. Each implementation provides:
+`crate::io::Backend` is the backend boundary. Each implementation provides:
 
 - one prepared submission type;
 - one backend-owned submit-batch type;
 - one backend-owned completion-event buffer type;
 - translation from `Operation` to the backend submission format; and
 - fallible batch submit plus completion wait methods that return
-  `BackendToken`s when progress succeeds.
+  `BackendToken`s when progress succeeds. Runtime progress failures use
+  `BackendResult<T> = Result<T, BackendError>` until a completion, Fatal, or
+  public reporting owner converts them to an IO report. Backend setup remains
+  `IoResult`, and each normal operation completion remains `StdIoResult`.
 
 Schedulers remain backend-neutral. The shared storage service uses
 domain-specific state-machine methods to decide how requests become

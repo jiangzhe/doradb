@@ -1,7 +1,6 @@
 use super::{
-    BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState,
-    IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult, SubmitAttempt,
-    SubmitRetry, SubmitRetryReason, SubmittedIoCleanup, backend_call_count,
+    Backend, BackendError, BackendResult, BackendStats, BackendStatsHandle, BackendToken, IOKind,
+    Operation, StdIoResult, SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup,
 };
 use crate::error::{IoError, IoResult};
 use error_stack::Report;
@@ -14,26 +13,29 @@ use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+/// Canonical name used in io_uring backend diagnostics.
+pub(crate) const BACKEND_NAME: &str = "io_uring";
+
 const IOURING_SYNC_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Concrete io_uring context used by the storage-engine backend.
 pub(crate) struct IouringBackend {
     ring: IoUring,
     io_depth: usize,
-    stats: IOBackendStatsHandle,
+    stats: BackendStatsHandle,
 }
 
 impl IouringBackend {
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
     #[expect(dead_code, reason = "internal io backend stats")]
-    fn stats(&self) -> IOBackendStats {
+    fn stats(&self) -> BackendStats {
         self.stats.snapshot()
     }
 
     /// Returns a cloneable handle to backend-owned submit/wait statistics.
     #[inline]
-    pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
+    pub(crate) fn stats_handle(&self) -> BackendStatsHandle {
         self.stats.clone()
     }
 
@@ -80,7 +82,10 @@ impl IouringBackend {
     }
 
     #[inline]
-    fn submit_pending_sqes(&mut self, batch: &mut IouringSubmitBatch) -> IoResult<SubmitOutcome> {
+    fn submit_pending_sqes(
+        &mut self,
+        batch: &mut IouringSubmitBatch,
+    ) -> BackendResult<SubmitOutcome> {
         debug_assert!(batch.pending_sqes != 0);
 
         let mut call_count = 0usize;
@@ -98,12 +103,12 @@ impl IouringBackend {
                     return Ok(retry_submit(reason, call_count));
                 }
                 Err(err) => {
-                    return Err(IOBackendFailure::report(
-                        "io_uring",
-                        IOBackendErrorPhase::Submit,
+                    return Err(BackendError::submit(
+                        BACKEND_NAME,
                         err,
                         call_count,
-                        IOBackendQueueState::submit(batch.staged.len(), batch.pending_sqes),
+                        batch.staged.len(),
+                        batch.pending_sqes,
                     ));
                 }
             }
@@ -112,11 +117,7 @@ impl IouringBackend {
         Ok(batch.finish_submit(submitted, call_count))
     }
 
-    fn blocking_submit_and_wait(
-        &mut self,
-        min_nr: usize,
-        observed_completions: usize,
-    ) -> IoResult<BlockingWaitOutcome> {
+    fn blocking_submit_and_wait(&mut self, min_nr: usize) -> BackendResult<BlockingWaitOutcome> {
         let mut call_count = 0usize;
         let submitted = loop {
             call_count += 1;
@@ -124,13 +125,7 @@ impl IouringBackend {
                 Ok(submitted) => break submitted,
                 Err(err) if err.raw_os_error() == Some(EINTR) => {}
                 Err(err) => {
-                    return Err(IOBackendFailure::report(
-                        "io_uring",
-                        IOBackendErrorPhase::Wait,
-                        err,
-                        call_count,
-                        IOBackendQueueState::wait_with_completions(observed_completions),
-                    ));
+                    return Err(BackendError::wait(BACKEND_NAME, err, call_count));
                 }
             }
         };
@@ -141,7 +136,7 @@ impl IouringBackend {
     }
 }
 
-impl IOBackend for IouringBackend {
+impl Backend for IouringBackend {
     type Prepared = squeue::Entry;
     type SubmitBatch = IouringSubmitBatch;
     type Events = ();
@@ -149,17 +144,20 @@ impl IOBackend for IouringBackend {
     #[inline]
     fn setup(io_depth: usize) -> IoResult<Self> {
         if io_depth == 0 {
-            return Err(Report::new(IoError::from(StdIoErrorKind::InvalidInput))
-                .attach("backend=io_uring, io_depth=0, reason=io depth must be non-zero"));
+            return Err(
+                Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
+                    "backend={BACKEND_NAME}, io_depth=0, reason=io depth must be non-zero"
+                )),
+            );
         }
         let ring_entries = io_depth.checked_next_power_of_two().ok_or_else(|| {
             Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
-                "backend=io_uring, io_depth={io_depth}, reason=next power of two overflow"
+                "backend={BACKEND_NAME}, io_depth={io_depth}, reason=next power of two overflow"
             ))
         })?;
         let ring_entries = u32::try_from(ring_entries).map_err(|_| {
             Report::new(IoError::from(StdIoErrorKind::InvalidInput)).attach(format!(
-                "backend=io_uring, io_depth={io_depth}, ring_entries={ring_entries}, reason=ring entries exceed u32"
+                "backend={BACKEND_NAME}, io_depth={io_depth}, ring_entries={ring_entries}, reason=ring entries exceed u32"
             ))
         })?;
         let ring = IoUring::new(ring_entries).map_err(|err| {
@@ -168,7 +166,7 @@ impl IOBackend for IouringBackend {
         Ok(Self {
             ring,
             io_depth,
-            stats: IOBackendStatsHandle::default(),
+            stats: BackendStatsHandle::default(),
         })
     }
 
@@ -220,7 +218,7 @@ impl IOBackend for IouringBackend {
         &mut self,
         batch: &mut Self::SubmitBatch,
         limit: usize,
-    ) -> IoResult<SubmitAttempt> {
+    ) -> BackendResult<SubmitAttempt> {
         let start = Instant::now();
         let sq_full = self.stage_pending_sqes(batch, limit);
 
@@ -230,7 +228,6 @@ impl IOBackend for IouringBackend {
                 // Treat this as submit pressure so bounded retry can fail
                 // sustained no-progress instead of spinning on Noop.
                 return Ok(SubmitAttempt::Retry(SubmitRetry::new(
-                    "io_uring",
                     SubmitRetryReason::NoProgress,
                     0,
                 )));
@@ -249,10 +246,8 @@ impl IOBackend for IouringBackend {
                 }
             })
             .inspect_err(|err| {
-                self.stats.record_submit_and_wait(
-                    backend_call_count(err),
-                    start.elapsed().as_nanos() as usize,
-                );
+                self.stats
+                    .record_submit_and_wait(err.call_count(), start.elapsed().as_nanos() as usize);
             })
             .map(|outcome| outcome.result)
     }
@@ -262,14 +257,13 @@ impl IOBackend for IouringBackend {
         &mut self,
         _events: &mut Self::Events,
         min_nr: usize,
-    ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
         {
             let cq = self.ring.completion();
             if cq.len() < min_nr {
-                let completions = cq.len();
                 drop(cq);
                 let start = Instant::now();
-                self.blocking_submit_and_wait(min_nr, completions)
+                self.blocking_submit_and_wait(min_nr)
                     .inspect(|outcome| {
                         record_blocking_wait_stats(
                             &self.stats,
@@ -282,7 +276,7 @@ impl IOBackend for IouringBackend {
                         record_blocking_wait_stats(
                             &self.stats,
                             None,
-                            backend_call_count(err),
+                            err.call_count(),
                             start.elapsed().as_nanos() as usize,
                         );
                     })?;
@@ -304,7 +298,7 @@ impl IOBackend for IouringBackend {
         {
             Ok(()) => SubmittedIoCleanup::DropAfterBackend,
             Err(err) => SubmittedIoCleanup::LeakAfterBackend {
-                backend: "io_uring",
+                backend: BACKEND_NAME,
                 reason: format!("sync cancel failed for {submitted} submitted ops: {err}"),
             },
         }
@@ -338,11 +332,7 @@ impl IouringSubmitBatch {
                 // `submit()` was called with pending SQEs but accepted none.
                 // Keep the pending prefix intact and let callers use the
                 // bounded retry/progress-failure path.
-                SubmitAttempt::Retry(SubmitRetry::new(
-                    "io_uring",
-                    SubmitRetryReason::NoProgress,
-                    call_count,
-                ))
+                SubmitAttempt::Retry(SubmitRetry::new(SubmitRetryReason::NoProgress, call_count))
             }
         };
         SubmitOutcome { result, call_count }
@@ -362,14 +352,14 @@ struct BlockingWaitOutcome {
 #[inline]
 fn retry_submit(reason: SubmitRetryReason, call_count: usize) -> SubmitOutcome {
     SubmitOutcome {
-        result: SubmitAttempt::Retry(SubmitRetry::new("io_uring", reason, call_count)),
+        result: SubmitAttempt::Retry(SubmitRetry::new(reason, call_count)),
         call_count,
     }
 }
 
 #[inline]
 fn record_blocking_wait_stats(
-    stats: &IOBackendStatsHandle,
+    stats: &BackendStatsHandle,
     outcome: Option<&BlockingWaitOutcome>,
     call_count: usize,
     elapsed_nanos: usize,
@@ -420,7 +410,6 @@ mod tests {
         let SubmitAttempt::Retry(retry) = outcome.result else {
             panic!("expected submit retry");
         };
-        assert_eq!(retry.backend(), "io_uring");
         assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
         assert_eq!(retry.raw_errno(), None);
         assert_eq!(retry.call_count(), 1);
@@ -449,7 +438,6 @@ mod tests {
         let SubmitAttempt::Retry(retry) = outcome.result else {
             panic!("expected submit retry");
         };
-        assert_eq!(retry.backend(), "io_uring");
         assert_eq!(retry.reason(), SubmitRetryReason::Ebusy);
         assert_eq!(retry.raw_errno(), Some(EBUSY));
         assert_eq!(retry.call_count(), 3);
@@ -487,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_record_blocking_wait_stats_counts_combined_fields() {
-        let stats = IOBackendStatsHandle::default();
+        let stats = BackendStatsHandle::default();
         let outcome = BlockingWaitOutcome {
             submitted: 5,
             call_count: 2,

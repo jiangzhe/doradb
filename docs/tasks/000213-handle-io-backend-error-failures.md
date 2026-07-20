@@ -113,7 +113,7 @@ owning the poison state.
 
 1. Add the `EnginePoisoner` component.
    - Add a crate-private component, for example in
-     `doradb-storage/src/engine_poison.rs`.
+     `doradb-storage/src/poison.rs`.
    - Implement `Component` with `Config = ()`,
      `Owned = EnginePoisoner`, and
      `Access = QuiescentGuard<EnginePoisoner>`.
@@ -123,7 +123,7 @@ owning the poison state.
      `doradb-storage/src/component.rs`.
    - Store a `QuiescentGuard<EnginePoisoner>` in `EngineInner`.
    - Change `EngineInner::acquire_admission` to call
-     `engine_poisoner.ensure_healthy()` instead of
+     `poisoner.ensure_healthy()` instead of
      `trx_sys.ensure_runtime_healthy()`.
 
 2. Move poison state out of `TransactionSystem`.
@@ -358,7 +358,7 @@ owning the poison state.
 
 ## Impacts
 
-- `doradb-storage/src/engine_poison.rs` or equivalent new module:
+- `doradb-storage/src/poison.rs` or equivalent new module:
   `EnginePoisoner` component and poison API.
 - `doradb-storage/src/lib.rs`: register the new module.
 - `doradb-storage/src/component.rs`: component-order documentation.

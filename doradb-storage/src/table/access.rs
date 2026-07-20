@@ -338,18 +338,18 @@ impl<'a> UserTableAccessor<'a> {
         rt: TrxRuntime<'_>,
         row_id: RowID,
     ) -> Result<()> {
-        let trx_sys = &rt.engine().trx_sys;
+        let engine = rt.engine();
         loop {
-            trx_sys.ensure_runtime_healthy()?;
+            engine.poisoner.ensure_healthy()?;
             if row_id < self.mem().blk_idx().pivot_row_id() {
                 return Ok(());
             }
             let route_epoch = self.mem().blk_idx().route_epoch();
-            let poison_listener = trx_sys.poison_listener();
+            let poison_listener = engine.poisoner.listener();
             if row_id < self.mem().blk_idx().pivot_row_id() {
                 return Ok(());
             }
-            trx_sys.ensure_runtime_healthy()?;
+            engine.poisoner.ensure_healthy()?;
 
             // Row pages in TRANSITION need either a newly published cold route
             // or storage poison. Without the poison wake, writers could sleep
@@ -362,7 +362,7 @@ impl<'a> UserTableAccessor<'a> {
                 () = route_wait => (),
                 () = poison_wait => (),
             }
-            trx_sys.ensure_runtime_healthy()?;
+            engine.poisoner.ensure_healthy()?;
         }
     }
 
@@ -470,7 +470,11 @@ impl<'a> UserTableAccessor<'a> {
     #[inline]
     fn row_page_create_redo_ctx<'b>(&self, rt: TrxRuntime<'b>) -> Option<RowPageCreateRedoCtx<'b>> {
         let engine = rt.engine();
-        Some(RowPageCreateRedoCtx::new(&engine.trx_sys, self.table_id()))
+        Some(RowPageCreateRedoCtx::new(
+            &engine.trx_sys,
+            &engine.poisoner,
+            self.table_id(),
+        ))
     }
 
     #[inline]
@@ -3645,7 +3649,7 @@ mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{
-        CompletionErrorKind, DataIntegrityError, FatalError, InternalError, OperationError, Result,
+        DataIntegrityError, FatalError, InternalError, IoError, OperationError, Result,
     };
     use crate::id::{PageID, RowID, SessionID, TableID, TrxID};
     use crate::index::{RowLocation, UniqueIndex};
@@ -3676,7 +3680,7 @@ mod tests {
     use crate::value::{Val, ValKind};
     use error_stack::Report;
     use smol::Timer;
-    use std::io::Error as IoError;
+    use std::io::Error as StdIoError;
     use std::iter::repeat_n;
     use std::sync::Arc;
     use std::time::Duration;
@@ -6929,7 +6933,7 @@ mod tests {
                     let mut transition_guard = CheckpointPublicationGuard::new(
                         &table.checkpoint_workflow,
                         &table.lifecycle,
-                        &engine.inner().trx_sys,
+                        &engine.inner().poisoner,
                     );
                     transition_guard.begin_transition().unwrap();
                     table
@@ -7349,7 +7353,7 @@ mod tests {
                 libc::EIO,
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
-            let expected_error_kind = IoError::from_raw_os_error(libc::EIO).kind();
+            let expected_error_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
 
             let mut trx = session.begin_trx().unwrap();
             let res = trx_insert_row_by_id(
@@ -7362,9 +7366,10 @@ mod tests {
             assert!(
                 res.as_ref().is_err_and(|err| err
                     .report()
-                    .downcast_ref::<CompletionErrorKind>()
+                    .downcast_ref::<IoError>()
                     .copied()
-                    == Some(CompletionErrorKind::Io(expected_error_kind))),
+                    .map(IoError::kind)
+                    == Some(expected_error_kind)),
                 "expected insert-page reload failure, got {res:?}"
             );
             assert!(
@@ -7447,7 +7452,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
@@ -7456,8 +7461,8 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
-                    .ensure_runtime_healthy()
+                    .poisoner
+                    .ensure_healthy()
                     .as_ref()
                     .is_err_and(|err| *err.current_context() == FatalError::RollbackAccess)
             );
@@ -7555,7 +7560,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)

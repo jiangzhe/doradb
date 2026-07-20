@@ -1,9 +1,8 @@
 use super::{
     LogRequestKind, LogWriteKind, LogWriteSubmission, ReadyGroupPrefix, RedoLogFile, SyncGroup,
 };
-use crate::error::FatalError;
+use crate::error::SharedFatalError;
 use crate::io::Completion;
-use error_stack::Report;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -78,7 +77,6 @@ impl LogPrefixTracker {
                 completion: Some(completion),
                 ready: false,
                 failure: None,
-                failure_report: None,
             },
         });
     }
@@ -228,7 +226,11 @@ impl LogPrefixTracker {
             let LogPrefixKind::Group { group } = entry.kind else {
                 unreachable!("front group entry kind was checked")
             };
-            if let Some(reason) = ready.failure_reason.or(group.failure_reason) {
+            if let Some(reason) = ready
+                .failure_reason
+                .clone()
+                .or_else(|| group.failure_reason.clone())
+            {
                 ready.failure_reason = Some(reason);
                 // Failed groups and all later ready groups are removed from the
                 // prefix, but they are not counted as durable commits.
@@ -353,9 +355,7 @@ pub(super) enum LogPrefixKind {
         /// Whether the header write has completed and the barrier can be popped.
         ready: bool,
         /// Fatal write failure reported when the barrier is completed.
-        failure: Option<FatalError>,
-        /// Source-preserving fatal report retained for the header completion waiter.
-        failure_report: Option<Report<FatalError>>,
+        failure: Option<SharedFatalError>,
     },
     /// Commit group waiting for its redo write and ordered publication.
     Group { group: SyncGroup },
@@ -372,7 +372,7 @@ pub(super) enum LogPrefixKind {
         /// Whether the sync completion has been observed.
         ready: bool,
         /// Fatal sync failure reported when the barrier completes.
-        failure: Option<FatalError>,
+        failure: Option<SharedFatalError>,
         /// Monotonic timestamp captured when the sync is submitted.
         started_at: Option<Instant>,
         /// Async sync latency measured from submission to completion.
@@ -395,18 +395,20 @@ pub(super) enum LogPrefixKind {
         /// Whether the seal write and configured sync have completed.
         ready: bool,
         /// Fatal write or sync failure reported when the barrier completes.
-        failure: Option<FatalError>,
+        failure: Option<SharedFatalError>,
     },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::FatalError;
     use crate::id::TrxID;
     use crate::io::Completion;
     use crate::log::LogSync;
     use crate::trx::FailedPrecommitReason;
     use crate::trx::PrecommitTrx;
+    use error_stack::Report;
     use std::os::fd::RawFd;
 
     fn sync_group_for_order_test(cts: TrxID, ready: bool, log_bytes: usize) -> SyncGroup {
@@ -450,7 +452,7 @@ mod tests {
         assert_eq!(ready.trx_count, 0);
         assert_eq!(ready.commit_count, 0);
         assert_eq!(ready.log_bytes, 0);
-        assert_eq!(ready.failure_reason, None);
+        assert!(ready.failure_reason.is_none());
         assert!(ready.written.is_empty());
         assert!(ready.failed.is_empty());
         assert_eq!(tracker.len(), 2);
@@ -464,7 +466,7 @@ mod tests {
         assert_eq!(ready.trx_count, 2);
         assert_eq!(ready.commit_count, 2);
         assert_eq!(ready.log_bytes, 4096);
-        assert_eq!(ready.failure_reason, None);
+        assert!(ready.failure_reason.is_none());
         assert_eq!(ready.written.len(), 2);
         assert_eq!(ready.written[0].max_cts, TrxID::new(10));
         assert_eq!(ready.written[1].max_cts, TrxID::new(11));
@@ -482,7 +484,7 @@ mod tests {
         assert_eq!(ready.trx_count, 1);
         assert_eq!(ready.commit_count, 1);
         assert_eq!(ready.log_bytes, 0);
-        assert_eq!(ready.failure_reason, None);
+        assert!(ready.failure_reason.is_none());
         assert_eq!(ready.written.len(), 1);
         assert_eq!(ready.written[0].max_cts, TrxID::new(20));
         assert!(ready.failed.is_empty());
@@ -492,9 +494,10 @@ mod tests {
     #[test]
     fn test_prefix_tracker_stops_at_failed_redo_boundary() {
         let mut tracker = LogPrefixTracker::new();
-        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+        let failure = SharedFatalError::capture(Report::new(FatalError::RedoWrite));
+        let failure_identity = failure.test_identity();
         let mut failed = sync_group_for_order_test(TrxID::new(31), true, 2048);
-        failed.failure_reason = Some(reason);
+        failed.failure_reason = Some(FailedPrecommitReason::Fatal(failure));
 
         tracker.push_group(sync_group_for_order_test(TrxID::new(30), true, 1024));
         tracker.push_group(failed);
@@ -504,7 +507,11 @@ mod tests {
         assert_eq!(ready.trx_count, 1);
         assert_eq!(ready.commit_count, 1);
         assert_eq!(ready.log_bytes, 1024);
-        assert_eq!(ready.failure_reason, Some(reason));
+        assert!(matches!(
+            ready.failure_reason,
+            Some(FailedPrecommitReason::Fatal(ref failure))
+                if failure.test_identity() == failure_identity
+        ));
         assert!(tracker.is_empty());
         assert_eq!(ready.written.len(), 1);
         assert_eq!(ready.written[0].max_cts, TrxID::new(30));
@@ -516,9 +523,10 @@ mod tests {
     #[test]
     fn test_prefix_tracker_keeps_unfinished_groups_after_failed_boundary() {
         let mut tracker = LogPrefixTracker::new();
-        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+        let failure = SharedFatalError::capture(Report::new(FatalError::RedoWrite));
+        let failure_identity = failure.test_identity();
         let mut failed = sync_group_for_order_test(TrxID::new(40), true, 1024);
-        failed.failure_reason = Some(reason);
+        failed.failure_reason = Some(FailedPrecommitReason::Fatal(failure));
 
         tracker.push_group(failed);
         tracker.push_group(sync_group_for_order_test(TrxID::new(41), false, 2048));
@@ -527,7 +535,11 @@ mod tests {
         assert_eq!(ready.trx_count, 0);
         assert_eq!(ready.commit_count, 0);
         assert_eq!(ready.log_bytes, 0);
-        assert_eq!(ready.failure_reason, Some(reason));
+        assert!(matches!(
+            ready.failure_reason,
+            Some(FailedPrecommitReason::Fatal(ref failure))
+                if failure.test_identity() == failure_identity
+        ));
         assert!(ready.written.is_empty());
         assert_eq!(ready.failed.len(), 1);
         assert_eq!(ready.failed[0].max_cts, TrxID::new(40));

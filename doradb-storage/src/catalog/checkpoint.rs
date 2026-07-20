@@ -3,9 +3,7 @@ use crate::catalog::{
     Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_table,
     is_user_table,
 };
-use crate::error::{
-    CompletionErrorKind, DataIntegrityError, DataIntegrityResult, FatalError, Result,
-};
+use crate::error::{DataIntegrityError, DataIntegrityResult, FatalError, IoError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
@@ -387,12 +385,12 @@ impl Catalog {
                 }
                 Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
                 Err(err)
-                    if matches!(
-                        err.report().downcast_ref::<CompletionErrorKind>(),
-                        Some(CompletionErrorKind::Io(_) | CompletionErrorKind::Send)
-                    ) =>
+                    if err.report().downcast_ref::<IoError>().is_some() =>
                 {
-                    Err(trx_sys.poison_engine(FatalError::CheckpointWrite).into())
+                    let report = err
+                        .into_fatal_report(FatalError::CheckpointWrite)
+                        .attach("catalog checkpoint publish IO failure");
+                    Err(self.poisoner.poison(report).into_report().into())
                 }
                 Err(err) => Err(err),
             }
@@ -410,10 +408,17 @@ impl Catalog {
             ),
         })
         .inspect_err(|err| {
-            obs::error!(
-                "event=checkpoint_publish component=catalog action=publish result=error error={}",
-                err
-            );
+            if err.report().downcast_ref::<FatalError>().is_some() {
+                obs::error!(
+                    "event=checkpoint_publish component=catalog action=poison result=error error={}",
+                    err
+                );
+            } else {
+                obs::error!(
+                    "event=checkpoint_publish component=catalog action=publish result=error error={}",
+                    err
+                );
+            }
         })
     }
 

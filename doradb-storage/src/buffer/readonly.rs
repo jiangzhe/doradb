@@ -16,7 +16,7 @@ use crate::buffer::{
     ReadonlyBlockValidator, pool_role_name,
 };
 use crate::error::{
-    CompletionErrorKind, CompletionResult, FileKind, InternalError, InternalResult, IoError,
+    CompletionErrorBridge, CompletionResult, FileKind, InternalError, InternalResult, IoError,
     LifecycleError, LifecycleResult, ResourceError, ResourceResult, RuntimeError, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
@@ -565,10 +565,11 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                         reservation,
                     );
                     if let Err(err) = self.send_read_async(req).await {
-                        err.into_inner().fail(CompletionErrorKind::from_send(
+                        err.into_inner().fail(CompletionErrorBridge::capture(
                             Report::new(IoError::from(IoErrorKind::BrokenPipe))
-                                .attach("readonly pool read request channel closed"),
-                            "send readonly pool read request",
+                                .attach(format!(
+                                    "send readonly pool read request: key={key:?}, request channel closed"
+                                )),
                         ));
                     }
                 }
@@ -576,10 +577,9 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             Err(err) => self.complete_inflight_load(
                 key,
                 &inflight,
-                Err(CompletionErrorKind::from_lifecycle(
-                    err,
-                    format!("reserve readonly block load frame: key={key:?}"),
-                )),
+                Err(CompletionErrorBridge::capture(err.attach(format!(
+                    "reserve readonly block load frame: key={key:?}"
+                )))),
             ),
         }
         Ok(inflight)
@@ -604,8 +604,11 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         inflight
             .wait_result()
             .await
-            .change_context(RuntimeError::BufferPageAccess)
-            .attach_with(|| format!("wait for readonly block load: key={key:?}"))
+            .map_err(|bridge| {
+                bridge
+                    .replace_context(RuntimeError::BufferPageAccess)
+                    .attach(format!("wait for readonly block load: key={key:?}"))
+            })
             .map(|frame_id| (frame_id, false))
     }
 
@@ -637,9 +640,12 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         inflight
             .wait_result()
             .await
-            .change_context(RuntimeError::BufferPageAccess)
-            .attach_with(|| {
-                format!("wait for validated readonly block load: file={file_kind}, key={key:?}")
+            .map_err(|bridge| {
+                bridge
+                    .replace_context(RuntimeError::BufferPageAccess)
+                    .attach(format!(
+                        "wait for validated readonly block load: file={file_kind}, key={key:?}"
+                    ))
             })
             .map(|frame_id| (frame_id, false))
     }
@@ -886,7 +892,7 @@ impl ReadSubmission {
 
     /// Fails the miss before worker completion and wakes all joined waiters.
     #[inline]
-    pub(crate) fn fail(mut self, err: Report<CompletionErrorKind>) {
+    pub(crate) fn fail(mut self, err: CompletionErrorBridge) {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
@@ -895,7 +901,7 @@ impl ReadSubmission {
 
     /// Fails a submitted miss load while retaining its borrowed page memory.
     #[inline]
-    pub(crate) fn fail_backend_submitted(&mut self, err: Report<CompletionErrorKind>) {
+    pub(crate) fn fail_backend_submitted(&mut self, err: CompletionErrorBridge) {
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(err));
@@ -927,12 +933,11 @@ impl ReadSubmission {
                         drop(self.reservation.take());
                         self.pool.stats.add_completed_reads(1);
                         self.pool.stats.add_read_errors(1);
-                        self.complete_inflight_once(Err(CompletionErrorKind::from_data_integrity(
-                            err,
-                            format!(
+                        self.complete_inflight_once(Err(CompletionErrorBridge::capture(
+                            err.attach(format!(
                                 "validate readonly block load: file={}, key={:?}",
                                 validation.file_kind, self.key
-                            ),
+                            )),
                         )));
                         return IOKind::Read;
                     }
@@ -944,18 +949,21 @@ impl ReadSubmission {
             }
             Ok(len) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::from_io(
-                    Report::new(IoError::from(IoErrorKind::UnexpectedEof)).attach(format!(
-                        "unexpected eof: actual_bytes={len}, expected_bytes={PAGE_SIZE}"
-                    )),
-                    format!("complete readonly block load: key={:?}", self.key),
+                Err(CompletionErrorBridge::capture(
+                    Report::new(IoError::from(IoErrorKind::UnexpectedEof))
+                        .attach(format!(
+                            "complete readonly block load: key={:?}, unexpected eof: actual_bytes={len}, expected_bytes={PAGE_SIZE}",
+                            self.key
+                        )),
                 ))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::from_io(
-                    Report::new(IoError::from(err.kind())).attach(format!("{err}")),
-                    format!("complete readonly block load: key={:?}", self.key),
+                Err(CompletionErrorBridge::capture(
+                    Report::new(IoError::from(err.kind())).attach(format!(
+                        "complete readonly block load: key={:?}, {err}",
+                        self.key
+                    )),
                 ))
             }
         };
@@ -984,12 +992,11 @@ impl Drop for ReadSubmission {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
-        self.complete_inflight_once(Err(CompletionErrorKind::from_internal(
-            Report::new(InternalError::CompletionDropped),
-            format!(
+        self.complete_inflight_once(Err(CompletionErrorBridge::capture(
+            Report::new(InternalError::CompletionDropped).attach(format!(
                 "drop readonly read submission before completion: key={:?}",
                 self.key
-            ),
+            )),
         )));
     }
 }
@@ -1288,7 +1295,7 @@ pub(crate) mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_TABLE_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
-        CompletionErrorKind, FileKind, LifecycleError, ResourceError, RuntimeError, RuntimeResult,
+        DataIntegrityError, FileKind, LifecycleError, ResourceError, RuntimeError, RuntimeResult,
     };
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
@@ -1366,12 +1373,8 @@ pub(crate) mod tests {
 
     fn assert_completion_data_integrity(err: Report<RuntimeError>) {
         assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
-        assert!(matches!(
-            err.downcast_ref::<CompletionErrorKind>().copied(),
-            Some(CompletionErrorKind::DataIntegrity(_))
-        ));
+        assert!(err.downcast_ref::<DataIntegrityError>().is_some());
         let report = format!("{err:?}");
-        assert!(report.contains("propagate from other threads"), "{report}");
         assert!(report.contains("wait for"), "{report}");
         assert!(report.contains("buffer_pool_type=readonly"), "{report}");
         assert!(report.contains("buffer_pool_role=disk"), "{report}");
@@ -2264,18 +2267,21 @@ pub(crate) mod tests {
                 reservation,
             );
 
-            submission.complete_inflight_once(Err(CompletionErrorKind::from_send(
+            submission.complete_inflight_once(Err(CompletionErrorBridge::capture(
                 Report::new(IoError::from(IoErrorKind::BrokenPipe))
-                    .attach("readonly inflight test channel closed"),
-                "complete readonly inflight test send failure",
+                    .attach("complete readonly inflight test send failure: channel closed"),
             )));
             assert!(submission.completed);
             let report = inflight.completed_result().unwrap().unwrap_err();
-            assert_eq!(*report.current_context(), CompletionErrorKind::Send);
+            let identity = report.test_identity();
+            assert_eq!(
+                report.downcast_ref::<IoError>().copied().map(IoError::kind),
+                Some(IoErrorKind::BrokenPipe)
+            );
 
             drop(submission);
             let report = inflight.completed_result().unwrap().unwrap_err();
-            assert_eq!(*report.current_context(), CompletionErrorKind::Send);
+            assert_eq!(report.test_identity(), identity);
 
             drop(pool);
             drop(table_file);
@@ -2856,10 +2862,9 @@ pub(crate) mod tests {
                         Err(err) => global.complete_inflight_load(
                             key,
                             &inflight_for_waiter,
-                            Err(CompletionErrorKind::from_lifecycle(
-                                err,
-                                format!("reserve readonly test block load frame: key={key:?}"),
-                            )),
+                            Err(CompletionErrorBridge::capture(err.attach(format!(
+                                "reserve readonly test block load frame: key={key:?}"
+                            )))),
                         ),
                     }
                 });
@@ -2882,10 +2887,14 @@ pub(crate) mod tests {
             reserve_waiter.await;
             teardown.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
-            let report = inflight.wait_result().await.unwrap_err();
+            let report = inflight
+                .wait_result()
+                .await
+                .unwrap_err()
+                .replace_context(RuntimeError::BufferPageAccess);
             assert_eq!(
-                *report.current_context(),
-                CompletionErrorKind::Lifecycle(LifecycleError::Shutdown)
+                report.downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::Shutdown)
             );
         });
     }
@@ -2942,10 +2951,7 @@ pub(crate) mod tests {
             };
             for err in [&err1, &err2] {
                 assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
-                assert!(matches!(
-                    err.downcast_ref::<CompletionErrorKind>().copied(),
-                    Some(CompletionErrorKind::Io(_))
-                ));
+                assert!(err.downcast_ref::<IoError>().is_some());
                 let output = format!("{err:?}");
                 assert!(output.contains("buffer_pool_type=readonly"), "{output}");
                 assert!(output.contains("buffer_pool_role=disk"), "{output}");

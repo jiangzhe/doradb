@@ -557,7 +557,7 @@ impl CatalogStorage {
                 .write_block(block_id, page.buf)
                 .await
                 .map_err(|report| {
-                    Error::from_completion_report(report, "persist catalog LWC block")
+                    Error::from_completion_bridge(report, "persist catalog LWC block")
                 })?;
             new_entries.push(page.shape.with_block_id(block_id));
         }
