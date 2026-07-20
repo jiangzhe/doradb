@@ -49,7 +49,14 @@ If both are present, CLI `type:*`/`priority:*` override metadata, and `codex` is
 ## Epic and Child Linking
 
 - Create parent issue first (`type:epic`).
-- Create children with `Part of #<parent>` in body.
+- Treat an explicit `Parent RFC:` block in a task document as the parent source.
+- Resolve exactly one RFC document from that block and require its
+  `github_issue` metadata.
+- Create the task with `tools/issue.rs create-issue-from-doc --parent <issue>`.
+- Let the tool pass `--parent` to the same `gh issue create` invocation so the
+  task becomes a native GitHub sub-issue.
+- Do not add `Part of #<parent>` to the issue body or run a follow-up linking
+  command; either creates a duplicate relationship.
 - Keep hierarchy flat: epic -> child issues.
 
 ## CLI Rules

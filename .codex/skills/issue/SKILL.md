@@ -60,15 +60,26 @@ Defaults when no source provides a value:
 - RFC doc -> `type:epic`
 - priority -> `priority:medium`
 
-For child issues linked to an epic:
+For a task whose explicit `Parent RFC:` block names one RFC document, validate
+that RFC document and read its `github_issue` value. Fail if the block is
+ambiguous or the RFC has no issue. Pass the resolved issue number to the task
+creation command:
 
 ```bash
+tools/issue.rs validate-doc-path \
+  --path docs/rfcs/0001-example.md
+
 tools/issue.rs create-issue-from-doc \
   --doc docs/tasks/000002-subtask.md \
   --labels "type:task" \
   --assignee "@me" \
   --parent 42
 ```
+
+The tool forwards `--parent` to the same `gh issue create` command so GitHub
+creates a native sub-issue. Do not add `Part of #<parent>` to the body and do
+not run a follow-up linking command. Omit `--parent` for standalone tasks and
+RFC documents.
 
 This script always uses `--body-file` to avoid body-length command issues.
 Issue bodies include planning metadata plus selected document context:

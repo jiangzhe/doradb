@@ -181,10 +181,10 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
                     eprintln!("missing value for --parent");
                     return Err(1);
                 };
-                let parsed = match v.parse::<i64>() {
+                let parsed = match parse_parent_issue_number(&v) {
                     Ok(n) => n,
-                    Err(_) => {
-                        eprintln!("invalid --parent value: {v}");
+                    Err(e) => {
+                        eprintln!("{e}");
                         return Err(1);
                     }
                 };
@@ -231,6 +231,10 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
             return Err(1);
         }
     };
+    if let Err(e) = validate_parent_doc_type(&validated.doc_type, parent) {
+        print_json(&json!({"created": false, "error": e}));
+        return Err(1);
+    }
 
     let metadata_labels = match parse_doc_issue_labels(doc_path) {
         Ok(v) => v,
@@ -272,7 +276,6 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         &validated.doc_type,
         &validated.doc_id,
         validated.title_hint.as_deref(),
-        parent,
         &doc_content,
     );
 
@@ -284,19 +287,13 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         }
     };
 
-    let create_cmd = vec![
-        "gh".to_string(),
-        "issue".to_string(),
-        "create".to_string(),
-        "--title".to_string(),
-        issue_title,
-        "--body-file".to_string(),
-        normalize_path(&temp_path),
-        "--label".to_string(),
-        labels.join(","),
-        "--assignee".to_string(),
-        assignee.clone(),
-    ];
+    let create_cmd = build_create_issue_command(
+        &issue_title,
+        &temp_path,
+        &labels,
+        &assignee,
+        parent,
+    );
 
     let create_res = run_command(&create_cmd);
 
@@ -909,12 +906,30 @@ fn default_type_label(doc_type: &str) -> &'static str {
     }
 }
 
+fn parse_parent_issue_number(value: &str) -> Result<i64, String> {
+    let parsed = value.parse::<i64>().map_err(|_| {
+        format!("invalid --parent value: {value}; expected a positive issue number")
+    })?;
+    if parsed <= 0 {
+        return Err(format!(
+            "invalid --parent value: {value}; expected a positive issue number"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_parent_doc_type(doc_type: &str, parent: Option<i64>) -> Result<(), String> {
+    if parent.is_some() && doc_type != "task" {
+        return Err("--parent is supported only for task documents".to_string());
+    }
+    Ok(())
+}
+
 fn build_body(
     doc_path: &str,
     doc_type: &str,
     doc_id: &str,
     doc_title: Option<&str>,
-    parent: Option<i64>,
     doc_content: &str,
 ) -> String {
     let mut lines = vec![
@@ -928,14 +943,38 @@ fn build_body(
     }
     lines.push(String::new());
     lines.push("Generated from document-first issue workflow.".to_string());
-    if let Some(p) = parent {
-        lines.push(format!("Part of #{p}"));
-    }
     let mut body = lines.join("\n") + "\n";
     for section in issue_body_sections(doc_type) {
         append_issue_body_section(&mut body, doc_content, section);
     }
     body
+}
+
+fn build_create_issue_command(
+    issue_title: &str,
+    body_path: &Path,
+    labels: &[String],
+    assignee: &str,
+    parent: Option<i64>,
+) -> Vec<String> {
+    let mut command = vec![
+        "gh".to_string(),
+        "issue".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        issue_title.to_string(),
+        "--body-file".to_string(),
+        normalize_path(body_path),
+        "--label".to_string(),
+        labels.join(","),
+        "--assignee".to_string(),
+        assignee.to_string(),
+    ];
+    if let Some(parent) = parent {
+        command.push("--parent".to_string());
+        command.push(parent.to_string());
+    }
+    command
 }
 
 fn issue_body_sections(doc_type: &str) -> &'static [&'static str] {
@@ -1185,12 +1224,11 @@ Do the work.
             "task",
             "000123",
             Some("Task: Example"),
-            Some(42),
             doc,
         );
 
         assert!(body.contains("Planning document:\n- `docs/tasks/000123-example.md`"));
-        assert!(body.contains("Part of #42"));
+        assert!(!body.contains("Part of #"));
         assert!(body.contains("## Summary\n\nTask summary.\n"));
         assert!(body.contains("## Context\n\nTask context.\n"));
         assert!(body.contains("## Goals\n\n1. Goal one.\n"));
@@ -1237,7 +1275,6 @@ Expected outcomes.
             "rfc",
             "0012",
             Some("RFC-0012: Example"),
-            None,
             doc,
         );
 
@@ -1258,7 +1295,6 @@ Expected outcomes.
             "task",
             "000124",
             None,
-            None,
             doc,
         );
 
@@ -1266,6 +1302,67 @@ Expected outcomes.
         assert!(body.contains("## Context\n\n_Section not found in the planning document._\n"));
         assert!(body.contains("## Goals\n\n_Section not found in the planning document._\n"));
         assert!(body.contains("## Non-Goals\n\n_Section not found in the planning document._\n"));
+    }
+
+    #[test]
+    fn test_create_issue_command_includes_native_parent() {
+        let labels = vec!["type:task".to_string(), "priority:medium".to_string()];
+        let command = build_create_issue_command(
+            "Task: Example",
+            Path::new("/tmp/body.md"),
+            &labels,
+            "@me",
+            Some(42),
+        );
+
+        assert_eq!(
+            command,
+            vec![
+                "gh",
+                "issue",
+                "create",
+                "--title",
+                "Task: Example",
+                "--body-file",
+                "/tmp/body.md",
+                "--label",
+                "type:task,priority:medium",
+                "--assignee",
+                "@me",
+                "--parent",
+                "42",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_issue_command_omits_parent_for_standalone_task() {
+        let labels = vec!["type:task".to_string(), "priority:medium".to_string()];
+        let command = build_create_issue_command(
+            "Task: Example",
+            Path::new("/tmp/body.md"),
+            &labels,
+            "@me",
+            None,
+        );
+
+        assert!(!command.iter().any(|arg| arg == "--parent"));
+    }
+
+    #[test]
+    fn test_parent_issue_number_must_be_positive() {
+        assert_eq!(parse_parent_issue_number("42").unwrap(), 42);
+        assert!(parse_parent_issue_number("0").is_err());
+        assert!(parse_parent_issue_number("-1").is_err());
+        assert!(parse_parent_issue_number("not-a-number").is_err());
+    }
+
+    #[test]
+    fn test_parent_is_rejected_for_rfc_documents() {
+        assert!(validate_parent_doc_type("task", Some(42)).is_ok());
+        assert!(validate_parent_doc_type("task", None).is_ok());
+        assert!(validate_parent_doc_type("rfc", None).is_ok());
+        assert!(validate_parent_doc_type("rfc", Some(42)).is_err());
     }
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
