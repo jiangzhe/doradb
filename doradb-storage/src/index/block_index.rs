@@ -2,7 +2,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableColumnLayout;
-use crate::error::{Error, InternalError, Result};
+use crate::error::Result;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
@@ -14,7 +14,6 @@ use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::table::ColumnStorage;
-use error_stack::Report;
 use std::sync::Arc;
 
 /// Facade of the hybrid block index.
@@ -241,8 +240,8 @@ impl<P: BufferPool> BlockIndex<P> {
                 root_block_id,
             } => {
                 self.find_row_in_column(
-                    storage,
-                    disk_pool_guard,
+                    storage.expect("block-index column route requires column storage"),
+                    disk_pool_guard.expect("block-index column route requires disk pool guard"),
                     row_id,
                     pivot_row_id,
                     root_block_id,
@@ -257,8 +256,9 @@ impl<P: BufferPool> BlockIndex<P> {
                 match self.root.try_column(row_id) {
                     Some((pivot_row_id, root_block_id)) => {
                         self.find_row_in_column(
-                            storage,
-                            disk_pool_guard,
+                            storage.expect("block-index column route requires column storage"),
+                            disk_pool_guard
+                                .expect("block-index column route requires disk pool guard"),
                             row_id,
                             pivot_row_id,
                             root_block_id,
@@ -274,22 +274,14 @@ impl<P: BufferPool> BlockIndex<P> {
     #[inline]
     async fn find_row_in_column(
         &self,
-        storage: Option<&ColumnStorage>,
-        disk_pool_guard: Option<&PoolGuard>,
+        storage: &ColumnStorage,
+        disk_pool_guard: &PoolGuard,
         row_id: RowID,
         pivot_row_id: RowID,
         root_block_id: BlockID,
     ) -> Result<RowLocation> {
-        let Some(storage) = storage else {
-            return Err(Error::column_storage_missing());
-        };
-        let Some(disk_pool_guard) = disk_pool_guard else {
-            return Err(Report::new(InternalError::DiskPoolGuardMissing)
-                .attach(format!(
-                    "row_id={row_id}, pivot_row_id={pivot_row_id}, root_block_id={root_block_id}"
-                ))
-                .into());
-        };
+        // A column route can only be published for a user table, whose runtime
+        // resolves both persisted storage and the matching disk-pool guard.
         let index = ColumnBlockIndex::new(
             root_block_id,
             pivot_row_id,
@@ -324,9 +316,11 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::value::ValKind;
+    use error_stack::Report;
     use semistr::SemiStr;
     use std::future::Future;
     use std::io::Error as StdIoError;
+    use std::panic::resume_unwind;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -599,7 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn test_find_row_returns_error_when_column_route_has_no_storage() {
+    #[should_panic(expected = "block-index column route requires column storage")]
+    fn test_find_row_panics_when_column_route_has_no_storage() {
         let pool = QuiescentBox::new(
             FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
         );
@@ -612,20 +607,14 @@ mod tests {
         ))
         .expect("test block-index construction should succeed");
 
-        // Row id 9 is below the pivot, so lookup goes straight to the column path.
-        // Without column storage this must surface as an error, not as "not found".
-        let err = match smol::block_on(blk_idx.find_row(&meta_guard, None, RowID::new(9), None)) {
-            Ok(_location) => panic!("expected missing-column-storage error, got row location"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::ColumnStorageMissing)
-        );
+        // Row id 9 is below the pivot, so lookup goes straight to the column
+        // path and enforces the user-table storage contract.
+        let _ = smol::block_on(blk_idx.find_row(&meta_guard, None, RowID::new(9), None));
     }
 
     #[test]
-    fn test_find_row_returns_error_when_column_fallback_has_no_storage() {
+    #[should_panic(expected = "block-index column route requires column storage")]
+    fn test_find_row_panics_when_column_fallback_has_no_storage() {
         let inner = QuiescentBox::new(
             FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
         );
@@ -665,14 +654,11 @@ mod tests {
             smol::block_on(blk_idx.update_column_root(RowID::new(11), test_block_id(88)));
             release.wait();
 
-            let res = handle.join().unwrap();
-            assert!(
-                res.as_ref().is_err_and(|err| err
-                    .report()
-                    .downcast_ref::<InternalError>()
-                    .copied()
-                    == Some(InternalError::ColumnStorageMissing))
-            );
+            let panic = match handle.join() {
+                Ok(_) => panic!("column fallback without storage must panic"),
+                Err(panic) => panic,
+            };
+            resume_unwind(panic);
         });
     }
 

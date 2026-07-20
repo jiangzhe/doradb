@@ -3,16 +3,13 @@
 //! `Completion<T>` stores a `CompletionResult<T>` so IO, redo, and commit
 //! fanout paths can move detailed domain reports across thread boundaries
 //! without promoting them to the public `Error` type too early. A completion
-//! report is not cloneable, so each waiter receives a propagated report with
-//! the same top-level `CompletionErrorKind`, structured backend attachments
-//! when present, and a propagation attachment. The original stored report keeps
-//! any remaining producer-side detail.
+//! failure stores one cloneable bridge. Fanout clones only its inner `Arc`;
+//! final error owners reconstruct independent reports with their own context
+//! after leaving the state lock.
 
-use crate::error::{CompletionResult, propagate_completion_report};
+use crate::error::CompletionResult;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
-
-const PROPAGATE_ATTACHMENT: &str = "propagate from other threads";
 
 enum CompletionState<T> {
     Running,
@@ -24,7 +21,7 @@ enum CompletionState<T> {
 /// Producers call [`Self::complete`] exactly once to publish the final result.
 /// Waiters can either poll [`Self::completed_result`] or await
 /// [`Self::wait_result`]. The stored value is propagated so multiple waiters can
-/// observe equivalent terminal state without cloning non-cloneable reports.
+/// observe equivalent terminal state without rebuilding reports under lock.
 pub(crate) struct Completion<T> {
     state: Mutex<CompletionState<T>>,
     ev: Event,
@@ -94,18 +91,15 @@ impl<T> Default for Completion<T> {
 fn propagate_result<T: Clone>(value: &CompletionResult<T>) -> CompletionResult<T> {
     match value {
         Ok(value) => Ok(value.clone()),
-        Err(report) => Err(propagate_completion_report(report, PROPAGATE_ATTACHMENT)),
+        Err(bridge) => Err(bridge.clone()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Completion;
-    use crate::error::{CompletionErrorKind, IoError};
-    use crate::io::{
-        IOBackendErrorPhase, IOBackendFailure, IOBackendOperationKind, IOBackendQueueState, IOKind,
-        attach_backend_operation_kind,
-    };
+    use crate::error::{CompletionErrorBridge, IoError, RuntimeError};
+    use crate::io::BackendError;
     use error_stack::Report;
     use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 
@@ -128,56 +122,66 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_error_propagates_context_only() {
+    fn test_completion_error_fanout_clones_bridge_without_reconstructing() {
         let completion = Completion::<usize>::new();
-        completion.complete(Err(CompletionErrorKind::from_send(
-            Report::new(IoError::from(IoErrorKind::BrokenPipe)).attach("original detail"),
-            "test send completion",
-        )));
+        let bridge = CompletionErrorBridge::capture(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                .attach("test send completion: original detail"),
+        );
+        let identity = bridge.test_identity();
+        completion.complete(Err(bridge));
 
-        let report = completion.completed_result().unwrap().unwrap_err();
-        assert_eq!(*report.current_context(), CompletionErrorKind::Send);
+        let first = completion.completed_result().unwrap().unwrap_err();
+        let second = completion.completed_result().unwrap().unwrap_err();
+        assert_eq!(first.test_identity(), identity);
+        assert_eq!(second.test_identity(), identity);
+        assert_eq!(first.test_reconstructions(), 0);
+        let report = first.replace_context(RuntimeError::BufferPageAccess);
+        assert_eq!(second.test_reconstructions(), 1);
+        assert_eq!(
+            report.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::BrokenPipe)
+        );
         let output = format!("{report:?}");
-        assert!(output.contains("propagate from other threads"));
-        assert!(!output.contains("original detail"));
+        assert!(output.contains("original detail"));
+        assert!(output.contains("test send completion"));
     }
 
     #[test]
     fn test_completion_error_propagates_backend_attachments() {
         let completion = Completion::<usize>::new();
-        let backend_report = IOBackendFailure::report(
+        let backend_report = BackendError::submit(
             "test_backend",
-            IOBackendErrorPhase::Submit,
             StdIoError::from_raw_os_error(libc::EIO),
             2,
-            IOBackendQueueState::submit(1, 1),
-        );
-        let backend_report = attach_backend_operation_kind(backend_report, Some(IOKind::Write));
-        completion.complete(Err(CompletionErrorKind::from_io(
-            IoError::report_backend(&backend_report, "original backend context"),
-            "test backend completion",
+            1,
+            1,
+        )
+        .into_report();
+        completion.complete(Err(CompletionErrorBridge::capture(
+            backend_report.attach("complete test backend write: op_kind=write"),
         )));
 
-        let report = completion.completed_result().unwrap().unwrap_err();
-        assert!(report.downcast_ref::<IOBackendFailure>().is_some());
-        assert!(report.downcast_ref::<IOBackendOperationKind>().is_some());
+        let report = completion
+            .completed_result()
+            .unwrap()
+            .unwrap_err()
+            .replace_context(RuntimeError::BufferPageAccess);
+        assert!(report.downcast_ref::<BackendError>().is_some());
         let output = format!("{report:?}");
         assert!(output.contains("backend=test_backend"), "{output}");
-        assert!(output.contains("propagate from other threads"), "{output}");
-        assert!(!output.contains("original backend context"), "{output}");
+        assert!(output.contains("op_kind=write"), "{output}");
+        assert!(output.contains("complete test backend write"), "{output}");
     }
 
     #[test]
     fn test_completion_report_unexpected_eof_reports_io() {
-        let report = CompletionErrorKind::from_io(
-            Report::new(IoError::from(IoErrorKind::UnexpectedEof))
-                .attach("unexpected eof: actual_bytes=17, expected_bytes=4096"),
-            "test completion short read",
-        );
-        assert_eq!(
-            *report.current_context(),
-            CompletionErrorKind::Io(IoErrorKind::UnexpectedEof)
-        );
+        let report = CompletionErrorBridge::capture(
+            Report::new(IoError::from(IoErrorKind::UnexpectedEof)).attach(
+                "test completion short read: unexpected eof: actual_bytes=17, expected_bytes=4096",
+            ),
+        )
+        .replace_context(RuntimeError::BufferPageAccess);
         assert_eq!(
             report.downcast_ref::<IoError>().copied().map(IoError::kind),
             Some(IoErrorKind::UnexpectedEof)
@@ -194,15 +198,11 @@ mod tests {
         let err = StdIoError::new(IoErrorKind::PermissionDenied, "completion io denied");
         let message = format!("{}", err);
 
-        let report = CompletionErrorKind::from_io(
-            Report::new(IoError::from(err.kind())).attach(format!("{err}")),
-            "test completion io",
-        );
+        let report = CompletionErrorBridge::capture(
+            Report::new(IoError::from(err.kind())).attach(format!("test completion io: {err}")),
+        )
+        .replace_context(RuntimeError::BufferPageAccess);
 
-        assert_eq!(
-            *report.current_context(),
-            CompletionErrorKind::Io(IoErrorKind::PermissionDenied)
-        );
         assert_eq!(
             report.downcast_ref::<IoError>().copied().map(IoError::kind),
             Some(IoErrorKind::PermissionDenied)

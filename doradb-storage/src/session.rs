@@ -1468,7 +1468,7 @@ async fn wait_for_maintenance_boundary(
 ) -> Result<TrxID> {
     let trx_sys = &session.engine.trx_sys;
     loop {
-        trx_sys.ensure_runtime_healthy()?;
+        session.engine.poisoner.ensure_healthy()?;
         if session.engine.shutdown_started() {
             return Err(maintenance_boundary_shutdown_err(boundary, ts));
         }
@@ -1479,10 +1479,10 @@ async fn wait_for_maintenance_boundary(
 
         trx_sys.request_purge_observation();
         let progress_listener = boundary.listener(session);
-        let poison_listener = trx_sys.poison_listener();
+        let poison_listener = session.engine.poisoner.listener();
         let shutdown_listener = session.engine.shutdown_listener();
 
-        trx_sys.ensure_runtime_healthy()?;
+        session.engine.poisoner.ensure_healthy()?;
         if session.engine.shutdown_started() {
             return Err(maintenance_boundary_shutdown_err(boundary, ts));
         }
@@ -1508,7 +1508,7 @@ fn maintenance_boundary_shutdown_err(boundary: MaintenanceBoundary, ts: TrxID) -
 async fn wait_for_purge_handoff(session: &SessionPin, ts: TrxID) -> Result<()> {
     let trx_sys = &session.engine.trx_sys;
     loop {
-        trx_sys.ensure_runtime_healthy()?;
+        session.engine.poisoner.ensure_healthy()?;
         if session.engine.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach("completed-purge wait observed engine shutdown before ordered handoff")
@@ -1518,9 +1518,9 @@ async fn wait_for_purge_handoff(session: &SessionPin, ts: TrxID) -> Result<()> {
             return Ok(());
         }
         let handoff_listener = trx_sys.purge_handoff_listener();
-        let poison_listener = trx_sys.poison_listener();
+        let poison_listener = session.engine.poisoner.listener();
         let shutdown_listener = session.engine.shutdown_listener();
-        trx_sys.ensure_runtime_healthy()?;
+        session.engine.poisoner.ensure_healthy()?;
         if session.engine.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach("completed-purge wait observed engine shutdown before ordered handoff")
@@ -2712,7 +2712,10 @@ pub(crate) mod tests {
                 std::task::Poll::Pending
             ));
 
-            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
             drop(redo_retention_lease);
 
             let err = maintenance_fut.await.unwrap_err();
@@ -3069,7 +3072,10 @@ pub(crate) mod tests {
                 std::task::Poll::Pending
             ));
 
-            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
             drop(redo_retention_lease);
 
             let err = truncate_fut.await.unwrap_err();
@@ -3275,7 +3281,10 @@ pub(crate) mod tests {
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
 
-            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
 
             assert_eq!(session.list_table_ids().unwrap(), vec![table_id]);
             assert!(session.transaction_system_stats().is_ok());

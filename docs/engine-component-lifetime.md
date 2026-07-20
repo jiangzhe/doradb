@@ -59,14 +59,19 @@ components in one fixed dependency order:
 11. `TransactionSystem`
 12. `TransactionSystemWorkers`
 
-`DiskPool` now depends on `FileSystem` directly because readonly-cache miss
-loads are dispatched through the shared storage worker rather than file-scoped
-wrappers.
+Every entry is an explicit `RegistryBuilder::build` call in
+`EngineConfig::build_inner`. Components register only themselves. Upstream
+components may publish typed startup provisions to the shared build shelf, but
+the downstream component remains a separate explicit build step.
+
+`DiskPool`, `IndexPool`, and `MemPool` depend on `FileSystem` directly because
+their cache and swap-file IO is dispatched through the shared storage worker
+rather than file-scoped wrappers.
 
 `EnginePoisoner` is registered first because runtime poison is engine-level
 admission state. Lower-level workers such as shared storage IO can poison the
-engine without depending on `TransactionSystem`, while transaction-system
-helpers continue to delegate to the same component during the migration.
+engine without depending on `TransactionSystem`; components that publish or
+inspect fatal state retain their own direct poisoner dependency.
 
 Registration order is the dependency order. Reverse registration order is both:
 

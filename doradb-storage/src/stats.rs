@@ -1,7 +1,7 @@
 //! Public storage-engine runtime statistics.
 
 use crate::file::fs::StorageServiceStats as InternalStorageServiceStats;
-use crate::io::IOBackendStats as InternalIoBackendStats;
+use crate::io::BackendStats as InternalIoBackendStats;
 use crate::trx::sys::TrxSysStats as InternalTrxSysStats;
 
 /// Monotonic transaction-system, redo, and purge statistics.

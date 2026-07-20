@@ -13,7 +13,6 @@ mod libaio_abi;
 #[cfg(feature = "libaio")]
 mod libaio_backend;
 
-use crate::error::IoResult;
 use crate::obs;
 use flume::{Receiver, SendError, Sender};
 use std::collections::VecDeque;
@@ -29,10 +28,10 @@ pub(crate) use completion::Completion;
 
 /// Canonical storage backend selected by cargo features.
 #[cfg(feature = "iouring")]
-pub(crate) use iouring_backend::IouringBackend as StorageBackend;
+pub(crate) use iouring_backend::{BACKEND_NAME, IouringBackend as StorageBackend};
 /// Canonical storage backend selected by cargo features.
 #[cfg(feature = "libaio")]
-pub(crate) use libaio_backend::LibaioBackend as StorageBackend;
+pub(crate) use libaio_backend::{BACKEND_NAME, LibaioBackend as StorageBackend};
 
 #[cfg(test)]
 pub(crate) use self::tests::{
@@ -231,6 +230,19 @@ pub(crate) enum IOKind {
     Write,
     Fsync,
     Fdatasync,
+}
+
+impl IOKind {
+    /// Returns the lowercase operation name used in diagnostics.
+    #[inline]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            IOKind::Read => "read",
+            IOKind::Write => "write",
+            IOKind::Fsync => "fsync",
+            IOKind::Fdatasync => "fdatasync",
+        }
+    }
 }
 
 /// Message delivered from IO clients to storage IO workers.
@@ -527,7 +539,7 @@ pub(crate) struct CompletedSubmission<S> {
 pub(crate) struct SubmissionDriver<S, B = StorageBackend>
 where
     S: IOSubmission,
-    B: IOBackend,
+    B: Backend,
 {
     backend: B,
     submitted_quarantine: SubmittedIoQuarantine<S, B::Prepared>,
@@ -543,7 +555,7 @@ where
 impl<S, B> SubmissionDriver<S, B>
 where
     S: IOSubmission,
-    B: IOBackend,
+    B: Backend,
 {
     /// Create a submission driver around one storage backend.
     #[inline]
@@ -673,7 +685,7 @@ where
     /// Submits staged operations up to backend capacity and returns the count
     /// accepted by the backend.
     #[inline]
-    pub(crate) fn submit_ready(&mut self) -> IoResult<SubmitAttempt> {
+    pub(crate) fn submit_ready(&mut self) -> BackendResult<SubmitAttempt> {
         if self.staged_slots.is_empty() {
             return Ok(SubmitAttempt::Noop);
         }
@@ -717,10 +729,11 @@ where
     pub(crate) fn backoff_submit_retry_or_progress_error(
         &mut self,
         retry: SubmitRetry,
-    ) -> IoResult<()> {
+    ) -> BackendResult<()> {
         self.submit_backoff.backoff_or_progress_error(
             retry,
-            IOBackendQueueState::submit(self.staged_slots.len(), self.pending_len()),
+            self.staged_slots.len(),
+            self.pending_len(),
         )
     }
 
@@ -729,7 +742,7 @@ where
     /// If a previous backend wait returned several completions, this returns
     /// the next buffered completion without entering the backend wait path.
     #[inline]
-    pub(crate) fn wait_at_least_one(&mut self) -> IoResult<CompletedSubmission<S>> {
+    pub(crate) fn wait_at_least_one(&mut self) -> BackendResult<CompletedSubmission<S>> {
         match self.completed.pop_front() {
             Some(completed) => Ok(completed),
             None => {
@@ -899,6 +912,7 @@ pub(crate) fn align_to_sector_size(len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::IoResult;
     use std::fs::metadata;
     use std::io::Error as StdIoError;
     use std::mem::MaybeUninit;
@@ -1153,7 +1167,7 @@ mod tests {
         }
     }
 
-    impl IOBackend for DriverBackend {
+    impl Backend for DriverBackend {
         type Prepared = BackendToken;
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
@@ -1184,7 +1198,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> IoResult<SubmitAttempt> {
+        ) -> BackendResult<SubmitAttempt> {
             let allowed = limit.min(batch.len());
             let submit_result = self.submit_results.pop_front().unwrap_or_else(|| {
                 NonZeroUsize::new(allowed).map_or(SubmitAttempt::Noop, SubmitAttempt::Submitted)
@@ -1209,7 +1223,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(!self.panic_on_wait, "backend wait must not be called");
             assert!(
                 self.inflight.len() >= min_nr,
@@ -1267,7 +1281,7 @@ mod tests {
 
     #[inline]
     fn driver_submit_retry(reason: SubmitRetryReason) -> SubmitAttempt {
-        SubmitAttempt::Retry(SubmitRetry::new("driver_test", reason, 1))
+        SubmitAttempt::Retry(SubmitRetry::new(reason, 1))
     }
 
     struct PreparedDropCounter {
@@ -1311,7 +1325,7 @@ mod tests {
         }
     }
 
-    impl IOBackend for CleanupBackend {
+    impl Backend for CleanupBackend {
         type Prepared = PreparedDropCounter;
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
@@ -1351,7 +1365,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> IoResult<SubmitAttempt> {
+        ) -> BackendResult<SubmitAttempt> {
             let allowed = limit.min(batch.len());
             let scripted = self.submit_results.pop_front().unwrap_or(allowed);
             let submit_count = scripted.min(allowed);
@@ -1371,7 +1385,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             _min_nr: usize,
-        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             panic!("cleanup tests must not wait for completions")
         }
 
@@ -1652,18 +1666,17 @@ mod tests {
         let SubmitAttempt::Retry(retry) = driver.submit_ready().unwrap() else {
             panic!("expected submit retry");
         };
-        assert_eq!(retry.backend(), "driver_test");
         assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
         assert_eq!(retry.call_count(), 1);
 
         let err = driver
             .backoff_submit_retry_or_progress_error(retry)
             .unwrap_err();
-        let failure = backend_failure(&err).expect("retry expiry must attach backend failure");
-        assert_eq!(failure.backend(), "driver_test");
-        assert_eq!(failure.phase(), IOBackendErrorPhase::Submit);
-        assert_eq!(failure.raw_errno(), Some(libc::EAGAIN));
-        assert_eq!(failure.call_count(), 1);
+        assert_eq!(err.backend(), BACKEND_NAME);
+        assert_eq!(err.op(), "submit");
+        assert_eq!(err.raw_errno(), Some(libc::EAGAIN));
+        assert_eq!(err.call_count(), 1);
+        assert!(err.to_string().contains("submit_retry_reason=EAGAIN"));
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
     }
@@ -1674,7 +1687,6 @@ mod tests {
             DriverBackend::with_submit_outcomes(
                 1,
                 VecDeque::from([SubmitAttempt::Retry(SubmitRetry::new(
-                    "driver_test",
                     SubmitRetryReason::NoProgress,
                     0,
                 ))]),
@@ -1686,7 +1698,6 @@ mod tests {
         let SubmitAttempt::Retry(retry) = driver.submit_ready().unwrap() else {
             panic!("expected submit retry");
         };
-        assert_eq!(retry.backend(), "driver_test");
         assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
         assert_eq!(retry.raw_errno(), None);
         assert_eq!(retry.call_count(), 0);
@@ -1694,11 +1705,11 @@ mod tests {
         let err = driver
             .backoff_submit_retry_or_progress_error(retry)
             .unwrap_err();
-        let failure = backend_failure(&err).expect("retry expiry must attach backend failure");
-        assert_eq!(failure.backend(), "driver_test");
-        assert_eq!(failure.phase(), IOBackendErrorPhase::Submit);
-        assert_eq!(failure.raw_errno(), None);
-        assert_eq!(failure.call_count(), 0);
+        assert_eq!(err.backend(), BACKEND_NAME);
+        assert_eq!(err.op(), "submit");
+        assert_eq!(err.raw_errno(), None);
+        assert_eq!(err.call_count(), 0);
+        assert!(err.to_string().contains("submit_retry_reason=NO_PROGRESS"));
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
     }

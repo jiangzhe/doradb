@@ -20,7 +20,7 @@ use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, DataIntegrityResult, InternalError, IoError,
+    CompletionErrorBridge, CompletionResult, DataIntegrityResult, InternalError, IoError,
     LifecycleError, LifecycleResult, ResourceError, RuntimeError, RuntimeResult, Validation,
 };
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
@@ -28,8 +28,8 @@ use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::file::{BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
 use crate::id::{BlockID, PageID};
 use crate::io::{
-    IOBackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation,
-    StdIoResult,
+    BackendError, BackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission,
+    Operation, StdIoResult,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::map::FastHashMap;
@@ -213,7 +213,7 @@ impl EvictableBufferPool {
     /// Returns one snapshot of backend-owned submit/wait activity for this pool.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
-    pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
+    pub(crate) fn io_backend_stats(&self) -> BackendStats {
         self.fs.io_backend_stats()
     }
 
@@ -222,8 +222,11 @@ impl EvictableBufferPool {
         self.inflight_io
             .wait_for_write(page_id, self.arena.frame(page_id))
             .await
-            .change_context(RuntimeError::BufferPageAccess)
-            .attach_with(|| format!("wait for evict pool writeback: page_id={page_id}"))
+            .map_err(|bridge| {
+                bridge
+                    .replace_context(RuntimeError::BufferPageAccess)
+                    .attach(format!("wait for evict pool writeback: page_id={page_id}"))
+            })
     }
 
     /// Try to dispatch read IO on given page.
@@ -333,11 +336,11 @@ impl EvictableBufferPool {
                     .change_context(RuntimeError::BufferPageAccess));
             }
             DispatchAction::Wait(completion) => {
-                completion
-                    .wait_result()
-                    .await
-                    .change_context(RuntimeError::BufferPageAccess)
-                    .attach_with(|| format!("wait for evict pool read: page_id={page_id}"))?;
+                completion.wait_result().await.map_err(|bridge| {
+                    bridge
+                        .replace_context(RuntimeError::BufferPageAccess)
+                        .attach(format!("wait for evict pool read: page_id={page_id}"))
+                })?;
             }
             DispatchAction::WaitForLoad(listener) => {
                 listener.await;
@@ -349,23 +352,24 @@ impl EvictableBufferPool {
             DispatchAction::SendRead { req, completion } => {
                 if let Err(send_err) = self.fs.send_pool_read_async(self.role, req).await {
                     let failed_req = send_err.0;
-                    failed_req.fail(CompletionErrorKind::from_send(
+                    failed_req.fail(CompletionErrorBridge::capture(
                         Report::new(IoError::from(IoErrorKind::BrokenPipe))
-                            .attach("evict pool read request channel closed"),
-                        "send evict pool read request",
+                            .attach(format!(
+                                "send evict pool read request: page_id={page_id}, request channel closed"
+                            )),
                     ));
                     self.in_mem.load_ev.notify(1);
                     return Err(Report::new(IoError::from(IoErrorKind::BrokenPipe))
                         .attach("send evict pool read request")
                         .change_context(RuntimeError::BufferPageAccess));
                 }
-                completion
-                    .wait_result()
-                    .await
-                    .change_context(RuntimeError::BufferPageAccess)
-                    .attach_with(|| {
-                        format!("wait for dispatched evict pool read: page_id={page_id}")
-                    })?;
+                completion.wait_result().await.map_err(|bridge| {
+                    bridge
+                        .replace_context(RuntimeError::BufferPageAccess)
+                        .attach(format!(
+                            "wait for dispatched evict pool read: page_id={page_id}"
+                        ))
+                })?;
             }
         }
         Ok(())
@@ -877,32 +881,20 @@ impl EvictablePoolStateMachine {
 
     /// Fail one not-yet-submitted pool request after backend progress failure.
     #[inline]
-    pub(crate) fn fail_request_with_backend_error(
-        &mut self,
-        req: PoolRequest,
-        err: &Report<IoError>,
-    ) {
+    pub(crate) fn fail_request_with_backend_error(&mut self, req: PoolRequest, err: &BackendError) {
         match req {
             PoolRequest::Read(req) => {
                 let page_id = req.page_id();
-                req.fail(CompletionErrorKind::from_io(
-                    IoError::report_backend(
-                        err,
-                        format!("submit evict pool read: page_id={page_id}"),
-                    ),
-                    "evict pool read completion transport",
-                ));
+                req.fail(CompletionErrorBridge::capture(err.to_report().attach(
+                    format!("submit evict pool read: op_kind=read, page_id={page_id}"),
+                )));
             }
             PoolRequest::BatchWrite(page_guards, done_ev) => {
                 for page_guard in page_guards {
-                    let page_id = page_guard.page_id();
                     self.pool.inflight_io.fail_writeback(
                         &self.pool.stats,
                         page_guard,
-                        IoError::report_backend(
-                            err,
-                            format!("submit evict pool writeback: page_id={page_id}"),
-                        ),
+                        err.to_report().attach("op_kind=write"),
                     );
                 }
                 drop(done_ev);
@@ -915,7 +907,7 @@ impl EvictablePoolStateMachine {
     pub(crate) fn fail_submission_with_backend_error(
         &mut self,
         sub: EvictSubmission,
-        err: &Report<IoError>,
+        err: &BackendError,
     ) -> StorageIOKind {
         match sub {
             EvictSubmission::Read(sub) => {
@@ -931,14 +923,10 @@ impl EvictablePoolStateMachine {
                     batch_done,
                 } = sub;
                 let _ = block_key;
-                let page_id = page_guard.page_id();
                 self.pool.inflight_io.fail_writeback(
                     &self.pool.stats,
                     page_guard,
-                    IoError::report_backend(
-                        err,
-                        format!("submit evict pool writeback: page_id={page_id}"),
-                    ),
+                    err.to_report().attach("op_kind=write"),
                 );
                 drop(batch_done);
                 StorageIOKind::Write
@@ -952,7 +940,7 @@ impl EvictablePoolStateMachine {
     pub(crate) fn fail_submitted_with_backend_error(
         &mut self,
         sub: &mut EvictSubmission,
-        err: &Report<IoError>,
+        err: &BackendError,
     ) -> StorageIOKind {
         match sub {
             EvictSubmission::Read(sub) => {
@@ -962,14 +950,10 @@ impl EvictablePoolStateMachine {
             }
             EvictSubmission::Write(sub) => {
                 let _ = sub.block_key;
-                let page_id = sub.page_id();
                 self.pool.inflight_io.fail_submitted_writeback(
                     &self.pool.stats,
                     &mut sub.page_guard,
-                    IoError::report_backend(
-                        err,
-                        format!("complete submitted evict pool writeback: page_id={page_id}"),
-                    ),
+                    err.to_report().attach("op_kind=write"),
                 );
                 drop(sub.batch_done.take());
                 StorageIOKind::Write
@@ -1578,7 +1562,7 @@ impl EvictReadSubmission {
 
     /// Fails the reload before worker completion and wakes joined readers.
     #[inline]
-    pub(crate) fn fail(mut self, err: Report<CompletionErrorKind>) {
+    pub(crate) fn fail(mut self, err: CompletionErrorBridge) {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
@@ -1587,7 +1571,7 @@ impl EvictReadSubmission {
 
     /// Fails a submitted reload while retaining its borrowed page memory.
     #[inline]
-    fn fail_backend_submitted(&mut self, err: Report<CompletionErrorKind>) {
+    fn fail_backend_submitted(&mut self, err: CompletionErrorBridge) {
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
         self.complete_waiters(Err(err));
@@ -1619,27 +1603,27 @@ impl EvictReadSubmission {
                     }
                     Err(err) => {
                         drop(reservation);
-                        Err(CompletionErrorKind::from_data_integrity(
-                            err,
-                            format!("validate evict pool read: page_id={page_id}"),
-                        ))
+                        Err(CompletionErrorBridge::capture(err.attach(format!(
+                            "validate evict pool read: page_id={page_id}"
+                        ))))
                     }
                 }
             }
             Ok(len) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::from_io(
-                    Report::new(IoError::from(IoErrorKind::UnexpectedEof)).attach(format!(
-                        "unexpected eof: actual_bytes={len}, expected_bytes={PAGE_SIZE}"
-                    )),
-                    format!("complete evict pool read: page_id={page_id}"),
+                Err(CompletionErrorBridge::capture(
+                    Report::new(IoError::from(IoErrorKind::UnexpectedEof))
+                        .attach(format!(
+                            "complete evict pool read: page_id={page_id}, unexpected eof: actual_bytes={len}, expected_bytes={PAGE_SIZE}"
+                        )),
                 ))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::from_io(
-                    Report::new(IoError::from(err.kind())).attach(format!("{err}")),
-                    format!("complete evict pool read: page_id={page_id}"),
+                Err(CompletionErrorBridge::capture(
+                    Report::new(IoError::from(err.kind())).attach(format!(
+                        "complete evict pool read: page_id={page_id}, {err}"
+                    )),
                 ))
             }
         };
@@ -1661,12 +1645,11 @@ impl Drop for EvictReadSubmission {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
-        self.complete_waiters(Err(CompletionErrorKind::from_internal(
-            Report::new(InternalError::CompletionDropped),
-            format!(
+        self.complete_waiters(Err(CompletionErrorBridge::capture(
+            Report::new(InternalError::CompletionDropped).attach(format!(
                 "drop evict read submission before completion: page_id={}",
                 self.key
-            ),
+            )),
         )));
     }
 }
@@ -1690,25 +1673,21 @@ impl PreparedEvictReadSubmission {
     }
 
     #[inline]
-    fn fail_backend_not_accepted(self, err: &Report<IoError>) {
+    fn fail_backend_not_accepted(self, err: &BackendError) {
         let page_id = self.page_id();
-        self.inner.fail(CompletionErrorKind::from_io(
-            IoError::report_backend(err, format!("submit evict pool read: page_id={page_id}")),
-            "evict pool read completion transport",
-        ));
+        self.inner
+            .fail(CompletionErrorBridge::capture(err.to_report().attach(
+                format!("submit evict pool read: op_kind=read, page_id={page_id}"),
+            )));
     }
 
     #[inline]
-    fn fail_backend_submitted(&mut self, err: &Report<IoError>) {
+    fn fail_backend_submitted(&mut self, err: &BackendError) {
         let page_id = self.page_id();
         self.inner
-            .fail_backend_submitted(CompletionErrorKind::from_io(
-                IoError::report_backend(
-                    err,
-                    format!("complete submitted evict pool read: page_id={page_id}"),
-                ),
-                "evict pool read completion transport",
-            ));
+            .fail_backend_submitted(CompletionErrorBridge::capture(err.to_report().attach(
+                format!("complete submitted evict pool read: op_kind=read, page_id={page_id}"),
+            )));
     }
 
     #[inline]
@@ -1863,9 +1842,8 @@ impl InflightIO {
         };
         drop(page_guard);
         if let Some(completion) = completion {
-            completion.complete(Err(CompletionErrorKind::from_io(
-                err,
-                format!("fail evict pool writeback: page_id={page_id}"),
+            completion.complete(Err(CompletionErrorBridge::capture(
+                err.attach(format!("fail evict pool writeback: page_id={page_id}")),
             )));
         }
     }
@@ -1907,10 +1885,9 @@ impl InflightIO {
             }
         };
         if let Some(completion) = completion {
-            completion.complete(Err(CompletionErrorKind::from_io(
-                err,
-                format!("fail submitted evict pool writeback: page_id={page_id}"),
-            )));
+            completion.complete(Err(CompletionErrorBridge::capture(err.attach(format!(
+                "fail submitted evict pool writeback: page_id={page_id}"
+            )))));
         }
     }
 
@@ -1958,7 +1935,7 @@ pub(crate) mod tests {
     use crate::component::{IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{CompletionErrorKind, ConfigError, DataIntegrityError, Result};
+    use crate::error::{ConfigError, DataIntegrityError, Result};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_TRAILER_SIZE, checksum_offset as block_checksum_offset,
         validate_block_checksum as validate_block_checksum_for_test,
@@ -1969,7 +1946,7 @@ pub(crate) mod tests {
         build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
     };
     use crate::index::BTreeNode;
-    use crate::io::{IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState};
+    use crate::io::BackendError;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
     use futures::task::noop_waker;
@@ -2113,30 +2090,33 @@ pub(crate) mod tests {
         (req, completion)
     }
 
-    fn backend_failure_for_test() -> Report<IoError> {
-        IOBackendFailure::report(
+    fn backend_failure_for_test() -> BackendError {
+        BackendError::submit(
             "test_backend",
-            IOBackendErrorPhase::Submit,
             StdIoError::from_raw_os_error(libc::EIO),
             1,
-            IOBackendQueueState::submit(1, 1),
+            1,
+            1,
         )
     }
 
-    fn assert_backend_page_completion_error(completion: &PageIOCompletion) {
+    fn assert_backend_page_completion_error(completion: &PageIOCompletion, expected_op_kind: &str) {
         let report = completion
             .completed_result()
             .expect("page IO completion should be terminal")
-            .expect_err("page IO should fail with backend error");
+            .expect_err("page IO should fail with backend error")
+            .replace_context(RuntimeError::BufferPageAccess);
         assert_eq!(
-            *report.current_context(),
-            CompletionErrorKind::Io(StdIoError::from_raw_os_error(libc::EIO).kind())
+            report.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(StdIoError::from_raw_os_error(libc::EIO).kind())
         );
         let failure = report
-            .downcast_ref::<IOBackendFailure>()
+            .downcast_ref::<BackendError>()
             .expect("backend failure attachment should be preserved");
         assert_eq!(failure.backend(), "test_backend");
-        assert_eq!(failure.phase(), IOBackendErrorPhase::Submit);
+        assert_eq!(failure.op(), "submit");
+        let output = format!("{report:?}");
+        assert!(output.contains(expected_op_kind), "{output}");
     }
 
     fn build_state_machine_for_test(
@@ -2416,7 +2396,7 @@ pub(crate) mod tests {
             let (read_req, read_completion) =
                 make_reload_submission_for_test(&owner, &pool_guard, read_page_id, |_| {});
             state_machine.fail_request_with_backend_error(PoolRequest::Read(read_req), &err);
-            assert_backend_page_completion_error(&read_completion);
+            assert_backend_page_completion_error(&read_completion, "op_kind=read");
             assert_eq!(owner.arena.frame(read_page_id).kind(), FrameKind::Evicted);
             assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
             assert_eq!(owner.inflight_io.reads.load(Ordering::Relaxed), 0);
@@ -2425,7 +2405,7 @@ pub(crate) mod tests {
             let (write_req, write_completion, write_page_id) =
                 make_dirty_writeback_request_for_test(&owner, &pool_guard).await;
             state_machine.fail_request_with_backend_error(write_req, &err);
-            assert_backend_page_completion_error(&write_completion);
+            assert_backend_page_completion_error(&write_completion, "op_kind=write");
             assert_eq!(owner.arena.frame(write_page_id).kind(), FrameKind::Hot);
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&write_page_id));
@@ -2448,7 +2428,7 @@ pub(crate) mod tests {
                 prepare_pool_request_for_test(&mut state_machine, PoolRequest::Read(read_req));
             let kind = state_machine.fail_submission_with_backend_error(read_sub, &err);
             assert_eq!(kind, StorageIOKind::Read);
-            assert_backend_page_completion_error(&read_completion);
+            assert_backend_page_completion_error(&read_completion, "op_kind=read");
             assert_eq!(owner.arena.frame(read_page_id).kind(), FrameKind::Evicted);
             assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
 
@@ -2457,7 +2437,7 @@ pub(crate) mod tests {
             let write_sub = prepare_pool_request_for_test(&mut state_machine, write_req);
             let kind = state_machine.fail_submission_with_backend_error(write_sub, &err);
             assert_eq!(kind, StorageIOKind::Write);
-            assert_backend_page_completion_error(&write_completion);
+            assert_backend_page_completion_error(&write_completion, "op_kind=write");
             assert_eq!(owner.arena.frame(write_page_id).kind(), FrameKind::Hot);
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
         });
@@ -2480,7 +2460,7 @@ pub(crate) mod tests {
             state_machine.on_submit(&read_sub);
             let kind = state_machine.fail_submitted_with_backend_error(&mut read_sub, &err);
             assert_eq!(kind, StorageIOKind::Read);
-            assert_backend_page_completion_error(&read_completion);
+            assert_backend_page_completion_error(&read_completion, "op_kind=read");
             assert_eq!(owner.inflight_io.reads.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&read_page_id));
             assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 1);
@@ -2494,7 +2474,7 @@ pub(crate) mod tests {
             state_machine.on_submit(&write_sub);
             let kind = state_machine.fail_submitted_with_backend_error(&mut write_sub, &err);
             assert_eq!(kind, StorageIOKind::Write);
-            assert_backend_page_completion_error(&write_completion);
+            assert_backend_page_completion_error(&write_completion, "op_kind=write");
             assert_eq!(owner.arena.frame(write_page_id).kind(), FrameKind::Hot);
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&write_page_id));
@@ -2920,10 +2900,14 @@ pub(crate) mod tests {
                     page[0] ^= 0xFF;
                 });
             assert_eq!(bad_req.complete(Ok(PAGE_SIZE)), IOKind::Read);
-            let report = bad_completion.wait_result().await.unwrap_err();
+            let report = bad_completion
+                .wait_result()
+                .await
+                .unwrap_err()
+                .replace_context(RuntimeError::BufferPageAccess);
             assert_eq!(
-                *report.current_context(),
-                CompletionErrorKind::DataIntegrity(DataIntegrityError::ChecksumMismatch)
+                report.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::ChecksumMismatch)
             );
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Evicted);
             assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
@@ -3043,10 +3027,14 @@ pub(crate) mod tests {
 
             assert_eq!(kind, StorageIOKind::Write);
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
-            let report = completion.wait_result().await.unwrap_err();
+            let report = completion
+                .wait_result()
+                .await
+                .unwrap_err()
+                .replace_context(RuntimeError::BufferPageAccess);
             assert_eq!(
-                *report.current_context(),
-                CompletionErrorKind::Io(StdIoError::from_raw_os_error(libc::EIO).kind())
+                report.downcast_ref::<IoError>().copied().map(IoError::kind),
+                Some(StdIoError::from_raw_os_error(libc::EIO).kind())
             );
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
@@ -3282,10 +3270,14 @@ pub(crate) mod tests {
                 Err(StdIoError::from_raw_os_error(libc::EIO)),
             );
             assert_eq!(kind, StorageIOKind::Write);
-            let report = completion.wait_result().await.unwrap_err();
+            let report = completion
+                .wait_result()
+                .await
+                .unwrap_err()
+                .replace_context(RuntimeError::BufferPageAccess);
             assert_eq!(
-                *report.current_context(),
-                CompletionErrorKind::Io(StdIoError::from_raw_os_error(libc::EIO).kind())
+                report.downcast_ref::<IoError>().copied().map(IoError::kind),
+                Some(StdIoError::from_raw_os_error(libc::EIO).kind())
             );
 
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);

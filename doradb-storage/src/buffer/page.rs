@@ -26,10 +26,6 @@ const _: () = assert_buffer_page::<Page>();
 /// Raw byte page image used by low-level IO paths.
 pub(crate) type Page = [u8; PAGE_SIZE];
 
-/// Convenient for IO thread to process, no matter
-/// what kind this page belongs to.
-impl sealed::Sealed for Page {}
-
 // SAFETY: `[u8; PAGE_SIZE]` is exactly one page, has no drop glue, and every
 // byte pattern is valid. It is used only as raw bytes under the buffer-pool
 // latch and IO ownership protocols.
@@ -90,12 +86,6 @@ impl From<u8> for BufferPageKind {
     }
 }
 
-/// Seals [`BufferPage`] implementations to page image types audited in this crate.
-pub(crate) mod sealed {
-    /// Private supertrait for crate-owned buffer page image implementations.
-    pub(crate) trait Sealed {}
-}
-
 /// A page image type that can be stored in the buffer-pool arena.
 ///
 /// # Safety
@@ -105,7 +95,7 @@ pub(crate) mod sealed {
 /// layout must remain stable for native in-process page images, and all
 /// interior mutation must be safe under the buffer-pool latch protocol.
 pub(crate) unsafe trait BufferPage:
-    sealed::Sealed + FromBytes + IntoBytes + KnownLayout + Sized + Send + Sync + 'static
+    FromBytes + IntoBytes + KnownLayout + Sized + Send + Sync + 'static
 {
     /// Logical kind recorded in the owning buffer frame.
     const KIND: BufferPageKind;

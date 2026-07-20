@@ -2,8 +2,8 @@ use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::table::TableMetadata;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, DataIntegrityResult, Error, FileKind, InternalError,
-    IoResult, ResourceError, ResourceResult, Result, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityResult, Error, FileKind, InternalError,
+    InternalResult, IoResult, ResourceError, ResourceResult, Result, RuntimeResult,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -353,7 +353,7 @@ impl MutableTableFile {
         &mut self,
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
-    ) -> Result<()> {
+    ) -> InternalResult<()> {
         let root = &mut self.new_root.root;
         if pivot_row_id < root.pivot_row_id {
             return Err(mutable_root_metadata_regression(format!(
@@ -478,7 +478,7 @@ impl MutableTableFile {
 
         try_join_all(writes)
             .await
-            .map_err(|report| Error::from_completion_report(report, "persist table LWC blocks"))?;
+            .map_err(|report| Error::from_completion_bridge(report, "persist table LWC blocks"))?;
 
         let root = self.root();
         let column_index = ColumnBlockIndex::new(
@@ -535,10 +535,9 @@ impl MutableCowFile for MutableTableFile {
             .as_cow_write_barrier()
             .begin_write(self.file.sparse_file().file_id(), block_id)
             .map_err(|report| {
-                CompletionErrorKind::from_internal(
-                    report,
-                    format!("begin table CoW write barrier: block_id={block_id}"),
-                )
+                CompletionErrorBridge::capture(report.attach(format!(
+                    "begin table CoW write barrier: block_id={block_id}"
+                )))
             })?;
         self.file
             .file()
@@ -601,10 +600,8 @@ fn secondary_index_root_inactive_slot_mismatch(index_no: usize, root: BlockID) -
 }
 
 #[inline]
-fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
-    Report::new(InternalError::MutableRootMetadataRegression)
-        .attach(message.into())
-        .into()
+fn mutable_root_metadata_regression(message: impl Into<String>) -> Report<InternalError> {
+    Report::new(InternalError::MutableRootMetadataRegression).attach(message.into())
 }
 
 #[inline]

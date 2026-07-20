@@ -16,8 +16,10 @@ responsibility-first, bottom-up program covering every top-level module in
 `doradb-storage`. Every production use of the public crate-level `Error` or
 `Result` must either move to its narrowest typed domain or receive an explicit,
 testable justification as an external-trait, genuinely mixed, or public
-convergence boundary. IO-domain producers use one central `IoResult<T>` alias
-instead of the backend-local `BackendResult<T>`. Cross-thread failures use one
+convergence boundary. IO-domain report producers use one central `IoResult<T>`
+alias. Runtime backend progress instead uses the IO-local concrete
+`BackendResult<T> = Result<T, BackendError>` until a completion, Fatal, or
+public reporting boundary creates the IO report. Cross-thread failures use one
 semantic-free, Arc-backed
 `CompletionErrorBridge` that shares an immutable canonical typed report across
 waiters without introducing a completion error domain. Internal invariant
@@ -68,6 +70,16 @@ backend implementations, and test doubles outside that defining file. The
 result belongs to the central IO error domain, while raw `std::io::Result`
 values returned inside backend completion payloads are a distinct transport
 detail. [C1], [C4], [C17], [D1], [U8]
+
+Phase 1 removed that report-carrying alias and established central `IoResult`.
+Phase 2 later exposed a separate nested-call-stack problem: backend threads
+were constructing `Report<IoError>` at submit or wait and passing it through
+drivers only for completion, Fatal, or public owners to extract and clone the
+structured backend failure into another IO report. Phase 2 therefore reuses
+the name `BackendResult`, but with new concrete semantics:
+`Result<T, BackendError>`. Setup remains `IoResult`, operation completions
+remain raw `StdIoResult`, and only terminal reporting owners convert the local
+failure to `Report<IoError>`. [C18], [U12]
 
 The crate currently declares 35 top-level modules in `lib.rs`. A production
 source scan finds 14 modules importing the public crate-level `Result`, one
@@ -136,7 +148,7 @@ Issue Labels:
 - [C2] `doradb-storage/src/lib.rs` - authoritative top-level module and public
   facade inventory.
 - [C3] `doradb-storage/src/component.rs`, `doradb-storage/src/thread.rs`, and
-  `doradb-storage/src/engine_poison.rs` - established associated build errors,
+  `doradb-storage/src/poison.rs` - established associated build errors,
   Runtime spawn reports, and Fatal publication.
 - [C4] `doradb-storage/src/io/backend.rs`,
   `doradb-storage/src/io/iouring_backend.rs`, and
@@ -183,6 +195,11 @@ Issue Labels:
   doubles in file/log/recovery modules - the backend-local
   `BackendResult<T> = Result<T, Report<IoError>>` alias and its consumers,
   alongside the distinct raw `StdIoResult<T>` completion payload alias.
+- [C18] `doradb-storage/src/io/backend.rs`, `doradb-storage/src/io/mod.rs`,
+  backend implementations, and the storage/redo/recovery progress handlers -
+  the Phase 2 concrete `BackendError`, private operation-detail enum,
+  `BackendResult<T> = Result<T, BackendError>` runtime transport, and terminal
+  IO-report conversions.
 
 ### Conversation References
 
@@ -197,8 +214,8 @@ Issue Labels:
   interpretation, and use of both related backlogs as design inputs were
   explicitly approved.
 - [U5] Completion transport was identified as a semantic-free asynchronous
-  bridge that should stack on the real report rather than duplicate its domain
-  in `CompletionErrorKind` variants.
+  bridge that should preserve and replay the real report rather than duplicate
+  its domain in `CompletionErrorKind` variants.
 - [U6] The Arc-backed `CompletionErrorBridge`/`BridgeInner` design was
   explicitly approved for adoption in RFC-0023 so fanout clones one immutable
   canonical report cheaply.
@@ -208,7 +225,7 @@ Issue Labels:
   explicit TODO comment.
 - [U8] `BackendResult` should be renamed to `IoResult` and moved from the IO
   backend module to the central error module.
-- [U9] The concrete cloneable representation used to materialize completion
+- [U9] The concrete cloneable representation used to reconstruct completion
   reports remains a completion-transport phase choice; the RFC must not assume
   erased frames can be cloned generically, and that phase cannot complete
   until the selected design satisfies the required physical-frame downcast
@@ -223,6 +240,11 @@ Issue Labels:
   completion transport makes one oversized task. The approved revision makes
   those dependency slices separate canonical RFC phases, producing four
   ordered phases in total.
+- [U12] Phase 2 review approved reintroducing `BackendResult` with concrete
+  `BackendError` semantics, renaming the crate-private backend contract to
+  `Backend`, representing operation-specific data with a private enum, and
+  deferring IO-report construction until completion, Fatal, or public
+  reporting boundaries.
 
 ### Source Backlogs
 
@@ -268,7 +290,7 @@ implementation to create public `Error`. Existing broad traits may remain only
 after their complete implementation and caller set proves that the trait
 itself is a genuine convergence boundary. [D1], [C3], [C6], [C9]
 
-### Central IO Result Alias
+### Central IO Reports and Concrete Backend Progress
 
 The IO main domain has one canonical result alias, defined beside the other
 main-domain aliases in `error.rs`: [D1], [C1], [C17], [U8]
@@ -287,11 +309,32 @@ buffer, log, or recovery code. This is an alias relocation and signature
 clarification; it does not change report frames, public `ErrorKind::Io`, or
 backend behavior. [C4], [C17], [U8]
 
+Phase 2 reintroduces the name only for a different local type:
+
+```rust
+pub(crate) type BackendResult<T> =
+    result::Result<T, BackendError>;
+```
+
+The crate-private `Backend` trait uses `IoResult<Self>` for setup, which
+returns immediately to an IO reporting caller. Its runtime submit/wait methods,
+submission drivers, and bounded retry path use `BackendResult` so nested
+backend-thread call stacks carry the concrete failure without constructing an
+intermediate report. `BackendError` stores common backend, IO kind, shared
+source text, errno, and syscall-count fields plus a private enum for submit,
+wait, and submit-retry-expired details. The enum derives the lowercase
+operation name; no string-like operation placeholder is accepted. Completion,
+Fatal, or public policy owners convert the value once to `Report<IoError>` and
+retain the exact `BackendError` attachment. [C18], [U12]
+
 Raw standard-library IO results remain distinct. Backend completion payloads
 may retain the backend-local `StdIoResult<T>` alias, and other local uses spell
 the type `StdIoResult` or `std::io::Result`; they do not alias
 `std::io::Result` as `IoResult`. Thus unqualified `IoResult` consistently means
-the storage IO-domain report throughout the crate. [C17], [D1], [U8]
+the storage IO-domain report throughout the crate. Runtime `BackendResult` is
+also distinct from these per-operation completion results: a completion
+payload describes one submitted read/write/sync outcome, while `BackendError`
+describes failure to make backend progress. [C17], [C18], [D1], [U8], [U12]
 
 ### Dual Public and Internal Conversion Surfaces
 
@@ -335,40 +378,57 @@ pub(crate) type CompletionResult<T> =
 pub(crate) struct CompletionErrorBridge(Arc<BridgeInner>);
 ```
 
-`BridgeInner` owns the pre-bridge canonical `Report<E>` through a private
-erased-report abstraction. It must not store public `Error`, `ErrorKind`, a
+`BridgeInner` owns the pre-bridge canonical typed report through a private
+closed source-report registry. It must not store public `Error`, `ErrorKind`, a
 consumer-visible second error-domain enum, or `Box<dyn Error>` that reduces
-typed frames to a standard error source. A private representation that holds
-concrete cloneable frame values solely for materialization is allowed; it is
-not a completion domain and must not be exposed for semantic matching.
+typed frames to a standard error source. The private registry and replay values
+exist solely for capture and reconstruction; they are not completion domains
+and must not be exposed for semantic matching.
 Capturing consumes the typed report, no mutable reference or frame-mutation API
 escapes, and every bridge clone shares the same immutable inner report.
-`BridgeInner` stores the pre-bridge report, not a materialized report containing
-its own bridge, so the ownership graph cannot form an Arc cycle. [D1], [C1],
+`BridgeInner` stores the pre-bridge report, not a reconstructed report, so the
+ownership graph cannot form an Arc cycle. [D1], [C1],
 [C14], [C15], [U6], [U9]
 
-`CompletionErrorBridge::capture(Report<E>)` is the only construction path.
-`E` satisfies a sealed `CompletionSource` contract implemented for real main
-domain contexts that can cross an established handoff. It is not implemented
-for public `ErrorKind`, for the bridge itself, or for `RuntimeError`: public
-capture would reintroduce early convergence, recursive capture would obscure
-the canonical cause, and Runtime spawn failure occurs before a worker can
-publish completion. Direct bridge-only reports are invalid by construction.
+`CompletionErrorBridge::capture` is the only construction path. Its input must
+convert into a closed `CompletionSourceReport` registry containing the real
+main-domain contexts that can cross an established handoff. No conversion
+exists for public `ErrorKind`, for the bridge itself, or for `RuntimeError`:
+public capture would reintroduce early convergence, recursive capture would
+obscure the canonical cause, and Runtime spawn failure occurs before a worker
+can publish completion. Direct bridge-only reports are invalid by construction.
 [D1], [D15], [U5], [U6]
 
-`Completion<T>` stores the bridge value and fanout clones only its Arc. A
-consumer that needs an owned error-stack report asks the bridge to materialize
-one. The concrete materialization mechanism is a Phase 2 choice. It may use a
-closed cloneable replay schema, per-source snapshot, or equivalent checked
-design, but it must define explicit clone-and-reconstruction behavior for every
-main-domain context and structured attachment supported across completion; it
-must not assume arbitrary erased frames can be cloned. Materialization uses
-that representation to reproduce the ordered main-domain context chain and
-required structured/printable attachments, then stacks a clone of
-`CompletionErrorBridge` as the current transport context. The shared canonical
-report remains reachable through the bridge so producer detail is retained for
-diagnostics. Per-waiter allocation is confined to the error path. [C1], [C14],
-[C15], [U6], [U9], [B2]
+`Completion<T>` stores the bridge value and fanout clones only its Arc. A final
+owner that needs an owned error-stack report consumes a bridge clone with
+`replace_context(context)`. The checked closed replay schema reproduces the
+ordered main-domain source chain and required structured/printable attachments,
+then installs the caller-owned context in the same reconstruction. The bridge
+itself is never a report context. It exposes neither raw `into_report` nor
+borrowing `to_report`, and it does not implement `std::error::Error`, preventing
+`error-stack`'s blanket raw conversion. Direct policy inspection reads the
+immutable canonical typed report only through a responsibility-specific
+wrapper such as `SharedFatalError`; the generic bridge exposes no production
+downcast API. The canonical report remains alive through any other carrier
+clones until their final drop.
+Per-waiter allocation is confined to the error path. [C1], [C14], [C15], [U6],
+[U9], [B2]
+
+Fatal state that remains shared after the completion boundary uses the
+crate-private `SharedFatalError(CompletionErrorBridge)` invariant wrapper.
+Only `Report<FatalError>` constructs it. Its consuming reconstruction extracts
+the final Fatal replay-builder variant with `expect`, preserving the exact
+Fatal source chain without adding the same Fatal context twice. Redo,
+failed-precommit, and engine-poison state carry this wrapper end to end and
+unwrap it only for a generic completion cell. `EnginePoisoner` retains the
+first wrapper internally but returns each poison caller's local wrapper
+directly; a local/published return pair is unnecessary. Its publication API
+accepts only a complete `Report<FatalError>` or `SharedFatalError`: it attaches
+no diagnostic message and emits no log. The policy owner attaches operation
+context and logs the canonical report under its actual component before
+publication. Components that publish, inspect, or listen for poison depend on
+`EnginePoisoner` directly rather than routing through a transaction-system
+facade. [C1], [C14], [U6], [U9]
 
 Explicit frame visitation may identify supported registered frame types, but
 with the pinned stable `error-stack` API it does not provide a generic way to
@@ -380,10 +440,12 @@ contain physical, downcastable domain frames rather than only an opaque nested
 report. [C1], [C15], [U9]
 
 The bridge has no domain variants, `error_kind()` mapping, generic Internal
-fallback, or semantic accessor. Public conversion derives `ErrorKind` from the
-nearest real main-domain context below the bridge and adds the public context
-once. Internal and test consumers inspect the real `FatalError`, `IoError`,
-`DataIntegrityError`, or other frames instead of matching a completion variant.
+fallback, or public semantic accessor. Public conversion derives `ErrorKind`
+from the nearest real main-domain context in the checked replay plan, then
+consumes the bridge with `replace_context(ErrorKind)`. The public report never
+contains the bridge. Internal policy consumers inspect the canonical
+`FatalError`, `IoError`, `DataIntegrityError`, or other frame directly, then
+reconstruct with their owned context instead of matching a completion variant.
 Phase 1 first narrows every caller contract that currently supplies a converged
 public `Error`. Each producer instead returns the real typed report or an
 explicit typed branch, and a temporary typed adapter may preserve that report
@@ -398,7 +460,8 @@ completion compatibility adapter may remain after Phase 2. [D1], [C1], [C6],
 
 Fatal classification is still made only by the durability, rollback,
 checkpoint, catalog, or poison policy owner that can determine safe
-continuation is impossible. A Fatal report captured by the bridge retains the
+continuation is impossible. A Fatal report captured by `SharedFatalError` or a
+generic completion bridge retains the
 initiating IO, Resource, DataIntegrity, or other source below it, so a
 `Fatal -> IO -> backend attachments` chain remains observable by every waiter.
 [D7], [D8], [B2], [C6], [C7], [C11], [U6]
@@ -453,7 +516,7 @@ convergence-confirmed outcome. [C2], [U2]
 | Starting state | Modules | Required outcome |
 | --- | --- | --- |
 | Central foundation | `error` | Preserve exhaustive typed/public conversions, define the canonical `IoResult`, replace semantic completion kinds with the Arc-backed bridge contract, and remove Generic convenience/fallback conversion paths. |
-| Typed, neutral, or infallible baseline | `bitmap`, `id`, `component`, `compression`, `engine_poison`, `free_list`, `latch`, `layout`, `lock`, `map`, `memcmp`, `notify`, `obs`, `ptr`, `quiescent`, `row`, `runtime`, `serde`, `stats`, `thread` | Verify the production call chains and why no public convergence is needed. Review callers of these modules so their typed reports are not immediately erased. |
+| Typed, neutral, or infallible baseline | `bitmap`, `id`, `component`, `compression`, `poison`, `free_list`, `latch`, `layout`, `lock`, `map`, `memcmp`, `notify`, `obs`, `ptr`, `quiescent`, `row`, `runtime`, `serde`, `stats`, `thread` | Verify the production call chains and why no public convergence is needed. Review callers of these modules so their typed reports are not immediately erased. |
 | Likely intentional convergence with private-site audit | `engine`, `lwc`, `session`, `value` | Confirm public facade, external-trait, and genuinely mixed sites; narrow any private item that does not satisfy an allowed reason. For `value` and similar shared public types, confirm that the public trait is a thin adapter and internal callers use the canonical typed operation. |
 | Substantial migration candidates | `buffer`, `catalog`, `conf`, `file`, `index`, `io`, `log`, `recovery`, `table`, `trx` | Separate native producers from forwarding and orchestration, narrow signatures, remove round trips, and justify every remaining crate-level result. |
 | Public facade | `lib.rs` | Preserve the public exports while ensuring internal modules do not use the facade as a convenience error set. |
@@ -482,11 +545,12 @@ convenience paths, unowned broad results, Generic convenience constructors or
 catch-all mappings, and untracked production Generic producers. [U2], [U4],
 [D9], [D12], [C8], [C16]
 
-The central `IoResult` definition, absence of `BackendResult`, typed completion
-capture, and removal of semantic completion matching remain behavioral and
-source-shape acceptance requirements of their owning phases. They do not
-require a persistent phase-spanning checker while signatures and ownership
-boundaries are still moving. [C1], [C14], [C17], [U5], [U6], [U8]
+The central `IoResult` definition, the concrete non-reporting `BackendResult`
+boundary, typed completion capture, and removal of semantic completion matching
+remain behavioral and source-shape acceptance requirements of their owning
+phases. They do not require a persistent phase-spanning checker while
+signatures and ownership boundaries are still moving. [C1], [C14], [C17],
+[C18], [U5], [U6], [U8], [U12]
 
 After all four phases stabilize, a separate follow-up may evaluate whether a
 deterministic audit tool provides enough regression value to justify its
@@ -500,11 +564,12 @@ and does not itself change persisted formats, backend submission semantics,
 checkpoint atomicity, transaction behavior, or lifecycle policy. A separate
 post-Phase-1 review decision widened the public `ValKind` representation and
 its persisted tags to u32, explicitly discarding previous-format compatibility;
-that adjacent change is not an error-boundary requirement. Replacing the
-crate-private `BackendResult` alias with central `IoResult<T>` is an internal
-alias relocation, not a new error domain or public classification. Replacing
-the crate-private completion error type and storage representation is in scope,
-but `Error::report()` and
+that adjacent change is not an error-boundary requirement. Phase 1 replacement
+of the report-carrying `BackendResult` alias with central `IoResult<T>` was an
+internal alias relocation, not a new error domain or public classification.
+Phase 2's concrete `BackendResult<T>` is likewise an IO-local runtime transport
+and introduces no public classification. Replacing the crate-private completion
+error type and storage representation is in scope, but `Error::report()` and
 `Error::into_report()` continue to expose owned reports containing physical
 domain frames. [C1], [D1], [D3], [D7], [D8], [U6], [U8]
 
@@ -531,20 +596,23 @@ unfinished supplier boundary. [U11], [D1], [D10]
 
 ## Alternatives Considered
 
-### Backend-Local IO Result Alias
+### Backend-Local IO Report Alias
 
-- Summary: retain `BackendResult<T>` in `io/backend.rs`, or rename it there
-  while continuing to scope the alias to backend operations.
-- Analysis: the alias already carries the central `IoError` domain and is used
+- Summary: retain the original report-carrying `BackendResult<T>` in
+  `io/backend.rs`, or rename it there while continuing to scope the IO report
+  alias to backend operations.
+- Analysis: that alias carried the central `IoError` domain and was used
   across the backend trait, drivers, implementations, and test doubles. Its
   current name makes a main-domain report appear owned by one supplier layer
   and gives non-backend IO producers no canonical alias, unlike the other main
   domains. [C1], [C4], [C17], [D1]
-- Why Not Chosen: `IoResult` in `error.rs` names the semantic domain, follows
+- Why Not Chosen: `IoResult` in `error.rs` names the reporting domain, follows
   the established central-alias pattern, and stays accurate as the same report
-  propagates beyond the backend. The raw standard IO payload remains separately
-  named `StdIoResult`. [U8], [C17]
-- References: [C1], [C4], [C17], [D1], [U8]
+  propagates beyond the backend. Phase 2's concrete `BackendResult<T>` does not
+  revive this alternative because it carries `BackendError`, not an IO report.
+  The raw standard IO payload remains separately named `StdIoResult`. [U8],
+  [U12], [C17], [C18]
+- References: [C1], [C4], [C17], [C18], [D1], [U8], [U12]
 
 ### Semantic Completion Domain Enum
 
@@ -570,9 +638,9 @@ unfinished supplier boundary. [U11], [D1], [D10]
   tree through `source()`, and importing an ordinary source records a string
   context. Public report downcasts would therefore not observe the original
   domain frames. [C1], [C15]
-- Why Not Chosen: the selected design uses a private erased report holder and
-  explicit materialization so real contexts remain physical and downcastable in
-  each consumed report. [U6], [C1]
+- Why Not Chosen: the selected design uses a private closed typed-report
+  registry and explicit owner-context reconstruction so real contexts remain physical and
+  downcastable in each consumed report. [U6], [C1]
 - References: [C1], [C15], [U6]
 
 ### Typed-Only Internal Core and Wholesale Trait Redesign
@@ -729,22 +797,26 @@ RFC. [D17], [D18]
 
 - **Phase 2: Completion Bridge and Infrastructure Closure**
   - Scope: Replace completion transport in `error` and `io::completion`, then
-    migrate every existing completion producer and consumer in `engine_poison`,
+    migrate every existing completion producer and consumer in `poison`,
     `file`, `buffer`, `log`, and the compiler-required transaction paths.
     Compiler fallout in recovery, catalog, table, or engine code is limited to
     consuming the new transport without reinterpreting storage semantics. [D1],
     [C1], [C3], [C5]-[C7], [C10]-[C14], [U5], [U6], [U11]
   - Goals: Replace `CompletionErrorKind` and report-storing fanout with the
-    Arc-backed `CompletionErrorBridge`, sealed typed capture, immutable erased
-    canonical report holder, explicit physical-frame materialization, and
-    real-frame public classification; select and implement a checked closed
+    Arc-backed `CompletionErrorBridge`, closed typed capture, an immutable
+    canonical source-report registry, explicit physical-frame reconstruction,
+    and real-frame public classification; select and implement a checked closed
     replay schema, per-source snapshot, or equivalent private representation
     for every stabilized main-domain context and required cloneable
     attachment; migrate all completion producers and consumers away from
     semantic transport variants; preserve Fatal sources at the first
     durability or poison policy boundary and through every waiter; remove all
-    Phase 1 completion adapters. [D1], [C1], [C3], [C6], [C7], [C11], [C14],
-    [C15], [U5], [U6], [U9], [U11]
+    Phase 1 completion adapters. Rename the crate-private IO backend contract
+    to `Backend`; carry submit, wait, and bounded retry failures as concrete
+    operation-specific `BackendError` values; and defer `Report<IoError>`
+    construction until a completion, Fatal, or public reporting boundary.
+    [D1], [C1], [C3], [C6], [C7], [C11], [C14], [C15], [C18], [U5], [U6],
+    [U9], [U11], [U12]
   - Non-goals: Reinterpret row/index/table/catalog foreground, checkpoint, or
     recovery meaning; redesign public `Error`/report APIs; broaden the
     transaction audit beyond compiler-required completion paths; finalize
@@ -752,29 +824,33 @@ RFC. [D17], [D18]
   - Prerequisites: Phase 1 has stabilized every completion supplier as a typed
     report or explicit typed branch, removed public-error capture inputs, and
     preserved every source context and attachment that must survive fanout.
-    Both backend configurations pass with the central `IoResult` contract.
-    [D1], [C17], [U8], [U10], [U11]
-  - Phase-local Choices: The concrete object-safe erased-report and
-    frame-materialization implementation; closed replay schema versus
-    per-source snapshot or an equivalent checked representation; the final
-    cloneable attachment registry; and the private replay discriminator shape.
-    These choices may not alter Arc ownership, semantic-free typed capture,
-    physical-frame downcasts, or the prohibition on a consumer-visible
-    completion domain. [U5], [U6], [U9]
+    Both backend configurations pass with the central `IoResult` reporting
+    contract. [D1], [C17], [U8], [U10], [U11]
+  - Phase-local Choices: Implemented one eager-on-error ordered replay plan
+    beside the canonical typed report, closed enum registries for contexts and
+    attachments, Arc-backed shared text, a private typed report builder, and
+    lazy per-owner reconstruction. Backend runtime progress uses the concrete
+    operation-specific `BackendError` detail enum before terminal IO reporting.
+    [C18], [U5], [U6], [U9], [U12]
   - After This Phase: All completion waiters share one immutable canonical
-    report and materialize the same real domain chain; no caller reconstructs a
+    report and reconstruct the same real domain chain under their final-owner
+    contexts; no caller reconstructs a
     lost IO, Resource, DataIntegrity, Lifecycle, Fatal, or Internal source from
     a transport discriminator; `CompletionErrorKind`, semantic completion
     matching, public-error capture, and every temporary Phase 1 adapter are
     absent; Fatal completion and engine-poison paths retain their initiating
     source frames; stateful storage receives stable typed suppliers and one
-    semantic-free completion bridge. [U5], [U6], [U10], [U11]
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    semantic-free completion bridge. Backend setup remains `IoResult`, runtime
+    progress uses `BackendResult<T> = Result<T, BackendError>`, and normal
+    submitted-operation completions remain `StdIoResult`. [C18], [U5], [U6],
+    [U10], [U11], [U12]
+  - Task Doc: `docs/tasks/000229-completion-bridge-and-infrastructure-closure.md`
+  - Task Issue: `#866`
+  - Phase Status: done
+  - Implementation Summary: Implemented the Arc-backed CompletionErrorBridge with checked ordered replay, lazy per-owner reconstruction, concrete BackendError progress transport, SharedFatalError poison propagation, and end-to-end producer and consumer migration; validated both IO backends and representative focused coverage. [Task Resolve Sync: docs/tasks/000229-completion-bridge-and-infrastructure-closure.md @ 2026-07-20]
   - Related Backlogs:
     - `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
+    - `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 3: Stateful Storage and Semantic Consumers**
   - Scope: Audit `row`, `index`, `table`, and `catalog`, including their
@@ -864,14 +940,16 @@ a risk. [D1], [D11], [B2], [U6]
 
 Bridge-focused tests capture an IO report and a cross-domain
 `Fatal -> IO -> backend context` report, publish each through a completion, and
-observe the failure from multiple waiters. They assert that every waiter owns a
-separate materialized report backed by the same `Arc<BridgeInner>`, that public
-classification comes from the nearest real domain, that
+observe the failure from multiple waiters. They assert that every waiter shares
+the same `Arc<BridgeInner>` before consumption and reconstructs a separate
+owner-context report, that public classification comes from the nearest real
+domain, that no reconstructed report contains a bridge frame, that
 `Error::report().downcast_ref` finds every required real context and structured
 attachment, and that rendering retains canonical producer detail. Tests also
 prove the bridge cannot be captured from `ErrorKind`, `RuntimeError`, or itself,
-cannot be created without a report, and exposes no semantic variant to match.
-These tests are the Phase 2 completion gate for the selected materialization
+cannot be created without a report, exposes no raw report conversion, and
+exposes no semantic variant to match. These tests are the Phase 2 completion
+gate for the selected reconstruction
 representation. [C1], [C14], [C15], [U5], [U6], [U9], [B2]
 
 Phase 1 reviews every existing `report_error(Error, ...)` caller during
@@ -887,13 +965,14 @@ exercise the public adapter and assert the public classification plus retained
 domain frame. Production caller review confirms reusable internal code uses
 the typed operation instead of the public adapter. [C8], [D1]
 
-The IO alias migration is compiled and exercised with both backend feature
+The IO boundary migration is compiled and exercised with both backend feature
 configurations. Source review verifies that `IoResult` has exactly one type
-definition in `error.rs`, `BackendResult` has no remaining references, and raw
-standard IO results are not imported as `IoResult`. Existing focused backend
-tests continue to assert the same `IoError` context and backend attachments;
-the alias rename does not justify changing observable failures. [C4], [C17],
-[D1], [U8]
+definition in `error.rs`; `BackendResult<T>` has exactly the concrete
+`BackendError` meaning in the IO subsystem; backend setup still uses
+`IoResult`; and raw per-operation standard IO results remain distinctly named.
+Focused backend tests cover submit, wait, and retry-expiry detail, direct
+concrete propagation, final `IoError` context, and exact backend attachment
+retention. [C4], [C17], [C18], [D1], [U8], [U12]
 
 Invariant removal is validated through the production path that establishes
 the invariant. A reachable failure reclassified from Internal is tested at its
@@ -930,9 +1009,11 @@ The RFC is implementation-complete only when:
 3. every approved external-trait adapter delegates to a canonical typed
    operation, and reusable internal callers use that typed operation directly;
 4. `IoResult<T>` is defined once in `error.rs` as the canonical
-   `Result<T, Report<IoError>>`, all applicable IO producers use it,
-   `BackendResult` is absent, and raw standard IO result aliases remain
-   distinctly named;
+   `Result<T, Report<IoError>>`; setup and immediate IO report producers use
+   it; runtime backend progress uses only
+   `BackendResult<T> = Result<T, BackendError>` until a completion, Fatal, or
+   public reporting boundary; and raw per-operation standard IO result aliases
+   remain distinctly named;
 5. every touched Internal producer has an evidence-backed assertion,
    responsible-domain reclassification, or specific Internal-retention
    disposition, and every Generic producer is either eliminated or has the
@@ -991,9 +1072,10 @@ The RFC is implementation-complete only when:
   technical debt until its linked task or backlog is resolved.
 - Each failed completion allocates one `BridgeInner` and retains its full
   canonical report until the completion and every cloned bridge are dropped.
-- Each waiter that consumes a failure materializes a small owned report and the
-  erased frame visitor must explicitly preserve required context and attachment
-  types as the error model evolves.
+- Each waiter that consumes a failure reconstructs a small owned report with
+  its final-owner context, and
+  the closed replay registry must explicitly preserve required context and
+  attachment types as the error model evolves.
 - Four RFC gates remain broader than individual source modules, so any further
   supporting tasks must be linked carefully rather than treating one gate as
   indivisible.
@@ -1006,10 +1088,7 @@ direction:
 1. For each broad crate-owned trait, does full implementation-set evidence
    favor an associated error, a responsibility-specific trait split, or a
    documented genuine convergence result?
-2. Which private object-safe report visitor/materializer representation best
-   replays ordered contexts and registered structured attachments without
-   introducing a second semantic domain enum?
-3. Do Phases 3 or 4 require bounded supporting task documents after their
+2. Do Phases 3 or 4 require bounded supporting task documents after their
    detailed source audits, or can each remain one canonical task?
 
 ## Future Work

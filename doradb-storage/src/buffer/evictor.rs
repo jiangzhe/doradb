@@ -1011,13 +1011,13 @@ mod tests {
     };
     use crate::component::{ComponentRegistry, DiskPoolConfig, IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
-    use crate::engine_poison::EnginePoisoner;
     use crate::error::FileKind;
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::fs::{FileSystem, FileSystemWorkers};
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::id::{BlockID, TableID, TrxID};
     use crate::io::{DirectBuf, IOBuf};
+    use crate::poison::EnginePoisoner;
     use crate::quiescent::QuiescentGuard;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;

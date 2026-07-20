@@ -24,9 +24,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Component contract:
 /// - [`Self::build`] runs after all earlier dependencies have been registered
 ///   and may fetch them from [`ComponentRegistry`].
-/// - [`Self::build`] may register additional helper components, such as worker
-///   components, as long as the overall registration order remains a valid
-///   dependency order.
+/// - [`Self::build`] registers only its own component. Helper components, such
+///   as worker owners, are separate explicit [`RegistryBuilder::build`] steps
+///   in the engine's fixed build program.
 /// - [`Self::access`] derives the cloneable handle stored in the registry for
 ///   later dependency lookup.
 /// - [`Self::shutdown`] is called in reverse registration order before owner
@@ -99,18 +99,29 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// Current engine registration order:
 /// 1. `EnginePoisoner`
 /// 2. `FileSystem`
-/// 3. `DiskPool`
+/// 3. `DiskPool` -> `FileSystem`
 /// 4. `MetaPool`
-/// 5. `IndexPool`
-/// 6. `MemPool`
+/// 5. `IndexPool` -> `FileSystem`
+/// 6. `MemPool` -> `FileSystem`
 /// 7. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
 ///    `MemPool`
 /// 8. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
 /// 9. `LockManager`
-/// 10. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
+/// 10. `Catalog` -> `EnginePoisoner`, `MetaPool`, `FileSystem`, `DiskPool`
 /// 11. `TransactionSystem` -> `EnginePoisoner`, `MetaPool`, `IndexPool`,
 ///     `MemPool`, `FileSystem`, `DiskPool`, `Catalog`
 /// 12. `TransactionSystemWorkers` -> `TransactionSystem`
+///
+/// Every entry above is an explicit [`RegistryBuilder::build`] call in the
+/// engine build program; component builds do not invoke downstream component
+/// builds themselves.
+///
+/// Each arrow points from a component to a direct registry dependency fetched
+/// during its build. `FileSystemWorkers` also consumes shelf provisions from
+/// `FileSystem`, `IndexPool`, and `MemPool`; `TransactionSystemWorkers`
+/// consumes one from `TransactionSystem`. Those build-time provision edges
+/// follow the same registration order but are transferred through
+/// [`ShelfScope`] rather than fetched from the registry.
 ///
 /// In addition to the direct component edges above, `Catalog` owns user-table
 /// runtimes that retain guards into `MemPool`, `IndexPool`, `FileSystem`,
@@ -352,12 +363,6 @@ impl<'a, C: Component> ShelfScope<'a, C> {
         Up: Supplier<C>,
     {
         self.shelf.take::<Up, C>()
-    }
-
-    /// Reborrows the shelf for another component scope.
-    #[inline]
-    pub(crate) fn scope<Other: Component>(&mut self) -> ShelfScope<'_, Other> {
-        self.shelf.scope::<Other>()
     }
 }
 

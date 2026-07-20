@@ -7,6 +7,7 @@ use crate::error::{FatalError, InternalError, Result, RuntimeError, RuntimeResul
 use crate::file::table_file::OldRoot;
 use crate::id::TrxID;
 use crate::map::{FastHashMap, FastHashSet};
+use crate::obs;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
 use crate::runtime;
@@ -334,7 +335,15 @@ impl TransactionSystem {
             .await
         {
             Ok(retired_row_pages) => Ok(retired_row_pages),
-            Err(_) => Err(self.poison_engine(FatalError::PurgeAccess).into()),
+            Err(_) => {
+                let report = Report::new(FatalError::PurgeAccess)
+                    .attach("purge transaction-list access failed");
+                obs::error!(
+                    "event=engine_poison component=purge action=poison result=error error={:?}",
+                    report
+                );
+                Err(self.poisoner.poison(report).into())
+            }
         }
     }
 
@@ -352,7 +361,9 @@ impl TransactionSystem {
             == PurgeTestAction::Fail
         {
             self.observe_purge_test_event(PurgeTestEvent::BucketFailed { gc_no });
-            return Err(self.poison_engine(FatalError::PurgeAccess).into());
+            let report = Report::new(FatalError::PurgeAccess)
+                .attach(format!("purge test hook failed bucket: gc_no={gc_no}"));
+            return Err(self.poisoner.poison(report).into());
         }
         let mut trx_list = Vec::new();
         self.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
@@ -482,27 +493,29 @@ impl TransactionSystem {
     ) -> bool {
         for batch in retired_row_pages {
             let Some(table) = catalog.pin_user_table_for_purge(batch.table_id) else {
-                let _ = self.poison_engine_with_context(
-                    FatalError::PurgeAccess,
-                    "purge",
-                    format!(
-                        "checkpoint retirement runtime missing: table_id={}, start_row_id={}, end_row_id={}",
-                        batch.table_id, batch.start_row_id, batch.end_row_id
-                    ),
+                let report = Report::new(FatalError::PurgeAccess).attach(format!(
+                    "checkpoint retirement runtime missing: table_id={}, start_row_id={}, end_row_id={}",
+                    batch.table_id, batch.start_row_id, batch.end_row_id
+                ));
+                obs::error!(
+                    "event=engine_poison component=purge action=poison result=error error={:?}",
+                    report
                 );
+                let _ = self.poisoner.poison(report);
                 return false;
             };
             let page_ids = match table.mem.unlink_retired_row_pages(guards, &batch).await {
                 Ok(page_ids) if page_ids.as_ref() == batch.page_ids.as_ref() => page_ids,
                 Ok(_) | Err(_) => {
-                    let _ = self.poison_engine_with_context(
-                        FatalError::PurgeAccess,
-                        "purge",
-                        format!(
-                            "checkpoint retirement prefix unlink failed: table_id={}, start_row_id={}, end_row_id={}",
-                            batch.table_id, batch.start_row_id, batch.end_row_id
-                        ),
+                    let report = Report::new(FatalError::PurgeAccess).attach(format!(
+                        "checkpoint retirement prefix unlink failed: table_id={}, start_row_id={}, end_row_id={}",
+                        batch.table_id, batch.start_row_id, batch.end_row_id
+                    ));
+                    obs::error!(
+                        "event=engine_poison component=purge action=poison result=error error={:?}",
+                        report
                     );
+                    let _ = self.poisoner.poison(report);
                     return false;
                 }
             };
@@ -512,14 +525,15 @@ impl TransactionSystem {
                 .await
                 .is_err()
             {
-                let _ = self.poison_engine_with_context(
-                    FatalError::PurgeDeallocate,
-                    "purge",
-                    format!(
-                        "checkpoint retirement row-page deallocation failed: table_id={}, start_row_id={}, end_row_id={}",
-                        batch.table_id, batch.start_row_id, batch.end_row_id
-                    ),
+                let report = Report::new(FatalError::PurgeDeallocate).attach(format!(
+                    "checkpoint retirement row-page deallocation failed: table_id={}, start_row_id={}, end_row_id={}",
+                    batch.table_id, batch.start_row_id, batch.end_row_id
+                ));
+                obs::error!(
+                    "event=engine_poison component=purge action=poison result=error error={:?}",
+                    report
                 );
+                let _ = self.poisoner.poison(report);
                 return false;
             }
         }
@@ -593,24 +607,6 @@ impl TransactionSystem {
 
         self.process_dropped_table_file_deletes();
         Ok(())
-    }
-
-    /// Destroy purge-ready dropped table runtimes, poisoning storage on failure.
-    ///
-    /// Returns `false` only after publishing `FatalError::PurgeDeallocate`.
-    #[inline]
-    async fn process_dropped_table_gc_or_poison(
-        &self,
-        guards: &PoolGuards,
-        min_active_sts: TrxID,
-    ) -> bool {
-        match self.process_dropped_table_gc(guards, min_active_sts).await {
-            Ok(()) => true,
-            Err(_) => {
-                let _ = self.poison_engine(FatalError::PurgeDeallocate);
-                false
-            }
-        }
     }
 
     #[inline]
@@ -1223,10 +1219,18 @@ impl PurgeDispatcher {
             if plan.dropped_table {
                 #[cfg(test)]
                 trx_sys.observe_purge_test_event(PurgeTestEvent::DroppedTableStarted);
-                let dropped_tables_processed = trx_sys
-                    .process_dropped_table_gc_or_poison(&pool_guards, curr_sts)
-                    .await;
-                if !dropped_tables_processed {
+                if trx_sys
+                    .process_dropped_table_gc(&pool_guards, curr_sts)
+                    .await
+                    .is_err()
+                {
+                    let report = Report::new(FatalError::PurgeDeallocate)
+                        .attach("dropped-table garbage collection failed");
+                    obs::error!(
+                        "event=engine_poison component=purge action=poison result=error error={:?}",
+                        report
+                    );
+                    let _ = trx_sys.poisoner.poison(report);
                     // Dropped-table destroy failure is fatal; exiting also closes
                     // the executor task channels when this dispatcher is dropped.
                     return;
@@ -1488,8 +1492,8 @@ mod tests {
     }
 
     async fn wait_for_purge_poison(trx_sys: &TransactionSystem) {
-        let listener = trx_sys.poison_listener();
-        if trx_sys.poison_error().is_none() {
+        let listener = trx_sys.poisoner.listener();
+        if trx_sys.poisoner.poison_error().is_none() {
             listener.await;
         }
     }
@@ -2219,7 +2223,7 @@ mod tests {
                     .process_retired_row_pages(engine.catalog(), &guards, Vec::new())
                     .await
             );
-            assert!(engine.inner().trx_sys.poison_error().is_none());
+            assert!(engine.inner().poisoner.poison_error().is_none());
 
             assert!(
                 !engine
@@ -2240,7 +2244,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::PurgeAccess)
@@ -2248,8 +2252,8 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
-                    .ensure_runtime_healthy()
+                    .poisoner
+                    .ensure_healthy()
                     .as_ref()
                     .is_err_and(|err| *err.current_context() == FatalError::PurgeAccess)
             );
@@ -2315,7 +2319,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::PurgeAccess)
@@ -3021,7 +3025,7 @@ mod tests {
                 assert!(
                     engine
                         .inner()
-                        .trx_sys
+                        .poisoner
                         .poison_error()
                         .as_ref()
                         .is_some_and(|err| *err.current_context() == FatalError::PurgeAccess)

@@ -176,17 +176,18 @@ Each RowPage moves through:
    incremental readiness succeeds, later lock/delete ownership observed on the
    frozen page is representable regardless of writer STS and cannot cause
    another cutoff delay.
-8. Acquire the unified publication guard, which owns lifecycle publish
-   admission, workflow completion, and fatal classification. Make it
-   irreversible before revalidating in canonical order under one page-state
-   write lock at a time. A matching page identity, cutoff, and full mutation
-   version reuses the plan; an absent or stale plan is rebuilt under that
-   page-local lock without reapplying the initial pre-fence blocker rule.
+8. Run the attempt through a table checkpointer, which owns lifecycle publish
+   admission, workflow completion, and the current irreversible fatal reason.
+   Mark it irreversible before revalidating in canonical order under one
+   page-state write lock at a time. A matching page identity, cutoff, and full
+   mutation version reuses the plan; an absent or stale plan is rebuilt under
+   that page-local lock without reapplying the initial pre-fence blocker rule.
    Locked regeneration must produce a plan because frozen pages cannot add an
    Insert/Update image after stable readiness. Publish each page as
    `TRANSITION`, install its prepared markers, and release its lock immediately.
-   During this phase the batch is a growing `TRANSITION` prefix followed by a
-   `FROZEN` suffix.
+   Returned failures are fatalized by the table boundary; cancellation is
+   handled by the checkpointer owner. During this phase the batch is a growing
+   `TRANSITION` prefix followed by a `FROZEN` suffix.
 9. Build LWC blocks from immutable page values plus the prepared deletion
    bitmap. Block-split retries reuse the bitmap rather than rescanning undo.
 10. Insert matching `ColumnBlockIndex` entries and build companion secondary

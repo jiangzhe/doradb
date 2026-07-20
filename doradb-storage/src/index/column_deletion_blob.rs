@@ -278,7 +278,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
             );
         }
         try_join_all(writes).await.map_err(|report| {
-            Error::from_completion_report(report, "write column deletion blob")
+            Error::from_completion_bridge(report, "write column deletion blob")
         })?;
         Ok(())
     }

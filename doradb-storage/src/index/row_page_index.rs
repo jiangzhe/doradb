@@ -2,7 +2,7 @@ use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
 use crate::buffer::page::{
-    BufferPage, BufferPageKind, PAGE_SIZE, VersionedPageID, assert_buffer_page, sealed,
+    BufferPage, BufferPageKind, PAGE_SIZE, VersionedPageID, assert_buffer_page,
 };
 use crate::buffer::{BufferPool, PoolGuard, get_page_versioned_shared};
 use crate::catalog::TableColumnLayout;
@@ -326,8 +326,6 @@ impl RowPageIndexNode {
         layout::slice_from_bytes_mut(&mut self.data[..bytes_len])
     }
 }
-
-impl sealed::Sealed for RowPageIndexNode {}
 
 // SAFETY: `RowPageIndexNode` is one explicit `repr(C)` page image, derives the
 // required zerocopy layout traits, has no drop glue, and is accessed through the
@@ -2892,8 +2890,11 @@ mod tests {
                 .await
                 .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.inner().mem_pool.pool_guard();
-                let redo_ctx =
-                    RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(104));
+                let redo_ctx = RowPageCreateRedoCtx::new(
+                    &engine.inner().trx_sys,
+                    &engine.inner().poisoner,
+                    TableID::new(104),
+                );
                 let page_guard = blk_idx
                     .get_insert_page(
                         &meta_guard,
@@ -2974,8 +2975,15 @@ mod tests {
             .await
             .expect("test row-page-index construction should succeed");
             let mem_guard = engine.inner().mem_pool.pool_guard();
-            let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(206));
-            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
+            let redo_ctx = RowPageCreateRedoCtx::new(
+                &engine.inner().trx_sys,
+                &engine.inner().poisoner,
+                TableID::new(206),
+            );
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
 
             let err = match blk_idx
                 .get_insert_page(
@@ -3037,7 +3045,11 @@ mod tests {
                     RowPageIndex::new(meta_pool.clone_inner(), &meta_guard, RowID::new(0))
                         .await
                         .expect("test row-page-index construction should succeed");
-                let redo_ctx = RowPageCreateRedoCtx::new(&engine.inner().trx_sys, table_id);
+                let redo_ctx = RowPageCreateRedoCtx::new(
+                    &engine.inner().trx_sys,
+                    &engine.inner().poisoner,
+                    table_id,
+                );
                 let total_pages = NBR_ROW_PAGE_ENTRIES_IN_LEAF + 64;
                 let worker_count = 8usize;
                 let pages_per_worker = total_pages.div_ceil(worker_count);

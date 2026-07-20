@@ -2,8 +2,8 @@ use crate::error::{DataIntegrityError, Error, InternalError, IoError, Result, Ru
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::id::TrxID;
 use crate::io::{
-    CompletedSubmission, DirectBuf, IOBackend, IOBuf, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
-    StorageBackend, SubmissionDriver, SubmitAttempt,
+    Backend, BackendError, CompletedSubmission, DirectBuf, IOBuf, IOSubmission, Operation,
+    STORAGE_SECTOR_SIZE, StorageBackend, SubmissionDriver, SubmitAttempt,
 };
 use crate::log::block_group::{TrxLog, block_count_for_payload};
 use crate::log::format::{
@@ -908,20 +908,20 @@ impl RedoReadCompletion {
     fn validate(self) -> Result<(u32, usize, DirectBuf)> {
         let actual_bytes = self.actual_bytes.map_err(|err| {
             let kind = err.kind();
-            Error::from(Report::new(IoError::from(kind)).attach(err).attach(format!(
-                "redo direct read failed: file_seq={:08x}, offset={}",
-                self.file_seq, self.offset
-            )))
+            Error::from(
+                Report::new(err)
+                    .change_context(IoError::from(kind))
+                    .attach(format!(
+                        "redo direct read failed: file_seq={:08x}, offset={}",
+                        self.file_seq, self.offset
+                    )),
+            )
         })?;
         if actual_bytes != self.expected_bytes {
             return Err(Report::new(IoError::from(IoErrorKind::UnexpectedEof))
                 .attach(format!(
-                    "unexpected eof: actual_bytes={actual_bytes}, expected_bytes={}",
-                    self.expected_bytes
-                ))
-                .attach(format!(
-                    "redo direct read short read: file_seq={:08x}, offset={}",
-                    self.file_seq, self.offset
+                    "redo direct read short read: file_seq={:08x}, offset={}, unexpected eof: actual_bytes={actual_bytes}, expected_bytes={}",
+                    self.file_seq, self.offset, self.expected_bytes
                 ))
                 .into());
         }
@@ -1170,7 +1170,7 @@ impl RedoReadAheadWorker {
     #[inline]
     fn drain_driver<B>(&mut self, driver: &mut SubmissionDriver<RedoReadSubmission, B>) -> usize
     where
-        B: IOBackend,
+        B: Backend,
     {
         let mut retained = 0;
         while driver.pending_len() != 0 {
@@ -1212,10 +1212,10 @@ impl RedoReadAheadWorker {
     fn handle_backend_progress_error<B>(
         &mut self,
         driver: &mut SubmissionDriver<RedoReadSubmission, B>,
-        err: Report<IoError>,
+        err: BackendError,
     ) -> Error
     where
-        B: IOBackend,
+        B: Backend,
     {
         self.cleanup_driver_after_backend_failure(driver);
         backend_progress_error(err)
@@ -1227,7 +1227,7 @@ impl RedoReadAheadWorker {
         driver: &mut SubmissionDriver<RedoReadSubmission, B>,
     ) -> usize
     where
-        B: IOBackend,
+        B: Backend,
     {
         let pending = driver.pending_len();
         let submitted = driver.submitted_len();
@@ -1563,8 +1563,9 @@ struct ValidatedGroupStart {
 }
 
 #[inline]
-fn backend_progress_error(err: Report<IoError>) -> Error {
-    err.attach("redo read-ahead backend progress failure")
+fn backend_progress_error(err: BackendError) -> Error {
+    err.into_report()
+        .attach("redo read-ahead backend progress failure")
         .into()
 }
 
@@ -1707,8 +1708,8 @@ mod tests {
     use crate::error::{ErrorKind, IoError, IoResult, RuntimeError};
     use crate::id::{RowID, TableID, TrxID};
     use crate::io::{
-        BackendToken, DirectBuf, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState, IOBuf,
-        StdIoResult, SubmittedIoCleanup,
+        BackendError, BackendResult, BackendToken, DirectBuf, IOBuf, StdIoResult,
+        SubmittedIoCleanup,
     };
     use crate::log::block_group::LogBlockGroup;
     use crate::log::format::{
@@ -1933,7 +1934,7 @@ mod tests {
         }
     }
 
-    impl IOBackend for WaitErrorBackend {
+    impl Backend for WaitErrorBackend {
         type Prepared = BackendToken;
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
@@ -1964,7 +1965,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> IoResult<SubmitAttempt> {
+        ) -> BackendResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
             let Some(submitted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
@@ -1982,13 +1983,11 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             _min_nr: usize,
-        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
-            Err(IOBackendFailure::report(
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+            Err(BackendError::wait(
                 "recovery_test",
-                IOBackendErrorPhase::Wait,
                 StdIoError::from_raw_os_error(libc::EIO),
                 1,
-                IOBackendQueueState::wait_with_completions(0),
             ))
         }
 

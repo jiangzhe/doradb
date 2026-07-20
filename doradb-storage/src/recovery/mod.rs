@@ -1220,7 +1220,7 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        CompletionErrorKind, DataIntegrityError, Error, ErrorKind, OperationError, Result,
+        CompletionErrorBridge, DataIntegrityError, Error, ErrorKind, OperationError, Result,
         RuntimeError,
     };
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
@@ -1267,16 +1267,16 @@ mod tests {
         expected: DataIntegrityError,
     ) {
         let report = format!("{err:?}");
-        if err.report().downcast_ref::<CompletionErrorKind>().copied()
-            == Some(CompletionErrorKind::DataIntegrity(expected))
-        {
-            assert!(report.contains("propagate from other threads"), "{report}");
-            assert!(report.contains("wait for"), "{report}");
-            return;
-        }
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(expected),
+            "{report}"
+        );
+        assert!(!report.contains("propagate from other threads"), "{report}");
+        assert!(
+            err.report()
+                .downcast_ref::<CompletionErrorBridge>()
+                .is_none(),
             "{report}"
         );
         assert!(report.contains("table_file"), "{report}");

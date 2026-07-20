@@ -16,6 +16,7 @@ use crate::index::{
     SecondaryIndex, UniqueIndex, UniqueMemIndex,
 };
 use crate::log::redo::DDLRedo;
+use crate::obs;
 use crate::row::RowRead;
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
@@ -413,7 +414,7 @@ pub(crate) async fn create_index_for_session(
         .await
         .attach_with(|| format!("operation=create_index, table_id={table_id}"))?;
     let table = validated_index_ddl_target(&guards, &engine, table_id, "create_index").await?;
-    engine.trx_sys.ensure_runtime_healthy()?;
+    engine.poisoner.ensure_healthy()?;
     table
         .check_foreground_live()
         .attach("operation=create_index")?;
@@ -609,7 +610,7 @@ pub(crate) async fn drop_index_for_session(
         .await
         .attach_with(|| format!("operation=drop_index, table_id={table_id}"))?;
     let table = validated_index_ddl_target(&guards, &engine, table_id, "drop_index").await?;
-    engine.trx_sys.ensure_runtime_healthy()?;
+    engine.poisoner.ensure_healthy()?;
     table
         .check_foreground_live()
         .attach("operation=drop_index")?;
@@ -1485,14 +1486,14 @@ fn poison_index_after_catalog_commit_with_source(
         IndexDdlKind::Create => "create_index",
         IndexDdlKind::Drop => "drop_index",
     };
-    let poison = engine.trx_sys.poison_engine(FatalError::Poisoned);
-    source
-        .into_report()
-        .change_context(*poison.current_context())
-        // This boundary already owns a failed report; `Report` has no lazy attachment API.
-        .attach(format!(
-            "{operation_name} failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
-        ))
+    let report = source.into_fatal_report(FatalError::Poisoned).attach(format!(
+        "{operation_name} failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
+    ));
+    obs::error!(
+        "event=engine_poison component=catalog_index action=poison result=error error={:?}",
+        report
+    );
+    engine.poisoner.poison(report).into_report()
 }
 
 #[cfg(test)]

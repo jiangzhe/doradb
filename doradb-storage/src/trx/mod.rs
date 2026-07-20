@@ -33,8 +33,8 @@ use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableCache, is_catalog_table};
 use crate::engine::{EngineRef, WeakEngineRef};
 use crate::error::{
-    CompletionErrorKind, Error, FatalError, InternalError, InternalResult, LifecycleError,
-    LifecycleResult, OperationError, ResourceError, Result,
+    CompletionErrorBridge, Error, FatalError, InternalError, InternalResult, LifecycleError,
+    LifecycleResult, OperationError, ResourceError, Result, SharedFatalError,
 };
 use crate::id::{SessionID, TableID, TrxID};
 use crate::io::Completion;
@@ -46,6 +46,7 @@ use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
+use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::session::TrxAttachment;
 use crate::table::Table;
@@ -1183,10 +1184,10 @@ pub(crate) struct TrxCleanupJob {
 }
 
 /// Reason a precommit transaction has to rollback instead of commit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum FailedPrecommitReason {
     /// Redo write, submit, or sync failed after precommit handoff.
-    Fatal(FatalError),
+    Fatal(SharedFatalError),
     /// A single precommit group exceeded an intrinsic redo resource limit.
     Resource(ResourceError),
     /// Group commit admission closed for engine shutdown.
@@ -1198,8 +1199,8 @@ impl FailedPrecommitReason {
     #[inline]
     pub(crate) fn into_error(self, message: impl Into<String>) -> Error {
         match self {
-            FailedPrecommitReason::Fatal(reason) => {
-                Report::new(reason).attach(message.into()).into()
+            FailedPrecommitReason::Fatal(error) => {
+                error.into_report().attach(message.into()).into()
             }
             FailedPrecommitReason::Resource(reason) => {
                 Report::new(reason).attach(message.into()).into()
@@ -1211,17 +1212,15 @@ impl FailedPrecommitReason {
     }
 
     #[inline]
-    fn completion_report(self, message: impl Into<String>) -> Report<CompletionErrorKind> {
+    fn completion_bridge(self, message: impl Into<String>) -> CompletionErrorBridge {
         match self {
-            FailedPrecommitReason::Fatal(reason) => {
-                CompletionErrorKind::from_fatal(Report::new(reason), message)
-            }
+            FailedPrecommitReason::Fatal(error) => error.into_completion_bridge(),
             FailedPrecommitReason::Resource(reason) => {
-                CompletionErrorKind::from_resource(Report::new(reason), message)
+                CompletionErrorBridge::capture(Report::new(reason).attach(message.into()))
             }
-            FailedPrecommitReason::Shutdown => {
-                CompletionErrorKind::from_lifecycle(Report::new(LifecycleError::Shutdown), message)
-            }
+            FailedPrecommitReason::Shutdown => CompletionErrorBridge::capture(
+                Report::new(LifecycleError::Shutdown).attach(message.into()),
+            ),
         }
     }
 }
@@ -1275,7 +1274,7 @@ impl FailedPrecommitCleanupJob {
         // Waiters must observe the original redo/shutdown failure only after
         // rollback has released MVCC undo ownership, transaction locks, session
         // state, and prepare waiters.
-        self.completion.complete(Err(self.reason.completion_report(
+        self.completion.complete(Err(self.reason.completion_bridge(
             "fail redo group commit waiters after failed precommit rollback",
         )));
     }
@@ -1994,12 +1993,15 @@ impl PrecommitTrx {
             .map(|attachment| attachment.engine().clone());
         if let (Some(payload), Some(attachment)) = (self.payload.as_mut(), self.attachment.as_ref())
         {
-            let res = payload.rollback(attachment).await;
-            if res.is_err() {
-                let _ = attachment
-                    .engine()
-                    .trx_sys
-                    .poison_engine(FatalError::RollbackAccess);
+            if let Err(err) = payload.rollback(attachment).await {
+                let report = err
+                    .into_fatal_report(FatalError::RollbackAccess)
+                    .attach("failed-precommit rollback failed");
+                obs::error!(
+                    "event=engine_poison component=trx action=poison result=error error={:?}",
+                    report
+                );
+                let _ = attachment.engine().poisoner.poison(report);
                 self.finish_failed_precommit_with_retention(engine);
                 return false;
             }
@@ -3713,7 +3715,10 @@ pub(crate) mod tests {
 
             let (_hook, started_rx, release) =
                 install_blocking_terminal_rollback_hook(trx_id, "rollback poisoned commit");
-            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
+            let _ = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
             let mut commit = Box::pin(trx.commit());
             assert!(matches!(
                 futures::poll!(commit.as_mut()),
@@ -3840,12 +3845,15 @@ pub(crate) mod tests {
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
 
-            let _ = engine.inner().trx_sys.poison_engine(FatalError::RedoWrite);
+            let poison = engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
             let completion = Arc::new(Completion::new());
             let job = FailedPrecommitCleanupJob::new(
                 vec![precommit1, precommit2, precommit3],
                 Arc::clone(&completion),
-                FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                FailedPrecommitReason::Fatal(poison),
             );
 
             job.run().await;
@@ -3862,17 +3870,14 @@ pub(crate) mod tests {
             assert!(!session1.in_trx().unwrap());
             assert!(!session2.in_trx().unwrap());
             assert!(!session3.in_trx().unwrap());
-            assert!(
-                completion
-                    .wait_result()
-                    .await
-                    .is_err_and(|err| *err.current_context()
-                        == CompletionErrorKind::Fatal(FatalError::RedoWrite))
-            );
+            assert!(completion.wait_result().await.is_err_and(|err| {
+                err.downcast_ref::<FatalError>()
+                    .is_some_and(|reason| *reason == FatalError::RedoWrite)
+            }));
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
             );

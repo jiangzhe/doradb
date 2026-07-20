@@ -26,6 +26,7 @@ use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::BlockIndex;
 use crate::map::{FastDashMap, FastHashMap, FastHashSet};
+use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::table::{
@@ -113,6 +114,8 @@ impl CatalogConfig {
 pub(crate) struct Catalog {
     next_table_id: AtomicU64,
     user_tables: FastDashMap<TableID, UserTableEntry>,
+    /// Engine-level fatal runtime poison state used by catalog policy boundaries.
+    pub(super) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Persistent storage for built-in catalog tables.
     pub(crate) storage: CatalogStorage,
     checkpoint_gate: CatalogCheckpointGate,
@@ -121,7 +124,11 @@ pub(crate) struct Catalog {
 impl Catalog {
     /// Create a catalog runtime from persisted catalog storage.
     #[inline]
-    pub(crate) async fn new(storage: CatalogStorage, config: CatalogConfig) -> Result<Self> {
+    pub(crate) async fn new(
+        storage: CatalogStorage,
+        poisoner: QuiescentGuard<EnginePoisoner>,
+        config: CatalogConfig,
+    ) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, storage.meta_pool.pool_guard())
             .push(PoolRole::Disk, storage.disk_pool.pool_guard())
@@ -138,6 +145,7 @@ impl Catalog {
         Ok(Catalog {
             next_table_id: AtomicU64::new(next_table_id.as_u64()),
             user_tables: FastDashMap::default(),
+            poisoner,
             storage,
             checkpoint_gate: CatalogCheckpointGate::new(),
         })
@@ -776,13 +784,14 @@ impl Component for Catalog {
         let meta_pool = registry.dependency::<MetaPool>();
         let table_fs = registry.dependency::<FileSystem>();
         let disk_pool = registry.dependency::<DiskPool>();
+        let poisoner = registry.dependency::<EnginePoisoner>();
         let storage = CatalogStorage::new(
             meta_pool.clone_inner(),
             table_fs.clone(),
             disk_pool.clone_inner(),
         )
         .await?;
-        registry.register::<Self>(Catalog::new(storage, config).await?);
+        registry.register::<Self>(Catalog::new(storage, poisoner, config).await?);
         Ok(())
     }
 
@@ -1151,7 +1160,7 @@ pub(crate) mod tests {
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{CompletionErrorKind, DataIntegrityError, Error};
+    use crate::error::{CompletionErrorBridge, DataIntegrityError, Error};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::id::BlockID;
@@ -1390,21 +1399,17 @@ pub(crate) mod tests {
 
     fn assert_catalog_data_integrity(err: Error) {
         let report = format!("{err:?}");
-        if matches!(
-            err.report().downcast_ref::<CompletionErrorKind>().copied(),
-            Some(CompletionErrorKind::DataIntegrity(_))
-        ) {
-            assert!(report.contains("propagate from other threads"), "{report}");
-            assert!(report.contains("wait for"), "{report}");
-        } else {
-            assert!(
-                err.report()
-                    .downcast_ref::<DataIntegrityError>()
-                    .copied()
-                    .is_some(),
-                "{report}"
-            );
-        }
+        assert!(
+            err.report().downcast_ref::<DataIntegrityError>().is_some(),
+            "{report}"
+        );
+        assert!(!report.contains("propagate from other threads"), "{report}");
+        assert!(
+            err.report()
+                .downcast_ref::<CompletionErrorBridge>()
+                .is_none(),
+            "{report}"
+        );
     }
 
     #[test]

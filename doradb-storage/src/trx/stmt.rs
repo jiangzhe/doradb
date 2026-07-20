@@ -5,6 +5,7 @@ use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
 use crate::error::{FatalError, LifecycleResult, OperationError, OperationResult, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
+use crate::obs;
 use crate::row::ops::{
     DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
@@ -766,31 +767,37 @@ impl<'stmt> Statement<'stmt> {
         let engine = self.attachment.engine().clone();
         let pool_guards = self.attachment.pool_guards();
         let mut table_cache = TableCache::new(engine.catalog());
-        if self
+        if let Err(err) = self
             .effects
             .rollback_index(&mut table_cache, pool_guards, sts)
             .await
-            .is_err()
         {
             let retention = self.effects.take_for_fatal_retention();
             engine.trx_sys.retain_fatal_rollback(retention);
-            return Err(engine
-                .trx_sys
-                .poison_engine(FatalError::RollbackAccess)
-                .into());
+            let report = err
+                .into_fatal_report(FatalError::RollbackAccess)
+                .attach("statement index rollback failed");
+            obs::error!(
+                "event=engine_poison component=trx action=poison result=error error={:?}",
+                report
+            );
+            return Err(engine.poisoner.poison(report).into());
         }
-        if self
+        if let Err(err) = self
             .effects
             .rollback_row(&mut table_cache, pool_guards)
             .await
-            .is_err()
         {
             let retention = self.effects.take_for_fatal_retention();
             engine.trx_sys.retain_fatal_rollback(retention);
-            return Err(engine
-                .trx_sys
-                .poison_engine(FatalError::RollbackAccess)
-                .into());
+            let report = err
+                .into_fatal_report(FatalError::RollbackAccess)
+                .attach("statement row rollback failed");
+            obs::error!(
+                "event=engine_poison component=trx action=poison result=error error={:?}",
+                report
+            );
+            return Err(engine.poisoner.poison(report).into());
         }
         self.effects.clear_redo();
         Ok(())
@@ -1198,7 +1205,7 @@ pub(crate) mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)

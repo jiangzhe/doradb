@@ -1,3 +1,4 @@
+use super::BACKEND_NAME;
 use crate::error::{IoError, IoResult};
 use error_stack::Report;
 use libc::{EAGAIN, EBUSY};
@@ -15,6 +16,9 @@ pub(crate) const DEFAULT_SUBMIT_RETRY_PROGRESS_TIMEOUT: Duration = Duration::fro
 
 /// Standard IO result returned by backend completion paths.
 pub(crate) type StdIoResult<T> = StdResult<T, StdIoError>;
+
+/// Runtime backend result carried until a terminal IO reporting boundary.
+pub(crate) type BackendResult<T> = StdResult<T, BackendError>;
 
 /// Transient submit pressure reported by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +70,6 @@ impl fmt::Display for SubmitRetryReason {
 /// Backend submit pressure details retained across retry handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SubmitRetry {
-    backend: &'static str,
     reason: SubmitRetryReason,
     call_count: usize,
 }
@@ -74,23 +77,8 @@ pub(crate) struct SubmitRetry {
 impl SubmitRetry {
     /// Build one submit-pressure retry description.
     #[inline]
-    pub(crate) const fn new(
-        backend: &'static str,
-        reason: SubmitRetryReason,
-        call_count: usize,
-    ) -> Self {
-        Self {
-            backend,
-            reason,
-            call_count,
-        }
-    }
-
-    /// Backend that reported submit pressure.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) const fn backend(self) -> &'static str {
-        self.backend
+    pub(crate) const fn new(reason: SubmitRetryReason, call_count: usize) -> Self {
+        Self { reason, call_count }
     }
 
     /// Submit-pressure reason.
@@ -124,22 +112,25 @@ impl SubmitRetry {
     #[inline]
     fn progress_error(
         self,
-        queue_state: IOBackendQueueState,
+        staged: usize,
+        pending: usize,
         attempts: u32,
         elapsed: Duration,
         timeout: Duration,
-    ) -> Report<IoError> {
-        IOBackendFailure::report(
-            self.backend,
-            IOBackendErrorPhase::Submit,
+    ) -> BackendError {
+        BackendError::new(
+            BACKEND_NAME,
             self.io_error(),
             self.call_count,
-            queue_state,
+            BackendErrorDetail::SubmitRetryExpired {
+                staged,
+                pending,
+                reason: self.reason,
+                attempts,
+                elapsed,
+                timeout,
+            },
         )
-        .attach(format!("submit_retry_reason={}", self.reason))
-        .attach(format!("submit_retry_attempts={attempts}"))
-        .attach(format!("submit_retry_elapsed_ms={}", elapsed.as_millis()))
-        .attach(format!("submit_retry_timeout_ms={}", timeout.as_millis()))
     }
 }
 
@@ -222,8 +213,9 @@ impl SubmitRetryBackoff {
     pub(crate) fn backoff_or_progress_error(
         &mut self,
         retry: SubmitRetry,
-        queue_state: IOBackendQueueState,
-    ) -> IoResult<()> {
+        staged: usize,
+        pending: usize,
+    ) -> BackendResult<()> {
         let now = Instant::now();
         let started_at = match self.started_at {
             Some(started_at) => started_at,
@@ -235,7 +227,8 @@ impl SubmitRetryBackoff {
         let elapsed = now.saturating_duration_since(started_at);
         if elapsed >= self.no_progress_timeout {
             return Err(retry.progress_error(
-                queue_state,
+                staged,
+                pending,
                 self.attempts,
                 elapsed,
                 self.no_progress_timeout,
@@ -243,25 +236,6 @@ impl SubmitRetryBackoff {
         }
         self.backoff();
         Ok(())
-    }
-}
-
-/// Kernel-entry phase that produced a backend progress failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IOBackendErrorPhase {
-    /// Nonblocking submit path.
-    Submit,
-    /// Completion wait path.
-    Wait,
-}
-
-impl fmt::Display for IOBackendErrorPhase {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Submit => f.write_str("submit"),
-            Self::Wait => f.write_str("wait"),
-        }
     }
 }
 
@@ -281,125 +255,91 @@ pub(crate) enum SubmittedIoCleanup {
     },
 }
 
-/// Queue state observed at one backend progress failure boundary.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct IOBackendQueueState {
-    staged: Option<usize>,
-    pending: Option<usize>,
-    submitted: Option<usize>,
-    completions: Option<usize>,
-}
-
-impl IOBackendQueueState {
-    /// Unknown backend queue state.
-    #[inline]
-    #[cfg_attr(
-        not(feature = "libaio"),
-        expect(dead_code, reason = "libaio wait path reports unknown queue state")
-    )]
-    pub(crate) const fn unknown() -> Self {
-        Self {
-            staged: None,
-            pending: None,
-            submitted: None,
-            completions: None,
-        }
-    }
-
-    /// Queue state known by submit paths.
-    #[inline]
-    pub(crate) const fn submit(staged: usize, pending: usize) -> Self {
-        Self {
-            staged: Some(staged),
-            pending: Some(pending),
-            submitted: None,
-            completions: None,
-        }
-    }
-
-    /// Queue state known by wait paths when a completion count is available.
-    #[inline]
-    #[cfg_attr(
-        all(not(feature = "iouring"), not(test)),
-        expect(
-            dead_code,
-            reason = "io_uring wait path reports observed completion count"
-        )
-    )]
-    pub(crate) const fn wait_with_completions(completions: usize) -> Self {
-        Self {
-            staged: None,
-            pending: None,
-            submitted: None,
-            completions: Some(completions),
-        }
-    }
-}
-
-/// Backend failure details attached to backend progress error reports.
-///
-/// This represents syscall progress failures before a normal per-operation
-/// completion exists. Completion-token validation and scheduler consistency
-/// violations remain assertion/panic boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IOBackendFailure {
+enum BackendErrorDetail {
+    Submit {
+        staged: usize,
+        pending: usize,
+        note: Option<&'static str>,
+    },
+    Wait,
+    SubmitRetryExpired {
+        staged: usize,
+        pending: usize,
+        reason: SubmitRetryReason,
+        attempts: u32,
+        elapsed: Duration,
+        timeout: Duration,
+    },
+}
+
+/// Cloneable runtime backend failure retained until an IO reporting boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendError {
     backend: &'static str,
-    phase: IOBackendErrorPhase,
-    source: String,
+    io_kind: StdIoErrorKind,
+    source: Arc<str>,
     raw_errno: Option<i32>,
     call_count: usize,
-    queue_state: IOBackendQueueState,
-    note: Option<&'static str>,
+    detail: BackendErrorDetail,
 }
 
-impl IOBackendFailure {
-    /// Build one backend progress report around the underlying syscall error.
+impl BackendError {
+    /// Builds a submit failure from one backend syscall error.
     #[inline]
-    pub(crate) fn report(
+    pub(crate) fn submit(
         backend: &'static str,
-        phase: IOBackendErrorPhase,
         source: StdIoError,
         call_count: usize,
-        queue_state: IOBackendQueueState,
-    ) -> Report<IoError> {
-        let raw_errno = source.raw_os_error();
-        let kind = source.kind();
-        Report::new(IoError::from(kind)).attach(Self {
-            backend,
-            phase,
-            source: source.to_string(),
-            raw_errno,
-            call_count,
-            queue_state,
-            note: None,
-        })
+        staged: usize,
+        pending: usize,
+    ) -> Self {
+        Self::submit_with_note(backend, source, call_count, staged, pending, None)
     }
 
-    /// Attach a static diagnostic note.
+    /// Builds a submit failure with an optional backend-specific static note.
     #[inline]
-    #[cfg_attr(
-        not(feature = "libaio"),
-        expect(dead_code, reason = "libaio backend attaches unsupported-sync notes")
-    )]
-    pub(crate) fn report_with_note(
+    pub(crate) fn submit_with_note(
         backend: &'static str,
-        phase: IOBackendErrorPhase,
         source: StdIoError,
         call_count: usize,
-        queue_state: IOBackendQueueState,
-        note: &'static str,
-    ) -> Report<IoError> {
-        let raw_errno = source.raw_os_error();
-        let kind = source.kind();
-        Report::new(IoError::from(kind)).attach(Self {
+        staged: usize,
+        pending: usize,
+        note: Option<&'static str>,
+    ) -> Self {
+        Self::new(
             backend,
-            phase,
-            source: source.to_string(),
+            source,
+            call_count,
+            BackendErrorDetail::Submit {
+                staged,
+                pending,
+                note,
+            },
+        )
+    }
+
+    /// Builds a completion-wait failure from one backend syscall error.
+    #[inline]
+    pub(crate) fn wait(backend: &'static str, source: StdIoError, call_count: usize) -> Self {
+        Self::new(backend, source, call_count, BackendErrorDetail::Wait)
+    }
+
+    fn new(
+        backend: &'static str,
+        source: StdIoError,
+        call_count: usize,
+        detail: BackendErrorDetail,
+    ) -> Self {
+        let raw_errno = source.raw_os_error();
+        BackendError {
+            backend,
+            io_kind: source.kind(),
+            source: Arc::from(source.to_string()),
             raw_errno,
             call_count,
-            queue_state,
-            note: Some(note),
-        })
+            detail,
+        }
     }
 
     /// Backend name that produced the failure.
@@ -408,10 +348,15 @@ impl IOBackendFailure {
         self.backend
     }
 
-    /// Kernel-entry phase that failed.
+    /// Backend operation that failed.
     #[inline]
-    pub(crate) fn phase(&self) -> IOBackendErrorPhase {
-        self.phase
+    pub(crate) fn op(&self) -> &'static str {
+        match &self.detail {
+            BackendErrorDetail::Submit { .. } | BackendErrorDetail::SubmitRetryExpired { .. } => {
+                "submit"
+            }
+            BackendErrorDetail::Wait => "wait",
+        }
     }
 
     /// Raw OS errno when the underlying error has one.
@@ -425,53 +370,66 @@ impl IOBackendFailure {
     pub(crate) fn call_count(&self) -> usize {
         self.call_count
     }
+
+    /// Formats the IO-domain root plus structured backend details for logs.
+    #[inline]
+    pub(crate) fn summary(&self) -> String {
+        format!("{}: {self}", IoError::from(self.io_kind))
+    }
+
+    /// Converts this runtime failure into its terminal IO-domain report.
+    #[inline]
+    pub(crate) fn into_report(self) -> Report<IoError> {
+        let io_kind = self.io_kind;
+        Report::new(IoError::from(io_kind)).attach(self)
+    }
+
+    /// Converts a clone into an IO-domain report while retaining this failure.
+    #[inline]
+    pub(crate) fn to_report(&self) -> Report<IoError> {
+        self.clone().into_report()
+    }
 }
 
-impl fmt::Display for IOBackendFailure {
+impl fmt::Display for BackendError {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "backend={} phase={} errno={:?} error={} calls={} queue={{staged={} pending={} submitted={} completions={}}}",
+            "backend={} op={} errno={:?} error={} calls={}",
             self.backend,
-            self.phase,
+            self.op(),
             self.raw_errno,
             self.source,
-            self.call_count,
-            OptionalCount(self.queue_state.staged),
-            OptionalCount(self.queue_state.pending),
-            OptionalCount(self.queue_state.submitted),
-            OptionalCount(self.queue_state.completions)
+            self.call_count
         )?;
-        if let Some(note) = self.note {
-            write!(f, " note={note}")?;
+        match &self.detail {
+            BackendErrorDetail::Submit {
+                staged,
+                pending,
+                note,
+            } => {
+                write!(f, " queue={{staged={staged} pending={pending}}}")?;
+                if let Some(note) = note {
+                    write!(f, " note={note}")?;
+                }
+            }
+            BackendErrorDetail::Wait => {}
+            BackendErrorDetail::SubmitRetryExpired {
+                staged,
+                pending,
+                reason,
+                attempts,
+                elapsed,
+                timeout,
+            } => write!(
+                f,
+                " queue={{staged={staged} pending={pending}}} submit_retry_reason={reason} submit_retry_attempts={attempts} submit_retry_elapsed_ms={} submit_retry_timeout_ms={}",
+                elapsed.as_millis(),
+                timeout.as_millis()
+            )?,
         }
         Ok(())
-    }
-}
-
-struct OptionalCount(Option<usize>);
-
-impl fmt::Display for OptionalCount {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(value) => write!(f, "{value}"),
-            None => f.write_str("?"),
-        }
-    }
-}
-
-/// Worker-known logical operation kind attached to backend progress reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IOBackendOperationKind {
-    kind: super::IOKind,
-}
-
-impl fmt::Display for IOBackendOperationKind {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "operation_kind={:?}", self.kind)
     }
 }
 
@@ -517,7 +475,7 @@ impl BackendToken {
 
 /// Snapshot of backend-owned submit/wait activity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct IOBackendStats {
+pub(crate) struct BackendStats {
     /// Number of backend kernel-entry calls spent submitting work or waiting.
     ///
     /// On `libaio`, one logical IO commonly contributes one submit call and
@@ -536,15 +494,15 @@ pub(crate) struct IOBackendStats {
     pub(crate) wait_completions: usize,
 }
 
-impl IOBackendStats {
+impl BackendStats {
     /// Returns the saturating delta from one earlier snapshot.
     #[inline]
     #[cfg_attr(
         any(not(test), feature = "iouring"),
         expect(dead_code, reason = "internal io backend stats")
     )]
-    pub(crate) fn delta_since(self, earlier: IOBackendStats) -> IOBackendStats {
-        IOBackendStats {
+    pub(crate) fn delta_since(self, earlier: BackendStats) -> BackendStats {
+        BackendStats {
             submit_and_wait_calls: self
                 .submit_and_wait_calls
                 .saturating_sub(earlier.submit_and_wait_calls),
@@ -560,7 +518,7 @@ impl IOBackendStats {
 }
 
 #[derive(Default)]
-struct IOBackendStatsCounters {
+struct BackendStatsCounters {
     submit_and_wait_calls: AtomicUsize,
     submitted_ops: AtomicUsize,
     submit_and_wait_nanos: AtomicUsize,
@@ -569,13 +527,13 @@ struct IOBackendStatsCounters {
 
 /// Shared handle used to collect backend submit and wait statistics.
 #[derive(Clone, Default)]
-pub(crate) struct IOBackendStatsHandle(Arc<IOBackendStatsCounters>);
+pub(crate) struct BackendStatsHandle(Arc<BackendStatsCounters>);
 
-impl IOBackendStatsHandle {
+impl BackendStatsHandle {
     /// Returns a point-in-time snapshot of backend activity counters.
     #[inline]
-    pub(crate) fn snapshot(&self) -> IOBackendStats {
-        IOBackendStats {
+    pub(crate) fn snapshot(&self) -> BackendStats {
+        BackendStats {
             submit_and_wait_calls: self.0.submit_and_wait_calls.load(Ordering::Relaxed),
             submitted_ops: self.0.submitted_ops.load(Ordering::Relaxed),
             submit_and_wait_nanos: self.0.submit_and_wait_nanos.load(Ordering::Relaxed),
@@ -635,7 +593,7 @@ impl IOBackendStatsHandle {
 ///
 /// This keeps libaio-specific `*mut *mut iocb` layout and future io_uring
 /// submission queue layout out of the IO scheduler.
-pub(crate) trait IOBackend: Sized {
+pub(crate) trait Backend: Sized {
     type Prepared;
     type SubmitBatch;
     type Events;
@@ -660,101 +618,104 @@ pub(crate) trait IOBackend: Sized {
         &mut self,
         batch: &mut Self::SubmitBatch,
         limit: usize,
-    ) -> IoResult<SubmitAttempt>;
+    ) -> BackendResult<SubmitAttempt>;
     /// Waits for at least `min_nr` completions and returns worker tokens plus results.
     fn wait_at_least(
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
-    ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>>;
+    ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>>;
     /// Best-effort backend cleanup for already-submitted IO after a fatal
     /// progress failure.
     fn cleanup_submitted_io(&mut self, submitted: usize) -> SubmittedIoCleanup;
 }
 
-/// Return the backend failure details attached to a progress report.
-#[inline]
-pub(crate) fn backend_failure(report: &Report<IoError>) -> Option<&IOBackendFailure> {
-    report.downcast_ref::<IOBackendFailure>()
-}
-
-/// Return the backend syscall attempt count attached to a progress report.
-#[inline]
-pub(crate) fn backend_call_count(report: &Report<IoError>) -> usize {
-    backend_failure(report).map_or(0, IOBackendFailure::call_count)
-}
-
-/// Attach the first known logical operation kind affected by a backend failure.
-#[inline]
-pub(crate) fn attach_backend_operation_kind(
-    report: Report<IoError>,
-    kind: Option<super::IOKind>,
-) -> Report<IoError> {
-    match kind {
-        Some(kind) => report.attach(IOBackendOperationKind { kind }),
-        None => report,
-    }
-}
-
-/// Return the attached logical operation kind when one has been added.
-#[inline]
-pub(crate) fn backend_operation_kind(report: &Report<IoError>) -> Option<IOBackendOperationKind> {
-    report.downcast_ref::<IOBackendOperationKind>().copied()
-}
-
-/// Format backend progress context for logs and poison diagnostics.
-pub(crate) fn backend_report_summary(report: &Report<IoError>) -> String {
-    let mut summary = report.current_context().to_string();
-    if let Some(failure) = backend_failure(report) {
-        summary.push_str(": ");
-        summary.push_str(&failure.to_string());
-    }
-    if let Some(operation_kind) = backend_operation_kind(report) {
-        summary.push_str(": ");
-        summary.push_str(&operation_kind.to_string());
-    }
-    summary
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::IOKind;
     use super::*;
     use std::io::ErrorKind as StdIoErrorKind;
 
     #[test]
-    fn test_backend_failure_formats_known_and_unknown_queue_state() {
-        let report = IOBackendFailure::report(
+    fn test_backend_error_submit_preserves_shared_source_and_converts_at_boundary() {
+        let failure = BackendError::submit(
             "test_backend",
-            IOBackendErrorPhase::Submit,
             StdIoError::new(StdIoErrorKind::PermissionDenied, "submit denied"),
             2,
-            IOBackendQueueState::submit(0, 3),
+            0,
+            3,
         );
-        let failure = backend_failure(&report).unwrap();
 
         assert_eq!(failure.backend(), "test_backend");
-        assert_eq!(failure.phase(), IOBackendErrorPhase::Submit);
-        assert_eq!(backend_call_count(&report), 2);
+        assert_eq!(failure.op(), "submit");
+        assert_eq!(failure.call_count(), 2);
         assert_eq!(
             failure.to_string(),
-            "backend=test_backend phase=submit errno=None error=submit denied calls=2 queue={staged=0 pending=3 submitted=? completions=?}"
+            "backend=test_backend op=submit errno=None error=submit denied calls=2 queue={staged=0 pending=3}"
+        );
+        let cloned = failure.clone();
+        assert!(Arc::ptr_eq(&failure.source, &cloned.source));
+
+        let report = failure.into_report();
+        assert!(report.downcast_ref::<BackendError>().is_some());
+        assert_eq!(
+            report.current_context().kind(),
+            StdIoErrorKind::PermissionDenied
         );
     }
 
     #[test]
-    fn test_backend_operation_kind_is_attached_separately() {
-        let report = IOBackendFailure::report(
+    fn test_backend_error_submit_formats_optional_note() {
+        let failure = BackendError::submit_with_note(
             "test_backend",
-            IOBackendErrorPhase::Wait,
-            StdIoError::new(StdIoErrorKind::Interrupted, "wait interrupted"),
-            4,
-            IOBackendQueueState::wait_with_completions(1),
+            StdIoError::new(StdIoErrorKind::InvalidInput, "unsupported submit"),
+            1,
+            2,
+            1,
+            Some("backend-specific note"),
         );
-        let report = attach_backend_operation_kind(report, Some(IOKind::Fsync));
-        let operation_kind = backend_operation_kind(&report).unwrap();
 
-        assert_eq!(operation_kind.to_string(), "operation_kind=Fsync");
-        assert!(backend_report_summary(&report).contains("operation_kind=Fsync"));
+        assert_eq!(
+            failure.to_string(),
+            "backend=test_backend op=submit errno=None error=unsupported submit calls=1 queue={staged=2 pending=1} note=backend-specific note"
+        );
+    }
+
+    #[test]
+    fn test_backend_error_wait_formats_common_diagnostics() {
+        let failure =
+            BackendError::wait("test_backend", StdIoError::from_raw_os_error(libc::EIO), 3);
+
+        assert_eq!(failure.op(), "wait");
+        assert_eq!(failure.raw_errno(), Some(libc::EIO));
+        assert_eq!(
+            failure.to_string(),
+            "backend=test_backend op=wait errno=Some(5) error=Input/output error (os error 5) calls=3"
+        );
+    }
+
+    #[test]
+    fn test_submit_retry_expiry_uses_operation_specific_detail() {
+        let failure = SubmitRetry::new(SubmitRetryReason::NoProgress, 4).progress_error(
+            2,
+            3,
+            5,
+            Duration::from_millis(7),
+            Duration::from_millis(6),
+        );
+
+        assert_eq!(failure.op(), "submit");
+        assert_eq!(failure.raw_errno(), None);
+        assert!(matches!(
+            failure.detail,
+            BackendErrorDetail::SubmitRetryExpired {
+                staged: 2,
+                pending: 3,
+                reason: SubmitRetryReason::NoProgress,
+                attempts: 5,
+                elapsed,
+                timeout,
+            } if elapsed == Duration::from_millis(7)
+                && timeout == Duration::from_millis(6)
+        ));
     }
 }

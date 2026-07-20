@@ -1,5 +1,6 @@
 use crate::error::{LifecycleError, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::poison::EnginePoisoner;
 use crate::row::INVALID_ROW_ID;
 use crate::trx::sys::TransactionSystem;
 
@@ -61,6 +62,7 @@ pub(super) struct ParentPosition<G> {
 #[derive(Clone, Copy)]
 pub(crate) struct RowPageCreateRedoCtx<'a> {
     trx_sys: &'a TransactionSystem,
+    poisoner: &'a EnginePoisoner,
     table_id: TableID,
 }
 
@@ -69,9 +71,14 @@ impl RowPageCreateRedoCtx<'_> {
     #[inline]
     pub(crate) fn new<'a>(
         trx_sys: &'a TransactionSystem,
+        poisoner: &'a EnginePoisoner,
         table_id: TableID,
     ) -> RowPageCreateRedoCtx<'a> {
-        RowPageCreateRedoCtx { trx_sys, table_id }
+        RowPageCreateRedoCtx {
+            trx_sys,
+            poisoner,
+            table_id,
+        }
     }
 
     /// Commits the system redo record for a newly allocated row page.
@@ -91,7 +98,7 @@ impl RowPageCreateRedoCtx<'_> {
         let res = self.trx_sys.commit_sys(trx);
         if let Err(err) = &res {
             debug_assert!(
-                self.trx_sys.poison_error().is_some()
+                self.poisoner.poison_error().is_some()
                     || err.report().downcast_ref::<LifecycleError>().copied()
                         == Some(LifecycleError::Shutdown),
                 "row-page create redo failed while transaction system is still healthy: {err:?}"

@@ -9,9 +9,8 @@ use crate::catalog::table::TableMetadata;
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
-use crate::engine_poison::EnginePoisoner;
 use crate::error::{
-    CompletionErrorKind, Error, FatalError, IoError, IoResult, Result, RuntimeError, RuntimeResult,
+    CompletionErrorBridge, Error, FatalError, IoResult, Result, RuntimeError, RuntimeResult,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
@@ -24,16 +23,16 @@ use crate::file::{
 };
 use crate::id::{TableID, TrxID};
 use crate::io::{
-    BackendToken, IOBackend, IOBackendQueueState, IOBackendStats, IOBackendStatsHandle, IOClient,
-    IOKind, IOMessage, IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult,
-    StorageBackend, SubmitAttempt, SubmitRetryBackoff, SubmittedIoCleanup,
-    attach_backend_operation_kind, backend_failure, backend_report_summary,
+    Backend, BackendError, BackendStats, BackendStatsHandle, BackendToken, IOClient, IOKind,
+    IOMessage, IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
+    SubmitAttempt, SubmitRetryBackoff, SubmittedIoCleanup,
 };
 #[cfg(test)]
 use crate::io::{StorageBackendOp, current_storage_backend_test_hook};
 use crate::map::FastHashSet;
 use crate::notify::EventNotifyOnDrop;
 use crate::obs;
+use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::thread;
 use crate::{IndexPool, MemPool};
@@ -229,19 +228,6 @@ impl StorageSubmission {
     fn index_pool(sub: EvictSubmission) -> Self {
         Self {
             inner: StorageSubmissionKind::IndexPool(sub),
-        }
-    }
-
-    #[inline]
-    fn io_kind(&self) -> IOKind {
-        match &self.inner {
-            StorageSubmissionKind::Table(TableFsSubmission::Write(_)) => IOKind::Write,
-            StorageSubmissionKind::Table(TableFsSubmission::Sync(_)) => IOKind::Fsync,
-            StorageSubmissionKind::Table(TableFsSubmission::Read(_))
-            | StorageSubmissionKind::MemPool(EvictSubmission::Read(_))
-            | StorageSubmissionKind::IndexPool(EvictSubmission::Read(_)) => IOKind::Read,
-            StorageSubmissionKind::MemPool(EvictSubmission::Write(_))
-            | StorageSubmissionKind::IndexPool(EvictSubmission::Write(_)) => IOKind::Write,
         }
     }
 
@@ -459,7 +445,7 @@ impl StorageStateMachine {
     fn fail_submission_with_backend_error(
         &mut self,
         sub: StorageSubmission,
-        err: &Report<IoError>,
+        err: &BackendError,
     ) -> IOKind {
         match sub.inner {
             StorageSubmissionKind::Table(sub) => {
@@ -480,7 +466,7 @@ impl StorageStateMachine {
     fn fail_submitted_with_backend_error(
         &mut self,
         sub: &mut StorageSubmission,
-        err: &Report<IoError>,
+        err: &BackendError,
     ) -> IOKind {
         match &mut sub.inner {
             StorageSubmissionKind::Table(sub) => {
@@ -497,17 +483,16 @@ impl StorageStateMachine {
 
     /// Fail one deferred table-read request that never reached backend submission.
     #[inline]
-    fn fail_table_read_request(&mut self, req: ReadSubmission, err: &Report<IoError>) {
-        let report = IoError::report_backend(err, "submit readonly table read");
-        req.fail(CompletionErrorKind::from_io(
-            report,
-            "readonly table read completion transport",
-        ));
+    fn fail_table_read_request(&mut self, req: ReadSubmission, err: &BackendError) {
+        let report = err
+            .to_report()
+            .attach("submit readonly table read: op_kind=read");
+        req.fail(CompletionErrorBridge::capture(report));
     }
 
     /// Fail one deferred pool-read request that never reached backend submission.
     #[inline]
-    fn fail_pool_read_request(&mut self, req: PoolReadRequest, err: &Report<IoError>) {
+    fn fail_pool_read_request(&mut self, req: PoolReadRequest, err: &BackendError) {
         match req {
             PoolReadRequest::Mem(req) => self
                 .mem_pool
@@ -520,11 +505,7 @@ impl StorageStateMachine {
 
     /// Fail one deferred background-write request that never reached backend submission.
     #[inline]
-    fn fail_background_write_request(
-        &mut self,
-        req: BackgroundWriteRequest,
-        err: &Report<IoError>,
-    ) {
+    fn fail_background_write_request(&mut self, req: BackgroundWriteRequest, err: &BackendError) {
         match req {
             BackgroundWriteRequest::Table(req) => req.fail(err),
             BackgroundWriteRequest::TableSync(req) => req.fail(err),
@@ -659,7 +640,7 @@ impl StorageRequestScheduler {
 
     /// Fail all lane-deferred requests that cannot be submitted after backend failure.
     #[inline]
-    fn fail_deferred(&mut self, state_machine: &mut StorageStateMachine, err: &Report<IoError>) {
+    fn fail_deferred(&mut self, state_machine: &mut StorageStateMachine, err: &BackendError) {
         if let Some(req) = self.table_reads.deferred_req.take() {
             state_machine.fail_table_read_request(req, err);
         }
@@ -1125,14 +1106,6 @@ impl<T> StorageInflightSlots<T> {
         }
     }
 
-    #[inline]
-    fn get(&self, slot: u32) -> &T {
-        match &self.slots[slot as usize].entry {
-            StorageSlotEntry::Occupied(value) => value,
-            StorageSlotEntry::Vacant(_) => panic!("slot {slot} is not occupied"),
-        }
-    }
-
     /// Take an occupied slot by local slot index before backend submission.
     #[inline]
     fn take_slot(&mut self, slot: u32) -> T {
@@ -1280,7 +1253,7 @@ pub(crate) struct StorageIOWorkerBuilder<B = StorageBackend> {
 
 impl<B> StorageIOWorkerBuilder<B>
 where
-    B: IOBackend,
+    B: Backend,
 {
     /// Create the worker builder together with the three ingress lane clients.
     #[inline]
@@ -1314,7 +1287,7 @@ where
     #[inline]
     fn bind(
         self,
-        engine_poisoner: QuiescentGuard<EnginePoisoner>,
+        poisoner: QuiescentGuard<EnginePoisoner>,
         state_machine: StorageStateMachine,
     ) -> StorageIOWorker<B> {
         let io_depth = self.backend.io_depth();
@@ -1347,13 +1320,13 @@ where
             submit_backoff: SubmitRetryBackoff::default(),
             slots: StorageInflightSlots::new(io_depth),
             state_machine,
-            engine_poisoner,
+            poisoner,
         }
     }
 }
 
 /// Backend-owning event loop for the shared storage service.
-struct StorageIOWorker<B: IOBackend = StorageBackend> {
+struct StorageIOWorker<B: Backend = StorageBackend> {
     backend: B,
     submitted_quarantine: SubmittedStorageIoQuarantine<B::Prepared>,
     scheduler: StorageRequestScheduler,
@@ -1363,12 +1336,12 @@ struct StorageIOWorker<B: IOBackend = StorageBackend> {
     submit_backoff: SubmitRetryBackoff,
     slots: StorageInflightSlots<StorageInflightEntry<StorageSubmission, B::Prepared>>,
     state_machine: StorageStateMachine,
-    engine_poisoner: QuiescentGuard<EnginePoisoner>,
+    poisoner: QuiescentGuard<EnginePoisoner>,
 }
 
 impl<B> StorageIOWorker<B>
 where
-    B: IOBackend,
+    B: Backend,
     B::Prepared: Send + 'static,
     B::SubmitBatch: Send + 'static,
 {
@@ -1432,11 +1405,7 @@ where
     }
 
     #[inline]
-    fn fail_not_submitted(
-        &mut self,
-        queue: &mut IOQueue<StorageSubmission>,
-        err: &Report<IoError>,
-    ) {
+    fn fail_not_submitted(&mut self, queue: &mut IOQueue<StorageSubmission>, err: &BackendError) {
         self.scheduler.fail_deferred(&mut self.state_machine, err);
         for sub in queue.drain_to(queue.len()) {
             self.state_machine
@@ -1451,7 +1420,7 @@ where
     }
 
     #[inline]
-    fn fail_submitted(&mut self, err: &Report<IoError>) {
+    fn fail_submitted(&mut self, err: &BackendError) {
         for slot in &mut self.slots.slots {
             let StorageSlotEntry::Occupied(entry) = &mut slot.entry else {
                 continue;
@@ -1511,36 +1480,24 @@ where
     fn handle_backend_progress_failure(
         &mut self,
         queue: &mut IOQueue<StorageSubmission>,
-        err: Report<IoError>,
+        err: BackendError,
     ) {
-        let err = attach_backend_operation_kind(
-            err,
-            self.staged_slots
-                .front()
-                .map(|slot| self.slots.get(*slot).submission.io_kind()),
-        );
-        let backend = backend_failure(&err);
-        let backend_name = backend.map_or("unknown", |failure| failure.backend());
-        let phase = backend
-            .map(|failure| failure.phase().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let raw_errno = backend.and_then(|failure| failure.raw_errno());
-        let error = backend_report_summary(&err);
+        let error = err.summary();
         obs::error!(
-            "event=storage_backend_progress_failure component=storage_io backend={} phase={} errno={:?} submitted={} staged={} queued={} action=poison result=error error={}",
-            backend_name,
-            phase,
-            raw_errno,
+            "event=storage_backend_progress_failure component=storage_io backend={} op={} errno={:?} submitted={} staged={} queued={} action=poison result=error error={}",
+            err.backend(),
+            err.op(),
+            err.raw_errno(),
             self.submitted,
             self.staged_slots.len(),
             queue.len(),
             error
         );
-        let _ = self.engine_poisoner.poison(
-            FatalError::StorageIo,
-            "storage_io",
-            format!("backend progress failure: {error}"),
-        );
+        let report = err
+            .to_report()
+            .change_context(FatalError::StorageIo)
+            .attach(format!("backend progress failure: {error}"));
+        let _ = self.poisoner.poison(report);
         self.fail_not_submitted(queue, &err);
         self.fail_submitted(&err);
         let cleanup = self.backend.cleanup_submitted_io(self.submitted);
@@ -1595,10 +1552,8 @@ where
                             );
                             if let Err(err) = self.submit_backoff.backoff_or_progress_error(
                                 reason,
-                                IOBackendQueueState::submit(
-                                    self.staged_slots.len(),
-                                    self.staged_slots.len(),
-                                ),
+                                self.staged_slots.len(),
+                                self.staged_slots.len(),
                             ) {
                                 self.handle_backend_progress_failure(&mut queue, err);
                                 return;
@@ -1715,12 +1670,12 @@ impl Component for FileSystemWorkers {
         let index_pool_file = shelf.take::<IndexPool>();
 
         let fs = registry.dependency::<FileSystem>();
-        let engine_poisoner = registry.dependency::<EnginePoisoner>();
+        let poisoner = registry.dependency::<EnginePoisoner>();
         let mem_pool = registry.dependency::<MemPool>();
         let index_pool = registry.dependency::<IndexPool>();
         let handle = builder
             .bind(
-                engine_poisoner,
+                poisoner,
                 StorageStateMachine::new(
                     mem_pool.clone_inner().into_sync(),
                     mem_pool_file,
@@ -1770,7 +1725,7 @@ pub(crate) struct FileSystem {
     table_reads: IOClient<ReadSubmission>,
     pool_reads: IOClient<PoolReadRequest>,
     background_writes: IOClient<BackgroundWriteRequest>,
-    io_backend_stats: IOBackendStatsHandle,
+    io_backend_stats: BackendStatsHandle,
     storage_service_stats: StorageServiceStatsHandle,
     configured_io_depth: usize,
     data_dir: PathBuf,
@@ -2002,7 +1957,7 @@ impl FileSystem {
 
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
-    pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
+    pub(crate) fn io_backend_stats(&self) -> BackendStats {
         self.io_backend_stats.snapshot()
     }
 
@@ -2151,15 +2106,15 @@ pub(crate) mod tests {
     use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{ConfigError, ErrorKind, IoResult};
+    use crate::error::{ConfigError, ErrorKind, IoError, IoResult};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::table_file::TableFile;
     use crate::file::{BlockKey, UNTRACKED_FILE_ID};
     use crate::id::BlockID;
     use crate::io::{
-        Completion, DirectBuf, IOBackendErrorPhase, IOBackendFailure, IOBackendOperationKind,
-        IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
-        SubmittedIoCleanup, install_storage_backend_test_hook,
+        BackendError, BackendResult, Completion, DirectBuf, IOBuf, IOKind,
+        StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook, SubmittedIoCleanup,
+        install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
     use crate::table::test_user_table_id;
@@ -2595,7 +2550,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl IOBackend for SubmittedWaitFailureBackend {
+    impl Backend for SubmittedWaitFailureBackend {
         type Prepared = BackendToken;
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
@@ -2633,7 +2588,7 @@ pub(crate) mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> IoResult<SubmitAttempt> {
+        ) -> BackendResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
             let Some(submitted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
@@ -2652,17 +2607,15 @@ pub(crate) mod tests {
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(
                 self.inflight.len() >= min_nr,
                 "test backend requires submitted work before wait failure"
             );
-            Err(IOBackendFailure::report(
+            Err(BackendError::wait(
                 "submitted_wait_failure_test",
-                IOBackendErrorPhase::Wait,
                 StdIoError::from_raw_os_error(libc::EIO),
                 1,
-                IOBackendQueueState::wait_with_completions(0),
             ))
         }
 
@@ -2708,42 +2661,34 @@ pub(crate) mod tests {
         )
     }
 
-    fn backend_progress_failure_for_test(phase: IOBackendErrorPhase) -> Report<IoError> {
-        let queue_state = match phase {
-            IOBackendErrorPhase::Submit => IOBackendQueueState::submit(1, 1),
-            IOBackendErrorPhase::Wait => IOBackendQueueState::wait_with_completions(0),
-        };
-        IOBackendFailure::report(
+    fn submit_backend_error_for_test() -> BackendError {
+        BackendError::submit(
             "submitted_wait_failure_test",
-            phase,
             StdIoError::from_raw_os_error(libc::EIO),
             1,
-            queue_state,
+            1,
+            1,
         )
     }
 
     fn assert_backend_sync_completion_error(
         completion: &Completion<()>,
-        phase: IOBackendErrorPhase,
-        expected_operation_kind: Option<&str>,
+        expected_op: &str,
+        expected_op_kind: &str,
     ) {
         let report = completion
             .completed_result()
             .expect("sync waiter should be completed")
-            .expect_err("sync waiter should fail with backend error");
+            .expect_err("sync waiter should fail with backend error")
+            .replace_context(RuntimeError::FileRootAccess);
         let failure = report
-            .downcast_ref::<IOBackendFailure>()
+            .downcast_ref::<BackendError>()
             .expect("backend failure context should be preserved");
         assert_eq!(failure.backend(), "submitted_wait_failure_test");
-        assert_eq!(failure.phase(), phase);
+        assert_eq!(failure.op(), expected_op);
         assert_eq!(failure.raw_errno(), Some(libc::EIO));
-        assert_eq!(
-            report
-                .downcast_ref::<IOBackendOperationKind>()
-                .map(ToString::to_string)
-                .as_deref(),
-            expected_operation_kind
-        );
+        let output = format!("{report:?}");
+        assert!(output.contains(expected_op_kind), "{output}");
     }
 
     #[test]
@@ -2822,14 +2767,14 @@ pub(crate) mod tests {
             let mut poison_builder = RegistryBuilder::new();
             poison_builder.build::<EnginePoisoner>(()).await.unwrap();
             let poison_registry = poison_builder.finish();
-            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>();
+            let poisoner = poison_registry.dependency::<EnginePoisoner>();
             let state_machine = StorageStateMachine::new(
                 fs.mem_pool().into_sync(),
                 mem_pool_file,
                 fs.index_pool().into_sync(),
                 index_pool_file,
             );
-            let worker = builder.bind(engine_poisoner.clone(), state_machine);
+            let worker = builder.bind(poisoner.clone(), state_machine);
             let (submission, completion) = SyncSubmission::prepare_fsync(table_file);
             let handle = worker.start_thread().unwrap();
             background_writes
@@ -2839,19 +2784,20 @@ pub(crate) mod tests {
                 .join()
                 .expect("test storage IO worker should not panic");
 
-            assert_backend_sync_completion_error(&completion, IOBackendErrorPhase::Wait, None);
+            assert_backend_sync_completion_error(&completion, "wait", "op_kind=fsync");
             assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 1);
+            let poison = poisoner
+                .poison_error()
+                .expect("backend wait failure should poison engine");
+            assert_eq!(*poison.current_context(), FatalError::StorageIo);
             assert_eq!(
-                *engine_poisoner
-                    .poison_error()
-                    .expect("backend wait failure should poison engine")
-                    .current_context(),
-                FatalError::StorageIo
+                poison.downcast_ref::<BackendError>().map(BackendError::op),
+                Some("wait")
             );
             drop(table_reads);
             drop(pool_reads);
             drop(background_writes);
-            drop(engine_poisoner);
+            drop(poisoner);
             drop(poison_registry);
             drop(fs);
         });
@@ -2884,14 +2830,14 @@ pub(crate) mod tests {
             let mut poison_builder = RegistryBuilder::new();
             poison_builder.build::<EnginePoisoner>(()).await.unwrap();
             let poison_registry = poison_builder.finish();
-            let engine_poisoner = poison_registry.dependency::<EnginePoisoner>();
+            let poisoner = poison_registry.dependency::<EnginePoisoner>();
             let state_machine = StorageStateMachine::new(
                 fs.mem_pool().into_sync(),
                 mem_pool_file,
                 fs.index_pool().into_sync(),
                 index_pool_file,
             );
-            let mut worker = builder.bind(engine_poisoner.clone(), state_machine);
+            let mut worker = builder.bind(poisoner.clone(), state_machine);
 
             let (staged_submission, staged_completion) = SyncSubmission::prepare_fsync(staged_file);
             let mut staged_submission = StorageSubmission::table(TableFsSubmission::Sync(
@@ -2921,38 +2867,28 @@ pub(crate) mod tests {
                 queued_submission.into_prepared(),
             )));
 
-            worker.handle_backend_progress_failure(
-                &mut queue,
-                backend_progress_failure_for_test(IOBackendErrorPhase::Submit),
-            );
+            worker.handle_backend_progress_failure(&mut queue, submit_backend_error_for_test());
 
             assert_eq!(queue.len(), 0);
             assert!(worker.staged_slots.is_empty());
             assert_eq!(worker.submitted, 0);
             assert!(worker.slots.has_vacant());
             assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 0);
-            assert_backend_sync_completion_error(
-                &staged_completion,
-                IOBackendErrorPhase::Submit,
-                Some("operation_kind=Fsync"),
-            );
-            assert_backend_sync_completion_error(
-                &queued_completion,
-                IOBackendErrorPhase::Submit,
-                Some("operation_kind=Fsync"),
-            );
+            assert_backend_sync_completion_error(&staged_completion, "submit", "op_kind=fsync");
+            assert_backend_sync_completion_error(&queued_completion, "submit", "op_kind=fsync");
+            let poison = poisoner
+                .poison_error()
+                .expect("backend submit failure should poison engine");
+            assert_eq!(*poison.current_context(), FatalError::StorageIo);
             assert_eq!(
-                *engine_poisoner
-                    .poison_error()
-                    .expect("backend submit failure should poison engine")
-                    .current_context(),
-                FatalError::StorageIo
+                poison.downcast_ref::<BackendError>().map(BackendError::op),
+                Some("submit")
             );
             drop(worker);
             drop(table_reads);
             drop(pool_reads);
             drop(background_writes);
-            drop(engine_poisoner);
+            drop(poisoner);
             drop(poison_registry);
             drop(fs);
         });
@@ -2986,10 +2922,7 @@ pub(crate) mod tests {
                     err.report().downcast_ref::<RuntimeError>().copied(),
                     Some(RuntimeError::FileRootAccess)
                 );
-                assert!(matches!(
-                    err.report().downcast_ref::<CompletionErrorKind>(),
-                    Some(CompletionErrorKind::Io(_))
-                ));
+                assert!(err.report().downcast_ref::<IoError>().is_some());
                 let report = format!("{err:?}");
                 assert!(report.contains("file_kind=catalog.mtb"), "{report}");
                 assert!(report.contains("phase=write_meta_block"), "{report}");
@@ -3074,10 +3007,7 @@ pub(crate) mod tests {
                 &RuntimeError::FileRootAccess,
                 "unexpected error: {err:?}"
             );
-            assert!(matches!(
-                err.downcast_ref::<CompletionErrorKind>(),
-                Some(CompletionErrorKind::Io(_))
-            ));
+            assert!(err.downcast_ref::<IoError>().is_some());
             let report = format!("{err:?}");
             assert!(report.contains("file_kind=table_file"), "{report}");
             assert!(report.contains("phase=fsync"), "{report}");

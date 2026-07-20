@@ -3,14 +3,15 @@ use super::{
     RedoGroupWriteMeta, RedoLogFile, RedoLogSealMetadata,
 };
 use crate::conf::TrxSysConfig;
-use crate::error::{CompletionErrorKind, FatalError, FatalResult};
+use crate::error::{FatalError, FatalResult, SharedFatalError};
 use crate::id::TrxID;
-use crate::io::{DirectBuf, IOBackend, IOBuf, SubmitAttempt};
+use crate::io::{Backend, DirectBuf, IOBuf, SubmitAttempt};
 use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoSuperBlock,
     serialize_redo_super_block, slot_offset,
 };
 use crate::trx::sys::TransactionSystem;
+use error_stack::Report;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::result::Result as StdResult;
@@ -136,7 +137,7 @@ impl LogFileSealer {
     pub(crate) fn seal_active_file_best_effort(
         &mut self,
         trx_sys: &TransactionSystem,
-        write_driver: &mut LogWriteDriver<impl IOBackend>,
+        write_driver: &mut LogWriteDriver<impl Backend>,
     ) {
         let target = {
             let group_commit_g = trx_sys.redo_log.group_commit.lock();
@@ -164,7 +165,7 @@ impl LogFileSealer {
     fn seal_file_target_best_effort(
         &self,
         target: LogFileSealTarget,
-        write_driver: &mut LogWriteDriver<impl IOBackend>,
+        write_driver: &mut LogWriteDriver<impl Backend>,
     ) -> StdResult<(), FatalError> {
         debug_assert_eq!(write_driver.pending_len(), 0);
         debug_assert_eq!(write_driver.submitted_len(), 0);
@@ -172,7 +173,10 @@ impl LogFileSealer {
             .map_err(|report| *report.current_context())?;
         let (submission, _completion) = LogWriteSubmission::header(fd, offset, buf);
         if let Err(submission) = write_driver.push_write(submission) {
-            submission.fail_unsubmitted_header(FatalError::RedoWrite);
+            submission.fail_unsubmitted_header(SharedFatalError::capture(
+                Report::new(FatalError::RedoWrite)
+                    .attach("redo sealed super-block write was not submitted"),
+            ));
             return Err(FatalError::RedoWrite);
         }
         match write_driver
@@ -188,7 +192,6 @@ impl LogFileSealer {
             owner: _,
             kind,
             buf,
-            poison: _,
             failure,
         } = write_driver
             .wait_at_least_one()
@@ -200,12 +203,9 @@ impl LogFileSealer {
             unreachable!("active file seal submits exactly one header write");
         };
         drop(buf.expect("active file seal header write must return a buffer"));
-        if let Some(report) = failure {
-            let reason = *report.current_context();
-            completion.complete(Err(CompletionErrorKind::from_fatal(
-                report,
-                "redo sealed super-block write failed",
-            )));
+        if let Some(error) = failure {
+            let reason = error.reason();
+            completion.complete(Err(error.into_completion_bridge()));
             return Err(reason);
         }
         completion.complete(Ok(()));
@@ -216,7 +216,7 @@ impl LogFileSealer {
     fn sync_file_target_best_effort(
         &self,
         fd: RawFd,
-        write_driver: &mut LogWriteDriver<impl IOBackend>,
+        write_driver: &mut LogWriteDriver<impl Backend>,
     ) -> StdResult<(), FatalError> {
         let Some(submission) = LogWriteSubmission::standalone_sync(fd, self.log_sync) else {
             return Ok(());
@@ -237,8 +237,7 @@ impl LogFileSealer {
             owner: _,
             kind,
             buf,
-            poison,
-            failure: _,
+            failure,
         } = write_driver
             .wait_at_least_one()
             .map_err(|_| FatalError::RedoSync)?;
@@ -246,7 +245,7 @@ impl LogFileSealer {
             unreachable!("active file seal submits exactly one standalone sync");
         };
         debug_assert!(buf.is_none());
-        poison.map_or(Ok(()), Err)
+        failure.map_or(Ok(()), |error| Err(error.reason()))
     }
 }
 

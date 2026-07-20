@@ -1,31 +1,12 @@
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::{FatalError, FatalResult};
-use crate::obs;
+use crate::error::{FatalError, FatalResult, SharedFatalError};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use event_listener::{Event, EventListener};
 use parking_lot::Mutex;
 use std::convert::Infallible;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// First fatal engine poison reason published to future admission checks.
-#[derive(Debug, Clone)]
-pub(crate) struct EnginePoisonReason {
-    reason: FatalError,
-    component: &'static str,
-    context: String,
-}
-
-impl EnginePoisonReason {
-    #[inline]
-    fn report(&self) -> Report<FatalError> {
-        Report::new(self.reason)
-            .attach(format!("component={}", self.component))
-            .attach(self.context.clone())
-    }
-}
 
 /// Engine-level owner of fatal runtime poison state.
 ///
@@ -34,12 +15,12 @@ impl EnginePoisonReason {
 /// consistency, while the engine owner remains responsible for normal explicit
 /// shutdown.
 pub(crate) struct EnginePoisoner {
-    /// Engine-runtime poison flag for fatal storage background or durability failures.
-    poisoned: CachePadded<AtomicBool>,
-    /// First fatal engine reason and diagnostic context that poisoned runtime admission.
-    poison_reason: CachePadded<Mutex<Option<EnginePoisonReason>>>,
+    /// Engine runtime poison flag for fatal storage background or durability failures.
+    poisoned: AtomicBool,
+    /// First source-bearing fatal failure that poisoned runtime admission.
+    poison_reason: Mutex<Option<SharedFatalError>>,
     /// One-shot wake for event waits that must notice engine poison.
-    poison_event: CachePadded<Event>,
+    poison_event: Event,
 }
 
 impl EnginePoisoner {
@@ -47,9 +28,9 @@ impl EnginePoisoner {
     #[inline]
     fn new() -> Self {
         Self {
-            poisoned: CachePadded::new(AtomicBool::new(false)),
-            poison_reason: CachePadded::new(Mutex::new(None)),
-            poison_event: CachePadded::new(Event::new()),
+            poisoned: AtomicBool::new(false),
+            poison_reason: Mutex::new(None),
+            poison_event: Event::new(),
         }
     }
 
@@ -59,12 +40,13 @@ impl EnginePoisoner {
         if !self.poisoned.load(Ordering::Acquire) {
             return None;
         }
-        let guard = self.poison_reason.lock();
-        debug_assert!(
-            guard.is_some(),
-            "engine poison flag published before poison reason was stored"
-        );
-        guard.as_ref().map(EnginePoisonReason::report)
+        let error = self
+            .poison_reason
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("engine poison flag must have a stored fatal error");
+        Some(error.into_report())
     }
 
     /// Returns `Err` once a fatal engine failure poisoned runtime admission.
@@ -82,52 +64,35 @@ impl EnginePoisoner {
         self.poison_event.listen()
     }
 
-    /// Records the first fatal poison reason and returns the published poison error.
+    /// Records one complete fatal report and returns this caller's shared error.
     ///
-    /// The first caller wins: later poison attempts return the already recorded
-    /// reason. The reason and context are stored before the atomic flag is
+    /// The first caller wins admission state, while later poison attempts retain
+    /// their local failure. The first reason is stored before the atomic flag is
     /// published so a thread that observes `poisoned == true` can immediately
-    /// load a meaningful error.
+    /// load the published error.
     #[inline]
-    pub(crate) fn poison(
-        &self,
-        reason: FatalError,
-        component: &'static str,
-        context: impl Into<String>,
-    ) -> Report<FatalError> {
-        let attempted_context = context.into();
+    pub(crate) fn poison(&self, report: Report<FatalError>) -> SharedFatalError {
+        self.publish_shared(SharedFatalError::capture(report))
+    }
+
+    /// Publishes an already captured shared Fatal error without reconstructing it.
+    #[inline]
+    pub(crate) fn poison_shared(&self, local: SharedFatalError) -> SharedFatalError {
+        self.publish_shared(local)
+    }
+
+    fn publish_shared(&self, local: SharedFatalError) -> SharedFatalError {
         {
             let mut guard = self.poison_reason.lock();
             if guard.is_none() {
-                *guard = Some(EnginePoisonReason {
-                    reason,
-                    component,
-                    context: attempted_context.clone(),
-                });
+                *guard = Some(local.clone());
             }
         }
         let already_poisoned = self.poisoned.swap(true, Ordering::AcqRel);
-        let poison = self.poison_error().unwrap_or_else(|| {
-            Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
-        });
         if !already_poisoned {
-            obs::error!(
-                "event=engine_poison component={} action=poison result=error fatal_reason={:?} context={}",
-                component,
-                poison.current_context(),
-                attempted_context
-            );
             self.poison_event.notify(usize::MAX);
-        } else if obs::log_enabled!(obs::Level::Debug) {
-            obs::debug!(
-                "event=engine_poison component={} action=poison result=ignored fatal_reason={:?} published_fatal_reason={:?} context={}",
-                component,
-                reason,
-                poison.current_context(),
-                attempted_context
-            );
         }
-        poison
+        local
     }
 }
 
@@ -179,7 +144,8 @@ mod tests {
         let worker_poisoner = Arc::clone(&poisoner);
         let handle = spawn(move || {
             worker_started.store(true, Ordering::Release);
-            let err = worker_poisoner.poison(FatalError::RedoWrite, "test", "blocked poison");
+            let err =
+                worker_poisoner.poison(Report::new(FatalError::RedoWrite).attach("blocked poison"));
             worker_finished.store(true, Ordering::Release);
             err
         });
@@ -202,7 +168,7 @@ mod tests {
 
         drop(blocked);
 
-        let err = handle.join().unwrap();
+        let err = handle.join().unwrap().into_report();
         assert_eq!(*err.current_context(), FatalError::RedoWrite);
         assert!(poisoner.poisoned.load(Ordering::Acquire));
         assert!(
@@ -228,28 +194,37 @@ mod tests {
         let worker_a_poisoner = Arc::clone(&poisoner);
         let worker_a = spawn(move || {
             worker_a_barrier.wait();
-            worker_a_poisoner.poison(FatalError::RedoWrite, "test", "writer")
+            worker_a_poisoner.poison(Report::new(FatalError::RedoWrite).attach("writer"))
         });
 
         let worker_b_barrier = Arc::clone(&barrier);
         let worker_b_poisoner = Arc::clone(&poisoner);
         let worker_b = spawn(move || {
             worker_b_barrier.wait();
-            worker_b_poisoner.poison(FatalError::RedoSync, "test", "sync")
+            worker_b_poisoner.poison(Report::new(FatalError::RedoSync).attach("sync"))
         });
 
         barrier.wait();
 
         let err_a = worker_a.join().unwrap();
         let err_b = worker_b.join().unwrap();
+        let stored_error = poisoner
+            .poison_reason
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("poisoned engine must retain the first fatal error");
         let stored = poisoner.poison_error().unwrap();
-        let err_a_reason = *err_a.current_context();
-        let err_b_reason = *err_b.current_context();
         let stored_reason = *stored.current_context();
 
         assert!(poisoner.poisoned.load(Ordering::Acquire));
-        assert_eq!(err_a_reason, err_b_reason);
-        assert_eq!(stored_reason, err_a_reason);
+        assert!(
+            stored_error.test_identity() == err_a.test_identity()
+                || stored_error.test_identity() == err_b.test_identity()
+        );
+        assert_eq!(err_a.reason(), FatalError::RedoWrite);
+        assert_eq!(err_b.reason(), FatalError::RedoSync);
+        assert_eq!(stored_error.reason(), stored_reason);
         assert!(
             poisoner
                 .ensure_healthy()
@@ -272,8 +247,19 @@ mod tests {
             });
 
             poisoner.ensure_healthy().unwrap();
-            let err = poisoner.poison(FatalError::CheckpointWrite, "test", "checkpoint");
-            assert_eq!(*err.current_context(), FatalError::CheckpointWrite);
+            let err =
+                poisoner.poison(Report::new(FatalError::CheckpointWrite).attach("checkpoint"));
+            let first_identity = err.test_identity();
+            assert_eq!(err.reason(), FatalError::CheckpointWrite);
+            assert_eq!(
+                poisoner
+                    .poison_reason
+                    .lock()
+                    .as_ref()
+                    .expect("first poison must store its fatal error")
+                    .test_identity(),
+                first_identity
+            );
             waiter.await;
             assert!(
                 poisoner
@@ -283,8 +269,26 @@ mod tests {
             );
 
             let late_listener = poisoner.listener();
-            let err = poisoner.poison(FatalError::RedoSync, "test", "sync");
-            assert_eq!(*err.current_context(), FatalError::CheckpointWrite);
+            let err = poisoner.poison(Report::new(FatalError::RedoSync).attach("sync"));
+            assert_eq!(err.reason(), FatalError::RedoSync);
+            assert_eq!(
+                poisoner
+                    .poison_reason
+                    .lock()
+                    .as_ref()
+                    .expect("later poison must retain the first fatal error")
+                    .reason(),
+                FatalError::CheckpointWrite
+            );
+            assert_eq!(
+                poisoner
+                    .poison_reason
+                    .lock()
+                    .as_ref()
+                    .expect("later poison must retain the first fatal error")
+                    .test_identity(),
+                first_identity
+            );
             drop(late_listener);
             assert!(
                 poisoner

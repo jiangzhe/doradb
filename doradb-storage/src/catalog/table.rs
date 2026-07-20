@@ -8,6 +8,7 @@ use crate::id::{TableID, TrxID};
 use crate::index::BlockIndex;
 use crate::log::redo::DDLRedo;
 use crate::map::FastHashSet;
+use crate::obs;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
@@ -226,13 +227,14 @@ impl CreateTableProgress {
         let mut cleanup_error = None;
         if let Err(err) = self.destroy_staged_runtime(guards).await {
             cleanup_error = Some(
-                poison_create_table_cleanup_with_source(
+                poison_error_source(
                     engine,
-                    self.table_id,
-                    operation,
-                    "runtime_destroy",
-                    &source_debug,
                     err,
+                    FatalError::Poisoned,
+                    format!(
+                        "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy, source_error={source_debug}",
+                        self.table_id
+                    ),
                 )
                 .into(),
             );
@@ -243,12 +245,14 @@ impl CreateTableProgress {
             && cleanup_error.is_none()
         {
             cleanup_error = Some(
-                poison_create_table_rollback_with_source(
+                poison_error_source(
                     engine,
-                    self.table_id,
-                    operation,
-                    &source_debug,
                     err,
+                    FatalError::RollbackAccess,
+                    format!(
+                        "create table rollback cleanup failed: table_id={}, operation={operation}, source_error={source_debug}",
+                        self.table_id
+                    ),
                 )
                 .into(),
             );
@@ -272,19 +276,28 @@ impl CreateTableProgress {
         let source_debug = format!("{source:?}");
         if let Err(err) = self.destroy_staged_runtime(guards).await {
             self.phase = CreateTablePhase::Aborted;
-            return poison_create_table_cleanup_with_source(
+            return poison_error_source(
                 engine,
-                self.table_id,
-                operation,
-                "runtime_destroy_after_root_publish",
-                &source_debug,
                 err,
+                FatalError::Poisoned,
+                format!(
+                    "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy_after_root_publish, source_error={source_debug}",
+                    self.table_id
+                ),
             )
             .into();
         }
         self.phase = CreateTablePhase::Aborted;
-        poison_create_table_after_root_publish_with_source(engine, self.table_id, operation, source)
-            .into()
+        poison_error_source(
+            engine,
+            source,
+            FatalError::Poisoned,
+            format!(
+                "create table failed after table-root publish: table_id={}, operation={operation}",
+                self.table_id
+            ),
+        )
+        .into()
     }
 }
 
@@ -1145,9 +1158,9 @@ pub(crate) async fn create_table_for_session(
         Err(err) => {
             let err = match progress.delete_provisional_file(&engine) {
                 Ok(()) => err,
-                Err(cleanup_err) => err.attach(cleanup_err).attach(format!(
+                Err(cleanup_err) => err.attach(cleanup_err.attach(format!(
                     "create table provisional-file cleanup failed: table_id={table_id}"
-                )),
+                ))),
             };
             progress.phase = CreateTablePhase::Aborted;
             return Err(err.into());
@@ -1237,7 +1250,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         .await
         .attach_with(|| format!("operation=drop_table, table_id={table_id}"))?;
     let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
-    engine.trx_sys.ensure_runtime_healthy()?;
+    engine.poisoner.ensure_healthy()?;
 
     let mut trx = session.begin_trx().attach("operation=drop_table")?;
 
@@ -1259,11 +1272,13 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         // statement-rollback failure. In either case the drop gate has been
         // crossed, so preserve the poison outcome below.
         let _ = trx.rollback().await;
-        return Err(poison_drop_table_after_gate_with_source(
+        return Err(poison_error_source(
             &engine,
-            table_id,
-            "catalog_cascade",
             err,
+            FatalError::Poisoned,
+            format!(
+                "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"
+            ),
         )
         .into());
     }
@@ -1271,9 +1286,15 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     let drop_cts = match trx.commit().await {
         Ok(drop_cts) => drop_cts,
         Err(err) => {
-            return Err(
-                poison_drop_table_after_gate_with_source(&engine, table_id, "commit", err).into(),
-            );
+            return Err(poison_error_source(
+                &engine,
+                err,
+                FatalError::Poisoned,
+                format!(
+                    "drop table failed after lifecycle gate: table_id={table_id}, operation=commit"
+                ),
+            )
+            .into());
         }
     };
 
@@ -1585,60 +1606,6 @@ fn finish_drop_table_runtime_retention(
 }
 
 #[inline]
-fn poison_create_table_after_root_publish_with_source(
-    engine: &EngineRef,
-    table_id: TableID,
-    operation: &'static str,
-    source: Error,
-) -> Report<FatalError> {
-    let poison = engine.trx_sys.poison_engine(FatalError::Poisoned);
-    source
-        .into_report()
-        .change_context(*poison.current_context())
-        // This boundary already owns a failed report; `Report` has no lazy attachment API.
-        .attach(format!(
-            "create table failed after table-root publish: table_id={table_id}, operation={operation}"
-        ))
-}
-
-#[inline]
-fn poison_create_table_rollback_with_source(
-    engine: &EngineRef,
-    table_id: TableID,
-    operation: &'static str,
-    source_debug: &str,
-    rollback_err: Error,
-) -> Report<FatalError> {
-    let poison = engine.trx_sys.poison_engine(FatalError::RollbackAccess);
-    rollback_err
-        .into_report()
-        .change_context(*poison.current_context())
-        // This boundary already owns a failed report; `Report` has no lazy attachment API.
-        .attach(format!(
-            "create table rollback cleanup failed: table_id={table_id}, operation={operation}, source_error={source_debug}"
-        ))
-}
-
-#[inline]
-fn poison_create_table_cleanup_with_source(
-    engine: &EngineRef,
-    table_id: TableID,
-    operation: &'static str,
-    cleanup_operation: &'static str,
-    source_debug: &str,
-    cleanup_err: Error,
-) -> Report<FatalError> {
-    let poison = engine.trx_sys.poison_engine(FatalError::Poisoned);
-    cleanup_err
-        .into_report()
-        .change_context(*poison.current_context())
-        // This boundary already owns a failed report; `Report` has no lazy attachment API.
-        .attach(format!(
-            "create table cleanup failed: table_id={table_id}, operation={operation}, cleanup_operation={cleanup_operation}, source_error={source_debug}"
-        ))
-}
-
-#[inline]
 fn poison_drop_table_after_gate(
     engine: &EngineRef,
     table_id: TableID,
@@ -1648,29 +1615,30 @@ fn poison_drop_table_after_gate(
     // is closed and the operation cannot be safely retried as an ordinary DDL
     // failure. Poison admission so future work sees the fatal state; explicit
     // engine shutdown remains responsible for stopping background workers.
-    engine
-        .trx_sys
-        .poison_engine(FatalError::Poisoned)
-        .attach(format!(
-            "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
-        ))
+    let report = Report::new(FatalError::Poisoned).attach(format!(
+        "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
+    ));
+    obs::error!(
+        "event=engine_poison component=catalog_table action=poison result=error error={:?}",
+        report
+    );
+    engine.poisoner.poison(report).into_report()
 }
 
+/// Fatalizes an already public source while retaining completion evidence.
 #[inline]
-fn poison_drop_table_after_gate_with_source(
+fn poison_error_source(
     engine: &EngineRef,
-    table_id: TableID,
-    operation: &'static str,
     source: Error,
+    reason: FatalError,
+    message: String,
 ) -> Report<FatalError> {
-    let poison = poison_drop_table_after_gate(engine, table_id, operation);
-    source
-        .into_report()
-        .change_context(*poison.current_context())
-        // This boundary already owns a failed report; `Report` has no lazy attachment API.
-        .attach(format!(
-            "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
-        ))
+    let report = source.into_fatal_report(reason).attach(message);
+    obs::error!(
+        "event=engine_poison component=catalog_table action=poison result=error error={:?}",
+        report
+    );
+    engine.poisoner.poison(report).into_report()
 }
 
 #[inline]
@@ -1728,8 +1696,8 @@ mod tests {
         IndexSpec, TableSpec,
     };
     use crate::error::{
-        CompletionErrorKind, ConfigError, Error, ErrorKind, FatalError, InternalError,
-        OperationError, RuntimeError,
+        ConfigError, Error, ErrorKind, FatalError, InternalError, IoError, OperationError,
+        RuntimeError,
     };
     use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
@@ -1778,7 +1746,9 @@ mod tests {
         if CREATE_TABLE_FAILURE.with(|slot| slot.get())
             == Some(CreateTableTestFailure::PoisonBeforeCatalogCommit)
         {
-            let _ = engine.trx_sys.poison_engine(FatalError::Poisoned);
+            let _ = engine
+                .poisoner
+                .poison(Report::new(FatalError::Poisoned).attach("forced create-table poison"));
         }
     }
 
@@ -2576,10 +2546,7 @@ mod tests {
                 err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::FileRootAccess)
             );
-            assert!(matches!(
-                err.report().downcast_ref::<CompletionErrorKind>(),
-                Some(CompletionErrorKind::Io(_))
-            ));
+            assert!(err.report().downcast_ref::<IoError>().is_some());
             let report = format!("{err:?}");
             assert!(report.contains("file_kind=table_file"), "{report}");
             assert!(report.contains("phase=write_meta_block"), "{report}");
@@ -2666,7 +2633,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
@@ -3176,7 +3143,7 @@ mod tests {
                 TableTerminal::Dropping
             );
             assert!(!session.in_trx().unwrap());
-            assert!(engine.inner().trx_sys.poison_error().is_none());
+            assert!(engine.inner().poisoner.poison_error().is_none());
         });
     }
 
@@ -3264,7 +3231,7 @@ mod tests {
                 TableTerminal::Live
             );
             assert!(!drop_session.in_trx().unwrap());
-            assert!(engine.inner().trx_sys.poison_error().is_none());
+            assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(engine.catalog().get_table(table_id).await.is_some());
         });
     }
@@ -3474,7 +3441,7 @@ mod tests {
             drop(drop_fut);
             let poison = engine
                 .inner()
-                .trx_sys
+                .poisoner
                 .poison_error()
                 .expect("abandoned terminal drop should poison storage");
             assert_eq!(*poison.current_context(), FatalError::Poisoned);
@@ -3846,7 +3813,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
@@ -3959,8 +3926,8 @@ mod tests {
                 "{report}"
             );
             assert_eq!(
-                err.report().downcast_ref::<CompletionErrorKind>().copied(),
-                Some(CompletionErrorKind::Fatal(FatalError::RedoWrite)),
+                err.report().downcast_ref::<IoError>().map(|_| ()),
+                Some(()),
                 "{report}"
             );
             assert!(
@@ -3969,11 +3936,11 @@ mod tests {
             );
             assert!(report.contains("operation=commit"), "{report}");
             assert!(report.contains("wait for redo group commit"), "{report}");
-            assert!(report.contains("propagate from other threads"), "{report}");
+            assert!(!report.contains("propagate from other threads"), "{report}");
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
@@ -4010,7 +3977,7 @@ mod tests {
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)

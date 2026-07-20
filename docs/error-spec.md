@@ -1,7 +1,7 @@
 # Error Handling Specification
 
 Status: Draft  
-Current implementation snapshot: 2026-07-18
+Current implementation snapshot: 2026-07-20
 
 ## Purpose
 
@@ -79,7 +79,7 @@ is a genuine mixed-domain seam.
 | Configuration | `ConfigResult<T>` | Invalid startup, static configuration, paths, or durable layout | `conf`, engine/bootstrap, file setup, log configuration |
 | Operation | `OperationResult<T>` | A valid request cannot complete in the current logical state | `lock`, `catalog`, table DML and operation orchestration |
 | Resource | `ResourceResult<T>` | Memory, buffer, file, or other capacity exhaustion | `buffer`, file allocation, indexes, log, transaction runtime |
-| IO | `Report<IoError>` and `BackendResult<T>` | OS, backend, short-IO, or transport failures | `io`, `file`, `buffer`, `log`, recovery streams |
+| IO | `IoResult<T>`; backend progress uses `BackendResult<T>` until a reporting boundary | OS, backend, short-IO, or transport failures | `io`, `file`, `buffer`, `log`, recovery streams |
 | Data integrity | `DataIntegrityResult<T>` | Invalid or corrupted persisted bytes and recovery invariants | `serde`, `value`, `file`, `log`, `lwc`, persisted indexes, catalog/table recovery |
 | Lifecycle | `LifecycleResult<T>` | Shutdown, admission closure, unavailable runtime state, or another clean lifecycle rejection | `engine`, `session`, buffer/log lifecycle, transaction attachment |
 | Runtime | `RuntimeResult<T>` | Recoverable failure of an engine-owned internal operation or runtime-infrastructure phase | `thread`, component construction, recovery and transaction startup |
@@ -94,7 +94,8 @@ counts, or operation names into the enum shape.
 ### Caller-neutral and transport domains
 
 Some producers cannot choose a main storage domain without knowing how their
-result will be consumed. They return a local, caller-neutral report instead:
+result will be consumed. They return a local, caller-neutral report or concrete
+failure instead:
 
 - `LayoutResult<T>` carries `LayoutError`. A consumer decides whether a layout
   mismatch means invalid persisted data, invalid configuration, or an internal
@@ -102,19 +103,45 @@ result will be consumed. They return a local, caller-neutral report instead:
 - `DmlValidationResult<T>` carries `DmlValidationError`. Foreground DML maps it
   to `OperationError::InvalidDmlInput`; recovery maps it to
   `DataIntegrityError::InvalidPayload`.
-- `BackendResult<T>` carries `IoError` while backend progress is still inside
-  the IO domain.
+- `BackendResult<T> = Result<T, BackendError>` is private to the IO subsystem.
+  Backend setup remains `IoResult<T>`, but runtime submit, wait, and bounded
+  retry paths carry a cloneable concrete `BackendError` without allocating an
+  `error-stack` report. The completion, Fatal, or public policy owner converts
+  it to `Report<IoError>` and retains the exact `BackendError` as an attachment.
+  Normal per-operation completion payloads remain `StdIoResult<T>` because
+  they describe the submitted operation rather than backend progress.
 
 Cross-thread completion is a separate transport boundary:
 
 ```rust
 pub(crate) type CompletionResult<T> =
-    std::result::Result<T, Report<CompletionErrorKind>>;
+    std::result::Result<T, CompletionErrorBridge>;
 ```
 
-`CompletionErrorKind` records the transported domain and preserves structured
-IO/backend context. It is converted to public `ErrorKind` only when the
-completion is consumed at a storage boundary.
+`CompletionErrorBridge` is a cloneable, Arc-backed transport for one canonical
+typed report and a checked private replay plan. A closed crate-private
+conversion registry permits owned IO, Resource, DataIntegrity, Lifecycle,
+Fatal, and Internal reports. Completion fan-out clones only the bridge; a
+final owner lazily calls `replace_context` to reconstruct an independent report
+containing the original physical domain frames and registered attachments under
+its caller-owned context. The bridge is never a report frame and exposes no raw
+bridge-to-report conversion. Public classification is selected from the nearest
+real domain frame in the replay plan only when the completion is consumed at a
+storage boundary.
+
+Already-Fatal failures shared by redo, failed-precommit cleanup, and engine
+poison use `SharedFatalError(CompletionErrorBridge)`. Only
+`Report<FatalError>` can construct this crate-private wrapper. Its consuming
+`into_report` requires the replay to end in the Fatal builder variant and
+returns that exact report without adding a duplicate Fatal context. It unwraps
+to `CompletionErrorBridge` only when a generic completion cell must carry the
+failure. `EnginePoisoner` stores the first wrapper privately and returns each
+caller's local wrapper directly; no publication pair is exposed. Poison
+publication accepts only a complete `Report<FatalError>` or
+`SharedFatalError`. `EnginePoisoner` neither adds diagnostic attachments nor
+logs: the policy owner completes and logs the report under its actual component
+before publishing it. Components access `EnginePoisoner` directly instead of
+delegating poison state through `TransactionSystem`.
 
 `Validation<T>` is not an error result. It represents expected optimistic
 valid/invalid control flow and must not be converted into an error merely to
@@ -325,7 +352,7 @@ pub(crate) fn acquire_admission(&self) -> LifecycleResult<EngineAdmission<'_>> {
         .lifecycle
         .admit()
         .attach_with(|| "phase=acquire_engine_lifecycle_admission")?;
-    self.engine_poisoner
+    self.poisoner
         .ensure_healthy()
         .change_context(LifecycleError::RuntimeUnavailable)
         .attach_with(|| "phase=check_engine_health")?;
@@ -383,11 +410,13 @@ cross-domain policy, or is intended to be called below the statement boundary.
 
 ### 6. Preserve structured completion errors
 
-Producers crossing an async or thread handoff convert typed reports directly
-to `CompletionErrorKind`. Preserve domain frames and structured backend
-attachments. Use the generic `CompletionErrorKind::report_error(Error, ...)`
-path only for producers that have already and legitimately converged multiple
-domains.
+Producers crossing an async or thread handoff finish constructing their owned
+typed report, including producer-stable diagnostics, and capture it once with
+`CompletionErrorBridge::capture`. Intermediate completion forwarders pass the
+bridge unchanged: they do not reconstruct, decorate, or recapture it. The typed
+or public policy owner consumes it with `replace_context` after the handoff,
+installing its caller-owned context during reconstruction. Preserve real domain
+frames and exact structured backend attachments throughout this path.
 
 ### 7. Keep one canonical helper API
 
@@ -452,9 +481,9 @@ one of its functions.
 `LayoutResult`, `DmlValidationResult`, `BackendResult`, `CompletionResult`,
 `Validation`, `IndexInsert`, `DeletionError`, and checkpoint or freeze outcomes
 are not automatically main storage domains. They respectively model
-caller-neutral failures, subsystem-local transport, optimistic control flow,
-or expected operation outcomes. Their semantic consumer chooses a main domain
-only when an error interpretation is required.
+caller-neutral failures, subsystem-local concrete failure or transport,
+optimistic control flow, or expected operation outcomes. Their semantic
+consumer chooses a main domain only when an error interpretation is required.
 
 ### Runtime domain
 
@@ -521,10 +550,11 @@ relevant block or superblock slot. The direct fsync helper remains
 Completion-typed because it only transports the background worker outcome; the
 root-publication owner adds Runtime context after awaiting it.
 Durability coordinators that deliberately poison the engine after a root-write
-or fsync transport failure inspect the retained `CompletionErrorKind` through
-`Error::report()`; they do not infer the leaf failure from the public Runtime
-classification. This preserves the existing Fatal policy for IO and send
-failure without treating validation, allocation, or invariant failures as IO.
+or fsync transport failure inspect the retained physical `IoError` frame
+through `Error::report()`; they do not infer the leaf failure from the public
+Runtime classification. This preserves the existing Fatal policy for IO and
+send failure without treating validation, allocation, or invariant failures as
+IO.
 
 Redo file-family discovery is an engine-owned Runtime operation because it
 combines directory IO with validation of durable filename and sequence state.
@@ -532,11 +562,12 @@ combines directory IO with validation of durable filename and sequence state.
 with `RedoLogDiscovery`, retaining `IoError` or the specific
 DataIntegrity filename, duplicate-sequence, or sequence-gap report beneath it.
 
-`CompletionErrorKind::Runtime` does not exist. Buffer workers transport their
-native IO, DataIntegrity, Lifecycle, Resource, Fatal, or Internal report; the
-waiting buffer-access owner adds `BufferPageAccess` only after completion
-delivery. Completion adapters expose no Runtime input, so a Runtime report
-cannot be silently transported as Internal.
+`RuntimeError` is not a permitted completion capture root. Buffer workers
+capture their native IO, DataIntegrity, Lifecycle, Resource, Fatal, or Internal
+report; the waiting buffer-access owner calls
+`replace_context(RuntimeError::BufferPageAccess)` only after completion
+delivery. The crate-private capture boundary also excludes public `ErrorKind`
+and the bridge itself.
 
 Runtime may later adopt variants currently classified as `InternalError`, but
 only after the owning module proves that the failure represents a recoverable
@@ -569,8 +600,8 @@ preselect variants for migration.
 | `conf` | Config for supplied settings, path policy, and durable-marker compatibility; IO for directory creation, marker serialization/persistence, and OS access. Marker-read IO remains retained beneath its Config validation context. | Keep reusable bootstrap phases Config- or IO-typed and converge only in public engine construction. |
 | `component`: registry and shelf | Fixed-topology violations are assertions, not recoverable Internal errors. Duplicate registration or provision, missing required dependency or provision, leftover shelf state, and a missing builder registry indicate construction bugs. | Keep registration order, typed supplier edges, assertion diagnostics, and lifecycle documentation synchronized. |
 | `component`: `Component::build` | `Component::Error` preserves each implementation's narrowest responsible build domain: infallible components use `Infallible`, single-domain builders retain typed reports, and an engine-owned cross-domain operation adds its specific Runtime context. Engine construction is the public convergence boundary across component types. | Keep `RegistryBuilder::build<C>` generic over `C::Error`; do not force the union of all component failures onto every implementation or flatten an operation-owned report into crate `Error` before engine convergence. |
-| `engine_poison` | Fatal producer. A later admission check may stack Lifecycle over the retained Fatal source. | Keep poison publication separate from the operation that originally failed. |
-| `io` | IO through central `IoResult`; `IOBackend::setup` owns defensive depth validation plus kernel initialization, while `CompletionResult` is cross-thread transport only. Static configuration validation may still reject invalid configured depths as Config before setup. | Preserve IO `InvalidInput` for direct backend depth rejection, native kernel setup errors, and structured backend diagnostics. |
+| `poison` | Silent first-wins Fatal publisher and shared engine-health state. A later admission check may stack Lifecycle over the retained Fatal source. | Accept only complete Fatal reports/wrappers, store the first `SharedFatalError` privately, return each caller's local failure directly, and leave attachments plus logging to the actual policy owner. Components access it directly rather than through a transaction-system facade. |
+| `io` | `Backend::setup` uses central `IoResult` for defensive depth validation and kernel initialization. Runtime submit, wait, and retry progress use `BackendResult<T> = Result<T, BackendError>` until a completion, Fatal, or public reporting boundary; `CompletionResult` is cross-thread transport only. Static configuration validation may still reject invalid configured depths as Config before setup. | Keep `BackendError` as an IO-local common record with private operation-specific detail, convert it once at the reporting boundary, preserve IO `InvalidInput` for direct setup-depth rejection, and retain native kernel setup errors and structured backend diagnostics. |
 | `file`: sparse/raw access | IO for OS filename representation and OS operations; Resource for address-space or file-capacity exhaustion. | Keep interior-NUL `NulError` beneath `IoErrorKind::InvalidFilename`, preserve typed sparse-file create/open reports through IO-only wrappers, and attach operation, path, offset, and size at their owning boundary. |
 | `file`: metadata and CoW | Runtime `FileRootAccess` for active-root loading and publication over retained Buffer access, DataIntegrity, Resource, Internal, or Completion reports; DataIntegrity for persisted metadata suppliers; Internal or assertions for trusted CoW ownership and mutable-root invariants. | Keep root forwarding Runtime-typed until a mixed/public boundary, preserve typed fsync completion transport, and distinguish persisted validation from mutation invariants. |
 | `file`: background workers | Completion for handoff. Fatal is valid only where a durability worker determines that safe continuation has been lost, retaining the IO source. Runtime covers failure to create the worker itself. | Propagate `BackgroundSpawn` during component construction and audit broad `report_error` transport. |
@@ -822,10 +853,11 @@ The following pieces already follow the intended direction:
   marker-read IO beneath `StorageLayoutMarkerRead`. Marker creation uses
   `create_new`, so `AlreadyExists` propagates as an ordinary IO error and
   aborts unpublished bootstrap.
-- `IOBackend: Sized` exposes one IO-typed `setup(io_depth)` constructor and an
+- `Backend: Sized` exposes one IO-typed `setup(io_depth)` constructor and an
   `io_depth()` capacity query. io-uring and libaio defensively reject invalid
   direct setup depths as IO `InvalidInput`, while kernel initialization retains
-  its native IO error. Configuration owners may still reject invalid configured
+  its native IO error. Runtime backend progress returns concrete
+  `BackendError`; configuration owners may still reject invalid configured
   depths as Config before calling the backend.
 - File-system and evictor components retain typed Runtime reports through
   generic component dispatch. Recovery read-ahead, transaction log, purge,
@@ -872,8 +904,10 @@ The following pieces already follow the intended direction:
 - Catalog checkpoint folding plus row, table-slot, root, and reachable-block
   validation retain DataIntegrity reports until mixed catalog storage
   orchestration. Folded-row materialization is infallible.
-- Completion paths use `CompletionErrorKind` rather than requiring `Error` to
-  be cloneable across waiters.
+- Completion paths share an Arc-backed `CompletionErrorBridge`; every waiter
+  lazily reconstructs an independent physical report under its final-owner
+  context without requiring `Error` or `Report` to be cloneable; the bridge
+  itself never appears in that report.
 - `WeakEngineRef` lifecycle upgrades, catalog live-table validation,
   `TrxInner::checked_lock_state`, and the lock provider APIs expose typed
   reports.
@@ -916,12 +950,14 @@ The following areas require separate audits after the migrated slice:
 - Other convenience constructors return public `Error` from internal invariant
   producers. Audit whether each represents an assertion, a typed Internal
   report, or a true convergence boundary.
-- The central error module has no general `IoResult<T>` alias while the backend
-  module has `BackendResult<T>`. Audit whether this distinction is intentional
-  or should be made uniform.
-- Calls to `CompletionErrorKind::report_error` must be checked to ensure their
-  producers are genuinely mixed-domain and did not collapse a typed report
-  prematurely.
+- Backend setup and runtime progress intentionally use distinct result types:
+  central `IoResult<T>` for immediate IO-domain reports and IO-local
+  `BackendResult<T>` for concrete submit/wait/retry failures. Keep conversions
+  at completion, Fatal, or public reporting boundaries rather than recreating
+  reports inside backend threads.
+- Completion producers must remain rooted in one of the explicitly permitted typed source
+  domains. A mixed public `Error` must not be collapsed and captured as a
+  completion report.
 - The remaining invariant-oriented `ActiveTransactionDiscarded`,
   `PoolGuardMissing`, and `RowPageMissing` producers encountered by this work
   retain their existing Internal-domain behavior. Their

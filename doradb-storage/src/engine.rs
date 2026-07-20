@@ -12,15 +12,15 @@ use crate::component::{
     RegistryBuilder,
 };
 use crate::conf::EngineConfig;
-use crate::engine_poison::EnginePoisoner;
 use crate::error::{LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
 use crate::lock::LockManager;
 use crate::obs;
+use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
 use crate::session::{Session, SessionRegistry};
-use crate::trx::sys::TransactionSystem;
+use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers};
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, Listener, listener};
@@ -636,7 +636,7 @@ impl WeakEngineRef {
 /// objects may retain. Owner-only teardown state lives on [`Engine`] itself.
 pub(crate) struct EngineInner {
     /// Engine-level fatal runtime poison state.
-    pub(crate) engine_poisoner: QuiescentGuard<EnginePoisoner>,
+    pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Shared catalog handle.
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
@@ -701,7 +701,7 @@ impl EngineInner {
             .lifecycle
             .admit()
             .attach_with(|| "phase=acquire_engine_lifecycle_admission")?;
-        self.engine_poisoner
+        self.poisoner
             .ensure_healthy()
             .change_context(LifecycleError::RuntimeUnavailable)
             .attach_with(|| "phase=check_engine_health")?;
@@ -818,6 +818,7 @@ impl EngineConfig {
         // owners are torn down.
         builder.build::<Catalog>(catalog_cfg).await?;
         builder.build::<TransactionSystem>(trx_cfg).await?;
+        builder.build::<TransactionSystemWorkers>(()).await?;
 
         if marker_was_present {
             if !resolved.validate_marker_if_present()? {
@@ -827,7 +828,7 @@ impl EngineConfig {
             resolved.persist_marker()?;
         }
         let registry = builder.finish();
-        let engine_poisoner = registry.dependency::<EnginePoisoner>();
+        let poisoner = registry.dependency::<EnginePoisoner>();
         let catalog = registry.dependency::<Catalog>();
         let trx_sys = registry.dependency::<TransactionSystem>();
         let meta_pool = registry.dependency::<MetaPool>();
@@ -837,7 +838,7 @@ impl EngineConfig {
         let disk_pool = registry.dependency::<DiskPool>();
         let lock_manager = registry.dependency::<LockManager>();
         let engine_inner = EngineInner {
-            engine_poisoner,
+            poisoner,
             catalog,
             trx_sys,
             meta_pool,
@@ -865,8 +866,8 @@ mod tests {
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
-        CompletionErrorKind, ConfigError, Error, ErrorKind, FatalError, LifecycleError,
-        OperationError, ResourceError, RuntimeError,
+        ConfigError, Error, ErrorKind, FatalError, LifecycleError, OperationError, ResourceError,
+        RuntimeError,
     };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::{TableID, TrxID};
@@ -1054,8 +1055,8 @@ mod tests {
         assert!(hook.failed(), "initial redo-header write was not injected");
         assert_eq!(err.kind(), ErrorKind::Fatal);
         assert_eq!(
-            err.report().downcast_ref::<CompletionErrorKind>().copied(),
-            Some(CompletionErrorKind::Fatal(FatalError::RedoWrite))
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::RedoWrite)
         );
         let output = format!("{err:?}");
         assert!(
@@ -2458,7 +2459,7 @@ mod tests {
             config.validate().unwrap();
             let (trx_sys, startup) = TransactionSystem::bootstrap(
                 config,
-                engine.inner().engine_poisoner.clone(),
+                engine.inner().poisoner.clone(),
                 engine.inner().pools(),
                 engine.inner().table_fs.clone(),
                 engine.inner().catalog.clone(),

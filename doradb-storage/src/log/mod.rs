@@ -8,17 +8,17 @@ use self::prefix::{LogPrefixEntry, LogPrefixId, LogPrefixKind, LogPrefixTracker}
 pub(crate) use self::seal::LogFileSealer;
 use crate::conf::TrxSysConfig;
 use crate::error::{
-    CompletionErrorKind, ConfigError, DataIntegrityError, DataIntegrityResult, Error, FatalError,
-    InternalError, InternalResult, IoError, IoResult, ResourceError, ResourceResult, Result,
-    RuntimeError, RuntimeResult,
+    ConfigError, DataIntegrityError, DataIntegrityResult, Error, FatalError, InternalError,
+    InternalResult, IoError, ResourceError, ResourceResult, Result, RuntimeError, RuntimeResult,
+    SharedFatalError,
 };
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
-    CompletedSubmission, Completion, DirectBuf, IOBackend, IOBackendStats, IOBackendStatsHandle,
-    IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver, SubmitAttempt,
-    SubmitRetry, attach_backend_operation_kind, backend_failure, backend_report_summary,
+    Backend, BackendError, BackendResult, BackendStats, BackendStatsHandle, CompletedSubmission,
+    Completion, DirectBuf, IOBuf, IOKind, IOSubmission, Operation, StorageBackend,
+    SubmissionDriver, SubmitAttempt, SubmitRetry,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -27,6 +27,7 @@ use crate::log::format::{
 };
 use crate::map::FastHashMap;
 use crate::obs;
+use crate::poison::EnginePoisoner;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, GroupCommit, MutexGroupCommit,
@@ -501,13 +502,10 @@ impl LogWriteSubmission {
     }
 
     #[inline]
-    fn fail_unsubmitted_header(mut self, reason: FatalError) {
+    fn fail_unsubmitted_header(mut self, failure: SharedFatalError) {
         let _ = self.operation.take_buf();
         if let LogWriteKind::Header { completion } = self.kind {
-            completion.complete(Err(CompletionErrorKind::from_fatal(
-                Report::new(reason),
-                "redo header write was not submitted",
-            )));
+            completion.complete(Err(failure.into_completion_bridge()));
         }
     }
 }
@@ -532,21 +530,20 @@ struct LogWriteCompletion {
     owner: Option<LogRequestOwner>,
     kind: LogWriteKind,
     buf: Option<DirectBuf>,
-    poison: Option<FatalError>,
-    failure: Option<Report<FatalError>>,
+    failure: Option<SharedFatalError>,
 }
 
 /// Driver wrapper for redo log write submissions.
 pub(crate) struct LogWriteDriver<B = StorageBackend>
 where
-    B: IOBackend,
+    B: Backend,
 {
     driver: SubmissionDriver<LogWriteSubmission, B>,
 }
 
 impl<B> LogWriteDriver<B>
 where
-    B: IOBackend,
+    B: Backend,
 {
     #[inline]
     fn new(backend: B) -> Self {
@@ -581,7 +578,7 @@ where
     }
 
     #[inline]
-    fn submit_ready(&mut self) -> IoResult<SubmitAttempt> {
+    fn submit_ready(&mut self) -> BackendResult<SubmitAttempt> {
         self.driver.submit_ready()
     }
 
@@ -607,12 +604,12 @@ where
     }
 
     #[inline]
-    fn backoff_submit_retry_or_progress_error(&mut self, retry: SubmitRetry) -> IoResult<()> {
+    fn backoff_submit_retry_or_progress_error(&mut self, retry: SubmitRetry) -> BackendResult<()> {
         self.driver.backoff_submit_retry_or_progress_error(retry)
     }
 
     #[inline]
-    fn wait_at_least_one(&mut self) -> IoResult<LogWriteCompletion> {
+    fn wait_at_least_one(&mut self) -> BackendResult<LogWriteCompletion> {
         self.driver
             .wait_at_least_one()
             .map(log_write_completion_from_completed)
@@ -649,7 +646,7 @@ pub(crate) struct RedoLog {
     /// Backend for redo writes, taken exactly once by the log thread.
     log_write_backend: CachePadded<Mutex<Option<StorageBackend>>>,
     /// Backend-owned submit/wait statistics for redo writes.
-    io_backend_stats: IOBackendStatsHandle,
+    io_backend_stats: BackendStatsHandle,
     /// Fixed byte size of every redo data-block write.
     pub(crate) log_block_size: usize,
     /// Log file prefix for the single redo file family.
@@ -718,10 +715,13 @@ impl RedoLog {
         let log = if let Some(redo_bin) = trx.take_log() {
             let log_group = match self.new_log_group(redo_bin) {
                 Ok(log_group) => log_group,
-                Err(_) => {
+                Err(err) => {
                     return Err(EnqueuePrecommitError {
                         trx: Box::new(trx),
-                        reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                        reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
+                            err.change_context(FatalError::RedoWrite)
+                                .attach("build redo log block group"),
+                        )),
                         close_admission: true,
                     });
                 }
@@ -729,7 +729,11 @@ impl RedoLog {
             let Some(log_file) = group_commit_g.log_file.as_ref() else {
                 return Err(EnqueuePrecommitError {
                     trx: Box::new(trx),
-                    reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                    reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
+                        Report::new(InternalError::CurrentRedoLogFileMissing)
+                            .attach("enqueue redo group requires current log file")
+                            .change_context(FatalError::RedoWrite),
+                    )),
                     close_admission: true,
                 });
             };
@@ -745,10 +749,14 @@ impl RedoLog {
                     if *err.current_context() == ResourceError::StorageFileCapacityExceeded =>
                 {
                     // Rotate log file and try again.
-                    if self.rotate_log_file(group_commit_g).is_err() {
+                    if let Err(err) = self.rotate_log_file(group_commit_g) {
                         return Err(EnqueuePrecommitError {
                             trx: Box::new(trx),
-                            reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                            reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
+                                err.into_report()
+                                    .change_context(FatalError::RedoWrite)
+                                    .attach("rotate redo log file for group allocation"),
+                            )),
                             close_admission: true,
                         });
                     }
@@ -756,7 +764,11 @@ impl RedoLog {
                     let Some(new_log_file) = group_commit_g.log_file.as_ref() else {
                         return Err(EnqueuePrecommitError {
                             trx: Box::new(trx),
-                            reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                            reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
+                                Report::new(InternalError::CurrentRedoLogFileMissing)
+                                    .attach("redo rotation did not install a current log file")
+                                    .change_context(FatalError::RedoWrite),
+                            )),
                             close_admission: true,
                         });
                     };
@@ -779,19 +791,25 @@ impl RedoLog {
                                 close_admission: false,
                             });
                         }
-                        Err(_) => {
+                        Err(err) => {
                             return Err(EnqueuePrecommitError {
                                 trx: Box::new(trx),
-                                reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                                reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
+                                    err.change_context(FatalError::RedoWrite)
+                                        .attach("allocate rotated redo log group"),
+                                )),
                                 close_admission: true,
                             });
                         }
                     }
                 }
-                Err(_) => {
+                Err(err) => {
                     return Err(EnqueuePrecommitError {
                         trx: Box::new(trx),
-                        reason: FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+                        reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
+                            err.change_context(FatalError::RedoWrite)
+                                .attach("allocate redo log group"),
+                        )),
                         close_admission: true,
                     });
                 }
@@ -861,7 +879,7 @@ impl RedoLog {
 
     /// Return a snapshot of redo write backend statistics.
     #[inline]
-    pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
+    pub(crate) fn io_backend_stats(&self) -> BackendStats {
         self.io_backend_stats.snapshot()
     }
 }
@@ -943,7 +961,7 @@ impl SyncGroup {
             self.failure_reason.get_or_insert(reason);
             return;
         }
-        self.failure_reason.get_or_insert(reason);
+        self.failure_reason.get_or_insert_with(|| reason.clone());
         let trx_list = mem::take(&mut self.trx_list);
         let completion = Arc::clone(&self.completion);
         trx_sys.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
@@ -1026,9 +1044,10 @@ impl FromStr for LogSync {
 /// Processes redo write and sync work for commit groups.
 pub(crate) struct RedoLogWriter<'a, B = StorageBackend>
 where
-    B: IOBackend,
+    B: Backend,
 {
     trx_sys: &'a TransactionSystem,
+    poisoner: &'a EnginePoisoner,
     write_driver: &'a mut LogWriteDriver<B>,
     log_block_size: usize,
     prefix: LogPrefixTracker,
@@ -1039,17 +1058,19 @@ where
 
 impl<'a, B> RedoLogWriter<'a, B>
 where
-    B: IOBackend,
+    B: Backend,
 {
     /// Create a redo log writer bound to a transaction system and write driver.
     #[inline]
     pub(crate) fn new(
         trx_sys: &'a TransactionSystem,
+        poisoner: &'a EnginePoisoner,
         config: &TrxSysConfig,
         write_driver: &'a mut LogWriteDriver<B>,
     ) -> Self {
         RedoLogWriter {
             trx_sys,
+            poisoner,
             write_driver,
             log_block_size: config.log_block_size.as_u64() as usize,
             prefix: LogPrefixTracker::new(),
@@ -1110,16 +1131,15 @@ where
 
     /// Fail all pending redo work after a fatal storage error.
     #[inline]
-    pub(crate) fn fail_pending(&mut self, _sealer: &mut LogFileSealer, err: Report<FatalError>) {
+    pub(crate) fn fail_pending(&mut self, _sealer: &mut LogFileSealer, failure: SharedFatalError) {
         self.shutdown = true;
-        let fatal = *err.current_context();
-        let reason = FailedPrecommitReason::Fatal(fatal);
-        self.fail_prefix_entries_with_report(fatal, Some(err));
+        let reason = FailedPrecommitReason::Fatal(failure.clone());
+        self.fail_prefix_entries(failure.clone());
 
         let mut queued = Vec::new();
         {
             let mut group_commit_g = self.trx_sys.redo_log.group_commit.lock();
-            group_commit_g.close(reason);
+            group_commit_g.close(reason.clone());
             while let Some(commit) = group_commit_g.queue.pop_front() {
                 match commit {
                     Commit::Group(group) => queued.push(group),
@@ -1127,7 +1147,7 @@ where
                         ended_log_file,
                         header_write,
                     } => {
-                        header_write.fail_unsubmitted_header(fatal);
+                        header_write.fail_unsubmitted_header(failure.clone());
                         drop(ended_log_file);
                     }
                     Commit::Shutdown => {}
@@ -1135,23 +1155,13 @@ where
             }
         }
         for group in queued {
-            self.fail_queued_group(group, reason);
+            self.fail_queued_group(group, reason.clone());
         }
     }
 
-    #[cfg(test)]
     #[inline]
-    fn fail_prefix_entries(&mut self, fatal: FatalError) {
-        self.fail_prefix_entries_with_report(fatal, None);
-    }
-
-    #[inline]
-    fn fail_prefix_entries_with_report(
-        &mut self,
-        fatal: FatalError,
-        mut source_report: Option<Report<FatalError>>,
-    ) {
-        let reason = FailedPrecommitReason::Fatal(fatal);
+    fn fail_prefix_entries(&mut self, fatal_error: SharedFatalError) {
+        let reason = FailedPrecommitReason::Fatal(fatal_error.clone());
         let mut recycle = Vec::new();
         for entry in &mut self.prefix.entries {
             match &mut entry.kind {
@@ -1159,7 +1169,6 @@ where
                     write,
                     ready,
                     failure,
-                    failure_report,
                     ..
                 } => {
                     if let Some(mut submission) = write.take() {
@@ -1167,16 +1176,13 @@ where
                         *ready = true;
                     }
                     if !*ready || failure.is_none() {
-                        *failure = Some(fatal);
-                    }
-                    if failure_report.is_none() {
-                        *failure_report = source_report.take();
+                        *failure = Some(fatal_error.clone());
                     }
                 }
                 LogPrefixKind::Group { group } => {
-                    group.fail_waiters(self.trx_sys, reason);
+                    group.fail_waiters(self.trx_sys, reason.clone());
                     recycle.extend(group.drain_buffers());
-                    group.failure_reason.get_or_insert(reason);
+                    group.failure_reason.get_or_insert_with(|| reason.clone());
                 }
                 LogPrefixKind::Sync {
                     ready_prefix,
@@ -1188,9 +1194,14 @@ where
                     if sync.take().is_some() {
                         *ready = true;
                     }
-                    fail_ready_prefix_waiters(self.trx_sys, ready_prefix, reason, &mut recycle);
+                    fail_ready_prefix_waiters(
+                        self.trx_sys,
+                        ready_prefix,
+                        reason.clone(),
+                        &mut recycle,
+                    );
                     if !*ready || failure.is_none() {
-                        *failure = Some(fatal);
+                        *failure = Some(fatal_error.clone());
                     }
                 }
                 LogPrefixKind::Seal {
@@ -1211,7 +1222,7 @@ where
                         *ready = true;
                     }
                     if !*ready || failure.is_none() {
-                        *failure = Some(fatal);
+                        *failure = Some(fatal_error.clone());
                     }
                 }
             }
@@ -1458,11 +1469,15 @@ where
                 *write = Some(submission);
             }
             Err(report) => {
-                let reason = *report.current_context();
-                *failure = Some(reason);
+                let report = report.attach("prepare redo file seal failed");
+                obs::error!(
+                    "event=engine_poison component=redo action=poison result=error error={:?}",
+                    report
+                );
+                let error = self.poisoner.poison(report);
+                *failure = Some(error.clone());
                 *ready = true;
-                let _ = self.trx_sys.poison_engine(reason);
-                self.fail_pending(sealer, report);
+                self.fail_pending(sealer, error);
             }
         }
     }
@@ -1471,18 +1486,18 @@ where
     fn advance_ready_group_prefix(&mut self, sealer: &mut LogFileSealer) {
         let mut ready = self.prefix.drain_ready_group_prefix();
 
-        if let Some(reason) = ready.failure_reason {
+        if let Some(reason) = ready.failure_reason.clone() {
             // Redo is sequential: the first failed group turns every later
             // queued group into cleanup-only work even if its own write is
             // already complete.
             for entry in &mut self.prefix.entries {
                 if let LogPrefixKind::Group { group } = &mut entry.kind {
-                    group.fail_waiters(self.trx_sys, reason);
-                    group.failure_reason.get_or_insert(reason);
+                    group.fail_waiters(self.trx_sys, reason.clone());
+                    group.failure_reason.get_or_insert_with(|| reason.clone());
                 }
             }
             for sync_group in &mut ready.failed {
-                self.fail_sync_group(sync_group, reason);
+                self.fail_sync_group(sync_group, reason.clone());
             }
         }
 
@@ -1517,8 +1532,8 @@ where
         };
         debug_assert!(sync.is_none());
         debug_assert!(ready);
-        if let Some(reason) = failure {
-            let failed_reason = FailedPrecommitReason::Fatal(reason);
+        if let Some(error) = failure {
+            let failed_reason = FailedPrecommitReason::Fatal(error);
             self.fail_ready_prefix_waiters(&mut ready_prefix, failed_reason);
             return;
         }
@@ -1723,20 +1738,14 @@ where
         &mut self,
         sealer: &mut LogFileSealer,
         reason: FatalError,
-        err: Report<IoError>,
+        err: BackendError,
     ) {
-        let backend = backend_failure(&err);
-        let backend_name = backend.map_or("unknown", |failure| failure.backend());
-        let phase = backend
-            .map(|failure| failure.phase().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let raw_errno = backend.and_then(|failure| failure.raw_errno());
-        let error = backend_report_summary(&err);
+        let error = err.summary();
         obs::error!(
-            "event=redo_backend_progress_failure component=redo backend={} phase={} errno={:?} action=poison result=error error={}",
-            backend_name,
-            phase,
-            raw_errno,
+            "event=redo_backend_progress_failure component=redo backend={} op={} errno={:?} action=poison result=error error={}",
+            err.backend(),
+            err.op(),
+            err.raw_errno(),
             error
         );
         let pending = self.write_driver.pending_len();
@@ -1750,29 +1759,29 @@ where
                 retained
             );
         }
-        let _ = self.trx_sys.poison_engine_with_context(
-            reason,
-            "redo",
-            format!("backend progress failure: {error}"),
-        );
-        self.fail_pending(
-            sealer,
-            err.change_context(reason)
-                .attach("redo backend progress failure"),
-        );
+        let report = err
+            .into_report()
+            .change_context(reason)
+            .attach(format!("redo backend progress failure: {error}"));
+        let error = self.poisoner.poison(report);
+        self.fail_pending(sealer, error);
     }
 
     #[inline]
     fn fail_pending_if_poisoned(
         &mut self,
         sealer: &mut LogFileSealer,
-        poison: Option<FatalError>,
+        failure: Option<SharedFatalError>,
     ) -> bool {
-        let Some(reason) = poison else {
+        let Some(failure) = failure else {
             return false;
         };
-        let err = self.trx_sys.poison_engine(reason);
-        self.fail_pending(sealer, err);
+        obs::error!(
+            "event=engine_poison component=redo action=poison result=error error={:?}",
+            failure
+        );
+        let error = self.poisoner.poison_shared(failure);
+        self.fail_pending(sealer, error);
         true
     }
 
@@ -1786,18 +1795,14 @@ where
             owner,
             kind,
             buf,
-            poison,
             failure,
         } = completion;
         match kind {
             LogWriteKind::Header { completion } => {
                 drop(buf.expect("redo header write completion must return a buffer"));
                 let Some(owner) = owner else {
-                    if let Some(report) = failure {
-                        completion.complete(Err(CompletionErrorKind::from_fatal(
-                            report,
-                            "redo header write failed",
-                        )));
+                    if let Some(error) = failure {
+                        completion.complete(Err(error.into_completion_bridge()));
                     } else {
                         completion.complete(Ok(()));
                     }
@@ -1807,8 +1812,8 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo header request must carry a prefix entry id");
-                self.complete_header_request(prefix_id, failure);
-                if self.fail_pending_if_poisoned(sealer, poison) {
+                self.complete_header_request(prefix_id, failure.clone());
+                if self.fail_pending_if_poisoned(sealer, failure) {
                     return true;
                 }
             }
@@ -1822,9 +1827,9 @@ where
                     prefix_id,
                     owner.group_write_idx,
                     buf.expect("redo group write completion must return a buffer"),
-                    poison,
+                    failure.clone(),
                 );
-                if self.fail_pending_if_poisoned(sealer, poison) {
+                if self.fail_pending_if_poisoned(sealer, failure) {
                     return true;
                 }
             }
@@ -1835,8 +1840,8 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo sync request must carry a prefix entry id");
-                self.complete_sync_request(prefix_id, poison);
-                if self.fail_pending_if_poisoned(sealer, poison) {
+                self.complete_sync_request(prefix_id, failure.clone());
+                if self.fail_pending_if_poisoned(sealer, failure) {
                     return true;
                 }
             }
@@ -1847,8 +1852,8 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo seal write request must carry a prefix entry id");
-                let poison = self.complete_seal_write_request(prefix_id, log_file, poison);
-                if self.fail_pending_if_poisoned(sealer, poison) {
+                let failure = self.complete_seal_write_request(prefix_id, log_file, failure);
+                if self.fail_pending_if_poisoned(sealer, failure) {
                     return true;
                 }
             }
@@ -1859,8 +1864,8 @@ where
                 let prefix_id = owner
                     .prefix_id
                     .expect("redo seal sync request must carry a prefix entry id");
-                let poison = self.complete_seal_sync_request(prefix_id, log_file, poison);
-                if self.fail_pending_if_poisoned(sealer, poison) {
+                let failure = self.complete_seal_sync_request(prefix_id, log_file, failure);
+                if self.fail_pending_if_poisoned(sealer, failure) {
                     return true;
                 }
             }
@@ -1875,27 +1880,17 @@ where
     fn complete_header_request(
         &mut self,
         prefix_id: LogPrefixId,
-        report: Option<Report<FatalError>>,
+        fatal_error: Option<SharedFatalError>,
     ) {
         let entry = self
             .prefix
             .entry_mut(prefix_id)
             .expect("redo header completion must match one prefix entry");
-        let LogPrefixKind::Header {
-            ready,
-            failure,
-            failure_report,
-            ..
-        } = &mut entry.kind
-        else {
+        let LogPrefixKind::Header { ready, failure, .. } = &mut entry.kind else {
             panic!("redo header completion matched non-header prefix entry");
         };
-        let poison = report.as_ref().map(|failure| *failure.current_context());
         if failure.is_none() {
-            *failure = poison;
-        }
-        if failure_report.is_none() {
-            *failure_report = report;
+            *failure = fatal_error;
         }
         *ready = true;
     }
@@ -1906,7 +1901,7 @@ where
         prefix_id: LogPrefixId,
         group_write_idx: Option<usize>,
         buf: DirectBuf,
-        poison: Option<FatalError>,
+        failure: Option<SharedFatalError>,
     ) {
         let entry = self
             .prefix
@@ -1920,15 +1915,19 @@ where
             "redo group completion must carry a physical block index"
         );
         group.finish_request(buf);
-        if let Some(source) = poison {
+        if let Some(error) = failure {
             group
                 .failure_reason
-                .get_or_insert(FailedPrecommitReason::Fatal(source));
+                .get_or_insert(FailedPrecommitReason::Fatal(error));
         }
     }
 
     #[inline]
-    fn complete_sync_request(&mut self, prefix_id: LogPrefixId, poison: Option<FatalError>) {
+    fn complete_sync_request(
+        &mut self,
+        prefix_id: LogPrefixId,
+        fatal_error: Option<SharedFatalError>,
+    ) {
         let entry = self
             .prefix
             .entry_mut(prefix_id)
@@ -1944,7 +1943,7 @@ where
             panic!("redo sync completion matched non-sync prefix entry");
         };
         if failure.is_none() {
-            *failure = poison;
+            *failure = fatal_error;
         }
         *sync_nanos = started_at
             .take()
@@ -1957,9 +1956,8 @@ where
         &mut self,
         prefix_id: LogPrefixId,
         log_file: Box<RedoLogFile>,
-        poison: Option<FatalError>,
-    ) -> Option<FatalError> {
-        let reason = poison;
+        fatal_error: Option<SharedFatalError>,
+    ) -> Option<SharedFatalError> {
         let entry = self
             .prefix
             .entry_mut(prefix_id)
@@ -1975,16 +1973,16 @@ where
         };
         let already_failed = failure.is_some();
         if !already_failed {
-            *failure = reason;
+            failure.clone_from(&fatal_error);
         }
-        if !already_failed && reason.is_none() && self.log_sync != LogSync::None {
+        if !already_failed && fatal_error.is_none() && self.log_sync != LogSync::None {
             debug_assert!(pending_sync.is_none());
             *pending_sync = Some(LogWriteSubmission::seal_sync(*log_file, self.log_sync));
         } else {
             drop(log_file);
             *ready = true;
         }
-        reason
+        fatal_error
     }
 
     #[inline]
@@ -1992,8 +1990,8 @@ where
         &mut self,
         prefix_id: LogPrefixId,
         log_file: Box<RedoLogFile>,
-        poison: Option<FatalError>,
-    ) -> Option<FatalError> {
+        fatal_error: Option<SharedFatalError>,
+    ) -> Option<SharedFatalError> {
         drop(log_file);
         let entry = self
             .prefix
@@ -2003,10 +2001,10 @@ where
             panic!("redo seal sync completion matched non-seal prefix entry");
         };
         if failure.is_none() {
-            *failure = poison;
+            failure.clone_from(&fatal_error);
         }
         *ready = true;
-        poison
+        fatal_error
     }
 }
 
@@ -2107,7 +2105,6 @@ fn finish_header_prefix_entry(entry: LogPrefixEntry) {
     let LogPrefixKind::Header {
         completion,
         failure,
-        failure_report,
         ..
     } = entry.kind
     else {
@@ -2116,16 +2113,8 @@ fn finish_header_prefix_entry(entry: LogPrefixEntry) {
     let Some(completion) = completion else {
         return;
     };
-    if let Some(report) = failure_report {
-        completion.complete(Err(CompletionErrorKind::from_fatal(
-            report,
-            "redo header write failed",
-        )));
-    } else if let Some(reason) = failure {
-        completion.complete(Err(CompletionErrorKind::from_fatal(
-            Report::new(reason),
-            "redo header write failed",
-        )));
+    if let Some(error) = failure {
+        completion.complete(Err(error.into_completion_bridge()));
     } else {
         completion.complete(Ok(()));
     }
@@ -2176,12 +2165,23 @@ fn log_write_completion_from_completed(
         ),
         IOKind::Fsync | IOKind::Fdatasync => None,
     };
-    let (poison, failure) = redo_io_failure(kind, completed.result, expected_len);
+    let failure = redo_io_failure(kind, completed.result, expected_len).map(|report| {
+        let owner = match &submission.kind {
+            LogWriteKind::Group { group_write_idx } => {
+                format!("redo group write failed: group_write_idx={group_write_idx}")
+            }
+            LogWriteKind::Header { .. } => "redo header write failed".to_string(),
+            LogWriteKind::CommitSync => "redo commit sync failed".to_string(),
+            LogWriteKind::SealWrite { .. } => "redo seal write failed".to_string(),
+            LogWriteKind::SealSync { .. } => "redo seal sync failed".to_string(),
+            LogWriteKind::StandaloneSync => "redo standalone sync failed".to_string(),
+        };
+        SharedFatalError::capture(report.attach(owner))
+    });
     LogWriteCompletion {
         owner: submission.owner,
         kind: submission.kind,
         buf,
-        poison,
         failure,
     }
 }
@@ -2191,8 +2191,8 @@ fn redo_io_failure(
     kind: IOKind,
     result: StdIoResult<usize>,
     expected_len: usize,
-) -> (Option<FatalError>, Option<Report<FatalError>>) {
-    let failure = match kind {
+) -> Option<Report<FatalError>> {
+    match kind {
         IOKind::Read | IOKind::Write => match result {
             Ok(len) if len == expected_len => None,
             Ok(len) => Some(
@@ -2203,7 +2203,8 @@ fn redo_io_failure(
             Err(err) => Some(Report::new(IoError::from(err.kind())).attach(format!("{err}"))),
         }
         .map(|report| {
-            attach_backend_operation_kind(report, Some(kind))
+            report
+                .attach(format!("op_kind={}", kind.as_str()))
                 .change_context(FatalError::RedoWrite)
                 .attach("redo write durability failure")
         }),
@@ -2217,13 +2218,12 @@ fn redo_io_failure(
             Err(err) => Some(Report::new(IoError::from(err.kind())).attach(format!("{err}"))),
         }
         .map(|report| {
-            attach_backend_operation_kind(report, Some(kind))
+            report
+                .attach(format!("op_kind={}", kind.as_str()))
                 .change_context(FatalError::RedoSync)
                 .attach("redo sync durability failure")
         }),
-    };
-    let poison = failure.as_ref().map(|report| *report.current_context());
-    (poison, failure)
+    }
 }
 
 #[inline]
@@ -2234,11 +2234,11 @@ fn fail_ready_prefix_waiters(
     recycle: &mut Vec<DirectBuf>,
 ) {
     for sync_group in &mut ready.written {
-        sync_group.fail_waiters(trx_sys, reason);
+        sync_group.fail_waiters(trx_sys, reason.clone());
         recycle.extend(sync_group.drain_buffers());
     }
     for sync_group in &mut ready.failed {
-        sync_group.fail_waiters(trx_sys, reason);
+        sync_group.fail_waiters(trx_sys, reason.clone());
         recycle.extend(sync_group.drain_buffers());
     }
 }
@@ -2421,20 +2421,20 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
     use crate::error::{
-        CompletionErrorKind, DataIntegrityError, ErrorKind, FatalError, InternalError,
-        LifecycleError, RuntimeError,
+        DataIntegrityError, ErrorKind, FatalError, InternalError, IoError as StorageIoError,
+        IoResult, LifecycleError, RuntimeError, SharedFatalError,
     };
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
-        BackendToken, IOBackend, IOBackendErrorPhase, IOBackendFailure, IOBackendQueueState,
-        IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook, SubmittedIoCleanup,
-        install_storage_backend_test_hook,
+        Backend, BackendError, BackendResult, BackendToken, IOKind, StdIoResult, StorageBackendOp,
+        StorageBackendTestHook, SubmittedIoCleanup, install_storage_backend_test_hook,
     };
     use crate::log::format::{
         REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, parse_redo_super_block,
         slot_offset,
     };
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
+    use crate::quiescent::QuiescentGuard;
     use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner};
     use crate::session::tests::SessionTestExt;
     use crate::trx::MAX_SNAPSHOT_TS;
@@ -2603,14 +2603,12 @@ mod tests {
             owner,
             kind,
             buf,
-            poison,
             failure,
         } = write_driver.wait_at_least_one().unwrap();
         match kind {
             LogWriteKind::Header { completion } => {
                 drop(buf.expect("redo header write completion must return a buffer"));
                 assert!(owner.is_none());
-                assert_eq!(poison, None);
                 assert!(failure.is_none());
                 completion.complete(Ok(()));
             }
@@ -2864,45 +2862,50 @@ mod tests {
         );
     }
 
-    fn assert_propagated_completion_fatal<T: Debug>(res: &Result<T>, expected: FatalError) {
+    fn assert_propagated_completion_fatal<T: Debug>(
+        res: &Result<T>,
+        expected: FatalError,
+        expected_op_kind: &str,
+    ) {
         let err = match res {
             Ok(value) => panic!("expected propagated completion failure, got {value:?}"),
             Err(err) => err,
         };
         assert_eq!(
-            err.report().downcast_ref::<CompletionErrorKind>().copied(),
-            Some(CompletionErrorKind::Fatal(expected)),
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(expected),
+            "{err:?}"
+        );
+        assert!(
+            err.report().downcast_ref::<StorageIoError>().is_some(),
             "{err:?}"
         );
         let report = format!("{err:?}");
-        assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(report.contains(expected_op_kind), "{report}");
         assert!(report.contains("wait for redo group commit"), "{report}");
+        assert!(!report.contains("propagate from other threads"), "{report}");
     }
 
     #[test]
     fn test_redo_sync_completion_accepts_only_zero_success_result() {
-        let (poison, failure) = redo_io_failure(IOKind::Fsync, Ok(0), 0);
-        assert_eq!(poison, None);
-        assert!(failure.is_none());
-        let (poison, failure) = redo_io_failure(IOKind::Fdatasync, Ok(0), 0);
-        assert_eq!(poison, None);
-        assert!(failure.is_none());
+        assert!(redo_io_failure(IOKind::Fsync, Ok(0), 0).is_none());
+        assert!(redo_io_failure(IOKind::Fdatasync, Ok(0), 0).is_none());
 
-        let (poison, failure) = redo_io_failure(IOKind::Fsync, Ok(1), 0);
-        assert_eq!(poison, Some(FatalError::RedoSync));
-        let failure = failure.expect("nonzero sync result must retain a fatal report");
+        let failure = redo_io_failure(IOKind::Fsync, Ok(1), 0)
+            .expect("nonzero sync result must retain a fatal report");
         assert_eq!(*failure.current_context(), FatalError::RedoSync);
         assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
+        assert!(format!("{failure:?}").contains("op_kind=fsync"));
 
-        let (poison, failure) = redo_io_failure(
+        let failure = redo_io_failure(
             IOKind::Fdatasync,
             Err(IoError::from_raw_os_error(libc::EIO)),
             0,
-        );
-        assert_eq!(poison, Some(FatalError::RedoSync));
-        let failure = failure.expect("sync IO failure must retain a fatal report");
+        )
+        .expect("sync IO failure must retain a fatal report");
         assert_eq!(*failure.current_context(), FatalError::RedoSync);
         assert!(failure.downcast_ref::<crate::error::IoError>().is_some());
+        assert!(format!("{failure:?}").contains("op_kind=fdatasync"));
     }
 
     fn record_seal_group(
@@ -2943,8 +2946,12 @@ mod tests {
         sealer: &mut LogFileSealer,
         log_file: RedoLogFile,
     ) {
-        let mut writer =
-            RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, write_driver);
+        let mut writer = RedoLogWriter::new(
+            &harness.trx_sys,
+            &harness.poisoner,
+            &harness.trx_sys.config,
+            write_driver,
+        );
         writer.prefix.push_seal(log_file);
         drain_pending_prefix_for_test(&mut writer, sealer);
         assert!(!writer.has_pending_io());
@@ -2956,7 +2963,7 @@ mod tests {
         writer: &mut RedoLogWriter<'_, B>,
         sealer: &mut LogFileSealer,
     ) where
-        B: IOBackend,
+        B: Backend,
     {
         while !writer.prefix.is_empty() {
             writer.advance_ordered_prefix(sealer);
@@ -3008,6 +3015,7 @@ mod tests {
 
     struct ManualLogProcessorHarness {
         trx_sys: TransactionSystem,
+        poisoner: QuiescentGuard<EnginePoisoner>,
         _purge_rx: flume::Receiver<Purge>,
         cleanup_rx: flume::Receiver<TrxCleanupMessage>,
     }
@@ -3021,6 +3029,7 @@ mod tests {
             manual_log_processor_transaction_system(engine, config, redo_log);
         ManualLogProcessorHarness {
             trx_sys,
+            poisoner: engine.inner().poisoner.clone(),
             _purge_rx: purge_rx,
             cleanup_rx,
         }
@@ -3070,13 +3079,16 @@ mod tests {
             let res = engine.inner().trx_sys.commit_sys(sys_trx);
 
             assert_direct_fatal(&res, FatalError::RedoWrite);
-            assert!(
-                engine
-                    .inner()
-                    .trx_sys
-                    .ensure_runtime_healthy()
-                    .as_ref()
-                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            let poison = engine
+                .inner()
+                .poisoner
+                .ensure_healthy()
+                .expect_err("redo write failure must poison runtime admission");
+            assert_eq!(*poison.current_context(), FatalError::RedoWrite);
+            assert_eq!(
+                poison.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::CurrentRedoLogFileMissing),
+                "{poison:?}"
             );
         });
     }
@@ -3132,16 +3144,16 @@ mod tests {
             let err = trx.commit().await.unwrap_err();
 
             assert_eq!(
-                err.report().downcast_ref::<CompletionErrorKind>().copied(),
-                Some(CompletionErrorKind::Fatal(FatalError::RedoWrite)),
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoWrite),
                 "{err:?}"
             );
             assert!(!session.in_trx().unwrap());
             assert!(
                 engine
                     .inner()
-                    .trx_sys
-                    .ensure_runtime_healthy()
+                    .poisoner
+                    .ensure_healthy()
                     .as_ref()
                     .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
             );
@@ -3309,8 +3321,8 @@ mod tests {
 
             let err = trx.commit().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<CompletionErrorKind>().copied(),
-                Some(CompletionErrorKind::Lifecycle(LifecycleError::Shutdown)),
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::Shutdown),
                 "{err:?}"
             );
             assert!(!session.in_trx().unwrap());
@@ -3365,15 +3377,15 @@ mod tests {
 
             let err = commit_fut.await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<CompletionErrorKind>().copied(),
-                Some(CompletionErrorKind::Fatal(FatalError::RedoSync)),
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoSync),
                 "{err:?}"
             );
             assert!(!session.in_trx().unwrap());
             assert!(
                 engine
                     .inner()
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
@@ -3485,7 +3497,7 @@ mod tests {
         }
     }
 
-    impl IOBackend for LogTestBackend {
+    impl Backend for LogTestBackend {
         type Prepared = (BackendToken, IOKind);
         type SubmitBatch = VecDeque<(BackendToken, IOKind)>;
         type Events = ();
@@ -3516,7 +3528,7 @@ mod tests {
             &mut self,
             batch: &mut Self::SubmitBatch,
             limit: usize,
-        ) -> IoResult<SubmitAttempt> {
+        ) -> BackendResult<SubmitAttempt> {
             let submit_count = limit.min(batch.len());
             let Some(accepted) = NonZeroUsize::new(submit_count) else {
                 return Ok(SubmitAttempt::Noop);
@@ -3534,7 +3546,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> IoResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(
                 self.inflight.len() >= min_nr,
                 "test backend requires enough inflight work to satisfy wait"
@@ -3556,12 +3568,10 @@ mod tests {
                         .expect("test backend must have one back completion");
                     Ok(vec![(token, Ok(log_test_completion_len(kind)))])
                 }
-                LogTestCompletionBatch::WaitError => Err(IOBackendFailure::report(
+                LogTestCompletionBatch::WaitError => Err(BackendError::wait(
                     "log_test",
-                    IOBackendErrorPhase::Wait,
                     IoError::from_raw_os_error(libc::EIO),
                     1,
-                    IOBackendQueueState::wait_with_completions(0),
                 )),
             }
         }
@@ -3610,6 +3620,7 @@ mod tests {
             {
                 let mut writer = RedoLogWriter::new(
                     &harness.trx_sys,
+                    &harness.poisoner,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
@@ -3707,6 +3718,7 @@ mod tests {
             {
                 let mut writer = RedoLogWriter::new(
                     &harness.trx_sys,
+                    &harness.poisoner,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
@@ -3787,6 +3799,7 @@ mod tests {
             {
                 let mut writer = RedoLogWriter::new(
                     &harness.trx_sys,
+                    &harness.poisoner,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
@@ -3810,7 +3823,7 @@ mod tests {
 
             assert!(
                 harness
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
@@ -3849,6 +3862,7 @@ mod tests {
             {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
+                    &harness.poisoner,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
@@ -3944,6 +3958,7 @@ mod tests {
             {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
+                    &harness.poisoner,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
@@ -4034,6 +4049,7 @@ mod tests {
             {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
+                    &harness.poisoner,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
@@ -4110,6 +4126,7 @@ mod tests {
             {
                 let mut fp = RedoLogWriter::new(
                     &harness.trx_sys,
+                    &harness.poisoner,
                     &harness.trx_sys.config,
                     &mut write_driver,
                 );
@@ -4303,7 +4320,7 @@ mod tests {
 
             assert!(
                 harness
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
@@ -4345,7 +4362,7 @@ mod tests {
 
             assert!(
                 harness
-                    .trx_sys
+                    .poisoner
                     .poison_error()
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
@@ -4388,7 +4405,7 @@ mod tests {
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
             sealer.seal_active_file_best_effort(&harness.trx_sys, &mut write_driver);
 
-            assert!(harness.trx_sys.poison_error().is_none());
+            assert!(harness.poisoner.poison_error().is_none());
             assert_eq!(
                 harness
                     .trx_sys
@@ -4466,13 +4483,19 @@ mod tests {
                 .log_sync(LogSync::None);
             let harness = manual_log_processor_harness(&engine, config, redo_log);
             let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
-            let mut writer =
-                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
+            let mut writer = RedoLogWriter::new(
+                &harness.trx_sys,
+                &harness.poisoner,
+                &harness.trx_sys.config,
+                &mut write_driver,
+            );
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
 
             writer.prefix.push_header(header_write);
             writer.prefix.push_seal(ended_log_file);
-            writer.fail_prefix_entries(FatalError::RedoWrite);
+            writer.fail_prefix_entries(SharedFatalError::capture(Report::new(
+                FatalError::RedoWrite,
+            )));
             writer.advance_ordered_prefix(&mut sealer);
 
             assert!(writer.prefix.is_empty());
@@ -4911,8 +4934,12 @@ mod tests {
             let harness = manual_log_processor_harness(&engine, config, redo_log);
             let mut write_driver = LogWriteDriver::new(StorageBackend::setup(1).unwrap());
             let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
-            let mut writer =
-                RedoLogWriter::new(&harness.trx_sys, &harness.trx_sys.config, &mut write_driver);
+            let mut writer = RedoLogWriter::new(
+                &harness.trx_sys,
+                &harness.poisoner,
+                &harness.trx_sys.config,
+                &mut write_driver,
+            );
 
             writer.fetch_io_reqs();
             drain_pending_prefix_for_test(&mut writer, &mut sealer);
@@ -5038,14 +5065,12 @@ mod tests {
                 owner,
                 kind,
                 buf,
-                poison,
                 failure,
             } = write_driver.wait_at_least_one().unwrap();
             match kind {
                 LogWriteKind::Group { .. } => {
                     drop(buf.expect("redo group write completion must return a buffer"));
                     assert!(owner.is_none());
-                    assert_eq!(poison, None);
                     assert!(failure.is_none());
                 }
                 LogWriteKind::Header { .. } => panic!("expected redo group write completion"),
@@ -5272,15 +5297,17 @@ mod tests {
 
             let res1 = commit1.join().unwrap();
             let res2 = commit2.join().unwrap();
-            assert_propagated_completion_fatal(&res1, FatalError::RedoWrite);
-            assert_propagated_completion_fatal(&res2, FatalError::RedoWrite);
+            assert_propagated_completion_fatal(&res1, FatalError::RedoWrite, "op_kind=write");
+            assert_propagated_completion_fatal(&res2, FatalError::RedoWrite, "op_kind=write");
+            let poison = engine
+                .inner()
+                .poisoner
+                .ensure_healthy()
+                .expect_err("redo write failure must poison runtime admission");
+            assert_eq!(*poison.current_context(), FatalError::RedoWrite);
             assert!(
-                engine
-                    .inner()
-                    .trx_sys
-                    .ensure_runtime_healthy()
-                    .as_ref()
-                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+                poison.downcast_ref::<StorageIoError>().is_some(),
+                "{poison:?}"
             );
         });
     }
@@ -5326,15 +5353,18 @@ mod tests {
 
         let res1 = commit1.join().unwrap();
         let res2 = commit2.join().unwrap();
-        assert_propagated_completion_fatal(&res1, FatalError::RedoSync);
-        assert_propagated_completion_fatal(&res2, FatalError::RedoSync);
+        let expected_op_kind = format!("op_kind={}", sync_kind.as_str());
+        assert_propagated_completion_fatal(&res1, FatalError::RedoSync, &expected_op_kind);
+        assert_propagated_completion_fatal(&res2, FatalError::RedoSync, &expected_op_kind);
+        let poison = engine
+            .inner()
+            .poisoner
+            .ensure_healthy()
+            .expect_err("redo sync failure must poison runtime admission");
+        assert_eq!(*poison.current_context(), FatalError::RedoSync);
         assert!(
-            engine
-                .inner()
-                .trx_sys
-                .ensure_runtime_healthy()
-                .as_ref()
-                .is_err_and(|err| *err.current_context() == FatalError::RedoSync)
+            poison.downcast_ref::<StorageIoError>().is_some(),
+            "{poison:?}"
         );
     }
 

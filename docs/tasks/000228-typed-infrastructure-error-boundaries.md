@@ -163,9 +163,9 @@ direct parameter and reports zero or representation overflow as IO
 `InvalidInput`, then performs `IoUring::new` or `io_setup` while retaining
 caller-owned `op=backend_setup` diagnostics and backend attachments. Static
 configuration owners may still reject invalid configured depths as Config.
-Preserve current retry/no-progress behavior and the
-`IOBackendFailure`/`IOBackendOperationKind` attachments. Keep backend completion
-payloads as `StdIoResult<usize>`.
+Preserve current retry/no-progress behavior, structured `IOBackendFailure`
+attachments, and exact lowercase per-request `op_kind=<kind>` diagnostics.
+Keep backend completion payloads as `StdIoResult<usize>`.
 
 ### 3. Narrow raw file, metadata, and CoW suppliers
 
