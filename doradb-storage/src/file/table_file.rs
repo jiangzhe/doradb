@@ -3,7 +3,7 @@ use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::table::TableMetadata;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityResult, Error, FileKind, InternalError,
-    IoResult, ResourceError, ResourceResult, Result, RuntimeResult,
+    InternalResult, IoResult, ResourceError, ResourceResult, Result, RuntimeResult,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -353,7 +353,7 @@ impl MutableTableFile {
         &mut self,
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
-    ) -> Result<()> {
+    ) -> InternalResult<()> {
         let root = &mut self.new_root.root;
         if pivot_row_id < root.pivot_row_id {
             return Err(mutable_root_metadata_regression(format!(
@@ -600,10 +600,8 @@ fn secondary_index_root_inactive_slot_mismatch(index_no: usize, root: BlockID) -
 }
 
 #[inline]
-fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
-    Report::new(InternalError::MutableRootMetadataRegression)
-        .attach(message.into())
-        .into()
+fn mutable_root_metadata_regression(message: impl Into<String>) -> Report<InternalError> {
+    Report::new(InternalError::MutableRootMetadataRegression).attach(message.into())
 }
 
 #[inline]

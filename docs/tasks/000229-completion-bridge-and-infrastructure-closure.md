@@ -1,7 +1,7 @@
 ---
 id: 000229
 title: Completion Bridge and Infrastructure Closure
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-19
 github_issue: 866
 ---
@@ -425,6 +425,51 @@ retention, table persistence, recovery, engine, and tests:
    scopes.
 
 ## Implementation Notes
+
+- Replaced `CompletionErrorKind` and its reconstruction adapters with the
+  pointer-sized `CompletionErrorBridge`. One owned typed report and its checked
+  linear replay plan are shared through `Arc`; each final owner reconstructs
+  the registered physical contexts and attachments beneath its own context.
+  Successful completions perform no bridge work, and failed fan-out clones only
+  the bridge while completion state is locked.
+- Added the closed `CompletionSourceReport`, `ReplayContext`, and
+  `ReplayAttachment` registries plus the private typed replay builder. Text is
+  replayed through Arc-backed diagnostics, structured `BackendError` values
+  remain downcastable, and unknown frames are rejected as documented
+  programmer-invariant violations. Public `ErrorKind`, Runtime, and bridge
+  reports cannot be capture roots.
+- Migrated file, readonly and evictable buffer, redo, transaction, catalog,
+  table, recovery, and engine paths to capture typed reports once, forward the
+  bridge unchanged, and reconstruct only at their Runtime, Fatal, or public
+  responsibility boundary. Joined waiters retain the same ordered source
+  chain and producer diagnostics without exposing the bridge as a report frame.
+- Renamed the private IO contract and failure to `Backend` and `BackendError`.
+  Submit, wait, and retry-expiry progress now use the concrete local
+  `BackendResult`; IO reports are created only at completion, Fatal, or public
+  boundaries, retain the structured failure, and use lowercase `op_kind`
+  diagnostics.
+- Added `SharedFatalError` for redo, failed-precommit, terminal rollback, and
+  first-wins poison propagation. `EnginePoisoner` is a silent publication
+  component; policy owners attach messages and log before publishing, and
+  catalog, transaction, and other components depend on it directly instead of
+  using transaction-system poison facades.
+- Review-driven supporting cleanup removed obsolete sealing and thin poison
+  helper layers, made missing column storage an asserted invariant, exposed
+  `TransactionSystemWorkers` construction explicitly in `EngineConfig`, and
+  synchronized the component dependency graph and poison ownership comments.
+  These changes did not alter public APIs, persisted formats, or unsafe
+  ownership contracts.
+- Broader domain-specific fault injection remains in backlog 000160. The
+  temporary lower public frame in terminal rollback remains an explicit replay
+  compatibility exception until RFC-0023 Phase 3 narrows the row/index undo
+  suppliers under backlog 000161.
+- Verification passed 1,476 default workspace tests and 1,401 alternate
+  `libaio` storage tests. Default and `libaio` strict Clippy passed, the style
+  gate passed all 49 branch-diff Rust files, forbidden-artifact searches and
+  `git diff --check` passed, and focused coverage across 42 central completion,
+  poison, file, buffer, log, and transaction files was 94.50% in aggregate with
+  every requested target above 80%. One catalog GC test failed once, then
+  passed its immediate retry and the complete workspace rerun.
 
 ## Impacts
 

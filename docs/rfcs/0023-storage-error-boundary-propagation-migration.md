@@ -826,15 +826,12 @@ RFC. [D17], [D18]
     preserved every source context and attachment that must survive fanout.
     Both backend configurations pass with the central `IoResult` reporting
     contract. [D1], [C17], [U8], [U10], [U11]
-  - Phase-local Choices: The concrete closed canonical-report and
-    frame-reconstruction implementation; closed replay schema versus
-    per-source snapshot or an equivalent checked representation; the final
-    cloneable attachment registry; the private replay discriminator shape; and
-    the operation-specific concrete representation used for backend runtime
-    progress before terminal IO reporting.
-    These choices may not alter Arc ownership, semantic-free typed capture,
-    physical-frame downcasts, or the prohibition on a consumer-visible
-    completion domain. [C18], [U5], [U6], [U9], [U12]
+  - Phase-local Choices: Implemented one eager-on-error ordered replay plan
+    beside the canonical typed report, closed enum registries for contexts and
+    attachments, Arc-backed shared text, a private typed report builder, and
+    lazy per-owner reconstruction. Backend runtime progress uses the concrete
+    operation-specific `BackendError` detail enum before terminal IO reporting.
+    [C18], [U5], [U6], [U9], [U12]
   - After This Phase: All completion waiters share one immutable canonical
     report and reconstruct the same real domain chain under their final-owner
     contexts; no caller reconstructs a
@@ -849,10 +846,11 @@ RFC. [D17], [D18]
     [U10], [U11], [U12]
   - Task Doc: `docs/tasks/000229-completion-bridge-and-infrastructure-closure.md`
   - Task Issue: `#866`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented the Arc-backed CompletionErrorBridge with checked ordered replay, lazy per-owner reconstruction, concrete BackendError progress transport, SharedFatalError poison propagation, and end-to-end producer and consumer migration; validated both IO backends and representative focused coverage. [Task Resolve Sync: docs/tasks/000229-completion-bridge-and-infrastructure-closure.md @ 2026-07-20]
   - Related Backlogs:
     - `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
+    - `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 3: Stateful Storage and Semantic Consumers**
   - Scope: Audit `row`, `index`, `table`, and `catalog`, including their

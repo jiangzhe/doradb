@@ -512,6 +512,13 @@ pub(crate) struct CompletionErrorBridge(Arc<BridgeInner>);
 
 impl CompletionErrorBridge {
     /// Captures one owned canonical typed report and validates its replay plan.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the report is branched or contains a context or attachment
+    /// outside the closed completion replay registry. Such a frame violates
+    /// the crate-private completion producer contract; `Report` erases
+    /// attachment types, so this invariant is validated during capture.
     #[inline]
     pub(crate) fn capture(report: impl Into<CompletionSourceReport>) -> Self {
         let canonical = report.into();

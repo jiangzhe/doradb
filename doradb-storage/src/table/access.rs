@@ -3664,7 +3664,6 @@ mod tests {
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
     };
-    use crate::table::checkpoint_workflow::CheckpointPublicationGuard;
     use crate::table::hot::{
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
     };
@@ -6930,12 +6929,10 @@ mod tests {
                         stmt.runtime().sts(),
                     );
                     assert!(delay.is_none());
-                    let mut transition_guard = CheckpointPublicationGuard::new(
-                        &table.checkpoint_workflow,
-                        &table.lifecycle,
-                        &engine.inner().poisoner,
-                    );
-                    transition_guard.begin_transition().unwrap();
+                    let transition_lease = table
+                        .checkpoint_workflow
+                        .try_begin_transition(&table.lifecycle)
+                        .unwrap();
                     table
                         .apply_page_transition(
                             &transition_pages,
@@ -6956,7 +6953,8 @@ mod tests {
                             panic!("uncommitted lock should remain as marker ref")
                         }
                     }
-                    transition_guard.finish();
+                    table.checkpoint_workflow.finish_publication();
+                    drop(transition_lease);
                     drop(root_lease);
                     drop(lock_row);
                     drop(page_guard);
