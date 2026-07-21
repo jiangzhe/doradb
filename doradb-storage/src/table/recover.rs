@@ -1,14 +1,16 @@
 use crate::buffer::PoolGuards;
-use crate::error::{DataIntegrityError, RecoveryDuplicateKey, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, RecoveryDuplicateKey, RuntimeError, RuntimeResult,
+};
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::IndexInsert;
 use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
-use crate::table::{DeletionError, DmlValidationResultExt, DmlValidator, Table};
+use crate::table::{DeletionError, DmlValidator, Table};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 
 impl Table {
     /// Recover row insert from redo log.
@@ -20,13 +22,17 @@ impl Table {
         cols: &[Val],
         cts: TrxID,
         disable_dml_validation: bool,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
             DmlValidator::new(metadata)
                 .validate_full_row(cols)
-                .with_recovery_context("recover_row_insert", self.table_id())?;
+                .change_context(DataIntegrityError::InvalidPayload)
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(|| {
+                    format!("operation=recover_row_insert, table_id={}", self.table_id())
+                })?;
         }
         debug_assert!(cols.len() == metadata.col.col_count());
         debug_assert!({
@@ -41,7 +47,14 @@ impl Table {
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
-        self.recover_row_insert_to_page(metadata, &mut page_guard, row_id, cols, cts)?;
+        self.recover_row_insert_to_page(metadata, &mut page_guard, row_id, cols, cts)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=recover_row_insert, table_id={}, page_id={page_id}, row_id={row_id}",
+                    self.table_id()
+                )
+            })?;
         page_guard.set_dirty(); // mark as dirty page.
         Ok(())
     }
@@ -55,20 +68,31 @@ impl Table {
         update: &[UpdateCol],
         cts: TrxID,
         disable_dml_validation: bool,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
         if !disable_dml_validation {
             DmlValidator::new(metadata)
                 .validate_sparse_update(update)
-                .with_recovery_context("recover_row_update", self.table_id())?;
+                .change_context(DataIntegrityError::InvalidPayload)
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(|| {
+                    format!("operation=recover_row_update, table_id={}", self.table_id())
+                })?;
         }
         let mut page_guard = self
             .mem
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
-        self.recover_row_update_to_page(metadata, &mut page_guard, row_id, update, cts)?;
+        self.recover_row_update_to_page(metadata, &mut page_guard, row_id, update, cts)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=recover_row_update, table_id={}, page_id={page_id}, row_id={row_id}",
+                    self.table_id()
+                )
+            })?;
         page_guard.set_dirty(); // mark as dirty page.
         Ok(())
     }
@@ -80,7 +104,7 @@ impl Table {
         page_id: PageID,
         row_id: RowID,
         cts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         // `recovery_bootstrap_unchecked`: restart recovery runs without
         // surviving user transactions, so it binds the current loaded root
         // directly for cold-row delete replay predicates.
@@ -94,7 +118,11 @@ impl Table {
                 Err(DeletionError::AlreadyDeleted | DeletionError::WriteConflict) => {
                     return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                         .attach(format!("row_id={row_id}, cts={cts}"))
-                        .into());
+                        .change_context(RuntimeError::TableAccess)
+                        .attach(format!(
+                            "operation=recover_row_delete, table_id={}, page_id={page_id}",
+                            self.table_id()
+                        )));
                 }
             }
         }
@@ -104,7 +132,14 @@ impl Table {
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
 
-        self.recover_row_delete_to_page(&mut page_guard, row_id, cts)?;
+        self.recover_row_delete_to_page(&mut page_guard, row_id, cts)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=recover_row_delete, table_id={}, page_id={page_id}, row_id={row_id}",
+                    self.table_id()
+                )
+            })?;
         page_guard.set_dirty(); // mark as dirty page.
         Ok(())
     }
@@ -114,32 +149,79 @@ impl Table {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let page_guard = self.mem.must_get_row_page_shared(guards, page_id).await?;
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
-        let index_pool_guard = self.mem.index_pool_guard(guards)?;
+        let index_pool_guard = self
+            .mem
+            .index_pool_guard(guards)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=populate_index_via_row_page, table_id={}, page_id={page_id}",
+                    self.table_id()
+                )
+            })?;
         for (index_no, index_spec) in metadata.idx.active_indexes() {
-            let sec_idx = layout.secondary_index(index_no)?;
+            let sec_idx = layout
+                .secondary_index(index_no)
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}",
+                        self.table_id()
+                    )
+                })?;
             let read_set: Vec<_> = index_spec.cols.iter().map(|c| c.col_no as usize).collect();
             for row_access in page_guard.read_all_rows() {
                 let row_id = row_access.row().row_id();
                 match row_access.read_row_latest(metadata, &read_set, None) {
                     ReadRow::Ok(vals) => {
                         if index_spec.unique() {
-                            let index = sec_idx.unique_mem()?;
+                            let index = sec_idx
+                                .unique_mem()
+                                .change_context(RuntimeError::TableAccess)
+                                .attach_with(|| {
+                                    format!(
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}",
+                                        self.table_id()
+                                    )
+                                })?;
                             let res = index
                                 .bind(index_pool_guard)
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await?;
-                            ensure_recovery_index_insert(sec_idx.index_no(), res)?;
+                            ensure_recovery_index_insert(sec_idx.index_no(), res)
+                                .change_context(RuntimeError::TableAccess)
+                                .attach_with(|| {
+                                    format!(
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}, row_id={row_id}",
+                                        self.table_id()
+                                    )
+                                })?;
                         } else {
-                            let index = sec_idx.non_unique_mem()?;
+                            let index = sec_idx
+                                .non_unique_mem()
+                                .change_context(RuntimeError::TableAccess)
+                                .attach_with(|| {
+                                    format!(
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}",
+                                        self.table_id()
+                                    )
+                                })?;
                             let res = index
                                 .bind(index_pool_guard)
                                 .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await?;
-                            ensure_recovery_index_insert(sec_idx.index_no(), res)?;
+                            ensure_recovery_index_insert(sec_idx.index_no(), res)
+                                .change_context(RuntimeError::TableAccess)
+                                .attach_with(|| {
+                                    format!(
+                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_no={index_no}, row_id={row_id}",
+                                        self.table_id()
+                                    )
+                                })?;
                         }
                     }
                     ReadRow::NotFound => (),
@@ -153,7 +235,10 @@ impl Table {
 
 /// Reject duplicate secondary-index entries during recovery rebuild.
 #[inline]
-pub(super) fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
+pub(super) fn ensure_recovery_index_insert(
+    index_no: usize,
+    res: IndexInsert,
+) -> DataIntegrityResult<()> {
     match res {
         IndexInsert::Ok(_) => Ok(()),
         IndexInsert::DuplicateKey(row_id, deleted) => Err(Report::new(
@@ -163,8 +248,7 @@ pub(super) fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) ->
             index_no,
             row_id,
             deleted,
-        })
-        .into()),
+        })),
     }
 }
 
@@ -174,14 +258,15 @@ mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::PAGE_SIZE;
     use crate::catalog::{TableMetadata, USER_TABLE_ID_START};
-    use crate::error::{DataIntegrityError, Error, RecoveryDuplicateKey};
+    use crate::error::{DataIntegrityError, RecoveryDuplicateKey, RuntimeError};
     use crate::id::RowID;
     use crate::id::{PageID, TrxID};
     use crate::index::IndexInsert;
     use crate::row::ops::UpdateCol;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
-    use crate::table::tests::*;
+    use crate::table::{DmlValidationError, tests::*};
     use crate::value::Val;
+    use error_stack::Report;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -196,7 +281,6 @@ mod tests {
         let err = ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(RowID::new(42), false))
             .unwrap_err();
         let duplicate = err
-            .report()
             .downcast_ref::<RecoveryDuplicateKey>()
             .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
         assert_eq!(duplicate.index_no, 3);
@@ -240,7 +324,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
             );
         });
@@ -257,14 +341,14 @@ mod tests {
             let metadata = table_for_internal_assertion(&engine, table_id).metadata();
             let mut page_guard = table_for_internal_assertion(&engine, table_id)
                 .mem
-                .get_insert_page_exclusive(&session.pool_guards(), 2, None)
+                .get_insert_page_exclusive(&session.pool_guards(), 2)
                 .await
                 .unwrap();
             let row_id = page_guard.page().header.start_row_id;
-            let assert_invalid_root = |err: Error, reason: &str| {
+            let assert_invalid_root = |err: Report<DataIntegrityError>, reason: &str| {
                 let report = format!("{err:?}");
                 assert_eq!(
-                    err.report().downcast_ref::<DataIntegrityError>().copied(),
+                    err.downcast_ref::<DataIntegrityError>().copied(),
                     Some(DataIntegrityError::InvalidRootInvariant),
                     "{report}"
                 );
@@ -369,12 +453,15 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            assert_eq!(*err.current_context(), RuntimeError::TableAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
+            assert!(err.downcast_ref::<DmlValidationError>().is_some());
             let report = format!("{err:?}");
             assert!(report.contains("recover_row_insert"), "{report}");
+            assert!(report.contains(&format!("table_id={table_id}")), "{report}");
 
             let err = table
                 .recover_row_update(
@@ -390,12 +477,15 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
+            assert_eq!(*err.current_context(), RuntimeError::TableAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
+            assert!(err.downcast_ref::<DmlValidationError>().is_some());
             let report = format!("{err:?}");
             assert!(report.contains("recover_row_update"), "{report}");
+            assert!(report.contains(&format!("table_id={table_id}")), "{report}");
         });
     }
 

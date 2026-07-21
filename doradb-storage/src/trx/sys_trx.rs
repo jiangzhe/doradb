@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::{Catalog, SilentWatermarkObject};
-use crate::error::{Error, InternalError, Result};
+use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
@@ -105,7 +105,7 @@ impl SysTrx {
         catalog: &Catalog,
         guards: &PoolGuards,
         watermark: SilentWatermarkObject,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         match self.redo.ddl.as_deref() {
             None => {
                 self.redo
@@ -117,12 +117,16 @@ impl SysTrx {
             Some(DDLRedo::TableReplaySilentWatermark { table_id })
                 if *table_id == watermark.table_id => {}
             Some(existing) => {
-                return Err(Error::from(
-                    Report::new(InternalError::Generic).attach(format!(
+                return Err(Report::new(InternalError::SilentWatermarkRedoConflict)
+                    .attach(format!(
                         "silent watermark system transaction has incompatible DDL redo: existing={existing:?}, table_id={}",
                         watermark.table_id
-                    )),
-                ));
+                    ))
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach(format!(
+                        "operation=upsert_silent_watermark, table_id={}",
+                        watermark.table_id
+                    )));
             }
         }
         let watermarks = catalog.storage.table_replay_silent_watermarks();

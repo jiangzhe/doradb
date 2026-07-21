@@ -411,16 +411,21 @@ still avoiding repeated lock acquisition on row-write paths. [U5], [U14], [D6],
 
 ### Explicit Table Lock API
 
-The first API should support internal callers and leave room for SQL/session
-surface later:
+The explicit API exposes only whole-table shared and exclusive modes. Intention
+modes remain crate-internal implementation details:
 
 ```rust
-impl ActiveTrx {
-    pub fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()>;
+pub enum TableLockMode {
+    Shared,
+    Exclusive,
+}
+
+impl Transaction {
+    pub async fn lock_table(&mut self, table_id: TableID, mode: TableLockMode) -> Result<()>;
 }
 
 impl Session {
-    pub fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()>;
+    pub async fn lock_table(&self, table_id: TableID, mode: TableLockMode) -> Result<()>;
     pub fn unlock_table(&self, table_id: TableID) -> Result<()>;
 }
 ```

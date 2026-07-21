@@ -6,11 +6,11 @@ use crate::catalog::{
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
-    Error, InternalError, InternalResult, LifecycleError, LifecycleResult, OperationError,
-    OperationResult, Result,
+    Error, InternalError, InternalResult, LifecycleError, LifecycleResult, MultiDomainResultExt,
+    OperationError, OperationResult, Result,
 };
 use crate::id::{SessionID, TableID, TrxID};
-use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
+use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, TableLockMode};
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::ChangeNotifier;
 use crate::quiescent::QuiescentGuard;
@@ -324,6 +324,7 @@ impl Session {
             .catalog()
             .checkpoint_now(&session.engine.trx_sys)
             .await
+            .map_err(Error::from)
             .map(|_| ())
     }
 
@@ -472,7 +473,10 @@ impl Session {
         table
             .check_foreground_live()
             .attach("operation=freeze_table")?;
-        table.freeze(&session, max_rows).await
+        Ok(table
+            .freeze(&session, max_rows)
+            .await
+            .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))?)
     }
 
     /// Persist eligible state using the table-owned canonical frozen batch.
@@ -501,7 +505,10 @@ impl Session {
         table
             .check_foreground_live()
             .attach("operation=checkpoint_table")?;
-        table.checkpoint(&session).await
+        table.checkpoint(&session).await.map_err(|err| {
+            Error::from(err)
+                .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
+        })
     }
 
     /// Wait until retry may be useful for one self-identifying checkpoint delay.
@@ -525,7 +532,10 @@ impl Session {
                 table
             }
         };
-        table.wait_for_checkpoint_retry(&session, reason).await
+        Ok(table
+            .wait_for_checkpoint_retry(&session, reason)
+            .await
+            .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))?)
     }
 
     /// Retry delayed table checkpoints through their exact production wait predicate.
@@ -583,11 +593,10 @@ impl Session {
             .await
             .attach("operation=count_table_row_pages")?;
         let guards = session.pool_guards();
-        table.total_row_pages(&guards).await.map_err(|err| {
-            err.attach(format!(
-                "operation=count_table_row_pages, table_id={table_id}"
-            ))
-        })
+        Ok(table
+            .total_row_pages(&guards)
+            .await
+            .attach_with(|| format!("operation=count_table_row_pages, table_id={table_id}"))?)
     }
 
     /// Full-scan cleanup for an existing user table's secondary MemIndex entries.
@@ -600,20 +609,24 @@ impl Session {
         let session = self
             .pin()
             .attach("operation=cleanup_secondary_mem_indexes")?;
+        ensure_idle_maintenance_session(&session)
+            .attach("operation=cleanup_secondary_mem_indexes")?;
         let table = session
             .resolve_user_table(table_id)
             .await
             .attach("operation=cleanup_secondary_mem_indexes")?;
-        table
+        Ok(table
             .cleanup_secondary_mem_indexes(session, clean_live_entries)
             .await
+            .attach_with(|| {
+                format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}")
+            })?)
     }
 
     /// Acquires an explicit session-lifetime table lock.
     #[inline]
-    pub async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
-        mode.validate_explicit_table_lock()
-            .attach_with(|| format!("operation=lock_explicit_table, table_id={table_id}"))?;
+    pub async fn lock_table(&self, table_id: TableID, mode: TableLockMode) -> Result<()> {
+        let mode = LockMode::from(mode);
         let session = self.pin().attach("operation=lock_explicit_table")?;
         Ok(session
             .lock_table(table_id, mode)
@@ -2274,7 +2287,7 @@ pub(crate) mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             assert_checkpoint_published(&mut session, table_id).await;
 
-            let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let before = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(before.meta.first_redo_log_seq, 0);
 
             let outcome = session
@@ -2303,7 +2316,7 @@ pub(crate) mod tests {
             );
             assert_eq!(outcome.redo_truncation.failed_unlink_files, 0);
 
-            let after = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let after = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(after.catalog_replay_start_ts, catalog_replay_start_ts);
             assert_eq!(
                 after.meta.first_redo_log_seq,
@@ -2346,7 +2359,7 @@ pub(crate) mod tests {
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
-            let checkpointed = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let checkpointed = engine.catalog().storage.checkpoint_snapshot();
             let outcome = session
                 .checkpoint_catalog_and_truncate_redo_log()
                 .await
@@ -2358,7 +2371,7 @@ pub(crate) mod tests {
                 outcome.redo_truncation.new_first_retained_file_seq > 0,
                 "{outcome:?}"
             );
-            let after = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let after = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(
                 after.catalog_replay_start_ts,
                 checkpointed.catalog_replay_start_ts
@@ -2488,7 +2501,7 @@ pub(crate) mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             assert_checkpoint_published(&mut session, table_id).await;
 
-            let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let before = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(before.meta.first_redo_log_seq, 0);
             let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
             assert_eq!(plan.first_retained_file_seq, 0);
@@ -2529,7 +2542,7 @@ pub(crate) mod tests {
                 Some(FatalError::CheckpointWrite)
             );
             assert!(publish_hook.call_count() > 0);
-            let after = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let after = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(
                 after.catalog_replay_start_ts,
                 before.catalog_replay_start_ts
@@ -2562,7 +2575,7 @@ pub(crate) mod tests {
             commit_redo_durability_anchor(&mut session, table_id).await;
             session.checkpoint_catalog().await.unwrap();
 
-            let before = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let before = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(before.meta.first_redo_log_seq, 0);
             let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
             assert_eq!(plan.first_retained_file_seq, 0);
@@ -2603,7 +2616,7 @@ pub(crate) mod tests {
                 Some(FatalError::CheckpointWrite)
             );
             assert!(publish_hook.call_count() > 0);
-            let after = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let after = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(
                 after.catalog_replay_start_ts,
                 before.catalog_replay_start_ts
@@ -2733,7 +2746,6 @@ pub(crate) mod tests {
                     .catalog()
                     .storage
                     .checkpoint_snapshot()
-                    .unwrap()
                     .meta
                     .first_redo_log_seq,
                 1
@@ -2905,7 +2917,7 @@ pub(crate) mod tests {
             assert_eq!(err.kind(), ErrorKind::Runtime, "{err:?}");
             assert_eq!(
                 err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::RedoLogDiscovery)
+                Some(RuntimeError::RedoLogAccess)
             );
             assert_eq!(
                 err.report().downcast_ref::<DataIntegrityError>().copied(),
@@ -2972,7 +2984,6 @@ pub(crate) mod tests {
                     .catalog()
                     .storage
                     .checkpoint_snapshot()
-                    .unwrap()
                     .meta
                     .first_redo_log_seq,
                 0

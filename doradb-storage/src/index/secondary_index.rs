@@ -17,7 +17,7 @@ use super::non_unique_index::{GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqu
 use super::unique_index::{GuardedUniqueMemIndex, UniqueIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{Error, InternalError, Result};
+use crate::error::{InternalError, RuntimeError, RuntimeResult, SecondaryIndexBinding};
 use crate::file::table_file::TableFile;
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::util::Maskable;
@@ -84,7 +84,7 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
         index_spec: &IndexSpec,
         ty_infer: F,
         ts: TrxID,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         if index_spec.unique() {
             let index =
                 UniqueMemIndex::new(index_pool, index_pool_guard, index_spec, ty_infer, ts).await?;
@@ -99,7 +99,7 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
 
     /// Destroy this in-memory secondary index and reclaim all pages it owns.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
         match self {
             Self::Unique(index) => index.destroy(pool_guard).await,
             Self::NonUnique(index) => index.destroy(pool_guard).await,
@@ -149,14 +149,15 @@ impl SecondaryDiskTreeRuntime {
         metadata: Arc<TableMetadata>,
         table_file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         let index_spec = metadata.idx.index_spec(index_no).ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
+            Report::new(InternalError::SecondaryIndexOutOfBounds)
+                .attach(format!(
                     "index_no={index_no}, index_slot_count={}",
                     metadata.idx.index_slot_count()
-                )),
-            )
+                ))
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=build_secondary_index_runtime")
         })?;
         let file_kind = table_file.file_kind();
         let file = Arc::clone(table_file.sparse_file());
@@ -231,13 +232,19 @@ impl SecondaryDiskTreeRuntime {
         &'a self,
         root_block_id: BlockID,
         disk_pool_guard: &'a PoolGuard,
-    ) -> Result<UniqueDiskTree<'a>> {
+    ) -> RuntimeResult<UniqueDiskTree<'a>> {
         match &self.kind {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
                 Ok(runtime.open(root_block_id, disk_pool_guard))
             }
             SecondaryDiskTreeRuntimeKind::NonUnique(_) => {
-                Err(Error::wrong_secondary_index_binding("unique", "non-unique"))
+                Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
+                    .attach(SecondaryIndexBinding {
+                        expected: "unique",
+                        actual: "non-unique",
+                    })
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=bind_secondary_index_runtime"))
             }
         }
     }
@@ -248,10 +255,16 @@ impl SecondaryDiskTreeRuntime {
         &'a self,
         root_block_id: BlockID,
         disk_pool_guard: &'a PoolGuard,
-    ) -> Result<NonUniqueDiskTree<'a>> {
+    ) -> RuntimeResult<NonUniqueDiskTree<'a>> {
         match &self.kind {
             SecondaryDiskTreeRuntimeKind::Unique(_) => {
-                Err(Error::wrong_secondary_index_binding("non-unique", "unique"))
+                Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
+                    .attach(SecondaryIndexBinding {
+                        expected: "non-unique",
+                        actual: "unique",
+                    })
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=bind_secondary_index_runtime"))
             }
             SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
                 Ok(runtime.open(root_block_id, disk_pool_guard))
@@ -266,7 +279,7 @@ impl SecondaryDiskTreeRuntime {
         root_block_id: BlockID,
         disk_pool_guard: &PoolGuard,
         out: &mut BTreeSet<BlockID>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         match &self.kind {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
                 runtime
@@ -306,7 +319,7 @@ pub(crate) enum SecondaryIndex<P: 'static> {
 impl<P: BufferPool> SecondaryIndex<P> {
     /// Destroy the mutable MemIndex owned by this composite index.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
         match self {
             Self::Unique { mem, .. } => mem.destroy(pool_guard).await,
             Self::NonUnique { mem, .. } => mem.destroy(pool_guard).await,
@@ -341,22 +354,32 @@ impl<P: BufferPool> SecondaryIndex<P> {
 
     /// Return the unique MemIndex when this slot is unique.
     #[inline]
-    pub(crate) fn unique_mem(&self) -> Result<&UniqueMemIndex<P>> {
+    pub(crate) fn unique_mem(&self) -> RuntimeResult<&UniqueMemIndex<P>> {
         match self {
             Self::Unique { mem, .. } => Ok(mem),
             Self::NonUnique { .. } => {
-                Err(Error::wrong_secondary_index_binding("unique", "non-unique"))
+                Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
+                    .attach(SecondaryIndexBinding {
+                        expected: "unique",
+                        actual: "non-unique",
+                    })
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=bind_secondary_index_runtime"))
             }
         }
     }
 
     /// Return the non-unique MemIndex when this slot is non-unique.
     #[inline]
-    pub(crate) fn non_unique_mem(&self) -> Result<&NonUniqueMemIndex<P>> {
+    pub(crate) fn non_unique_mem(&self) -> RuntimeResult<&NonUniqueMemIndex<P>> {
         match self {
-            Self::Unique { .. } => {
-                Err(Error::wrong_secondary_index_binding("non-unique", "unique"))
-            }
+            Self::Unique { .. } => Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
+                .attach(SecondaryIndexBinding {
+                    expected: "non-unique",
+                    actual: "unique",
+                })
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=bind_secondary_index_runtime")),
             Self::NonUnique { mem, .. } => Ok(mem),
         }
     }
@@ -367,7 +390,7 @@ impl<P: BufferPool> SecondaryIndex<P> {
         &'a self,
         guards: &'g PoolGuards,
         root: BlockID,
-    ) -> Result<UniqueSecondaryIndex<'a, 'g, P>> {
+    ) -> RuntimeResult<UniqueSecondaryIndex<'a, 'g, P>> {
         match self {
             Self::Unique { mem, disk } => Ok(UniqueSecondaryIndex::new(
                 mem,
@@ -377,7 +400,13 @@ impl<P: BufferPool> SecondaryIndex<P> {
                 guards.disk_guard(),
             )),
             Self::NonUnique { .. } => {
-                Err(Error::wrong_secondary_index_binding("unique", "non-unique"))
+                Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
+                    .attach(SecondaryIndexBinding {
+                        expected: "unique",
+                        actual: "non-unique",
+                    })
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=bind_secondary_index_runtime"))
             }
         }
     }
@@ -388,11 +417,15 @@ impl<P: BufferPool> SecondaryIndex<P> {
         &'a self,
         guards: &'g PoolGuards,
         root: BlockID,
-    ) -> Result<NonUniqueSecondaryIndex<'a, 'g, P>> {
+    ) -> RuntimeResult<NonUniqueSecondaryIndex<'a, 'g, P>> {
         match self {
-            Self::Unique { .. } => {
-                Err(Error::wrong_secondary_index_binding("non-unique", "unique"))
-            }
+            Self::Unique { .. } => Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
+                .attach(SecondaryIndexBinding {
+                    expected: "non-unique",
+                    actual: "unique",
+                })
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=bind_secondary_index_runtime")),
             Self::NonUnique { mem, disk } => Ok(NonUniqueSecondaryIndex::new(
                 mem,
                 disk,
@@ -431,7 +464,7 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
     }
 
     #[inline]
-    fn open(&self) -> Result<UniqueDiskTree<'_>> {
+    fn open(&self) -> RuntimeResult<UniqueDiskTree<'_>> {
         self.disk.open_unique_at(self.root, self.disk_pool_guard)
     }
 }
@@ -446,7 +479,7 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
         Self: 'a;
 
     #[inline]
-    async fn lookup(&self, key: &[Val], ts: TrxID) -> Result<Option<(RowID, bool)>> {
+    async fn lookup(&self, key: &[Val], ts: TrxID) -> RuntimeResult<Option<(RowID, bool)>> {
         if let Some(hit) = self.mem.lookup(key, ts).await? {
             return Ok(Some(hit));
         }
@@ -461,7 +494,7 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> Result<IndexInsert> {
+    ) -> RuntimeResult<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         if let Some((old_row_id, deleted)) = self.mem.lookup(key, ts).await? {
             if merge_if_match_deleted && deleted && old_row_id == row_id {
@@ -483,7 +516,7 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
         old_row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         debug_assert!(!old_row_id.is_deleted());
         self.mem
             .compare_delete(key, old_row_id, ignore_del_mask, ts)
@@ -497,7 +530,7 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> Result<IndexCompareExchange> {
+    ) -> RuntimeResult<IndexCompareExchange> {
         if self.mem.lookup(key, ts).await?.is_some() {
             return self
                 .mem
@@ -530,14 +563,14 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
         let mem = self.mem.index_scan_candidates(range, ts)?;
         let disk = self.open()?.scan_candidate_stream(range);
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 
     #[inline]
-    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
+    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
         let mem_entries = self.mem.scan_encoded_entries().await?;
         let disk = self.open()?;
         let disk_entries = disk.scan_entries().await?;
@@ -573,7 +606,7 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
     }
 
     #[inline]
-    fn open(&self) -> Result<NonUniqueDiskTree<'_>> {
+    fn open(&self) -> RuntimeResult<NonUniqueDiskTree<'_>> {
         self.disk
             .open_non_unique_at(self.root, self.disk_pool_guard)
     }
@@ -589,7 +622,7 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
         Self: 'a;
 
     #[inline]
-    async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
+    async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
         let mem_entries = self.mem.lookup_encoded_entries(key).await?;
         let disk = self.open()?;
         let disk_entries = disk.prefix_scan_entries(key).await?;
@@ -598,7 +631,12 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 
     #[inline]
-    async fn lookup_unique(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<Option<bool>> {
+    async fn lookup_unique(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> RuntimeResult<Option<bool>> {
         if let Some(mem_hit) = self.mem.lookup_unique(key, row_id, ts).await? {
             return Ok(Some(mem_hit));
         }
@@ -617,7 +655,7 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> Result<IndexInsert> {
+    ) -> RuntimeResult<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         if let Some(active) = self.mem.lookup_unique(key, row_id, ts).await? {
             if merge_if_match_deleted && !active {
@@ -633,7 +671,7 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 
     #[inline]
-    async fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
+    async fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> RuntimeResult<bool> {
         debug_assert!(!row_id.is_deleted());
         match self.mem.lookup_unique(key, row_id, ts).await? {
             Some(true) => self.mem.mask_as_deleted(key, row_id, ts).await,
@@ -652,7 +690,7 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
     }
 
     #[inline]
-    async fn mask_as_active(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
+    async fn mask_as_active(&self, key: &[Val], row_id: RowID, ts: TrxID) -> RuntimeResult<bool> {
         self.mem.mask_as_active(key, row_id, ts).await
     }
 
@@ -663,7 +701,7 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         debug_assert!(!row_id.is_deleted());
         self.mem
             .compare_delete(key, row_id, ignore_del_mask, ts)
@@ -675,7 +713,7 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
         let mem = self.mem.index_scan_candidates(range, ts)?;
         let disk = self.open()?.scan_candidate_stream(range);
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
@@ -686,14 +724,14 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
         let mem = self.mem.equal_scan_candidates(range, ts)?;
         let disk = self.open()?.scan_candidate_stream(range);
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 
     #[inline]
-    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
+    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
         let mem_entries = self.mem.scan_encoded_entries().await?;
         let disk = self.open()?;
         let disk_entries = disk.scan_entries().await?;
@@ -729,7 +767,7 @@ where
         }
     }
 
-    async fn ensure_mem(&mut self) -> Result<bool> {
+    async fn ensure_mem(&mut self) -> RuntimeResult<bool> {
         loop {
             if !self.mem_buf.is_empty() {
                 return Ok(true);
@@ -753,7 +791,7 @@ where
         }
     }
 
-    async fn ensure_disk(&mut self) -> Result<bool> {
+    async fn ensure_disk(&mut self) -> RuntimeResult<bool> {
         loop {
             if !self.disk_buf.is_empty() {
                 return Ok(true);
@@ -803,7 +841,7 @@ where
     M: IndexBatchStream<IndexLookupCandidate>,
     D: IndexBatchStream<IndexLookupCandidate>,
 {
-    async fn next_batch(&mut self) -> Result<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
         let mut out = Vec::new();
         loop {
             let mem_has = self.ensure_mem().await?;
@@ -1020,7 +1058,7 @@ mod tests {
     async fn non_unique_disk_tree_prefix_scan_rows(
         tree: &NonUniqueDiskTree<'_>,
         key: &[Val],
-    ) -> Result<Vec<RowID>> {
+    ) -> RuntimeResult<Vec<RowID>> {
         Ok(tree
             .prefix_scan_entries(key)
             .await?

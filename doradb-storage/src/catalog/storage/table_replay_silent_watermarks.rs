@@ -6,7 +6,7 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::{DataIntegrityError, DataIntegrityResult, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeError, RuntimeResult};
 use crate::id::{TableID, TrxID};
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
@@ -14,7 +14,7 @@ use crate::table::NoTrxUpsertChange;
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
@@ -46,7 +46,7 @@ impl TableReplaySilentWatermarks<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<Option<SilentWatermarkObject>> {
+    ) -> RuntimeResult<Option<SilentWatermarkObject>> {
         let key_vals = [Val::from(table_id)];
         self.table
             .index_lookup_unique_uncommitted(
@@ -56,6 +56,8 @@ impl TableReplaySilentWatermarks<'_> {
                 row_to_table_replay_silent_watermark_object,
             )
             .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| format!("operation=find_silent_watermark, table_id={table_id}"))
     }
 
     /// Upsert one caller-supplied monotonic live watermark without transaction state.
@@ -68,7 +70,7 @@ impl TableReplaySilentWatermarks<'_> {
         guards: &PoolGuards,
         obj: &SilentWatermarkObject,
         on_change: F,
-    ) -> Result<()>
+    ) -> RuntimeResult<()>
     where
         F: FnOnce(NoTrxUpsertChange),
     {
@@ -89,6 +91,13 @@ impl TableReplaySilentWatermarks<'_> {
                 on_change,
             )
             .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=upsert_silent_watermark_no_trx, table_id={}",
+                    obj.table_id
+                )
+            })
     }
 
     /// Delete one watermark row by user table id.
@@ -96,7 +105,7 @@ impl TableReplaySilentWatermarks<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         let key_vals = [Val::from(table_id)];
         let res = stmt
             .catalog_delete_primary_key_mvcc(
@@ -105,7 +114,12 @@ impl TableReplaySilentWatermarks<'_> {
                 &key_vals,
                 true,
             )
-            .await?;
+            .await
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_table_replay_silent_watermarks_delete, table_id={table_id}"
+                )
+            })?;
         Ok(matches!(res, DeleteMvcc::Deleted))
     }
 }

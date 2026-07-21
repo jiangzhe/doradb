@@ -1,6 +1,6 @@
 use crate::buffer::EvictableBufferPool;
 use crate::catalog::TableMetadata;
-use crate::error::{Error, InternalError, Result};
+use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::index::SecondaryIndex;
 use error_stack::Report;
 use std::sync::Arc;
@@ -19,58 +19,52 @@ impl TableRuntimeLayout {
         generation: u64,
         metadata: Arc<TableMetadata>,
         secondary_indexes: Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
-    ) -> Result<Self> {
+    ) -> Self {
         let layout = Self {
             generation,
             metadata,
             secondary_indexes,
         };
-        layout.validate()?;
-        Ok(layout)
+        layout.assert_valid();
+        layout
     }
 
-    /// Validate layout shape against metadata and index runtime identity.
+    /// Assert layout shape against metadata and index runtime identity.
     #[inline]
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.secondary_indexes.len() != self.metadata.idx.index_slot_count() {
-            return Err(invalid_runtime_layout(format!(
-                "slot count mismatch: runtime_slots={}, metadata_slots={}",
-                self.secondary_indexes.len(),
-                self.metadata.idx.index_slot_count()
-            )));
-        }
+    pub(crate) fn assert_valid(&self) {
+        assert_eq!(
+            self.secondary_indexes.len(),
+            self.metadata.idx.index_slot_count(),
+            "table runtime layout invariant violated: runtime_slots={}, metadata_slots={}",
+            self.secondary_indexes.len(),
+            self.metadata.idx.index_slot_count()
+        );
 
         for (index_no, _) in self.metadata.idx.active_indexes() {
-            if self
-                .secondary_indexes
-                .get(index_no)
-                .and_then(Option::as_ref)
-                .is_none()
-            {
-                return Err(invalid_runtime_layout(format!(
-                    "active metadata index missing runtime slot: index_no={index_no}"
-                )));
-            }
+            assert!(
+                self.secondary_indexes
+                    .get(index_no)
+                    .and_then(Option::as_ref)
+                    .is_some(),
+                "table runtime layout invariant violated: active metadata index missing runtime slot, index_no={index_no}"
+            );
         }
 
         for (index_no, index) in self.secondary_indexes.iter().enumerate() {
             let Some(index) = index else {
                 continue;
             };
-            if self.metadata.idx.index_spec(index_no).is_none() {
-                return Err(invalid_runtime_layout(format!(
-                    "runtime slot has no active metadata spec: index_no={index_no}"
-                )));
-            }
-            if index.index_no() != index_no {
-                return Err(invalid_runtime_layout(format!(
-                    "runtime index_no mismatch: slot={index_no}, runtime={}",
-                    index.index_no()
-                )));
-            }
+            assert!(
+                self.metadata.idx.index_spec(index_no).is_some(),
+                "table runtime layout invariant violated: runtime slot has no active metadata spec, index_no={index_no}"
+            );
+            assert_eq!(
+                index.index_no(),
+                index_no,
+                "table runtime layout invariant violated: runtime index number mismatch, slot={index_no}, runtime={}",
+                index.index_no()
+            );
         }
-
-        Ok(())
     }
 
     /// Returns the monotonic runtime layout generation.
@@ -116,7 +110,7 @@ impl TableRuntimeLayout {
     pub(crate) fn secondary_index(
         &self,
         index_no: usize,
-    ) -> Result<&SecondaryIndex<EvictableBufferPool>> {
+    ) -> RuntimeResult<&SecondaryIndex<EvictableBufferPool>> {
         self.secondary_indexes
             .get(index_no)
             .and_then(Option::as_deref)
@@ -126,7 +120,8 @@ impl TableRuntimeLayout {
                         "index_no={index_no}, index_slot_count={}",
                         self.index_slot_count()
                     ))
-                    .into()
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=resolve_secondary_index_runtime")
             })
     }
 
@@ -152,18 +147,11 @@ pub(crate) struct RetiredSecondaryIndex {
     pub(crate) index: Arc<SecondaryIndex<EvictableBufferPool>>,
 }
 
-#[inline]
-fn invalid_runtime_layout(message: impl Into<String>) -> Error {
-    Report::new(InternalError::Generic)
-        .attach(format!("invalid table runtime layout: {}", message.into()))
-        .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::catalog::{ColumnAttributes, ColumnSpec};
     use crate::table::tests::*;
     use crate::value::ValKind;
     use tempfile::TempDir;
@@ -182,20 +170,6 @@ mod tests {
         )
     }
 
-    fn metadata_with_primary_index() -> Arc<TableMetadata> {
-        Arc::new(
-            TableMetadata::try_new(
-                vec![ColumnSpec::new(
-                    "id",
-                    ValKind::I32,
-                    ColumnAttributes::empty(),
-                )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            )
-            .expect("valid table metadata"),
-        )
-    }
-
     #[test]
     fn runtime_layout_accepts_matching_empty_index_shape() {
         let metadata = metadata_without_indexes();
@@ -203,34 +177,11 @@ mod tests {
             7,
             Arc::clone(&metadata),
             Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
-        )
-        .expect("empty index layout should be valid");
+        );
 
         assert_eq!(layout.generation(), 7);
         assert_eq!(layout.metadata().idx.index_slot_count(), 0);
         assert_eq!(layout.index_slot_count(), 0);
-    }
-
-    #[test]
-    fn runtime_layout_rejects_slot_count_mismatch() {
-        let metadata = metadata_without_indexes();
-        let err = match TableRuntimeLayout::new(0, metadata, vec![None].into_boxed_slice()) {
-            Ok(_) => panic!("extra runtime slot should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(err.is_kind(crate::error::ErrorKind::Internal), "{err:?}");
-    }
-
-    #[test]
-    fn runtime_layout_rejects_active_index_without_runtime_slot() {
-        let metadata = metadata_with_primary_index();
-        let err = match TableRuntimeLayout::new(0, metadata, vec![None].into_boxed_slice()) {
-            Ok(_) => panic!("active metadata index requires runtime slot"),
-            Err(err) => err,
-        };
-
-        assert!(err.is_kind(crate::error::ErrorKind::Internal), "{err:?}");
     }
 
     #[test]
@@ -260,12 +211,10 @@ mod tests {
                 old_layout.generation() + 1,
                 metadata_without_indexes,
                 inactive_slots.into_boxed_slice(),
-            )
-            .unwrap();
+            );
 
             let installed = table_for_internal_assertion(&engine, table_id)
-                .install_runtime_layout(old_layout.generation(), new_layout)
-                .unwrap();
+                .install_runtime_layout(old_layout.generation(), new_layout);
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
             assert_eq!(installed.metadata().idx.active_index_count(), 0);
             assert_eq!(
@@ -309,49 +258,6 @@ mod tests {
             );
             assert!(
                 !table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes()
-            );
-        })
-    }
-
-    #[test]
-    fn test_runtime_layout_install_rejects_shrinking_index_slots() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let old_layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
-            assert_eq!(old_layout.index_slot_count(), 1);
-
-            let shrinking_metadata = Arc::new(
-                TableMetadata::try_new(
-                    vec![
-                        ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-                    ],
-                    vec![],
-                )
-                .expect("valid table metadata"),
-            );
-            let shrinking_layout = TableRuntimeLayout::new(
-                old_layout.generation() + 1,
-                shrinking_metadata,
-                Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
-            )
-            .unwrap();
-
-            let result = table_for_internal_assertion(&engine, table_id)
-                .install_runtime_layout(old_layout.generation(), shrinking_layout);
-            assert!(result.is_err());
-            let err = result.err().unwrap();
-            assert!(
-                format!("{err:?}").contains("new layout must not shrink sparse index slots"),
-                "{err:?}"
-            );
-            assert_eq!(
-                table_for_internal_assertion(&engine, table_id)
-                    .layout_snapshot()
-                    .generation(),
-                old_layout.generation()
             );
         })
     }

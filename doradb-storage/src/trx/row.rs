@@ -1,6 +1,7 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableColumnLayout, TableMetadata};
+use crate::error::{OperationError, OperationResult};
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::{BTreeKeyEncoder, IndexLookupCandidate};
 use crate::map::FastHashMap;
@@ -15,6 +16,7 @@ use crate::trx::undo::{
 use crate::trx::ver_map::{RowPageState, RowVersionMap, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
+use error_stack::Report;
 use event_listener::EventListener;
 use parking_lot::RwLockReadGuard;
 use std::collections::{BTreeMap, BTreeSet};
@@ -521,13 +523,13 @@ impl<'a> RowReadAccess<'a> {
         index_no: usize,
         key_vals: &[Val],
         ctx: &TrxContext,
-    ) -> FindOldVersion {
+    ) -> OperationResult<FindOldVersion> {
         let undo = match &self.state {
             RowReadState::Recover(_) => unreachable!(),
             RowReadState::RowVer(undo) => undo,
         };
         let Some(index_spec) = metadata.idx.index_spec(index_no) else {
-            return FindOldVersion::None;
+            return Ok(FindOldVersion::None);
         };
 
         match &**undo {
@@ -536,26 +538,26 @@ impl<'a> RowReadAccess<'a> {
                 if !row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
                     if !row.is_deleted() {
                         // Scenario #2
-                        return FindOldVersion::DuplicateKey;
+                        return Err(Report::new(OperationError::DuplicateKey));
                     }
                     // Scenario #3.a
-                    return FindOldVersion::None;
+                    return Ok(FindOldVersion::None);
                 }
                 // Scenario #4
-                FindOldVersion::None
+                Ok(FindOldVersion::None)
             }
             Some(undo_head) => {
                 let ts = undo_head.ts();
                 if !trx_is_committed(ts) && !ctx.is_same_trx(undo_head) {
                     // Scenario #1.a
-                    return FindOldVersion::WriteConflict;
+                    return Err(Report::new(OperationError::WriteConflict));
                 }
                 let row = self.row();
                 // Old row matches key.
                 if !row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
                     if !row.is_deleted() {
                         // Scenario #2
-                        return FindOldVersion::DuplicateKey;
+                        return Err(Report::new(OperationError::DuplicateKey));
                     }
                     // Scenario #3.b
                     // The first undo entry must be DELETE as page data is deleted.
@@ -569,7 +571,11 @@ impl<'a> RowReadAccess<'a> {
                     ));
                     // Collect old row to calculate delta for link.
                     let old_row = row.clone_vals(metadata.col.as_ref());
-                    return FindOldVersion::Ok(old_row, ts, undo_head.next.main.entry.clone());
+                    return Ok(FindOldVersion::Found(
+                        old_row,
+                        ts,
+                        undo_head.next.main.entry.clone(),
+                    ));
                 }
                 // Old row does not match key.
                 // Traverse version chain to find matched version.
@@ -600,14 +606,14 @@ impl<'a> RowReadAccess<'a> {
                     }
                     // Here we check if current version matches input key
                     if !deleted && metadata.idx.match_key(index_no, key_vals, &vals) {
-                        return FindOldVersion::Ok(vals, cts, entry);
+                        return Ok(FindOldVersion::Found(vals, cts, entry));
                     }
                     // We only need to go through main branch, because Index
                     // branch won't have different key than those in main
                     // branch.
                     match entry.as_ref().next.as_ref() {
                         None => {
-                            return FindOldVersion::None;
+                            return Ok(FindOldVersion::None);
                         }
                         Some(next) => {
                             cts = next.main.status.ts();
@@ -1459,11 +1465,7 @@ pub(crate) enum LockRowForWrite<'a> {
 /// Result of searching a row's old versions for a unique-key owner.
 pub(crate) enum FindOldVersion {
     /// Matching old version found with values, timestamp, and undo entry.
-    Ok(Vec<Val>, TrxID, RowUndoRef),
-    /// Another active transaction owns a conflicting old version.
-    WriteConflict,
-    /// A visible old version already owns the unique key.
-    DuplicateKey,
+    Found(Vec<Val>, TrxID, RowUndoRef),
     /// No matching old version exists.
     None,
 }
@@ -1922,6 +1924,6 @@ pub(crate) mod tests {
         let res =
             access.find_old_version_for_unique_key(&metadata, key.index_no, &key.vals, &trx_ctx);
 
-        assert!(matches!(res, FindOldVersion::None));
+        assert!(matches!(res, Ok(FindOldVersion::None)));
     }
 }

@@ -876,7 +876,7 @@ mod tests {
         install_storage_backend_test_hook,
     };
     use crate::lock::tests::{debug_snapshot, try_acquire};
-    use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::session::tests::{SessionTestExt, session_registry_len};
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
     use crate::trx::tests::add_pseudo_redo_log_entry;
@@ -1749,7 +1749,7 @@ mod tests {
             assert_runtime_unavailable_after_shutdown(err);
 
             let err = match session
-                .lock_table(TableID::new(91_300), LockMode::Shared)
+                .lock_table(TableID::new(91_300), TableLockMode::Shared)
                 .await
             {
                 Ok(_) => panic!("expected shutdown error"),
@@ -1835,7 +1835,7 @@ mod tests {
             assert_eq!(err.report().downcast_ref::<usize>().copied(), Some(1));
 
             let err = trx
-                .lock_table(table_id, LockMode::Shared)
+                .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap_err();
             assert_runtime_unavailable_after_shutdown(err);
@@ -2111,7 +2111,9 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let owner = LockOwner::Transaction(trx.trx_id());
 
-            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            trx.lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap();
             assert!(lock_entry_count(&engine, owner) > 0);
 
             drop(trx);
@@ -2137,7 +2139,9 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let owner = LockOwner::Transaction(trx.trx_id());
 
-            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            trx.lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap();
             assert!(lock_entry_count(&engine, owner) > 0);
 
             let checkout = trx.checkout().unwrap();

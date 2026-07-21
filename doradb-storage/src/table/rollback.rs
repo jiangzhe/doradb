@@ -1,13 +1,13 @@
 use super::{MemTable, Table, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::CatalogTable;
-use crate::error::{Error, InternalError, Result};
+use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::id::{RowID, TrxID};
 use crate::index::util::Maskable;
 use crate::index::{IndexCompareExchange, NonUniqueIndex, UniqueIndex};
 use crate::row::ops::SelectKey;
 use crate::trx::undo::{IndexUndo, IndexUndoKind};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 
 /// Rollback adapter for table-specific secondary-index runtimes.
 ///
@@ -32,7 +32,7 @@ pub(crate) trait IndexRollback {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool>;
+    ) -> RuntimeResult<bool>;
 
     /// Removes a unique entry when the current value matches `row_id`.
     async fn unique_compare_delete(
@@ -42,7 +42,7 @@ pub(crate) trait IndexRollback {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool>;
+    ) -> RuntimeResult<bool>;
 
     /// Atomically replaces a unique entry when the current value matches.
     async fn unique_compare_exchange(
@@ -52,7 +52,7 @@ pub(crate) trait IndexRollback {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> Result<IndexCompareExchange>;
+    ) -> RuntimeResult<IndexCompareExchange>;
 
     /// Marks an existing non-unique exact entry as deleted.
     async fn non_unique_mask_as_deleted(
@@ -61,7 +61,7 @@ pub(crate) trait IndexRollback {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool>;
+    ) -> RuntimeResult<bool>;
 
     /// Marks an existing non-unique exact entry as active.
     async fn non_unique_mask_as_active(
@@ -70,7 +70,7 @@ pub(crate) trait IndexRollback {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool>;
+    ) -> RuntimeResult<bool>;
 
     /// Removes a non-unique exact entry when the current value matches.
     async fn non_unique_compare_delete(
@@ -80,7 +80,7 @@ pub(crate) trait IndexRollback {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool>;
+    ) -> RuntimeResult<bool>;
 
     /// Rolls back one secondary-index undo entry against this table runtime.
     async fn rollback_index_entry(
@@ -88,9 +88,18 @@ pub(crate) trait IndexRollback {
         entry: IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let table = self.mem_table();
-        let index_pool_guard = table.index_pool_guard(guards)?;
+        let index_pool_guard = table
+            .index_pool_guard(guards)
+            .change_context(RuntimeError::IndexAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=rollback_index_entry, table_id={}, row_id={}",
+                    table.table_id(),
+                    entry.row_id
+                )
+            })?;
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 if merge_old_deleted {
@@ -202,7 +211,7 @@ impl IndexRollback for UserTableRollback<'_> {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .unique_mem()?
@@ -219,7 +228,7 @@ impl IndexRollback for UserTableRollback<'_> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .unique_mem()?
@@ -236,7 +245,7 @@ impl IndexRollback for UserTableRollback<'_> {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> Result<IndexCompareExchange> {
+    ) -> RuntimeResult<IndexCompareExchange> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .unique_mem()?
@@ -252,7 +261,7 @@ impl IndexRollback for UserTableRollback<'_> {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .non_unique_mem()?
@@ -268,7 +277,7 @@ impl IndexRollback for UserTableRollback<'_> {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .non_unique_mem()?
@@ -285,7 +294,7 @@ impl IndexRollback for UserTableRollback<'_> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         let index = self.layout.secondary_index(key.index_no)?;
         index
             .non_unique_mem()?
@@ -304,7 +313,7 @@ impl Table {
         entry: IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         UserTableRollback {
             table: self,
             layout,
@@ -330,11 +339,16 @@ impl IndexRollback for CatalogTable {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         self.mem
             .require_sec_idx(key.index_no)?
             .unique()
-            .ok_or_else(|| secondary_index_kind_mismatch("rollback_unique_mask_deleted", "unique"))?
+            .ok_or_else(|| {
+                Report::new(InternalError::SecondaryIndexKindMismatch)
+                    .attach("operation=rollback_unique_mask_deleted, expected=unique")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=rollback_secondary_index_entry")
+            })?
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
             .await
@@ -348,12 +362,15 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         self.mem
             .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback_unique_compare_delete", "unique")
+                Report::new(InternalError::SecondaryIndexKindMismatch)
+                    .attach("operation=rollback_unique_compare_delete, expected=unique")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=rollback_secondary_index_entry")
             })?
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
@@ -368,12 +385,15 @@ impl IndexRollback for CatalogTable {
         old_row_id: RowID,
         new_row_id: RowID,
         ts: TrxID,
-    ) -> Result<IndexCompareExchange> {
+    ) -> RuntimeResult<IndexCompareExchange> {
         self.mem
             .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback_unique_compare_exchange", "unique")
+                Report::new(InternalError::SecondaryIndexKindMismatch)
+                    .attach("operation=rollback_unique_compare_exchange, expected=unique")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=rollback_secondary_index_entry")
             })?
             .bind(index_pool_guard)
             .compare_exchange(&key.vals, old_row_id, new_row_id, ts)
@@ -387,12 +407,15 @@ impl IndexRollback for CatalogTable {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         self.mem
             .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback_non_unique_mask_deleted", "non_unique")
+                Report::new(InternalError::SecondaryIndexKindMismatch)
+                    .attach("operation=rollback_non_unique_mask_deleted, expected=non_unique")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=rollback_secondary_index_entry")
             })?
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
@@ -406,12 +429,15 @@ impl IndexRollback for CatalogTable {
         key: &SelectKey,
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         self.mem
             .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback_non_unique_mask_active", "non_unique")
+                Report::new(InternalError::SecondaryIndexKindMismatch)
+                    .attach("operation=rollback_non_unique_mask_active, expected=non_unique")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=rollback_secondary_index_entry")
             })?
             .bind(index_pool_guard)
             .mask_as_active(&key.vals, row_id, ts)
@@ -426,24 +452,20 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         self.mem
             .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
-                secondary_index_kind_mismatch("rollback_non_unique_compare_delete", "non_unique")
+                Report::new(InternalError::SecondaryIndexKindMismatch)
+                    .attach("operation=rollback_non_unique_compare_delete, expected=non_unique")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=rollback_secondary_index_entry")
             })?
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
     }
-}
-
-#[inline]
-fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str) -> Error {
-    Report::new(InternalError::SecondaryIndexKindMismatch)
-        .attach(format!("operation={operation}, expected={expected}"))
-        .into()
 }
 
 #[cfg(test)]

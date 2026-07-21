@@ -48,16 +48,12 @@ impl OwnerLockState {
 
     /// Returns whether the cached lock mode covers the requested mode.
     #[inline]
-    pub(crate) fn cached_covers(
-        &self,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> OperationResult<bool> {
+    pub(crate) fn cached_covers(&self, resource: LockResource, mode: LockMode) -> bool {
         match self.held.get(&resource).copied() {
             Some(held) => held.covers(resource, mode),
             None => {
-                mode.validate_for(resource)?;
-                Ok(false)
+                mode.assert_valid_for(resource);
+                false
             }
         }
     }
@@ -73,7 +69,7 @@ impl OwnerLockState {
         resource: LockResource,
         mode: LockMode,
     ) -> OperationResult<()> {
-        if self.cached_covers(resource, mode)? {
+        if self.cached_covers(resource, mode) {
             return Ok(());
         }
         match self.owner_group {
@@ -98,7 +94,7 @@ impl OwnerLockState {
         resource: LockResource,
         mode: LockMode,
     ) -> OperationResult<LockGrant> {
-        if self.cached_covers(resource, mode)? {
+        if self.cached_covers(resource, mode) {
             return Ok(LockGrant::Existing);
         }
         match self.owner_group {
@@ -118,10 +114,12 @@ impl OwnerLockState {
     /// Records a lock grant in the owner-local cache.
     #[inline]
     pub(crate) fn cache_granted(&mut self, resource: LockResource, mode: LockMode) {
+        mode.assert_valid_for(resource);
         if let Some(held) = self.held.get(&resource).copied() {
-            debug_assert!(
-                mode.covers(resource, held).unwrap_or(false),
-                "newly granted lock mode must cover the previous cached mode"
+            assert!(
+                mode.covers(resource, held),
+                "granted lock cache invariant violated: resource={resource}, \
+                 previous_mode={held}, new_mode={mode}"
             );
         }
         self.held.insert(resource, mode);
@@ -208,7 +206,7 @@ mod tests {
                 .acquire(&manager, resource, LockMode::Exclusive)
                 .await
                 .unwrap();
-            assert!(state.cached_covers(resource, LockMode::Shared).unwrap());
+            assert!(state.cached_covers(resource, LockMode::Shared));
             state
                 .acquire(&manager, resource, LockMode::Shared)
                 .await
@@ -245,7 +243,7 @@ mod tests {
                 LockGrant::Fresh
             );
 
-            assert!(!state.cached_covers(resource, LockMode::Shared).unwrap());
+            assert!(!state.cached_covers(resource, LockMode::Shared));
             assert!(has_entry(&manager, resource, LockMode::Shared, owner, None));
             assert_eq!(state.release_all(&manager), 0);
             assert!(has_entry(&manager, resource, LockMode::Shared, owner, None));
@@ -268,7 +266,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(state.owner_group(), Some(owner_group));
-            assert!(state.cached_covers(resource, LockMode::Shared).unwrap());
+            assert!(state.cached_covers(resource, LockMode::Shared));
             assert!(has_entry(
                 &manager,
                 resource,
@@ -299,12 +297,8 @@ mod tests {
                 OperationError::LockConversionNotSupported,
             );
 
-            assert!(
-                state
-                    .cached_covers(resource, LockMode::IntentExclusive)
-                    .unwrap()
-            );
-            assert!(!state.cached_covers(resource, LockMode::Shared).unwrap());
+            assert!(state.cached_covers(resource, LockMode::IntentExclusive));
+            assert!(!state.cached_covers(resource, LockMode::Shared));
             assert_eq!(owner_entry_count(&manager, owner), 1);
             assert!(has_entry(
                 &manager,
@@ -316,23 +310,6 @@ mod tests {
 
             assert_eq!(state.release_all(&manager), 1);
         });
-    }
-
-    #[test]
-    fn cached_covers_validates_requested_mode() {
-        let resource = table_metadata(50);
-        let mut state = OwnerLockState::new(trx(5));
-
-        assert_operation_err(
-            state.cached_covers(resource, LockMode::IntentShared),
-            OperationError::InvalidLockMode,
-        );
-
-        state.cache_granted(resource, LockMode::Shared);
-        assert_operation_err(
-            state.cached_covers(resource, LockMode::IntentExclusive),
-            OperationError::InvalidLockMode,
-        );
     }
 
     #[test]

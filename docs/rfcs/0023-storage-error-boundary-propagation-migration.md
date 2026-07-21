@@ -793,7 +793,7 @@ RFC. [D17], [D18]
   - Implementation Summary: Implemented typed infrastructure error boundaries across IO, file, buffer, log, configuration, catalog, and targeted transaction completion paths; preserved source reports through Runtime and Completion contexts; validated both IO backends and deferred lower rollback supplier narrowing to Phase 3. [Task Resolve Sync: docs/tasks/000228-typed-infrastructure-error-boundaries.md @ 2026-07-18]
   - Related Backlogs:
     - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
-    - `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
+    - `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 2: Completion Bridge and Infrastructure Closure**
   - Scope: Replace completion transport in `error` and `io::completion`, then
@@ -850,7 +850,7 @@ RFC. [D17], [D18]
   - Implementation Summary: Implemented the Arc-backed CompletionErrorBridge with checked ordered replay, lazy per-owner reconstruction, concrete BackendError progress transport, SharedFatalError poison propagation, and end-to-end producer and consumer migration; validated both IO backends and representative focused coverage. [Task Resolve Sync: docs/tasks/000229-completion-bridge-and-infrastructure-closure.md @ 2026-07-20]
   - Related Backlogs:
     - `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
-    - `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
+    - `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 3: Stateful Storage and Semantic Consumers**
   - Scope: Audit `row`, `index`, `table`, and `catalog`, including their
@@ -867,8 +867,10 @@ RFC. [D17], [D18]
     validation, checkpoint delay, and cancellation caller-neutral until their
     semantic consumer; map foreground conflicts to Operation and invalid replay
     to DataIntegrity; remove domain-to-public-to-domain round trips; justify
-    any mixed `TableAccess`, index, or catalog orchestration seam. [D1], [D16],
-    [C16], [U7]
+    any mixed `TableAccess`, index, or catalog orchestration seam. The remaining
+    production proof for fixed metadata-pool reachability, required
+    `PoolGuards`, and row-page-index cursor traversal is explicitly carried by
+    backlog 000159 into Phase 4. [D1], [D16], [C16], [U7]
   - Non-goals: Change index/table persistence formats or checkpoint semantics;
     redesign public statement/session APIs; classify a generic producer as
     Fatal merely because one coordinator may poison on its failure.
@@ -876,26 +878,31 @@ RFC. [D17], [D18]
     contracts and completion cases used by these modules are stable, and the
     Arc-backed bridge preserves typed source frames without temporary public
     reconstruction.
-  - Phase-local Choices: Exact decomposition or associated-error shape for
-    index traits; which proven fixed-pool failures become assertions versus
-    specific typed Internal reports; which blocked invariant proof or domain
-    change needs a tracked Generic TODO; the minimal genuine mixed seams
-    retained in table and catalog orchestration.
+  - Phase-local Choices: Implemented narrow index traits and peer-domain
+    carriers without introducing a generic error-set framework; retained
+    neutral semantic outcomes until foreground/replay consumers; and limited
+    table/catalog public convergence to documented facade or mixed seams. The
+    fixed-pool invariant proof remains tracked by backlog 000159 instead of
+    treating synthetic pool failures as production evidence.
   - After This Phase: Transaction and recovery orchestration receive typed
     storage failures plus explicit neutral outcomes and own all foreground-
-    versus-replay interpretation; row/index/table/catalog contain no
-    unreviewed Internal producer or unannotated Generic fallback.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    versus-replay interpretation; row/index/table/catalog contain no production
+    unannotated Generic fallback. Backlog 000159 is the explicit remaining
+    fixed-pool/guard/cursor invariant review, and final error-spec refinement is
+    deferred to Phase 4.
+  - Task Doc: `docs/tasks/000230-stateful-storage-runtime-boundaries-and-semantic-consumers.md`
+  - Task Issue: `#868`
+  - Phase Status: done
+  - Implementation Summary: Implemented typed stateful-storage Runtime boundaries, peer-domain carriers, neutral semantic outcomes, typed checkpoint/catalog/rollback flows, and strict monotonic Fatal completion propagation; validated both IO backends. Fixed-pool invariant proof in backlog 000159 and final error-spec refinement remain Phase 4 work. [Task Resolve Sync: docs/tasks/000230-stateful-storage-runtime-boundaries-and-semantic-consumers.md @ 2026-07-21]
   - Related Backlogs:
     - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
-    - `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
+    - `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 4: Orchestration, Public Convergence, and Documentation Closure**
   - Scope: Audit `trx`, `recovery`, `session`, `engine`, statement/stream
-    facades, and `lib.rs`; then review every top-level module against the final
+    facades, and `lib.rs`; complete backlog 000159's production ownership proof
+    for fixed metadata pools, required `PoolGuards`, and row-page-index cursor
+    traversal; then review every top-level module against the final
     responsibility model. [D1], [D2], [D7], [D8], [C2], [C11]-[C13]
   - Goals: Narrow reusable transaction, rollback, purge, retention, recovery
     stream, planning, replay, admission, and construction helpers; preserve
@@ -904,15 +911,17 @@ RFC. [D17], [D18]
     coverage, including outer consumers of the Arc-backed bridge; audit and
     reclassify the remaining transaction/recovery/session/engine Internal
     producers; require structured TODOs for any infeasible Generic residue;
-    update the implementation snapshot, completion contract, and module
-    blueprint in `docs/error-spec.md`; resolve the source backlogs when their acceptance
-    criteria are met. [D1], [D16], [C16], [U7]
+    refine and simplify the implementation snapshot, completion contract,
+    mixed-boundary inventory, and module blueprint in `docs/error-spec.md`
+    after the final code audit; resolve the source backlogs when their
+    acceptance criteria are met. [D1], [D16], [C16], [U7]
   - Non-goals: Remove the public storage error wrapper, add a new generic
     error-set architecture, or alter public operation/lifecycle behavior solely
     to simplify typing.
   - Prerequisites: Phase 3 has fixed the foreground-versus-recovery semantic
     boundaries and no lower module requires an unclassified public-result
-    adapter.
+    adapter. Backlog 000159 is an explicit accepted carryover rather than an
+    untracked Phase 3 boundary.
   - Phase-local Choices: The exact grouping of focused fault-injection tests
     and the clearest final documentation of approved public and mixed-domain
     convergence sites.
@@ -925,6 +934,7 @@ RFC. [D17], [D18]
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
+    - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
     - `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
 
 ## Test Strategy and Acceptance

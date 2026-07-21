@@ -1,7 +1,7 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
-use crate::error::Result;
+use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 #[cfg(test)]
 use crate::index::btree::BTreeKeyEncoder;
@@ -41,7 +41,7 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
         key: &[Val],
         res: &mut Vec<RowID>,
         ts: TrxID,
-    ) -> impl Future<Output = Result<()>>;
+    ) -> impl Future<Output = RuntimeResult<()>>;
 
     /// Lookup key and value(row_id) uniquely.
     /// Return None if not found.
@@ -51,7 +51,7 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> impl Future<Output = Result<Option<bool>>>;
+    ) -> impl Future<Output = RuntimeResult<Option<bool>>>;
 
     /// Insert key value pair into the index.
     /// Value is always RowID.
@@ -61,7 +61,7 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> impl Future<Output = Result<IndexInsert>>;
+    ) -> impl Future<Output = RuntimeResult<IndexInsert>>;
 
     /// Mask a given key value as deleted.
     fn mask_as_deleted(
@@ -69,7 +69,7 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> impl Future<Output = Result<bool>>;
+    ) -> impl Future<Output = RuntimeResult<bool>>;
 
     /// Mask a given key value as not deleted.
     fn mask_as_active(
@@ -77,7 +77,7 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> impl Future<Output = Result<bool>>;
+    ) -> impl Future<Output = RuntimeResult<bool>>;
 
     /// Delete key value pair from the index.
     /// Value is always RowID.
@@ -87,11 +87,15 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> impl Future<Output = Result<bool>>;
+    ) -> impl Future<Output = RuntimeResult<bool>>;
 
     /// Scan values into given collection.
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
-    fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> impl Future<Output = Result<()>>;
+    fn scan_values(
+        &self,
+        values: &mut Vec<RowID>,
+        ts: TrxID,
+    ) -> impl Future<Output = RuntimeResult<()>>;
 
     /// Scan lookup candidates over a bounded encoded-key range.
     ///
@@ -104,14 +108,14 @@ pub(crate) trait NonUniqueIndex: Send + Sync {
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::LookupCandidateStream<'a>>;
+    ) -> RuntimeResult<Self::LookupCandidateStream<'a>>;
 
     /// Scan lookup candidates equal to one encoded secondary-key range.
     fn equal_scan_candidates<'a>(
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> Result<Self::LookupCandidateStream<'a>>;
+    ) -> RuntimeResult<Self::LookupCandidateStream<'a>>;
 }
 
 /// Generic non-unique-index implementation backed by a generic B-Tree.
@@ -135,7 +139,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
         index_spec: &IndexSpec,
         ty_infer: F,
         ts: TrxID,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         debug_assert!(!index_spec.unique());
         debug_assert!(!index_spec.cols.is_empty());
         let mut types: Vec<_> = index_spec
@@ -171,7 +175,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
 
     /// Destroy this non-unique index and reclaim all backing tree pages.
     #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
         self.0.destroy(pool_guard).await
     }
 
@@ -187,7 +191,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         debug_assert!(!row_id.is_deleted());
         let key = self.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -218,7 +222,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
         &self,
         pool_guard: &PoolGuard,
         key: &[Val],
-    ) -> Result<Vec<MemIndexEntry>> {
+    ) -> RuntimeResult<Vec<MemIndexEntry>> {
         let key = self
             .encoder()
             .encode_prefix(key, Some(mem::size_of::<RowID>()));
@@ -238,7 +242,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
     pub(crate) async fn scan_encoded_entries(
         &self,
         pool_guard: &PoolGuard,
-    ) -> Result<Vec<MemIndexEntry>> {
+    ) -> RuntimeResult<Vec<MemIndexEntry>> {
         self.0
             .scan_encoded_entries::<NonUniqueMemIndexEntryScanSpec>(pool_guard)
             .await
@@ -286,7 +290,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
         encoded_key: &[u8],
         deleted: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         Ok(matches!(
             self.tree()
                 .delete_exact(pool_guard, encoded_key, BTREE_BYTE_ZERO, deleted, ts)
@@ -306,7 +310,10 @@ pub(crate) struct GuardedNonUniqueMemIndex<'a, 'g, P: 'static> {
 impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
     /// Scan exact MemIndex entries for one logical key with encoded keys.
     #[inline]
-    pub(crate) async fn lookup_encoded_entries(&self, key: &[Val]) -> Result<Vec<MemIndexEntry>> {
+    pub(crate) async fn lookup_encoded_entries(
+        &self,
+        key: &[Val],
+    ) -> RuntimeResult<Vec<MemIndexEntry>> {
         self.index
             .lookup_encoded_entries(self.pool_guard, key)
             .await
@@ -319,7 +326,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         self.index
             .insert_delete_overlay_if_absent(self.pool_guard, key, row_id, ts)
             .await
@@ -327,7 +334,7 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
 
     /// Scan all exact MemIndex entries with encoded keys and delete state.
     #[inline]
-    pub(crate) async fn scan_encoded_entries(&self) -> Result<Vec<MemIndexEntry>> {
+    pub(crate) async fn scan_encoded_entries(&self) -> RuntimeResult<Vec<MemIndexEntry>> {
         self.index.scan_encoded_entries(self.pool_guard).await
     }
 }
@@ -339,7 +346,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
         Self: 'a;
 
     #[inline]
-    async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
+    async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
         let k = self
             .index
             .encoder()
@@ -352,7 +359,12 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    async fn lookup_unique(&self, key: &[Val], row_id: RowID, _ts: TrxID) -> Result<Option<bool>> {
+    async fn lookup_unique(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        _ts: TrxID,
+    ) -> RuntimeResult<Option<bool>> {
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(self
             .index
@@ -369,7 +381,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> Result<IndexInsert> {
+    ) -> RuntimeResult<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -392,7 +404,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    async fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
+    async fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> RuntimeResult<bool> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -415,7 +427,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    async fn mask_as_active(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
+    async fn mask_as_active(&self, key: &[Val], row_id: RowID, ts: TrxID) -> RuntimeResult<bool> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -444,7 +456,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
         Ok(
@@ -471,7 +483,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         _ts: TrxID,
-    ) -> Result<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
         Ok(NonUniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,
@@ -483,7 +495,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
         &'a self,
         range: &'a KeyRange,
         _ts: TrxID,
-    ) -> Result<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
         Ok(NonUniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,
@@ -491,7 +503,7 @@ impl<P: BufferPool> NonUniqueIndex for GuardedNonUniqueMemIndex<'_, '_, P> {
     }
 
     #[inline]
-    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> Result<()> {
+    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
         let mut cursor = self.index.tree().cursor(self.pool_guard, 0);
         cursor.seek(&[]).await?;
         while let Some(g) = cursor.next().await? {
@@ -509,7 +521,7 @@ struct CollectRowID<'a>(&'a mut Vec<RowID>);
 
 impl BTreeSlotCallback for CollectRowID<'_> {
     #[inline]
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool> {
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> RuntimeResult<bool> {
         // todo: with covering index support, we may skip deleted entries.
         let value = node.unpack_value::<BTreeU64>(slot);
         // The result collection may contain row ids from deleted entries.
@@ -522,7 +534,7 @@ struct CollectEncodedExactEntries<'a>(&'a mut Vec<MemIndexEntry>);
 
 impl BTreeSlotCallback for CollectEncodedExactEntries<'_> {
     #[inline]
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool> {
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> RuntimeResult<bool> {
         // In-memory BTree slot data has already been validated by the scanner.
         push_non_unique_encoded_entry(node, slot, self.0)?;
         Ok(true)
@@ -682,7 +694,7 @@ mod tests {
                 .await
                 .expect_err("malformed exact key should fail encoded-entry lookup");
             assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
+                err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::MemIndexKeyMalformed)
             );
         })

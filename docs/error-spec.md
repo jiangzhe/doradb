@@ -77,7 +77,7 @@ is a genuine mixed-domain seam.
 | Domain | Result type | Meaning | Principal modules |
 | --- | --- | --- | --- |
 | Configuration | `ConfigResult<T>` | Invalid startup, static configuration, paths, or durable layout | `conf`, engine/bootstrap, file setup, log configuration |
-| Operation | `OperationResult<T>` | A valid request cannot complete in the current logical state | `lock`, `catalog`, table DML and operation orchestration |
+| Operation | `OperationResult<T>` | A foreground request is invalid or cannot complete in the current logical state | `lock`, `catalog`, table DDL/DML and operation orchestration |
 | Resource | `ResourceResult<T>` | Memory, buffer, file, or other capacity exhaustion | `buffer`, file allocation, indexes, log, transaction runtime |
 | IO | `IoResult<T>`; backend progress uses `BackendResult<T>` until a reporting boundary | OS, backend, short-IO, or transport failures | `io`, `file`, `buffer`, `log`, recovery streams |
 | Data integrity | `DataIntegrityResult<T>` | Invalid or corrupted persisted bytes and recovery invariants | `serde`, `value`, `file`, `log`, `lwc`, persisted indexes, catalog/table recovery |
@@ -90,6 +90,29 @@ The domain enums are crate-private and generally fieldless. Examples include
 `OperationError`, `DataIntegrityError`, and `InternalError`. Fieldless variants
 provide stable classifications without embedding table IDs, paths, byte
 counts, or operation names into the enum shape.
+
+Index mutation helpers that can terminate with either a semantic foreground
+failure or a mechanical table/index failure use
+`OperationOrRuntimeResult<T>`. Its carrier owns either
+`Report<OperationError>` or `Report<RuntimeError>` directly, supports `?` from
+both native result types, and is not itself an `error-stack` context. Purely
+non-unique and row-ID-only mutation helpers remain `RuntimeResult<T>`. The
+carrier is converted outward at the existing foreground table-access seam,
+where row allocation may independently contribute an already-Fatal public
+failure; it is never reconstructed from public `Error` or used to absorb that
+Fatal domain.
+
+Multi-domain carriers use the crate-local `MultiDomainResultExt::attach_with`
+to add diagnostics without changing their error type. They deliberately do not
+implement `error_stack::ResultExt` or `IntoReport`, because either route would
+collapse the peer reports into one context instead of preserving their native
+domains.
+
+`RuntimeOrFatalResultExt` extends that shared attachment surface with the only
+permitted peer-domain context transformation: replacing an ordinary Runtime
+context while leaving an existing Fatal report unchanged. Operation-or-Runtime
+carriers expose no corresponding context-changing extension, so terminal
+Operation reports cannot be reclassified through result chaining.
 
 ### Caller-neutral and transport domains
 
@@ -217,16 +240,24 @@ Same-domain callers use `?` without changing context. They may attach facts
 owned by that caller, but must not invent a new classification.
 
 ```rust
-fn validate_lock_requests(
-    requests: &[(LockResource, LockMode)],
+async fn acquire_table_write_lock(
+    lock_state: &mut OwnerLockState,
+    lock_manager: &LockManager,
+    table_id: TableID,
 ) -> OperationResult<()> {
-    for (position, (resource, mode)) in requests.iter().copied().enumerate() {
-        mode.validate_for(resource)
-            .attach_with(|| format!("request_position={position}"))?;
-    }
-    Ok(())
+    lock_state
+        .acquire(
+            lock_manager,
+            LockResource::TableData(table_id),
+            LockMode::IntentExclusive,
+        )
+        .await
 }
 ```
+
+The resource/mode pair above is an internal construction contract. The lock
+manager asserts that contract in release builds; `OperationResult` carries only
+failures that can arise from a valid lock request.
 
 Avoid repeating attachments already produced by the callee. Each layer should
 add only information newly owned or known at that layer.
@@ -504,7 +535,12 @@ pub(crate) enum RuntimeError {
     BufferPageAllocation,
     BufferPageAccess,
     FileRootAccess,
-    RedoLogDiscovery,
+    RedoLogAccess,
+    IndexAccess,
+    TableAccess,
+    CatalogAccess,
+    CheckpointExecution,
+    SystemTransactionCommit,
 }
 
 // Public boundary classification, defined in error.rs.
@@ -556,11 +592,14 @@ Runtime classification. This preserves the existing Fatal policy for IO and
 send failure without treating validation, allocation, or invariant failures as
 IO.
 
-Redo file-family discovery is an engine-owned Runtime operation because it
-combines directory IO with validation of durable filename and sequence state.
-`discover_redo_log_files` and obsolete-prefix listing return `RuntimeResult`
-with `RedoLogDiscovery`, retaining `IoError` or the specific
-DataIntegrity filename, duplicate-sequence, or sequence-gap report beneath it.
+Redo discovery, recovery planning, and stream access are engine-owned Runtime
+operations. `discover_redo_log_files`, obsolete-prefix listing, replay planners,
+and the direct-IO redo stream return `RuntimeResult` with `RedoLogAccess`.
+They retain directory/direct-IO reports and specific DataIntegrity filename,
+sequence, super-block, checksum, or payload reports beneath that context.
+Transaction payload decoding remains `DataIntegrityResult`; asynchronous
+worker, channel, completion-order, and owned-buffer protocol failures retain
+the specific `InternalError::RedoReadProtocolInvariant` source.
 
 `RuntimeError` is not a permitted completion capture root. Buffer workers
 capture their native IO, DataIntegrity, Lifecycle, Resource, Fatal, or Internal
@@ -603,13 +642,13 @@ preselect variants for migration.
 | `poison` | Silent first-wins Fatal publisher and shared engine-health state. A later admission check may stack Lifecycle over the retained Fatal source. | Accept only complete Fatal reports/wrappers, store the first `SharedFatalError` privately, return each caller's local failure directly, and leave attachments plus logging to the actual policy owner. Components access it directly rather than through a transaction-system facade. |
 | `io` | `Backend::setup` uses central `IoResult` for defensive depth validation and kernel initialization. Runtime submit, wait, and retry progress use `BackendResult<T> = Result<T, BackendError>` until a completion, Fatal, or public reporting boundary; `CompletionResult` is cross-thread transport only. Static configuration validation may still reject invalid configured depths as Config before setup. | Keep `BackendError` as an IO-local common record with private operation-specific detail, convert it once at the reporting boundary, preserve IO `InvalidInput` for direct setup-depth rejection, and retain native kernel setup errors and structured backend diagnostics. |
 | `file`: sparse/raw access | IO for OS filename representation and OS operations; Resource for address-space or file-capacity exhaustion. | Keep interior-NUL `NulError` beneath `IoErrorKind::InvalidFilename`, preserve typed sparse-file create/open reports through IO-only wrappers, and attach operation, path, offset, and size at their owning boundary. |
-| `file`: metadata and CoW | Runtime `FileRootAccess` for active-root loading and publication over retained Buffer access, DataIntegrity, Resource, Internal, or Completion reports; DataIntegrity for persisted metadata suppliers; Internal or assertions for trusted CoW ownership and mutable-root invariants. | Keep root forwarding Runtime-typed until a mixed/public boundary, preserve typed fsync completion transport, and distinguish persisted validation from mutation invariants. |
+| `file`: metadata and CoW | Runtime `FileRootAccess` for active-root loading and publication over retained Buffer access, DataIntegrity, Resource, Internal, or Completion reports; DataIntegrity for format, version, checksum, decode, and root-shape validation; assertions for schema metadata serialized only from a validated `TableMetadata`, trusted CoW ownership, and mutable-root invariants. | Keep root forwarding Runtime-typed until a mixed/public boundary, preserve typed fsync completion transport, and distinguish physical persisted-data validation from trusted semantic reconstruction. |
 | `file`: background workers | Completion for handoff. Fatal is valid only where a durability worker determines that safe continuation has been lost, retaining the IO source. Runtime covers failure to create the worker itself. | Propagate `BackgroundSpawn` during component construction and audit broad `report_error` transport. |
 | `buffer`: fixed and arena storage | Resource for constructor/allocation capacity; Internal or assertions for trusted page identity, type, and ownership invariants. Engine component construction stacks `BufferPoolInit`, page allocation stacks `BufferPageAllocation`, and page lookup stacks `BufferPageAccess` above the retained leaf report. | Keep reusable constructors Resource-typed; make fallible `BufferPool` operations Runtime-typed and attach pool type, role, operation, and page identity at the operation owner. |
 | `buffer`: evictable and readonly storage | Resource, Lifecycle, IO, DataIntegrity, Completion, and Internal according to the failing phase. Initialization uses `BufferPoolInit`; mutable allocation uses `BufferPageAllocation`; mutable and readonly lookup use `BufferPageAccess`. Reservations remain Lifecycle-typed. | Add Runtime only at the owning build/allocation/access boundary, retain native completion frames, and identify the pool plus page or block target without changing reservation or IO control flow. |
 | `buffer`: persisted validation | DataIntegrity belongs to the supplied validator and remains preserved through load completion beneath `BufferPageAccess`. | Keep validation frames structured rather than rebuilding them as buffer errors. |
 | `log`: format and recovery reads | DataIntegrity for headers, checksums, payloads, filenames, and sequence continuity; Config for static log policy. | Keep format parsing and sequence validation typed beneath recovery and discovery operations. |
-| `log`: allocation and runtime | Runtime for redo-family discovery over retained IO/DataIntegrity reports; Resource for durable log capacity; Lifecycle for shutdown; IO/completion for backend progress; Internal or assertions for trusted encoding and coordinator invariants. | Keep discovery Runtime-typed, initial-header and block-group materialization Internal-typed, and separate ordinary runtime failure from the policy that decides whether it is Fatal. |
+| `log`: allocation and runtime | Runtime for redo-family discovery, planning, and stream access over retained IO/DataIntegrity/Internal reports; Resource for durable log capacity; Lifecycle for shutdown; IO/completion for backend progress; Internal or assertions for trusted encoding and coordinator invariants. | Keep redo access Runtime-typed, payload parsing DataIntegrity-typed, initial-header and block-group materialization Internal-typed, and separate ordinary runtime failure from the policy that decides whether it is Fatal. |
 | `log`: append, sync, and seal | Fatal when an admitted durability operation fails and the engine cannot safely continue, retaining IO or Resource source frames. Runtime covers inability to start required log workers. | Keep Fatal at the durability decision point rather than generic format or file helpers. |
 | `lock` | Operation for invalid modes, conflicts, unsupported conversion, released waiters, and unavailable logical ownership. | Keep expected contention and conversion policy out of Lifecycle and Internal unless an outer caller assigns a distinct meaning. |
 
@@ -620,14 +659,14 @@ preselect variants for migration.
 | `index`: hot structures | Config for build policy, Resource for allocation, Internal or assertions for structural and ownership invariants, and forwarded buffer domains. | Keep lookup absence, optimistic invalidation, and duplicate insertion as neutral outcomes such as `Option`, `Validation`, or `IndexInsert`. |
 | `index`: persisted structures | DataIntegrity for persisted tree, column-index, and deletion-blob decoding; Internal or assertions for rewrite invariants. | Keep buffer/IO reports monotonic and avoid early public convergence in reusable scans. |
 | `index`: mutation orchestration | Foreground consumers map duplicate/conflict outcomes to Operation; recovery consumers map invalid replay outcomes to DataIntegrity. An index coordinator may propagate a Fatal redo failure without making generic index primitives Fatal. | Audit `Result`-returning mutation chains and keep the foreground-versus-recovery policy at their consumers. |
-| `table`: validation and lifecycle | `DmlValidationResult` stays caller-neutral; foreground maps it to Operation and recovery to DataIntegrity. Foreground dropping/not-found state is Operation; maintenance cancellation should prefer explicit outcomes or Lifecycle. | Remove formatting-only validation extensions and operation-name plumbing as consumers are migrated. |
+| `table`: validation and lifecycle | `DmlValidationResult` stays caller-neutral; foreground maps it to Operation and recovery to DataIntegrity. Foreground schema validation is `OperationError::InvalidMetadata`; schema reconstructed from engine-owned, format-validated persistence is asserted. Foreground dropping/not-found state is Operation; maintenance cancellation should prefer explicit outcomes or Lifecycle. | Keep checked DDL constructors Operation-typed, trusted persisted constructors infallible, and maintenance cancellation explicit. |
 | `table`: access, hot rows, and memory tables | Operation for client-visible conflicts and unsupported requests; Resource and forwarded buffer/IO for storage access; Internal or assertions for trusted row/index invariants. | Split reusable leaf producers from mixed access orchestration and continue the invariant audit. |
-| `table`: persistence, recovery, and checkpoint | DataIntegrity for persisted or replayed input; Config for durable schema policy; Internal or assertions for rewrite invariants; Fatal only at poison-worthy checkpoint, catalog-write, or rollback decisions. | Preserve typed cold-path reports and keep expected checkpoint delay/cancel states as outcomes. |
-| `catalog`: runtime lookup and DDL | Operation for lookup and DDL state, Config for schema/index policy, and Internal or assertions for runtime catalog invariants. | Keep session-owned operation context out of reusable catalog helpers. |
-| `catalog`: persisted storage and replay | DataIntegrity for durable catalog bytes, checkpoint folding, and replay validation; IO/Resource are forwarded from storage. | Keep row/key/root leaf validators DataIntegrity-typed until mixed storage orchestration, and reinterpret foreground-oriented outcomes at the replay consumer. |
-| `catalog`: checkpoint and durability | Completion for handoff; Fatal only when a catalog/checkpoint/rollback durability failure prevents safe continuation. Runtime covers worker creation failure. | Preserve the lower source report at poison boundaries. |
+| `table`: persistence, recovery, and checkpoint | DataIntegrity for physical persisted or replayed input; Operation for rejected user schema metadata; assertions for validated schema reconstruction and rewrite invariants; Fatal only at poison-worthy checkpoint, catalog-write, or rollback decisions. | Preserve typed cold-path reports, keep expected checkpoint delay/cancel states as outcomes, and do not classify user schema as engine configuration. |
+| `catalog`: runtime lookup and DDL | Operation for lookup, user schema validation, duplicate/conflict semantics, and DDL state; Runtime `CatalogAccess` for catalog storage and mechanics; assertions for catalog keys and relationships derived from atomically allocated IDs and validated metadata. | Keep public `Error` at the four session DDL adapters, preserve Operation-or-Runtime composition below them, and use Runtime-or-Fatal terminal commit/rollback paths without round-tripping through public errors. |
+| `catalog`: persisted storage and replay | DataIntegrity for durable catalog bytes, checkpoint folding, physical root coherence, and replay validation; assertions for table/column/index relationships written transactionally from validated metadata; IO/Resource are forwarded beneath Runtime `CatalogAccess`. | Keep row/key/root leaf validators DataIntegrity-typed, assert trusted relational reconstruction, and retain supported catalog/table-file index-DDL reconciliation. |
+| `catalog`: checkpoint and durability | DataIntegrity for pure DDL/root classification, Runtime `CatalogAccess` for redo scan and checkpoint mechanics, and Runtime-or-Fatal for publication. Apply failures carrying IO retain the existing policy of poisoning as `CheckpointWrite`; an already-Fatal reason is preserved. | Keep `Catalog::checkpoint_now` typed and fold it only at the public Session maintenance API; preserve lower source reports and existing cleanup/error precedence at poison boundaries. |
 | `trx`: core state and locks | Lifecycle for transaction attachment, checkout, discard, and terminal state; Operation for lock and request semantics; Internal or assertions for transaction invariants. | Continue separating clean unavailability from invariant-oriented discarded-state producers. |
-| `trx`: commit and logging | Resource for log capacity, completion for handoff, and Fatal for redo/sync/rollback failures that prevent safe continuation. | Preserve the source domain through failed-precommit transport and poisoning. |
+| `trx`: commit and logging | Resource for log capacity, completion for handoff, and Fatal for redo/sync/rollback failures that prevent safe continuation. Catalog DDL uses crate-private Runtime-or-Fatal terminal adapters while the public transaction API retains public `Result`. | Preserve the source domain through prepare, failed-precommit transport, terminal cleanup, and poisoning; convert only at the owning public API. |
 | `trx`: rollback, purge, and retention | Fatal for unsafe rollback/purge/checkpoint failure; DataIntegrity for durable timeline inconsistency; Internal or assertions for bookkeeping invariants. Runtime covers required worker spawn failure. | Audit public `Result` below these coordinators and classify invariant-only branches before adding tests. |
 | `trx/stmt.rs`, `trx/stream_stmt.rs`, public streams | Outermost public operation orchestration. Crate `Error` and `Result` are valid for facade methods and their private orchestration chains because they combine unrelated domains. | Do not narrow or widen statement-local signatures solely for taxonomy. Keep typed results for reusable producers or deliberate cross-domain policies below this boundary. |
 | `session` | Public convergence owner. Reusable admission and state helpers use Lifecycle; request-policy helpers use Operation. | Keep public context at session operations and avoid early conversion in the session registry. |
@@ -739,8 +778,8 @@ Convert the typed source report directly:
 
 ```rust
 let report = source
-    .change_context(OperationError::IndexMutation)
-    .attach_with(|| "phase=claim_secondary_index_key")?;
+    .change_context(RuntimeError::IndexAccess)
+    .attach_with(|| "operation=insert_if_not_exists")?;
 ```
 
 Once public `Error` has been produced at a legitimate public or mixed-domain
@@ -896,7 +935,7 @@ The following pieces already follow the intended direction:
   `PersistedLwcBlock::load` remains a mixed read/completion and validation
   convergence boundary.
 - Redo filename and sequence validation retain specific DataIntegrity reports
-  beneath `RedoLogDiscovery`; directory traversal retains its IO report
+  beneath `RedoLogAccess`; directory traversal retains its IO report
   beneath the same Runtime operation. Block-count helpers remain
   DataIntegrity-typed. Trusted initial-super-block and block-group
   materialization retain specific Internal reports, including recoverable
@@ -911,8 +950,10 @@ The following pieces already follow the intended direction:
 - `WeakEngineRef` lifecycle upgrades, catalog live-table validation,
   `TrxInner::checked_lock_state`, and the lock provider APIs expose typed
   reports.
-- `LockMode`, `LockManager`, and `OwnerLockState` now preserve
-  `OperationResult` through the lock module.
+- Public explicit table-lock APIs accept only `TableLockMode::Shared` or
+  `TableLockMode::Exclusive`. Internal `LockMode`, `LockManager`, and
+  `OwnerLockState` assert resource/mode construction contracts while preserving
+  `OperationResult` for valid-request conflicts and waiter failures.
 - Logical-lock consumers in stream, statement, transaction, session, and
   catalog code preserve typed reports through semantic operation boundaries.
   Cross-domain write-lock helpers stack `OperationError::LockUnavailable` over
@@ -945,8 +986,6 @@ The following areas require separate audits after the migrated slice:
   transport coverage, and poison-with-source behavior are deferred to
   [backlog 000160](./backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md);
   they are not established by Task 000226.
-- `DmlValidationResultExt` owns operation and table formatting that should be
-  visible at foreground and recovery consumers.
 - Other convenience constructors return public `Error` from internal invariant
   producers. Audit whether each represents an assertion, a typed Internal
   report, or a true convergence boundary.

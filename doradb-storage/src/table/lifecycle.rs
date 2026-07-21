@@ -1,4 +1,4 @@
-use crate::error::{Error, InternalError, OperationError, OperationResult, Result};
+use crate::error::{OperationError, OperationResult};
 use crate::id::TableID;
 use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
@@ -277,15 +277,17 @@ impl TableLifecycle {
     /// This synchronously marks the handle as dropping and closes new checkpoint
     /// publication admission. The returned token asynchronously drains only a
     /// publish lease that was already admitted.
-    pub(crate) fn start_drop(&self, table_id: TableID) -> Result<TableDropDrain<'_>> {
+    pub(crate) fn start_drop(&self, table_id: TableID) -> OperationResult<TableDropDrain<'_>> {
         loop {
             let (raw, state) = self.inspect_state("begin drop enter");
             if state.terminal != TableTerminal::Live {
                 return Err(drop_not_live_err(table_id, "begin drop", state.terminal));
             }
-            if state.metadata_change == MetadataChangePhase::Active {
-                return Err(begin_drop_metadata_active_err(table_id));
-            }
+            assert_ne!(
+                state.metadata_change,
+                MetadataChangePhase::Active,
+                "begin drop requires no active metadata change: table_id={table_id}"
+            );
 
             let mut next = state;
             next.terminal = TableTerminal::Dropping;
@@ -319,22 +321,28 @@ impl TableLifecycle {
 
     /// Marks a dropping table handle as fully dropped.
     #[inline]
-    pub(crate) fn mark_dropped(&self, table_id: TableID) -> Result<()> {
+    pub(crate) fn mark_dropped(&self, table_id: TableID) {
         loop {
             let (raw, state) = self.inspect_state("mark dropped enter");
-            if state.terminal != TableTerminal::Dropping {
-                return Err(mark_dropped_err(table_id, state.terminal));
-            }
-            if state.publish != PublishGateState::Closed {
-                return Err(mark_dropped_publish_err(table_id, state.publish));
-            }
+            assert_eq!(
+                state.terminal,
+                TableTerminal::Dropping,
+                "mark dropped requires dropping state: table_id={table_id}, lifecycle_state={}",
+                state.terminal.label()
+            );
+            assert_eq!(
+                state.publish,
+                PublishGateState::Closed,
+                "mark dropped requires closed publish gate: table_id={table_id}, publish_state={}",
+                state.publish.label()
+            );
 
             let mut next = state;
             next.terminal = TableTerminal::Dropped;
             next.debug_assert_valid("mark dropped exit");
             if self.compare_exchange_state(raw, next) {
                 self.changed.notify(usize::MAX);
-                return Ok(());
+                return;
             }
         }
     }
@@ -379,7 +387,7 @@ impl TableLifecycle {
     pub(crate) async fn begin_metadata_change(
         &self,
         table_id: TableID,
-    ) -> Result<TableMetadataChangeLease<'_>> {
+    ) -> OperationResult<TableMetadataChangeLease<'_>> {
         let mut pending = None;
         loop {
             let mut should_wait = true;
@@ -716,7 +724,11 @@ fn foreground_not_live_err(state: TableTerminal) -> Report<OperationError> {
 }
 
 #[inline]
-fn drop_not_live_err(table_id: TableID, operation: &'static str, state: TableTerminal) -> Error {
+fn drop_not_live_err(
+    table_id: TableID,
+    operation: &'static str,
+    state: TableTerminal,
+) -> Report<OperationError> {
     let reason = match state {
         TableTerminal::Live => unreachable!("live table should not fail drop gate"),
         TableTerminal::Dropping => OperationError::TableDropping,
@@ -727,36 +739,6 @@ fn drop_not_live_err(table_id: TableID, operation: &'static str, state: TableTer
             "table lifecycle operation rejected: table_id={table_id}, operation={operation}, lifecycle_state={}",
             state.label()
         ))
-        .into()
-}
-
-#[inline]
-fn mark_dropped_err(table_id: TableID, state: TableTerminal) -> Error {
-    Report::new(InternalError::Generic)
-        .attach(format!(
-            "mark dropped requires dropping state: table_id={table_id}, lifecycle_state={}",
-            state.label()
-        ))
-        .into()
-}
-
-#[inline]
-fn mark_dropped_publish_err(table_id: TableID, publish: PublishGateState) -> Error {
-    Report::new(InternalError::Generic)
-        .attach(format!(
-            "mark dropped requires closed publish gate: table_id={table_id}, publish_state={}",
-            publish.label()
-        ))
-        .into()
-}
-
-#[inline]
-fn begin_drop_metadata_active_err(table_id: TableID) -> Error {
-    Report::new(InternalError::Generic)
-        .attach(format!(
-            "begin drop requires no active metadata change: table_id={table_id}"
-        ))
-        .into()
 }
 
 #[cfg(test)]
@@ -783,7 +765,7 @@ mod tests {
             let err = lifecycle.check_foreground_live().unwrap_err();
             assert_eq!(*err.current_context(), OperationError::TableDropping);
 
-            lifecycle.mark_dropped(TABLE_ID).unwrap();
+            lifecycle.mark_dropped(TABLE_ID);
             let err = lifecycle.check_foreground_live().unwrap_err();
             assert_eq!(*err.current_context(), OperationError::TableNotFound);
         });
@@ -813,7 +795,7 @@ mod tests {
             }
             let err = lifecycle.begin_metadata_change(TABLE_ID).await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
+                err.downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableDropping)
             );
 
@@ -825,6 +807,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "mark dropped requires closed publish gate")]
     fn test_mark_dropped_requires_drained_publish_gate() {
         smol::block_on(async {
             let lifecycle = Arc::new(TableLifecycle::new());
@@ -837,13 +820,8 @@ mod tests {
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert!(lifecycle.mark_dropped(TABLE_ID).is_err());
-
-            drop(publish_lease);
-            drop_fut.await;
-            lifecycle.mark_dropped(TABLE_ID).unwrap();
-            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropped);
-            drop(root_lease);
+            lifecycle.mark_dropped(TABLE_ID);
+            drop((publish_lease, drop_fut, root_lease));
         });
     }
 
@@ -855,17 +833,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "begin drop requires no active metadata change")]
     fn test_begin_drop_rejects_active_metadata_change() {
         smol::block_on(async {
             let lifecycle = TableLifecycle::new();
             let metadata_lease = lifecycle.begin_metadata_change(TABLE_ID).await.unwrap();
 
-            assert!(lifecycle.start_drop(TABLE_ID).is_err());
-            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Live);
-
+            let _ = lifecycle.start_drop(TABLE_ID);
             drop(metadata_lease);
-            lifecycle.start_drop(TABLE_ID).unwrap().wait().await;
-            assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropping);
         });
     }
 
@@ -878,11 +853,11 @@ mod tests {
 
             let err = lifecycle.start_drop(TABLE_ID).unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
+                err.downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableDropping)
             );
 
-            lifecycle.mark_dropped(TABLE_ID).unwrap();
+            lifecycle.mark_dropped(TABLE_ID);
             assert_eq!(lifecycle.inspect_terminal(), TableTerminal::Dropped);
         });
     }
@@ -1005,7 +980,7 @@ mod tests {
             );
             assert_eq!(write_trx.commit().await.unwrap(), TrxID::new(0));
 
-            table.mark_dropped_lifecycle().unwrap();
+            table.mark_dropped_lifecycle();
 
             let mut dropped_read = session.begin_trx().unwrap();
             let err =
@@ -1136,7 +1111,7 @@ mod tests {
             let root_before = table.file().active_root_unchecked().clone();
 
             table.start_drop_lifecycle().unwrap().wait().await;
-            table.mark_dropped_lifecycle().unwrap();
+            table.mark_dropped_lifecycle();
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_eq!(

@@ -17,7 +17,10 @@ use crate::catalog::{
     CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogRedoEntry, CatalogTable,
     catalog_table_id_from_slot, catalog_table_slot,
 };
-use crate::error::{DataIntegrityError, DataIntegrityResult, Error, FileKind, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, FileKind, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
@@ -69,12 +72,14 @@ impl CatalogStorage {
         meta_pool: QuiescentGuard<FixedBufferPool>,
         table_fs: QuiescentGuard<FileSystem>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         let meta_pool_guard = meta_pool.pool_guard();
         let mtb = table_fs
             .open_or_create_multi_table_file(disk_pool.clone())
-            .await?;
-        let mtb_snapshot = mtb.load_snapshot()?;
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=open_catalog_storage")?;
+        let mtb_snapshot = mtb.load_snapshot();
 
         let mut cat: Vec<Arc<CatalogTable>> = vec![];
         for CatalogDefinition { table_id, metadata } in [
@@ -87,7 +92,12 @@ impl CatalogStorage {
             // Make sure catalog table ids match their dense root slots.
             assert_eq!(cat.len(), must_catalog_table_slot(*table_id));
             let metadata = Arc::new(metadata.clone());
-            let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), &meta_pool_guard).await?;
+            let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), &meta_pool_guard)
+                .await
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!("operation=create_catalog_block_index, table_id={table_id}")
+                })?;
             let table = Arc::new(
                 CatalogTable::new(
                     meta_pool.clone(),
@@ -180,7 +190,7 @@ impl CatalogStorage {
 
     /// Returns current persisted catalog checkpoint snapshot from `catalog.mtb`.
     #[inline]
-    pub(crate) fn checkpoint_snapshot(&self) -> Result<MultiTableFileSnapshot> {
+    pub(crate) fn checkpoint_snapshot(&self) -> MultiTableFileSnapshot {
         self.mtb.load_snapshot()
     }
 
@@ -191,8 +201,11 @@ impl CatalogStorage {
     /// replay. It tells recovery that missing prefix files below the marker
     /// were intentionally truncated; ordinary catalog-table state cannot prove
     /// that until after redo has already been selected for replay.
-    pub(crate) async fn publish_first_redo_log_seq(&self, first_redo_log_seq: u32) -> Result<u32> {
-        let snapshot = self.mtb.load_snapshot()?;
+    pub(crate) async fn publish_first_redo_log_seq(
+        &self,
+        first_redo_log_seq: u32,
+    ) -> RuntimeResult<u32> {
+        let snapshot = self.mtb.load_snapshot();
         if first_redo_log_seq <= snapshot.meta.first_redo_log_seq {
             return Ok(snapshot.meta.first_redo_log_seq);
         }
@@ -206,9 +219,24 @@ impl CatalogStorage {
         if first_redo_log_seq <= current_first_redo_log_seq {
             return Ok(current_first_redo_log_seq);
         }
-        mutable.apply_first_redo_log_seq(first_redo_log_seq)?;
-        mutable.reserve_publish_meta_block_reclaiming_displaced_meta(displaced_meta_block_id)?;
-        let (_, old_root) = mutable.commit_prepared().await?;
+        mutable.apply_first_redo_log_seq(first_redo_log_seq);
+        mutable
+            .reserve_publish_meta_block_reclaiming_displaced_meta(displaced_meta_block_id)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=publish_first_redo_log_seq, phase=reserve_meta_block, first_redo_log_seq={first_redo_log_seq}"
+                )
+            })?;
+        let (_, old_root) = mutable
+            .commit_prepared()
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=publish_first_redo_log_seq, phase=commit_catalog_root, first_redo_log_seq={first_redo_log_seq}"
+                )
+            })?;
         drop(old_root);
         Ok(first_redo_log_seq)
     }
@@ -219,27 +247,31 @@ impl CatalogStorage {
         snapshot: &MultiTableFileSnapshot,
         guards: &PoolGuards,
         disable_dml_validation: bool,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         for (idx, root) in snapshot.meta.table_roots.iter().copied().enumerate() {
             if idx >= self.tables.len() {
                 break;
             }
             if catalog_table_slot(root.table_id) != Some(idx) {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                         "catalog root table id mismatch: root_table_id={}, slot_idx={idx}",
                         root.table_id
-                    ))
-                    .into());
+                    )),
+                )
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=bootstrap_catalog, phase=validate_table_root");
             }
             if root.root_block_id.is_none() {
                 if root.pivot_row_id != RowID::new(0) {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                             "empty catalog root has nonzero pivot_row_id={}",
                             root.pivot_row_id
-                        ))
-                        .into());
+                        )),
+                    )
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach("operation=bootstrap_catalog, phase=validate_empty_root");
                 }
                 continue;
             }
@@ -249,7 +281,14 @@ impl CatalogStorage {
             for row in rows {
                 self.tables[idx]
                     .insert_no_trx(guards, &row.vals, disable_dml_validation)
-                    .await?;
+                    .await
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=bootstrap_catalog, phase=insert_row, table_id={}",
+                            root.table_id
+                        )
+                    })?;
             }
         }
         let watermarks = self
@@ -268,14 +307,14 @@ impl CatalogStorage {
         &self,
         batch: CatalogCheckpointBatch,
         next_table_id: TableID,
-    ) -> Result<PreparedCatalogCheckpoint> {
+    ) -> RuntimeOrFatalResult<PreparedCatalogCheckpoint> {
         let CatalogCheckpointBatch {
             replay_start_ts,
             safe_cts,
             catalog_ops,
             ..
         } = batch;
-        let snapshot = self.mtb.load_snapshot()?;
+        let snapshot = self.mtb.load_snapshot();
         let current_catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
         let next_catalog_replay_start_ts = safe_cts.saturating_add(1).max(replay_start_ts);
 
@@ -290,11 +329,14 @@ impl CatalogStorage {
                     checkpointed_silent_watermarks: self.checkpointed_silent_watermarks(),
                 });
             }
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "catalog replay start mismatch: current={current_catalog_replay_start_ts}, expected={replay_start_ts}, next={next_catalog_replay_start_ts}"
-                ))
-                .into());
+            return Err(RuntimeOrFatalError::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach("catalog replay start does not match checkpoint batch")
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach(format!(
+                    "operation=prepare_catalog_checkpoint, current_replay_start_ts={current_catalog_replay_start_ts}, expected_replay_start_ts={replay_start_ts}, next_replay_start_ts={next_catalog_replay_start_ts}"
+                    )),
+            ));
         }
 
         // A scan can legitimately find no durable record at or after the
@@ -318,7 +360,13 @@ impl CatalogStorage {
             let mut ops_by_table: Vec<Vec<RowRedoKind>> =
                 (0..self.tables.len()).map(|_| Vec::new()).collect();
             for CatalogRedoEntry { table_id, kind } in catalog_ops {
-                let table_idx = catalog_table_slot_checked(table_id, ops_by_table.len())?;
+                let table_idx = catalog_table_slot_checked(table_id, ops_by_table.len())
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=prepare_catalog_checkpoint, phase=group_catalog_redo, table_id={table_id}"
+                        )
+                    })?;
                 ops_by_table[table_idx].push(kind);
             }
 
@@ -345,11 +393,14 @@ impl CatalogStorage {
         // Publishing the metadata block advances the durable catalog replay
         // boundary even for metadata-only checkpoints, such as DML-only
         // heartbeat batches.
-        mutable.apply_checkpoint_metadata(
-            next_catalog_replay_start_ts,
-            next_table_id,
-            new_roots,
-        )?;
+        mutable
+            .apply_checkpoint_metadata(next_catalog_replay_start_ts, next_table_id, new_roots)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=prepare_catalog_checkpoint, phase=apply_checkpoint_metadata, replay_start_ts={next_catalog_replay_start_ts}, next_table_id={next_table_id}"
+                )
+            })?;
         if catalog_blocks_changed {
             // Rewriting catalog table roots can make arbitrary old catalog
             // blocks unreachable, so rebuild the allocation map from the new
@@ -359,7 +410,10 @@ impl CatalogStorage {
             // Metadata-only checkpoints do not change catalog table root
             // reachability. Reclaim the displaced metadata block directly and
             // avoid reading catalog indexes just to rebuild the same map.
-            mutable.reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)?;
+            mutable
+                .reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=prepare_catalog_checkpoint, phase=reserve_meta_block")?;
         }
         let disk_pool_guard = self.disk_pool.pool_guard();
         // Load the silent replay watermark overlay from `new_roots`, not from
@@ -389,9 +443,9 @@ impl CatalogStorage {
         &self,
         batch: CatalogCheckpointBatch,
         next_table_id: TableID,
-    ) -> Result<CatalogCheckpointOutcome> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
         let prepared = self.prepare_checkpoint_batch(batch, next_table_id).await?;
-        prepared.commit(self).await
+        Ok(prepared.commit(self).await?)
     }
 
     #[inline]
@@ -406,7 +460,7 @@ impl CatalogStorage {
         &self,
         disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
-    ) -> Result<FastHashMap<TableID, TableRedoReplayFloor>> {
+    ) -> RuntimeResult<FastHashMap<TableID, TableRedoReplayFloor>> {
         let rows = self
             .load_rows_from_root(
                 self.tables[must_catalog_table_slot(TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS)]
@@ -417,7 +471,9 @@ impl CatalogStorage {
             .await?;
         let mut watermarks = FastHashMap::default();
         for row in rows {
-            let obj = table_replay_silent_watermark_object_from_vals(&row.vals)?;
+            let obj = table_replay_silent_watermark_object_from_vals(&row.vals)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=load_checkpointed_silent_watermarks, phase=decode_row")?;
             watermarks.insert(
                 obj.table_id,
                 TableRedoReplayFloor {
@@ -432,18 +488,24 @@ impl CatalogStorage {
     async fn rebuild_catalog_alloc_map(
         &self,
         mutable: &mut MutableMultiTableFile,
-    ) -> Result<usize> {
-        mutable.reserve_publish_meta_block()?;
+    ) -> RuntimeResult<usize> {
+        mutable
+            .reserve_publish_meta_block()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=rebuild_catalog_alloc_map, phase=reserve_meta_block")?;
         let reachable = self
             .collect_catalog_reachable_blocks(mutable.root())
             .await?;
-        mutable.rebuild_alloc_map_from_reachable(&reachable)
+        mutable
+            .rebuild_alloc_map_from_reachable(&reachable)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=rebuild_catalog_alloc_map, phase=publish_alloc_map")
     }
 
     async fn collect_catalog_reachable_blocks(
         &self,
         root: &MultiTableActiveRoot,
-    ) -> Result<BTreeSet<BlockID>> {
+    ) -> RuntimeResult<BTreeSet<BlockID>> {
         let mut reachable = BTreeSet::new();
         reachable.insert(SUPER_BLOCK_ID);
         reachable.insert(root.meta_block_id);
@@ -451,29 +513,42 @@ impl CatalogStorage {
         let disk_pool_guard = self.disk_pool.pool_guard();
         for (idx, table_root) in root.table_roots.iter().enumerate() {
             if catalog_table_slot(table_root.table_id) != Some(idx) {
-                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                    .attach(format!(
-                        "file={}, root_ts={}, catalog table root table-id mismatch: table_id={}, slot_idx={idx}",
+                return Err(
+                    Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                        "file={}, root_ts={}, table_id={}, slot_idx={idx}",
                         FileKind::CatalogMultiTableFile,
                         root.root_ts,
                         table_root.table_id
-                    ))
-                    .into());
+                    )),
+                )
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=collect_catalog_reachable_blocks, phase=validate_table_root");
             }
             let Some(root_block_id) = table_root.checkpoint_root_block_id() else {
                 if table_root.pivot_row_id != RowID::new(0) {
-                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                        .attach(format!(
-                            "file={}, root_ts={}, empty catalog root has nonzero pivot_row_id={}",
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+                            "file={}, root_ts={}, pivot_row_id={}",
                             FileKind::CatalogMultiTableFile,
                             root.root_ts,
                             table_root.pivot_row_id
-                        ))
-                        .into());
+                        )),
+                    )
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach(
+                        "operation=collect_catalog_reachable_blocks, phase=validate_empty_root",
+                    );
                 }
                 continue;
             };
-            validate_catalog_reachable_block(root, root_block_id)?;
+            validate_catalog_reachable_block(root, root_block_id)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_catalog_reachable_blocks, phase=validate_index_root, table_id={}, block_id={root_block_id}",
+                        table_root.table_id
+                    )
+                })?;
             let column_index = ColumnBlockIndex::new(
                 root_block_id,
                 table_root.pivot_row_id,
@@ -484,11 +559,24 @@ impl CatalogStorage {
             );
             column_index
                 .collect_reachable_blocks(&mut reachable)
-                .await?;
+                .await
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_catalog_reachable_blocks, phase=walk_column_index, table_id={}",
+                        table_root.table_id
+                    )
+                })?;
         }
 
         for block_id in reachable.iter().copied() {
-            validate_catalog_reachable_block(root, block_id)?;
+            validate_catalog_reachable_block(root, block_id)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_catalog_reachable_blocks, phase=validate_reachable_block, block_id={block_id}"
+                    )
+                })?;
         }
         Ok(reachable)
     }
@@ -501,26 +589,54 @@ impl CatalogStorage {
         root: CatalogTableRootDesc,
         table_ops: &[RowRedoKind],
         checkpoint_cts: TrxID,
-    ) -> Result<(CatalogTableRootDesc, bool)> {
+    ) -> RuntimeOrFatalResult<(CatalogTableRootDesc, bool)> {
         let disk_pool_guard = self.disk_pool.pool_guard();
         let base_rows = self
             .load_rows_from_root(metadata, &disk_pool_guard, root)
             .await?;
-        let mut folded = CatalogFoldedRows::from_base_rows(metadata, base_rows)?;
+        let mut folded = CatalogFoldedRows::from_base_rows(metadata, base_rows)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| format!("operation=apply_catalog_table_ops, table_id={table_id}"))?;
 
         for kind in table_ops {
             match kind {
-                RowRedoKind::Insert(vals) => folded.fold_insert(metadata, vals.clone())?,
-                RowRedoKind::DeleteByPrimaryKey(key) => folded.fold_delete(key)?,
+                RowRedoKind::Insert(vals) => folded
+                    .fold_insert(metadata, vals.clone())
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=apply_catalog_table_ops, phase=fold_insert, table_id={table_id}"
+                        )
+                    })?,
+                RowRedoKind::DeleteByPrimaryKey(key) => folded
+                    .fold_delete(key)
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=apply_catalog_table_ops, phase=fold_delete, table_id={table_id}"
+                        )
+                    })?,
                 RowRedoKind::UpdateByPrimaryKey(key, update) => {
-                    folded.fold_update(metadata, key, update)?;
+                    folded
+                        .fold_update(metadata, key, update)
+                        .change_context(RuntimeError::CatalogAccess)
+                        .attach_with(|| {
+                            format!(
+                                "operation=apply_catalog_table_ops, phase=fold_update, table_id={table_id}"
+                            )
+                        })?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(
-                            "catalog checkpoint table op must be insert, delete-by-primary-key, or update-by-primary-key",
-                        )
-                        .into());
+                    return Err(RuntimeOrFatalError::from(
+                        Report::new(DataIntegrityError::InvalidPayload)
+                            .attach(
+                                "catalog checkpoint table op must be insert, delete-by-primary-key, or update-by-primary-key",
+                            )
+                            .change_context(RuntimeError::CatalogAccess)
+                            .attach(format!(
+                                "operation=apply_catalog_table_ops, table_id={table_id}"
+                            )),
+                    ));
                 }
             }
         }
@@ -549,15 +665,30 @@ impl CatalogStorage {
                 vals,
             })
             .collect::<Vec<_>>();
-        let new_pages = build_lwc_blocks_from_row_records(metadata, &output_rows)?;
+        let new_pages =
+            build_lwc_blocks_from_row_records(metadata, &output_rows).attach_with(|| {
+                format!(
+                    "operation=apply_catalog_table_ops, phase=build_lwc_blocks, table_id={table_id}"
+                )
+            })?;
         let mut new_entries = Vec::with_capacity(new_pages.len());
         for page in new_pages {
-            let block_id = mutable.allocate_block()?;
+            let block_id = mutable
+                .allocate_block()
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=apply_catalog_table_ops, phase=allocate_lwc_block, table_id={table_id}"
+                    )
+                })?;
             mutable
                 .write_block(block_id, page.buf)
                 .await
-                .map_err(|report| {
-                    Error::from_completion_bridge(report, "persist catalog LWC block")
+                .map_err(|bridge| bridge.into_runtime_or_fatal(RuntimeError::CatalogAccess))
+                .attach_with(|| {
+                    format!(
+                        "operation=apply_catalog_table_ops, phase=write_lwc_block, table_id={table_id}, block_id={block_id}, persist catalog LWC block"
+                    )
                 })?;
             new_entries.push(page.shape.with_block_id(block_id));
         }
@@ -572,11 +703,24 @@ impl CatalogStorage {
         );
         let root_block_id = column_index
             .batch_insert(mutable, &new_entries, pivot_row_id, checkpoint_cts)
-            .await?;
-        let root_block_id = NonZeroU64::new(root_block_id.into()).ok_or_else(|| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach("catalog root block id resolved to zero")
-        })?;
+            .await
+            .change_runtime_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=apply_catalog_table_ops, phase=build_column_index, table_id={table_id}"
+                )
+            })?;
+        let root_block_id = NonZeroU64::new(root_block_id.into())
+            .ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach("catalog root block id resolved to zero")
+            })
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=apply_catalog_table_ops, phase=validate_column_index_root, table_id={table_id}"
+                )
+            })?;
         Ok((
             CatalogTableRootDesc {
                 table_id,
@@ -591,7 +735,7 @@ impl CatalogStorage {
         &self,
         disk_pool_guard: &PoolGuard,
         root_block_id: BlockID,
-    ) -> Result<Vec<CatalogIndexEntry>> {
+    ) -> RuntimeResult<Vec<CatalogIndexEntry>> {
         assert_ne!(
             root_block_id, SUPER_BLOCK_ID,
             "root_block_id must not reference the reserved super block",
@@ -604,7 +748,13 @@ impl CatalogStorage {
             &self.disk_pool,
             disk_pool_guard,
         );
-        index.collect_leaf_entries().await
+        index
+            .collect_leaf_entries()
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!("operation=collect_catalog_index_entries, root_block_id={root_block_id}")
+            })
     }
 
     /// Load rows from one catalog table root.
@@ -630,15 +780,20 @@ impl CatalogStorage {
         metadata: &TableMetadata,
         disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
-    ) -> Result<Vec<RowRecord>> {
+    ) -> RuntimeResult<Vec<RowRecord>> {
         if root.root_block_id.is_none() {
             if root.pivot_row_id != RowID::new(0) {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                         "empty catalog root has nonzero pivot_row_id={}",
                         root.pivot_row_id
-                    ))
-                    .into());
+                    )),
+                )
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(format!(
+                    "operation=load_catalog_rows_from_root, table_id={}",
+                    root.table_id
+                ));
             }
             return Ok(Vec::new());
         }
@@ -656,13 +811,30 @@ impl CatalogStorage {
             &self.disk_pool,
             disk_pool_guard,
         );
-        let key_builder = CatalogMergeKeyBuilder::new(metadata)?;
+        let key_builder = CatalogMergeKeyBuilder::new(metadata)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=load_catalog_rows_from_root, phase=build_primary_key, table_id={}",
+                    root.table_id
+                )
+            })?;
         let mut rows = Vec::new();
         let mut primary_keys = FastHashSet::default();
         for entry in entries {
             debug_assert!(
                 {
-                    let delete_deltas = column_index.load_delete_deltas(&entry).await?;
+                    let delete_deltas = column_index
+                        .load_delete_deltas(&entry)
+                        .await
+                        .change_context(RuntimeError::CatalogAccess)
+                        .attach_with(|| {
+                            format!(
+                                "operation=load_catalog_rows_from_root, phase=load_delete_deltas, table_id={}, block_id={}",
+                                root.table_id,
+                                entry.block_id()
+                            )
+                        })?;
                     delete_deltas.is_empty()
                 },
                 "catalog root should not contain delete deltas: start_row_id={}",
@@ -672,28 +844,64 @@ impl CatalogStorage {
                 .decode_lwc_page_rows(metadata, disk_pool_guard, &column_index, &entry)
                 .await?;
             for row in page_rows {
-                let delta = row.row_id.checked_sub(entry.start_row_id).ok_or_else(|| {
-                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                        "catalog root row id precedes block start: row_id={}, start_row_id={}",
-                        row.row_id, entry.start_row_id
-                    ))
-                })?;
-                if delta > u32::MAX as u64 {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
-                            "catalog root row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
+                let delta = row
+                    .row_id
+                    .checked_sub(entry.start_row_id)
+                    .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))
+                    .attach_with(|| {
+                        format!(
+                            "catalog root row id precedes block start: row_id={}, start_row_id={}",
                             row.row_id, entry.start_row_id
-                        ))
-                        .into());
-                }
-                validate_catalog_row(metadata, &row.vals, "catalog checkpoint root row")?;
-                let primary_key = key_builder.key_from_row(&row.vals)?;
-                if primary_keys.contains(&primary_key) {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
+                        )
+                    })
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=load_catalog_rows_from_root, table_id={}, block_id={}",
+                            root.table_id,
+                            entry.block_id()
+                        )
+                    })?;
+                if delta > u32::MAX as u64 {
+                    return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                                "catalog root row delta exceeds u32: delta={delta}, row_id={}, start_row_id={}",
+                                row.row_id, entry.start_row_id
+                            )))
+                        .change_context(RuntimeError::CatalogAccess)
                         .attach(format!(
+                                "operation=load_catalog_rows_from_root, table_id={}, block_id={}",
+                                root.table_id,
+                                entry.block_id()
+                            ));
+                }
+                validate_catalog_row(metadata, &row.vals, "catalog checkpoint root row")
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=load_catalog_rows_from_root, phase=validate_row, table_id={}, row_id={}",
+                            root.table_id, row.row_id
+                        )
+                    })?;
+                let primary_key = key_builder
+                    .key_from_row(&row.vals)
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=load_catalog_rows_from_root, phase=decode_primary_key, table_id={}, row_id={}",
+                            root.table_id, row.row_id
+                        )
+                    })?;
+                if primary_keys.contains(&primary_key) {
+                    return Err(
+                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                             "catalog root contains duplicate primary key: key={primary_key:?}"
-                        ))
-                        .into());
+                        )),
+                    )
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach(format!(
+                        "operation=load_catalog_rows_from_root, table_id={}, row_id={}",
+                        root.table_id, row.row_id
+                    ));
                 }
                 primary_keys.insert(primary_key);
                 rows.push(row);
@@ -708,7 +916,7 @@ impl CatalogStorage {
         disk_pool_guard: &PoolGuard,
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
-    ) -> Result<Vec<RowRecord>> {
+    ) -> RuntimeResult<Vec<RowRecord>> {
         let file_kind = self.mtb.file_kind();
         let block_id = entry.block_id();
         let persisted = PersistedLwcBlock::load(
@@ -718,25 +926,45 @@ impl CatalogStorage {
             disk_pool_guard,
             block_id,
         )
-        .await?;
+        .await
+        .change_context(RuntimeError::CatalogAccess)
+        .attach_with(|| {
+            format!(
+                "operation=decode_catalog_lwc_page_rows, phase=load_lwc_block, block_id={block_id}"
+            )
+        })?;
         let lwc_block = persisted.block();
         let row_count = lwc_block.row_count();
-        let row_ids = column_index.load_entry_row_ids(entry).await?;
+        let row_ids = column_index
+            .load_entry_row_ids(entry)
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=decode_catalog_lwc_page_rows, phase=load_row_ids, block_id={block_id}"
+                )
+            })?;
         if row_count != row_ids.len() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "file={file_kind}, block=lwc_block, block_id={block_id}, \
-                     row_count={row_count}, index_row_id_count={}",
+                         row_count={row_count}, index_row_id_count={}",
                     row_ids.len()
-                ))
-                .into());
+                )),
+            )
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=decode_catalog_lwc_page_rows, phase=validate_row_count");
         }
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
             let vals = lwc_block
                 .decode_full_row_values(&metadata.col, row_idx)
+                .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))
+                .change_context(RuntimeError::CatalogAccess)
                 .attach_with(|| {
-                    format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                    format!(
+                        "operation=decode_catalog_lwc_page_rows, phase=decode_row, block_id={block_id}, row_idx={row_idx}"
+                    )
                 })?;
             rows.push(RowRecord { row_id, vals });
         }
@@ -815,17 +1043,20 @@ impl PreparedCatalogCheckpoint {
 
     /// Add a monotonic first-retained redo marker to the prepared catalog root.
     #[inline]
-    pub(crate) fn apply_first_redo_log_seq(&mut self, first_redo_log_seq: u32) -> Result<bool> {
+    pub(crate) fn apply_first_redo_log_seq(&mut self, first_redo_log_seq: u32) -> bool {
         match self {
             PreparedCatalogCheckpoint::Published(publish) => {
                 publish.mutable.apply_first_redo_log_seq(first_redo_log_seq)
             }
-            PreparedCatalogCheckpoint::Noop { .. } => Ok(false),
+            PreparedCatalogCheckpoint::Noop { .. } => false,
         }
     }
 
     /// Commit the prepared catalog root, installing projected caches after success.
-    pub(crate) async fn commit(self, storage: &CatalogStorage) -> Result<CatalogCheckpointOutcome> {
+    pub(crate) async fn commit(
+        self,
+        storage: &CatalogStorage,
+    ) -> RuntimeResult<CatalogCheckpointOutcome> {
         match self {
             PreparedCatalogCheckpoint::Published(publish) => {
                 let PreparedCatalogPublish {
@@ -833,7 +1064,11 @@ impl PreparedCatalogCheckpoint {
                     catalog_replay_start_ts,
                     checkpointed_silent_watermarks,
                 } = *publish;
-                let (_, old_root) = mutable.commit_prepared().await?;
+                let (_, old_root) = mutable
+                    .commit_prepared()
+                    .await
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach("operation=commit_catalog_checkpoint")?;
                 drop(old_root);
                 storage.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
                 Ok(CatalogCheckpointOutcome::Published {
@@ -871,8 +1106,8 @@ fn catalog_table_slot_checked(
     };
     if slot >= catalog_table_count {
         return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-            "catalog checkpoint redo table id out of range: table_id={table_id}, slot={slot}, catalog_table_count={catalog_table_count}"
-        )));
+                "catalog checkpoint redo table id out of range: table_id={table_id}, slot={slot}, catalog_table_count={catalog_table_count}"
+            )));
     }
     Ok(slot)
 }
@@ -880,9 +1115,16 @@ fn catalog_table_slot_checked(
 fn build_lwc_blocks_from_row_records(
     metadata: &TableMetadata,
     rows: &[RowRecord],
-) -> Result<Vec<PendingLwcBlock>> {
+) -> RuntimeResult<Vec<PendingLwcBlock>> {
     for row in rows {
-        validate_catalog_row(metadata, &row.vals, "catalog checkpoint LWC row")?;
+        validate_catalog_row(metadata, &row.vals, "catalog checkpoint LWC row")
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=build_catalog_lwc_blocks, phase=validate_row, row_id={}",
+                    row.row_id
+                )
+            })?;
     }
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -899,66 +1141,87 @@ fn build_lwc_blocks_from_row_records(
         }
         if !builder.append_row_values(row.row_id, &row.vals) {
             if builder.is_empty() {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                         "single catalog row does not fit in LWC block: row_id={}",
                         row.row_id
-                    ))
-                    .into());
+                    )),
+                )
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=build_catalog_lwc_blocks, phase=append_row");
             }
-            let start_row_id = builder_start.take().ok_or_else(|| {
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach("catalog LWC builder missing start row id")
-            })?;
+            let start_row_id = builder_start
+                .take()
+                .ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidPayload)
+                        .attach("catalog LWC builder missing start row id")
+                })
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=build_catalog_lwc_blocks, phase=finish_block")?;
             if builder_end <= start_row_id {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
-                        "catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
-                    ))
-                    .into());
+                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                            "catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
+                        )))
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach("operation=build_catalog_lwc_blocks, phase=finish_block");
             }
             let shape = ColumnBlockEntryShape::new(
                 start_row_id,
                 builder_end,
                 builder.row_ids().to_vec(),
                 Vec::new(),
-            )?;
-            let buf = builder.build(shape.row_shape_fingerprint())?;
+            )
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=build_catalog_lwc_blocks, phase=build_block_shape")?;
+            let buf = builder
+                .build(shape.row_shape_fingerprint())
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=build_catalog_lwc_blocks, phase=encode_block")?;
             lwc_blocks.push(PendingLwcBlock { shape, buf });
 
             builder = LwcBuilder::new(&metadata.col);
             builder_start = Some(row.row_id);
             if !builder.append_row_values(row.row_id, &row.vals) {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                         "single catalog row does not fit in LWC block: row_id={}",
                         row.row_id
-                    ))
-                    .into());
+                    )),
+                )
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=build_catalog_lwc_blocks, phase=append_row");
             }
         }
         builder_end = row.row_id.saturating_add(1);
     }
 
     if !builder.is_empty() {
-        let start_row_id = builder_start.ok_or_else(|| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach("catalog LWC builder missing final start row id")
-        })?;
+        let start_row_id = builder_start
+            .ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach("catalog LWC builder missing final start row id")
+            })
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=build_catalog_lwc_blocks, phase=finish_final_block")?;
         if builder_end <= start_row_id {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "final catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
-                ))
-                .into());
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "final catalog LWC builder end does not advance: start_row_id={start_row_id}, end_row_id={builder_end}"
+                    )))
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=build_catalog_lwc_blocks, phase=finish_final_block");
         }
         let shape = ColumnBlockEntryShape::new(
             start_row_id,
             builder_end,
             builder.row_ids().to_vec(),
             Vec::new(),
-        )?;
-        let buf = builder.build(shape.row_shape_fingerprint())?;
+        )
+        .change_context(RuntimeError::CatalogAccess)
+        .attach("operation=build_catalog_lwc_blocks, phase=build_final_block_shape")?;
+        let buf = builder
+            .build(shape.row_shape_fingerprint())
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=build_catalog_lwc_blocks, phase=encode_final_block")?;
         lwc_blocks.push(PendingLwcBlock { shape, buf });
     }
     Ok(lwc_blocks)
@@ -1023,7 +1286,7 @@ pub(crate) mod tests {
     use crate::catalog::{
         CatalogCheckpointBatch, CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec,
     };
-    use crate::error::{DataIntegrityError, ErrorKind};
+    use crate::error::{DataIntegrityError, Result, RuntimeError, RuntimeOrFatalError};
     use crate::file::BlockKey;
     use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
@@ -1039,6 +1302,15 @@ pub(crate) mod tests {
     pub(crate) fn mark_catalog_ddl(stmt: &mut Statement<'_>, ddl: DDLRedo) {
         let old = stmt.effects_mut().set_ddl_redo(ddl);
         debug_assert!(old.is_none());
+    }
+
+    fn expect_runtime_report(error: RuntimeOrFatalError) -> Report<RuntimeError> {
+        match error {
+            RuntimeOrFatalError::Runtime(report) => report,
+            RuntimeOrFatalError::Fatal(report) => {
+                panic!("expected Runtime catalog failure, got Fatal: {report:?}")
+            }
+        }
     }
 
     /// Publish a metadata-only catalog root with a test-controlled redo retention marker.
@@ -1122,24 +1394,18 @@ pub(crate) mod tests {
         storage: &CatalogStorage,
         next_table_id: TableID,
     ) -> Result<()> {
-        let replay_start_ts = storage
-            .checkpoint_snapshot()
-            .unwrap()
-            .catalog_replay_start_ts;
-        storage
+        let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
+        Ok(storage
             .apply_checkpoint_batch(metadata_only_batch(replay_start_ts), next_table_id)
             .await
-            .map(|_| ())
+            .map(|_| ())?)
     }
 
     fn checkpoint_batch_with_ops(
         storage: &CatalogStorage,
         catalog_ops: Vec<CatalogRedoEntry>,
     ) -> CatalogCheckpointBatch {
-        let replay_start_ts = storage
-            .checkpoint_snapshot()
-            .unwrap()
-            .catalog_replay_start_ts;
+        let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
         CatalogCheckpointBatch {
             replay_start_ts,
             safe_cts: replay_start_ts,
@@ -1197,8 +1463,8 @@ pub(crate) mod tests {
     }
 
     async fn catalog_root_rows(storage: &CatalogStorage, table_id: TableID) -> Vec<RowRecord> {
-        let root = storage.checkpoint_snapshot().unwrap().meta.table_roots
-            [must_catalog_table_slot(table_id)];
+        let root =
+            storage.checkpoint_snapshot().meta.table_roots[must_catalog_table_slot(table_id)];
         let table = storage.get_catalog_table(table_id).unwrap();
         let disk_pool_guard = storage.disk_pool.pool_guard();
         storage
@@ -1211,8 +1477,8 @@ pub(crate) mod tests {
         storage: &CatalogStorage,
         table_id: TableID,
     ) -> Vec<RowRecord> {
-        let root = storage.checkpoint_snapshot().unwrap().meta.table_roots
-            [must_catalog_table_slot(table_id)];
+        let root =
+            storage.checkpoint_snapshot().meta.table_roots[must_catalog_table_slot(table_id)];
         let rows = catalog_root_rows(storage, table_id).await;
         for (idx, row) in rows.iter().enumerate() {
             assert_eq!(row.row_id, RowID::new(idx as u64));
@@ -1317,10 +1583,7 @@ pub(crate) mod tests {
         let engine = open_catalog_test_engine(main_dir, Some(engine_name)).await;
 
         let storage = &engine.catalog().storage;
-        let replay_start_ts = storage
-            .checkpoint_snapshot()
-            .unwrap()
-            .catalog_replay_start_ts;
+        let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
         let batch = CatalogCheckpointBatch {
             replay_start_ts,
             safe_cts: replay_start_ts,
@@ -1334,21 +1597,21 @@ pub(crate) mod tests {
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
 
-        let err = storage
-            .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
-            .await
-            .unwrap_err();
+        let err = expect_runtime_report(
+            storage
+                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap_err(),
+        );
 
+        assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
         assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            err.downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidPayload)
         );
         let report = format!("{err:?}");
         assert!(report.contains(expected_message), "{report}");
-        let current_replay_start_ts = storage
-            .checkpoint_snapshot()
-            .unwrap()
-            .catalog_replay_start_ts;
+        let current_replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
         assert_eq!(current_replay_start_ts, replay_start_ts);
     }
 
@@ -1361,7 +1624,7 @@ pub(crate) mod tests {
                 open_catalog_test_engine(main_dir, Some("catalog-empty-root-mismatch")).await;
 
             let storage = &engine.catalog().storage;
-            let mut snapshot = storage.checkpoint_snapshot().unwrap();
+            let mut snapshot = storage.checkpoint_snapshot();
             let root = &mut snapshot.meta.table_roots[0];
             assert_eq!(root.root_block_id, None);
             assert_eq!(root.pivot_row_id, RowID::new(0));
@@ -1376,8 +1639,9 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
 
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1390,6 +1654,10 @@ pub(crate) mod tests {
                 "{report}"
             );
             assert!(report.contains("slot_idx=0"), "{report}");
+            assert!(
+                report.contains("operation=bootstrap_catalog, phase=validate_table_root"),
+                "{report}"
+            );
         });
     }
 
@@ -1401,10 +1669,7 @@ pub(crate) mod tests {
             let engine = open_catalog_test_engine(main_dir, Some("catalog-redo-table-range")).await;
 
             let storage = &engine.catalog().storage;
-            let replay_start_ts = storage
-                .checkpoint_snapshot()
-                .unwrap()
-                .catalog_replay_start_ts;
+            let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
             let invalid_table_id = catalog_table_id_from_slot(CATALOG_TABLE_ROOT_DESC_COUNT);
             let batch = CatalogCheckpointBatch {
                 replay_start_ts,
@@ -1419,13 +1684,16 @@ pub(crate) mod tests {
                 stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             };
 
-            let err = storage
-                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
-                .await
-                .unwrap_err();
+            let err = expect_runtime_report(
+                storage
+                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                    .await
+                    .unwrap_err(),
+            );
 
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1448,10 +1716,7 @@ pub(crate) mod tests {
                 )),
                 "{report}"
             );
-            let current_replay_start_ts = storage
-                .checkpoint_snapshot()
-                .unwrap()
-                .catalog_replay_start_ts;
+            let current_replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
             assert_eq!(current_replay_start_ts, replay_start_ts);
         });
     }
@@ -1512,13 +1777,18 @@ pub(crate) mod tests {
                 Ok(_) => panic!("oversized row should fail LWC block build"),
                 Err(err) => err,
             };
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
             assert!(
                 report.contains("single catalog row does not fit in LWC block: row_id=0"),
+                "{report}"
+            );
+            assert!(
+                report.contains("operation=build_catalog_lwc_blocks, phase=append_row"),
                 "{report}"
             );
             assert_eq!(storage.meta_pool.allocated(), allocated_before);
@@ -1551,8 +1821,9 @@ pub(crate) mod tests {
                 Ok(_) => panic!("{case} must fail catalog row validation"),
                 Err(err) => err,
             };
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload),
                 "case={case}"
             );
@@ -1632,8 +1903,9 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
 
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1680,7 +1952,7 @@ pub(crate) mod tests {
             drop(engine);
 
             let engine = open_catalog_test_engine(main_dir, Some("catalog-meta-reclaim")).await;
-            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap.catalog_replay_start_ts, expected_replay_start_ts);
             assert_eq!(snap.meta.next_table_id, USER_TABLE_ID_START);
         });
@@ -1702,12 +1974,12 @@ pub(crate) mod tests {
                 .unwrap();
 
             let storage = &engine.catalog().storage;
-            let before = storage.checkpoint_snapshot().unwrap();
+            let before = storage.checkpoint_snapshot();
 
             let marker = storage.publish_first_redo_log_seq(3).await.unwrap();
 
             assert_eq!(marker, 3);
-            let after = storage.checkpoint_snapshot().unwrap();
+            let after = storage.checkpoint_snapshot();
             assert_ne!(after.meta_block_id, before.meta_block_id);
             assert_eq!(
                 after.catalog_replay_start_ts,
@@ -1720,7 +1992,7 @@ pub(crate) mod tests {
             let marker = storage.publish_first_redo_log_seq(2).await.unwrap();
 
             assert_eq!(marker, 3);
-            assert_eq!(storage.checkpoint_snapshot().unwrap(), after);
+            assert_eq!(storage.checkpoint_snapshot(), after);
         });
     }
 
@@ -1739,7 +2011,7 @@ pub(crate) mod tests {
                 .unwrap();
 
             let storage = &engine.catalog().storage;
-            let snap = storage.checkpoint_snapshot().unwrap();
+            let snap = storage.checkpoint_snapshot();
             let disk_pool_guard = storage.disk_pool.pool_guard();
             let mut catalog_index_blocks = BTreeSet::new();
             for root in snap.meta.table_roots {
@@ -1790,10 +2062,7 @@ pub(crate) mod tests {
             let before_root = storage.mtb.active_root_unchecked();
             let old_meta_block_id = before_root.meta_block_id;
             let before_allocated = before_root.alloc_map.allocated();
-            let replay_start_ts = storage
-                .checkpoint_snapshot()
-                .unwrap()
-                .catalog_replay_start_ts;
+            let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
             let table_id = USER_TABLE_ID_START + 4242;
             let batch = CatalogCheckpointBatch {
                 replay_start_ts,
@@ -1911,13 +2180,16 @@ pub(crate) mod tests {
                 ],
             );
 
-            let err = storage
-                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
-                .await
-                .unwrap_err();
+            let err = expect_runtime_report(
+                storage
+                    .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                    .await
+                    .unwrap_err(),
+            );
 
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let report = format!("{err:?}");
@@ -1992,7 +2264,7 @@ pub(crate) mod tests {
                 .find(|block_id| !active_before.alloc_map.is_allocated(usize::from(*block_id)))
                 .unwrap();
 
-            let mut roots = storage.checkpoint_snapshot().unwrap().meta.table_roots;
+            let mut roots = storage.checkpoint_snapshot().meta.table_roots;
             roots[0].root_block_id = NonZeroU64::new(u64::from(bogus_root_block_id));
             roots[0].pivot_row_id = RowID::new(1);
 
@@ -2010,9 +2282,9 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
 
-            assert_eq!(err.kind(), ErrorKind::DataIntegrity);
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
             );
             let active_after = storage.mtb.active_root_unchecked();
@@ -2083,7 +2355,7 @@ pub(crate) mod tests {
 
             let storage = &engine.catalog().storage;
             let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
-            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[0];
+            let root = storage.checkpoint_snapshot().meta.table_roots[0];
             assert!(root.root_block_id.is_some());
 
             let table_id = USER_TABLE_ID_START + 4242;
@@ -2127,7 +2399,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap = engine.catalog().storage.checkpoint_snapshot();
             let tables_root = snap.meta.table_roots[0];
             let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
             let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
@@ -2182,7 +2454,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot();
             let tables_root1 = snap1.meta.table_roots[0];
             assert!(tables_root1.root_block_id.is_some());
             assert_compact_catalog_root(&engine.catalog().storage, TABLE_ID_TABLES).await;
@@ -2194,7 +2466,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot();
             let tables_root2 = snap2.meta.table_roots[0];
             let rows =
                 assert_compact_catalog_root(&engine.catalog().storage, TABLE_ID_TABLES).await;
@@ -2255,7 +2527,7 @@ pub(crate) mod tests {
                 .unwrap();
 
             let disk_pool_guard = storage.disk_pool.pool_guard();
-            let snap1 = storage.checkpoint_snapshot().unwrap();
+            let snap1 = storage.checkpoint_snapshot();
             let columns_root1 = snap1.meta.table_roots[1];
             assert_eq!(columns_root1.pivot_row_id, RowID::new(1));
             let entries1 = storage
@@ -2278,7 +2550,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap2 = storage.checkpoint_snapshot().unwrap();
+            let snap2 = storage.checkpoint_snapshot();
             let columns_root2 = snap2.meta.table_roots[1];
             let rows = assert_compact_catalog_root(storage, TABLE_ID_COLUMNS).await;
             assert_eq!(rows.len(), 5);

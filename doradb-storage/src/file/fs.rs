@@ -10,7 +10,8 @@ use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::error::{
-    CompletionErrorBridge, Error, FatalError, IoResult, Result, RuntimeError, RuntimeResult,
+    CompletionErrorBridge, Error, FatalError, IoError, IoResult, Result, RuntimeError,
+    RuntimeResult,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
@@ -1851,9 +1852,15 @@ impl FileSystem {
         &self,
         table_id: TableID,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<Arc<TableFile>> {
+    ) -> RuntimeResult<Arc<TableFile>> {
         let file_path = self.user_table_file_path(table_id);
-        let table_file = Arc::new(TableFile::open(&file_path, table_id)?);
+        let table_file = Arc::new(
+            TableFile::open(&file_path, table_id)
+                .change_context(RuntimeError::FileRootAccess)
+                .attach_with(|| {
+                    format!("operation=open_table_file, table_id={table_id}, file_path={file_path}")
+                })?,
+        );
         let active_root = table_file.load_active_root_from_pool(&disk_pool).await?;
         let old_root = table_file.install_loaded_root(active_root);
         debug_assert!(old_root.is_none());
@@ -1869,12 +1876,15 @@ impl FileSystem {
 
     /// Delete one deterministic user-table file.
     #[inline]
-    pub(crate) fn delete_user_table_file(&self, table_id: TableID) -> Result<()> {
+    pub(crate) fn delete_user_table_file(&self, table_id: TableID) -> IoResult<()> {
         debug_assert!(is_user_table(table_id));
         match fs::remove_file(self.data_dir.join(user_table_file_name(table_id))) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == IoErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                let kind = err.kind();
+                Err(Report::new(IoError::from(kind)).attach(err))
+            }
         }
     }
 
@@ -1979,9 +1989,14 @@ impl FileSystem {
     pub(crate) async fn open_or_create_multi_table_file(
         &self,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<Arc<MultiTableFile>> {
+    ) -> RuntimeResult<Arc<MultiTableFile>> {
         let file_path = self.catalog_mtb_file_path();
-        match MultiTableFile::open_or_create(&file_path).await? {
+        match MultiTableFile::open_or_create(&file_path)
+            .await
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!("operation=open_or_create_catalog_file, file_path={file_path}")
+            })? {
             MultiTableFileOpenOutcome::Opened(mtb) => {
                 let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
                 let old_root = mtb.install_loaded_root(active_root);
@@ -1997,7 +2012,7 @@ impl FileSystem {
                 if let Err(err) = mutable.commit().await {
                     drop(mtb);
                     let _ = fs::remove_file(&file_path);
-                    return Err(err.into());
+                    return Err(err);
                 }
                 let _ = disk_pool;
                 Ok(mtb)
@@ -2917,12 +2932,16 @@ pub(crate) mod tests {
                     Ok(_) => panic!("expected initial catalog.mtb publish failure"),
                     Err(err) => err,
                 };
-                assert_eq!(err.kind(), ErrorKind::Runtime, "unexpected error: {err:?}");
                 assert_eq!(
-                    err.report().downcast_ref::<RuntimeError>().copied(),
+                    *err.current_context(),
+                    RuntimeError::FileRootAccess,
+                    "unexpected error: {err:?}"
+                );
+                assert_eq!(
+                    err.downcast_ref::<RuntimeError>().copied(),
                     Some(RuntimeError::FileRootAccess)
                 );
-                assert!(err.report().downcast_ref::<IoError>().is_some());
+                assert!(err.downcast_ref::<IoError>().is_some());
                 let report = format!("{err:?}");
                 assert!(report.contains("file_kind=catalog.mtb"), "{report}");
                 assert!(report.contains("phase=write_meta_block"), "{report}");
@@ -2937,7 +2956,7 @@ pub(crate) mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let snapshot = mtb.load_snapshot().unwrap();
+            let snapshot = mtb.load_snapshot();
             assert_eq!(snapshot.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(snapshot.meta.next_table_id, USER_TABLE_ID_START);
             assert!(mtb.active_root_unchecked().meta_block_id > BlockID::new(0));

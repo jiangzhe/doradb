@@ -1,7 +1,10 @@
 use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
-use crate::error::{DataIntegrityError, Error, InternalError, Result};
+use crate::error::{
+    DataIntegrityError, InternalResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
+    RuntimeResult,
+};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::{
@@ -113,7 +116,7 @@ impl MemIndexCleanupSnapshot<'_> {
     }
 
     #[inline]
-    fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
+    fn secondary_index_root(&self, index_no: usize) -> InternalResult<BlockID> {
         self.root.secondary_index_root(index_no)
     }
 
@@ -162,25 +165,39 @@ impl Table {
         &self,
         session: SessionPin,
         clean_live_entries: bool,
-    ) -> Result<SecondaryMemIndexCleanupStats> {
+    ) -> RuntimeOrFatalResult<SecondaryMemIndexCleanupStats> {
         let trx_sys = session.engine.trx_sys.clone();
         let pool_guards = session.pool_guards();
         loop {
             let mut trx = session
                 .begin_trx()
-                .attach("operation=cleanup_secondary_mem_indexes")?;
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=cleanup_secondary_mem_indexes, table_id={}, phase=begin_transaction",
+                        self.table_id()
+                    )
+                })
+                .map_err(RuntimeOrFatalError::from)?;
             let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let cleanup_res = {
                 let checkout = trx
                     .checkout()
-                    .attach("operation=cleanup_secondary_mem_indexes")?;
+                    .change_context(RuntimeError::TableAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=cleanup_secondary_mem_indexes, table_id={}, phase=checkout_transaction",
+                            self.table_id()
+                        )
+                    })
+                    .map_err(RuntimeOrFatalError::from)?;
                 let proof = checkout.inner().ctx().read_proof();
-                let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts, &proof)?;
+                let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts, &proof);
                 if !snapshot.is_visible_to(cleanup_sts) {
                     drop(snapshot);
                     drop(checkout);
-                    trx.rollback().await?;
+                    trx.rollback_table_maintenance().await?;
                     continue;
                 }
                 let cleanup_res = self
@@ -194,12 +211,8 @@ impl Table {
                 drop(checkout);
                 cleanup_res
             };
-            let rollback_res = trx.rollback().await;
-            return match (cleanup_res, rollback_res) {
-                (Ok(stats), Ok(())) => Ok(stats),
-                (Err(err), Ok(())) => Err(err),
-                (_, Err(err)) => Err(err),
-            };
+            let rollback_res = trx.rollback_table_maintenance().await;
+            return finish_secondary_mem_index_cleanup(cleanup_res, rollback_res);
         }
     }
 
@@ -208,7 +221,7 @@ impl Table {
         &self,
         min_active_sts: TrxID,
         proof: &TrxReadProof<'ctx>,
-    ) -> Result<MemIndexCleanupSnapshot<'ctx>> {
+    ) -> MemIndexCleanupSnapshot<'ctx> {
         let layout = self.layout_snapshot();
         let (root, root_metadata) = self.with_active_root(proof, |root| {
             (
@@ -216,12 +229,12 @@ impl Table {
                 Arc::clone(&root.metadata),
             )
         });
-        Ok(MemIndexCleanupSnapshot {
+        MemIndexCleanupSnapshot {
             root,
             root_metadata,
             layout,
             min_active_sts,
-        })
+        }
     }
 
     #[inline]
@@ -230,13 +243,22 @@ impl Table {
         guards: &PoolGuards,
         snapshot: &MemIndexCleanupSnapshot<'_>,
         clean_live_entries: bool,
-    ) -> Result<SecondaryMemIndexCleanupStats> {
+    ) -> RuntimeResult<SecondaryMemIndexCleanupStats> {
         debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_ts());
 
         let layout = snapshot.layout();
         let metadata = layout.metadata();
         let column_index = self.cleanup_column_index(guards, snapshot);
-        let index_pool_guard = self.mem.index_pool_guard(guards)?;
+        let index_pool_guard = self
+            .mem
+            .index_pool_guard(guards)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=cleanup_secondary_mem_indexes, table_id={}, phase=resolve_index_pool_guard",
+                    self.table_id()
+                )
+            })?;
         let disk_pool_guard = guards.disk_guard();
         let cleanup_context = MemIndexCleanupContext {
             snapshot,
@@ -255,7 +277,15 @@ impl Table {
             if !snapshot.root_index_is_active(index_no) {
                 continue;
             }
-            let secondary_root = snapshot.secondary_index_root(index_no)?;
+            let secondary_root = snapshot
+                .secondary_index_root(index_no)
+                .change_context(RuntimeError::TableAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=cleanup_secondary_mem_indexes, table_id={}, index_no={index_no}, phase=resolve_secondary_root",
+                        self.table_id()
+                    )
+                })?;
             let mut index_stats =
                 SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());
             match index {
@@ -294,7 +324,7 @@ impl Table {
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let disk = index
             .disk_runtime()
             .open_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
@@ -367,7 +397,7 @@ impl Table {
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let disk = index
             .disk_runtime()
             .open_non_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
@@ -459,7 +489,7 @@ impl Table {
         index_no: usize,
         index: &UniqueMemIndex<EvictableBufferPool>,
         entry: &MemIndexEntry,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
             .await?
@@ -479,7 +509,7 @@ impl Table {
         index_no: usize,
         index: &NonUniqueMemIndex<EvictableBufferPool>,
         entry: &MemIndexEntry,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         match self
             .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
             .await?
@@ -498,7 +528,7 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         row_id: RowID,
-    ) -> Result<DeleteOverlayProof> {
+    ) -> RuntimeResult<DeleteOverlayProof> {
         let snapshot = cleanup_context.snapshot;
         // A globally purgeable row tombstone proves the delete overlay is no
         // longer protecting any transaction-visible row, independent of where
@@ -540,13 +570,14 @@ impl Table {
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         row: ResolvedColumnRow,
-    ) -> Result<Vec<Val>> {
+    ) -> RuntimeResult<Vec<Val>> {
         let metadata = cleanup_context.metadata;
-        let index_spec = metadata.idx.index_spec(index_no).ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::IndexKeyMissing).attach(format!("index_no={index_no}")),
+        let index_spec = metadata.idx.index_spec(index_no).unwrap_or_else(|| {
+            panic!(
+                "active cleanup index must exist in captured metadata: table_id={}, index_no={index_no}",
+                self.table_id()
             )
-        })?;
+        });
         let read_set = index_spec
             .cols
             .iter()
@@ -565,11 +596,34 @@ impl Table {
                     "file={file_kind}, block=lwc_block, block_id={block_id}, \
                      reason=row_shape_fingerprint_mismatch"
                 ))
-                .into());
+                .change_context(RuntimeError::TableAccess)
+                .attach(format!(
+                    "operation=cleanup_secondary_mem_indexes, table_id={}, index_no={index_no}",
+                    self.table_id()
+                )));
         }
-        Ok(block
+        block
             .decode_row_values(metadata.col.as_ref(), row.row_idx(), &read_set)
-            .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))?)
+            .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=cleanup_secondary_mem_indexes, table_id={}, index_no={index_no}",
+                    self.table_id()
+                )
+            })
+    }
+}
+
+#[inline]
+fn finish_secondary_mem_index_cleanup(
+    cleanup_res: RuntimeResult<SecondaryMemIndexCleanupStats>,
+    rollback_res: RuntimeOrFatalResult<()>,
+) -> RuntimeOrFatalResult<SecondaryMemIndexCleanupStats> {
+    match (cleanup_res, rollback_res) {
+        (Ok(stats), Ok(())) => Ok(stats),
+        (Err(err), Ok(())) => Err(RuntimeOrFatalError::from(err)),
+        (_, Err(err)) => Err(err),
     }
 }
 
@@ -579,7 +633,7 @@ async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
     index_pool_guard: &PoolGuard,
     entry: &MemIndexEntry,
     min_active_sts: TrxID,
-) -> Result<CleanupDecision> {
+) -> RuntimeResult<CleanupDecision> {
     if index
         .compare_delete_encoded_entry(
             index_pool_guard,
@@ -602,7 +656,7 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
     index_pool_guard: &PoolGuard,
     entry: &MemIndexEntry,
     min_active_sts: TrxID,
-) -> Result<CleanupDecision> {
+) -> RuntimeResult<CleanupDecision> {
     if index
         .compare_delete_encoded_entry(
             index_pool_guard,
@@ -620,15 +674,40 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
 
 #[cfg(test)]
 mod tests {
+    use super::finish_secondary_mem_index_cleanup;
     use crate::catalog::IndexNo;
-    use crate::error::{DataIntegrityError, LifecycleError};
+    use crate::error::{
+        DataIntegrityError, LifecycleError, OperationError, RuntimeError, RuntimeOrFatalError,
+    };
     use crate::id::{RowID, TrxID};
     use crate::index::{IndexInsert, NonUniqueIndex, UniqueIndex};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::value::Val;
+    use error_stack::Report;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_rollback_error_overrides_cleanup_error() {
+        let cleanup_err = Report::new(DataIntegrityError::InvalidPayload)
+            .change_context(RuntimeError::TableAccess);
+        let rollback_err =
+            Report::new(LifecycleError::Shutdown).change_context(RuntimeError::TableAccess);
+        let err = finish_secondary_mem_index_cleanup(
+            Err(cleanup_err),
+            Err(RuntimeOrFatalError::Runtime(rollback_err)),
+        )
+        .unwrap_err();
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("Runtime rollback failure must remain Runtime");
+        };
+        assert_eq!(
+            err.downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::Shutdown)
+        );
+        assert!(err.downcast_ref::<DataIntegrityError>().is_none());
+    }
 
     #[test]
     fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
@@ -694,11 +773,24 @@ mod tests {
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
                 .unwrap_err();
-            let lifecycle_error = err.report().downcast_ref::<LifecycleError>().copied();
+            let operation_error = err.report().downcast_ref::<OperationError>().copied();
             let was_in_trx = session.in_trx().unwrap();
 
+            let internal_err = table_for_internal_assertion(&engine, table_id)
+                .cleanup_secondary_mem_indexes(session.pin().unwrap(), true)
+                .await
+                .unwrap_err();
+            let RuntimeOrFatalError::Runtime(internal_err) = internal_err else {
+                panic!("existing transaction must remain a recoverable table-access failure");
+            };
+
             trx.rollback().await.unwrap();
-            assert_eq!(lifecycle_error, Some(LifecycleError::ExistingTransaction));
+            assert_eq!(operation_error, Some(OperationError::NotSupported));
+            assert_eq!(*internal_err.current_context(), RuntimeError::TableAccess);
+            assert_eq!(
+                internal_err.downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
+            );
             assert!(was_in_trx);
             assert!(!session.in_trx().unwrap());
         });

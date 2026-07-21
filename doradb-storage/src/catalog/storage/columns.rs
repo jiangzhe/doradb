@@ -6,13 +6,14 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::Result;
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
+use error_stack::ResultExt;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
@@ -35,8 +36,15 @@ pub(crate) struct Columns<'a> {
 }
 
 impl Columns<'_> {
-    /// Insert a column.
-    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &ColumnObject) -> bool {
+    /// Insert a column in a freshly allocated table-id namespace.
+    ///
+    /// Column numbers are assigned by metadata order, so `(table_id, column_no)`
+    /// is unique by construction. Operation failures are invariant violations.
+    pub(crate) async fn insert(
+        &self,
+        stmt: &mut Statement<'_>,
+        obj: &ColumnObject,
+    ) -> RuntimeResult<()> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.column_no),
@@ -44,7 +52,15 @@ impl Columns<'_> {
             Val::from(obj.column_type as u32),
             Val::from(obj.column_attributes.bits()),
         ];
-        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
+        stmt.catalog_insert_mvcc(self.table, cols)
+            .await
+            .map(|_| ())
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_columns_insert, table_id={}, column_no={}",
+                    obj.table_id, obj.column_no
+                )
+            })
     }
 
     /// List all columns of one table from uncommitted-visible catalog rows.
@@ -52,7 +68,7 @@ impl Columns<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<Vec<ColumnObject>> {
+    ) -> RuntimeResult<Vec<ColumnObject>> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(guards, |col_layout, row| {
@@ -70,7 +86,9 @@ impl Columns<'_> {
                 }
                 true
             })
-            .await?;
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| format!("operation=list_catalog_columns, table_id={table_id}"))?;
         Ok(res)
     }
 
@@ -80,11 +98,17 @@ impl Columns<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         column_no: u16,
-    ) -> bool {
+    ) -> RuntimeResult<bool> {
         let key_vals = [Val::from(table_id), Val::from(column_no)];
-        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_COLUMNS, &key_vals, true)
+        let res = stmt
+            .catalog_delete_primary_key_mvcc(self.table, PK_NO_COLUMNS, &key_vals, true)
             .await
-            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_columns_delete, table_id={table_id}, column_no={column_no}"
+                )
+            })?;
+        Ok(matches!(res, DeleteMvcc::Deleted))
     }
 
     /// Delete all columns for one table and return the number of deleted rows.
@@ -92,13 +116,13 @@ impl Columns<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> Result<usize> {
+    ) -> RuntimeResult<usize> {
         let columns = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;
         let mut deleted = 0;
         for column in columns {
-            if self.delete_by_id(stmt, table_id, column.column_no).await {
+            if self.delete_by_id(stmt, table_id, column.column_no).await? {
                 deleted += 1;
             }
         }
@@ -233,30 +257,24 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .columns()
-                        .insert(stmt, &col_42_0)
-                        .await
-                );
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .columns()
-                        .insert(stmt, &col_42_1)
-                        .await
-                );
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .columns()
-                        .insert(stmt, &col_43_0)
-                        .await
-                );
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .insert(stmt, &col_42_0)
+                    .await?;
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .insert(stmt, &col_42_1)
+                    .await?;
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .insert(stmt, &col_43_0)
+                    .await?;
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())
             })
@@ -272,7 +290,7 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 1)
-                        .await
+                        .await?
                 );
                 assert!(
                     !engine
@@ -280,7 +298,7 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 9)
-                        .await
+                        .await?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
@@ -317,7 +335,7 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 1)
-                        .await
+                        .await?
                 );
                 assert!(
                     engine
@@ -325,7 +343,7 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 0)
-                        .await
+                        .await?
                 );
                 assert!(
                     engine
@@ -333,7 +351,7 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(43), 0)
-                        .await
+                        .await?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
@@ -403,14 +421,12 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 for column in &columns {
-                    assert!(
-                        engine
-                            .catalog()
-                            .storage
-                            .columns()
-                            .insert(stmt, column)
-                            .await
-                    );
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .insert(stmt, column)
+                        .await?;
                 }
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())

@@ -62,7 +62,7 @@ impl<'a> RecoveryResources<'a> {
         let first_retained_file_seq = self
             .catalog
             .storage
-            .checkpoint_snapshot()?
+            .checkpoint_snapshot()
             .meta
             .first_redo_log_seq;
         let logs = discover_redo_log_files(&file_prefix, first_retained_file_seq, false)?;

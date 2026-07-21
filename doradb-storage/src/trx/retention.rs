@@ -113,7 +113,7 @@ impl TransactionSystem {
     /// Compute a side-effect-free redo truncation plan.
     #[inline]
     pub(crate) fn plan_redo_truncation(&self) -> Result<RedoTruncationPlan> {
-        let snapshot = self.catalog.storage.checkpoint_snapshot()?;
+        let snapshot = self.catalog.storage.checkpoint_snapshot();
         let first_retained_file_seq = snapshot.meta.first_redo_log_seq;
         let catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
 
@@ -189,9 +189,9 @@ impl TransactionSystem {
                 .await
             {
                 Ok(marker) => marker,
-                Err(err) if err.report().downcast_ref::<IoError>().is_some() => {
+                Err(err) if err.downcast_ref::<IoError>().is_some() => {
                     let report = err
-                        .into_fatal_report(FatalError::CheckpointWrite)
+                        .change_context(FatalError::CheckpointWrite)
                         .attach("publish redo retention marker IO failure");
                     obs::error!(
                         "event=engine_poison component=redo_retention action=poison result=error error={:?}",
@@ -199,7 +199,7 @@ impl TransactionSystem {
                     );
                     return Err(self.poisoner.poison(report).into_report().into());
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             }
         } else {
             previous_first_retained_file_seq
@@ -286,7 +286,7 @@ impl TransactionSystem {
         let first_retained_file_seq = self
             .catalog
             .storage
-            .checkpoint_snapshot()?
+            .checkpoint_snapshot()
             .meta
             .first_redo_log_seq;
         let projected_catalog_progress = projected_catalog_redo_retention_progress(
@@ -318,7 +318,7 @@ impl TransactionSystem {
         // `catalog.mtb` root; otherwise use the marker-only publication path.
         let checkpoint_outcome = if checkpoint_will_publish {
             if target_marker > previous_first_retained_file_seq {
-                let applied = prepared.apply_first_redo_log_seq(target_marker)?;
+                let applied = prepared.apply_first_redo_log_seq(target_marker);
                 debug_assert!(
                     applied,
                     "marker must monotonically advance when target_marker ({target_marker}) \
@@ -328,9 +328,9 @@ impl TransactionSystem {
             }
             match prepared.commit(&self.catalog.storage).await {
                 Ok(outcome) => outcome,
-                Err(err) if err.report().downcast_ref::<IoError>().is_some() => {
+                Err(err) if err.downcast_ref::<IoError>().is_some() => {
                     let report = err
-                        .into_fatal_report(FatalError::CheckpointWrite)
+                        .change_context(FatalError::CheckpointWrite)
                         .attach("commit combined catalog checkpoint IO failure");
                     obs::error!(
                         "event=engine_poison component=redo_retention action=poison result=error error={:?}",
@@ -338,7 +338,7 @@ impl TransactionSystem {
                     );
                     return Err(self.poisoner.poison(report).into_report().into());
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             }
         } else {
             if target_marker > previous_first_retained_file_seq {
@@ -349,9 +349,9 @@ impl TransactionSystem {
                     .await
                 {
                     Ok(marker) => marker,
-                    Err(err) if err.report().downcast_ref::<IoError>().is_some() => {
+                    Err(err) if err.downcast_ref::<IoError>().is_some() => {
                         let report = err
-                            .into_fatal_report(FatalError::CheckpointWrite)
+                            .change_context(FatalError::CheckpointWrite)
                             .attach("publish combined redo retention marker IO failure");
                         obs::error!(
                             "event=engine_poison component=redo_retention action=poison result=error error={:?}",
@@ -359,7 +359,7 @@ impl TransactionSystem {
                         );
                         return Err(self.poisoner.poison(report).into_report().into());
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => return Err(err.into()),
                 };
             }
             CatalogCheckpointOutcome::Noop

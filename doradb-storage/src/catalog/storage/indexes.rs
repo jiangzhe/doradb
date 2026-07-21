@@ -7,13 +7,14 @@ use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
     catalog_table_id_from_slot,
 };
-use crate::error::Result;
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
+use error_stack::ResultExt;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
@@ -50,14 +51,29 @@ pub(crate) struct Indexes<'a> {
 }
 
 impl Indexes<'_> {
-    /// Insert an index.
-    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexObject) -> bool {
+    /// Insert an index with a table-local allocated index number.
+    ///
+    /// `(table_id, index_no)` is unique by construction. Operation failures are
+    /// asserted at the statement boundary.
+    pub(crate) async fn insert(
+        &self,
+        stmt: &mut Statement<'_>,
+        obj: &IndexObject,
+    ) -> RuntimeResult<()> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
             Val::from(obj.index_attributes.bits()),
         ];
-        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
+        stmt.catalog_insert_mvcc(self.table, cols)
+            .await
+            .map(|_| ())
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_indexes_insert, table_id={}, index_no={}",
+                    obj.table_id, obj.index_no
+                )
+            })
     }
 
     /// Delete an index by (table_id, index_no).
@@ -66,11 +82,17 @@ impl Indexes<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         index_no: u16,
-    ) -> bool {
+    ) -> RuntimeResult<bool> {
         let key_vals = [Val::from(table_id), Val::from(index_no)];
-        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEXES, &key_vals, true)
+        let res = stmt
+            .catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEXES, &key_vals, true)
             .await
-            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_indexes_delete, table_id={table_id}, index_no={index_no}"
+                )
+            })?;
+        Ok(matches!(res, DeleteMvcc::Deleted))
     }
 
     /// Delete all indexes for one table and return the number of deleted rows.
@@ -78,13 +100,13 @@ impl Indexes<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> Result<usize> {
+    ) -> RuntimeResult<usize> {
         let indexes = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;
         let mut deleted = 0;
         for index in indexes {
-            if self.delete_by_id(stmt, table_id, index.index_no).await {
+            if self.delete_by_id(stmt, table_id, index.index_no).await? {
                 deleted += 1;
             }
         }
@@ -96,7 +118,7 @@ impl Indexes<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<Vec<IndexObject>> {
+    ) -> RuntimeResult<Vec<IndexObject>> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(guards, |col_layout, row| {
@@ -114,7 +136,9 @@ impl Indexes<'_> {
                 }
                 true
             })
-            .await?;
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| format!("operation=list_catalog_indexes, table_id={table_id}"))?;
         Ok(res)
     }
 }
@@ -125,8 +149,15 @@ pub(crate) struct IndexColumns<'a> {
 }
 
 impl IndexColumns<'_> {
-    /// Insert one index-column mapping row.
-    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexColumnObject) -> bool {
+    /// Insert one index-column mapping row derived from index-key order.
+    ///
+    /// The enumerated `index_column_no` makes the composite primary key unique
+    /// by construction. Operation failures are invariant violations.
+    pub(crate) async fn insert(
+        &self,
+        stmt: &mut Statement<'_>,
+        obj: &IndexColumnObject,
+    ) -> RuntimeResult<()> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
@@ -134,7 +165,15 @@ impl IndexColumns<'_> {
             Val::from(obj.column_no),
             Val::from(obj.index_order as u8),
         ];
-        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
+        stmt.catalog_insert_mvcc(self.table, cols)
+            .await
+            .map(|_| ())
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_index_columns_insert, table_id={}, index_no={}, index_column_no={}",
+                    obj.table_id, obj.index_no, obj.index_column_no
+                )
+            })
     }
 
     async fn delete_by_id(
@@ -143,15 +182,21 @@ impl IndexColumns<'_> {
         table_id: TableID,
         index_no: u16,
         index_column_no: u16,
-    ) -> bool {
+    ) -> RuntimeResult<bool> {
         let key_vals = [
             Val::from(table_id),
             Val::from(index_no),
             Val::from(index_column_no),
         ];
-        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEX_COLUMNS, &key_vals, true)
+        let res = stmt
+            .catalog_delete_primary_key_mvcc(self.table, PK_NO_INDEX_COLUMNS, &key_vals, true)
             .await
-            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
+            .attach_with(|| {
+                format!(
+                    "operation=catalog_index_columns_delete, table_id={table_id}, index_no={index_no}, index_column_no={index_column_no}"
+                )
+            })?;
+        Ok(matches!(res, DeleteMvcc::Deleted))
     }
 
     /// Delete all index-column rows by `(table_id, index_no)`.
@@ -160,7 +205,7 @@ impl IndexColumns<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         index_no: u16,
-    ) -> Result<usize> {
+    ) -> RuntimeResult<usize> {
         let index_columns = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;
@@ -171,7 +216,7 @@ impl IndexColumns<'_> {
         {
             if self
                 .delete_by_id(stmt, table_id, index_no, index_column.index_column_no)
-                .await
+                .await?
             {
                 deleted += 1;
             }
@@ -184,7 +229,7 @@ impl IndexColumns<'_> {
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
-    ) -> Result<usize> {
+    ) -> RuntimeResult<usize> {
         let index_columns = self
             .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
             .await?;
@@ -197,7 +242,7 @@ impl IndexColumns<'_> {
                     index_column.index_no,
                     index_column.index_column_no,
                 )
-                .await
+                .await?
             {
                 deleted += 1;
             }
@@ -210,7 +255,7 @@ impl IndexColumns<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<Vec<IndexColumnObject>> {
+    ) -> RuntimeResult<Vec<IndexColumnObject>> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(guards, |col_layout, row| {
@@ -227,7 +272,9 @@ impl IndexColumns<'_> {
                 }
                 true
             })
-            .await?;
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| format!("operation=list_catalog_index_columns, table_id={table_id}"))?;
         Ok(res)
     }
 }
@@ -414,30 +461,24 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .insert(stmt, &idx_42_0)
-                        .await
-                );
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .insert(stmt, &idx_42_1)
-                        .await
-                );
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .indexes()
-                        .insert(stmt, &idx_43_0)
-                        .await
-                );
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .insert(stmt, &idx_42_0)
+                    .await?;
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .insert(stmt, &idx_42_1)
+                    .await?;
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .insert(stmt, &idx_43_0)
+                    .await?;
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())
             })
@@ -453,7 +494,7 @@ mod tests {
                         .storage
                         .indexes()
                         .delete_by_id(stmt, TableID::new(42), 1)
-                        .await
+                        .await?
                 );
                 assert!(
                     !engine
@@ -461,7 +502,7 @@ mod tests {
                         .storage
                         .indexes()
                         .delete_by_id(stmt, TableID::new(42), 9)
-                        .await
+                        .await?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
@@ -498,7 +539,7 @@ mod tests {
                         .storage
                         .indexes()
                         .delete_by_id(stmt, TableID::new(42), 1)
-                        .await
+                        .await?
                 );
                 assert!(
                     engine
@@ -506,7 +547,7 @@ mod tests {
                         .storage
                         .indexes()
                         .delete_by_id(stmt, TableID::new(42), 0)
-                        .await
+                        .await?
                 );
                 assert!(
                     engine
@@ -514,7 +555,7 @@ mod tests {
                         .storage
                         .indexes()
                         .delete_by_id(stmt, TableID::new(43), 0)
-                        .await
+                        .await?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
@@ -578,7 +619,12 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 for index in &indexes {
-                    assert!(engine.catalog().storage.indexes().insert(stmt, index).await);
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .insert(stmt, index)
+                        .await?;
                 }
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())
@@ -683,14 +729,12 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 for index_column in &index_columns {
-                    assert!(
-                        engine
-                            .catalog()
-                            .storage
-                            .index_columns()
-                            .insert(stmt, index_column)
-                            .await
-                    );
+                    engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .insert(stmt, index_column)
+                        .await?;
                 }
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())

@@ -1,6 +1,5 @@
-use crate::error::{LifecycleError, Result};
+use crate::error::{MultiDomainResultExt, RuntimeOrFatalResult};
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::poison::EnginePoisoner;
 use crate::row::INVALID_ROW_ID;
 use crate::trx::sys::TransactionSystem;
 
@@ -62,7 +61,6 @@ pub(super) struct ParentPosition<G> {
 #[derive(Clone, Copy)]
 pub(crate) struct RowPageCreateRedoCtx<'a> {
     trx_sys: &'a TransactionSystem,
-    poisoner: &'a EnginePoisoner,
     table_id: TableID,
 }
 
@@ -71,14 +69,9 @@ impl RowPageCreateRedoCtx<'_> {
     #[inline]
     pub(crate) fn new<'a>(
         trx_sys: &'a TransactionSystem,
-        poisoner: &'a EnginePoisoner,
         table_id: TableID,
     ) -> RowPageCreateRedoCtx<'a> {
-        RowPageCreateRedoCtx {
-            trx_sys,
-            poisoner,
-            table_id,
-        }
+        RowPageCreateRedoCtx { trx_sys, table_id }
     }
 
     /// Commits the system redo record for a newly allocated row page.
@@ -88,23 +81,18 @@ impl RowPageCreateRedoCtx<'_> {
         page_id: PageID,
         start_row_id: RowID,
         end_row_id: RowID,
-    ) -> Result<TrxID> {
+    ) -> RuntimeOrFatalResult<TrxID> {
         let mut trx = self.trx_sys.begin_sys_trx();
         let table_id = self.table_id;
         // Safety relies on callers serializing this no-wait commit with the
         // row-page-index append path. Later row-page creation and user redo
         // must not persist ahead of this CreateRowPage record.
         trx.create_row_page(table_id, page_id, start_row_id, end_row_id);
-        let res = self.trx_sys.commit_sys(trx);
-        if let Err(err) = &res {
-            debug_assert!(
-                self.poisoner.poison_error().is_some()
-                    || err.report().downcast_ref::<LifecycleError>().copied()
-                        == Some(LifecycleError::Shutdown),
-                "row-page create redo failed while transaction system is still healthy: {err:?}"
-            );
-        }
-        res
+        self.trx_sys.commit_sys(trx).attach_with(|| {
+            format!(
+                "operation=commit_row_page, table_id={table_id}, page_id={page_id}, row_range={start_row_id}..{end_row_id}"
+            )
+        })
     }
 }
 

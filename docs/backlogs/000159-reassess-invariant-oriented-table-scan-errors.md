@@ -33,28 +33,43 @@ that does not establish a reachable production error path.
 
 ## Deferred From (Optional)
 
-docs/tasks/000225-refine-error-boundaries-and-typed-propagation.md
+docs/tasks/000225-refine-error-boundaries-and-typed-propagation.md;
+docs/tasks/000230-stateful-storage-runtime-boundaries-and-semantic-consumers.md;
+docs/rfcs/0023-storage-error-boundary-propagation-migration.md Phase 3, deferred
+to Phase 4
 
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000225 preserves remaining Internal classifications and
   conservatively propagates the generic cursor result while refining error
   boundaries. Deciding whether those paths are impossible requires ownership,
-  page-lifetime, and concurrency proofs outside the current refactor.
+  page-lifetime, and concurrency proofs outside the current refactor. Task
+  000230 narrowed the surrounding stateful-storage error paths but explicitly
+  deferred this production proof to RFC-0023 Phase 4 so Phase 3 resolution does
+  not infer infallibility from a generic trait signature or synthetic failing
+  pool.
 - Findings: Active transaction attachments normally retain their engine;
   session and transaction attachments normally construct complete pool guards;
   published row-page-index entries normally name reachable pages. Production
   cursor traversal uses the fixed metadata pool, where root lifetime and a held
   parent appear to protect child reachability and page kind. Concurrent table
   drop, index structural modification, cleanup, and fatal rollback still need
-  an explicit proof before replacing returned errors with assertions.
+  an explicit proof before replacing returned errors with assertions. At task
+  000230 resolution, `RowPageIndexMemCursor::seek`/`next` remain Runtime-typed,
+  the published-node reachability TODO remains in `row_page_index.rs`, and the
+  required-guard TODO remains in `MemTable::missing_pool_guard`; the synthetic
+  failing insert-page pool is still not accepted as production reachability
+  evidence.
 - Direction Hint: Start from production ownership and concurrency schedules,
   not from the generic trait signature or a test-only failing pool. Prove root
   lifetime, pool identity, page kind, parent-protected child/sibling
   reachability, re-seek behavior, and table-drop exclusion. If failure is
   impossible, prefer an explicit assertion or infallible production API. If a
   valid production schedule can fail, retain the narrowest typed result and
-  add a regression that exercises that real path.
+  add a regression that exercises that real path. Revisit this together with
+  the Phase 4 transaction/orchestration call-stack audit and final
+  `docs/error-spec.md` simplification so the proof and final boundary inventory
+  agree.
 
 ## Scope Hint
 

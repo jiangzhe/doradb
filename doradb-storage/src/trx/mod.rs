@@ -34,13 +34,14 @@ use crate::catalog::{TableCache, is_catalog_table};
 use crate::engine::{EngineRef, WeakEngineRef};
 use crate::error::{
     CompletionErrorBridge, Error, FatalError, InternalError, InternalResult, LifecycleError,
-    LifecycleResult, OperationError, ResourceError, Result, SharedFatalError,
+    LifecycleResult, OperationError, ResourceError, Result, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeResult, SharedFatalError,
 };
 use crate::id::{SessionID, TableID, TrxID};
 use crate::io::Completion;
 use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
-    StmtNo,
+    StmtNo, TableLockMode,
 };
 use crate::log::block_group::TrxLog;
 use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
@@ -182,7 +183,8 @@ impl Transaction {
 
     /// Acquires an explicit transaction-lifetime table lock.
     #[inline]
-    pub async fn lock_table(&mut self, table_id: TableID, mode: LockMode) -> Result<()> {
+    pub async fn lock_table(&mut self, table_id: TableID, mode: TableLockMode) -> Result<()> {
+        let mode = LockMode::from(mode);
         let mut checkout = self.checkout().attach("operation=lock_explicit_table")?;
         checkout.lock_table(table_id, mode).await
     }
@@ -217,7 +219,7 @@ impl Transaction {
         enum ExecOutcome<T> {
             Success(T),
             StatementError(Error),
-            FatalRollback(Error),
+            FatalRollback(Report<FatalError>),
         }
         let outcome = {
             let (inner, attachment) = checkout.inner_and_attachment_mut();
@@ -239,8 +241,42 @@ impl Transaction {
             ExecOutcome::StatementError(err) => Err(err),
             ExecOutcome::FatalRollback(err) => {
                 checkout.discard_after_fatal_rollback();
-                Err(err)
+                Err(err.into())
             }
+        }
+    }
+
+    /// Stages one catalog DDL statement without widening Runtime errors.
+    ///
+    /// Statement effects are merged into the transaction even when `f` returns
+    /// an error. The catalog DDL owner must therefore terminate and roll back
+    /// the whole transaction after an error instead of continuing to use it.
+    /// Catalog insert Operation failures are asserted at the statement boundary
+    /// because catalog key construction guarantees uniqueness.
+    #[inline]
+    pub(crate) async fn stage_catalog_statement<T, F>(&mut self, f: F) -> RuntimeResult<T>
+    where
+        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> RuntimeResult<T>,
+    {
+        let mut checkout = self
+            .checkout()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=stage_catalog_statement")?;
+        let trx_id = checkout.inner().trx_id();
+        let stmt_no = checkout
+            .inner_mut()
+            .next_stmt_no()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=stage_catalog_statement")?;
+        let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
+        {
+            let (inner, attachment) = checkout.inner_and_attachment_mut();
+            let mut stmt = Statement::new(inner, attachment, stmt_owner)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=stage_catalog_statement")?;
+            let result = f(&mut stmt).await;
+            stmt.merge_effects();
+            result
         }
     }
 
@@ -282,6 +318,97 @@ impl Transaction {
             .claim_terminal(TrxEntryState::RollingBack)
             .attach("operation=rollback_active_transaction")?;
         engine.trx_sys.rollback_transaction(claim).await
+    }
+
+    /// Commit a catalog DDL transaction without crossing the public error boundary.
+    #[inline]
+    pub(crate) async fn commit_catalog_ddl(self) -> RuntimeOrFatalResult<TrxID> {
+        let mut trx = self;
+        trx.terminal_started = true;
+        let engine = trx
+            .engine
+            .upgrade_for_terminal()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=commit_catalog_ddl, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
+                    trx.session_id, trx.trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        let claim = trx
+            .claim_terminal(TrxEntryState::Committing)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=commit_catalog_ddl, session_id={}, trx_id={}",
+                    trx.session_id, trx.trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        engine.trx_sys.commit_catalog_transaction(claim).await
+    }
+
+    /// Roll back a catalog DDL transaction without crossing the public error boundary.
+    #[inline]
+    pub(crate) async fn rollback_catalog_ddl(self) -> RuntimeOrFatalResult<()> {
+        let mut trx = self;
+        trx.terminal_started = true;
+        let engine = trx
+            .engine
+            .upgrade_for_terminal()
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=rollback_catalog_ddl, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
+                    trx.session_id, trx.trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        let claim = trx
+            .claim_terminal(TrxEntryState::RollingBack)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=rollback_catalog_ddl, session_id={}, trx_id={}",
+                    trx.session_id, trx.trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        engine.trx_sys.rollback_catalog_transaction(claim).await
+    }
+
+    /// Roll back an engine-owned table-maintenance transaction without crossing
+    /// the public error boundary.
+    #[inline]
+    pub(crate) async fn rollback_table_maintenance(self) -> RuntimeOrFatalResult<()> {
+        let mut trx = self;
+        trx.terminal_started = true;
+        let engine = trx
+            .engine
+            .upgrade_for_terminal()
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=rollback_table_maintenance, session_id={}, trx_id={}, phase=upgrade_engine_runtime",
+                    trx.session_id, trx.trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        let claim = trx
+            .claim_terminal(TrxEntryState::RollingBack)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=rollback_table_maintenance, session_id={}, trx_id={}",
+                    trx.session_id, trx.trx_id
+                )
+            })
+            .map_err(RuntimeOrFatalError::from)?;
+        engine
+            .trx_sys
+            .rollback_table_maintenance_transaction(claim)
+            .await
     }
 }
 
@@ -1195,31 +1322,30 @@ pub(crate) enum FailedPrecommitReason {
 }
 
 impl FailedPrecommitReason {
-    /// Convert this failed-precommit reason into an operation error.
+    /// Convert this rejection at a Runtime-or-Fatal system-commit boundary.
     #[inline]
-    pub(crate) fn into_error(self, message: impl Into<String>) -> Error {
+    pub(crate) fn into_runtime_or_fatal(self) -> RuntimeOrFatalError {
         match self {
-            FailedPrecommitReason::Fatal(error) => {
-                error.into_report().attach(message.into()).into()
-            }
-            FailedPrecommitReason::Resource(reason) => {
-                Report::new(reason).attach(message.into()).into()
-            }
-            FailedPrecommitReason::Shutdown => Report::new(LifecycleError::Shutdown)
-                .attach(message.into())
-                .into(),
+            FailedPrecommitReason::Fatal(error) => RuntimeOrFatalError::from(error),
+            FailedPrecommitReason::Resource(reason) => RuntimeOrFatalError::from(
+                Report::new(reason).change_context(RuntimeError::SystemTransactionCommit),
+            ),
+            FailedPrecommitReason::Shutdown => RuntimeOrFatalError::from(
+                Report::new(LifecycleError::Shutdown)
+                    .change_context(RuntimeError::SystemTransactionCommit),
+            ),
         }
     }
 
     #[inline]
-    fn completion_bridge(self, message: impl Into<String>) -> CompletionErrorBridge {
+    fn completion_bridge(self, message: &'static str) -> CompletionErrorBridge {
         match self {
             FailedPrecommitReason::Fatal(error) => error.into_completion_bridge(),
             FailedPrecommitReason::Resource(reason) => {
-                CompletionErrorBridge::capture(Report::new(reason).attach(message.into()))
+                CompletionErrorBridge::capture(Report::new(reason).attach(message))
             }
             FailedPrecommitReason::Shutdown => CompletionErrorBridge::capture(
-                Report::new(LifecycleError::Shutdown).attach(message.into()),
+                Report::new(LifecycleError::Shutdown).attach(message),
             ),
         }
     }
@@ -1522,8 +1648,6 @@ impl TrxInner {
         mode: LockMode,
     ) -> Result<()> {
         let operation = "lock_explicit_table";
-        mode.validate_explicit_table_lock()
-            .attach_with(|| format!("operation={operation}, table_id={table_id}"))?;
         let engine = self.checked_engine(attachment).attach_with(|| {
             format!("operation={operation}, table_id={table_id}, phase=resolve_transaction_engine")
         })?;
@@ -1543,12 +1667,8 @@ impl TrxInner {
             })?;
         let owner = lock_state.owner();
         let cache = TrxTableLockCache {
-            metadata_cached: lock_state
-                .cached_covers(resources.metadata, LockMode::Shared)
-                .attach_with(|| format!("operation={operation}, table_id={table_id}"))?,
-            data_cached: lock_state
-                .cached_covers(resources.data, mode)
-                .attach_with(|| format!("operation={operation}, table_id={table_id}"))?,
+            metadata_cached: lock_state.cached_covers(resources.metadata, LockMode::Shared),
+            data_cached: lock_state.cached_covers(resources.data, mode),
         };
         let metadata_grant = lock_state
             .acquire_uncached(lock_manager, resources.metadata, LockMode::Shared)
@@ -1628,11 +1748,10 @@ impl TrxInner {
 
     /// Prepare current transaction for committing.
     #[inline]
-    fn prepare(mut self, attachment: TrxAttachment) -> Result<PreparedTrx> {
+    fn prepare(mut self, attachment: TrxAttachment) -> InternalResult<PreparedTrx> {
         if !self.active {
             return Err(Report::new(InternalError::ActiveTransactionDiscarded)
-                .attach("operation=prepare_active_transaction")
-                .into());
+                .attach("operation=prepare_active_transaction"));
         }
         // fast path for readonly transactions
         if !self.require_ordered_commit() {
@@ -1851,7 +1970,7 @@ impl PrecommitTrxPayload {
     }
 
     #[inline]
-    async fn rollback(&mut self, attachment: &TrxAttachment) -> Result<()> {
+    async fn rollback(&mut self, attachment: &TrxAttachment) -> RuntimeResult<()> {
         let PrecommitTrxPayload::User {
             sts,
             row_undo,
@@ -1995,7 +2114,7 @@ impl PrecommitTrx {
         {
             if let Err(err) = payload.rollback(attachment).await {
                 let report = err
-                    .into_fatal_report(FatalError::RollbackAccess)
+                    .change_context(FatalError::RollbackAccess)
                     .attach("failed-precommit rollback failed");
                 obs::error!(
                     "event=engine_poison component=trx action=poison result=error error={:?}",
@@ -2552,7 +2671,7 @@ pub(crate) mod tests {
             .claim_terminal(TrxEntryState::Committing)
             .attach("operation=prepare_active_transaction")?;
         let (_entry, inner, attachment) = claim.into_parts();
-        inner.prepare(attachment)
+        Ok(inner.prepare(attachment)?)
     }
 
     #[inline]
@@ -2659,7 +2778,7 @@ pub(crate) mod tests {
                 Ok(inner
                     .checked_lock_state()
                     .attach("operation=check_transaction_lock_cache")?
-                    .cached_covers(resource, mode)?)
+                    .cached_covers(resource, mode))
             },
         )?
     }
@@ -2695,7 +2814,7 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<bool> {
-        if lock_state.cached_covers(resource, mode)? {
+        if lock_state.cached_covers(resource, mode) {
             return Ok(true);
         }
         let owner = lock_state.owner();
@@ -3311,13 +3430,19 @@ pub(crate) mod tests {
             let data = LockResource::TableData(table_id);
 
             assert_eq!(entry.inspect_state(), TrxEntryState::Active);
-            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
+            trx.lock_table(table_id, TableLockMode::Exclusive)
+                .await
+                .unwrap();
             assert_eq!(entry.inspect_state(), TrxEntryState::Active);
             assert!(cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
             assert!(cached_transaction_lock_covers(&trx, data, LockMode::Exclusive).unwrap());
 
-            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
-            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
+            trx.lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap();
+            trx.lock_table(table_id, TableLockMode::Exclusive)
+                .await
+                .unwrap();
 
             assert_eq!(entry.inspect_state(), TrxEntryState::Active);
             assert_eq!(lock_entry_count(&engine, owner), 2);
@@ -3358,7 +3483,7 @@ pub(crate) mod tests {
             let entry = transaction_entry(&trx);
             let owner = lock_owner(&trx).unwrap();
             let metadata = LockResource::TableMetadata(table_id);
-            let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
+            let mut lock_fut = Box::pin(trx.lock_table(table_id, TableLockMode::Shared));
 
             assert!(matches!(
                 futures::poll!(lock_fut.as_mut()),
@@ -3412,7 +3537,7 @@ pub(crate) mod tests {
                 try_acquire(engine.lock_manager(), data, LockMode::Exclusive, blocker).unwrap()
             );
 
-            let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
+            let mut lock_fut = Box::pin(trx.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
                 futures::poll!(lock_fut.as_mut()),
                 std::task::Poll::Pending

@@ -7,7 +7,7 @@ use crate::index::{
 };
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::row::ops::SelectMvcc;
-use crate::table::{DmlValidationResultExt, DmlValidator, Table, TableRuntimeLayout};
+use crate::table::{DmlValidator, Table, TableRuntimeLayout};
 use crate::trx::{Transaction, TrxCheckout, TrxRuntime};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
@@ -176,7 +176,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
             .expect("stream state is present until exhaustion or error");
         let rt = state.stmt_state.runtime();
         let accessor = state.table.accessor_with_layout(&state.layout);
-        accessor
+        Ok(accessor
             .index_lookup_candidate_row_mvcc(
                 rt,
                 state.index_no,
@@ -186,6 +186,14 @@ impl<'trx> IndexScanMvccStream<'trx> {
                 &state.read_set,
             )
             .await
+            .attach_with(|| {
+                format!(
+                    "operation={INDEX_SCAN_STREAM_OPERATION}, table_id={}, index_no={}, row_id={}",
+                    state.table.table_id(),
+                    state.index_no,
+                    candidate.row_id
+                )
+            })?)
     }
 
     #[inline]
@@ -286,7 +294,10 @@ impl<'trx> StreamStmt<'trx> {
         if !self.disable_validation {
             DmlValidator::new(layout.metadata())
                 .validate_index_scan(index_no, &range, read_set)
-                .with_foreground_context(INDEX_SCAN_STREAM_OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| {
+                    format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}")
+                })?;
         }
         let index = layout.secondary_index(index_no)?;
         let unique = index.is_unique();

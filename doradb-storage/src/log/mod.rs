@@ -667,12 +667,15 @@ impl RedoLog {
     }
 
     #[inline]
-    fn rotate_log_file(&self, group_commit_g: &mut MutexGuard<'_, GroupCommit>) -> Result<()> {
+    fn rotate_log_file(
+        &self,
+        group_commit_g: &mut MutexGuard<'_, GroupCommit>,
+    ) -> RuntimeResult<()> {
         let Some(old_log_file) = group_commit_g.log_file.take() else {
-            return Err(Error::from(
-                Report::new(InternalError::CurrentRedoLogFileMissing)
-                    .attach("redo log rotation requires current log file"),
-            ));
+            return Err(Report::new(InternalError::CurrentRedoLogFileMissing)
+                .attach("redo log rotation requires current log file")
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=rotate_redo_log_file"));
         };
         let CreatedLogFile {
             log_file: new_log_file,
@@ -693,7 +696,7 @@ impl RedoLog {
     }
 
     #[inline]
-    fn create_log_file(&self) -> Result<CreatedLogFile> {
+    fn create_log_file(&self) -> RuntimeResult<CreatedLogFile> {
         let file_seq = self.file_seq.fetch_add(1, Ordering::SeqCst);
         create_log_file(
             &self.file_prefix,
@@ -732,7 +735,8 @@ impl RedoLog {
                     reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
                         Report::new(InternalError::CurrentRedoLogFileMissing)
                             .attach("enqueue redo group requires current log file")
-                            .change_context(FatalError::RedoWrite),
+                            .change_context(FatalError::RedoWrite)
+                            .attach("operation=enqueue_precommit, phase=resolve_current_redo_file"),
                     )),
                     close_admission: true,
                 });
@@ -753,8 +757,7 @@ impl RedoLog {
                         return Err(EnqueuePrecommitError {
                             trx: Box::new(trx),
                             reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
-                                err.into_report()
-                                    .change_context(FatalError::RedoWrite)
+                                err.change_context(FatalError::RedoWrite)
                                     .attach("rotate redo log file for group allocation"),
                             )),
                             close_admission: true,
@@ -767,7 +770,10 @@ impl RedoLog {
                             reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
                                 Report::new(InternalError::CurrentRedoLogFileMissing)
                                     .attach("redo rotation did not install a current log file")
-                                    .change_context(FatalError::RedoWrite),
+                                    .change_context(FatalError::RedoWrite)
+                                    .attach(
+                                        "operation=enqueue_precommit, phase=resolve_rotated_redo_file",
+                                    ),
                             )),
                             close_admission: true,
                         });
@@ -2032,7 +2038,7 @@ pub(crate) fn discover_redo_log_files(
     validate_redo_log_file_sequences(file_prefix, first_retained_file_seq, &files).map_err(
         |report| {
             report
-                .change_context(RuntimeError::RedoLogDiscovery)
+                .change_context(RuntimeError::RedoLogAccess)
                 .attach(format!(
                     "phase=validate_redo_log_family, file_prefix={file_prefix}"
                 ))
@@ -2068,7 +2074,7 @@ fn collect_redo_log_family_files(file_prefix: &str) -> RuntimeResult<Vec<RedoLog
         let path = entry.map_err(|err| {
             Report::new(IoError::from(err.error().kind()))
                 .attach(format!("{err}"))
-                .change_context(RuntimeError::RedoLogDiscovery)
+                .change_context(RuntimeError::RedoLogAccess)
                 .attach(format!(
                     "phase=enumerate_redo_log_family, file_prefix={file_prefix}, path={}",
                     err.path().display()
@@ -2086,7 +2092,7 @@ fn collect_redo_log_family_files(file_prefix: &str) -> RuntimeResult<Vec<RedoLog
                     "path={}, expected={file_prefix}.<8-hex-sequence>",
                     path.display()
                 ))
-                .change_context(RuntimeError::RedoLogDiscovery)
+                .change_context(RuntimeError::RedoLogAccess)
                 .attach(format!(
                     "phase=enumerate_redo_log_family, file_prefix={file_prefix}"
                 )));
@@ -2255,7 +2261,7 @@ fn create_log_file(
     file_seq: u32,
     file_max_size: usize,
     log_block_size: usize,
-) -> Result<CreatedLogFile> {
+) -> RuntimeResult<CreatedLogFile> {
     let (created, _) = create_log_file_with_header_completion(
         file_prefix,
         file_seq,
@@ -2271,7 +2277,7 @@ fn create_log_file_with_header_completion(
     file_seq: u32,
     file_max_size: usize,
     log_block_size: usize,
-) -> Result<(CreatedLogFile, Arc<Completion<()>>)> {
+) -> RuntimeResult<(CreatedLogFile, Arc<Completion<()>>)> {
     create_log_file_with_header_completion_with_mode(
         file_prefix,
         file_seq,
@@ -2288,20 +2294,38 @@ fn create_log_file_with_header_completion_with_mode(
     file_max_size: usize,
     log_block_size: usize,
     create_mode: RedoLogCreateMode,
-) -> Result<(CreatedLogFile, Arc<Completion<()>>)> {
+) -> RuntimeResult<(CreatedLogFile, Arc<Completion<()>>)> {
     let file_name = log_file_name(file_prefix, file_seq);
     let sparse_file = match create_mode {
         RedoLogCreateMode::CreateOrFail => {
-            SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_FILE_ID)?
+            SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_FILE_ID)
         }
         RedoLogCreateMode::CreateOrTrunc => {
-            SparseFile::create_or_trunc(&file_name, file_max_size, UNTRACKED_FILE_ID)?
+            SparseFile::create_or_trunc(&file_name, file_max_size, UNTRACKED_FILE_ID)
         }
     };
+    let sparse_file = sparse_file.map_err(|err| {
+        err.change_context(RuntimeError::RedoLogAccess)
+            .attach(format!(
+                "operation=create_redo_log_file, file={file_name}, file_seq={file_seq}"
+            ))
+    })?;
     let super_block = RedoSuperBlock::initial(file_seq, log_block_size, file_max_size);
     let (header_write, header_completion) =
-        prepare_initial_redo_super_block(&sparse_file, &super_block)?;
-    let _ = sparse_file.alloc(REDO_DEFAULT_DATA_START_OFFSET)?;
+        prepare_initial_redo_super_block(&sparse_file, &super_block).map_err(|err| {
+            err.change_context(RuntimeError::RedoLogAccess)
+            .attach(format!(
+                "operation=prepare_initial_redo_super_block, file={file_name}, file_seq={file_seq}"
+            ))
+        })?;
+    let _ = sparse_file
+        .alloc(REDO_DEFAULT_DATA_START_OFFSET)
+        .map_err(|err| {
+            err.change_context(RuntimeError::RedoLogAccess)
+                .attach(format!(
+                    "operation=allocate_redo_log_data_start, file={file_name}, file_seq={file_seq}"
+                ))
+        })?;
     let log_file = RedoLogFile::new(sparse_file, super_block);
     Ok((
         CreatedLogFile {
@@ -2421,8 +2445,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
     use crate::error::{
-        DataIntegrityError, ErrorKind, FatalError, InternalError, IoError as StorageIoError,
-        IoResult, LifecycleError, RuntimeError, SharedFatalError,
+        DataIntegrityError, ErrorKind, FatalError, InternalError, IoError, IoResult,
+        LifecycleError, RuntimeError, RuntimeOrFatalError, SharedFatalError,
     };
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
@@ -2448,7 +2472,7 @@ mod tests {
     use std::fmt::Debug;
     use std::fs::{self, File, OpenOptions};
     use std::future::Future;
-    use std::io::{Error as IoError, Seek, SeekFrom, Write};
+    use std::io::{Error as StdIoError, Seek, SeekFrom, Write};
     use std::iter::repeat_n;
     use std::num::NonZeroUsize;
     use std::os::fd::{AsRawFd, RawFd};
@@ -2479,7 +2503,7 @@ mod tests {
         err: &Report<RuntimeError>,
         expected: DataIntegrityError,
     ) {
-        assert_eq!(*err.current_context(), RuntimeError::RedoLogDiscovery);
+        assert_eq!(*err.current_context(), RuntimeError::RedoLogAccess);
         assert_eq!(
             err.downcast_ref::<DataIntegrityError>().copied(),
             Some(expected)
@@ -2722,7 +2746,7 @@ mod tests {
                 smol::block_on(listener);
             }
             if let Some(errno) = self.inner.errno {
-                *res = Err(IoError::from_raw_os_error(errno));
+                *res = Err(StdIoError::from_raw_os_error(errno));
             }
         }
     }
@@ -2804,7 +2828,7 @@ mod tests {
                 smol::block_on(listener);
             }
             if self.inner.errno != 0 {
-                *res = Err(IoError::from_raw_os_error(self.inner.errno));
+                *res = Err(StdIoError::from_raw_os_error(self.inner.errno));
             }
         }
     }
@@ -2850,18 +2874,6 @@ mod tests {
         })
     }
 
-    fn assert_direct_fatal<T: Debug>(res: &Result<T>, expected: FatalError) {
-        let err = match res {
-            Ok(value) => panic!("expected fatal error, got {value:?}"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.report().downcast_ref::<FatalError>().copied(),
-            Some(expected),
-            "{err:?}"
-        );
-    }
-
     fn assert_propagated_completion_fatal<T: Debug>(
         res: &Result<T>,
         expected: FatalError,
@@ -2876,10 +2888,7 @@ mod tests {
             Some(expected),
             "{err:?}"
         );
-        assert!(
-            err.report().downcast_ref::<StorageIoError>().is_some(),
-            "{err:?}"
-        );
+        assert!(err.report().downcast_ref::<IoError>().is_some(), "{err:?}");
         let report = format!("{err:?}");
         assert!(report.contains(expected_op_kind), "{report}");
         assert!(report.contains("wait for redo group commit"), "{report}");
@@ -2899,7 +2908,7 @@ mod tests {
 
         let failure = redo_io_failure(
             IOKind::Fdatasync,
-            Err(IoError::from_raw_os_error(libc::EIO)),
+            Err(StdIoError::from_raw_os_error(libc::EIO)),
             0,
         )
         .expect("sync IO failure must retain a fatal report");
@@ -3053,10 +3062,11 @@ mod tests {
         };
 
         assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
+            err.downcast_ref::<InternalError>().copied(),
             Some(InternalError::CurrentRedoLogFileMissing),
             "{err:?}"
         );
+        assert_eq!(err.current_context(), &RuntimeError::RedoLogAccess);
     }
 
     #[test]
@@ -3078,7 +3088,11 @@ mod tests {
             );
             let res = engine.inner().trx_sys.commit_sys(sys_trx);
 
-            assert_direct_fatal(&res, FatalError::RedoWrite);
+            let err = res.expect_err("missing current log file should fail system commit");
+            let RuntimeOrFatalError::Fatal(err) = err else {
+                panic!("redo publication failure should be Fatal")
+            };
+            assert_eq!(err.current_context(), &FatalError::RedoWrite);
             let poison = engine
                 .inner()
                 .poisoner
@@ -3143,20 +3157,40 @@ mod tests {
 
             let err = trx.commit().await.unwrap_err();
 
+            assert_eq!(err.kind(), ErrorKind::Fatal);
             assert_eq!(
                 err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RedoWrite),
                 "{err:?}"
             );
-            assert!(!session.in_trx().unwrap());
-            assert!(
-                engine
-                    .inner()
-                    .poisoner
-                    .ensure_healthy()
-                    .as_ref()
-                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::RedoLogAccess),
+                "{err:?}"
             );
+            assert!(err.report().downcast_ref::<IoError>().is_some(), "{err:?}");
+            assert_eq!(
+                err.report()
+                    .frames()
+                    .filter(|frame| frame.is::<ErrorKind>())
+                    .count(),
+                1,
+                "{err:?}"
+            );
+            assert!(!session.in_trx().unwrap());
+            let poison = engine
+                .inner()
+                .poisoner
+                .ensure_healthy()
+                .expect_err("redo rotation failure must poison runtime admission");
+            assert_eq!(poison.current_context(), &FatalError::RedoWrite);
+            assert_eq!(
+                poison.downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::RedoLogAccess),
+                "{poison:?}"
+            );
+            assert!(poison.downcast_ref::<IoError>().is_some(), "{poison:?}");
+            assert!(poison.downcast_ref::<ErrorKind>().is_none(), "{poison:?}");
             drop(session);
         });
     }
@@ -3570,7 +3604,7 @@ mod tests {
                 }
                 LogTestCompletionBatch::WaitError => Err(BackendError::wait(
                     "log_test",
-                    IoError::from_raw_os_error(libc::EIO),
+                    StdIoError::from_raw_os_error(libc::EIO),
                     1,
                 )),
             }
@@ -4610,7 +4644,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
             err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::RedoLogDiscovery)
+            Some(RuntimeError::RedoLogAccess)
         );
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
@@ -4794,7 +4828,7 @@ mod tests {
             let mut stream = planned.stream;
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::LogFileCorrupted)
             );
         });
@@ -4875,7 +4909,7 @@ mod tests {
             let mut stream = planned.stream;
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::LogFileCorrupted)
             );
         });
@@ -5158,7 +5192,7 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::Runtime);
             assert_eq!(
                 err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::RedoLogDiscovery)
+                Some(RuntimeError::RedoLogAccess)
             );
             assert_eq!(
                 err.report().downcast_ref::<DataIntegrityError>().copied(),
@@ -5305,10 +5339,7 @@ mod tests {
                 .ensure_healthy()
                 .expect_err("redo write failure must poison runtime admission");
             assert_eq!(*poison.current_context(), FatalError::RedoWrite);
-            assert!(
-                poison.downcast_ref::<StorageIoError>().is_some(),
-                "{poison:?}"
-            );
+            assert!(poison.downcast_ref::<IoError>().is_some(), "{poison:?}");
         });
     }
 
@@ -5362,10 +5393,7 @@ mod tests {
             .ensure_healthy()
             .expect_err("redo sync failure must poison runtime admission");
         assert_eq!(*poison.current_context(), FatalError::RedoSync);
-        assert!(
-            poison.downcast_ref::<StorageIoError>().is_some(),
-            "{poison:?}"
-        );
+        assert!(poison.downcast_ref::<IoError>().is_some(), "{poison:?}");
     }
 
     #[test]

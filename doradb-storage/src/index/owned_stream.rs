@@ -14,7 +14,7 @@ use super::index_stream::{
 use super::secondary_index::{SecondaryIndex, SecondaryIndexCandidateStream};
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
-use crate::error::Result;
+use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::index::btree::{BTreeNode, BTreeNodeCursorState};
 use crate::index::{IndexBatchStream, IndexLookupCandidate, KeyRange};
@@ -42,7 +42,7 @@ impl<P: BufferPool> IndexLeafCursor for OwnedUniqueMemIndexCursor<P> {
     type Leaf = PageSharedGuard<BTreeNode>;
 
     #[inline]
-    async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
         let mem = match self.index.as_ref() {
             SecondaryIndex::Unique { mem, .. } => mem,
             SecondaryIndex::NonUnique { .. } => {
@@ -55,7 +55,7 @@ impl<P: BufferPool> IndexLeafCursor for OwnedUniqueMemIndexCursor<P> {
     }
 
     #[inline]
-    async fn next_leaf(&mut self) -> Result<Option<Self::Leaf>> {
+    async fn next_leaf(&mut self) -> RuntimeResult<Option<Self::Leaf>> {
         let mem = match self.index.as_ref() {
             SecondaryIndex::Unique { mem, .. } => mem,
             SecondaryIndex::NonUnique { .. } => {
@@ -87,7 +87,7 @@ impl<P: BufferPool> IndexLeafCursor for OwnedNonUniqueMemIndexCursor<P> {
     type Leaf = PageSharedGuard<BTreeNode>;
 
     #[inline]
-    async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
         let mem = match self.index.as_ref() {
             SecondaryIndex::NonUnique { mem, .. } => mem,
             SecondaryIndex::Unique { .. } => {
@@ -100,7 +100,7 @@ impl<P: BufferPool> IndexLeafCursor for OwnedNonUniqueMemIndexCursor<P> {
     }
 
     #[inline]
-    async fn next_leaf(&mut self) -> Result<Option<Self::Leaf>> {
+    async fn next_leaf(&mut self) -> RuntimeResult<Option<Self::Leaf>> {
         let mem = match self.index.as_ref() {
             SecondaryIndex::NonUnique { mem, .. } => mem,
             SecondaryIndex::Unique { .. } => {
@@ -132,12 +132,12 @@ impl<P: BufferPool> IndexLeafCursor for OwnedUniqueDiskTreeCursor<P> {
     type Leaf = DiskTreeLeaf<UniqueDiskTreeSpec>;
 
     #[inline]
-    async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
         self.state.seek(key).await
     }
 
     #[inline]
-    async fn next_leaf(&mut self) -> Result<Option<Self::Leaf>> {
+    async fn next_leaf(&mut self) -> RuntimeResult<Option<Self::Leaf>> {
         let runtime = match self.index.as_ref() {
             SecondaryIndex::Unique { disk, .. } => disk.unique_runtime(),
             SecondaryIndex::NonUnique { .. } => {
@@ -169,12 +169,12 @@ impl<P: BufferPool> IndexLeafCursor for OwnedNonUniqueDiskTreeCursor<P> {
     type Leaf = DiskTreeLeaf<NonUniqueDiskTreeSpec>;
 
     #[inline]
-    async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
         self.state.seek(key).await
     }
 
     #[inline]
-    async fn next_leaf(&mut self) -> Result<Option<Self::Leaf>> {
+    async fn next_leaf(&mut self) -> RuntimeResult<Option<Self::Leaf>> {
         let runtime = match self.index.as_ref() {
             SecondaryIndex::NonUnique { disk, .. } => disk.non_unique_runtime(),
             SecondaryIndex::Unique { .. } => {
@@ -314,7 +314,7 @@ impl<P: BufferPool + 'static> IndexBatchStream<IndexLookupCandidate>
     for OwnedSecondaryIndexCandidateStream<P>
 {
     #[inline]
-    async fn next_batch(&mut self) -> Result<Option<Vec<IndexLookupCandidate>>> {
+    async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
         match &mut self.inner {
             OwnedSecondaryIndexCandidateStreamKind::Unique(stream) => stream.next_batch().await,
             OwnedSecondaryIndexCandidateStreamKind::NonUnique(stream) => stream.next_batch().await,

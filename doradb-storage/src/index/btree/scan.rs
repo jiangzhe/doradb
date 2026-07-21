@@ -1,6 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
-use crate::error::Result;
+use crate::error::RuntimeResult;
 use crate::index::btree::{BTreeNode, BTreeSlot};
 use crate::index::btree::{BTreeNodeCursor, GenericBTree};
 use std::ops::{Deref, DerefMut};
@@ -18,16 +18,16 @@ pub(crate) trait BTreeSlotCallback {
     /// same tree should be avoided).
     /// Returns `Ok(true)` if the scan should continue, `Ok(false)` if it
     /// should stop cleanly, or `Err` if slot processing fails.
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool>;
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> RuntimeResult<bool>;
 }
 
 /// Convenient blank implemtation of support scan callback.
 impl<F> BTreeSlotCallback for F
 where
-    F: FnMut(&BTreeNode, &BTreeSlot) -> Result<bool>,
+    F: FnMut(&BTreeNode, &BTreeSlot) -> RuntimeResult<bool>,
 {
     #[inline]
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool> {
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> RuntimeResult<bool> {
         self(node, slot)
     }
 }
@@ -64,7 +64,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
 
     /// Scan slots whose keys start with `key` and invoke the callback for each.
     #[inline]
-    pub(crate) async fn scan_prefix(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) async fn scan_prefix(&mut self, key: &[u8]) -> RuntimeResult<()> {
         // find first leaf node of prefix key.
         self.cursor.seek(key).await?;
         let Some(first_g) = self.cursor.next().await? else {
@@ -286,7 +286,7 @@ mod tests {
 
     impl BTreeSlotCallback for Count {
         #[inline]
-        fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> Result<bool> {
+        fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> RuntimeResult<bool> {
             self.0 += 1;
             Ok(true)
         }

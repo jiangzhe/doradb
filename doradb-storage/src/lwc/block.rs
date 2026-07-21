@@ -2,11 +2,7 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableColumnLayout};
-use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind};
-// Genuine mixed-domain convergence: `PersistedLwcBlock::load` combines
-// buffer/read completion failures with persisted DataIntegrity validation, so
-// its public storage result ends typed propagation at the load boundary.
-use crate::error::Result;
+use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind, RuntimeResult};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
@@ -166,10 +162,12 @@ impl LwcBlock {
         let col_count = self.header.col_count() as usize;
         let end_idx = col_count * mem::size_of::<u16>();
         if end_idx > self.body.len() {
-            return Err(invalid_lwc_payload(format!(
-                "LWC column offset table length {end_idx} exceeds body length {}",
-                self.body.len()
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC column offset table length {end_idx} exceeds body length {}",
+                    self.body.len()
+                )),
+            );
         }
         let raw = &self.body[..end_idx];
         let offsets = layout::slice_from_bytes::<[u8; 2]>(raw);
@@ -187,21 +185,26 @@ impl LwcBlock {
         col_idx: usize,
     ) -> DataIntegrityResult<LwcColumn<'a>> {
         if col_idx >= col_layout.col_count() {
-            return Err(invalid_lwc_payload(format!(
-                "LWC column metadata mismatch: col_idx={col_idx}, col_count={}",
-                col_layout.col_count()
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC column metadata mismatch: col_idx={col_idx}, col_count={}",
+                    col_layout.col_count()
+                )),
+            );
         }
         let (start_idx, end_idx) = self.col_offsets().and_then(|offsets| {
             offsets.get(col_idx).ok_or_else(|| {
-                invalid_lwc_payload(format!("LWC column index {col_idx} is out of range"))
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("LWC column index {col_idx} is out of range"))
             })
         })?;
         if end_idx > self.body.len() || start_idx > end_idx {
-            return Err(invalid_lwc_payload(format!(
-                "invalid LWC column slice start={start_idx}, end={end_idx}, body_len={}",
-                self.body.len()
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "invalid LWC column slice start={start_idx}, end={end_idx}, body_len={}",
+                    self.body.len()
+                )),
+            );
         }
         let data = &self.body[start_idx..end_idx];
         let row_count = self.header.row_count() as usize;
@@ -210,10 +213,12 @@ impl LwcBlock {
             let (bitmap, values) = LwcNullBitmap::from_bytes(data)?;
             let required = row_count.div_ceil(8);
             if bitmap.len() < required {
-                return Err(invalid_lwc_payload(format!(
-                    "LWC null bitmap length {} is shorter than required {required}",
-                    bitmap.len()
-                )));
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "LWC null bitmap length {} is shorter than required {required}",
+                        bitmap.len()
+                    )),
+                );
             }
             Ok(LwcColumn {
                 kind,
@@ -327,7 +332,7 @@ impl PersistedLwcBlock {
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_pool_guard: &PoolGuard,
         block_id: BlockID,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         let guard = disk_pool
             .read_validated_block(
                 file_kind,
@@ -401,14 +406,16 @@ impl ColOffsets<'_> {
     pub(crate) fn validate(&self, body_len: usize) -> DataIntegrityResult<()> {
         let mut start_idx = self.data_start;
         if start_idx > body_len {
-            return Err(invalid_lwc_payload(format!(
-                "LWC data start {start_idx} exceeds body length {body_len}"
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC data start {start_idx} exceeds body length {body_len}"
+                )),
+            );
         }
         for offset in self.offsets {
             let end_idx = u16::from_le_bytes(*offset) as usize;
             if end_idx > body_len || start_idx > end_idx {
-                return Err(invalid_lwc_payload(format!(
+                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "invalid LWC column offset start={start_idx}, end={end_idx}, body_len={body_len}"
                 )));
             }
@@ -512,11 +519,6 @@ pub(crate) fn validate_persisted_lwc_block(
     block_id: BlockID,
 ) -> DataIntegrityResult<()> {
     LwcBlock::try_from_persisted_bytes(input, file_kind, block_id).map(|_| ())
-}
-
-#[inline]
-fn invalid_lwc_payload(message: impl Into<String>) -> Report<DataIntegrityError> {
-    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
 }
 
 #[cfg(test)]
@@ -820,7 +822,7 @@ mod tests {
         let (index_no, indexed_metadata) = metadata
             .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
             .unwrap();
-        let dropped_metadata = indexed_metadata.try_without_index(index_no).unwrap();
+        let dropped_metadata = indexed_metadata.without_index(index_no);
         let page =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
                 .unwrap();

@@ -76,11 +76,11 @@ impl Deser for MetaBlock {
                 .iter()
                 .map(|active_index_spec| active_index_spec.index_no as usize),
         )?;
-        let schema = TableMetadata::try_from(meta).map_err(|err| {
-            err.into_report()
-                .change_context(DataIntegrityError::InvalidPayload)
-                .attach("invalid persisted table metadata")
-        })?;
+        // Table metadata is serialized only from a validated `TableMetadata`.
+        // The surrounding format/version/checksum validation establishes that
+        // these are engine-owned persisted fields, so semantic reconstruction
+        // is a release-mode invariant rather than a recoverable decode error.
+        let schema = TableMetadata::from(meta);
         Ok((
             idx,
             MetaBlock {
@@ -209,14 +209,14 @@ impl Deser for MultiTableMetaBlockData {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, next_table_id) = TableID::deser(input, start_idx)?;
         if next_table_id > USER_TABLE_ID_LIMIT {
-            return Err(invalid_payload(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "next_table_id {next_table_id} is out of user table id range (limit: {USER_TABLE_ID_LIMIT})"
             )));
         }
         let (idx, table_count) = input.deser_u32(idx)?;
         let (mut idx, first_redo_log_seq) = input.deser_u32(idx)?;
         if table_count as usize != CATALOG_TABLE_ROOT_DESC_COUNT {
-            return Err(invalid_payload(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "catalog table root count {table_count} does not match expected {CATALOG_TABLE_ROOT_DESC_COUNT}"
             )));
         }
@@ -230,9 +230,11 @@ impl Deser for MultiTableMetaBlockData {
             // is a checkpointed persisted root block id.
             let root_block_id = NonZeroU64::new(root_block_id_raw);
             if root_block_id.is_none() && pivot_row_id != RowID::new(0) {
-                return Err(invalid_payload(format!(
-                    "catalog table root has no root block but pivot_row_id {pivot_row_id}"
-                )));
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "catalog table root has no root block but pivot_row_id {pivot_row_id}"
+                    )),
+                );
             }
             *root = CatalogTableRootDesc {
                 table_id,
@@ -316,16 +318,10 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
 }
 
 #[inline]
-fn invalid_payload(message: impl Into<String>) -> Report<DataIntegrityError> {
-    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
-}
-
-#[inline]
 fn validate_alloc_map(alloc_map: &AllocMap) -> DataIntegrityResult<()> {
     if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
-        return Err(invalid_payload(
-            "allocation map must include allocated super block",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("allocation map must include allocated super block"));
     }
     Ok(())
 }
@@ -338,11 +334,13 @@ fn validate_secondary_index_roots(
 ) -> DataIntegrityResult<()> {
     let index_slot_count = next_index_no as usize;
     if secondary_index_roots.len() != index_slot_count {
-        return Err(invalid_payload(format!(
-            "secondary index root count {} does not match next_index_no {}",
-            secondary_index_roots.len(),
-            next_index_no
-        )));
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "secondary index root count {} does not match next_index_no {}",
+                secondary_index_roots.len(),
+                next_index_no
+            )),
+        );
     }
 
     let mut active_slots = vec![false; index_slot_count];
@@ -357,7 +355,7 @@ fn validate_secondary_index_roots(
         .enumerate()
     {
         if !active && root != SUPER_BLOCK_ID {
-            return Err(invalid_payload(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "inactive secondary index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
             )));
         }

@@ -1,4 +1,7 @@
-use crate::error::{DataIntegrityError, Error, InternalError, IoError, Result, RuntimeResult};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, InternalError, InternalResult, IoError, IoResult,
+    RuntimeError, RuntimeResult,
+};
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::id::TrxID;
 use crate::io::{
@@ -145,7 +148,7 @@ impl TrxLogIterator {
 
     /// Return the next transaction frame, or `None` once the body is exhausted.
     #[inline]
-    pub(crate) fn try_next(&mut self) -> Result<Option<TrxLog>> {
+    pub(crate) fn try_next(&mut self) -> DataIntegrityResult<Option<TrxLog>> {
         if self.offset == self.data.len() {
             return Ok(None);
         }
@@ -154,19 +157,18 @@ impl TrxLogIterator {
         // loop forever on corrupt input.
         if offset == self.offset {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("block=redo-group, trx parser consumed zero bytes")
-                .into());
+                .attach("block=redo-group, trx parser consumed zero bytes"));
         }
         let cts = res.header.cts;
         // The header range is a cheap cross-check that every transaction record
         // belongs to this group without requiring exact min/max recomputation.
         if cts < self.min_cts || cts > self.max_cts {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "block=redo-group, cts={cts}, min_cts={}, max_cts={}",
                     self.min_cts, self.max_cts
-                ))
-                .into());
+                )),
+            );
         }
         self.offset = offset;
         Ok(Some(res))
@@ -187,15 +189,36 @@ pub(crate) struct RedoLogSegment {
 impl RedoLogSegment {
     /// Build validated segment metadata by reading only the fixed super-block area.
     #[inline]
-    pub(crate) fn from_descriptor(descriptor: RedoLogFileDescriptor) -> Result<Self> {
+    pub(crate) fn from_descriptor(descriptor: RedoLogFileDescriptor) -> RuntimeResult<Self> {
         Self::from_path(descriptor.path, descriptor.seq)
     }
 
     /// Build validated segment metadata for a path and expected sequence.
     #[inline]
-    pub(crate) fn from_path(path: PathBuf, file_seq: u32) -> Result<Self> {
-        let mut file = File::open(&path)?;
-        let file_len = file.metadata()?.len();
+    pub(crate) fn from_path(path: PathBuf, file_seq: u32) -> RuntimeResult<Self> {
+        let mut file = File::open(&path).map_err(|err| {
+            let kind = err.kind();
+            Report::new(IoError::from(kind))
+                .attach(err)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach(format!(
+                    "operation=open_redo_segment, path={}",
+                    path.display()
+                ))
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|err| {
+                let kind = err.kind();
+                Report::new(IoError::from(kind))
+                    .attach(err)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach(format!(
+                        "operation=read_redo_metadata, path={}",
+                        path.display()
+                    ))
+            })?
+            .len();
         if file_len < REDO_DEFAULT_DATA_START_OFFSET as u64 {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -204,7 +227,8 @@ impl RedoLogSegment {
                     file_len,
                     REDO_DEFAULT_DATA_START_OFFSET
                 ))
-                .into());
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach(format!("operation=load_redo_segment, file_seq={file_seq:08x}")));
         }
         let mut header = vec![0; REDO_DEFAULT_DATA_START_OFFSET];
         if let Err(err) = file.read_exact(&mut header) {
@@ -215,11 +239,24 @@ impl RedoLogSegment {
                         path.display(),
                         REDO_DEFAULT_DATA_START_OFFSET
                     ))
-                    .into());
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach(format!("operation=load_redo_segment, file_seq={file_seq:08x}")));
             }
-            return Err(err.into());
+            let kind = err.kind();
+            return Err(Report::new(IoError::from(kind))
+                .attach(err)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach(format!(
+                    "operation=read_redo_super_block, path={}, file_seq={file_seq:08x}",
+                    path.display()
+                )));
         }
-        let super_block = select_redo_super_block(&header, file_seq)?;
+        let super_block = select_redo_super_block(&header, file_seq)
+            .change_context(RuntimeError::RedoLogAccess)
+            .attach(format!(
+                "operation=select_redo_super_block, path={}, file_seq={file_seq:08x}",
+                path.display()
+            ))?;
         if super_block.file_max_size > file_len {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -228,7 +265,8 @@ impl RedoLogSegment {
                     super_block.file_max_size,
                     file_len
                 ))
-                .into());
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach(format!("operation=load_redo_segment, file_seq={file_seq:08x}")));
         }
         Ok(Self {
             path,
@@ -269,7 +307,7 @@ impl RedoReplayPlanner {
         &self,
         floor: TrxID,
         read_depth: usize,
-    ) -> Result<PlannedRedoRecovery> {
+    ) -> RuntimeResult<PlannedRedoRecovery> {
         let suffix = self.load_replay_suffix(floor)?;
         let planned = self.plan_replay_segments(&suffix, floor)?;
 
@@ -288,7 +326,7 @@ impl RedoReplayPlanner {
         &self,
         floor: TrxID,
         read_depth: usize,
-    ) -> Result<PlannedCatalogRedoScan> {
+    ) -> RuntimeResult<PlannedCatalogRedoScan> {
         let segments = self.load_all_segments()?;
         let suffix_start = replay_suffix_start(&segments, floor);
         let suffix = &segments[suffix_start..];
@@ -308,7 +346,7 @@ impl RedoReplayPlanner {
     }
 
     #[inline]
-    fn load_all_segments(&self) -> Result<Vec<RedoLogSegment>> {
+    fn load_all_segments(&self) -> RuntimeResult<Vec<RedoLogSegment>> {
         self.discovered
             .iter()
             .cloned()
@@ -318,7 +356,7 @@ impl RedoReplayPlanner {
 
     /// Build retained-segment summaries by validating only redo super-block metadata.
     #[inline]
-    pub(crate) fn plan_retention_segments(&self) -> Result<Vec<RedoRetentionSegment>> {
+    pub(crate) fn plan_retention_segments(&self) -> RuntimeResult<Vec<RedoRetentionSegment>> {
         self.load_all_segments().map(|segments| {
             segments
                 .iter()
@@ -328,7 +366,7 @@ impl RedoReplayPlanner {
     }
 
     #[inline]
-    fn load_replay_suffix(&self, floor: TrxID) -> Result<Vec<RedoLogSegment>> {
+    fn load_replay_suffix(&self, floor: TrxID) -> RuntimeResult<Vec<RedoLogSegment>> {
         let mut suffix = Vec::new();
         for descriptor in self.discovered.iter().rev() {
             let segment = RedoLogSegment::from_descriptor(descriptor.clone())?;
@@ -349,7 +387,7 @@ impl RedoReplayPlanner {
         &self,
         suffix: &[RedoLogSegment],
         floor: TrxID,
-    ) -> Result<PlannedReplaySegments> {
+    ) -> RuntimeResult<PlannedReplaySegments> {
         let repair_policy = self.repair_policy_for_segments(suffix)?;
         let replayable_segments = match repair_policy {
             RedoRecoveryRepairPolicy::FinalTwoUnsealed { .. } => {
@@ -388,7 +426,7 @@ impl RedoReplayPlanner {
     fn repair_policy_for_segments(
         &self,
         segments: &[RedoLogSegment],
-    ) -> Result<RedoRecoveryRepairPolicy> {
+    ) -> RuntimeResult<RedoRecoveryRepairPolicy> {
         let Some(last) = segments.last() else {
             return Ok(RedoRecoveryRepairPolicy::CreateNext { file_seq: 0 });
         };
@@ -403,7 +441,12 @@ impl RedoReplayPlanner {
         // corruption instead of a repair candidate.
         match unsealed_positions.as_slice() {
             [] => Ok(RedoRecoveryRepairPolicy::CreateNext {
-                file_seq: next_redo_file_seq(last.file_seq)?,
+                file_seq: next_redo_file_seq(last.file_seq)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach(format!(
+                        "operation=plan_redo_repair, file_seq={:08x}",
+                        last.file_seq
+                    ))?,
             }),
             // Normal crash tail: the final file is open, so replay its accepted
             // prefix and then either seal it or recreate it after recovery.
@@ -423,7 +466,9 @@ impl RedoReplayPlanner {
                     newest_file_seq: segments[*newest_idx].file_seq,
                 })
             }
-            _ => Err(log_file_corrupted()),
+            _ => Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream")),
         }
     }
 }
@@ -515,14 +560,19 @@ impl RedoLogStream {
 
     /// Refill the in-memory queue from the direct-IO stream.
     #[inline]
-    async fn fill_buffer(&mut self) -> Result<()> {
+    async fn fill_buffer(&mut self) -> RuntimeResult<()> {
         while self.state == RedoLogStreamState::Active {
             if let Some(mut iter) = self.read_next_group().await? {
                 loop {
                     match iter.try_next() {
                         Ok(Some(res)) => self.buffer.push_back(res),
                         Ok(None) => return Ok(()),
-                        Err(err) => return Err(self.fail_stream(err)),
+                        Err(err) => {
+                            return Err(self.fail_stream(
+                                err.change_context(RuntimeError::RedoLogAccess)
+                                    .attach("operation=decode_redo_group"),
+                            ));
+                        }
                     }
                 }
             }
@@ -532,9 +582,12 @@ impl RedoLogStream {
 
     /// Try to read the next transaction redo record, reading direct-IO blocks on demand.
     #[inline]
-    pub(crate) async fn try_next(&mut self) -> Result<Option<TrxLog>> {
+    pub(crate) async fn try_next(&mut self) -> RuntimeResult<Option<TrxLog>> {
         if self.state == RedoLogStreamState::Failed {
-            return Err(Self::read_after_failed_error());
+            return Err(Report::new(InternalError::RedoReadProtocolInvariant)
+                .attach("redo stream read after terminal error")
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         match self.buffer.pop_front() {
             res @ Some(_) => Ok(res),
@@ -546,12 +599,17 @@ impl RedoLogStream {
     }
 
     #[inline]
-    async fn read_next_group(&mut self) -> Result<Option<TrxLogIterator>> {
+    async fn read_next_group(&mut self) -> RuntimeResult<Option<TrxLogIterator>> {
         loop {
             match self.state {
                 RedoLogStreamState::Active => {}
                 RedoLogStreamState::Ended => return Ok(None),
-                RedoLogStreamState::Failed => return Err(Self::read_after_failed_error()),
+                RedoLogStreamState::Failed => {
+                    return Err(Report::new(InternalError::RedoReadProtocolInvariant)
+                        .attach("redo stream read after terminal error")
+                        .change_context(RuntimeError::RedoLogAccess)
+                        .attach("operation=read_redo_stream"));
+                }
             }
             let mut state = match self.current_segment.take() {
                 Some(state) => state,
@@ -585,7 +643,7 @@ impl RedoLogStream {
     }
 
     #[inline]
-    async fn receive_next_segment(&mut self) -> Result<Option<SegmentReadState>> {
+    async fn receive_next_segment(&mut self) -> RuntimeResult<Option<SegmentReadState>> {
         match self.recv_item().await? {
             RedoReadItem::SegmentStart(segment) => {
                 Ok(Some(SegmentReadState::from_segment(segment)?))
@@ -597,18 +655,25 @@ impl RedoLogStream {
             RedoReadItem::Error(err) => Err(err),
             RedoReadItem::Block { buf, .. } => {
                 self.recycle_buf(buf);
-                Err(Report::new(InternalError::Generic)
+                Err(Report::new(InternalError::RedoReadProtocolInvariant)
                     .attach("redo read-ahead emitted block before segment start")
-                    .into())
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=receive_redo_segment"))
             }
-            RedoReadItem::SegmentEnd { .. } => Err(Report::new(InternalError::Generic)
-                .attach("redo read-ahead emitted segment end before segment start")
-                .into()),
+            RedoReadItem::SegmentEnd { .. } => {
+                Err(Report::new(InternalError::RedoReadProtocolInvariant)
+                    .attach("redo read-ahead emitted segment end before segment start")
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=receive_redo_segment"))
+            }
         }
     }
 
     #[inline]
-    async fn read_group_from_segment(&mut self, state: &mut SegmentReadState) -> Result<ReadGroup> {
+    async fn read_group_from_segment(
+        &mut self,
+        state: &mut SegmentReadState,
+    ) -> RuntimeResult<ReadGroup> {
         if let Some(result) = state.read_exhausted_result()? {
             self.consume_segment_end(state).await?;
             return Ok(result);
@@ -636,12 +701,16 @@ impl RedoLogStream {
             .and_then(|group_len| state.offset.checked_add(group_len))
         else {
             self.recycle_buf(first_block);
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         };
         if group_end_offset > state.scan_end_offset {
             self.recycle_buf(first_block);
             if state.sealed.is_some() {
-                return Err(log_file_corrupted());
+                return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=read_redo_stream"));
             }
             return Ok(ReadGroup::ReplayEof(Some(state.unsealed_terminal(
                 UnsealedSegmentTerminalReason::IncompleteContinuationTail,
@@ -658,7 +727,9 @@ impl RedoLogStream {
             &mut payload,
         ) {
             self.recycle_buf(first_block);
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         self.recycle_buf(first_block);
 
@@ -667,10 +738,14 @@ impl RedoLogStream {
                 .checked_mul(state.log_block_size)
                 .and_then(|delta| state.offset.checked_add(delta))
             else {
-                return Err(log_file_corrupted());
+                return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=read_redo_stream"));
             };
             if block_offset >= state.scan_end_offset {
-                return Err(log_file_corrupted());
+                return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=read_redo_stream"));
             }
             let block = self
                 .recv_expected_block(state.file_seq, block_offset)
@@ -693,23 +768,31 @@ impl RedoLogStream {
         }
 
         if payload.len() != group_start.payload_len {
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         state.finish_group_read(group_start, payload)
     }
 
     #[inline]
-    async fn consume_segment_end(&mut self, state: &SegmentReadState) -> Result<()> {
+    async fn consume_segment_end(&mut self, state: &SegmentReadState) -> RuntimeResult<()> {
         match self.recv_item().await? {
             RedoReadItem::SegmentEnd { file_seq } if file_seq == state.file_seq => Ok(()),
             RedoReadItem::SegmentEnd { .. } | RedoReadItem::SegmentStart(_) => {
-                Err(log_file_corrupted())
+                Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=read_redo_stream"))
             }
             RedoReadItem::Block { buf, .. } => {
                 self.recycle_buf(buf);
-                Err(log_file_corrupted())
+                Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=read_redo_stream"))
             }
-            RedoReadItem::End => Err(log_file_corrupted()),
+            RedoReadItem::End => Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream")),
             RedoReadItem::Error(err) => Err(err),
         }
     }
@@ -719,7 +802,7 @@ impl RedoLogStream {
         &mut self,
         expected_file_seq: u32,
         expected_offset: usize,
-    ) -> Result<DirectBuf> {
+    ) -> RuntimeResult<DirectBuf> {
         match self.recv_item().await? {
             RedoReadItem::Block {
                 file_seq,
@@ -728,27 +811,32 @@ impl RedoLogStream {
             } if file_seq == expected_file_seq && offset == expected_offset => Ok(buf),
             RedoReadItem::Block { buf, .. } => {
                 self.recycle_buf(buf);
-                Err(log_file_corrupted())
+                Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=read_redo_stream"))
             }
             RedoReadItem::SegmentEnd { .. } | RedoReadItem::SegmentStart(_) | RedoReadItem::End => {
-                Err(log_file_corrupted())
+                Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=read_redo_stream"))
             }
             RedoReadItem::Error(err) => Err(err),
         }
     }
 
     #[inline]
-    async fn recv_item(&mut self) -> Result<RedoReadItem> {
+    async fn recv_item(&mut self) -> RuntimeResult<RedoReadItem> {
         let reader = self.reader.as_ref().ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::Generic)
-                    .attach("redo read-ahead receive before worker start"),
-            )
+            Report::new(InternalError::RedoReadProtocolInvariant)
+                .attach("redo read-ahead receive before worker start")
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=receive_redo_item")
         })?;
         reader.items.recv_async().await.map_err(|_| {
-            Error::from(
-                Report::new(InternalError::Generic).attach("redo read-ahead worker channel closed"),
-            )
+            Report::new(InternalError::RedoReadProtocolInvariant)
+                .attach("redo read-ahead worker channel closed")
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=receive_redo_item")
         })
     }
 
@@ -768,7 +856,7 @@ impl RedoLogStream {
     }
 
     #[inline]
-    fn fail_stream(&mut self, err: Error) -> Error {
+    fn fail_stream(&mut self, err: Report<RuntimeError>) -> Report<RuntimeError> {
         self.buffer.clear();
         self.current_segment = None;
         self.stop_reader();
@@ -781,13 +869,6 @@ impl RedoLogStream {
         self.current_segment = None;
         self.stop_reader();
         self.state = RedoLogStreamState::Ended;
-    }
-
-    #[inline]
-    fn read_after_failed_error() -> Error {
-        Report::new(InternalError::Generic)
-            .attach("redo stream read after terminal error")
-            .into()
     }
 
     /// Take accepted-prefix metadata for unsealed segments observed by this stream.
@@ -825,7 +906,7 @@ enum RedoReadItem {
     /// Marks normal logical EOF after every planned segment has ended.
     End,
     /// Terminal worker failure; no later item is valid.
-    Error(Error),
+    Error(Report<RuntimeError>),
 }
 
 struct RedoReadAheadHandle {
@@ -905,25 +986,20 @@ struct RedoReadCompletion {
 
 impl RedoReadCompletion {
     #[inline]
-    fn validate(self) -> Result<(u32, usize, DirectBuf)> {
+    fn validate(self) -> IoResult<(u32, usize, DirectBuf)> {
         let actual_bytes = self.actual_bytes.map_err(|err| {
             let kind = err.kind();
-            Error::from(
-                Report::new(err)
-                    .change_context(IoError::from(kind))
-                    .attach(format!(
-                        "redo direct read failed: file_seq={:08x}, offset={}",
-                        self.file_seq, self.offset
-                    )),
-            )
+            Report::new(IoError::from(kind)).attach(err).attach(format!(
+                "redo direct read failed: file_seq={:08x}, offset={}",
+                self.file_seq, self.offset
+            ))
         })?;
         if actual_bytes != self.expected_bytes {
             return Err(Report::new(IoError::from(IoErrorKind::UnexpectedEof))
                 .attach(format!(
                     "redo direct read short read: file_seq={:08x}, offset={}, unexpected eof: actual_bytes={actual_bytes}, expected_bytes={}",
                     self.file_seq, self.offset, self.expected_bytes
-                ))
-                .into());
+                )));
         }
         Ok((self.file_seq, self.offset, self.buf))
     }
@@ -974,7 +1050,9 @@ impl RedoReadAheadWorker {
                     let _ = worker.send_item(RedoReadItem::Error(err));
                 }
             }
-        })?;
+        })
+        .change_context(RuntimeError::RedoLogAccess)
+        .attach("operation=spawn_redo_read_ahead")?;
         Ok(RedoReadAheadHandle {
             items: items_rx,
             recycle: recycle_tx,
@@ -984,8 +1062,10 @@ impl RedoReadAheadWorker {
     }
 
     #[inline]
-    fn run(&mut self) -> Result<bool> {
-        let backend = StorageBackend::setup(self.read_depth)?;
+    fn run(&mut self) -> RuntimeResult<bool> {
+        let backend = StorageBackend::setup(self.read_depth)
+            .change_context(RuntimeError::RedoLogAccess)
+            .attach("operation=initialize_redo_read_backend")?;
         let mut driver = SubmissionDriver::new(backend);
         for segment in take(&mut self.segments) {
             if self.stopped() {
@@ -1001,7 +1081,7 @@ impl RedoReadAheadWorker {
         &mut self,
         driver: &mut SubmissionDriver<RedoReadSubmission>,
         segment: RedoLogSegment,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let file = open_direct_segment_file(&segment)?;
         let file_seq = segment.file_seq;
         let log_block_size = segment.super_block.log_block_size as usize;
@@ -1024,18 +1104,21 @@ impl RedoReadAheadWorker {
                 let submission =
                     RedoReadSubmission::new(file_seq, next_submit_offset, file.as_raw_fd(), buf);
                 if driver.push(submission).is_err() {
-                    return Err(Report::new(InternalError::Generic)
+                    return Err(Report::new(InternalError::RedoReadProtocolInvariant)
                         .attach("redo read-ahead driver rejected submission despite capacity")
-                        .into());
+                        .change_context(RuntimeError::RedoLogAccess)
+                        .attach("operation=submit_redo_read"));
                 }
                 next_submit_offset =
                     next_submit_offset
                         .checked_add(log_block_size)
                         .ok_or_else(|| {
-                            Error::from(
-                                Report::new(DataIntegrityError::InvalidPayload)
-                                    .attach("redo read-ahead offset overflow"),
-                            )
+                            Report::new(DataIntegrityError::InvalidPayload)
+                                .attach("redo read-ahead offset overflow")
+                                .change_context(RuntimeError::RedoLogAccess)
+                                .attach(format!(
+                                    "operation=advance_redo_read, file_seq={file_seq:08x}"
+                                ))
                         })?;
             }
             let submit_attempt = match driver.submit_ready() {
@@ -1095,21 +1178,29 @@ impl RedoReadAheadWorker {
                 Ok(completed) => completed,
                 Err(err) => return Err(self.handle_backend_progress_error(driver, err)),
             };
-            let completion = take_read_completion(completed_submission)?;
-            let (completed_file_seq, completed_offset, buf) = match completion.validate() {
-                Ok(completed) => completed,
-                Err(err) => {
-                    self.drain_driver(driver);
-                    return Err(err);
-                }
-            };
+            let completion = take_read_completion(completed_submission)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach(format!(
+                    "operation=complete_redo_read, file_seq={file_seq:08x}"
+                ))?;
+            let (completed_file_seq, completed_offset, buf) =
+                match completion.validate() {
+                    Ok(completed) => completed,
+                    Err(err) => {
+                        self.drain_driver(driver);
+                        return Err(err.change_context(RuntimeError::RedoLogAccess).attach(
+                            format!("operation=validate_redo_read, file_seq={file_seq:08x}"),
+                        ));
+                    }
+                };
             if completed_file_seq != file_seq || completed.insert(completed_offset, buf).is_some() {
                 self.drain_driver(driver);
-                return Err(Report::new(InternalError::Generic)
+                return Err(Report::new(InternalError::RedoReadProtocolInvariant)
                     .attach(format!(
                         "redo read-ahead duplicate or mismatched completion: file_seq={completed_file_seq:08x}, offset={completed_offset}"
                     ))
-                    .into());
+                    .change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=order_redo_read_completions"));
             }
         }
         if self.send_item(RedoReadItem::SegmentEnd { file_seq }) {
@@ -1213,7 +1304,7 @@ impl RedoReadAheadWorker {
         &mut self,
         driver: &mut SubmissionDriver<RedoReadSubmission, B>,
         err: BackendError,
-    ) -> Error
+    ) -> Report<RuntimeError>
     where
         B: Backend,
     {
@@ -1297,7 +1388,7 @@ struct SegmentReadState {
 
 impl SegmentReadState {
     #[inline]
-    fn from_segment(segment: RedoLogSegment) -> Result<Self> {
+    fn from_segment(segment: RedoLogSegment) -> RuntimeResult<Self> {
         let scan_end_offset = segment_scan_end_offset(&segment)?;
         let sealed = segment
             .super_block
@@ -1322,12 +1413,14 @@ impl SegmentReadState {
     }
 
     #[inline]
-    fn read_exhausted_result(&self) -> Result<Option<ReadGroup>> {
+    fn read_exhausted_result(&self) -> RuntimeResult<Option<ReadGroup>> {
         if self.offset < self.scan_end_offset {
             return Ok(None);
         }
         if !self.validate_sealed_end() {
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         if self.sealed.is_none() {
             return Ok(Some(ReadGroup::ReplayEof(Some(self.unsealed_terminal(
@@ -1338,7 +1431,7 @@ impl SegmentReadState {
     }
 
     #[inline]
-    fn read_group_start(&self, block: &[u8]) -> Result<GroupStartRead> {
+    fn read_group_start(&self, block: &[u8]) -> RuntimeResult<GroupStartRead> {
         debug_assert!(self.offset.is_multiple_of(STORAGE_SECTOR_SIZE));
         if is_zero_redo_block(block) {
             return self.group_start_tail(UnsealedSegmentTerminalReason::ZeroTail);
@@ -1389,7 +1482,7 @@ impl SegmentReadState {
     }
 
     #[inline]
-    fn malformed_group_start_tail(&self) -> Result<GroupStartRead> {
+    fn malformed_group_start_tail(&self) -> RuntimeResult<GroupStartRead> {
         // Malformed group-start bytes can be the crash tail of an unsealed
         // file. Only sealed files report corruption here because their durable
         // end offset says another complete group start must exist.
@@ -1397,12 +1490,17 @@ impl SegmentReadState {
     }
 
     #[inline]
-    fn group_start_tail(&self, reason: UnsealedSegmentTerminalReason) -> Result<GroupStartRead> {
+    fn group_start_tail(
+        &self,
+        reason: UnsealedSegmentTerminalReason,
+    ) -> RuntimeResult<GroupStartRead> {
         // At group-start boundaries, zero or malformed blocks terminate only an
         // unsealed file. Sealed files already published their durable byte
         // range, so encountering such a tail inside that range is corruption.
         if self.sealed.is_some() {
-            Err(log_file_corrupted())
+            Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"))
         } else {
             Ok(GroupStartRead::UnsealedTail(reason))
         }
@@ -1415,7 +1513,7 @@ impl SegmentReadState {
         payload: &mut Vec<u8>,
         expected_idx: usize,
         block_count: usize,
-    ) -> Result<ContinuationRead> {
+    ) -> RuntimeResult<ContinuationRead> {
         if is_zero_redo_block(block) {
             return self.incomplete_continuation_result();
         }
@@ -1430,11 +1528,15 @@ impl SegmentReadState {
             || header.is_group_start()
             || header.group_block_idx as usize != expected_idx
         {
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         let final_block = expected_idx + 1 == block_count;
         if header.is_group_end() != final_block {
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         if !append_block_payload(
             block,
@@ -1444,7 +1546,9 @@ impl SegmentReadState {
             final_block,
             payload,
         ) {
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         Ok(ContinuationRead::Appended)
     }
@@ -1454,7 +1558,7 @@ impl SegmentReadState {
         &mut self,
         group_start: ValidatedGroupStart,
         payload: Vec<u8>,
-    ) -> Result<ReadGroup> {
+    ) -> RuntimeResult<ReadGroup> {
         let extension = group_start.extension;
         self.record_accepted_group(extension.min_redo_cts, extension.max_redo_cts);
         if let Some(sealed) = self.sealed.as_mut() {
@@ -1462,7 +1566,9 @@ impl SegmentReadState {
         }
         self.offset += group_start.block_count * self.log_block_size;
         if self.offset == self.scan_end_offset && !self.validate_sealed_end() {
-            return Err(log_file_corrupted());
+            return Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"));
         }
         Ok(ReadGroup::Group(TrxLogIterator::new(
             payload,
@@ -1472,9 +1578,11 @@ impl SegmentReadState {
     }
 
     #[inline]
-    fn incomplete_continuation_result(&self) -> Result<ContinuationRead> {
+    fn incomplete_continuation_result(&self) -> RuntimeResult<ContinuationRead> {
         if self.sealed.is_some() {
-            Err(log_file_corrupted())
+            Err(Report::new(DataIntegrityError::LogFileCorrupted)
+                .change_context(RuntimeError::RedoLogAccess)
+                .attach("operation=read_redo_stream"))
         } else {
             Ok(ContinuationRead::IncompleteTail)
         }
@@ -1563,10 +1671,11 @@ struct ValidatedGroupStart {
 }
 
 #[inline]
-fn backend_progress_error(err: BackendError) -> Error {
+fn backend_progress_error(err: BackendError) -> Report<RuntimeError> {
     err.into_report()
         .attach("redo read-ahead backend progress failure")
-        .into()
+        .change_context(RuntimeError::RedoLogAccess)
+        .attach("operation=progress_redo_read_backend")
 }
 
 #[inline]
@@ -1616,51 +1725,57 @@ fn retention_segment_summary(segment: &RedoLogSegment) -> RedoRetentionSegment {
 }
 
 #[inline]
-fn log_file_corrupted() -> Error {
-    Report::new(DataIntegrityError::LogFileCorrupted).into()
-}
-
-#[inline]
-fn open_direct_segment_file(segment: &RedoLogSegment) -> Result<SparseFile> {
+fn open_direct_segment_file(segment: &RedoLogSegment) -> RuntimeResult<SparseFile> {
     let path = segment.path.to_str().ok_or_else(|| {
-        Error::from(
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
                 "redo log path is not valid UTF-8: path={}",
                 segment.path.display()
-            )),
-        )
+            ))
+            .change_context(RuntimeError::RedoLogAccess)
+            .attach(format!(
+                "operation=open_redo_segment, file_seq={:08x}",
+                segment.file_seq
+            ))
     })?;
-    Ok(SparseFile::open(path, UNTRACKED_FILE_ID)?)
+    SparseFile::open(path, UNTRACKED_FILE_ID)
+        .change_context(RuntimeError::RedoLogAccess)
+        .attach(format!(
+            "operation=open_redo_segment, file_seq={:08x}",
+            segment.file_seq
+        ))
 }
 
 #[inline]
-fn segment_scan_end_offset(segment: &RedoLogSegment) -> Result<usize> {
+fn segment_scan_end_offset(segment: &RedoLogSegment) -> RuntimeResult<usize> {
     let raw = if segment.super_block.is_sealed() {
         segment.super_block.durable_end_offset
     } else {
         segment.super_block.file_max_size
     };
     usize::try_from(raw).map_err(|_| {
-        Error::from(
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
                 "redo scan end offset exceeds usize: file_seq={:08x}, offset={raw}",
                 segment.file_seq
-            )),
-        )
+            ))
+            .change_context(RuntimeError::RedoLogAccess)
+            .attach(format!(
+                "operation=plan_redo_segment_scan, file_seq={:08x}",
+                segment.file_seq
+            ))
     })
 }
 
 #[inline]
 fn take_read_completion(
     completed: CompletedSubmission<RedoReadSubmission>,
-) -> Result<RedoReadCompletion> {
+) -> InternalResult<RedoReadCompletion> {
     let mut submission = completed.submission;
     let expected_bytes = submission.operation.len();
     let buf = submission.operation.take_buf().ok_or_else(|| {
-        Error::from(
-            Report::new(InternalError::Generic)
-                .attach("redo direct read completion did not return owned buffer"),
-        )
+        Report::new(InternalError::RedoReadProtocolInvariant)
+            .attach("redo direct read completion did not return owned buffer")
     })?;
     Ok(RedoReadCompletion {
         file_seq: submission.file_seq,
@@ -1705,7 +1820,7 @@ fn append_block_payload(
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
-    use crate::error::{ErrorKind, IoError, IoResult, RuntimeError};
+    use crate::error::{IoError, IoResult, RuntimeError};
     use crate::id::{RowID, TableID, TrxID};
     use crate::io::{
         BackendError, BackendResult, BackendToken, DirectBuf, IOBuf, StdIoResult,
@@ -1877,12 +1992,11 @@ mod tests {
             }
             .expect("injected read-ahead spawn must fail planning");
 
-            assert_eq!(err.kind(), ErrorKind::Runtime);
-            assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::BackgroundSpawn)
-            );
-            assert!(err.report().downcast_ref::<IoError>().is_some());
+            assert_eq!(*err.current_context(), RuntimeError::RedoLogAccess);
+            assert!(err.frames().any(|frame| {
+                frame.downcast_ref::<RuntimeError>() == Some(&RuntimeError::BackgroundSpawn)
+            }));
+            assert!(err.downcast_ref::<IoError>().is_some());
             let output = format!("{err:?}");
             assert!(output.contains(phase), "report={output}");
             assert_eq!(output.matches("thread_name=Redo-ReadAhead").count(), 1);
@@ -1891,6 +2005,7 @@ mod tests {
 
     #[test]
     fn test_redo_read_completion_preserves_owned_io_error() {
+        let expected_io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
         let completion = RedoReadCompletion {
             file_seq: 0x12,
             offset: STORAGE_SECTOR_SIZE,
@@ -1904,10 +2019,9 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.kind(), ErrorKind::Io);
+        assert_eq!(*err.current_context(), IoError::from(expected_io_kind));
         assert_eq!(
-            err.report()
-                .downcast_ref::<StdIoError>()
+            err.downcast_ref::<StdIoError>()
                 .and_then(StdIoError::raw_os_error),
             Some(libc::EIO)
         );
@@ -2059,7 +2173,7 @@ mod tests {
     async fn assert_stream_corrupted(stream: &mut RedoLogStream) {
         let err = stream.try_next().await.unwrap_err();
         assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            err.downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted),
             "{err:?}"
         );
@@ -2079,10 +2193,11 @@ mod tests {
         assert_eq!(terminals[0].redo_range, redo_range);
     }
 
-    fn assert_read_after_failed(err: Error) {
+    fn assert_read_after_failed(err: Report<RuntimeError>) {
+        assert_eq!(*err.current_context(), RuntimeError::RedoLogAccess);
         assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::Generic),
+            err.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::RedoReadProtocolInvariant),
             "{err:?}"
         );
         assert!(
@@ -2325,7 +2440,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            err.downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted)
         );
     }
@@ -2359,7 +2474,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            err.downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted)
         );
     }
@@ -2639,7 +2754,7 @@ mod tests {
 
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
         });
@@ -2677,7 +2792,7 @@ mod tests {
 
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
             let err = stream.try_next().await.unwrap_err();
@@ -2702,7 +2817,7 @@ mod tests {
 
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
         });
