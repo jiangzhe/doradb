@@ -12,7 +12,7 @@ use crate::buffer::guard::{
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
-use crate::error::{ConfigError, Result};
+use crate::error::{ConfigError, ConfigResult, RuntimeResult};
 use crate::id::{PageID, TrxID};
 use crate::index::btree::algo::{
     KnownFenceNodeParams, MemTreeSiblingMergePlan, NodeSlotRange, pack_node_range_box,
@@ -119,7 +119,7 @@ impl<P: BufferPool> GenericBTree<P> {
         pool_guard: &PoolGuard,
         hints_enabled: bool,
         ts: TrxID,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         let mut g = pool.allocate_page::<BTreeNode>(pool_guard).await?;
         let page_id = g.page_id();
         let page = g.page_mut();
@@ -132,8 +132,11 @@ impl<P: BufferPool> GenericBTree<P> {
     }
 
     #[inline]
-    async fn allocate_node(&self, pool_guard: &PoolGuard) -> Result<PageExclusiveGuard<BTreeNode>> {
-        Ok(self.pool.allocate_page::<BTreeNode>(pool_guard).await?)
+    async fn allocate_node(
+        &self,
+        pool_guard: &PoolGuard,
+    ) -> RuntimeResult<PageExclusiveGuard<BTreeNode>> {
+        self.pool.allocate_page::<BTreeNode>(pool_guard).await
     }
 
     #[inline]
@@ -142,17 +145,16 @@ impl<P: BufferPool> GenericBTree<P> {
         pool_guard: &PoolGuard,
         page_id: PageID,
         mode: LatchFallbackMode,
-    ) -> Result<FacadePageGuard<BTreeNode>> {
-        Ok(self
-            .pool
+    ) -> RuntimeResult<FacadePageGuard<BTreeNode>> {
+        self.pool
             .get_page::<BTreeNode>(pool_guard, page_id, mode)
-            .await?)
+            .await
     }
 
     /// Destroy the tree.
     /// This method will traverse the tree and deallocate all the nodes recursively.
     #[inline]
-    pub(crate) async fn destory(self, pool_guard: &PoolGuard) -> Result<()> {
+    pub(crate) async fn destory(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
         let g = self
             .get_node(pool_guard, self.root, LatchFallbackMode::Exclusive)
             .await?
@@ -222,7 +224,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> Result<Option<V>> {
+    ) -> RuntimeResult<Option<V>> {
         loop {
             let res = self.try_lookup_optimistic(pool_guard, key).await?;
             let res = verify_continue!(res);
@@ -240,7 +242,7 @@ impl<P: BufferPool> GenericBTree<P> {
         value: V,
         merge_if_match_deleted: bool,
         ts: TrxID,
-    ) -> Result<BTreeInsert<V>> {
+    ) -> RuntimeResult<BTreeInsert<V>> {
         // Stack holds the path from root to leaf.
         loop {
             let res = self
@@ -323,7 +325,7 @@ impl<P: BufferPool> GenericBTree<P> {
         value: V,
         ignore_del_mask: bool,
         ts: TrxID,
-    ) -> Result<BTreeDelete> {
+    ) -> RuntimeResult<BTreeDelete> {
         debug_assert!(!value.is_deleted());
         let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await?;
         debug_assert!(g.page().is_leaf());
@@ -349,7 +351,7 @@ impl<P: BufferPool> GenericBTree<P> {
         value: V,
         expected_deleted: bool,
         ts: TrxID,
-    ) -> Result<BTreeDelete> {
+    ) -> RuntimeResult<BTreeDelete> {
         debug_assert!(!value.is_deleted());
         let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await?;
         debug_assert!(g.page().is_leaf());
@@ -371,7 +373,7 @@ impl<P: BufferPool> GenericBTree<P> {
         old_value: V,
         new_value: V,
         ts: TrxID,
-    ) -> Result<BTreeUpdate<V>> {
+    ) -> RuntimeResult<BTreeUpdate<V>> {
         let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await?;
         debug_assert!(g.page().is_leaf());
         let node = g.page_mut();
@@ -409,7 +411,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         height: usize,
-    ) -> Result<SpaceStatistics> {
+    ) -> RuntimeResult<SpaceStatistics> {
         let mut cursor = self.cursor(pool_guard, height);
         cursor.seek(&[]).await?;
         let mut preview = SpaceStatistics::default();
@@ -429,7 +431,7 @@ impl<P: BufferPool> GenericBTree<P> {
     pub(crate) async fn collect_space_statistics(
         &self,
         pool_guard: &PoolGuard,
-    ) -> Result<SpaceStatistics> {
+    ) -> RuntimeResult<SpaceStatistics> {
         let height = self.height();
         let mut res = SpaceStatistics::default();
         for h in 0..height + 1 {
@@ -460,7 +462,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         config: BTreeCompactConfig,
-    ) -> Result<Vec<PageExclusiveGuard<BTreeNode>>> {
+    ) -> RuntimeResult<Vec<PageExclusiveGuard<BTreeNode>>> {
         let height = self.height();
         let mut purge_list = vec![];
         // leaf compaction.
@@ -485,7 +487,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         // test if root has only one child with optimistic lock,
         // to avoid block concurrent operations.
         loop {
@@ -537,7 +539,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> Result<Validation<Option<V>>> {
+    ) -> RuntimeResult<Validation<Option<V>>> {
         let g = self
             .find_leaf::<OptimisticStrategy>(pool_guard, key)
             .await?;
@@ -565,7 +567,7 @@ impl<P: BufferPool> GenericBTree<P> {
         mut p_guard: FacadePageGuard<BTreeNode>,
         mut c_guard: PageExclusiveGuard<BTreeNode>,
         ts: TrxID,
-    ) -> Result<BTreeSplit> {
+    ) -> RuntimeResult<BTreeSplit> {
         let c_node = c_guard.page_mut();
         debug_assert!(c_node.is_leaf());
         debug_assert!(c_node.count() > 1);
@@ -638,8 +640,9 @@ impl<P: BufferPool> GenericBTree<P> {
         sep_idx: usize,
         sep_key: &[u8],
         ts: TrxID,
-    ) -> Result<Either<(PageExclusiveGuard<BTreeNode>, PageExclusiveGuard<BTreeNode>), BTreeSplit>>
-    {
+    ) -> RuntimeResult<
+        Either<(PageExclusiveGuard<BTreeNode>, PageExclusiveGuard<BTreeNode>), BTreeSplit>,
+    > {
         let c_page_id = c_guard.page_id();
         let c_lower_fence_key = c_guard.page().lower_fence_key();
         let c_optimistic_guard = c_guard.downgrade();
@@ -691,7 +694,7 @@ impl<P: BufferPool> GenericBTree<P> {
         page_id: PageID,
         sep_key: &[u8],
         ts: TrxID,
-    ) -> Result<BTreeSplit> {
+    ) -> RuntimeResult<BTreeSplit> {
         debug_assert!(page_id != self.root);
         match self
             .find_branch_for_split(pool_guard, lower_fence_key, page_id)
@@ -767,7 +770,7 @@ impl<P: BufferPool> GenericBTree<P> {
         root: &mut BTreeNode,
         is_leaf: bool,
         ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         debug_assert!(root.is_leaf() == is_leaf);
         let ts = root.ts().max(ts);
         let height = root.height() as u16;
@@ -894,7 +897,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> Result<S::Guard> {
+    ) -> RuntimeResult<S::Guard> {
         loop {
             let res = self.try_find_leaf::<S>(pool_guard, key).await?;
             let res = verify_continue!(res);
@@ -1032,7 +1035,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> Result<Validation<S::Guard>> {
+    ) -> RuntimeResult<Validation<S::Guard>> {
         let mut p_guard = self
             .pool
             .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
@@ -1084,7 +1087,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> Result<Validation<(S::Guard, Option<FacadePageGuard<BTreeNode>>)>> {
+    ) -> RuntimeResult<Validation<(S::Guard, Option<FacadePageGuard<BTreeNode>>)>> {
         let mut p_guard = self
             .pool
             .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
@@ -1137,7 +1140,7 @@ impl<P: BufferPool> GenericBTree<P> {
         pool_guard: &PoolGuard,
         lower_fence_key: &[u8],
         page_id: PageID,
-    ) -> Result<Option<PageExclusiveGuard<BTreeNode>>> {
+    ) -> RuntimeResult<Option<PageExclusiveGuard<BTreeNode>>> {
         loop {
             let res = self
                 .try_find_branch_for_split(pool_guard, lower_fence_key, page_id)
@@ -1154,7 +1157,7 @@ impl<P: BufferPool> GenericBTree<P> {
         pool_guard: &PoolGuard,
         lower_fence_key: &[u8],
         page_id: PageID,
-    ) -> Result<Validation<Option<PageExclusiveGuard<BTreeNode>>>> {
+    ) -> RuntimeResult<Validation<Option<PageExclusiveGuard<BTreeNode>>>> {
         let mut g = self
             .pool
             .get_page::<BTreeNode>(pool_guard, self.root, LatchFallbackMode::Spin)
@@ -1199,7 +1202,7 @@ impl<P: BufferPool> GenericBTree<P> {
         &self,
         pool_guard: &PoolGuard,
         g: PageExclusiveGuard<BTreeNode>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let p_node = g.page();
         debug_assert!(p_node.height() == 1);
         // Deallocate child associated with lower fence key.
@@ -1262,7 +1265,7 @@ where
         pool_guard: &PoolGuard,
         height: usize,
         key: &[u8],
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         loop {
             self.reset();
             let g = tree
@@ -1293,7 +1296,7 @@ where
         height: usize,
         key: &[u8],
         mut p_guard: FacadePageGuard<BTreeNode>,
-    ) -> Result<Validation<()>> {
+    ) -> RuntimeResult<Validation<()>> {
         loop {
             let curr_height = verify_result!(p_guard.with_page_ref_validated(|page| page.height()));
             if curr_height < height {
@@ -1435,7 +1438,7 @@ impl BTreeNodeCursorState {
         tree: &GenericBTree<P>,
         pool_guard: &PoolGuard,
         key: &[u8],
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         self.coupling
             .seek_and_lock(tree, pool_guard, self.height, key)
             .await
@@ -1447,7 +1450,7 @@ impl BTreeNodeCursorState {
         &mut self,
         tree: &GenericBTree<P>,
         pool_guard: &PoolGuard,
-    ) -> Result<Option<PageSharedGuard<BTreeNode>>> {
+    ) -> RuntimeResult<Option<PageSharedGuard<BTreeNode>>> {
         if let Some(g) = self.coupling.node.take() {
             return Ok(Some(g));
         }
@@ -1514,13 +1517,13 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
 
     /// Seek to the first node at this cursor height that may contain `key`.
     #[inline]
-    pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
         self.state.seek(self.tree, self.pool_guard, key).await
     }
 
     /// Fetch next node.
     #[inline]
-    pub(crate) async fn next(&mut self) -> Result<Option<PageSharedGuard<BTreeNode>>> {
+    pub(crate) async fn next(&mut self) -> RuntimeResult<Option<PageSharedGuard<BTreeNode>>> {
         self.state.next(self.tree, self.pool_guard).await
     }
 }
@@ -1542,14 +1545,13 @@ impl BTreeCompactConfig {
     /// Create a compaction configuration from low and high occupancy ratios.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "internal btree compaction"))]
-    pub(crate) fn new(low_ratio: f64, high_ratio: f64) -> Result<Self> {
+    pub(crate) fn new(low_ratio: f64, high_ratio: f64) -> ConfigResult<Self> {
         if !(0.0..=1.0).contains(&low_ratio)
             || !(0.0..=1.0).contains(&high_ratio)
             || high_ratio < low_ratio
         {
             return Err(Report::new(ConfigError::InvalidBTreeCompactRatio)
-                .attach(format!("low_ratio={low_ratio}, high_ratio={high_ratio}"))
-                .into());
+                .attach(format!("low_ratio={low_ratio}, high_ratio={high_ratio}")));
         }
         Ok(BTreeCompactConfig {
             low_ratio,
@@ -1619,7 +1621,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
 
     /// Seek to the first compactable node at or after `key`.
     #[inline]
-    pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
         self.coupling
             .seek_and_lock(self.tree, self.pool_guard, self.height, key)
             .await
@@ -1630,7 +1632,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     pub(crate) async fn run_to_end(
         mut self,
         purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let mut lower_fence_key_buffer = Vec::new();
         let mut upper_fence_key_buffer = Vec::new();
         self.seek(&[]).await?;
@@ -1670,7 +1672,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
         lower_fence_key_buffer: &mut Vec<u8>,
         upper_fence_key_buffer: &mut Vec<u8>,
         purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>,
-    ) -> Result<BTreeCompact> {
+    ) -> RuntimeResult<BTreeCompact> {
         if self.coupling.parent.is_none() {
             // Single-node compaction.
             if let Some(mut g) = self.coupling.node.take() {
@@ -1798,7 +1800,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     // Skip current node and take next node.
     // Return false if next node not found.
     #[inline]
-    async fn skip(&mut self) -> Result<bool> {
+    async fn skip(&mut self) -> RuntimeResult<bool> {
         drop(self.coupling.node.take());
         if let Some(parent) = self.coupling.parent.as_mut() {
             let p_node = parent.g.page();
@@ -1836,7 +1838,9 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     }
 
     #[inline]
-    async fn lock_right(&mut self) -> Result<Option<(usize, PageExclusiveGuard<BTreeNode>)>> {
+    async fn lock_right(
+        &mut self,
+    ) -> RuntimeResult<Option<(usize, PageExclusiveGuard<BTreeNode>)>> {
         if let Some(parent) = self.coupling.parent.as_mut() {
             let p_node = parent.g.page();
             let next_idx = (parent.idx + 1) as usize;
@@ -1858,7 +1862,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     }
 
     #[inline]
-    async fn lock_current(&mut self) -> Result<bool> {
+    async fn lock_current(&mut self) -> RuntimeResult<bool> {
         if self.coupling.node.is_some() {
             return Ok(true);
         }
@@ -2455,7 +2459,7 @@ mod tests {
                     .await
                     .expect_err("second split-root allocation should fail");
                 assert_eq!(
-                    err.report().downcast_ref::<ResourceError>().copied(),
+                    err.downcast_ref::<ResourceError>().copied(),
                     Some(ResourceError::BufferPoolFull)
                 );
             }

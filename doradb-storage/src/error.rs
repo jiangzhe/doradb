@@ -42,6 +42,29 @@ pub(crate) type FatalResult<T> = result::Result<T, Report<FatalError>>;
 /// Result carrying cloneable completion error bridges.
 pub(crate) type CompletionResult<T> = result::Result<T, CompletionErrorBridge>;
 
+/// Minimal result extensions for carriers that preserve multiple error domains.
+///
+/// Unlike [`error_stack::ResultExt`], this trait keeps the carrier error type
+/// unchanged instead of collapsing it into one `Report` context.
+pub(crate) trait MultiDomainResultExt: Sized {
+    /// Adds static caller-owned diagnostic context to the carrier error.
+    fn attach(self, attachment: &'static str) -> Self;
+
+    /// Lazily adds caller-owned diagnostic context to the carrier error.
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String;
+}
+
+/// Result extensions specific to the Runtime-or-Fatal carrier.
+pub(crate) trait RuntimeOrFatalResultExt: MultiDomainResultExt {
+    /// Replaces only an ordinary Runtime context and leaves Fatal unchanged.
+    ///
+    /// This carrier primitive owns no operation identity. Semantic callers
+    /// must chain [`MultiDomainResultExt::attach_with`] at the conversion site.
+    fn change_runtime_context(self, context: RuntimeError) -> Self;
+}
+
 /// Public storage error boundary classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub enum ErrorKind {
@@ -125,8 +148,6 @@ pub(crate) enum ConfigError {
     InvalidLatchFallbackMode,
     #[error("invalid B-tree compact ratio")]
     InvalidBTreeCompactRatio,
-    #[error("invalid index spec")]
-    InvalidIndexSpec,
 }
 
 /// Fieldless data-integrity-domain errors carried underneath `ErrorKind::DataIntegrity`.
@@ -191,9 +212,24 @@ pub(crate) enum RuntimeError {
     /// An engine-owned file root could not be loaded or published.
     #[error("file root access failed")]
     FileRootAccess,
-    /// Discovery of the configured redo log file family could not complete.
-    #[error("redo log discovery failed")]
-    RedoLogDiscovery,
+    /// Redo discovery, recovery planning, or stream access could not complete.
+    #[error("redo log access failed")]
+    RedoLogAccess,
+    /// Lookup, traversal, mutation, binding, or stream integration failed.
+    #[error("index access failed")]
+    IndexAccess,
+    /// Row, index, or table runtime integration failed.
+    #[error("table access failed")]
+    TableAccess,
+    /// Catalog storage or runtime integration failed.
+    #[error("catalog access failed")]
+    CatalogAccess,
+    /// Reversible checkpoint orchestration failed.
+    #[error("checkpoint execution failed")]
+    CheckpointExecution,
+    /// System-transaction preparation or commit admission failed.
+    #[error("system transaction commit failed")]
+    SystemTransactionCommit,
 }
 
 /// Fieldless resource-domain errors carried underneath `ErrorKind::Resource`.
@@ -220,8 +256,6 @@ pub(crate) enum OperationError {
     TableAlreadyExists,
     #[error("index not found")]
     IndexNotFound,
-    #[error("index mutation failed")]
-    IndexMutation,
     #[error("not supported")]
     NotSupported,
     #[error("duplicate key")]
@@ -230,8 +264,8 @@ pub(crate) enum OperationError {
     WriteConflict,
     #[error("invalid DML input")]
     InvalidDmlInput,
-    #[error("invalid lock mode")]
-    InvalidLockMode,
+    #[error("invalid metadata")]
+    InvalidMetadata,
     #[error("lock is unavailable")]
     LockUnavailable,
     #[error("lock upgrade would block")]
@@ -286,16 +320,12 @@ pub(crate) enum InternalError {
     ReadonlyWriteBlocked,
     #[error("row page missing")]
     RowPageMissing,
-    #[error("full-table update row-page identity mismatch")]
-    FullTableUpdatePageIdentityMismatch,
-    #[error("full-table update encountered transition page")]
-    FullTableUpdateTransitionPage,
+    #[error("row page scan start is not a page boundary")]
+    RowPageScanStartInvalid,
     #[error("pool guard missing")]
     PoolGuardMissing,
     #[error("block-index leaf stale")]
     BlockIndexLeafStale,
-    #[error("indexed value missing")]
-    IndexedValueMissing,
     #[error("index key missing")]
     IndexKeyMissing,
     #[error("lwc builder misuse")]
@@ -324,8 +354,12 @@ pub(crate) enum InternalError {
     CatalogRootDescriptorInvariant,
     #[error("catalog primary key missing")]
     CatalogPrimaryKeyMissing,
+    #[error("catalog table unexpectedly resolved a persisted LWC row")]
+    CatalogTableUnexpectedLwcRow,
     #[error("LWC block encoding contract is unsatisfied")]
     LwcBlockEncodingContract,
+    #[error("checkpoint transition marker conflicts with existing state")]
+    CheckpointTransitionMarkerConflict,
     #[error("readonly frame index out of bounds")]
     ReadonlyFrameIndexOutOfBounds,
     #[error("B-tree pack invariant violated")]
@@ -342,12 +376,18 @@ pub(crate) enum InternalError {
     ActiveTransactionDiscarded,
     #[error("system transaction redo missing")]
     SystemTransactionRedoMissing,
+    #[error("silent-watermark system transaction redo conflicts with existing redo")]
+    SilentWatermarkRedoConflict,
+    #[error("catalog DDL redo conflicts with existing statement redo")]
+    CatalogDdlRedoConflict,
     #[error("statement number overflow")]
     StatementNumberOverflow,
     #[error("current redo log file is missing")]
     CurrentRedoLogFileMissing,
     #[error("redo writer format encoding failed")]
     RedoFormatEncoding,
+    #[error("redo read protocol invariant violated")]
+    RedoReadProtocolInvariant,
 }
 
 /// IO-domain errors carried underneath `ErrorKind::Io`.
@@ -544,6 +584,27 @@ impl CompletionErrorBridge {
         self.replay_builder().finish(context)
     }
 
+    /// Splits an audited completion into a peer Runtime-or-Fatal error.
+    ///
+    /// An existing Fatal source is reconstructed without adding Runtime. Every
+    /// other registered physical source is reconstructed beneath the supplied
+    /// Runtime context. The caller owns any diagnostic attached after this
+    /// structural conversion.
+    #[inline]
+    pub(crate) fn into_runtime_or_fatal(
+        self,
+        runtime_context: RuntimeError,
+    ) -> RuntimeOrFatalError {
+        if self.fatal_context().is_some() {
+            let report = self
+                .reconstruct_fatal()
+                .expect("Fatal completion source must reconstruct as Fatal");
+            RuntimeOrFatalError::Fatal(report)
+        } else {
+            RuntimeOrFatalError::Runtime(self.replace_context(runtime_context))
+        }
+    }
+
     /// Inspects the canonical physical report without reconstructing a new stack.
     #[inline]
     #[cfg(test)]
@@ -596,18 +657,16 @@ impl CompletionErrorBridge {
 
     fn capture_replay(report: &CompletionSourceReport) -> Box<[ReplayFrame]> {
         match report {
-            CompletionSourceReport::Io(report) => Self::capture_typed_replay(report, false),
-            CompletionSourceReport::Resource(report) => Self::capture_typed_replay(report, false),
-            CompletionSourceReport::DataIntegrity(report) => {
-                Self::capture_typed_replay(report, false)
-            }
-            CompletionSourceReport::Lifecycle(report) => Self::capture_typed_replay(report, false),
-            CompletionSourceReport::Fatal(report) => Self::capture_typed_replay(report, true),
-            CompletionSourceReport::Internal(report) => Self::capture_typed_replay(report, false),
+            CompletionSourceReport::Io(report) => Self::capture_typed_replay(report),
+            CompletionSourceReport::Resource(report) => Self::capture_typed_replay(report),
+            CompletionSourceReport::DataIntegrity(report) => Self::capture_typed_replay(report),
+            CompletionSourceReport::Lifecycle(report) => Self::capture_typed_replay(report),
+            CompletionSourceReport::Fatal(report) => Self::capture_typed_replay(report),
+            CompletionSourceReport::Internal(report) => Self::capture_typed_replay(report),
         }
     }
 
-    fn capture_typed_replay<E>(report: &Report<E>, fatal_root: bool) -> Box<[ReplayFrame]>
+    fn capture_typed_replay<E>(report: &Report<E>) -> Box<[ReplayFrame]>
     where
         E: StdError + Send + Sync + 'static,
     {
@@ -615,7 +674,6 @@ impl CompletionErrorBridge {
         let mut replay = Vec::with_capacity(expected_frames);
         let mut frame = report.current_frame();
         let mut visited = 0;
-        let mut seen_fatal = false;
 
         loop {
             let position = visited;
@@ -626,9 +684,7 @@ impl CompletionErrorBridge {
                 std::any::type_name::<E>(),
                 frame.sources().len()
             );
-            if let Some(replay_frame) =
-                Self::capture_frame(frame, position, fatal_root, &mut seen_fatal)
-            {
+            if let Some(replay_frame) = Self::capture_frame(frame, position) {
                 replay.push(replay_frame);
             }
             let Some(source) = frame.sources().first() else {
@@ -652,21 +708,11 @@ impl CompletionErrorBridge {
         replay.into_boxed_slice()
     }
 
-    fn capture_frame(
-        frame: &Frame,
-        position: usize,
-        fatal_root: bool,
-        seen_fatal: &mut bool,
-    ) -> Option<ReplayFrame> {
+    fn capture_frame(frame: &Frame, position: usize) -> Option<ReplayFrame> {
         match frame.kind() {
             FrameKind::Context(_) => {
                 if let Some(context) = ReplayContext::capture(frame) {
-                    *seen_fatal |= matches!(context, ReplayContext::Fatal(_));
                     return Some(ReplayFrame::Context(context));
-                }
-                // TODO(error-boundary): remove this compatibility exception with backlog 000161.
-                if fatal_root && *seen_fatal && frame.is::<ErrorKind>() {
-                    return None;
                 }
                 panic!(
                     "unregistered completion context: frame_position={position}, type_id={:?}",
@@ -777,6 +823,198 @@ impl Debug for SharedFatalError {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Debug::fmt(&self.0, f)
+    }
+}
+
+/// Constrained carrier for internal operations with Operation and Runtime exits.
+///
+/// The reports remain in their native domains until an outward public boundary.
+/// This carrier is deliberately not an `error-stack` context and never accepts
+/// a public [`Error`].
+pub(crate) enum OperationOrRuntimeError {
+    /// A terminal semantic operation failure.
+    Operation(Report<OperationError>),
+    /// A recoverable runtime-integration failure.
+    Runtime(Report<RuntimeError>),
+}
+
+impl Debug for OperationOrRuntimeError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operation(report) => Debug::fmt(report, f),
+            Self::Runtime(report) => Debug::fmt(report, f),
+        }
+    }
+}
+
+impl OperationOrRuntimeError {
+    /// Adds static caller-owned diagnostic context without changing either domain.
+    #[inline]
+    pub(crate) fn attach(self, attachment: &'static str) -> Self {
+        match self {
+            Self::Operation(report) => Self::Operation(report.attach(attachment)),
+            Self::Runtime(report) => Self::Runtime(report.attach(attachment)),
+        }
+    }
+
+    /// Adds caller-owned diagnostic context without changing either domain.
+    #[inline]
+    pub(crate) fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Operation(report) => Self::Operation(report.attach(attachment())),
+            Self::Runtime(report) => Self::Runtime(report.attach(attachment())),
+        }
+    }
+}
+
+impl From<Report<OperationError>> for OperationOrRuntimeError {
+    #[inline]
+    fn from(report: Report<OperationError>) -> Self {
+        Self::Operation(report)
+    }
+}
+
+impl From<Report<RuntimeError>> for OperationOrRuntimeError {
+    #[inline]
+    fn from(report: Report<RuntimeError>) -> Self {
+        Self::Runtime(report)
+    }
+}
+
+/// Result carrying either a terminal Operation report or a Runtime report.
+pub(crate) type OperationOrRuntimeResult<T> = result::Result<T, OperationOrRuntimeError>;
+
+impl<T> MultiDomainResultExt for OperationOrRuntimeResult<T> {
+    #[inline]
+    fn attach(self, attachment: &'static str) -> Self {
+        self.map_err(|error| error.attach(attachment))
+    }
+
+    #[inline]
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|error| error.attach_with(attachment))
+    }
+}
+
+/// Constrained carrier for integration operations with Runtime and Fatal exits.
+///
+/// This enum owns the two report types directly and is deliberately not an
+/// `error-stack` context. In particular, it never accepts a public [`Error`].
+pub(crate) enum RuntimeOrFatalError {
+    /// An ordinary recoverable integration failure.
+    Runtime(Report<RuntimeError>),
+    /// A failure that already crossed a Fatal policy boundary.
+    Fatal(Report<FatalError>),
+}
+
+impl Debug for RuntimeOrFatalError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(report) => Debug::fmt(report, f),
+            Self::Fatal(report) => Debug::fmt(report, f),
+        }
+    }
+}
+
+impl RuntimeOrFatalError {
+    /// Adds static caller-owned diagnostic context to either report arm.
+    #[inline]
+    pub(crate) fn attach(self, attachment: &'static str) -> Self {
+        match self {
+            Self::Runtime(report) => Self::Runtime(report.attach(attachment)),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment)),
+        }
+    }
+
+    /// Adds caller-owned diagnostic context to either report arm.
+    #[inline]
+    pub(crate) fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Runtime(report) => Self::Runtime(report.attach(attachment())),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment())),
+        }
+    }
+
+    /// Replaces only an ordinary Runtime context and leaves Fatal unchanged.
+    ///
+    /// This is the error-arm implementation behind
+    /// [`RuntimeOrFatalResultExt::change_runtime_context`]. It deliberately
+    /// does not attach caller facts; the result-level caller owns them.
+    #[inline]
+    fn change_runtime_context(self, context: RuntimeError) -> Self {
+        match self {
+            Self::Runtime(report) => Self::Runtime(report.change_context(context)),
+            Self::Fatal(report) => Self::Fatal(report),
+        }
+    }
+
+    /// Crosses an irreversible boundary without replacing an existing Fatal reason.
+    ///
+    /// The fallback selects policy only. Callers must attach the irreversible
+    /// operation or phase where they invoke this generic carrier conversion.
+    #[inline]
+    pub(crate) fn into_fatal_report(self, fallback_reason: FatalError) -> Report<FatalError> {
+        match self {
+            Self::Runtime(report) => report.change_context(fallback_reason),
+            Self::Fatal(report) => report,
+        }
+    }
+}
+
+impl From<Report<RuntimeError>> for RuntimeOrFatalError {
+    #[inline]
+    fn from(report: Report<RuntimeError>) -> Self {
+        Self::Runtime(report)
+    }
+}
+
+impl From<Report<FatalError>> for RuntimeOrFatalError {
+    #[inline]
+    fn from(report: Report<FatalError>) -> Self {
+        Self::Fatal(report)
+    }
+}
+
+impl From<SharedFatalError> for RuntimeOrFatalError {
+    #[inline]
+    fn from(error: SharedFatalError) -> Self {
+        Self::Fatal(error.into_report())
+    }
+}
+
+/// Result carrying either an ordinary Runtime report or an already-Fatal report.
+pub(crate) type RuntimeOrFatalResult<T> = result::Result<T, RuntimeOrFatalError>;
+
+impl<T> MultiDomainResultExt for RuntimeOrFatalResult<T> {
+    #[inline]
+    fn attach(self, attachment: &'static str) -> Self {
+        self.map_err(|error| error.attach(attachment))
+    }
+
+    #[inline]
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|error| error.attach_with(attachment))
+    }
+}
+
+impl<T> RuntimeOrFatalResultExt for RuntimeOrFatalResult<T> {
+    #[inline]
+    fn change_runtime_context(self, context: RuntimeError) -> Self {
+        self.map_err(|error| error.change_runtime_context(context))
     }
 }
 
@@ -1077,45 +1315,19 @@ impl Error {
         self.0
     }
 
-    /// Reclassifies this public error as Fatal while retaining its physical sources.
-    ///
-    /// An existing Fatal frame owns the policy reason. `fallback_reason` is
-    /// used only when the source has not already crossed a Fatal boundary.
-    #[inline]
-    pub(crate) fn into_fatal_report(self, fallback_reason: FatalError) -> Report<FatalError> {
-        let reason = self
-            .report()
-            .downcast_ref::<FatalError>()
-            .copied()
-            .unwrap_or(fallback_reason);
-        self.into_report().change_context(reason)
-    }
-
     /// Adds boundary context without changing the existing error classification.
     #[inline]
-    pub(crate) fn attach(self, attachment: impl Into<String>) -> Self {
-        Error(self.0.attach(attachment.into()))
+    pub(crate) fn attach(self, attachment: &'static str) -> Self {
+        Error(self.0.attach(attachment))
     }
 
-    /// Converts a completion bridge into the public storage error.
+    /// Lazily adds boundary context without changing the existing error classification.
     #[inline]
-    pub(crate) fn from_completion_bridge(
-        bridge: CompletionErrorBridge,
-        message: impl Into<String>,
-    ) -> Self {
-        let kind = bridge.public_error_kind();
-        Error(bridge.replace_context(kind).attach(message.into()))
-    }
-
-    /// Builds an error for a secondary-index binding mismatch.
-    #[inline]
-    pub(crate) fn wrong_secondary_index_binding(
-        expected: &'static str,
-        actual: &'static str,
-    ) -> Self {
-        Report::new(InternalError::SecondaryIndexBindingMismatch)
-            .attach(SecondaryIndexBinding { expected, actual })
-            .into()
+    pub(crate) fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        Error(self.0.attach(attachment()))
     }
 
     #[inline]
@@ -1213,6 +1425,34 @@ impl From<Report<RuntimeError>> for Error {
     fn from(report: Report<RuntimeError>) -> Self {
         // This structural public classification adds no caller-owned diagnostic.
         Error(report.change_context(ErrorKind::Runtime))
+    }
+}
+
+impl From<OperationOrRuntimeError> for Error {
+    #[inline]
+    fn from(error: OperationOrRuntimeError) -> Self {
+        match error {
+            OperationOrRuntimeError::Operation(report) => report.into(),
+            OperationOrRuntimeError::Runtime(report) => report.into(),
+        }
+    }
+}
+
+impl From<RuntimeOrFatalError> for Error {
+    #[inline]
+    fn from(error: RuntimeOrFatalError) -> Self {
+        match error {
+            RuntimeOrFatalError::Runtime(report) => report.into(),
+            RuntimeOrFatalError::Fatal(report) => report.into(),
+        }
+    }
+}
+
+impl From<CompletionErrorBridge> for Error {
+    #[inline]
+    fn from(bridge: CompletionErrorBridge) -> Self {
+        let kind = bridge.public_error_kind();
+        Error(bridge.replace_context(kind))
     }
 }
 
@@ -1388,6 +1628,7 @@ mod tests {
     use super::*;
     use crate::io::BackendError;
     use error_stack::ResultExt;
+    use std::cell::Cell;
     use std::io::Error as StdIoError;
 
     #[test]
@@ -1420,27 +1661,6 @@ mod tests {
             Some(IoErrorKind::WouldBlock)
         );
         assert!(format!("{err:?}").contains("not ready"));
-    }
-
-    #[test]
-    fn test_public_error_fatalization_preserves_existing_reason() {
-        let existing = Error::from(
-            Report::new(IoError::from(IoErrorKind::BrokenPipe))
-                .change_context(FatalError::RedoSync),
-        )
-        .into_fatal_report(FatalError::CheckpointWrite);
-        assert_eq!(*existing.current_context(), FatalError::RedoSync);
-        assert_eq!(
-            existing
-                .downcast_ref::<IoError>()
-                .copied()
-                .map(IoError::kind),
-            Some(IoErrorKind::BrokenPipe)
-        );
-
-        let fallback = Error::from(Report::new(IoError::from(IoErrorKind::Other)))
-            .into_fatal_report(FatalError::CheckpointWrite);
-        assert_eq!(*fallback.current_context(), FatalError::CheckpointWrite);
     }
 
     #[test]
@@ -1479,6 +1699,202 @@ mod tests {
             Some(IoErrorKind::Other)
         );
         assert!(format!("{err:?}").contains("thread_name=Runtime-Conversion-Test"));
+    }
+
+    #[test]
+    fn test_operation_or_runtime_operation_arm_stays_operation() {
+        let carrier = OperationOrRuntimeError::from(
+            Report::new(OperationError::DuplicateKey).attach("operation=insert_unique_index"),
+        )
+        .attach("table_id=42");
+
+        let err = Error::from(carrier);
+
+        assert_eq!(err.kind(), ErrorKind::Operation);
+        assert_eq!(
+            err.report().downcast_ref::<OperationError>().copied(),
+            Some(OperationError::DuplicateKey)
+        );
+        let output = format!("{err:?}");
+        assert!(output.contains("operation=insert_unique_index"));
+        assert!(output.contains("table_id=42"));
+    }
+
+    #[test]
+    fn test_operation_or_runtime_runtime_arm_preserves_native_source() {
+        let carrier = OperationOrRuntimeError::from(
+            Report::new(InternalError::SecondaryIndexOutOfBounds)
+                .attach("index_no=4, index_count=2")
+                .change_context(RuntimeError::TableAccess),
+        )
+        .attach("operation=insert_index");
+
+        let err = Error::from(carrier);
+
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::TableAccess)
+        );
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::SecondaryIndexOutOfBounds)
+        );
+        let output = format!("{err:?}");
+        assert!(output.contains("index_no=4, index_count=2"));
+        assert!(output.contains("operation=insert_index"));
+    }
+
+    #[test]
+    fn test_operation_or_runtime_result_attachment_preserves_operation_arm() {
+        let result: OperationOrRuntimeResult<()> = Err(OperationOrRuntimeError::from(Report::new(
+            OperationError::DuplicateKey,
+        )));
+
+        let carrier = result
+            .attach("operation=insert_unique_index")
+            .expect_err("operation failure must remain terminal");
+        let OperationOrRuntimeError::Operation(report) = carrier else {
+            panic!("operation attachment must preserve the Operation arm")
+        };
+
+        assert_eq!(
+            report.downcast_ref::<OperationError>().copied(),
+            Some(OperationError::DuplicateKey)
+        );
+        assert!(format!("{report:?}").contains("operation=insert_unique_index"));
+    }
+
+    #[test]
+    fn test_runtime_or_fatal_result_attachment_preserves_fatal_arm() {
+        let result: RuntimeOrFatalResult<()> = Err(RuntimeOrFatalError::Fatal(Report::new(
+            FatalError::CheckpointWrite,
+        )));
+
+        let carrier = result
+            .attach("operation=publish_checkpoint")
+            .expect_err("fatal failure must remain terminal");
+        let RuntimeOrFatalError::Fatal(report) = carrier else {
+            panic!("fatal attachment must preserve the Fatal arm")
+        };
+
+        assert_eq!(
+            report.downcast_ref::<FatalError>().copied(),
+            Some(FatalError::CheckpointWrite)
+        );
+        assert!(format!("{report:?}").contains("operation=publish_checkpoint"));
+    }
+
+    #[test]
+    fn test_runtime_or_fatal_result_changes_only_runtime_context() {
+        let result: RuntimeOrFatalResult<()> = Err(RuntimeOrFatalError::Runtime(
+            Report::new(InternalError::SecondaryIndexOutOfBounds)
+                .attach("index_no=4, index_count=2")
+                .change_context(RuntimeError::IndexAccess),
+        ));
+
+        let carrier = result
+            .change_runtime_context(RuntimeError::CheckpointExecution)
+            .attach("operation=checkpoint_table")
+            .expect_err("runtime failure must remain an error");
+        let RuntimeOrFatalError::Runtime(report) = carrier else {
+            panic!("Runtime context replacement must preserve the Runtime arm")
+        };
+
+        assert_eq!(report.current_context(), &RuntimeError::CheckpointExecution);
+        assert_eq!(
+            report.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::SecondaryIndexOutOfBounds)
+        );
+        let output = format!("{report:?}");
+        assert!(output.contains("index_no=4, index_count=2"));
+        assert!(output.contains("operation=checkpoint_table"));
+    }
+
+    #[test]
+    fn test_runtime_or_fatal_result_context_change_preserves_fatal_arm() {
+        let result: RuntimeOrFatalResult<()> = Err(RuntimeOrFatalError::Fatal(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                .attach("checkpoint write failed")
+                .change_context(FatalError::CheckpointWrite),
+        ));
+
+        let carrier = result
+            .change_runtime_context(RuntimeError::CheckpointExecution)
+            .expect_err("fatal failure must remain an error");
+        let RuntimeOrFatalError::Fatal(report) = carrier else {
+            panic!("Runtime context replacement must not replace Fatal")
+        };
+
+        assert_eq!(report.current_context(), &FatalError::CheckpointWrite);
+        assert_eq!(
+            report.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::BrokenPipe)
+        );
+        assert!(format!("{report:?}").contains("checkpoint write failed"));
+    }
+
+    #[test]
+    fn test_multi_domain_result_attachment_is_lazy_on_success() {
+        let called = Cell::new(false);
+        let result: OperationOrRuntimeResult<u8> = Ok(7);
+
+        let value = result
+            .attach_with(|| {
+                called.set(true);
+                "must not be evaluated".to_string()
+            })
+            .expect("successful result must remain successful");
+
+        assert_eq!(value, 7);
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn test_runtime_or_fatal_runtime_arm_converts_losslessly() {
+        let carrier = RuntimeOrFatalError::Runtime(
+            Report::new(InternalError::SecondaryIndexOutOfBounds)
+                .attach("index_no=4, index_count=2")
+                .change_context(RuntimeError::CheckpointExecution),
+        );
+
+        let err = Error::from(carrier);
+
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::CheckpointExecution)
+        );
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::SecondaryIndexOutOfBounds)
+        );
+        assert!(format!("{err:?}").contains("index_no=4, index_count=2"));
+    }
+
+    #[test]
+    fn test_runtime_or_fatal_fatal_arm_converts_losslessly() {
+        let carrier = RuntimeOrFatalError::Fatal(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                .attach("checkpoint write failed")
+                .change_context(FatalError::CheckpointWrite),
+        );
+
+        let err = Error::from(carrier);
+
+        assert_eq!(err.kind(), ErrorKind::Fatal);
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::CheckpointWrite)
+        );
+        assert_eq!(
+            err.report()
+                .downcast_ref::<IoError>()
+                .copied()
+                .map(IoError::kind),
+            Some(IoErrorKind::BrokenPipe)
+        );
+        assert!(format!("{err:?}").contains("checkpoint write failed"));
     }
 
     #[test]
@@ -1576,7 +1992,7 @@ mod tests {
     fn test_redo_log_discovery_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(DataIntegrityError::InvalidRedoLogFileName)
             .attach("path=redo.log.invalid")
-            .change_context(RuntimeError::RedoLogDiscovery)
+            .change_context(RuntimeError::RedoLogAccess)
             .attach("phase=enumerate_redo_log_family, file_prefix=redo.log");
 
         let err = Error::from(report);
@@ -1584,7 +2000,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
             err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::RedoLogDiscovery)
+            Some(RuntimeError::RedoLogAccess)
         );
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
@@ -1619,25 +2035,25 @@ mod tests {
     }
 
     #[test]
-    fn test_typed_index_mutation_context_preserves_lower_error() {
+    fn test_typed_index_access_context_preserves_lower_error() {
         let lower: InternalResult<()> = Err(Report::new(InternalError::IndexKeyMissing)
             .attach("secondary index key is unavailable"));
         let report = lower
-            .change_context(OperationError::IndexMutation)
-            .attach_with(|| "phase=claim_secondary_index_key")
+            .change_context(RuntimeError::IndexAccess)
+            .attach_with(|| "operation=insert_if_not_exists")
             .unwrap_err();
 
-        assert_eq!(report.current_context(), &OperationError::IndexMutation);
+        assert_eq!(report.current_context(), &RuntimeError::IndexAccess);
         assert_eq!(
             report.downcast_ref::<InternalError>().copied(),
             Some(InternalError::IndexKeyMissing)
         );
 
         let err: Error = report.attach("secondary index claim").into();
-        assert_eq!(err.kind(), ErrorKind::Operation);
+        assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
-            err.report().downcast_ref::<OperationError>().copied(),
-            Some(OperationError::IndexMutation)
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::IndexAccess)
         );
         assert_eq!(
             err.report().downcast_ref::<InternalError>().copied(),
@@ -1708,7 +2124,7 @@ mod tests {
         assert!(second_output.contains("op_kind=read"));
         assert!(second_output.contains("complete test backend read"));
 
-        let err = Error::from_completion_bridge(bridge, "public completion boundary");
+        let err = Error::from(bridge).attach("public completion boundary");
         assert_eq!(err.kind(), ErrorKind::Io);
         assert!(err.report().downcast_ref::<BackendError>().is_some());
         assert!(
@@ -1797,6 +2213,68 @@ mod tests {
     }
 
     #[test]
+    fn test_completion_bridge_runtime_conversion_composes_static_attachment() {
+        let bridge = CompletionErrorBridge::capture(
+            Report::new(InternalError::CompletionDropped).attach("completion source"),
+        );
+        let result: RuntimeOrFatalResult<()> =
+            Err(bridge.into_runtime_or_fatal(RuntimeError::SystemTransactionCommit));
+
+        let error = result
+            .attach("operation=commit_system_transaction")
+            .expect_err("completion failure must remain an error");
+        let RuntimeOrFatalError::Runtime(report) = error else {
+            panic!("non-Fatal completion must reconstruct as Runtime")
+        };
+
+        assert_eq!(
+            report.current_context(),
+            &RuntimeError::SystemTransactionCommit
+        );
+        assert_eq!(
+            report.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::CompletionDropped)
+        );
+        let output = format!("{report:?}");
+        assert!(output.contains("completion source"), "{output}");
+        assert!(
+            output.contains("operation=commit_system_transaction"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_completion_bridge_fatal_conversion_composes_static_attachment() {
+        let bridge = CompletionErrorBridge::capture(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                .attach("redo completion source")
+                .change_context(FatalError::RedoWrite),
+        );
+        let result: RuntimeOrFatalResult<()> =
+            Err(bridge.into_runtime_or_fatal(RuntimeError::SystemTransactionCommit));
+
+        let error = result
+            .attach("operation=commit_system_transaction")
+            .expect_err("Fatal completion must remain an error");
+        let RuntimeOrFatalError::Fatal(report) = error else {
+            panic!("Fatal completion must remain Fatal")
+        };
+
+        assert_eq!(report.current_context(), &FatalError::RedoWrite);
+        assert!(report.downcast_ref::<RuntimeError>().is_none());
+        assert_eq!(
+            report.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::BrokenPipe)
+        );
+        let output = format!("{report:?}");
+        assert!(output.contains("redo completion source"), "{output}");
+        assert!(
+            output.contains("operation=commit_system_transaction"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn test_completion_bridge_replays_real_context_order() {
         let report = Report::new(ConfigError::InvalidIoDepth)
             .attach("recovery_io_depth=0")
@@ -1820,25 +2298,66 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_bridge_skips_lower_public_frame_below_fatal() {
-        let report = Report::new(IoError::from(IoErrorKind::Other))
+    fn test_completion_bridge_preserves_fatal_runtime_io_stack() {
+        let io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
+        let report = Report::new(IoError::from(io_kind))
             .attach("terminal rollback IO source")
-            .change_context(ErrorKind::Io)
-            .change_context(FatalError::RollbackAccess);
-        let reconstructed =
-            CompletionErrorBridge::capture(report).replace_context(RuntimeError::BufferPageAccess);
+            .change_context(RuntimeError::TableAccess)
+            .attach("operation=rollback_row_undo")
+            .change_context(FatalError::RollbackAccess)
+            .attach("terminal rollback cleanup failed");
+        let bridge = CompletionErrorBridge::capture(report);
+        let reconstructed = bridge
+            .clone()
+            .reconstruct_fatal()
+            .expect("Fatal completion must reconstruct as Fatal");
+
+        assert_eq!(reconstructed.current_context(), &FatalError::RollbackAccess);
         assert_eq!(
-            reconstructed.downcast_ref::<FatalError>().copied(),
-            Some(FatalError::RollbackAccess)
+            reconstructed.downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::TableAccess)
         );
         assert_eq!(
             reconstructed
                 .downcast_ref::<IoError>()
                 .copied()
                 .map(IoError::kind),
-            Some(IoErrorKind::Other)
+            Some(io_kind)
         );
         assert!(reconstructed.downcast_ref::<ErrorKind>().is_none());
+
+        let public = Error::from(bridge);
+        assert_eq!(public.kind(), ErrorKind::Fatal);
+        assert_eq!(
+            public
+                .report()
+                .frames()
+                .filter(|frame| frame.is::<ErrorKind>())
+                .count(),
+            1
+        );
+        assert_eq!(
+            public.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::TableAccess)
+        );
+        assert_eq!(
+            public
+                .report()
+                .downcast_ref::<IoError>()
+                .copied()
+                .map(IoError::kind),
+            Some(io_kind)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unregistered completion context")]
+    fn test_completion_bridge_rejects_public_frame_below_fatal() {
+        let report = Report::new(IoError::from(IoErrorKind::Other))
+            .attach("terminal rollback IO source")
+            .change_context(ErrorKind::Io)
+            .change_context(FatalError::RollbackAccess);
+        let _ = CompletionErrorBridge::capture(report);
     }
 
     #[test]
@@ -1872,10 +2391,8 @@ mod tests {
         assert!(output.contains("redo write source"), "{output}");
         assert!(output.contains("redo write policy"), "{output}");
 
-        let public = Error::from_completion_bridge(
-            shared.into_completion_bridge(),
-            "wait for shared fatal completion",
-        );
+        let public =
+            Error::from(shared.into_completion_bridge()).attach("wait for shared fatal completion");
         assert_eq!(public.kind(), ErrorKind::Fatal);
         assert_eq!(
             public.report().downcast_ref::<FatalError>().copied(),
@@ -1888,59 +2405,6 @@ mod tests {
                 .downcast_ref::<CompletionErrorBridge>()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn test_completion_bridge_final_fatal_policy_recaptures_without_prior_transport() {
-        let original = CompletionErrorBridge::capture(
-            Report::new(IoError::from(IoErrorKind::TimedOut)).attach("checkpoint write source"),
-        );
-        let original_identity = original.test_identity();
-        let public: Error = original
-            .clone()
-            .replace_context(RuntimeError::FileRootAccess)
-            .into();
-        assert!(
-            public
-                .report()
-                .downcast_ref::<CompletionErrorBridge>()
-                .is_none()
-        );
-        let fatal_error = SharedFatalError::capture(
-            public
-                .into_report()
-                .change_context(FatalError::CheckpointWrite),
-        );
-        assert_ne!(fatal_error.test_identity(), original_identity);
-        let fatal = fatal_error.into_report();
-
-        assert_eq!(
-            fatal.downcast_ref::<FatalError>().copied(),
-            Some(FatalError::CheckpointWrite)
-        );
-        assert_eq!(
-            fatal.downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::FileRootAccess)
-        );
-        assert_eq!(
-            fatal.downcast_ref::<IoError>().copied().map(IoError::kind),
-            Some(IoErrorKind::TimedOut)
-        );
-        assert_eq!(
-            fatal
-                .frames()
-                .filter(|frame| frame.is::<CompletionErrorBridge>())
-                .count(),
-            0
-        );
-        assert_eq!(
-            fatal
-                .frames()
-                .filter(|frame| frame.is::<FatalError>())
-                .count(),
-            1
-        );
-        assert!(format!("{fatal:?}").contains("checkpoint write source"));
     }
 
     #[test]

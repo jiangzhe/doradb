@@ -38,7 +38,10 @@ pub(crate) use tests::{test_hooks, test_user_table_id};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{DataIntegrityError, Error, InternalError, OperationResult, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, InternalError, InternalResult, OperationResult,
+    RuntimeError, RuntimeResult,
+};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
@@ -109,7 +112,7 @@ impl Table {
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         // `catalog_load_boundary`: runtime table construction uses the loaded
         // root to seed metadata and hot/cold secondary-index state.
         let active_root = file.active_root_unchecked();
@@ -123,7 +126,9 @@ impl Table {
             disk_pool.clone(),
             active_root.root_ts,
         )
-        .await?;
+        .await
+        .change_context(RuntimeError::TableAccess)
+        .attach_with(|| format!("operation=build_secondary_indexes, table_id={table_id}"))?;
         let mem = MemTable {
             table_id,
             metadata: Arc::clone(&metadata),
@@ -133,13 +138,22 @@ impl Table {
             blk_idx,
             sec_idx: Box::new([]),
         };
-        let storage = ColumnStorage::new(file, disk_pool)?;
-        debug_assert_eq!(
+        let storage = ColumnStorage::new(file, disk_pool)
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| format!("operation=create_column_storage, table_id={table_id}"))?;
+        assert_eq!(
             storage.secondary_index_runtimes().len(),
-            secondary_index_count
+            secondary_index_count,
+            "table construction invariant violated: cold runtime slots do not match metadata, runtime_slots={}, metadata_slots={secondary_index_count}",
+            storage.secondary_index_runtimes().len()
         );
-        debug_assert_eq!(sec_idx.len(), secondary_index_count);
-        let layout = TableRuntimeLayout::new(0, Arc::clone(&metadata), sec_idx)?;
+        assert_eq!(
+            sec_idx.len(),
+            secondary_index_count,
+            "table construction invariant violated: hot runtime slots do not match metadata, runtime_slots={}, metadata_slots={secondary_index_count}",
+            sec_idx.len()
+        );
+        let layout = TableRuntimeLayout::new(0, Arc::clone(&metadata), sec_idx);
         Ok(Table {
             mem,
             storage,
@@ -166,7 +180,9 @@ impl Table {
 
     /// Acquires the reversible metadata-change gate for future index DDL.
     #[inline]
-    pub(crate) async fn begin_metadata_change(&self) -> Result<TableMetadataChangeLease<'_>> {
+    pub(crate) async fn begin_metadata_change(
+        &self,
+    ) -> OperationResult<TableMetadataChangeLease<'_>> {
         self.lifecycle.begin_metadata_change(self.table_id()).await
     }
 
@@ -180,7 +196,7 @@ impl Table {
 
     /// Starts terminal drop admission and closes the checkpoint workflow.
     #[inline]
-    pub(crate) fn start_drop_lifecycle(&self) -> Result<TableDropDrain<'_>> {
+    pub(crate) fn start_drop_lifecycle(&self) -> OperationResult<TableDropDrain<'_>> {
         let drain = self.lifecycle.start_drop(self.table_id())?;
         self.checkpoint_workflow.close();
         Ok(drain)
@@ -188,7 +204,7 @@ impl Table {
 
     /// Marks this table lifecycle as fully dropped.
     #[inline]
-    pub(crate) fn mark_dropped_lifecycle(&self) -> Result<()> {
+    pub(crate) fn mark_dropped_lifecycle(&self) {
         self.checkpoint_workflow.assert_closed();
         self.lifecycle.mark_dropped(self.table_id())
     }
@@ -208,7 +224,7 @@ impl Table {
     /// purge caller treats failure as fatal storage poison rather than retrying
     /// inline.
     #[inline]
-    pub(crate) async fn destroy_dropped_runtime(self, guards: &PoolGuards) -> Result<()> {
+    pub(crate) async fn destroy_dropped_runtime(self, guards: &PoolGuards) -> RuntimeResult<()> {
         let Table {
             mem,
             storage: _storage,
@@ -221,45 +237,39 @@ impl Table {
         let index_pool_guard = guards.index_guard();
         for retired in retired_secondary_indexes.into_inner() {
             let _retired_identity = (retired.index_no, retired.retired_generation);
-            let index = Arc::try_unwrap(retired.index).map_err(|index| {
-                Report::new(InternalError::Generic)
-                    .attach(format!(
-                        "retired secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
-                        index.index_no(),
-                        Arc::strong_count(&index)
-                    ))
-            })?;
+            let index = Arc::try_unwrap(retired.index).unwrap_or_else(|index| {
+                panic!(
+                    "retired secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
+                    index.index_no(),
+                    Arc::strong_count(&index)
+                )
+            });
             index.destroy(index_pool_guard).await?;
         }
-        let layout = Arc::try_unwrap(layout.into_inner()).map_err(|layout| {
-            Report::new(InternalError::Generic)
-                .attach(format!(
-                    "table runtime layout still referenced during runtime destroy: generation={}, strong_count={}",
-                    layout.generation(),
-                    Arc::strong_count(&layout)
-                ))
-        })?;
+        let layout = Arc::try_unwrap(layout.into_inner()).unwrap_or_else(|layout| {
+            panic!(
+                "table runtime layout still referenced during runtime destroy: generation={}, strong_count={}",
+                layout.generation(),
+                Arc::strong_count(&layout)
+            )
+        });
         let indexes = layout.into_secondary_indexes();
         for index in indexes.iter().flatten() {
-            if Arc::strong_count(index) != 1 {
-                return Err(Report::new(InternalError::Generic)
-                    .attach(format!(
-                        "secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
-                        index.index_no(),
-                        Arc::strong_count(index)
-                    ))
-                    .into());
-            }
+            assert_eq!(
+                Arc::strong_count(index),
+                1,
+                "secondary index still referenced during runtime destroy: index_no={}",
+                index.index_no()
+            );
         }
         for index in indexes.into_iter().flatten() {
-            let index = Arc::try_unwrap(index).map_err(|index| {
-                Report::new(InternalError::Generic)
-                    .attach(format!(
-                        "secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
-                        index.index_no(),
-                        Arc::strong_count(&index)
-                    ))
-            })?;
+            let index = Arc::try_unwrap(index).unwrap_or_else(|index| {
+                panic!(
+                    "secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
+                    index.index_no(),
+                    Arc::strong_count(&index)
+                )
+            });
             index.destroy(index_pool_guard).await?;
         }
         mem.destroy(guards).await
@@ -350,39 +360,29 @@ impl Table {
         &self,
         expected_generation: u64,
         new_layout: TableRuntimeLayout,
-    ) -> Result<Arc<TableRuntimeLayout>> {
-        new_layout.validate()?;
-        if new_layout.generation() <= expected_generation {
-            return Err(Report::new(InternalError::Generic)
-                .attach(format!(
-                    "new layout generation must advance: expected_generation={}, new_generation={}",
-                    expected_generation,
-                    new_layout.generation()
-                ))
-                .into());
-        }
+    ) -> Arc<TableRuntimeLayout> {
+        new_layout.assert_valid();
+        assert!(
+            new_layout.generation() > expected_generation,
+            "table runtime layout install invariant violated: generation did not advance, expected_generation={expected_generation}, new_generation={}",
+            new_layout.generation()
+        );
 
         let new_layout = Arc::new(new_layout);
         let old_layout = {
             let mut guard = self.layout.lock();
-            if guard.generation() != expected_generation {
-                return Err(Report::new(InternalError::Generic)
-                    .attach(format!(
-                        "layout generation mismatch: expected={}, actual={}",
-                        expected_generation,
-                        guard.generation()
-                    ))
-                    .into());
-            }
-            if new_layout.index_slot_count() < guard.index_slot_count() {
-                return Err(Report::new(InternalError::Generic)
-                    .attach(format!(
-                        "new layout must not shrink sparse index slots: old_slots={}, new_slots={}",
-                        guard.index_slot_count(),
-                        new_layout.index_slot_count()
-                    ))
-                    .into());
-            }
+            assert_eq!(
+                guard.generation(),
+                expected_generation,
+                "table runtime layout install invariant violated: stale generation, expected_generation={expected_generation}, actual_generation={}",
+                guard.generation()
+            );
+            assert!(
+                new_layout.index_slot_count() >= guard.index_slot_count(),
+                "table runtime layout install invariant violated: sparse slots shrank, old_slots={}, new_slots={}",
+                guard.index_slot_count(),
+                new_layout.index_slot_count()
+            );
             let old_layout = Arc::clone(&guard);
             *guard = Arc::clone(&new_layout);
             old_layout
@@ -409,14 +409,14 @@ impl Table {
         if !retired.is_empty() {
             self.retired_secondary_indexes.lock().extend(retired);
         }
-        Ok(new_layout)
+        new_layout
     }
 
     /// Destroys retired secondary-index runtimes whose old layout snapshots drained.
     pub(crate) async fn cleanup_retired_secondary_indexes(
         &self,
         guards: &PoolGuards,
-    ) -> Result<usize> {
+    ) -> RuntimeResult<usize> {
         let mut ready = Vec::new();
         {
             let mut queued = self.retired_secondary_indexes.lock();
@@ -476,7 +476,11 @@ impl Table {
 
     /// Find the current hot or persisted location for a row id.
     #[inline]
-    pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> Result<RowLocation> {
+    pub(crate) async fn find_row(
+        &self,
+        guards: &PoolGuards,
+        row_id: RowID,
+    ) -> RuntimeResult<RowLocation> {
         self.mem
             .blk_idx
             .find_row(
@@ -486,11 +490,18 @@ impl Table {
                 Some(&self.storage),
             )
             .await
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=find_row, table_id={}, row_id={row_id}",
+                    self.table_id()
+                )
+            })
     }
 
     /// Returns total number of row pages.
     #[inline]
-    pub(crate) async fn total_row_pages(&self, guards: &PoolGuards) -> Result<usize> {
+    pub(crate) async fn total_row_pages(&self, guards: &PoolGuards) -> RuntimeResult<usize> {
         let mut res = 0usize;
         let pivot_row_id = self.mem.pivot_row_id();
         let meta_pool_guard = guards.meta_guard();
@@ -511,18 +522,21 @@ impl Table {
         Ok(res)
     }
 
-    async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F) -> Result<()>
+    async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F) -> RuntimeResult<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let meta_pool_guard = guards.try_guard(PoolRole::Meta).ok_or_else(|| {
-            Report::new(InternalError::PoolGuardMissing).attach(format!(
-                "operation=table_mem_scan, table_id={}, missing meta pool guard",
-                self.table_id()
-            ))
-        })?;
+        let meta_pool_guard = guards
+            .try_guard(PoolRole::Meta)
+            .ok_or_else(|| {
+                Report::new(InternalError::PoolGuardMissing).attach(format!(
+                    "operation=table_mem_scan, table_id={}, missing meta pool guard",
+                    self.table_id()
+                ))
+            })
+            .change_context(RuntimeError::TableAccess)?;
         let pivot_row_id = self.mem.pivot_row_id();
         let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(pivot_row_id).await?;
@@ -533,7 +547,7 @@ impl Table {
                         "operation=table_mem_scan, table_id={}, stale block-index leaf lock",
                         self.table_id()
                     ))
-                    .into());
+                    .change_context(RuntimeError::TableAccess));
             };
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
@@ -561,7 +575,7 @@ impl Table {
         row_id: RowID,
         cols: &[Val],
         cts: TrxID,
-    ) -> Result<()> {
+    ) -> DataIntegrityResult<()> {
         let page_id = page_guard.page_id();
         let page = page_guard.page();
         debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
@@ -639,7 +653,7 @@ impl Table {
         row_id: RowID,
         cols: &[UpdateCol],
         cts: TrxID,
-    ) -> Result<()> {
+    ) -> DataIntegrityResult<()> {
         let page_id = page_guard.page_id();
         let page = page_guard.page();
         // column indexes must be in range
@@ -732,7 +746,7 @@ impl Table {
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
         cts: TrxID,
-    ) -> Result<()> {
+    ) -> DataIntegrityResult<()> {
         let page_id = page_guard.page_id();
         let page = page_guard.page();
         if !page.row_id_in_valid_range(row_id) {
@@ -852,7 +866,7 @@ impl<'ctx> TableRootSnapshot<'ctx> {
 
     /// Returns the captured DiskTree root for one secondary index.
     #[inline]
-    pub(crate) fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
+    pub(crate) fn secondary_index_root(&self, index_no: usize) -> InternalResult<BlockID> {
         self.secondary_index_roots
             .get(index_no)
             .copied()
@@ -919,7 +933,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
     file: Arc<TableFile>,
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     index_ts: TrxID,
-) -> Result<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
+) -> RuntimeResult<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
     let mut builder = SecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
     for (index_no, index_spec) in metadata.idx.active_indexes() {
         let runtime = match SecondaryDiskTreeRuntime::new(
@@ -994,12 +1008,10 @@ fn recovery_page_invariant_error(
     row_id: RowID,
     cts: TrxID,
     reason: &str,
-) -> Error {
-    Report::new(DataIntegrityError::InvalidRootInvariant)
-        .attach(format!(
-            "recover row {op}: page_id={page_id}, row_id={row_id}, cts={cts}, reason={reason}"
-        ))
-        .into()
+) -> Report<DataIntegrityError> {
+    Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+        "recover row {op}: page_id={page_id}, row_id={row_id}, cts={cts}, reason={reason}"
+    ))
 }
 
 #[inline]
@@ -1081,7 +1093,7 @@ fn unique_key_from_full_row(
     unique_index_no: usize,
     cols: &[Val],
     operation: &'static str,
-) -> Result<SelectKey> {
+) -> InternalResult<SelectKey> {
     debug_assert!(cols.len() == metadata.col.col_count());
     debug_assert!(
         cols.iter()
@@ -1091,8 +1103,7 @@ fn unique_key_from_full_row(
     let index_spec = metadata.idx.require_index_spec(unique_index_no)?;
     if !index_spec.unique() {
         return Err(Report::new(InternalError::SecondaryIndexKindMismatch)
-            .attach(format!("operation={operation}, expected=unique"))
-            .into());
+            .attach(format!("operation={operation}, expected=unique")));
     }
     let vals = index_spec
         .cols
@@ -1103,10 +1114,9 @@ fn unique_key_from_full_row(
 }
 
 #[inline]
-fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
+fn missing_secondary_index(index_no: usize, index_count: usize) -> Report<InternalError> {
     Report::new(InternalError::SecondaryIndexOutOfBounds)
         .attach(format!("index_no={index_no}, index_count={index_count}"))
-        .into()
 }
 
 #[cfg(test)]
@@ -1122,7 +1132,7 @@ pub(crate) mod tests {
     use crate::engine::Engine;
     use crate::error::{
         CompletionErrorBridge, DataIntegrityError, Error, FatalError, FileKind, OperationError,
-        Result,
+        Result, RuntimeResult,
     };
     use crate::file::SparseFile;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
@@ -1143,8 +1153,8 @@ pub(crate) mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::{
-        CheckpointPublishLease, DeleteMarker, FreezeOutcome, FrozenPageBatchInfo, Table,
-        TableCheckpointRootMutationLease, TableRuntimeLayout,
+        CheckpointPublishLease, DeleteMarker, DmlValidationError, FreezeOutcome,
+        FrozenPageBatchInfo, Table, TableCheckpointRootMutationLease, TableRuntimeLayout,
     };
     use crate::trx::Transaction;
     use crate::trx::stmt::Statement;
@@ -1159,7 +1169,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     pub(crate) mod test_hooks {
-        use crate::error::{InternalError, Result};
+        use crate::error::{InternalError, RuntimeError, RuntimeResult};
         use crate::id::PageID;
         use error_stack::Report;
         use std::cell::{Cell, RefCell};
@@ -1213,13 +1223,11 @@ pub(crate) mod tests {
             }
         }
 
-        pub(crate) fn maybe_force_lwc_build_error() -> Result<()> {
+        pub(crate) fn maybe_force_lwc_build_error() -> RuntimeResult<()> {
             if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
-                // TODO(error-boundary): backlog 000160 should replace this
-                // generic hook with an owner-specific construction failure.
-                return Err(Report::new(InternalError::Generic)
+                return Err(Report::new(InternalError::LwcBuilderMisuse)
                     .attach("test LWC build failure")
-                    .into());
+                    .change_context(RuntimeError::TableAccess));
             }
             Ok(())
         }
@@ -1723,6 +1731,10 @@ pub(crate) mod tests {
         assert_eq!(
             err.report().downcast_ref::<OperationError>().copied(),
             Some(OperationError::InvalidDmlInput)
+        );
+        assert!(
+            err.report().downcast_ref::<DmlValidationError>().is_some(),
+            "invalid DML input must retain its validation source: {err:?}"
         );
     }
 
@@ -2268,7 +2280,7 @@ pub(crate) mod tests {
 
     impl IndexBatchStream<IndexLookupCandidate> for BoundUniqueIndexCandidateStream<'_> {
         #[inline]
-        async fn next_batch(&mut self) -> Result<Option<Vec<IndexLookupCandidate>>> {
+        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
             if self.done {
                 return Ok(None);
             }
@@ -2296,7 +2308,7 @@ pub(crate) mod tests {
 
     impl IndexBatchStream<IndexLookupCandidate> for BoundNonUniqueIndexCandidateStream<'_> {
         #[inline]
-        async fn next_batch(&mut self) -> Result<Option<Vec<IndexLookupCandidate>>> {
+        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
             if self.done {
                 return Ok(None);
             }
@@ -2326,7 +2338,7 @@ pub(crate) mod tests {
             Self: 'a;
 
         #[inline]
-        async fn lookup(&self, key: &[Val], ts: TrxID) -> Result<Option<(RowID, bool)>> {
+        async fn lookup(&self, key: &[Val], ts: TrxID) -> RuntimeResult<Option<(RowID, bool)>> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_unique(self.guards, self.root)?
@@ -2341,7 +2353,7 @@ pub(crate) mod tests {
             row_id: RowID,
             merge_if_match_deleted: bool,
             ts: TrxID,
-        ) -> Result<IndexInsert> {
+        ) -> RuntimeResult<IndexInsert> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_unique(self.guards, self.root)?
@@ -2356,7 +2368,7 @@ pub(crate) mod tests {
             old_row_id: RowID,
             ignore_del_mask: bool,
             ts: TrxID,
-        ) -> Result<bool> {
+        ) -> RuntimeResult<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_unique(self.guards, self.root)?
@@ -2371,7 +2383,7 @@ pub(crate) mod tests {
             old_row_id: RowID,
             new_row_id: RowID,
             ts: TrxID,
-        ) -> Result<IndexCompareExchange> {
+        ) -> RuntimeResult<IndexCompareExchange> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_unique(self.guards, self.root)?
@@ -2384,7 +2396,7 @@ pub(crate) mod tests {
             &'a self,
             range: &'a KeyRange,
             ts: TrxID,
-        ) -> Result<Self::LookupCandidateStream<'a>> {
+        ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
             Ok(BoundUniqueIndexCandidateStream {
                 layout: Arc::clone(&self.layout),
                 guards: self.guards,
@@ -2397,7 +2409,7 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
+        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> RuntimeResult<()> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_unique(self.guards, self.root)?
@@ -2420,7 +2432,7 @@ pub(crate) mod tests {
             Self: 'a;
 
         #[inline]
-        async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
+        async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, ts: TrxID) -> RuntimeResult<()> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
@@ -2434,7 +2446,7 @@ pub(crate) mod tests {
             key: &[Val],
             row_id: RowID,
             ts: TrxID,
-        ) -> Result<Option<bool>> {
+        ) -> RuntimeResult<Option<bool>> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
@@ -2449,7 +2461,7 @@ pub(crate) mod tests {
             row_id: RowID,
             merge_if_match_deleted: bool,
             ts: TrxID,
-        ) -> Result<IndexInsert> {
+        ) -> RuntimeResult<IndexInsert> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
@@ -2458,7 +2470,12 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        async fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
+        async fn mask_as_deleted(
+            &self,
+            key: &[Val],
+            row_id: RowID,
+            ts: TrxID,
+        ) -> RuntimeResult<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
@@ -2467,7 +2484,12 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        async fn mask_as_active(&self, key: &[Val], row_id: RowID, ts: TrxID) -> Result<bool> {
+        async fn mask_as_active(
+            &self,
+            key: &[Val],
+            row_id: RowID,
+            ts: TrxID,
+        ) -> RuntimeResult<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
@@ -2482,7 +2504,7 @@ pub(crate) mod tests {
             row_id: RowID,
             ignore_del_mask: bool,
             ts: TrxID,
-        ) -> Result<bool> {
+        ) -> RuntimeResult<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
@@ -2495,7 +2517,7 @@ pub(crate) mod tests {
             &'a self,
             range: &'a KeyRange,
             ts: TrxID,
-        ) -> Result<Self::LookupCandidateStream<'a>> {
+        ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
             Ok(BoundNonUniqueIndexCandidateStream {
                 layout: Arc::clone(&self.layout),
                 guards: self.guards,
@@ -2512,7 +2534,7 @@ pub(crate) mod tests {
             &'a self,
             range: &'a KeyRange,
             ts: TrxID,
-        ) -> Result<Self::LookupCandidateStream<'a>> {
+        ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
             Ok(BoundNonUniqueIndexCandidateStream {
                 layout: Arc::clone(&self.layout),
                 guards: self.guards,
@@ -2525,7 +2547,7 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> Result<()> {
+        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> RuntimeResult<()> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?

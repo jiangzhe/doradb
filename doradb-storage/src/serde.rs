@@ -210,11 +210,9 @@ impl Serde for [u8] {
     fn deser_u64(&self, idx: usize) -> DeserResult<(usize, u64)> {
         debug_assert!(idx + mem::size_of::<u64>() <= self.len());
         let end = idx + mem::size_of::<u64>();
-        let val = u64::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid u64 byte width"))?,
-        );
+        let val = u64::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid u64 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -222,11 +220,9 @@ impl Serde for [u8] {
     fn deser_i64(&self, idx: usize) -> DeserResult<(usize, i64)> {
         debug_assert!(idx + mem::size_of::<i64>() <= self.len());
         let end = idx + mem::size_of::<i64>();
-        let val = i64::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid i64 byte width"))?,
-        );
+        let val = i64::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid i64 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -234,11 +230,9 @@ impl Serde for [u8] {
     fn deser_f64(&self, idx: usize) -> DeserResult<(usize, f64)> {
         debug_assert!(idx + mem::size_of::<f64>() <= self.len());
         let end = idx + mem::size_of::<f64>();
-        let val = f64::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid f64 byte width"))?,
-        );
+        let val = f64::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid f64 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -246,11 +240,9 @@ impl Serde for [u8] {
     fn deser_u32(&self, idx: usize) -> DeserResult<(usize, u32)> {
         debug_assert!(idx + mem::size_of::<u32>() <= self.len());
         let end = idx + mem::size_of::<u32>();
-        let val = u32::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid u32 byte width"))?,
-        );
+        let val = u32::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid u32 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -258,11 +250,9 @@ impl Serde for [u8] {
     fn deser_i32(&self, idx: usize) -> DeserResult<(usize, i32)> {
         debug_assert!(idx + mem::size_of::<i32>() <= self.len());
         let end = idx + mem::size_of::<i32>();
-        let val = i32::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid i32 byte width"))?,
-        );
+        let val = i32::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid i32 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -270,11 +260,9 @@ impl Serde for [u8] {
     fn deser_f32(&self, idx: usize) -> DeserResult<(usize, f32)> {
         debug_assert!(idx + mem::size_of::<f32>() <= self.len());
         let end = idx + mem::size_of::<f32>();
-        let val = f32::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid f32 byte width"))?,
-        );
+        let val = f32::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid f32 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -282,11 +270,9 @@ impl Serde for [u8] {
     fn deser_u16(&self, idx: usize) -> DeserResult<(usize, u16)> {
         debug_assert!(idx + mem::size_of::<u16>() <= self.len());
         let end = idx + mem::size_of::<u16>();
-        let val = u16::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid u16 byte width"))?,
-        );
+        let val = u16::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid u16 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -294,11 +280,9 @@ impl Serde for [u8] {
     fn deser_i16(&self, idx: usize) -> DeserResult<(usize, i16)> {
         debug_assert!(idx + mem::size_of::<i16>() <= self.len());
         let end = idx + mem::size_of::<i16>();
-        let val = i16::from_le_bytes(
-            self[idx..end]
-                .try_into()
-                .map_err(|_| invalid_serde_payload("invalid i16 byte width"))?,
-        );
+        let val = i16::from_le_bytes(self[idx..end].try_into().map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload).attach("invalid i16 byte width")
+        })?);
         Ok((end, val))
     }
 
@@ -776,8 +760,10 @@ impl Deser for SemiStr {
         let (idx, len) = input.deser_u32(start_idx)?;
         let (idx, s) = input.deser_byte_slice(idx, len as usize)?;
         // here we always validate utf-8 encoding.
-        let s = str::from_utf8(s)
-            .map_err(|err| invalid_serde_payload(format!("invalid UTF-8 string: {err}")))?;
+        let s = str::from_utf8(s).map_err(|err| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("invalid UTF-8 string: {err}"))
+        })?;
         Ok((idx, SemiStr::new(s)))
     }
 }
@@ -1100,11 +1086,6 @@ fn combined_min_bytes(left: MinBytesHint, right: MinBytesHint) -> MinBytesHint {
     left.get()
         .checked_add(right.get())
         .and_then(NonZeroUsize::new)
-}
-
-#[inline]
-fn invalid_serde_payload(message: impl Into<String>) -> Report<DataIntegrityError> {
-    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
 }
 
 #[cfg(test)]

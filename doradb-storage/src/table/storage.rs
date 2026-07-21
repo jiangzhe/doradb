@@ -1,6 +1,6 @@
 use super::ColumnDeletionBuffer;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
-use crate::error::{DataIntegrityError, Result};
+use crate::error::{DataIntegrityError, RuntimeError, RuntimeResult};
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::BlockID;
 use crate::index::SecondaryDiskTreeRuntime;
@@ -27,7 +27,7 @@ impl ColumnStorage {
     pub(crate) fn new(
         file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         // `catalog_load_boundary`: table construction binds the loaded root to
         // initialize column storage and validate secondary root layout.
         let active_root = file.active_root_unchecked();
@@ -39,7 +39,11 @@ impl ColumnStorage {
                     active_root.secondary_index_roots.len(),
                     metadata.idx.index_slot_count()
                 ))
-                .into());
+                .change_context(RuntimeError::TableAccess)
+                .attach(format!(
+                    "operation=build_column_storage, file={}",
+                    file.file_kind()
+                )));
         }
         let mut secondary_indexes = Vec::with_capacity(metadata.idx.index_slot_count());
         secondary_indexes.resize_with(metadata.idx.index_slot_count(), || None);
@@ -88,7 +92,7 @@ impl ColumnStorage {
         &self,
         disk_pool_guard: &PoolGuard,
         block_id: BlockID,
-    ) -> Result<PersistedLwcBlock> {
+    ) -> RuntimeResult<PersistedLwcBlock> {
         PersistedLwcBlock::load(
             self.file().file_kind(),
             self.file().sparse_file(),

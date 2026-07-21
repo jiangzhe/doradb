@@ -8,7 +8,8 @@ use crate::conf::TrxSysConfig;
 use crate::engine::EngineRef;
 use crate::error::{
     CompletionErrorBridge, DataIntegrityError, Error, FatalError, FatalResult, InternalError,
-    Result, RuntimeResult,
+    MultiDomainResultExt, Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
+    RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
@@ -251,8 +252,7 @@ impl PendingTransactionSystemStartup {
         // workers; later redo records must not be accepted until the active log
         // file has a valid super-block.
         if let Err(report) = self.initial_redo_header.wait_result().await {
-            let mut err =
-                Error::from_completion_bridge(report, "wait for initial redo super-block write");
+            let mut err = Error::from(report).attach("wait for initial redo super-block write");
             if !trx_sys.rollback_log_thread_startup(log_thread) {
                 err = err.attach(
                     "phase=rollback_initial_redo_header_failure, cleanup=join_log_worker, result=panic",
@@ -973,7 +973,7 @@ impl TransactionSystem {
     }
 
     #[inline]
-    fn commit_prepared_no_wait(&self, trx: PreparedTrx) -> Result<TrxID> {
+    fn commit_prepared_no_wait(&self, trx: PreparedTrx) -> RuntimeOrFatalResult<TrxID> {
         debug_assert!(trx.attachment.is_none());
         // This API is for sessionless system transactions only.
         //
@@ -993,7 +993,9 @@ impl TransactionSystem {
             }
             Err(CommitRejection { cts, trx, reason }) => {
                 (*trx).discard_rejected();
-                Err(reason.into_error(format!("redo group commit is closed: commit_ts={cts}")))
+                Err(reason
+                    .into_runtime_or_fatal()
+                    .attach_with(|| format!("redo group commit is closed: commit_ts={cts}")))
             }
         }
     }
@@ -1001,6 +1003,33 @@ impl TransactionSystem {
     /// Enqueue a prepared transaction and wait for ordered commit completion.
     #[inline]
     pub(crate) async fn commit_prepared(&self, trx: PreparedTrx) -> Result<TrxID> {
+        let (cts, waiter) = self.enqueue_prepared_waiter(trx);
+        waiter.wait_result().await.map_err(|report| {
+            Error::from(report)
+                .attach_with(|| format!("wait for redo group commit: commit_ts={cts}"))
+        })?;
+        assert!(TrxID::new(self.redo_log.persisted_cts.load(Ordering::Relaxed)) >= cts);
+        Ok(cts)
+    }
+
+    /// Enqueue a catalog transaction and preserve Runtime/Fatal completion domains.
+    #[inline]
+    async fn commit_prepared_catalog(&self, trx: PreparedTrx) -> RuntimeOrFatalResult<TrxID> {
+        let (cts, waiter) = self.enqueue_prepared_waiter(trx);
+        waiter
+            .wait_result()
+            .await
+            .map_err(|bridge| bridge.into_runtime_or_fatal(RuntimeError::CatalogAccess))
+            .attach_with(|| {
+                format!("operation=commit_catalog_ddl, phase=wait_redo_group, commit_ts={cts}")
+            })?;
+        assert!(TrxID::new(self.redo_log.persisted_cts.load(Ordering::Relaxed)) >= cts);
+        Ok(cts)
+    }
+
+    /// Enqueue a prepared transaction and return its guaranteed completion waiter.
+    #[inline]
+    fn enqueue_prepared_waiter(&self, trx: PreparedTrx) -> (TrxID, Arc<Completion<()>>) {
         let (cts, waiter) = match self.enqueue_commit(trx, true) {
             Ok(QueuedCommit { cts, waiter }) => (cts, waiter),
             Err(CommitRejection { cts, trx, reason }) => {
@@ -1019,14 +1048,7 @@ impl TransactionSystem {
         let waiter = waiter.expect(
             "async prepared commit requested a completion waiter but enqueue returned none",
         );
-        waiter.wait_result().await.map_err(|report| {
-            Error::from_completion_bridge(
-                report,
-                format!("wait for redo group commit: commit_ts={cts}"),
-            )
-        })?;
-        assert!(TrxID::new(self.redo_log.persisted_cts.load(Ordering::Relaxed)) >= cts);
-        Ok(cts)
+        (cts, waiter)
     }
 
     /// Mark a user-table root publication effective and retain the swapped root.
@@ -1062,7 +1084,7 @@ impl TransactionSystem {
         mutable_file: MutableTableFile,
         root_ts: TrxID,
         try_delete_if_fail: bool,
-    ) -> Result<Arc<TableFile>> {
+    ) -> RuntimeResult<Arc<TableFile>> {
         let (table_file, old_root) = mutable_file.commit(root_ts, try_delete_if_fail).await?;
         self.mark_published_table_root(&table_file, old_root);
         Ok(table_file)
@@ -1165,15 +1187,50 @@ impl TransactionSystem {
         self.commit_prepared(prepared_trx).await
     }
 
+    /// Commit an active catalog DDL transaction with Runtime/Fatal domains intact.
+    #[inline]
+    pub(crate) async fn commit_catalog_transaction(
+        &self,
+        claim: TrxCompletionClaim,
+    ) -> RuntimeOrFatalResult<TrxID> {
+        if let Err(fatal) = self.poisoner.ensure_healthy() {
+            let completion =
+                self.enqueue_terminal_rollback(claim, "rollback poisoned catalog commit");
+            Self::wait_terminal_rollback_runtime_or_fatal(
+                completion,
+                RuntimeError::CatalogAccess,
+                "wait for poisoned catalog commit rollback cleanup",
+            )
+            .await?;
+            return Err(RuntimeOrFatalError::from(fatal));
+        }
+        let (_entry, inner, attachment) = claim.into_parts();
+        inner.debug_assert_redo_invariants();
+        let prepared_trx = inner
+            .prepare(attachment)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=commit_catalog_ddl, phase=prepare")
+            .map_err(RuntimeOrFatalError::from)?;
+        if !prepared_trx.require_ordered_commit() {
+            self.discard_unordered_prepared(prepared_trx);
+            return Ok(TrxID::new(0));
+        }
+        self.commit_prepared_catalog(prepared_trx).await
+    }
+
     /// Commit a system transaction through the no-wait group-commit path.
     #[inline]
-    pub(crate) fn commit_sys(&self, trx: SysTrx) -> Result<TrxID> {
-        self.poisoner.ensure_healthy()?;
+    pub(crate) fn commit_sys(&self, trx: SysTrx) -> RuntimeOrFatalResult<TrxID> {
+        self.poisoner
+            .ensure_healthy()
+            .map_err(RuntimeOrFatalError::from)?;
         if trx.redo.is_empty() {
             if trx.retired_row_pages.is_some() {
-                return Err(Error::from(
+                return Err(RuntimeOrFatalError::from(
                     Report::new(InternalError::SystemTransactionRedoMissing)
-                        .attach("system row-page retirement requires recovery-visible redo"),
+                        .attach("system row-page retirement requires recovery-visible redo")
+                        .change_context(RuntimeError::SystemTransactionCommit)
+                        .attach("operation=commit_system_transaction"),
                 ));
             }
             // System transaction does not hold any active start timestamp
@@ -1194,6 +1251,37 @@ impl TransactionSystem {
     pub(crate) async fn rollback_transaction(&self, claim: TrxCompletionClaim) -> Result<()> {
         let completion = self.enqueue_terminal_rollback(claim, "rollback active transaction");
         Self::wait_terminal_rollback(completion, "wait for terminal rollback cleanup").await
+    }
+
+    /// Roll back an active catalog DDL transaction with Runtime/Fatal domains intact.
+    #[inline]
+    pub(crate) async fn rollback_catalog_transaction(
+        &self,
+        claim: TrxCompletionClaim,
+    ) -> RuntimeOrFatalResult<()> {
+        let completion = self.enqueue_terminal_rollback(claim, "rollback catalog DDL transaction");
+        Self::wait_terminal_rollback_runtime_or_fatal(
+            completion,
+            RuntimeError::CatalogAccess,
+            "wait for catalog DDL terminal rollback cleanup",
+        )
+        .await
+    }
+
+    /// Roll back an engine-owned table-maintenance transaction with typed domains.
+    #[inline]
+    pub(crate) async fn rollback_table_maintenance_transaction(
+        &self,
+        claim: TrxCompletionClaim,
+    ) -> RuntimeOrFatalResult<()> {
+        let completion =
+            self.enqueue_terminal_rollback(claim, "rollback table maintenance transaction");
+        Self::wait_terminal_rollback_runtime_or_fatal(
+            completion,
+            RuntimeError::TableAccess,
+            "wait for table maintenance terminal rollback cleanup",
+        )
+        .await
     }
 
     /// Queue terminal rollback cleanup and return the observer completion.
@@ -1230,11 +1318,22 @@ impl TransactionSystem {
     ) -> Result<()> {
         match completion.wait_result().await {
             Ok(()) => Ok(()),
-            Err(bridge) => Err(Error::from_completion_bridge(
-                bridge,
-                format!("{operation}: terminal rollback cleanup failed"),
-            )),
+            Err(bridge) => Err(Error::from(bridge)
+                .attach_with(|| format!("{operation}: terminal rollback cleanup failed"))),
         }
+    }
+
+    #[inline]
+    async fn wait_terminal_rollback_runtime_or_fatal(
+        completion: Arc<Completion<()>>,
+        runtime_context: RuntimeError,
+        operation: &'static str,
+    ) -> RuntimeOrFatalResult<()> {
+        completion
+            .wait_result()
+            .await
+            .map_err(|bridge| bridge.into_runtime_or_fatal(runtime_context))
+            .attach_with(|| format!("{operation}: terminal rollback cleanup failed"))
     }
 
     /// Rollback an abandoned transaction claimed by cleanup.
@@ -1282,7 +1381,6 @@ impl TransactionSystem {
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
             let report = err
-                .into_report()
                 .change_context(FatalError::RollbackAccess)
                 .attach(format!("{operation}: index undo rollback failed"));
             obs::error!(
@@ -1290,9 +1388,6 @@ impl TransactionSystem {
                 report
             );
             let error = self.poisoner.poison(report);
-            // TODO(error-boundary): blocked=index undo rollback still returns public Error;
-            // owner=typed index rollback source in RFC-0023 Phase 3;
-            // tracking=docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md.
             return Err(error.into_report());
         }
         if let Err(err) = inner
@@ -1305,7 +1400,6 @@ impl TransactionSystem {
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
             let report = err
-                .into_report()
                 .change_context(FatalError::RollbackAccess)
                 .attach(format!("{operation}: row undo rollback failed"));
             obs::error!(
@@ -1313,9 +1407,6 @@ impl TransactionSystem {
                 report
             );
             let error = self.poisoner.poison(report);
-            // TODO(error-boundary): blocked=row undo rollback still returns public Error;
-            // owner=typed row rollback source in RFC-0023 Phase 3;
-            // tracking=docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md.
             return Err(error.into_report());
         }
         inner.effects_mut().clear_for_rollback();
@@ -1578,9 +1669,15 @@ impl TransactionSystem {
 
     /// Build the catalog checkpoint scan configuration from the transaction config.
     #[inline]
-    pub(crate) fn catalog_checkpoint_scan_config(&self) -> Result<CatalogCheckpointScanConfig> {
+    pub(crate) fn catalog_checkpoint_scan_config(
+        &self,
+    ) -> RuntimeResult<CatalogCheckpointScanConfig> {
         Ok(CatalogCheckpointScanConfig {
-            file_prefix: self.config.file_prefix()?,
+            file_prefix: self
+                .config
+                .file_prefix()
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=build_catalog_checkpoint_scan_config")?,
             read_ahead_depth: self.config.catalog_checkpoint_scan_io_depth,
         })
     }
@@ -2183,8 +2280,11 @@ pub(crate) mod tests {
             let res = engine.inner().trx_sys.commit_sys(sys_trx);
 
             let err = res.unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("redo allocation exhaustion should be a Runtime error")
+            };
             assert_eq!(
-                err.report().downcast_ref::<ResourceError>().copied(),
+                err.downcast_ref::<ResourceError>().copied(),
                 Some(ResourceError::StorageFileCapacityExceeded)
             );
             engine.inner().poisoner.ensure_healthy().unwrap();
@@ -2246,8 +2346,11 @@ pub(crate) mod tests {
                 vec![PageID::new(46)].into_boxed_slice(),
             ));
             let err = engine.inner().trx_sys.commit_sys(sys_trx).unwrap_err();
+            let RuntimeOrFatalError::Runtime(err) = err else {
+                panic!("missing system redo should be a Runtime error")
+            };
             assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
+                err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::SystemTransactionRedoMissing)
             );
             engine.inner().poisoner.ensure_healthy().unwrap();

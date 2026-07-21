@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::{TableCache, is_catalog_table};
-use crate::error::Result;
+use crate::error::RuntimeResult as Result;
 use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::SelectKey;
 use crate::table::IndexRollback;

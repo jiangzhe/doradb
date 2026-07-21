@@ -3,14 +3,17 @@ use crate::catalog::{
     Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_table,
     is_user_table,
 };
-use crate::error::{DataIntegrityError, DataIntegrityResult, FatalError, IoError, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, FatalError, IoError, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::obs;
 use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -360,7 +363,7 @@ impl Catalog {
     pub(crate) async fn checkpoint_now(
         &self,
         trx_sys: &TransactionSystem,
-    ) -> Result<CatalogCheckpointOutcome> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
         obs::info!("event=checkpoint_publish component=catalog action=start result=ok");
         async {
             let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
@@ -384,15 +387,28 @@ impl Catalog {
                     })
                 }
                 Ok(CatalogCheckpointOutcome::Noop) => Ok(CatalogCheckpointOutcome::Noop),
-                Err(err)
-                    if err.report().downcast_ref::<IoError>().is_some() =>
-                {
+                Err(err) => {
+                    let has_io_source = match &err {
+                        RuntimeOrFatalError::Runtime(report) => {
+                            report.downcast_ref::<IoError>().is_some()
+                        }
+                        RuntimeOrFatalError::Fatal(report) => {
+                            report.downcast_ref::<IoError>().is_some()
+                        }
+                    };
+                    if !has_io_source {
+                        return Err(err);
+                    }
+                    // Preserve the existing policy: any apply failure carrying
+                    // an IO source is poisoned as a checkpoint-write failure.
+                    // An already-Fatal source retains its original Fatal reason.
                     let report = err
                         .into_fatal_report(FatalError::CheckpointWrite)
                         .attach("catalog checkpoint publish IO failure");
-                    Err(self.poisoner.poison(report).into_report().into())
+                    Err(RuntimeOrFatalError::from(
+                        self.poisoner.poison(report).into_report(),
+                    ))
                 }
-                Err(err) => Err(err),
             }
         }
         .await
@@ -407,18 +423,15 @@ impl Catalog {
                 "event=checkpoint_publish component=catalog action=publish result=skipped reason=noop"
             ),
         })
-        .inspect_err(|err| {
-            if err.report().downcast_ref::<FatalError>().is_some() {
-                obs::error!(
-                    "event=checkpoint_publish component=catalog action=poison result=error error={}",
-                    err
-                );
-            } else {
-                obs::error!(
-                    "event=checkpoint_publish component=catalog action=publish result=error error={}",
-                    err
-                );
-            }
+        .inspect_err(|err| match err {
+            RuntimeOrFatalError::Fatal(report) => obs::error!(
+                "event=checkpoint_publish component=catalog action=poison result=error error={:?}",
+                report
+            ),
+            RuntimeOrFatalError::Runtime(report) => obs::error!(
+                "event=checkpoint_publish component=catalog action=publish result=error error={:?}",
+                report
+            ),
         })
     }
 
@@ -435,8 +448,8 @@ impl Catalog {
         &self,
         durable_upper_cts: TrxID,
         scan_cfg: CatalogCheckpointScanConfig,
-    ) -> Result<CatalogCheckpointBatch> {
-        let snapshot = self.storage.checkpoint_snapshot()?;
+    ) -> RuntimeResult<CatalogCheckpointBatch> {
+        let snapshot = self.storage.checkpoint_snapshot();
         let first_retained_file_seq = snapshot.meta.first_redo_log_seq;
         let replay_start_ts = snapshot.catalog_replay_start_ts;
         // Start with an empty batch whose safe point is just before the
@@ -457,16 +470,38 @@ impl Catalog {
             return Ok(batch);
         }
 
-        let logs = discover_redo_log_files(&scan_cfg.file_prefix, first_retained_file_seq, false)?;
+        let logs = discover_redo_log_files(&scan_cfg.file_prefix, first_retained_file_seq, false)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=scan_catalog_checkpoint, phase=discover_redo, replay_start_ts={replay_start_ts}"
+                )
+            })?;
         if logs.is_empty() {
             return Ok(batch);
         }
         let planner = RedoReplayPlanner::new(logs);
-        let planned = planner.plan_catalog_scan(replay_start_ts, scan_cfg.read_ahead_depth)?;
+        let planned = planner
+            .plan_catalog_scan(replay_start_ts, scan_cfg.read_ahead_depth)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=scan_catalog_checkpoint, phase=plan_redo, replay_start_ts={replay_start_ts}"
+                )
+            })?;
         batch.sealed_redo_segments = planned.sealed_segments;
         let mut stream = planned.stream;
 
-        while let Some(log) = stream.try_next().await? {
+        while let Some(log) = stream
+            .try_next()
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=scan_catalog_checkpoint, phase=read_redo, replay_start_ts={replay_start_ts}"
+                )
+            })?
+        {
             let (header, redo) = log.into_inner();
             if header.cts < replay_start_ts {
                 // Older records are already represented by the current
@@ -490,7 +525,16 @@ impl Catalog {
             // Decide how this DDL transaction participates in the catalog
             // checkpoint before advancing the safe cursor. The decision covers
             // both table DDL ordering rules and index DDL root-proof rules.
-            match self.catalog_checkpoint_txn_action(ddl, &redo.dml, header.cts)? {
+            match self
+                .catalog_checkpoint_txn_action(ddl, &redo.dml, header.cts)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=scan_catalog_checkpoint, phase=classify_ddl, commit_ts={}",
+                        header.cts
+                    )
+                })?
+            {
                 CatalogCheckpointTxnAction::Include => {
                     // Reaching here means this transaction will never need to be
                     // replayed as catalog history before the next checkpoint cursor.
@@ -531,7 +575,7 @@ impl Catalog {
         ddl: &DDLRedo,
         dml: &BTreeMap<TableID, TableDML>,
         cts: TrxID,
-    ) -> Result<CatalogCheckpointTxnAction> {
+    ) -> DataIntegrityResult<CatalogCheckpointTxnAction> {
         match ddl {
             DDLRedo::CreateTable(_) => Ok(CatalogCheckpointTxnAction::Include),
             DDLRedo::DropTable(table_id) if is_user_table(*table_id) => {
@@ -575,7 +619,7 @@ impl Catalog {
         table_id: TableID,
         index_no: u16,
         cts: TrxID,
-    ) -> Result<CatalogCheckpointTxnAction> {
+    ) -> DataIntegrityResult<CatalogCheckpointTxnAction> {
         let table = self.get_table_now(table_id);
         let active_root = table
             .as_ref()

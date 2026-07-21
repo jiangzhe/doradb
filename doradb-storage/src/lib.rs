@@ -44,7 +44,7 @@ pub use catalog::{
 pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LogSync, TrxSysConfig};
 pub use engine::Engine;
 pub use error::{Error, ErrorKind, Result};
-pub use lock::LockMode;
+pub use lock::TableLockMode;
 pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 pub use session::{
     CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,

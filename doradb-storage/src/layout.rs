@@ -32,7 +32,7 @@ where
     T: FromBytes + KnownLayout + Immutable,
 {
     T::ref_from_bytes(bytes).map_err(|_| {
-        invalid_layout(format!(
+        Report::new(LayoutError::Mismatch).attach(format!(
             "invalid byte layout for {}: len={}",
             type_name::<T>(),
             bytes.len()
@@ -48,7 +48,7 @@ where
 {
     let len = bytes.len();
     T::mut_from_bytes(bytes).map_err(|_| {
-        invalid_layout(format!(
+        Report::new(LayoutError::Mismatch).attach(format!(
             "invalid mutable byte layout for {}: len={len}",
             type_name::<T>()
         ))
@@ -63,7 +63,7 @@ where
 {
     let elem_len = mem::size_of::<T>();
     if elem_len == 0 || !bytes.len().is_multiple_of(elem_len) {
-        return Err(invalid_layout(format!(
+        return Err(Report::new(LayoutError::Mismatch).attach(format!(
             "invalid byte length {} for slice of {}",
             bytes.len(),
             type_name::<T>()
@@ -71,7 +71,7 @@ where
     }
     let count = bytes.len() / elem_len;
     <[T]>::ref_from_bytes_with_elems(bytes, count).map_err(|_| {
-        invalid_layout(format!(
+        Report::new(LayoutError::Mismatch).attach(format!(
             "invalid byte layout for slice of {}: len={}",
             type_name::<T>(),
             bytes.len()
@@ -87,7 +87,7 @@ where
 {
     let elem_len = mem::size_of::<T>();
     if elem_len == 0 || !bytes.len().is_multiple_of(elem_len) {
-        return Err(invalid_layout(format!(
+        return Err(Report::new(LayoutError::Mismatch).attach(format!(
             "invalid mutable byte length {} for slice of {}",
             bytes.len(),
             type_name::<T>()
@@ -96,7 +96,7 @@ where
     let len = bytes.len();
     let count = bytes.len() / elem_len;
     <[T]>::mut_from_bytes_with_elems(bytes, count).map_err(|_| {
-        invalid_layout(format!(
+        Report::new(LayoutError::Mismatch).attach(format!(
             "invalid mutable byte layout for slice of {}: len={}",
             type_name::<T>(),
             len
@@ -146,11 +146,6 @@ where
 {
     try_slice_from_bytes_mut(bytes)
         .expect("trusted bytes must match the requested mutable zerocopy slice")
-}
-
-#[inline]
-fn invalid_layout(message: impl Into<String>) -> Report<LayoutError> {
-    Report::new(LayoutError::Mismatch).attach(message.into())
 }
 
 #[cfg(test)]

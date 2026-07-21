@@ -1,6 +1,7 @@
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, Error, FileKind, InternalError, Result,
+    DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult,
+    MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -70,7 +71,7 @@ impl ColumnAuxBlobHeader {
         codec_version: u8,
         flags: u8,
         payload_len: usize,
-    ) -> Result<Self> {
+    ) -> InternalResult<Self> {
         if payload_len == 0 || payload_len > u32::MAX as usize {
             return Err(column_deletion_blob_invariant());
         }
@@ -85,7 +86,7 @@ impl ColumnAuxBlobHeader {
 
     /// Creates a header for row-id-delta delete payload bytes.
     #[inline]
-    pub(crate) fn delete_payload(payload_len: usize) -> Result<Self> {
+    pub(crate) fn delete_payload(payload_len: usize) -> InternalResult<Self> {
         Self::new(
             COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
@@ -132,21 +133,26 @@ impl ColumnAuxBlobHeader {
     }
 
     #[inline]
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    fn decode(bytes: &[u8]) -> DataIntegrityResult<Self> {
         if bytes.len() < COLUMN_AUX_BLOB_HEADER_SIZE {
-            return Err(invalid_payload(format!(
-                "column auxiliary blob header is too short: len={}",
-                bytes.len()
-            )));
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "column auxiliary blob header is too short: len={}",
+                    bytes.len()
+                )),
+            );
         }
         let payload_len = u32::from_le_bytes(
             bytes[COLUMN_AUX_BLOB_PAYLOAD_LEN_OFFSET..COLUMN_AUX_BLOB_PAYLOAD_LEN_OFFSET + 4]
-                .try_into()?,
+                .try_into()
+                .map_err(|_| {
+                    Report::new(DataIntegrityError::InvalidPayload)
+                        .attach("invalid payload-length width")
+                })?,
         );
         if payload_len == 0 {
-            return Err(invalid_payload(
-                "column auxiliary blob payload length must be non-zero",
-            ));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("column auxiliary blob payload length must be non-zero"));
         }
         Ok(ColumnAuxBlobHeader {
             blob_kind: bytes[0],
@@ -218,8 +224,15 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
 
     /// Appends one framed delete payload and returns the persisted blob
     /// reference.
-    pub(super) async fn append_delete_payload(&mut self, bytes: &[u8]) -> Result<BlobRef> {
-        let header = ColumnAuxBlobHeader::delete_payload(bytes.len())?;
+    pub(super) async fn append_delete_payload(&mut self, bytes: &[u8]) -> RuntimeResult<BlobRef> {
+        let header = ColumnAuxBlobHeader::delete_payload(bytes.len())
+            .change_context(RuntimeError::IndexAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=append_column_delete_payload, byte_len={}",
+                    bytes.len()
+                )
+            })?;
         self.append_framed_blob(header, bytes).await
     }
 
@@ -227,18 +240,22 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         &mut self,
         header: ColumnAuxBlobHeader,
         bytes: &[u8],
-    ) -> Result<BlobRef> {
+    ) -> RuntimeResult<BlobRef> {
         let framed_len = COLUMN_AUX_BLOB_HEADER_SIZE + bytes.len();
         if framed_len > u32::MAX as usize {
-            return Err(column_deletion_blob_invariant());
+            return Err(column_deletion_blob_invariant()
+                .change_context(RuntimeError::IndexAccess)
+                .attach(format!(
+                    "operation=append_column_deletion_blob, framed_len={framed_len}"
+                )));
         }
         self.ensure_current_block()?;
         let (start_block_id, start_offset) = {
             let current = self.current_page.as_ref().ok_or_else(|| {
-                Error::from(
-                    Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                        .attach("current block missing after ensure_current_block"),
-                )
+                Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                    .attach("current block missing after ensure_current_block")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=append_column_deletion_blob")
             })?;
             (current.block_id, current.used_size)
         };
@@ -253,7 +270,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
     }
 
     /// Flushes every pending blob page into the mutable CoW file.
-    pub(super) async fn finish(&mut self) -> Result<()> {
+    pub(super) async fn finish(&mut self) -> RuntimeOrFatalResult<()> {
         if let Some(page) = self.current_page.take()
             && page.used_size > 0
         {
@@ -270,42 +287,54 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
                 &mut sealed.page.buf.data_mut()[BLOCK_INTEGRITY_HEADER_SIZE..payload_end],
                 sealed.next_block_id,
                 sealed.page.used_size,
-            )?;
+            )
+            .change_context(RuntimeError::IndexAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=finish_column_deletion_blob, block_id={}",
+                    sealed.page.block_id
+                )
+            })?;
             write_block_checksum(sealed.page.buf.data_mut());
             writes.push(
                 self.mutable_file
                     .write_block(sealed.page.block_id, sealed.page.buf),
             );
         }
-        try_join_all(writes).await.map_err(|report| {
-            Error::from_completion_bridge(report, "write column deletion blob")
-        })?;
+        try_join_all(writes)
+            .await
+            .map_err(|bridge| bridge.into_runtime_or_fatal(RuntimeError::IndexAccess))
+            .attach("write column deletion blob")?;
         Ok(())
     }
 
     #[inline]
-    fn ensure_current_block(&mut self) -> Result<()> {
+    fn ensure_current_block(&mut self) -> RuntimeResult<()> {
         match self.current_page.as_ref() {
             Some(current) if current.free_space() == 0 => self.roll_to_next_block()?,
             Some(_) => {}
             None => {
-                let block_id = self.mutable_file.allocate_block()?;
+                let block_id = self
+                    .mutable_file
+                    .allocate_block()
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=allocate_column_deletion_blob_block")?;
                 self.current_page = Some(PendingBlobPage::new(block_id));
             }
         }
         Ok(())
     }
 
-    fn write_stream(&mut self, mut bytes: &[u8]) -> Result<()> {
+    fn write_stream(&mut self, mut bytes: &[u8]) -> RuntimeResult<()> {
         while !bytes.is_empty() {
             let free_space = self
                 .current_page
                 .as_ref()
                 .ok_or_else(|| {
-                    Error::from(
-                        Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                            .attach("current page missing while writing stream"),
-                    )
+                    Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                        .attach("current page missing while writing stream")
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=write_column_deletion_blob_stream")
                 })?
                 .free_space();
             if free_space == 0 {
@@ -314,10 +343,10 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
             }
             let take = bytes.len().min(free_space);
             let current = self.current_page.as_mut().ok_or_else(|| {
-                Error::from(
-                    Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                        .attach("current page missing before write"),
-                )
+                Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                    .attach("current page missing before write")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=write_column_deletion_blob_stream")
             })?;
             current.write_bytes(&bytes[..take]);
             bytes = &bytes[take..];
@@ -325,13 +354,19 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         Ok(())
     }
 
-    fn roll_to_next_block(&mut self) -> Result<()> {
-        let next_block_id = self.mutable_file.allocate_block()?;
+    fn roll_to_next_block(&mut self) -> RuntimeResult<()> {
+        let next_block_id = self
+            .mutable_file
+            .allocate_block()
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=roll_column_deletion_blob_block")?;
         let page = self.current_page.take().ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                    .attach("current block missing during block roll"),
-            )
+            Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                .attach("current block missing during block roll")
+                .change_context(RuntimeError::IndexAccess)
+                .attach(format!(
+                    "operation=roll_column_deletion_blob_block, next_block_id={next_block_id}"
+                ))
         })?;
         self.sealed_pages.push(SealedBlobPage {
             page,
@@ -371,21 +406,36 @@ impl<'a> ColumnDeletionBlobReader<'a> {
     pub(crate) async fn read_framed_blob(
         &self,
         blob_ref: BlobRef,
-    ) -> Result<(ColumnAuxBlobHeader, Vec<u8>)> {
+    ) -> RuntimeResult<(ColumnAuxBlobHeader, Vec<u8>)> {
         let mut bytes = self.read_raw(blob_ref).await?;
         if bytes.len() < COLUMN_AUX_BLOB_HEADER_SIZE {
-            return Err(invalid_payload(format!(
+            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "framed column deletion blob is too short: start_block_id={}, start_offset={}, byte_len={}",
                 blob_ref.start_block_id, blob_ref.start_offset, blob_ref.byte_len
-            )));
+            ))
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=read_framed_column_deletion_blob"));
         }
-        let header = ColumnAuxBlobHeader::decode(&bytes[..COLUMN_AUX_BLOB_HEADER_SIZE])?;
+        let header = ColumnAuxBlobHeader::decode(&bytes[..COLUMN_AUX_BLOB_HEADER_SIZE])
+            .change_context(RuntimeError::IndexAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=read_framed_column_deletion_blob, start_block_id={}",
+                    blob_ref.start_block_id
+                )
+            })?;
         if bytes.len() != COLUMN_AUX_BLOB_HEADER_SIZE + header.payload_len() {
-            return Err(invalid_payload(format!(
-                "framed column deletion blob length {} does not match header payload length {}",
-                bytes.len(),
-                header.payload_len()
-            )));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "framed column deletion blob length {} does not match header payload length {}",
+                    bytes.len(),
+                    header.payload_len()
+                ))
+                .change_context(RuntimeError::IndexAccess)
+                .attach(format!(
+                    "operation=read_framed_column_deletion_blob, start_block_id={}",
+                    blob_ref.start_block_id
+                )));
         }
         let payload = bytes.split_off(COLUMN_AUX_BLOB_HEADER_SIZE);
         Ok((header, payload))
@@ -396,12 +446,15 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         &self,
         blob_ref: BlobRef,
         mut visit: impl FnMut(BlockID),
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         if blob_ref.start_block_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
-            return Err(invalid_payload(format!(
-                "invalid column deletion blob reference: start_block_id={}, byte_len={}",
-                blob_ref.start_block_id, blob_ref.byte_len
-            )));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "invalid column deletion blob reference: start_block_id={}, byte_len={}",
+                    blob_ref.start_block_id, blob_ref.byte_len
+                ))
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=collect_column_deletion_blob_blocks"));
         }
         let file_kind = self.file_kind;
         let start_offset = blob_ref.start_offset as usize;
@@ -427,38 +480,50 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     block_id,
                     validate_persisted_blob_page,
                 )
-                .await?;
+                .await
+                .change_context(RuntimeError::IndexAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_column_deletion_blob_blocks, file={file_kind}, block_id={block_id}"
+                    )
+                })?;
             visit(block_id);
             let payload = validated_blob_page_payload(guard.page());
-            let header = decode_blob_page_header(payload).attach_with(|| {
-                format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
-            })?;
+            let header = decode_blob_page_header(payload)
+                .attach_with(|| {
+                    format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
+                })
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=collect_column_deletion_blob_blocks")?;
             let used_size = header.used_size as usize;
             if offset > used_size {
-                return Err(invalid_blob_payload(
-                    file_kind,
-                    block_id,
-                    format!("blob offset {offset} exceeds used size {used_size}"),
-                ));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob offset {offset} exceeds used size {used_size}"
+                    ))
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=collect_column_deletion_blob_blocks"));
             }
             let available = used_size - offset;
             if available == 0 && remaining > 0 {
-                return Err(invalid_blob_payload(
-                    file_kind,
-                    block_id,
-                    "blob reference reaches empty page before reading all bytes",
-                ));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob reference reaches empty page before reading all bytes"
+                    ))
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=collect_column_deletion_blob_blocks"));
             }
             remaining -= remaining.min(available);
             if remaining == 0 {
                 break;
             }
             if header.next_block_id == SUPER_BLOCK_ID {
-                return Err(invalid_blob_payload(
-                    file_kind,
-                    block_id,
-                    "blob chain ended before reading all bytes",
-                ));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob chain ended before reading all bytes"
+                    ))
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=collect_column_deletion_blob_blocks"));
             }
             block_id = header.next_block_id;
             offset = 0;
@@ -466,12 +531,15 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         Ok(())
     }
 
-    async fn read_raw(&self, blob_ref: BlobRef) -> Result<Vec<u8>> {
+    async fn read_raw(&self, blob_ref: BlobRef) -> RuntimeResult<Vec<u8>> {
         if blob_ref.start_block_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
-            return Err(invalid_payload(format!(
-                "invalid column deletion blob reference: start_block_id={}, byte_len={}",
-                blob_ref.start_block_id, blob_ref.byte_len
-            )));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "invalid column deletion blob reference: start_block_id={}, byte_len={}",
+                    blob_ref.start_block_id, blob_ref.byte_len
+                ))
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=read_column_deletion_blob"));
         }
         let file_kind = self.file_kind;
         let mut out = Vec::with_capacity(blob_ref.byte_len as usize);
@@ -489,26 +557,37 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     block_id,
                     validate_persisted_blob_page,
                 )
-                .await?;
+                .await
+                .change_context(RuntimeError::IndexAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=read_column_deletion_blob, file={file_kind}, block_id={block_id}"
+                    )
+                })?;
             let payload = validated_blob_page_payload(guard.page());
-            let header = decode_blob_page_header(payload).attach_with(|| {
-                format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
-            })?;
+            let header = decode_blob_page_header(payload)
+                .attach_with(|| {
+                    format!("file={file_kind}, block=column_deletion_blob, block_id={block_id}")
+                })
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=read_column_deletion_blob")?;
             let used_size = header.used_size as usize;
             if offset > used_size {
-                return Err(invalid_blob_payload(
-                    file_kind,
-                    block_id,
-                    format!("blob offset {offset} exceeds used size {used_size}"),
-                ));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob offset {offset} exceeds used size {used_size}"
+                    ))
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=read_column_deletion_blob"));
             }
             let available = used_size - offset;
             if available == 0 && remaining > 0 {
-                return Err(invalid_blob_payload(
-                    file_kind,
-                    block_id,
-                    "blob reference reaches empty page before reading all bytes",
-                ));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob reference reaches empty page before reading all bytes"
+                    ))
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=read_column_deletion_blob"));
             }
             let take = remaining.min(available);
             let body_start = COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE + offset;
@@ -519,11 +598,12 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                 break;
             }
             if header.next_block_id == SUPER_BLOCK_ID {
-                return Err(invalid_blob_payload(
-                    file_kind,
-                    block_id,
-                    "blob chain ended before reading all bytes",
-                ));
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "file={file_kind}, block=column_deletion_blob, block_id={block_id}, blob chain ended before reading all bytes"
+                    ))
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=read_column_deletion_blob"));
             }
             block_id = header.next_block_id;
             offset = 0;
@@ -550,15 +630,8 @@ pub(crate) fn validate_persisted_blob_page(
 }
 
 #[inline]
-fn column_deletion_blob_invariant() -> Error {
-    Report::new(InternalError::ColumnDeletionBlobInvariant).into()
-}
-
-#[inline]
-fn invalid_payload(message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(message.into())
-        .into()
+fn column_deletion_blob_invariant() -> Report<InternalError> {
+    Report::new(InternalError::ColumnDeletionBlobInvariant)
 }
 
 fn decode_blob_page_header(page: &[u8]) -> DataIntegrityResult<BlobPageHeader> {
@@ -566,42 +639,30 @@ fn decode_blob_page_header(page: &[u8]) -> DataIntegrityResult<BlobPageHeader> {
         page[COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET
             ..COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET + 8]
             .try_into()
-            .map_err(|_| invalid_blob_decode("invalid next-block-id width"))?,
+            .map_err(|_| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach("invalid next-block-id width")
+            })?,
     );
     let used_size = u16::from_le_bytes(
         page[COLUMN_DELETION_BLOB_USED_SIZE_OFFSET..COLUMN_DELETION_BLOB_USED_SIZE_OFFSET + 2]
             .try_into()
-            .map_err(|_| invalid_blob_decode("invalid used-size width"))?,
+            .map_err(|_| {
+                Report::new(DataIntegrityError::InvalidPayload).attach("invalid used-size width")
+            })?,
     );
     if used_size as usize > COLUMN_DELETION_BLOB_PAGE_BODY_SIZE {
-        return Err(invalid_blob_decode(format!(
-            "column deletion blob used_size {} exceeds page body size {}",
-            used_size, COLUMN_DELETION_BLOB_PAGE_BODY_SIZE
-        )));
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "column deletion blob used_size {} exceeds page body size {}",
+                used_size, COLUMN_DELETION_BLOB_PAGE_BODY_SIZE
+            )),
+        );
     }
     Ok(BlobPageHeader {
         next_block_id: BlockID::from(next_block_id),
         used_size,
     })
-}
-
-#[inline]
-fn invalid_blob_decode(message: impl Into<String>) -> Report<DataIntegrityError> {
-    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
-}
-
-#[inline]
-fn invalid_blob_payload(
-    file_kind: FileKind,
-    block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
-    let message = message.into();
-    Report::new(DataIntegrityError::InvalidPayload)
-        .attach(format!(
-            "file={file_kind}, block=column_deletion_blob, block_id={block_id}, {message}"
-        ))
-        .into()
 }
 
 #[inline]
@@ -616,7 +677,11 @@ fn validated_blob_page_payload(page: &[u8]) -> &[u8] {
     &page[payload_start..payload_end]
 }
 
-fn encode_blob_page_header(buf: &mut [u8], next_block_id: BlockID, used_size: usize) -> Result<()> {
+fn encode_blob_page_header(
+    buf: &mut [u8],
+    next_block_id: BlockID,
+    used_size: usize,
+) -> InternalResult<()> {
     if used_size > COLUMN_DELETION_BLOB_PAGE_BODY_SIZE {
         return Err(column_deletion_blob_invariant());
     }
@@ -669,10 +734,8 @@ mod tests {
         assert!(
             ColumnAuxBlobHeader::decode(&bytes)
                 .as_ref()
-                .is_err_and(
-                    |err| err.report().downcast_ref::<DataIntegrityError>().copied()
-                        == Some(DataIntegrityError::InvalidPayload)
-                )
+                .is_err_and(|err| err.downcast_ref::<DataIntegrityError>().copied()
+                    == Some(DataIntegrityError::InvalidPayload))
         );
     }
 

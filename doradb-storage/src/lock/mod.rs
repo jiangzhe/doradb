@@ -60,9 +60,18 @@ impl fmt::Display for LockResource {
     }
 }
 
-/// Logical lock mode.
+/// Mode accepted by the public explicit table-lock APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LockMode {
+pub enum TableLockMode {
+    /// Shared whole-table access.
+    Shared,
+    /// Exclusive whole-table access.
+    Exclusive,
+}
+
+/// Logical lock mode used inside the lock manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LockMode {
     /// Intention shared mode (`IS`) for table-data resources.
     IntentShared,
     /// Intention exclusive mode (`IX`) for table-data resources.
@@ -84,10 +93,13 @@ impl LockMode {
         }
     }
 
-    /// Validates that this mode can be used for `resource`.
+    /// Asserts that this mode can be used for `resource`.
     #[inline]
-    pub(crate) fn validate_for(self, resource: LockResource) -> OperationResult<()> {
-        validate_mode(resource, self)
+    fn assert_valid_for(self, resource: LockResource) {
+        assert!(
+            mode_is_valid(resource, self),
+            "lock mode/resource invariant violated: resource={resource}, mode={self}"
+        );
     }
 
     /// Returns whether this mode covers a request for `requested` on `resource`.
@@ -96,20 +108,20 @@ impl LockMode {
     /// decisions. `TableData(S)` and `TableData(IX)` are intentionally
     /// incomparable because the first phase does not introduce `SIX`.
     #[inline]
-    pub(crate) fn covers(self, resource: LockResource, requested: Self) -> OperationResult<bool> {
-        validate_mode(resource, self)?;
-        validate_mode(resource, requested)?;
-        Ok(mode_covers(resource, self, requested))
+    pub(crate) fn covers(self, resource: LockResource, requested: Self) -> bool {
+        self.assert_valid_for(resource);
+        requested.assert_valid_for(resource);
+        mode_covers(resource, self, requested)
     }
+}
 
-    /// Validates that this mode is allowed for explicit table-lock APIs.
+impl From<TableLockMode> for LockMode {
     #[inline]
-    pub(crate) fn validate_explicit_table_lock(self) -> OperationResult<()> {
-        if matches!(self, LockMode::Shared | LockMode::Exclusive) {
-            return Ok(());
+    fn from(mode: TableLockMode) -> Self {
+        match mode {
+            TableLockMode::Shared => LockMode::Shared,
+            TableLockMode::Exclusive => LockMode::Exclusive,
         }
-        Err(Report::new(OperationError::InvalidLockMode)
-            .attach(format!("explicit table lock mode={self}")))
     }
 }
 
@@ -426,7 +438,7 @@ impl LockManager {
         owner: LockOwner,
         owner_group: Option<LockOwnerGroup>,
     ) -> OperationResult<LockGrant> {
-        validate_mode(resource, mode)?;
+        mode.assert_valid_for(resource);
         let (waiter, waiter_guard, grant) = {
             // Reuse the non-blocking path first. If the request must wait,
             // enqueue the waiter while still holding the resource guard so a
@@ -625,6 +637,7 @@ impl LockManager {
         owner: LockOwner,
         requested: LockMode,
     ) -> bool {
+        requested.assert_valid_for(resource);
         self.resources
             .get(&resource)
             .and_then(|resource_state| resource_state.granted_mode(owner))
@@ -1082,15 +1095,6 @@ fn mark_waiters(waiters: &[Arc<Waiter>], outcome: WaitOutcome) {
 }
 
 #[inline]
-fn validate_mode(resource: LockResource, mode: LockMode) -> OperationResult<()> {
-    if mode_is_valid(resource, mode) {
-        return Ok(());
-    }
-    Err(Report::new(OperationError::InvalidLockMode)
-        .attach(format!("resource={resource}, mode={mode}")))
-}
-
-#[inline]
 fn mode_is_valid(resource: LockResource, mode: LockMode) -> bool {
     match resource {
         LockResource::TableMetadata(_) => {
@@ -1341,7 +1345,7 @@ pub(crate) mod tests {
         owner: LockOwner,
         owner_group: Option<LockOwnerGroup>,
     ) -> OperationResult<bool> {
-        validate_mode(resource, mode)?;
+        mode.assert_valid_for(resource);
         let mut resource_state = manager.resources.entry(resource).or_default();
         match resource_state.try_acquire_immediate(resource, mode, owner, owner_group)? {
             AcquireImmediate::Granted(_) => Ok(true),
@@ -1483,16 +1487,6 @@ pub(crate) mod tests {
     #[test]
     fn metadata_only_accepts_shared_and_exclusive() {
         let resource = table_metadata(TableID::new(1));
-        assert!(LockMode::Shared.validate_for(resource).is_ok());
-        assert!(LockMode::Exclusive.validate_for(resource).is_ok());
-        assert_operation_err(
-            LockMode::IntentShared.validate_for(resource),
-            OperationError::InvalidLockMode,
-        );
-        assert_operation_err(
-            LockMode::IntentExclusive.validate_for(resource),
-            OperationError::InvalidLockMode,
-        );
         assert!(modes_are_compatible(
             resource,
             LockMode::Shared,

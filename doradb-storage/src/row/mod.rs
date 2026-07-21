@@ -1948,7 +1948,7 @@ mod tests {
         let (index_no, indexed_metadata) = metadata
             .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
             .unwrap();
-        let dropped_metadata = indexed_metadata.try_without_index(index_no).unwrap();
+        let dropped_metadata = indexed_metadata.without_index(index_no);
 
         let row = page.row(0);
         assert_eq!(row.clone_vals(metadata.col.as_ref()), expected);

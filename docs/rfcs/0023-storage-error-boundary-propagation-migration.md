@@ -885,7 +885,7 @@ RFC. [D17], [D18]
     storage failures plus explicit neutral outcomes and own all foreground-
     versus-replay interpretation; row/index/table/catalog contain no
     unreviewed Internal producer or unannotated Generic fallback.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000230-stateful-storage-runtime-boundaries-and-semantic-consumers.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`

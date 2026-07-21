@@ -118,9 +118,8 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::VarByte => {
                         let offset_count = len.checked_add(1).ok_or_else(|| {
-                            invalid_compressed_payload_report(
-                                "LWC varbyte offset table length overflows usize",
-                            )
+                            Report::new(DataIntegrityError::InvalidPayload)
+                                .attach("LWC varbyte offset table length overflows usize")
                         })?;
                         let offset_bytes_len = checked_lwc_payload_len(
                             offset_count,
@@ -128,9 +127,8 @@ impl<'a> LwcData<'a> {
                             "LWC varbyte offset table",
                         )?;
                         if input.len() < offset_bytes_len {
-                            return Err(invalid_compressed_payload_report(
-                                "LWC varbyte payload is shorter than its offset table",
-                            ));
+                            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                                .attach("LWC varbyte payload is shorter than its offset table"));
                         }
                         let (offset_bytes, data) = input.split_at(offset_bytes_len);
                         let offsets = persisted_lwc_layout(
@@ -156,9 +154,11 @@ impl<'a> LwcData<'a> {
                             2 => LwcPrimitive::ForBp2I8(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I8(ForBitpacking4 { len, min, data }),
                             _ => {
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -170,9 +170,11 @@ impl<'a> LwcData<'a> {
                             2 => LwcPrimitive::ForBp2U8(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U8(ForBitpacking4 { len, min, data }),
                             _ => {
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -185,9 +187,11 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4I16(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I16(ForBitpacking8 { min, data }),
                             _ => {
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -200,9 +204,11 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4U16(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U16(ForBitpacking8 { min, data }),
                             _ => {
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -222,9 +228,11 @@ impl<'a> LwcData<'a> {
                                 LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
                             }
                             _ => {
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -244,9 +252,11 @@ impl<'a> LwcData<'a> {
                                 LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
                             }
                             _ => {
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -273,9 +283,11 @@ impl<'a> LwcData<'a> {
                                 LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
                             }
                             _ => {
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -303,16 +315,17 @@ impl<'a> LwcData<'a> {
                             }
                             _ => {
                                 // any other number of bits are not supported.
-                                return Err(invalid_compressed_payload_report(format!(
-                                    "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                )));
+                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
+                                    format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ),
+                                ));
                             }
                         }
                     }
                     ValKind::F32 | ValKind::F64 | ValKind::VarByte => {
-                        return Err(invalid_compressed_payload_report(format!(
-                            "unexpected type: val_kind={kind:?}"
-                        )));
+                        return Err(Report::new(DataIntegrityError::InvalidPayload)
+                            .attach(format!("unexpected type: val_kind={kind:?}")));
                     }
                 };
                 LwcData::Primitive(p)
@@ -435,9 +448,8 @@ impl LwcCode {
         match value {
             1 => Ok(LwcCode::Flat),
             3 => Ok(LwcCode::ForBitpacking),
-            _ => Err(invalid_compressed_payload_report(format!(
-                "invalid LWC code {value}"
-            ))),
+            _ => Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("invalid LWC code {value}"))),
         }
     }
 }
@@ -673,9 +685,8 @@ impl<'a> LwcPrimitiveSer<'a> {
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved new_bytes"))]
     pub(crate) fn new_bytes(offsets: &[u32], data: &[u8]) -> InternalResult<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
-            return Err(lwc_builder_misuse(
-                "LWC bytes offsets must be non-empty and start at zero",
-            ));
+            return Err(Report::new(InternalError::LwcBuilderMisuse)
+                .attach("LWC bytes offsets must be non-empty and start at zero"));
         }
         Ok(LwcPrimitiveSer::Bytes(LwcBytesSer {
             offsets: offsets.to_vec(),
@@ -687,9 +698,8 @@ impl<'a> LwcPrimitiveSer<'a> {
     #[inline]
     pub(crate) fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> InternalResult<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
-            return Err(lwc_builder_misuse(
-                "LWC bytes offsets must be non-empty and start at zero",
-            ));
+            return Err(Report::new(InternalError::LwcBuilderMisuse)
+                .attach("LWC bytes offsets must be non-empty and start at zero"));
         }
         Ok(LwcPrimitiveSer::Bytes(LwcBytesSer { offsets, data }))
     }
@@ -1470,9 +1480,8 @@ impl<'a> LwcNullBitmap<'a> {
         let (len, input) = read_le_u16(input)?;
         let len = len as usize;
         if input.len() < len {
-            return Err(invalid_compressed_payload_report(
-                "LWC null bitmap payload is shorter than declared length",
-            ));
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("LWC null bitmap payload is shorter than declared length"));
         }
         let (bytes, rest) = input.split_at(len);
         Ok((LwcNullBitmap { bytes }, rest))
@@ -1593,11 +1602,6 @@ impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
 impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
 
 #[inline]
-fn invalid_compressed_payload_report(message: impl Into<String>) -> Report<DataIntegrityError> {
-    Report::new(DataIntegrityError::InvalidPayload).attach(message.into())
-}
-
-#[inline]
 fn persisted_lwc_layout<T>(
     result: layout::LayoutResult<T>,
     field: &'static str,
@@ -1613,14 +1617,10 @@ fn lwc_block_encoding_contract() -> Report<InternalError> {
 }
 
 #[inline]
-fn lwc_builder_misuse(message: impl Into<String>) -> Report<InternalError> {
-    Report::new(InternalError::LwcBuilderMisuse).attach(message.into())
-}
-
-#[inline]
 fn lwc_payload_len_from_u64(len: u64, payload: &str) -> DataIntegrityResult<usize> {
     usize::try_from(len).map_err(|_| {
-        invalid_compressed_payload_report(format!("{payload} length exceeds usize::MAX"))
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("{payload} length exceeds usize::MAX"))
     })
 }
 
@@ -1631,7 +1631,8 @@ fn checked_lwc_payload_len(
     payload: &str,
 ) -> DataIntegrityResult<usize> {
     len.checked_mul(unit_len).ok_or_else(|| {
-        invalid_compressed_payload_report(format!("{payload} length overflows usize"))
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("{payload} length overflows usize"))
     })
 }
 
@@ -1642,9 +1643,11 @@ fn expect_exact_lwc_payload_len(
     payload: &str,
 ) -> DataIntegrityResult<()> {
     if actual_len != expected_len {
-        return Err(invalid_compressed_payload_report(format!(
-            "{payload} length mismatch: expected {expected_len}, actual {actual_len}"
-        )));
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "{payload} length mismatch: expected {expected_len}, actual {actual_len}"
+            )),
+        );
     }
     Ok(())
 }
@@ -1940,9 +1943,8 @@ fn estimate_bitpacked_size(range: u64, row_count: usize, unit: usize, flat: usiz
 #[inline]
 fn read_le_u64(input: &[u8]) -> DataIntegrityResult<(u64, &[u8])> {
     if input.len() < 8 {
-        return Err(invalid_compressed_payload_report(
-            "expected LWC little-endian u64",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("expected LWC little-endian u64"));
     }
     let u: [u8; 8] = input[..8].try_into().unwrap();
     let v = u64::from_le_bytes(u);
@@ -1952,9 +1954,8 @@ fn read_le_u64(input: &[u8]) -> DataIntegrityResult<(u64, &[u8])> {
 #[inline]
 fn read_le_u32(input: &[u8]) -> DataIntegrityResult<(u32, &[u8])> {
     if input.len() < 4 {
-        return Err(invalid_compressed_payload_report(
-            "expected LWC little-endian u32",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("expected LWC little-endian u32"));
     }
     let u: [u8; 4] = input[..4].try_into().unwrap();
     Ok((u32::from_le_bytes(u), &input[4..]))
@@ -1963,9 +1964,8 @@ fn read_le_u32(input: &[u8]) -> DataIntegrityResult<(u32, &[u8])> {
 #[inline]
 fn read_le_i32(input: &[u8]) -> DataIntegrityResult<(i32, &[u8])> {
     if input.len() < 4 {
-        return Err(invalid_compressed_payload_report(
-            "expected LWC little-endian i32",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("expected LWC little-endian i32"));
     }
     let u: [u8; 4] = input[..4].try_into().unwrap();
     Ok((i32::from_le_bytes(u), &input[4..]))
@@ -1974,9 +1974,8 @@ fn read_le_i32(input: &[u8]) -> DataIntegrityResult<(i32, &[u8])> {
 #[inline]
 fn read_le_u16(input: &[u8]) -> DataIntegrityResult<(u16, &[u8])> {
     if input.len() < 2 {
-        return Err(invalid_compressed_payload_report(
-            "expected LWC little-endian u16",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("expected LWC little-endian u16"));
     }
     let u: [u8; 2] = input[..2].try_into().unwrap();
     Ok((u16::from_le_bytes(u), &input[2..]))
@@ -1985,9 +1984,8 @@ fn read_le_u16(input: &[u8]) -> DataIntegrityResult<(u16, &[u8])> {
 #[inline]
 fn read_le_i16(input: &[u8]) -> DataIntegrityResult<(i16, &[u8])> {
     if input.len() < 2 {
-        return Err(invalid_compressed_payload_report(
-            "expected LWC little-endian i16",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("expected LWC little-endian i16"));
     }
     let u: [u8; 2] = input[..2].try_into().unwrap();
     Ok((i16::from_le_bytes(u), &input[2..]))
@@ -1996,9 +1994,8 @@ fn read_le_i16(input: &[u8]) -> DataIntegrityResult<(i16, &[u8])> {
 #[inline]
 fn read_le_i64(input: &[u8]) -> DataIntegrityResult<(i64, &[u8])> {
     if input.len() < 8 {
-        return Err(invalid_compressed_payload_report(
-            "expected LWC little-endian i64",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("expected LWC little-endian i64"));
     }
     let u: [u8; 8] = input[..8].try_into().unwrap();
     Ok((i64::from_le_bytes(u), &input[8..]))
@@ -2007,7 +2004,7 @@ fn read_le_i64(input: &[u8]) -> DataIntegrityResult<(i64, &[u8])> {
 #[inline]
 fn read_u8(input: &[u8]) -> DataIntegrityResult<(u8, &[u8])> {
     if input.is_empty() {
-        return Err(invalid_compressed_payload_report("expected LWC u8"));
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach("expected LWC u8"));
     }
     let v = input[0];
     Ok((v, &input[1..]))
@@ -2016,7 +2013,7 @@ fn read_u8(input: &[u8]) -> DataIntegrityResult<(u8, &[u8])> {
 #[inline]
 fn read_i8(input: &[u8]) -> DataIntegrityResult<(i8, &[u8])> {
     if input.is_empty() {
-        return Err(invalid_compressed_payload_report("expected LWC i8"));
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach("expected LWC i8"));
     }
     let v = input[0] as i8;
     Ok((v, &input[1..]))

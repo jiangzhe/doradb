@@ -2,8 +2,8 @@ use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot};
 use crate::error::{
-    CompletionResult, DataIntegrityResult, Error, FileKind, InternalError, IoResult, ResourceError,
-    ResourceResult, Result, RuntimeResult,
+    CompletionResult, DataIntegrityResult, FileKind, InternalError, InternalResult, IoResult,
+    ResourceError, ResourceResult, RuntimeError, RuntimeResult,
 };
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -225,13 +225,13 @@ impl MultiTableFile {
 
     /// Returns active-root snapshot from in-memory pointer without additional IO.
     #[inline]
-    pub(crate) fn load_snapshot(&self) -> Result<MultiTableFileSnapshot> {
+    pub(crate) fn load_snapshot(&self) -> MultiTableFileSnapshot {
         let active_root = self.active_root_unchecked();
-        Ok(MultiTableFileSnapshot {
+        MultiTableFileSnapshot {
             catalog_replay_start_ts: active_root.root_ts,
             meta_block_id: active_root.meta_block_id,
             meta: active_root.meta.clone(),
-        })
+        }
     }
 
     /// Returns this file's storage kind for validation and cache identity.
@@ -321,25 +321,31 @@ impl MutableMultiTableFile {
         catalog_replay_start_ts: TrxID,
         next_table_id: TableID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
-    ) -> Result<()> {
+    ) -> InternalResult<()> {
         let root = &mut self.new_root.root;
         if catalog_replay_start_ts < root.root_ts {
-            return Err(mutable_root_metadata_regression(format!(
-                "catalog replay start regressed: current={}, new={catalog_replay_start_ts}",
-                root.root_ts
-            )));
+            return Err(
+                Report::new(InternalError::MutableRootMetadataRegression).attach(format!(
+                    "catalog replay start regressed: current={}, new={catalog_replay_start_ts}",
+                    root.root_ts
+                )),
+            );
         }
         if next_table_id > USER_TABLE_ID_LIMIT {
-            return Err(catalog_root_descriptor_invariant(format!(
-                "next_table_id={next_table_id}, user_table_id_limit={USER_TABLE_ID_LIMIT}"
-            )));
+            return Err(
+                Report::new(InternalError::CatalogRootDescriptorInvariant).attach(format!(
+                    "next_table_id={next_table_id}, user_table_id_limit={USER_TABLE_ID_LIMIT}"
+                )),
+            );
         }
         for root in &table_roots {
             if root.root_block_id.is_none() && root.pivot_row_id != RowID::new(0) {
-                return Err(catalog_root_descriptor_invariant(format!(
-                    "table_id={}, root block missing but pivot_row_id={}",
-                    root.table_id, root.pivot_row_id
-                )));
+                return Err(
+                    Report::new(InternalError::CatalogRootDescriptorInvariant).attach(format!(
+                        "table_id={}, root block missing but pivot_row_id={}",
+                        root.table_id, root.pivot_row_id
+                    )),
+                );
             }
         }
 
@@ -351,13 +357,13 @@ impl MutableMultiTableFile {
 
     /// Apply a first-retained redo marker to the mutable catalog root.
     #[inline]
-    pub(crate) fn apply_first_redo_log_seq(&mut self, first_redo_log_seq: u32) -> Result<bool> {
+    pub(crate) fn apply_first_redo_log_seq(&mut self, first_redo_log_seq: u32) -> bool {
         let root = &mut self.new_root.root;
         if first_redo_log_seq <= root.first_redo_log_seq {
-            return Ok(false);
+            return false;
         }
         root.first_redo_log_seq = first_redo_log_seq;
-        Ok(true)
+        true
     }
 
     /// Returns immutable reference to the mutable catalog root snapshot.
@@ -368,10 +374,9 @@ impl MutableMultiTableFile {
 
     /// Reserve the final meta block for a catalog checkpoint publication.
     #[inline]
-    pub(crate) fn reserve_publish_meta_block(&mut self) -> Result<BlockID> {
-        Ok(self
-            .new_root
-            .reserve_publish_meta_block("multi-table publish root could not allocate meta block")?)
+    pub(crate) fn reserve_publish_meta_block(&mut self) -> ResourceResult<BlockID> {
+        self.new_root
+            .reserve_publish_meta_block("multi-table publish root could not allocate meta block")
     }
 
     /// Reserve the final meta block and clear the displaced active meta block.
@@ -384,8 +389,11 @@ impl MutableMultiTableFile {
     pub(crate) fn reserve_publish_meta_block_reclaiming_displaced_meta(
         &mut self,
         displaced_meta_block_id: BlockID,
-    ) -> Result<BlockID> {
-        let meta_block_id = self.reserve_publish_meta_block()?;
+    ) -> RuntimeResult<BlockID> {
+        let meta_block_id = self
+            .reserve_publish_meta_block()
+            .change_context(RuntimeError::FileRootAccess)
+            .attach("operation=reserve_catalog_publish_meta_block")?;
         if displaced_meta_block_id == SUPER_BLOCK_ID {
             return Ok(meta_block_id);
         }
@@ -394,7 +402,8 @@ impl MutableMultiTableFile {
                 .attach(format!(
                     "displaced meta block matches publish meta block: block_id={meta_block_id}"
                 ))
-                .into());
+                .change_context(RuntimeError::FileRootAccess)
+                .attach("operation=reclaim_displaced_catalog_meta_block"));
         }
         let displaced_meta_idx = usize::from(displaced_meta_block_id);
         if displaced_meta_idx >= self.new_root.root.alloc_map.len()
@@ -405,7 +414,8 @@ impl MutableMultiTableFile {
                     "displaced meta block is not allocated: block_id={displaced_meta_block_id}, alloc_map_len={}",
                     self.new_root.root.alloc_map.len()
                 ))
-                .into());
+                .change_context(RuntimeError::FileRootAccess)
+                .attach("operation=reclaim_displaced_catalog_meta_block"));
         }
         Ok(meta_block_id)
     }
@@ -417,8 +427,8 @@ impl MutableMultiTableFile {
     pub(crate) fn rebuild_alloc_map_from_reachable(
         &mut self,
         reachable: &BTreeSet<BlockID>,
-    ) -> Result<usize> {
-        Ok(self.new_root.rebuild_alloc_map_from_reachable(reachable)?)
+    ) -> InternalResult<usize> {
+        self.new_root.rebuild_alloc_map_from_reachable(reachable)
     }
 
     /// Commit mutable root by writing meta block then ping-pong super block.
@@ -489,20 +499,6 @@ impl MutableCowFile for MutableMultiTableFile {
 
 /// Guard object for reclaimed replaced roots of `catalog.mtb`.
 pub(crate) type OldMultiTableRoot = OldCowRoot<MultiTableMetaBlock>;
-
-#[inline]
-fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
-    Report::new(InternalError::MutableRootMetadataRegression)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
-    Report::new(InternalError::CatalogRootDescriptorInvariant)
-        .attach(message.into())
-        .into()
-}
 
 #[inline]
 fn parse_multi_table_super_block(buf: &[u8]) -> DataIntegrityResult<SuperBlock> {
@@ -617,7 +613,7 @@ fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID
 mod tests {
     use super::*;
     use crate::buffer::global_readonly_pool_scope;
-    use crate::error::{DataIntegrityError, Error, ErrorKind, RuntimeError};
+    use crate::error::{DataIntegrityError, InternalError, Result, RuntimeError};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::test_block_id;
     use crate::file::{build_test_fs, build_test_fs_in};
@@ -638,17 +634,16 @@ mod tests {
     }
 
     fn assert_multi_table_meta_corruption(
-        err: Error,
+        err: Report<RuntimeError>,
         page_id: BlockID,
         expected: DataIntegrityError,
     ) {
-        assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
+            err.downcast_ref::<RuntimeError>().copied(),
             Some(RuntimeError::FileRootAccess)
         );
         assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            err.downcast_ref::<DataIntegrityError>().copied(),
             Some(expected)
         );
         let report = format!("{err:?}");
@@ -672,12 +667,44 @@ mod tests {
         drop(old_root);
     }
 
+    #[test]
+    fn test_reclaim_displaced_meta_retains_internal_source() {
+        smol::block_on(async {
+            let (_dir, fs) = build_test_fs();
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let mtb = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
+            let displaced_meta_block_id = (1..mtb.active_root_unchecked().alloc_map.len())
+                .rev()
+                .map(BlockID::from)
+                .find(|block_id| {
+                    !mtb.active_root_unchecked()
+                        .alloc_map
+                        .is_allocated(usize::from(*block_id))
+                })
+                .unwrap();
+            let mut mutable = MutableMultiTableFile::fork(&mtb, fs.background_writes());
+
+            let err = mutable
+                .reserve_publish_meta_block_reclaiming_displaced_meta(displaced_meta_block_id)
+                .unwrap_err();
+
+            assert_eq!(*err.current_context(), RuntimeError::FileRootAccess);
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::CowFileAllocationInvariant)
+            );
+        });
+    }
+
     pub(crate) async fn publish_first_redo_log_seq_for_test(
         mtb: &Arc<MultiTableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
         first_redo_log_seq: u32,
     ) -> Result<()> {
-        let snapshot = mtb.load_snapshot()?;
+        let snapshot = mtb.load_snapshot();
         let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
         mutable.apply_checkpoint_metadata(
             snapshot.catalog_replay_start_ts,
@@ -703,7 +730,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let s0 = mtb.load_snapshot().unwrap();
+            let s0 = mtb.load_snapshot();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_table_id, USER_TABLE_ID_START);
             assert_eq!(s0.meta.first_redo_log_seq, 0);
@@ -732,7 +759,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let s1 = mtb2.load_snapshot().unwrap();
+            let s1 = mtb2.load_snapshot();
             assert_eq!(s1.catalog_replay_start_ts, TrxID::new(7));
             assert_eq!(s1.meta.next_table_id, USER_TABLE_ID_START + 16);
             assert_eq!(s1.meta.first_redo_log_seq, 0);
@@ -758,7 +785,7 @@ mod tests {
             publish_first_redo_log_seq_for_test(&mtb, background_writes, 3)
                 .await
                 .unwrap();
-            let marker_snapshot = mtb.load_snapshot().unwrap();
+            let marker_snapshot = mtb.load_snapshot();
             assert_eq!(marker_snapshot.meta.first_redo_log_seq, 3);
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
@@ -773,7 +800,7 @@ mod tests {
                 roots,
             )
             .await;
-            let updated_snapshot = mtb.load_snapshot().unwrap();
+            let updated_snapshot = mtb.load_snapshot();
             assert_eq!(updated_snapshot.catalog_replay_start_ts, TrxID::new(8));
             assert_eq!(updated_snapshot.meta.first_redo_log_seq, 3);
             drop(mtb);
@@ -784,7 +811,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let reloaded = mtb.load_snapshot().unwrap();
+            let reloaded = mtb.load_snapshot();
             assert_eq!(reloaded.catalog_replay_start_ts, TrxID::new(8));
             assert_eq!(reloaded.meta.first_redo_log_seq, 3);
         });
@@ -965,7 +992,7 @@ mod tests {
                 roots_v1,
             )
             .await;
-            let older_snapshot = mtb.load_snapshot().unwrap();
+            let older_snapshot = mtb.load_snapshot();
 
             let mut roots_v2 = roots_v1;
             roots_v2[0].root_block_id = NonZeroU64::new(99);
@@ -991,7 +1018,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let snapshot = mtb.load_snapshot().unwrap();
+            let snapshot = mtb.load_snapshot();
             assert_eq!(
                 snapshot.catalog_replay_start_ts,
                 older_snapshot.catalog_replay_start_ts

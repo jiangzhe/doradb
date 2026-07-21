@@ -2,7 +2,11 @@ use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableObject, is_user_table};
 use crate::engine::EngineRef;
-use crate::error::{ConfigError, Error, FatalError, InternalError, OperationError, Result};
+use crate::error::{
+    FatalError, FatalResult, InternalError, InternalResult, IoResult, OperationError,
+    OperationOrRuntimeResult, OperationResult, Result, RuntimeError, RuntimeOrFatalError,
+    RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::id::{TableID, TrxID};
 use crate::index::BlockIndex;
@@ -113,7 +117,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn publish_file(&mut self, engine: &EngineRef) -> Result<()> {
+    async fn publish_file(&mut self, engine: &EngineRef) -> RuntimeResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::CatalogStaged);
         let root_ts = self
             .trx
@@ -127,14 +131,25 @@ impl CreateTableProgress {
         let table_file = engine
             .trx_sys
             .publish_table_file_root(mutable_file, root_ts, true)
-            .await?;
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=create_table, phase=publish_file, table_id={}",
+                    self.table_id
+                )
+            })?;
         self.table_file = Some(table_file);
         self.phase = CreateTablePhase::FilePublished;
         Ok(())
     }
 
     #[inline]
-    async fn build_runtime(&mut self, guards: &PoolGuards, engine: &EngineRef) -> Result<()> {
+    async fn build_runtime(
+        &mut self,
+        guards: &PoolGuards,
+        engine: &EngineRef,
+    ) -> RuntimeResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::FilePublished);
         let table_file = Arc::clone(
             self.table_file
@@ -148,7 +163,14 @@ impl CreateTableProgress {
             active_root.pivot_row_id,
             active_root.column_block_index_root,
         )
-        .await?;
+        .await
+        .change_context(RuntimeError::CatalogAccess)
+        .attach_with(|| {
+            format!(
+                "operation=create_table, phase=build_block_index, table_id={}",
+                self.table_id
+            )
+        })?;
         let table = Arc::new(
             Table::new(
                 engine.mem_pool.clone_inner(),
@@ -159,7 +181,14 @@ impl CreateTableProgress {
                 table_file,
                 engine.disk_pool.clone_inner(),
             )
-            .await?,
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=create_table, phase=build_runtime, table_id={}",
+                    self.table_id
+                )
+            })?,
         );
         self.staged_table = Some(table);
         self.phase = CreateTablePhase::RuntimeBuilt;
@@ -167,33 +196,34 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn commit_catalog(&mut self) -> Result<()> {
+    async fn commit_catalog(&mut self) -> RuntimeOrFatalResult<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::RuntimeBuilt);
         let trx = self
             .trx
             .take()
             .expect("catalog transaction is present before commit");
-        trx.commit().await?;
+        trx.commit_catalog_ddl().await?;
         self.phase = CreateTablePhase::CatalogCommitted;
         Ok(())
     }
 
     #[inline]
-    fn install_runtime(&mut self, engine: &EngineRef) -> Result<()> {
+    fn install_runtime(&mut self, engine: &EngineRef) {
         debug_assert_eq!(self.phase, CreateTablePhase::CatalogCommitted);
         let table = Arc::clone(
             self.staged_table
                 .as_ref()
                 .expect("staged table runtime is present before install"),
         );
-        engine.catalog().insert_user_table(table)?;
+        // The table id was atomically allocated and this DDL owns the metadata
+        // gate through commit, so no cache entry can exist for this runtime.
+        engine.catalog().insert_user_table(table);
         let _ = self.staged_table.take();
         self.phase = CreateTablePhase::Installed;
-        Ok(())
     }
 
     #[inline]
-    fn delete_provisional_file(&mut self, engine: &EngineRef) -> Result<()> {
+    fn delete_provisional_file(&mut self, engine: &EngineRef) -> IoResult<()> {
         if let Some(mutable_file) = self.mutable_file.take() {
             let _ = mutable_file.try_delete();
         }
@@ -201,17 +231,17 @@ impl CreateTableProgress {
         engine.table_fs.delete_user_table_file(self.table_id)
     }
 
-    async fn destroy_staged_runtime(&mut self, guards: &PoolGuards) -> Result<()> {
+    async fn destroy_staged_runtime(&mut self, guards: &PoolGuards) -> RuntimeResult<()> {
         let Some(table) = self.staged_table.take() else {
             return Ok(());
         };
-        let table = Arc::try_unwrap(table).map_err(|table| {
-            Report::new(InternalError::Generic).attach(format!(
+        let table = Arc::try_unwrap(table).unwrap_or_else(|table| {
+            panic!(
                 "staged create-table runtime still referenced during cleanup: table_id={}, strong_count={}",
                 self.table_id,
                 Arc::strong_count(&table)
-            ))
-        })?;
+            )
+        });
         table.close_checkpoint_workflow_offline();
         table.destroy_dropped_runtime(guards).await
     }
@@ -221,49 +251,49 @@ impl CreateTableProgress {
         engine: &EngineRef,
         guards: &PoolGuards,
         operation: &'static str,
-        source: Error,
-    ) -> Error {
+        source: Report<RuntimeError>,
+    ) -> RuntimeOrFatalError {
         let source_debug = format!("{source:?}");
         let mut cleanup_error = None;
         if let Err(err) = self.destroy_staged_runtime(guards).await {
-            cleanup_error = Some(
-                poison_error_source(
-                    engine,
-                    err,
-                    FatalError::Poisoned,
-                    format!(
-                        "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy, source_error={source_debug}",
-                        self.table_id
-                    ),
-                )
-                .into(),
-            );
+            cleanup_error = Some(poison_error_source(
+                engine,
+                RuntimeOrFatalError::from(err),
+                FatalError::Poisoned,
+                format!(
+                    "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy, source_error={source_debug}",
+                    self.table_id
+                ),
+            ));
         }
         if let Some(trx) = self.trx.take()
             && trx.engine().is_some()
-            && let Err(err) = trx.rollback().await
+            && let Err(err) = trx.rollback_catalog_ddl().await
             && cleanup_error.is_none()
         {
-            cleanup_error = Some(
-                poison_error_source(
-                    engine,
-                    err,
-                    FatalError::RollbackAccess,
-                    format!(
-                        "create table rollback cleanup failed: table_id={}, operation={operation}, source_error={source_debug}",
-                        self.table_id
-                    ),
-                )
-                .into(),
-            );
+            cleanup_error = Some(poison_error_source(
+                engine,
+                err,
+                FatalError::RollbackAccess,
+                format!(
+                    "create table rollback cleanup failed: table_id={}, operation={operation}, source_error={source_debug}",
+                    self.table_id
+                ),
+            ));
         }
         if let Err(err) = self.delete_provisional_file(engine)
             && cleanup_error.is_none()
         {
-            cleanup_error = Some(err);
+            cleanup_error = Some(RuntimeOrFatalError::from(
+                err.change_context(RuntimeError::CatalogAccess)
+                    .attach(format!(
+                        "operation=create_table, phase=delete_provisional_file, table_id={}",
+                        self.table_id
+                    )),
+            ));
         }
         self.phase = CreateTablePhase::Aborted;
-        cleanup_error.unwrap_or(source)
+        cleanup_error.unwrap_or_else(|| RuntimeOrFatalError::from(source))
     }
 
     async fn abort_after_root_publish_commit_error(
@@ -271,21 +301,20 @@ impl CreateTableProgress {
         engine: &EngineRef,
         guards: &PoolGuards,
         operation: &'static str,
-        source: Error,
-    ) -> Error {
+        source: RuntimeOrFatalError,
+    ) -> RuntimeOrFatalError {
         let source_debug = format!("{source:?}");
         if let Err(err) = self.destroy_staged_runtime(guards).await {
             self.phase = CreateTablePhase::Aborted;
             return poison_error_source(
                 engine,
-                err,
+                RuntimeOrFatalError::from(err),
                 FatalError::Poisoned,
                 format!(
                     "create table cleanup failed: table_id={}, operation={operation}, cleanup_operation=runtime_destroy_after_root_publish, source_error={source_debug}",
                     self.table_id
                 ),
-            )
-            .into();
+            );
         }
         self.phase = CreateTablePhase::Aborted;
         poison_error_source(
@@ -297,7 +326,6 @@ impl CreateTableProgress {
                 self.table_id
             ),
         )
-        .into()
     }
 }
 
@@ -326,20 +354,19 @@ impl IndexSpecs {
         next_index_no: IndexNo,
         active_index_specs: Vec<ActiveIndexSpec>,
         col_count: usize,
-    ) -> Result<Self> {
+    ) -> OperationResult<Self> {
         let mut slots = vec![None; next_index_no as usize];
         let mut active_count = 0usize;
         for active_index_spec in active_index_specs {
             let index_no = active_index_spec.index_no as usize;
             if index_no >= next_index_no as usize {
-                return Err(invalid_table_metadata(format!(
+                return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
                     "index_no {index_no} must be less than next_index_no {next_index_no}"
                 )));
             }
             if slots[index_no].is_some() {
-                return Err(invalid_table_metadata(format!(
-                    "duplicate index_no {index_no}"
-                )));
+                return Err(Report::new(OperationError::InvalidMetadata)
+                    .attach(format!("duplicate index_no {index_no}")));
             }
             validate_index_spec(index_no, &active_index_spec.spec, col_count)?;
             slots[index_no] = Some(active_index_spec.spec);
@@ -423,11 +450,10 @@ pub(crate) struct TableColumnLayout {
 impl TableColumnLayout {
     /// Try to create a physical column layout from column specifications.
     #[inline]
-    pub(crate) fn try_new(column_specs: Vec<ColumnSpec>) -> Result<Self> {
+    pub(crate) fn try_new(column_specs: Vec<ColumnSpec>) -> OperationResult<Self> {
         if column_specs.is_empty() {
-            return Err(invalid_table_metadata(
-                "table column layout requires columns",
-            ));
+            return Err(Report::new(OperationError::InvalidMetadata)
+                .attach("table column layout requires columns"));
         }
         let col_names: Vec<_> = column_specs.iter().map(|c| c.column_name.clone()).collect();
         let col_attrs: Vec<_> = column_specs.iter().map(|c| c.column_attributes).collect();
@@ -449,14 +475,13 @@ impl TableColumnLayout {
         col_names: Vec<SemiStr>,
         col_types: Vec<ValType>,
         col_attrs: Vec<ColumnAttributes>,
-    ) -> Result<Self> {
+    ) -> OperationResult<Self> {
         if col_names.is_empty() || col_types.is_empty() || col_attrs.is_empty() {
-            return Err(invalid_table_metadata(
-                "table column layout requires columns",
-            ));
+            return Err(Report::new(OperationError::InvalidMetadata)
+                .attach("table column layout requires columns"));
         }
         if col_names.len() != col_types.len() || col_names.len() != col_attrs.len() {
-            return Err(invalid_table_metadata(format!(
+            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
                 "column metadata length mismatch: names={}, types={}, attrs={}",
                 col_names.len(),
                 col_types.len(),
@@ -469,7 +494,7 @@ impl TableColumnLayout {
             let type_nullable = col_type.nullable;
             let attr_nullable = col_attr.contains(ColumnAttributes::NULLABLE);
             if type_nullable != attr_nullable {
-                return Err(invalid_table_metadata(format!(
+                return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
                     "column nullability metadata mismatch: column_index={idx}, column_name={}, type_nullable={type_nullable}, attr_nullable={attr_nullable}",
                     col_name.as_str()
                 )));
@@ -596,7 +621,7 @@ impl TableIndexLayout {
         column_layout: &TableColumnLayout,
         index_specs: Vec<ActiveIndexSpec>,
         next_index_no: IndexNo,
-    ) -> Result<Self> {
+    ) -> OperationResult<Self> {
         let index_specs =
             IndexSpecs::try_from_active(next_index_no, index_specs, column_layout.col_count())?;
         validate_primary_key_contract(column_layout, &index_specs)?;
@@ -626,12 +651,12 @@ impl TableIndexLayout {
         &self,
         column_layout: &TableColumnLayout,
         index_spec: IndexSpec,
-    ) -> Result<(IndexNo, Self)> {
+    ) -> OperationResult<(IndexNo, Self)> {
         let index_no = self.next_index_no;
         validate_index_spec(index_no as usize, &index_spec, column_layout.col_count())?;
-        let next_index_no = index_no
-            .checked_add(1)
-            .ok_or_else(|| invalid_index_spec("next_index_no overflow"))?;
+        let next_index_no = index_no.checked_add(1).ok_or_else(|| {
+            Report::new(OperationError::InvalidMetadata).attach("next_index_no overflow")
+        })?;
         let mut index_specs = self
             .active_indexes()
             .map(|(index_no, spec)| ActiveIndexSpec::new(index_no as IndexNo, spec.clone()))
@@ -643,24 +668,18 @@ impl TableIndexLayout {
 
     /// Returns an index layout with one active index slot made inactive.
     #[inline]
-    fn try_without_index(
-        &self,
-        column_layout: &TableColumnLayout,
-        index_no: IndexNo,
-    ) -> Result<Self> {
+    fn without_index(&self, column_layout: &TableColumnLayout, index_no: IndexNo) -> Self {
         let index_no_usize = usize::from(index_no);
-        if index_no_usize >= self.index_slot_count() {
-            return Err(index_not_found(format!(
-                "drop index out of range: index_no={index_no}, next_index_no={}",
-                self.next_index_no
-            )));
-        }
-        if self.index_spec(index_no_usize).is_none() {
-            return Err(index_not_found(format!(
-                "drop index inactive slot: index_no={index_no}, next_index_no={}",
-                self.next_index_no
-            )));
-        }
+        assert!(
+            index_no_usize < self.index_slot_count(),
+            "drop-index metadata invariant violated: index_no={index_no}, next_index_no={}",
+            self.next_index_no
+        );
+        assert!(
+            self.index_spec(index_no_usize).is_some(),
+            "drop-index metadata invariant violated: inactive index_no={index_no}, next_index_no={}",
+            self.next_index_no
+        );
 
         let index_specs = self
             .active_indexes()
@@ -669,7 +688,12 @@ impl TableIndexLayout {
                 ActiveIndexSpec::new(active_index_no as IndexNo, spec.clone())
             })
             .collect::<Vec<_>>();
-        Self::try_create(column_layout, index_specs, self.next_index_no)
+        Self::try_create(column_layout, index_specs, self.next_index_no).unwrap_or_else(|err| {
+            panic!(
+                "drop-index metadata rebuild invariant violated: index_no={index_no}, next_index_no={}, error={err:?}",
+                self.next_index_no
+            )
+        })
     }
 
     /// Returns the sparse secondary-index slot count.
@@ -698,14 +722,12 @@ impl TableIndexLayout {
 
     /// Requires one active secondary-index spec by stable index number.
     #[inline]
-    pub(crate) fn require_index_spec(&self, index_no: usize) -> Result<&IndexSpec> {
+    pub(crate) fn require_index_spec(&self, index_no: usize) -> InternalResult<&IndexSpec> {
         self.index_spec(index_no).ok_or_else(|| {
-            Report::new(InternalError::SecondaryIndexOutOfBounds)
-                .attach(format!(
-                    "index_no={index_no}, index_slot_count={}",
-                    self.index_slot_count()
-                ))
-                .into()
+            Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
+                "index_no={index_no}, index_slot_count={}",
+                self.index_slot_count()
+            ))
         })
     }
 
@@ -879,9 +901,10 @@ impl TableMetadata {
     pub(crate) fn try_new(
         column_specs: Vec<ColumnSpec>,
         index_specs: Vec<IndexSpec>,
-    ) -> Result<Self> {
+    ) -> OperationResult<Self> {
         let next_index_no = IndexNo::try_from(index_specs.len()).map_err(|_| {
-            invalid_table_metadata("next_index_no overflow while deriving table metadata")
+            Report::new(OperationError::InvalidMetadata)
+                .attach("next_index_no overflow while deriving table metadata")
         })?;
         let col_count = column_specs.len();
         let active_index_specs = index_specs
@@ -893,7 +916,7 @@ impl TableMetadata {
                 }
                 Ok(ActiveIndexSpec::new(index_no as IndexNo, spec))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<OperationResult<Vec<_>>>()?;
         Self::try_new_with_next_index_no(column_specs, active_index_specs, next_index_no)
     }
 
@@ -903,7 +926,7 @@ impl TableMetadata {
         column_specs: Vec<ColumnSpec>,
         index_specs: Vec<ActiveIndexSpec>,
         next_index_no: IndexNo,
-    ) -> Result<Self> {
+    ) -> OperationResult<Self> {
         let column_layout = Arc::new(TableColumnLayout::try_new(column_specs)?);
         let index_layout =
             TableIndexLayout::try_create(&column_layout, index_specs, next_index_no)?;
@@ -911,6 +934,22 @@ impl TableMetadata {
             col: column_layout,
             idx: index_layout,
         })
+    }
+
+    /// Reconstructs metadata previously validated and persisted by the engine.
+    #[inline]
+    pub(crate) fn from_persisted_parts(
+        column_specs: Vec<ColumnSpec>,
+        index_specs: Vec<ActiveIndexSpec>,
+        next_index_no: IndexNo,
+    ) -> Self {
+        Self::try_new_with_next_index_no(column_specs, index_specs, next_index_no).unwrap_or_else(
+            |err| {
+                panic!(
+                    "persisted table metadata invariant violated: next_index_no={next_index_no}, error={err:?}"
+                )
+            },
+        )
     }
 
     /// Returns the primary-key metadata view when this table has one.
@@ -932,7 +971,7 @@ impl TableMetadata {
         col_attrs: Vec<ColumnAttributes>,
         index_specs: Vec<ActiveIndexSpec>,
         next_index_no: IndexNo,
-    ) -> Result<Self> {
+    ) -> OperationResult<Self> {
         let column_layout = Arc::new(TableColumnLayout::try_create(
             col_names, col_types, col_attrs,
         )?);
@@ -947,7 +986,10 @@ impl TableMetadata {
     /// Allocates the next table-local index number and returns metadata with
     /// the new active index appended in the corresponding sparse slot.
     #[inline]
-    pub(crate) fn try_with_created_index(&self, index_spec: IndexSpec) -> Result<(IndexNo, Self)> {
+    pub(crate) fn try_with_created_index(
+        &self,
+        index_spec: IndexSpec,
+    ) -> OperationResult<(IndexNo, Self)> {
         let (index_no, index_layout) = self.idx.try_with_created_index(&self.col, index_spec)?;
         let metadata = Self {
             col: Arc::clone(&self.col),
@@ -958,26 +1000,12 @@ impl TableMetadata {
 
     /// Returns metadata with one active index slot made inactive.
     #[inline]
-    pub(crate) fn try_without_index(&self, index_no: IndexNo) -> Result<Self> {
-        let index_no_usize = usize::from(index_no);
-        if index_no_usize >= self.idx.index_slot_count() {
-            return Err(index_not_found(format!(
-                "drop index out of range: index_no={index_no}, next_index_no={}",
-                self.idx.next_index_no()
-            )));
-        }
-        if self.idx.index_spec(index_no_usize).is_none() {
-            return Err(index_not_found(format!(
-                "drop index inactive slot: index_no={index_no}, next_index_no={}",
-                self.idx.next_index_no()
-            )));
-        }
-
-        let index_layout = self.idx.try_without_index(&self.col, index_no)?;
-        Ok(Self {
+    pub(crate) fn without_index(&self, index_no: IndexNo) -> Self {
+        let index_layout = self.idx.without_index(&self.col, index_no);
+        Self {
             col: Arc::clone(&self.col),
             idx: index_layout,
-        })
+        }
     }
 
     /// Create a view for serialization.
@@ -993,11 +1021,9 @@ impl TableMetadata {
     }
 }
 
-impl TryFrom<TableBriefMetadata> for TableMetadata {
-    type Error = Error;
-
+impl From<TableBriefMetadata> for TableMetadata {
     #[inline]
-    fn try_from(value: TableBriefMetadata) -> Result<Self> {
+    fn from(value: TableBriefMetadata) -> Self {
         TableMetadata::try_create(
             value.col_names,
             value.col_types,
@@ -1005,6 +1031,12 @@ impl TryFrom<TableBriefMetadata> for TableMetadata {
             value.index_specs,
             value.next_index_no,
         )
+        .unwrap_or_else(|err| {
+            panic!(
+                "persisted table-file metadata invariant violated: next_index_no={}, error={err:?}",
+                value.next_index_no
+            )
+        })
     }
 }
 
@@ -1181,7 +1213,8 @@ pub(crate) async fn create_table_for_session(
     if let Err(err) = exec_res {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "catalog_staging", err)
-            .await);
+            .await
+            .into());
     }
     progress.mark_catalog_staged();
 
@@ -1189,33 +1222,38 @@ pub(crate) async fn create_table_for_session(
     if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterCatalogStaged) {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "test_after_catalog_staging", err)
-            .await);
+            .await
+            .into());
     }
 
     if let Err(err) = progress.publish_file(&engine).await {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "file_publish", err)
-            .await);
+            .await
+            .into());
     }
 
     #[cfg(test)]
     if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterFilePublished) {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "test_after_file_publish", err)
-            .await);
+            .await
+            .into());
     }
 
     if let Err(err) = progress.build_runtime(&guards, &engine).await {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "runtime_build", err)
-            .await);
+            .await
+            .into());
     }
 
     #[cfg(test)]
     if let Err(err) = maybe_fail_create_table(CreateTableTestFailure::AfterRuntimeBuilt) {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "test_after_runtime_build", err)
-            .await);
+            .await
+            .into());
     }
 
     #[cfg(test)]
@@ -1224,14 +1262,11 @@ pub(crate) async fn create_table_for_session(
     if let Err(err) = progress.commit_catalog().await {
         return Err(progress
             .abort_after_root_publish_commit_error(&engine, &guards, "catalog_commit", err)
-            .await);
+            .await
+            .into());
     }
 
-    if let Err(err) = progress.install_runtime(&engine) {
-        return Err(progress
-            .abort_after_root_publish_commit_error(&engine, &guards, "runtime_install", err)
-            .await);
-    }
+    progress.install_runtime(&engine);
 
     Ok(table_id)
 }
@@ -1257,8 +1292,10 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     let drain = match table.start_drop_lifecycle() {
         Ok(drain) => drain,
         Err(err) => {
-            trx.rollback().await?;
-            return Err(err);
+            if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
+                return Err(rollback_err.into());
+            }
+            return Err(err.into());
         }
     };
     let mut drop_progress = DropTableProgressGuard::new(engine.clone(), table_id);
@@ -1268,13 +1305,13 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     let metadata = table.metadata().clone();
     let exec_res = execute_drop_table_catalog_cascade(&engine, &mut trx, table_id, &metadata).await;
     if let Err(err) = exec_res {
-        // `trx.exec` may have already discarded the transaction after a fatal
-        // statement-rollback failure. In either case the drop gate has been
-        // crossed, so preserve the poison outcome below.
-        let _ = trx.rollback().await;
+        // The lifecycle gate is already irreversible. Preserve the catalog
+        // cascade failure as the poison source; rollback is best-effort cleanup
+        // and its error must not replace the failure that crossed the gate.
+        let _ = trx.rollback_catalog_ddl().await;
         return Err(poison_error_source(
             &engine,
-            err,
+            RuntimeOrFatalError::from(err),
             FatalError::Poisoned,
             format!(
                 "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"
@@ -1283,7 +1320,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         .into());
     }
 
-    let drop_cts = match trx.commit().await {
+    let drop_cts = match trx.commit_catalog_ddl().await {
         Ok(drop_cts) => drop_cts,
         Err(err) => {
             return Err(poison_error_source(
@@ -1313,15 +1350,16 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
 
 /// Reject table ids outside user-managed catalog space.
 #[inline]
-pub(crate) fn reject_non_user_table_id(table_id: TableID, operation: &'static str) -> Result<()> {
+pub(crate) fn reject_non_user_table_id(
+    table_id: TableID,
+    operation: &'static str,
+) -> OperationResult<()> {
     if is_user_table(table_id) {
         return Ok(());
     }
-    Err(Report::new(OperationError::TableNotFound)
-        .attach(format!(
-            "{operation} requires user table id: table_id={table_id}"
-        ))
-        .into())
+    Err(Report::new(OperationError::TableNotFound).attach(format!(
+        "{operation} requires user table id: table_id={table_id}"
+    )))
 }
 
 /// Ensure the user-table catalog row exists for a DDL operation.
@@ -1331,7 +1369,7 @@ pub(crate) async fn ensure_user_table_catalog_row(
     engine: &EngineRef,
     table_id: TableID,
     operation: &'static str,
-) -> Result<()> {
+) -> OperationOrRuntimeResult<()> {
     if engine
         .catalog()
         .storage
@@ -1353,7 +1391,7 @@ pub(crate) async fn precheck_index_ddl_target(
     engine: &EngineRef,
     table_id: TableID,
     operation: &'static str,
-) -> Result<()> {
+) -> OperationOrRuntimeResult<()> {
     let _ = validated_index_ddl_target(guards, engine, table_id, operation).await?;
     Ok(())
 }
@@ -1364,7 +1402,7 @@ pub(crate) async fn validated_index_ddl_target(
     engine: &EngineRef,
     table_id: TableID,
     operation: &'static str,
-) -> Result<Arc<Table>> {
+) -> OperationOrRuntimeResult<Arc<Table>> {
     reject_non_user_table_id(table_id, operation)?;
     let table = engine
         .catalog()
@@ -1380,11 +1418,11 @@ pub(crate) async fn validated_index_ddl_target(
 pub(crate) fn reject_user_table_primary_key_index(
     index_spec: &IndexSpec,
     operation: &'static str,
-) -> Result<()> {
+) -> OperationResult<()> {
     if !index_spec.primary_key() {
         return Ok(());
     }
-    Err(invalid_index_spec(format!(
+    Err(Report::new(OperationError::InvalidMetadata).attach(format!(
         "{operation} does not support user-table primary keys"
     )))
 }
@@ -1393,39 +1431,18 @@ pub(crate) fn reject_user_table_primary_key_index(
 fn reject_user_table_primary_key_indexes(
     index_specs: &[IndexSpec],
     operation: &'static str,
-) -> Result<()> {
+) -> OperationResult<()> {
     for index_spec in index_specs {
         reject_user_table_primary_key_index(index_spec, operation)?;
     }
     Ok(())
 }
 
-#[inline]
-fn invalid_table_metadata(message: impl Into<String>) -> Error {
-    Report::new(InternalError::Generic)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn invalid_index_spec(message: impl Into<String>) -> Error {
-    Report::new(ConfigError::InvalidIndexSpec)
-        .attach(message.into())
-        .into()
-}
-
-#[inline]
-fn index_not_found(message: impl Into<String>) -> Error {
-    Report::new(OperationError::IndexNotFound)
-        .attach(message.into())
-        .into()
-}
-
 async fn validated_drop_table_target(
     guards: &PoolGuards,
     engine: &EngineRef,
     table_id: TableID,
-) -> Result<Arc<Table>> {
+) -> OperationOrRuntimeResult<Arc<Table>> {
     reject_non_user_table_id(table_id, "drop_table")?;
     let Some(table) = engine.catalog().get_table(table_id).await else {
         return Err(Report::new(OperationError::TableNotFound)
@@ -1436,6 +1453,11 @@ async fn validated_drop_table_target(
     Ok(table)
 }
 
+/// Stage the catalog rows for a newly allocated table.
+///
+/// `table_id` is allocated atomically before this call. Every child key is
+/// derived by enumerating validated metadata inside that fresh table-id
+/// namespace, so catalog insert Operation failures are invariant violations.
 #[inline]
 async fn execute_create_table_catalog_staging(
     engine: &EngineRef,
@@ -1445,52 +1467,53 @@ async fn execute_create_table_catalog_staging(
     column_objects: Vec<ColumnObject>,
     index_objects: Vec<IndexObject>,
     index_column_objects: Vec<IndexColumnObject>,
-) -> Result<()> {
-    trx.exec(async |stmt| {
-        let inserted = engine
+) -> RuntimeResult<()> {
+    trx.stage_catalog_statement(async |stmt| {
+        engine
             .catalog()
             .storage
             .tables()
             .insert(stmt, &table_object)
-            .await;
-        if !inserted {
-            return Err(Report::new(OperationError::TableAlreadyExists)
-                .attach(format!("create table catalog object: table_id={table_id}"))
-                .into());
-        }
+            .await?;
 
         for column_object in column_objects {
-            let inserted = engine
+            engine
                 .catalog()
                 .storage
                 .columns()
                 .insert(stmt, &column_object)
-                .await;
-            debug_assert!(inserted);
+                .await?;
         }
         for index_object in index_objects {
-            let inserted = engine
+            engine
                 .catalog()
                 .storage
                 .indexes()
                 .insert(stmt, &index_object)
-                .await;
-            debug_assert!(inserted);
+                .await?;
         }
         for index_column_object in index_column_objects {
-            let inserted = engine
+            engine
                 .catalog()
                 .storage
                 .index_columns()
                 .insert(stmt, &index_column_object)
-                .await;
-            debug_assert!(inserted);
+                .await?;
         }
 
-        let res = stmt
+        if let Some(existing) = stmt
             .effects_mut()
-            .set_ddl_redo(DDLRedo::CreateTable(table_id));
-        debug_assert!(res.is_none());
+            .set_ddl_redo(DDLRedo::CreateTable(table_id))
+        {
+            return Err(Report::new(InternalError::CatalogDdlRedoConflict)
+                .attach(format!(
+                    "operation=create_table_catalog_staging, table_id={table_id}, existing_ddl={existing:?}"
+                ))
+                .change_context(RuntimeError::CatalogAccess)
+                .attach(format!(
+                    "operation=create_table, phase=stage_catalog_redo, table_id={table_id}"
+                )));
+        }
         Ok(())
     })
     .await
@@ -1502,8 +1525,8 @@ async fn execute_drop_table_catalog_cascade(
     trx: &mut Transaction,
     table_id: TableID,
     metadata: &TableMetadata,
-) -> Result<()> {
-    trx.exec(async |stmt| {
+) -> RuntimeResult<()> {
+    trx.stage_catalog_statement(async |stmt| {
         let index_columns_deleted = engine
             .catalog()
             .storage
@@ -1527,12 +1550,11 @@ async fn execute_drop_table_catalog_cascade(
             .storage
             .tables()
             .delete_by_id(stmt, table_id)
-            .await;
-        if !table_deleted {
-            return Err(Report::new(OperationError::TableNotFound)
-                .attach(format!("drop table catalog row: table_id={table_id}"))
-                .into());
-        }
+            .await?;
+        assert!(
+            table_deleted,
+            "drop-table catalog invariant violated: validated table row is missing, table_id={table_id}"
+        );
         engine
             .catalog()
             .storage
@@ -1540,49 +1562,52 @@ async fn execute_drop_table_catalog_cascade(
             .delete_by_table_id(stmt, table_id)
             .await?;
 
-        validate_drop_catalog_delete_counts(
+        assert_drop_catalog_delete_counts(
             table_id,
             metadata,
             columns_deleted,
             indexes_deleted,
             index_columns_deleted,
-        )?;
+        );
 
-        let res = stmt
-            .effects_mut()
-            .set_ddl_redo(DDLRedo::DropTable(table_id));
-        debug_assert!(res.is_none());
+        assert!(
+            stmt.effects_mut()
+                .set_ddl_redo(DDLRedo::DropTable(table_id))
+                .is_none(),
+            "drop-table catalog invariant violated: statement already has DDL redo, table_id={table_id}"
+        );
         Ok(())
     })
     .await
 }
 
 #[inline]
-fn validate_drop_catalog_delete_counts(
+fn assert_drop_catalog_delete_counts(
     table_id: TableID,
     metadata: &TableMetadata,
     columns_deleted: usize,
     indexes_deleted: usize,
     index_columns_deleted: usize,
-) -> Result<()> {
+) {
     let expected_index_columns = metadata
         .idx
         .active_indexes()
         .map(|(_, spec)| spec.cols.len())
         .sum::<usize>();
-    if columns_deleted == metadata.col.col_count()
-        && indexes_deleted == metadata.idx.active_index_count()
-        && index_columns_deleted == expected_index_columns
-    {
-        return Ok(());
-    }
-    Err(Report::new(InternalError::Generic)
-        .attach(format!(
-            "drop table catalog cascade count mismatch: table_id={table_id}, columns_deleted={columns_deleted}, expected_columns={}, indexes_deleted={indexes_deleted}, expected_indexes={}, index_columns_deleted={index_columns_deleted}, expected_index_columns={expected_index_columns}",
-            metadata.col.col_count(),
-            metadata.idx.active_index_count(),
-        ))
-        .into())
+    assert_eq!(
+        columns_deleted,
+        metadata.col.col_count(),
+        "drop-table catalog invariant violated: column delete count mismatch, table_id={table_id}"
+    );
+    assert_eq!(
+        indexes_deleted,
+        metadata.idx.active_index_count(),
+        "drop-table catalog invariant violated: index delete count mismatch, table_id={table_id}"
+    );
+    assert_eq!(
+        index_columns_deleted, expected_index_columns,
+        "drop-table catalog invariant violated: index-column delete count mismatch, table_id={table_id}"
+    );
 }
 
 #[inline]
@@ -1592,17 +1617,19 @@ fn finish_drop_table_runtime_retention(
     table: Arc<Table>,
     drop_cts: TrxID,
     replay_floor: TableRedoReplayFloor,
-) -> Result<()> {
-    if let Err(_err) = table.mark_dropped_lifecycle() {
-        return Err(poison_drop_table_after_gate(engine, table_id, "mark_dropped").into());
-    }
+) -> FatalResult<()> {
+    table.mark_dropped_lifecycle();
     if engine
         .catalog()
         .mark_user_table_dropped_runtime(table_id, table, drop_cts, replay_floor)
     {
         return Ok(());
     }
-    Err(poison_drop_table_after_gate(engine, table_id, "runtime_retention").into())
+    Err(poison_drop_table_after_gate(
+        engine,
+        table_id,
+        "runtime_retention",
+    ))
 }
 
 #[inline]
@@ -1625,33 +1652,32 @@ fn poison_drop_table_after_gate(
     engine.poisoner.poison(report).into_report()
 }
 
-/// Fatalizes an already public source while retaining completion evidence.
+/// Fatalizes a typed catalog source while retaining its physical evidence.
 #[inline]
 fn poison_error_source(
     engine: &EngineRef,
-    source: Error,
+    source: RuntimeOrFatalError,
     reason: FatalError,
     message: String,
-) -> Report<FatalError> {
+) -> RuntimeOrFatalError {
     let report = source.into_fatal_report(reason).attach(message);
     obs::error!(
         "event=engine_poison component=catalog_table action=poison result=error error={:?}",
         report
     );
-    engine.poisoner.poison(report).into_report()
+    RuntimeOrFatalError::from(engine.poisoner.poison(report).into_report())
 }
 
 #[inline]
-fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> Result<()> {
+fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> OperationResult<()> {
     if spec.cols.is_empty() {
-        return Err(invalid_index_spec(format!(
-            "index_no {index_no} has no key columns"
-        )));
+        return Err(Report::new(OperationError::InvalidMetadata)
+            .attach(format!("index_no {index_no} has no key columns")));
     }
     for key in &spec.cols {
         let col_no = key.col_no as usize;
         if col_no >= col_count {
-            return Err(invalid_index_spec(format!(
+            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
                 "index_no {index_no} references column {col_no} outside column count {col_count}"
             )));
         }
@@ -1663,21 +1689,21 @@ fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> R
 fn validate_primary_key_contract(
     column_layout: &TableColumnLayout,
     index_specs: &IndexSpecs,
-) -> Result<()> {
+) -> OperationResult<()> {
     let mut primary_key_index_no = None;
     for (index_no, index_spec) in index_specs.active_indexes() {
         if !index_spec.primary_key() {
             continue;
         }
         if let Some(existing_index_no) = primary_key_index_no {
-            return Err(invalid_index_spec(format!(
+            return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
                 "multiple primary keys: index_no {existing_index_no} and index_no {index_no}"
             )));
         }
         for key in &index_spec.cols {
             let col_no = usize::from(key.col_no);
             if column_layout.nullable(col_no) {
-                return Err(invalid_index_spec(format!(
+                return Err(Report::new(OperationError::InvalidMetadata).attach(format!(
                     "primary key index_no {index_no} references nullable column {col_no}"
                 )));
             }
@@ -1696,13 +1722,12 @@ mod tests {
         IndexSpec, TableSpec,
     };
     use crate::error::{
-        ConfigError, Error, ErrorKind, FatalError, InternalError, IoError, OperationError,
-        RuntimeError,
+        Error, ErrorKind, FatalError, InternalError, IoError, OperationError, RuntimeError,
     };
-    use crate::id::{SessionID, TrxID};
+    use crate::id::TrxID;
     use crate::io::install_storage_backend_test_hook;
     use crate::lock::tests::{LockDebugEntryState, try_acquire};
-    use crate::lock::{LockMode, LockOwner, LockOwnerGroup, LockResource};
+    use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use crate::table::TableTerminal;
@@ -1731,13 +1756,14 @@ mod tests {
         CREATE_TABLE_FAILURE.with(|slot| slot.set(failure));
     }
 
-    pub(super) fn maybe_fail_create_table(failure: CreateTableTestFailure) -> Result<()> {
+    pub(super) fn maybe_fail_create_table(failure: CreateTableTestFailure) -> RuntimeResult<()> {
         if CREATE_TABLE_FAILURE.with(|slot| slot.get()) == Some(failure) {
             // TODO(error-boundary): backlog 000160 should replace this generic
             // hook with a create-table phase-specific source-domain failure.
             return Err(Report::new(InternalError::Generic)
                 .attach("test create-table phase failure")
-                .into());
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=test_create_table_phase_failure"));
         }
         Ok(())
     }
@@ -1752,11 +1778,12 @@ mod tests {
         }
     }
 
-    fn assert_invalid_index_spec(err: Error, expected_message: &str) {
-        assert!(err.is_kind(crate::error::ErrorKind::Config));
+    fn assert_invalid_metadata(err: impl Into<Error>, expected_message: &str) {
+        let err = err.into();
+        assert!(err.is_kind(crate::error::ErrorKind::Operation));
         assert_eq!(
-            err.report().downcast_ref::<ConfigError>().copied(),
-            Some(ConfigError::InvalidIndexSpec)
+            err.report().downcast_ref::<OperationError>().copied(),
+            Some(OperationError::InvalidMetadata)
         );
         let report = format!("{err:?}");
         assert!(report.contains(expected_message), "{report}");
@@ -1886,48 +1913,12 @@ mod tests {
         let (index_no, created) = metadata
             .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
             .unwrap();
-        let dropped = created.try_without_index(index_no).unwrap();
+        let dropped = created.without_index(index_no);
 
         assert!(Arc::ptr_eq(&metadata.col, &created.col));
         assert!(Arc::ptr_eq(&metadata.col, &dropped.col));
         assert_eq!(created.idx.active_index_count(), 1);
         assert_eq!(dropped.idx.active_index_count(), 0);
-    }
-
-    #[test]
-    fn test_table_metadata_rejects_deserialized_empty_columns() {
-        let brief = TableBriefMetadata {
-            col_names: vec![],
-            col_types: vec![],
-            col_attrs: vec![],
-            next_index_no: 0,
-            index_specs: vec![],
-        };
-
-        let err = TableMetadata::try_from(brief).unwrap_err();
-        let report = format!("{err:?}");
-        assert!(
-            report.contains("table column layout requires columns"),
-            "{report}"
-        );
-    }
-
-    #[test]
-    fn test_table_metadata_rejects_inconsistent_column_nullability() {
-        let brief = TableBriefMetadata {
-            col_names: vec![SemiStr::new("c0")],
-            col_types: vec![ValType::new(ValKind::U32, true)],
-            col_attrs: vec![ColumnAttributes::empty()],
-            next_index_no: 0,
-            index_specs: vec![],
-        };
-
-        let err = TableMetadata::try_from(brief).unwrap_err();
-        let report = format!("{err:?}");
-        assert!(report.contains("column_index=0"), "{report}");
-        assert!(report.contains("column_name=c0"), "{report}");
-        assert!(report.contains("type_nullable=true"), "{report}");
-        assert!(report.contains("attr_nullable=false"), "{report}");
     }
 
     #[test]
@@ -2024,7 +2015,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_index_spec(err, "multiple primary keys");
+        assert_invalid_metadata(err, "multiple primary keys");
     }
 
     #[test]
@@ -2050,7 +2041,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_index_spec(err, "multiple primary keys");
+        assert_invalid_metadata(err, "multiple primary keys");
     }
 
     #[test]
@@ -2065,11 +2056,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_index_spec(err, "primary key index_no 0 references nullable column 0");
+        assert_invalid_metadata(err, "primary key index_no 0 references nullable column 0");
     }
 
     #[test]
-    fn test_table_metadata_rejects_invalid_index_specs_as_config_errors() {
+    fn test_table_metadata_rejects_invalid_index_specs_as_operation_errors() {
         let columns = vec![ColumnSpec::new(
             "c0",
             ValKind::U32,
@@ -2081,7 +2072,7 @@ mod tests {
             vec![IndexSpec::new(vec![], IndexAttributes::PK)],
         )
         .unwrap_err();
-        assert_invalid_index_spec(err, "index_no 0 has no key columns");
+        assert_invalid_metadata(err, "index_no 0 has no key columns");
 
         let err = TableMetadata::try_new_with_next_index_no(
             columns.clone(),
@@ -2092,14 +2083,14 @@ mod tests {
             2,
         )
         .unwrap_err();
-        assert_invalid_index_spec(err, "index_no 1 has no key columns");
+        assert_invalid_metadata(err, "index_no 1 has no key columns");
 
         let err = TableMetadata::try_new(
             columns,
             vec![IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK)],
         )
         .unwrap_err();
-        assert_invalid_index_spec(err, "index_no 0 references column 1 outside column count 1");
+        assert_invalid_metadata(err, "index_no 0 references column 1 outside column count 1");
     }
 
     #[test]
@@ -2214,7 +2205,7 @@ mod tests {
         )
         .unwrap();
 
-        let dropped = metadata.try_without_index(2).unwrap();
+        let dropped = metadata.without_index(2);
 
         assert_eq!(dropped.idx.next_index_no(), 4);
         assert_eq!(dropped.idx.index_slot_count(), 4);
@@ -2226,37 +2217,6 @@ mod tests {
         assert_eq!(
             dropped.idx.index_cols,
             [0].into_iter().collect::<FastHashSet<_>>()
-        );
-    }
-
-    #[test]
-    fn test_table_metadata_drop_index_rejects_inactive_and_out_of_range() {
-        let metadata = TableMetadata::try_new_with_next_index_no(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![ActiveIndexSpec::new(
-                0,
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-            )],
-            2,
-        )
-        .unwrap();
-
-        let inactive = metadata.try_without_index(1).unwrap_err();
-        assert_eq!(
-            inactive.report().downcast_ref::<OperationError>().copied(),
-            Some(OperationError::IndexNotFound)
-        );
-        let out_of_range = metadata.try_without_index(2).unwrap_err();
-        assert_eq!(
-            out_of_range
-                .report()
-                .downcast_ref::<OperationError>()
-                .copied(),
-            Some(OperationError::IndexNotFound)
         );
     }
 
@@ -2454,8 +2414,8 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.report().downcast_ref::<ConfigError>().copied(),
-                Some(ConfigError::InvalidIndexSpec)
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::InvalidMetadata)
             );
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
@@ -2488,7 +2448,7 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert_invalid_index_spec(err, "create_table does not support user-table primary keys");
+            assert_invalid_metadata(err, "create_table does not support user-table primary keys");
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
@@ -2544,8 +2504,11 @@ mod tests {
             assert!(err.is_kind(ErrorKind::Runtime), "{err:?}");
             assert_eq!(
                 err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::FileRootAccess)
+                Some(RuntimeError::CatalogAccess)
             );
+            assert!(err.report().frames().any(|frame| {
+                frame.downcast_ref::<RuntimeError>() == Some(&RuntimeError::FileRootAccess)
+            }));
             assert!(err.report().downcast_ref::<IoError>().is_some());
             let report = format!("{err:?}");
             assert!(report.contains("file_kind=table_file"), "{report}");
@@ -2645,34 +2608,6 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_table_locks_reject_intent_modes() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-
-            for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
-                let err = session.lock_table(table_id, mode).await.unwrap_err();
-                assert_eq!(
-                    err.report().downcast_ref::<OperationError>().copied(),
-                    Some(OperationError::InvalidLockMode)
-                );
-            }
-
-            let mut trx = session.begin_trx().unwrap();
-            for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
-                let err = trx.lock_table(table_id, mode).await.unwrap_err();
-                assert_eq!(
-                    err.report().downcast_ref::<OperationError>().copied(),
-                    Some(OperationError::InvalidLockMode)
-                );
-            }
-            trx.rollback().await.unwrap();
-        });
-    }
-
-    #[test]
     fn test_transaction_shared_table_lock_blocks_external_row_writer() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -2682,7 +2617,9 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let owner = trx_tests::lock_owner(&trx).unwrap();
 
-            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            trx.lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap();
             assert!(has_lock_entry(
                 &engine,
                 owner,
@@ -2741,9 +2678,15 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let owner = trx_tests::lock_owner(&trx).unwrap();
 
-            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
-            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
-            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
+            trx.lock_table(table_id, TableLockMode::Exclusive)
+                .await
+                .unwrap();
+            trx.lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap();
+            trx.lock_table(table_id, TableLockMode::Exclusive)
+                .await
+                .unwrap();
 
             assert_eq!(lock_entry_count(&engine, owner), 2);
             assert!(has_lock_entry(
@@ -2777,7 +2720,7 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             session
-                .lock_table(table_id, LockMode::Shared)
+                .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap();
 
@@ -2839,7 +2782,7 @@ mod tests {
             .unwrap();
 
             let err = session
-                .lock_table(table_id, LockMode::Shared)
+                .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -2880,7 +2823,7 @@ mod tests {
 
             let session = engine.new_session().unwrap();
             let session_owner = LockOwner::Session(session.id());
-            let mut lock_fut = Box::pin(session.lock_table(table_id, LockMode::Shared));
+            let mut lock_fut = Box::pin(session.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
                 futures::poll!(lock_fut.as_mut()),
                 std::task::Poll::Pending
@@ -2927,14 +2870,14 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let session_owner = LockOwner::Session(session.id());
             session
-                .lock_table(table_id, LockMode::Shared)
+                .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap();
             let mut trx = session.begin_trx().unwrap();
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
 
             let err = trx
-                .lock_table(table_id, LockMode::Exclusive)
+                .lock_table(table_id, TableLockMode::Exclusive)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -2985,7 +2928,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
-            let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
+            let mut lock_fut = Box::pin(trx.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
                 futures::poll!(lock_fut.as_mut()),
                 std::task::Poll::Pending
@@ -3036,7 +2979,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let session_owner = LockOwner::Session(session.id());
             session
-                .lock_table(table_id, LockMode::Exclusive)
+                .lock_table(table_id, TableLockMode::Exclusive)
                 .await
                 .unwrap();
 
@@ -3205,7 +3148,7 @@ mod tests {
                         .storage
                         .tables()
                         .delete_by_id(stmt, table_id)
-                        .await;
+                        .await?;
                     assert!(deleted);
                     let old = stmt
                         .effects_mut()
@@ -3239,14 +3182,17 @@ mod tests {
     #[test]
     fn test_drop_table_rejects_same_session_explicit_table_lock() {
         smol::block_on(async {
-            for mode in [LockMode::Shared, LockMode::Exclusive] {
+            for (table_mode, lock_mode) in [
+                (TableLockMode::Shared, LockMode::Shared),
+                (TableLockMode::Exclusive, LockMode::Exclusive),
+            ] {
                 let temp_dir = TempDir::new().unwrap();
                 let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
                 let table_id = create_table2_for_test(&engine).await;
                 let mut session = engine.new_session().unwrap();
                 let owner = LockOwner::Session(session.id());
 
-                session.lock_table(table_id, mode).await.unwrap();
+                session.lock_table(table_id, table_mode).await.unwrap();
                 let err = session.drop_table(table_id).await.unwrap_err();
                 assert_eq!(
                     err.report().downcast_ref::<OperationError>().copied(),
@@ -3274,7 +3220,7 @@ mod tests {
                     &engine,
                     owner,
                     LockResource::TableData(table_id),
-                    mode,
+                    lock_mode,
                     LockDebugEntryState::Granted,
                 ));
 
@@ -3391,7 +3337,7 @@ mod tests {
             let lock_session = engine.new_session().unwrap();
             let lock_owner = LockOwner::Session(lock_session.id());
             let err = lock_session
-                .lock_table(table_id, LockMode::Shared)
+                .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3481,7 +3427,7 @@ mod tests {
             let mut trx = lock_session.begin_trx().unwrap();
             let lock_owner = trx_tests::lock_owner(&trx).unwrap();
             let err = trx
-                .lock_table(table_id, LockMode::Exclusive)
+                .lock_table(table_id, TableLockMode::Exclusive)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3524,7 +3470,7 @@ mod tests {
             let lock_session = engine.new_session().unwrap();
             let session_owner = LockOwner::Session(lock_session.id());
             let err = lock_session
-                .lock_table(table_id, LockMode::Shared)
+                .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3546,7 +3492,7 @@ mod tests {
             let mut trx = trx_session.begin_trx().unwrap();
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
             let err = trx
-                .lock_table(table_id, LockMode::Exclusive)
+                .lock_table(table_id, TableLockMode::Exclusive)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -3758,154 +3704,6 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut corrupt_session = engine.new_session().unwrap();
-            let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
-
-            corrupt_trx
-                .exec(async |stmt| {
-                    let deleted = engine
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .delete_by_index(stmt, table_id, 0)
-                        .await
-                        .unwrap();
-                    assert_eq!(deleted, 1);
-                    let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
-                        table_id,
-                        index_no: 0,
-                    });
-                    debug_assert!(old.is_none());
-                    Ok(())
-                })
-                .await
-                .unwrap();
-            corrupt_trx.commit().await.unwrap();
-
-            let mut drop_session = engine.new_session().unwrap();
-            let err = drop_session.drop_table(table_id).await.unwrap_err();
-            let report = format!("{err:?}");
-
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::Poisoned),
-                "{report}"
-            );
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::Generic),
-                "{report}"
-            );
-            assert!(
-                report.contains("drop table failed after lifecycle gate: table_id="),
-                "{report}"
-            );
-            assert!(report.contains("operation=catalog_cascade"), "{report}");
-            assert!(
-                report.contains("drop table catalog cascade count mismatch"),
-                "{report}"
-            );
-            assert!(
-                engine
-                    .inner()
-                    .poisoner
-                    .poison_error()
-                    .as_ref()
-                    .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
-            );
-            assert!(!drop_session.in_trx().unwrap());
-        });
-    }
-
-    #[test]
-    fn test_drop_table_catalog_cascade_failure_fails_queued_locks_as_dropping() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut corrupt_session = engine.new_session().unwrap();
-            let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
-
-            corrupt_trx
-                .exec(async |stmt| {
-                    let deleted = engine
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .delete_by_index(stmt, table_id, 0)
-                        .await
-                        .unwrap();
-                    assert_eq!(deleted, 1);
-                    let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
-                        table_id,
-                        index_no: 0,
-                    });
-                    debug_assert!(old.is_none());
-                    Ok(())
-                })
-                .await
-                .unwrap();
-            corrupt_trx.commit().await.unwrap();
-
-            let table = table_for_internal_assertion(&engine, table_id);
-            let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
-            let mut drop_session = engine.new_session().unwrap();
-            let drop_owner = LockOwner::Session(drop_session.id());
-            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
-            assert!(matches!(
-                futures::poll!(drop_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert!(has_lock_entry(
-                &engine,
-                drop_owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Exclusive,
-                LockDebugEntryState::Granted,
-            ));
-
-            let waiting_session_id = SessionID::new(91_501);
-            let waiting_owner = LockOwner::Session(waiting_session_id);
-            let waiting_group = LockOwnerGroup::Session(waiting_session_id);
-            let mut lock_fut = Box::pin(engine.lock_manager().acquire_grouped_table_locks(
-                table_id,
-                LockMode::Shared,
-                waiting_owner,
-                waiting_group,
-            ));
-            assert!(matches!(
-                futures::poll!(lock_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
-            wait_for_lock_entry(
-                &engine,
-                waiting_owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Shared,
-                LockDebugEntryState::Waiting,
-            )
-            .await;
-
-            drop(publish_lease);
-            let err = drop_fut.await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::Poisoned)
-            );
-            let Err(waiter_err) = lock_fut.await else {
-                panic!("queued table lock waiter should fail after drop gate error");
-            };
-            assert_eq!(*waiter_err.current_context(), OperationError::TableDropping);
-            drop(root_lease);
-        });
-    }
-
-    #[test]
     fn test_drop_table_commit_poison_preserves_source_error() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -3935,7 +3733,10 @@ mod tests {
                 "{report}"
             );
             assert!(report.contains("operation=commit"), "{report}");
-            assert!(report.contains("wait for redo group commit"), "{report}");
+            assert!(
+                report.contains("operation=commit_catalog_ddl, phase=wait_redo_group"),
+                "{report}"
+            );
             assert!(!report.contains("propagate from other threads"), "{report}");
             assert!(
                 engine
@@ -4127,7 +3928,6 @@ mod tests {
                     .catalog()
                     .storage
                     .checkpoint_snapshot()
-                    .unwrap()
                     .catalog_replay_start_ts
                     > TrxID::new(1)
             );

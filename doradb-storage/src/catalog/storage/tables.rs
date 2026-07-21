@@ -6,13 +6,14 @@ use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, catalog_table_id_from_slot,
 };
-use crate::error::Result;
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::id::TableID;
 use crate::row::ops::DeleteMvcc;
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
+use error_stack::ResultExt;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
@@ -31,7 +32,10 @@ pub(crate) struct Tables<'a> {
 
 impl Tables<'_> {
     /// List all table rows from uncommitted-visible catalog state.
-    pub(crate) async fn list_uncommitted(&self, guards: &PoolGuards) -> Result<Vec<TableObject>> {
+    pub(crate) async fn list_uncommitted(
+        &self,
+        guards: &PoolGuards,
+    ) -> RuntimeResult<Vec<TableObject>> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(guards, |col_layout, row| {
@@ -41,7 +45,9 @@ impl Tables<'_> {
                 res.push(row_to_table_object(col_layout, row));
                 true
             })
-            .await?;
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=list_catalog_tables")?;
         Ok(res)
     }
 
@@ -51,25 +57,45 @@ impl Tables<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<Option<TableObject>> {
+    ) -> RuntimeResult<Option<TableObject>> {
         let key_vals = [Val::from(table_id)];
         self.table
             .index_lookup_unique_uncommitted(guards, PK_NO_TABLES, &key_vals, row_to_table_object)
             .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| format!("operation=find_catalog_table, table_id={table_id}"))
     }
 
-    /// Insert a table.
-    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &TableObject) -> bool {
+    /// Insert a table row whose primary key is owned by the current DDL.
+    ///
+    /// Create-table uses an atomically allocated id. Create-index first deletes
+    /// and then reinserts the same row in one metadata-gated transaction. The
+    /// primary key is therefore unique by construction, and the statement
+    /// boundary asserts if storage reports an Operation failure.
+    pub(crate) async fn insert(
+        &self,
+        stmt: &mut Statement<'_>,
+        obj: &TableObject,
+    ) -> RuntimeResult<()> {
         let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
-        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
+        stmt.catalog_insert_mvcc(self.table, cols)
+            .await
+            .map(|_| ())
+            .attach_with(|| format!("operation=catalog_tables_insert, table_id={}", obj.table_id))
     }
 
     /// Delete a table by id.
-    pub(crate) async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
+    pub(crate) async fn delete_by_id(
+        &self,
+        stmt: &mut Statement<'_>,
+        id: TableID,
+    ) -> RuntimeResult<bool> {
         let key_vals = [Val::from(id)];
-        stmt.catalog_delete_primary_key_mvcc(self.table, PK_NO_TABLES, &key_vals, true)
+        let res = stmt
+            .catalog_delete_primary_key_mvcc(self.table, PK_NO_TABLES, &key_vals, true)
             .await
-            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
+            .attach_with(|| format!("operation=catalog_tables_delete, table_id={id}"))?;
+        Ok(matches!(res, DeleteMvcc::Deleted))
     }
 }
 
@@ -127,6 +153,7 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::tests::{open_catalog_test_engine, table1};
+    use crate::error::InternalError;
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
@@ -149,22 +176,18 @@ mod tests {
             };
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .tables()
-                        .insert(stmt, &table100)
-                        .await
-                );
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .tables()
-                        .insert(stmt, &table101)
-                        .await
-                );
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(stmt, &table100)
+                    .await?;
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(stmt, &table101)
+                    .await?;
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(table100.table_id));
                 Ok(())
             })
@@ -180,7 +203,7 @@ mod tests {
                         .storage
                         .tables()
                         .delete_by_id(stmt, table100.table_id)
-                        .await
+                        .await?
                 );
                 assert!(
                     !engine
@@ -188,7 +211,7 @@ mod tests {
                         .storage
                         .tables()
                         .delete_by_id(stmt, TableID::new(999))
-                        .await
+                        .await?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(table100.table_id));
                 Ok(())
@@ -246,6 +269,19 @@ mod tests {
                         .is_some()
                 );
             }
+
+            let err = engine
+                .catalog()
+                .storage
+                .tables()
+                .find_uncommitted_by_id(&PoolGuards::builder().build(), table_id)
+                .await
+                .unwrap_err();
+            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::PoolGuardMissing)
+            );
 
             drop(engine);
         });

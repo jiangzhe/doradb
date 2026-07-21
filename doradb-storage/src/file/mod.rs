@@ -1176,7 +1176,7 @@ mod tests {
 
             assert_eq!(kind, IOKind::Write);
             let wait_result = waiter.wait_result().await.map_err(|report| {
-                Error::from_completion_bridge(report, "wait for table file background write")
+                Error::from(report).attach("wait for table file background write")
             });
             assert!(wait_result.as_ref().is_err_and(|err| {
                 err.report()
@@ -1249,7 +1249,7 @@ mod tests {
 
             assert_eq!(kind, IOKind::Fsync);
             let wait_result = waiter.wait_result().await.map_err(|report| {
-                Error::from_completion_bridge(report, "wait for table file background fsync")
+                Error::from(report).attach("wait for table file background fsync")
             });
             let err = wait_result.expect_err("nonzero fsync completion should fail");
             assert_eq!(
@@ -1291,7 +1291,7 @@ mod tests {
 
             assert_eq!(kind, IOKind::Fsync);
             let wait_result = waiter.wait_result().await.map_err(|report| {
-                Error::from_completion_bridge(report, "wait for table file background fsync")
+                Error::from(report).attach("wait for table file background fsync")
             });
             let err = wait_result.expect_err("backend fsync completion should fail");
             assert!(

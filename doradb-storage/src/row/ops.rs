@@ -1,7 +1,7 @@
 use crate::catalog::TableColumnLayout;
 use crate::id::RowID;
 use crate::row::{Row, RowMut};
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
 use std::iter::Enumerate;
@@ -51,10 +51,7 @@ impl Deser for SelectKey {
         min_bytes_hint(mem::size_of::<u32>() + mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, index_no) = input.deser_u32(start_idx)?;
         let (idx, vals) = <Vec<Val>>::deser(input, idx)?;
         Ok((idx, SelectKey::new(index_no as usize, vals)))
@@ -150,8 +147,6 @@ impl InsertRow {
 pub(crate) enum LinkForUniqueIndex {
     Linked,
     NotNeeded,
-    WriteConflict,
-    DuplicateKey,
 }
 
 /// Row-page in-place update result.
@@ -250,10 +245,7 @@ impl Deser for UpdateCol {
         min_bytes_hint(mem::size_of::<u32>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let idx = start_idx;
         let (i, idx) = input.deser_u32(idx)?;
         let (i, val) = Val::deser(input, i)?;

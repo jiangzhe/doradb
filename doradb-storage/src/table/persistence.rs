@@ -6,8 +6,9 @@ use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{IndexSpec, SilentWatermarkObject, TableColumnLayout, TableMetadata};
 use crate::error::{
-    ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, LifecycleError,
-    OperationError, Result,
+    DataIntegrityError, DataIntegrityResult, FatalError, InternalError, LifecycleError,
+    MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
+    RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, MutableTableFile};
@@ -36,8 +37,6 @@ use std::result::Result as StdResult;
 
 #[cfg(test)]
 pub(crate) use tests::test_hooks;
-
-const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
 
 /// User-table checkpoint execution result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,86 +96,6 @@ pub enum CheckpointDelayReason {
     },
 }
 
-type TableCheckpointResult<T> = StdResult<T, TableCheckpointError>;
-
-#[derive(Debug)]
-enum TableCheckpointError {
-    Public(Error),
-    Internal(Report<InternalError>),
-    Lifecycle(Report<LifecycleError>),
-    Operation(Report<OperationError>),
-}
-
-impl TableCheckpointError {
-    #[inline]
-    fn attach(self, message: impl Into<String>) -> Self {
-        let message = message.into();
-        match self {
-            Self::Public(err) => Self::Public(err.attach(message)),
-            Self::Internal(report) => Self::Internal(report.attach(message)),
-            Self::Lifecycle(report) => Self::Lifecycle(report.attach(message)),
-            Self::Operation(report) => Self::Operation(report.attach(message)),
-        }
-    }
-
-    #[inline]
-    fn into_public(self) -> Error {
-        match self {
-            Self::Public(err) => err,
-            Self::Internal(report) => report.into(),
-            Self::Lifecycle(report) => report.into(),
-            Self::Operation(report) => report.into(),
-        }
-    }
-
-    fn into_fatal_report(self, fallback: FatalError) -> Report<FatalError> {
-        match self {
-            Self::Public(err) => {
-                let reason = if err.kind() == ErrorKind::Fatal {
-                    err.report()
-                        .downcast_ref::<FatalError>()
-                        .copied()
-                        .expect("top-level fatal storage error must contain a fatal reason")
-                } else {
-                    fallback
-                };
-                err.into_report().change_context(reason)
-            }
-            Self::Internal(report) => report.change_context(fallback),
-            Self::Lifecycle(report) => report.change_context(fallback),
-            Self::Operation(report) => report.change_context(fallback),
-        }
-    }
-}
-
-impl From<Error> for TableCheckpointError {
-    #[inline]
-    fn from(err: Error) -> Self {
-        Self::Public(err)
-    }
-}
-
-impl From<Report<InternalError>> for TableCheckpointError {
-    #[inline]
-    fn from(report: Report<InternalError>) -> Self {
-        Self::Internal(report)
-    }
-}
-
-impl From<Report<LifecycleError>> for TableCheckpointError {
-    #[inline]
-    fn from(report: Report<LifecycleError>) -> Self {
-        Self::Lifecycle(report)
-    }
-}
-
-impl From<Report<OperationError>> for TableCheckpointError {
-    #[inline]
-    fn from(report: Report<OperationError>) -> Self {
-        Self::Operation(report)
-    }
-}
-
 /// Owns one table checkpoint attempt and its reversible-to-fatal boundary.
 struct TableCheckpointer<'table, 'session> {
     table: &'table Table,
@@ -206,16 +125,10 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         }
     }
 
-    async fn run(&mut self) -> TableCheckpointResult<CheckpointOutcome> {
+    async fn run(&mut self) -> RuntimeOrFatalResult<CheckpointOutcome> {
         let table = self.table;
         let session = self.session;
         let table_id = table.table_id();
-        if session.in_trx()? {
-            return Err(Report::new(OperationError::NotSupported)
-                .attach(CHECKPOINT_REQUIRES_IDLE_SESSION)
-                .into());
-        }
-
         let table_file = table.file();
         let disk_pool = table.disk_pool();
         let trx_sys = session.engine.trx_sys.clone();
@@ -236,7 +149,13 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         // post-lease liveness check above.
         let mut mutable_file = MutableTableFile::fork(table_file, &table_writes, disk_pool.clone());
         let pivot_row_id = mutable_file.root().pivot_row_id;
-        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)?;
+        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)
+            .change_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!(
+                    "operation=checkpoint_table, phase=initialize_secondary_sidecar, table_id={table_id}"
+                )
+            })?;
 
         // Step 2: derive replay and data cutoffs from the explicit batch. The
         // purge-published horizon is the exclusive cutoff for both frozen row
@@ -267,7 +186,13 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             None => {
                 let heap_redo_start_ts = table
                     .heap_redo_start_from(&pool_guards, heap_redo_start_row_id)
-                    .await?;
+                    .await
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach_with(|| {
+                        format!(
+                            "operation=checkpoint_table, phase=resolve_heap_redo_start, table_id={table_id}, start_row_id={heap_redo_start_row_id}"
+                        )
+                    })?;
                 if let Some(batch) = self.attempt.batch_mut() {
                     batch.heap_redo_start_ts = heap_redo_start_ts;
                 }
@@ -277,7 +202,13 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         if !pages.is_empty() {
             let transition_pages = table
                 .load_frozen_pages_for_transition(&pool_guards, &pages)
-                .await?;
+                .await
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=load_frozen_pages, table_id={table_id}"
+                    )
+                })?;
             let delay = {
                 let Some(batch) = self.attempt.batch_mut() else {
                     panic!("non-empty checkpoint page list requires frozen source")
@@ -305,7 +236,14 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             let Some(batch) = self.attempt.batch_mut() else {
                 panic!("non-empty checkpoint page list requires frozen source")
             };
-            table.apply_page_transition(&transition_pages, batch, cutoff_ts)?;
+            table
+                .apply_page_transition(&transition_pages, batch, cutoff_ts)
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=apply_page_transition, table_id={table_id}"
+                    )
+                })?;
         }
         #[cfg(test)]
         if !pages.is_empty() {
@@ -337,7 +275,11 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                     .unwrap_or_default(),
                 collect_visible_row,
             )
-            .await?;
+            .await
+            .change_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!("operation=checkpoint_table, phase=build_lwc_blocks, table_id={table_id}")
+            })?;
         // A heartbeat checkpoint still advances the heap replay floor: its
         // transaction STS comes from the global timestamp sequence.
         let heap_redo_start_ts = next_heap_redo_start_ts.unwrap_or(checkpoint_ts);
@@ -345,16 +287,36 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         if let Some(last) = lwc_blocks.last_mut()
             && last.shape.end_row_id() < new_pivot_row_id
         {
-            last.shape.set_end_row_id(new_pivot_row_id)?;
+            last.shape
+                .set_end_row_id(new_pivot_row_id)
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=extend_last_lwc_block, table_id={table_id}, pivot_row_id={new_pivot_row_id}"
+                    )
+                })?;
         }
 
         // Step 5: apply checkpoint changes to the already-checked mutable root.
         if !lwc_blocks.is_empty() {
             mutable_file
                 .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, checkpoint_ts, disk_pool)
-                .await?;
+                .await
+                .change_runtime_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=apply_lwc_blocks, table_id={table_id}"
+                    )
+                })?;
         } else {
-            mutable_file.apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)?;
+            mutable_file
+                .apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=apply_checkpoint_metadata, table_id={table_id}"
+                    )
+                })?;
         }
 
         // Step 7: merge committed cold-row deletions into column index payloads,
@@ -368,7 +330,13 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                 cutoff_ts,
                 checkpoint_ts,
             )
-            .await?;
+            .await
+            .change_runtime_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!(
+                    "operation=checkpoint_table, phase=apply_deletion_checkpoint, table_id={table_id}"
+                )
+            })?;
 
         // Step 8: apply accumulated secondary-index sidecar work to DiskTree
         // roots on the same mutable file fork. Root publication remains atomic
@@ -380,14 +348,24 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                 &mut secondary_sidecar,
                 checkpoint_ts,
             )
-            .await?;
+            .await
+            .change_runtime_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!(
+                    "operation=checkpoint_table, phase=apply_secondary_sidecar, table_id={table_id}"
+                )
+            })?;
 
         // Step 9: after all checkpoint CoW writes are represented in the
         // mutable root, rebuild its allocation map from the current active root
         // and the mutable root that will be published.
         table
             .rebuild_reachable_alloc_map(&mut mutable_file, &layout)
-            .await?;
+            .await
+            .change_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!("operation=checkpoint_table, phase=rebuild_alloc_map, table_id={table_id}")
+            })?;
 
         if let Some(requested_floor) =
             silent_watermark_floor(table_file.active_root_unchecked(), mutable_file.root())
@@ -407,23 +385,35 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                 deletion_cutoff_ts: requested_floor.deletion_cutoff_ts,
             };
             self.set_irreversible(FatalError::CatalogWrite);
-            async {
-                #[cfg(test)]
-                test_hooks::run_test_silent_watermark_mutation_hook().await?;
-                sys_trx
-                    .upsert_silent_watermark(session.engine.catalog(), &pool_guards, watermark)
-                    .await
-            }
-            .await
-            .map_err(|err| {
-                TableCheckpointError::from(err).attach("catalog silent-watermark update failed")
-            })?;
+            #[cfg(test)]
+            test_hooks::run_test_silent_watermark_mutation_hook()
+                .await
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=test_silent_watermark_hook, table_id={table_id}"
+                    )
+                })?;
+            sys_trx
+                .upsert_silent_watermark(session.engine.catalog(), &pool_guards, watermark)
+                .await
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=upsert_silent_watermark, table_id={table_id}"
+                    )
+                })?;
             self.set_irreversible(FatalError::CheckpointWrite);
             #[cfg(test)]
             test_hooks::maybe_force_checkpoint_commit_error()?;
-            let redo_cts = trx_sys.commit_sys(sys_trx).map_err(|err| {
-                TableCheckpointError::from(err).attach("commit silent table checkpoint redo failed")
-            })?;
+            let redo_cts = trx_sys
+                .commit_sys(sys_trx)
+                .change_runtime_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=checkpoint_table, phase=commit_silent_redo, table_id={table_id}"
+                    )
+                })?;
             return Ok(CheckpointOutcome::Published {
                 checkpoint_ts,
                 redo_cts,
@@ -466,8 +456,9 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         trx_sys
             .publish_table_file_root(mutable_file, checkpoint_ts, false)
             .await
-            .map_err(|err| {
-                TableCheckpointError::from(err).attach("table checkpoint root publication failed")
+            .change_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!("operation=checkpoint_table, phase=publish_table_root, table_id={table_id}")
             })?;
         table
             .mem
@@ -479,9 +470,14 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
 
         #[cfg(test)]
         test_hooks::maybe_force_checkpoint_commit_error()?;
-        let redo_cts = trx_sys.commit_sys(sys_trx).map_err(|err| {
-            TableCheckpointError::from(err).attach("commit table checkpoint redo failed")
-        })?;
+        let redo_cts = trx_sys
+            .commit_sys(sys_trx)
+            .change_runtime_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!(
+                    "operation=checkpoint_table, phase=commit_checkpoint_redo, table_id={table_id}"
+                )
+            })?;
         Ok(CheckpointOutcome::Published {
             checkpoint_ts,
             redo_cts,
@@ -532,8 +528,8 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
 
     fn resolve(
         mut self,
-        result: TableCheckpointResult<CheckpointOutcome>,
-    ) -> Result<CheckpointOutcome> {
+        result: RuntimeOrFatalResult<CheckpointOutcome>,
+    ) -> RuntimeOrFatalResult<CheckpointOutcome> {
         match result {
             Ok(outcome) => {
                 match outcome {
@@ -566,7 +562,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                         self.table.checkpoint_workflow.finish_publication();
                         drop(self.publish_lease.take());
                     }
-                    Err(err.into_public())
+                    Err(err)
                 }
             }
         }
@@ -624,19 +620,19 @@ enum SecondaryIndexSidecar {
 
 impl SecondaryIndexSidecar {
     #[inline]
-    fn new(metadata: &TableMetadata, index_spec: &IndexSpec) -> Result<Self> {
+    fn new(metadata: &TableMetadata, index_spec: &IndexSpec) -> Self {
         if index_spec.unique() {
-            Ok(Self::Unique {
-                encoder: secondary_disk_tree_encoder(metadata, index_spec, false)?,
+            Self::Unique {
+                encoder: secondary_disk_tree_encoder(metadata, index_spec, false),
                 puts: Vec::new(),
                 deletes: Vec::new(),
-            })
+            }
         } else {
-            Ok(Self::NonUnique {
-                encoder: secondary_disk_tree_encoder(metadata, index_spec, true)?,
+            Self::NonUnique {
+                encoder: secondary_disk_tree_encoder(metadata, index_spec, true),
                 inserts: Vec::new(),
                 deletes: Vec::new(),
-            })
+            }
         }
     }
 
@@ -729,7 +725,7 @@ struct SecondaryCheckpointSidecar {
 }
 
 impl SecondaryCheckpointSidecar {
-    fn new(metadata: &TableMetadata) -> Result<Self> {
+    fn new(metadata: &TableMetadata) -> RuntimeResult<Self> {
         let indexes = metadata
             .idx
             .active_indexes()
@@ -741,10 +737,10 @@ impl SecondaryCheckpointSidecar {
                         .iter()
                         .map(|index_key| index_key.col_no as usize)
                         .collect(),
-                    sidecar: SecondaryIndexSidecar::new(metadata, index_spec)?,
+                    sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<RuntimeResult<Vec<_>>>()?;
         Ok(Self { indexes })
     }
 
@@ -759,7 +755,7 @@ impl SecondaryCheckpointSidecar {
         page: &RowPage,
         row_idx: usize,
         row_id: RowID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         // Data checkpoint feeds committed-visible transition rows here, once
         // per row selected for persistence.
         for active in &mut self.indexes {
@@ -779,20 +775,28 @@ impl SecondaryCheckpointSidecar {
         index_no: usize,
         row_id: RowID,
         key: Vec<Val>,
-    ) -> Result<()> {
-        let active = self.indexes.get_mut(sidecar_pos).ok_or_else(|| {
-            Error::from(
-                Report::new(InternalError::IndexKeyMissing)
-                    .attach(format!("index_no={index_no}, sidecar_pos={sidecar_pos}")),
-            )
-        })?;
+    ) -> RuntimeResult<()> {
+        let active = self
+            .indexes
+            .get_mut(sidecar_pos)
+            .ok_or_else(|| Report::new(InternalError::IndexKeyMissing))
+            .attach_with(|| format!("index_no={index_no}, sidecar_pos={sidecar_pos}"))
+            .change_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!(
+                    "operation=add_secondary_checkpoint_delete, index_no={index_no}, row_id={row_id}"
+                )
+            })?;
         if active.index_no != index_no {
             return Err(Report::new(InternalError::IndexKeyMissing)
                 .attach(format!(
                     "secondary sidecar index mismatch: sidecar_pos={sidecar_pos}, expected_index_no={index_no}, actual_index_no={}",
                     active.index_no
                 ))
-                .into());
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=add_secondary_checkpoint_delete, index_no={index_no}, row_id={row_id}"
+                )));
         }
         active.sidecar.add_delete(key, row_id);
         Ok(())
@@ -804,10 +808,11 @@ pub(crate) fn secondary_disk_tree_encoder(
     metadata: &TableMetadata,
     index_spec: &IndexSpec,
     append_row_id: bool,
-) -> Result<BTreeKeyEncoder> {
-    if index_spec.cols.is_empty() {
-        return Err(invalid_index_spec("index has no key columns"));
-    }
+) -> BTreeKeyEncoder {
+    assert!(
+        !index_spec.cols.is_empty(),
+        "secondary-index encoder invariant violated: index has no key columns"
+    );
     let mut types = Vec::with_capacity(index_spec.cols.len() + usize::from(append_row_id));
     for key in &index_spec.cols {
         let col_no = key.col_no as usize;
@@ -816,20 +821,18 @@ pub(crate) fn secondary_disk_tree_encoder(
             .col_types()
             .get(col_no)
             .copied()
-            .ok_or_else(|| invalid_index_spec(format!("index column {col_no} is out of range")))?;
+            .unwrap_or_else(|| {
+                panic!(
+                    "secondary-index encoder invariant violated: column_no={col_no}, column_count={}",
+                    metadata.col.col_count()
+                )
+            });
         types.push(ty);
     }
     if append_row_id {
         types.push(ValType::new(ValKind::U64, false));
     }
-    Ok(BTreeKeyEncoder::new(types))
-}
-
-#[inline]
-fn invalid_index_spec(message: impl Into<String>) -> Error {
-    Report::new(ConfigError::InvalidIndexSpec)
-        .attach(message.into())
-        .into()
+    BTreeKeyEncoder::new(types)
 }
 
 #[inline]
@@ -866,30 +869,20 @@ fn normalize_encoded_keys(keys: &mut Vec<Vec<u8>>) {
     keys.dedup();
 }
 
-fn invalid_reachable_block(root_ts: TrxID, block_id: BlockID, message: impl Into<String>) -> Error {
-    Report::new(DataIntegrityError::InvalidRootInvariant)
-        .attach(format!(
-            "invalid table-root reachable block: root_ts={root_ts}, block_id={block_id}, {}",
-            message.into()
-        ))
-        .into()
-}
-
-fn validate_reachable_block(root: &ActiveRoot, block_id: BlockID) -> Result<()> {
+fn validate_reachable_block(root: &ActiveRoot, block_id: BlockID) -> DataIntegrityResult<()> {
     let idx = usize::from(block_id);
     if idx >= root.alloc_map.len() {
-        return Err(invalid_reachable_block(
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+            "invalid table-root reachable block: root_ts={}, block_id={block_id}, alloc_map_len={}",
             root.root_ts,
-            block_id,
-            format!("alloc_map_len={}", root.alloc_map.len()),
-        ));
+            root.alloc_map.len()
+        )));
     }
     if !root.alloc_map.is_allocated(idx) {
-        return Err(invalid_reachable_block(
-            root.root_ts,
-            block_id,
-            "allocation bit is not set",
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+            "invalid table-root reachable block: root_ts={}, block_id={block_id}, allocation bit is not set",
+            root.root_ts
+        )));
     }
     Ok(())
 }
@@ -900,7 +893,7 @@ impl Table {
         root: &ActiveRoot,
         layout: &TableRuntimeLayout,
         reachable: &mut BTreeSet<BlockID>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         if root.secondary_index_roots.len() != layout.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
@@ -908,7 +901,12 @@ impl Table {
                     root.secondary_index_roots.len(),
                     layout.index_slot_count()
                 ))
-                .into());
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=collect_root_reachable_blocks, table_id={}, root_ts={}",
+                    self.table_id(),
+                    root.root_ts
+                )));
         }
 
         let mut root_reachable = BTreeSet::new();
@@ -928,7 +926,14 @@ impl Table {
             );
             column_index
                 .collect_reachable_blocks(&mut root_reachable)
-                .await?;
+                .await
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_root_reachable_blocks, phase=walk_column_index, table_id={}, root_ts={}",
+                        self.table_id(), root.root_ts
+                    )
+                })?;
         }
 
         for (index_no, index_slot) in layout.secondary_indexes().iter().enumerate() {
@@ -939,7 +944,11 @@ impl Table {
                         .attach(format!(
                             "inactive secondary index slot has root: index_no={index_no}, root={root_block_id}"
                         ))
-                        .into());
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach(format!(
+                            "operation=collect_root_reachable_blocks, table_id={}, root_ts={}",
+                            self.table_id(), root.root_ts
+                        )));
                 }
                 continue;
             };
@@ -950,11 +959,25 @@ impl Table {
             let disk_pool_guard = runtime.disk_pool_guard();
             runtime
                 .collect_reachable_blocks(root_block_id, &disk_pool_guard, &mut root_reachable)
-                .await?;
+                .await
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_root_reachable_blocks, phase=walk_secondary_index, table_id={}, index_no={index_no}, root_block_id={root_block_id}",
+                        self.table_id()
+                    )
+                })?;
         }
 
         for block_id in root_reachable {
-            validate_reachable_block(root, block_id)?;
+            validate_reachable_block(root, block_id)
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_root_reachable_blocks, phase=validate_block, table_id={}, root_ts={}, block_id={block_id}",
+                        self.table_id(), root.root_ts
+                    )
+                })?;
             reachable.insert(block_id);
         }
         Ok(())
@@ -964,7 +987,7 @@ impl Table {
         &self,
         mutable_file: &mut MutableTableFile,
         layout: &TableRuntimeLayout,
-    ) -> Result<usize> {
+    ) -> RuntimeResult<usize> {
         let mut reachable = BTreeSet::new();
         self.collect_root_reachable_blocks(
             self.file().active_root_unchecked(),
@@ -974,7 +997,15 @@ impl Table {
         .await?;
         self.collect_root_reachable_blocks(mutable_file.root(), layout, &mut reachable)
             .await?;
-        mutable_file.rebuild_alloc_map_from_reachable(&reachable)
+        mutable_file
+            .rebuild_alloc_map_from_reachable(&reachable)
+            .change_context(RuntimeError::CheckpointExecution)
+            .attach_with(|| {
+                format!(
+                    "operation=rebuild_reachable_alloc_map, table_id={}",
+                    self.table_id()
+                )
+            })
     }
 
     async fn apply_deletion_checkpoint(
@@ -984,7 +1015,7 @@ impl Table {
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let disk_pool = self.disk_pool();
         let disk_pool_guard = disk_pool.pool_guard();
         let (column_block_index_root, pivot_row_id, deletion_cutoff_ts) = {
@@ -1034,6 +1065,11 @@ impl Table {
                 .attach(format!(
                     "eligible delete markers require column index: column_block_index_root={column_block_index_root}, pivot_row_id={pivot_row_id}"
                 ))
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=apply_deletion_checkpoint, phase=validate_column_index, table_id={}",
+                    self.table_id()
+                ))
                 .into());
         }
 
@@ -1069,24 +1105,42 @@ impl Table {
                         .attach(format!(
                             "eligible delete marker cannot be located: row_id={row_id}"
                         ))
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach(format!(
+                            "operation=apply_deletion_checkpoint, phase=locate_delete_marker, table_id={}, row_id={row_id}",
+                            self.table_id()
+                        ))
                         .into());
                 };
                 cached_entry = Some(entry);
                 entry
             };
-            let delta_u64 = row_id.checked_sub(entry.start_row_id).ok_or_else(|| {
-                Error::from(
-                    Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
+            let delta_u64 = row_id
+                .checked_sub(entry.start_row_id)
+                .ok_or_else(|| Report::new(DataIntegrityError::InvalidRootInvariant))
+                .attach_with(|| {
+                    format!(
                         "delete marker precedes block start: row_id={row_id}, start_row_id={}",
                         entry.start_row_id
-                    )),
-                )
-            })?;
+                    )
+                })
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=apply_deletion_checkpoint, phase=calculate_delete_delta, table_id={}, row_id={row_id}",
+                        self.table_id()
+                    )
+                })?;
             if delta_u64 > u32::MAX as u64 {
                 return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                     .attach(format!(
                         "delete marker delta exceeds u32: delta={delta_u64}, row_id={row_id}, start_row_id={}",
                         entry.start_row_id
+                    ))
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach(format!(
+                        "operation=apply_deletion_checkpoint, phase=validate_delete_delta, table_id={}, row_id={row_id}",
+                        self.table_id()
                     ))
                     .into());
             }
@@ -1112,6 +1166,11 @@ impl Table {
             // least one patch group or fail above.
             return Err(Report::new(InternalError::ColumnIndexRewriteMiss)
                 .attach("delete marker selection produced no patch groups")
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=apply_deletion_checkpoint, table_id={}",
+                    self.table_id()
+                ))
                 .into());
         }
 
@@ -1174,7 +1233,7 @@ impl Table {
         layout: &TableRuntimeLayout,
         sidecar: &mut SecondaryCheckpointSidecar,
         checkpoint_ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeOrFatalResult<()> {
         if sidecar.is_empty() {
             return Ok(());
         }
@@ -1192,6 +1251,11 @@ impl Table {
                     mutable_file.secondary_index_roots().len(),
                     metadata.idx.index_slot_count()
                 ))
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=apply_secondary_checkpoint_sidecar, table_id={}",
+                    self.table_id()
+                ))
                 .into());
         }
 
@@ -1202,6 +1266,11 @@ impl Table {
             if metadata.idx.index_spec(index_no).is_none() {
                 return Err(Report::new(InternalError::IndexKeyMissing)
                     .attach(format!("index_no={index_no}"))
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach(format!(
+                        "operation=apply_secondary_checkpoint_sidecar, table_id={}, index_no={index_no}",
+                        self.table_id()
+                    ))
                     .into());
             }
             let index_sidecar = &mut active.sidecar;
@@ -1209,7 +1278,15 @@ impl Table {
             if !index_sidecar.has_work() {
                 continue;
             }
-            let old_root = mutable_file.secondary_index_root(index_no)?;
+            let old_root = mutable_file
+                .secondary_index_root(index_no)
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=apply_secondary_checkpoint_sidecar, phase=load_index_root, table_id={}, index_no={index_no}",
+                        self.table_id()
+                    )
+                })?;
             let runtime = layout.secondary_index(index_no)?.disk_runtime();
             let new_root = match index_sidecar {
                 SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
@@ -1261,7 +1338,15 @@ impl Table {
             if new_root != old_root {
                 // The root update stays private to mutable_file until the
                 // final table-file commit publishes every checkpoint change.
-                mutable_file.set_secondary_index_root(index_no, new_root)?;
+                mutable_file
+                    .set_secondary_index_root(index_no, new_root)
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach_with(|| {
+                        format!(
+                            "operation=apply_secondary_checkpoint_sidecar, phase=set_index_root, table_id={}, index_no={index_no}",
+                            self.table_id()
+                        )
+                    })?;
             }
         }
         Ok(())
@@ -1274,7 +1359,7 @@ impl Table {
         delete_deltas: &[u32],
         metadata: &TableMetadata,
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         if secondary_sidecar.indexes.is_empty() || delete_deltas.is_empty() {
             return Ok(());
         }
@@ -1291,7 +1376,12 @@ impl Table {
                     entry.row_count(),
                     row_ids.len()
                 ))
-                .into());
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={}",
+                    self.table_id(),
+                    entry.block_id()
+                )));
         }
         let dense_row_ids = row_ids.len() == entry.row_id_span() as usize
             && row_ids
@@ -1322,7 +1412,11 @@ impl Table {
                     block.row_shape_fingerprint(),
                     entry.row_shape_fingerprint()
                 ))
-                .into());
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
+                    self.table_id()
+                )));
         }
 
         let mut sparse_row_idx = 0usize;
@@ -1330,21 +1424,31 @@ impl Table {
             let row_id = entry
                 .start_row_id
                 .checked_add(u64::from(*delta))
-                .ok_or_else(|| {
-                    Error::from(
-                        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                            "delete delta overflows row id: start_row_id={}, delta={delta}",
-                            entry.start_row_id
-                        )),
+                .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))
+                .attach_with(|| {
+                    format!(
+                        "delete delta overflows row id: start_row_id={}, delta={delta}",
+                        entry.start_row_id
+                    )
+                })
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
+                        self.table_id()
                     )
                 })?;
             let row_idx = if dense_row_ids {
-                usize::try_from(*delta).map_err(|_| {
-                    Error::from(
-                        Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!("delete delta does not fit usize: delta={delta}")),
-                    )
-                })?
+                usize::try_from(*delta)
+                    .change_context(DataIntegrityError::InvalidPayload)
+                    .attach_with(|| format!("delete delta does not fit usize: delta={delta}"))
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach_with(|| {
+                        format!(
+                            "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
+                            self.table_id()
+                        )
+                    })?
             } else {
                 while row_ids
                     .get(sparse_row_idx)
@@ -1357,7 +1461,11 @@ impl Table {
                         .attach(format!(
                             "delete delta does not map to row id: row_id={row_id}, delta={delta}"
                         ))
-                        .into());
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach(format!(
+                            "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
+                            self.table_id()
+                        )));
                 }
                 sparse_row_idx
             };
@@ -1367,15 +1475,23 @@ impl Table {
                         "delete delta row index out of bounds: row_idx={row_idx}, row_count={}",
                         row_ids.len()
                     ))
-                    .into());
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach(format!(
+                        "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
+                        self.table_id()
+                    )));
             }
             for sidecar_pos in 0..secondary_sidecar.indexes.len() {
                 let (index_no, key) = {
                     let active = &secondary_sidecar.indexes[sidecar_pos];
                     let key = block
                         .decode_row_values(metadata.col.as_ref(), row_idx, active.key_cols.as_ref())
+                        .change_context(RuntimeError::CheckpointExecution)
                         .attach_with(|| {
-                            format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                            format!(
+                                "operation=collect_deleted_secondary_sidecar, table_id={}, file={file_kind}, block=lwc_block, block_id={block_id}, row_idx={row_idx}",
+                                self.table_id()
+                            )
                         })?;
                     (active.index_no, key)
                 };
@@ -1402,7 +1518,7 @@ impl Table {
         &self,
         session: &SessionPin,
         reason: CheckpointDelayReason,
-    ) -> Result<()> {
+    ) -> RuntimeOrFatalResult<()> {
         match reason {
             CheckpointDelayReason::ActiveRoot {
                 table_id,
@@ -1425,7 +1541,7 @@ impl Table {
         &self,
         session: &SessionPin,
         effective_ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let trx_sys = &session.engine.trx_sys;
         loop {
             ensure_maintenance_wait_running(session, "wait for active-root checkpoint retry")?;
@@ -1463,7 +1579,7 @@ impl Table {
         &self,
         session: &SessionPin,
         page_id: PageID,
-    ) -> Result<()> {
+    ) -> RuntimeOrFatalResult<()> {
         ensure_maintenance_wait_running(session, "wait for frozen-page checkpoint retry")?;
         let mut attempt = match self.checkpoint_workflow.begin_checkpoint(&self.lifecycle) {
             Ok(attempt) => attempt,
@@ -1574,7 +1690,7 @@ impl Table {
         &self,
         session: &SessionPin,
         max_rows: usize,
-    ) -> Result<FreezeOutcome> {
+    ) -> RuntimeResult<FreezeOutcome> {
         let mut attempt = match self.checkpoint_workflow.begin_freeze(&self.lifecycle) {
             Ok(attempt) => attempt,
             Err(outcome) => return Ok(outcome),
@@ -1626,7 +1742,7 @@ impl Table {
         &self,
         guards: &PoolGuards,
         start_row_id: RowID,
-    ) -> Result<Option<TrxID>> {
+    ) -> RuntimeResult<Option<TrxID>> {
         let mut heap_redo_start_ts = None;
         self.mem
             .scan_from(guards, start_row_id, |page_guard| {
@@ -1643,9 +1759,9 @@ impl Table {
         guards: &PoolGuards,
         prepared_pages: &[Option<PreparedTransitionPage>],
         mut collect_visible_row: Option<C>,
-    ) -> Result<Vec<LwcBlockPersist>>
+    ) -> RuntimeResult<Vec<LwcBlockPersist>>
     where
-        C: FnMut(&RowPage, usize, RowID) -> Result<()>,
+        C: FnMut(&RowPage, usize, RowID) -> RuntimeResult<()>,
     {
         #[cfg(test)]
         use super::test_hooks as table_test_hooks;
@@ -1661,7 +1777,11 @@ impl Table {
                 let Some(prepared) = prepared.as_ref() else {
                     return Err(Report::new(InternalError::LwcBuilderMisuse)
                         .attach("transitioned page has no prepared visibility plan")
-                        .into());
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach(format!(
+                            "operation=build_lwc_blocks, table_id={}",
+                            self.table_id()
+                        )));
                 };
                 let page_guard = self
                     .mem
@@ -1669,10 +1789,15 @@ impl Table {
                     .await?;
                 let page = page_guard.page();
                 assert_eq!(page.header.start_row_id, prepared.start_row_id);
-                let view = page.vector_view_with_del_bitmap(
-                    metadata.col.as_ref(),
-                    prepared.del_bitmap.clone(),
-                )?;
+                let view = page
+                    .vector_view_with_del_bitmap(metadata.col.as_ref(), prepared.del_bitmap.clone())
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach_with(|| {
+                        format!(
+                            "operation=build_lwc_blocks, phase=build_vector_view, table_id={}, page_id={}",
+                            self.table_id(), prepared.page_id
+                        )
+                    })?;
                 if view.rows_non_deleted() == 0 {
                     continue;
                 }
@@ -1694,30 +1819,61 @@ impl Table {
                                 "single row page does not fit in LWC block: page_id={}",
                                 prepared.page_id
                             ))
-                            .into());
+                            .change_context(RuntimeError::CheckpointExecution)
+                            .attach(format!(
+                                "operation=build_lwc_blocks, phase=append_page, table_id={}",
+                                self.table_id()
+                            )));
                     }
                     let shape = ColumnBlockEntryShape::new(
                         current_start,
                         current_end,
                         builder.row_ids().to_vec(),
                         Vec::new(),
-                    )?;
-                    let buf = builder.build(shape.row_shape_fingerprint())?;
+                    )
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach_with(|| {
+                        format!(
+                            "operation=build_lwc_blocks, phase=build_block_shape, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
+                            self.table_id()
+                        )
+                    })?;
+                    let buf = builder
+                        .build(shape.row_shape_fingerprint())
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach_with(|| {
+                            format!(
+                                "operation=build_lwc_blocks, phase=encode_block, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
+                                self.table_id()
+                            )
+                        })?;
                     lwc_blocks.push(LwcBlockPersist { shape, buf });
                     builder = LwcBuilder::new(metadata.col.as_ref());
                     current_start = prepared.start_row_id;
                     current_end = prepared.end_row_id;
-                    let view = page.vector_view_with_del_bitmap(
-                        metadata.col.as_ref(),
-                        prepared.del_bitmap.clone(),
-                    )?;
+                    let view = page
+                        .vector_view_with_del_bitmap(
+                            metadata.col.as_ref(),
+                            prepared.del_bitmap.clone(),
+                        )
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach_with(|| {
+                            format!(
+                                "operation=build_lwc_blocks, phase=rebuild_vector_view, table_id={}, page_id={}",
+                                self.table_id(), prepared.page_id
+                            )
+                        })?;
                     if !builder.append_view(view, prepared.start_row_id) {
                         return Err(Report::new(InternalError::LwcBuilderMisuse)
                             .attach(format!(
                                 "single row page does not fit in LWC block: page_id={}",
                                 prepared.page_id
                             ))
-                            .into());
+                            .change_context(RuntimeError::CheckpointExecution)
+                            .attach(format!(
+                                "operation=build_lwc_blocks, phase=append_page, table_id={}",
+                                self.table_id()
+                            )));
                     }
                 } else {
                     current_end = prepared.end_row_id;
@@ -1729,8 +1885,23 @@ impl Table {
                     current_end,
                     builder.row_ids().to_vec(),
                     Vec::new(),
-                )?;
-                let buf = builder.build(shape.row_shape_fingerprint())?;
+                )
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=build_lwc_blocks, phase=build_final_block_shape, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
+                        self.table_id()
+                    )
+                })?;
+                let buf = builder
+                    .build(shape.row_shape_fingerprint())
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach_with(|| {
+                        format!(
+                            "operation=build_lwc_blocks, phase=encode_final_block, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
+                            self.table_id()
+                        )
+                    })?;
                 lwc_blocks.push(LwcBlockPersist { shape, buf });
             }
         }
@@ -1738,7 +1909,10 @@ impl Table {
     }
 
     /// Execute one user-table checkpoint attempt against table-owned workflow state.
-    pub(crate) async fn checkpoint(&self, session: &SessionPin) -> Result<CheckpointOutcome> {
+    pub(crate) async fn checkpoint(
+        &self,
+        session: &SessionPin,
+    ) -> RuntimeOrFatalResult<CheckpointOutcome> {
         let table_id = self.table_id();
         let result = match self.checkpoint_workflow.begin_checkpoint(&self.lifecycle) {
             Ok(attempt) => {
@@ -1773,13 +1947,11 @@ impl Table {
                 ),
             })
             .inspect_err(|err| {
-                if err.kind() == ErrorKind::Fatal {
-                    obs::error!(
-                        "event=checkpoint_publish component=table table_id={} action=poison result=error error={}",
-                        table_id,
-                        err
-                    );
-                }
+                obs::error!(
+                    "event=checkpoint_publish component=table table_id={} action=error result=error error={:?}",
+                    table_id,
+                    err
+                );
             })
     }
 }
@@ -1817,12 +1989,17 @@ fn silent_watermark_floor(
 }
 
 #[inline]
-fn ensure_maintenance_wait_running(session: &SessionPin, operation: &'static str) -> Result<()> {
+fn ensure_maintenance_wait_running(
+    session: &SessionPin,
+    operation: &'static str,
+) -> RuntimeOrFatalResult<()> {
     session.engine.poisoner.ensure_healthy()?;
     if session.engine.shutdown_started() {
-        return Err(Report::new(LifecycleError::Shutdown)
-            .attach(format!("{operation}: engine shutdown started"))
-            .into());
+        return Err(RuntimeOrFatalError::from(
+            Report::new(LifecycleError::Shutdown)
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!("{operation}: engine shutdown started")),
+        ));
     }
     Ok(())
 }
@@ -1830,15 +2007,16 @@ fn ensure_maintenance_wait_running(session: &SessionPin, operation: &'static str
 #[cfg(test)]
 mod tests {
     pub(crate) mod test_hooks {
-        use crate::error::{FatalError, InternalError, Result};
+        use crate::error::{FatalError, FatalResult, InternalError, RuntimeError, RuntimeResult};
         use error_stack::Report;
         use std::cell::{Cell, RefCell};
         use std::future::Future;
         use std::pin::Pin;
 
         type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
-        type FallibleTableHook =
-            Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + 'static>> + 'static>;
+        type FallibleTableHook = Box<
+            dyn FnOnce() -> Pin<Box<dyn Future<Output = RuntimeResult<()>> + 'static>> + 'static,
+        >;
 
         thread_local! {
             static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
@@ -1858,13 +2036,11 @@ mod tests {
             TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.set(enabled));
         }
 
-        pub(crate) fn maybe_force_secondary_sidecar_error() -> Result<()> {
+        pub(crate) fn maybe_force_secondary_sidecar_error() -> RuntimeResult<()> {
             if TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get()) {
-                // TODO(error-boundary): backlog 000160 should replace this
-                // generic hook with a checkpoint sidecar-specific failure.
-                return Err(Report::new(InternalError::Generic)
+                return Err(Report::new(InternalError::DiskTreeRewriteInvariant)
                     .attach("test secondary-index sidecar failure")
-                    .into());
+                    .change_context(RuntimeError::CheckpointExecution));
             }
             Ok(())
         }
@@ -1888,11 +2064,10 @@ mod tests {
             }
         }
 
-        pub(crate) fn maybe_force_post_publish_checkpoint_error() -> Result<()> {
+        pub(crate) fn maybe_force_post_publish_checkpoint_error() -> FatalResult<()> {
             if TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(Cell::get) {
                 return Err(Report::new(FatalError::CheckpointWrite)
-                    .attach("forced post-publication table checkpoint failure")
-                    .into());
+                    .attach("forced post-publication table checkpoint failure"));
             }
             Ok(())
         }
@@ -1912,11 +2087,10 @@ mod tests {
             }
         }
 
-        pub(crate) fn maybe_force_checkpoint_commit_error() -> Result<()> {
+        pub(crate) fn maybe_force_checkpoint_commit_error() -> FatalResult<()> {
             if TEST_FORCE_CHECKPOINT_COMMIT_ERROR.with(Cell::get) {
                 return Err(Report::new(FatalError::CheckpointWrite)
-                    .attach("forced table checkpoint commit failure")
-                    .into());
+                    .attach("forced table checkpoint commit failure"));
             }
             Ok(())
         }
@@ -1969,7 +2143,7 @@ mod tests {
         pub(crate) fn set_test_silent_watermark_mutation_hook<F, Fut>(hook: F)
         where
             F: FnOnce() -> Fut + 'static,
-            Fut: Future<Output = Result<()>> + 'static,
+            Fut: Future<Output = RuntimeResult<()>> + 'static,
         {
             TEST_SILENT_WATERMARK_MUTATION_HOOK.with(|slot| {
                 let old = slot
@@ -1997,7 +2171,7 @@ mod tests {
             }
         }
 
-        pub(crate) async fn run_test_silent_watermark_mutation_hook() -> Result<()> {
+        pub(crate) async fn run_test_silent_watermark_mutation_hook() -> RuntimeResult<()> {
             let hook = TEST_SILENT_WATERMARK_MUTATION_HOOK.with(|slot| slot.borrow_mut().take());
             match hook {
                 Some(hook) => hook().await,
@@ -2019,6 +2193,9 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableSpec};
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
+    use crate::error::{
+        Error, FatalError, LifecycleError, OperationError, RuntimeError, RuntimeOrFatalError,
+    };
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::io::install_storage_backend_test_hook;
@@ -2062,6 +2239,61 @@ mod tests {
     use std::task::Poll;
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_maintenance_wait_stacks_shutdown_under_checkpoint_runtime() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-shutdown").await;
+            let session = engine.new_session().unwrap();
+            let pin = session.pin().unwrap();
+
+            thread::scope(|scope| {
+                let shutdown = scope.spawn(|| engine.shutdown());
+                while !pin.engine.shutdown_started() {
+                    thread::yield_now();
+                }
+
+                let err =
+                    ensure_maintenance_wait_running(&pin, "test maintenance wait").unwrap_err();
+                let RuntimeOrFatalError::Runtime(err) = err else {
+                    panic!("shutdown must remain a recoverable checkpoint Runtime failure");
+                };
+                assert_eq!(*err.current_context(), RuntimeError::CheckpointExecution);
+                assert_eq!(
+                    err.downcast_ref::<LifecycleError>().copied(),
+                    Some(LifecycleError::Shutdown)
+                );
+
+                drop(pin);
+                shutdown.join().unwrap().unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn test_maintenance_wait_preserves_existing_fatal_reason() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "maintenance-wait-poison").await;
+            let session = engine.new_session().unwrap();
+            let pin = session.pin().unwrap();
+            engine
+                .inner()
+                .poisoner
+                .poison(Report::new(FatalError::RedoWrite).attach("test redo poison"));
+
+            let err = ensure_maintenance_wait_running(&pin, "test maintenance wait").unwrap_err();
+            let RuntimeOrFatalError::Fatal(err) = err else {
+                panic!("existing poison must remain Fatal");
+            };
+            assert_eq!(*err.current_context(), FatalError::RedoWrite);
+
+            drop(pin);
+            drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
 
     async fn row_page_states(table: &Table, guards: &PoolGuards) -> Vec<RowPageState> {
         let mut states = Vec::new();
@@ -2474,11 +2706,7 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let metadata = table.metadata();
             let guards = session.pool_guards();
-            let page_guard = table
-                .mem
-                .try_get_insert_page(&guards, 1, None)
-                .await
-                .unwrap();
+            let page_guard = table.mem.try_get_insert_page(&guards, 1).await.unwrap();
             let page = page_guard.page();
             let payload_len =
                 page.header.var_field_offset() - usize::from(page.header.fix_field_end);
@@ -2502,16 +2730,15 @@ mod tests {
                     &metadata,
                     &guards,
                     &[Some(prepared)],
-                    None::<fn(&RowPage, usize, RowID) -> Result<()>>,
+                    None::<fn(&RowPage, usize, RowID) -> RuntimeResult<()>>,
                 )
                 .await
             {
                 Ok(_) => panic!("oversized first row page should fail LWC block build"),
                 Err(err) => err,
             };
-            assert_eq!(err.kind(), ErrorKind::Internal);
             assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
+                err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::LwcBuilderMisuse)
             );
             let report = format!("{err:?}");
@@ -4492,7 +4719,7 @@ mod tests {
             drop(transition_pages);
             drop(attempt);
             assert_checkpoint_workflow_closed(&table);
-            table.mark_dropped_lifecycle().unwrap();
+            table.mark_dropped_lifecycle();
             drop(root_lease);
         });
     }
@@ -4619,88 +4846,37 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_error_preserves_top_fatal_reason() {
-        let err =
-            Error::from(Report::new(FatalError::CatalogWrite).attach("fatal checkpoint source"));
+    fn test_checkpoint_carrier_preserves_fatal_reason() {
+        let err = RuntimeOrFatalError::Fatal(
+            Report::new(FatalError::CatalogWrite).attach("fatal checkpoint source"),
+        );
 
-        let report = TableCheckpointError::from(err).into_fatal_report(FatalError::CheckpointWrite);
+        let report = err.into_fatal_report(FatalError::CheckpointWrite);
 
         assert_eq!(*report.current_context(), FatalError::CatalogWrite);
         assert!(format!("{report:?}").contains("fatal checkpoint source"));
     }
 
     #[test]
-    fn test_checkpoint_error_ignores_buried_fatal_reason() {
-        let err = Error::from(
-            Report::new(FatalError::RedoSync)
-                .change_context(OperationError::NotSupported)
-                .attach("nonfatal checkpoint boundary"),
+    fn test_checkpoint_runtime_carrier_uses_fallback_reason() {
+        let err = RuntimeOrFatalError::Runtime(
+            Report::new(InternalError::MutableRootMetadataRegression)
+                .attach("typed checkpoint invariant")
+                .change_context(RuntimeError::CheckpointExecution),
         );
-        assert_eq!(err.kind(), ErrorKind::Operation);
 
-        let report = TableCheckpointError::from(err).into_fatal_report(FatalError::CheckpointWrite);
-
-        assert_eq!(*report.current_context(), FatalError::CheckpointWrite);
-        assert!(format!("{report:?}").contains("nonfatal checkpoint boundary"));
-    }
-
-    #[test]
-    fn test_checkpoint_internal_error_uses_fallback_reason() {
-        let report = Report::new(InternalError::MutableRootMetadataRegression)
-            .attach("typed checkpoint invariant");
-
-        let report =
-            TableCheckpointError::from(report).into_fatal_report(FatalError::CheckpointWrite);
+        let report = err.into_fatal_report(FatalError::CheckpointWrite);
 
         assert_eq!(*report.current_context(), FatalError::CheckpointWrite);
+        assert_eq!(
+            report.downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::CheckpointExecution)
+        );
         assert_eq!(
             report.downcast_ref::<InternalError>().copied(),
             Some(InternalError::MutableRootMetadataRegression)
         );
-    }
-
-    #[test]
-    fn test_checkpoint_operation_error_stays_typed_until_resolution() {
-        let err = TableCheckpointError::from(
-            Report::new(OperationError::NotSupported).attach(CHECKPOINT_REQUIRES_IDLE_SESSION),
-        );
-        assert!(matches!(&err, TableCheckpointError::Operation(_)));
-
-        let err = err.into_public();
-        assert_eq!(err.kind(), ErrorKind::Operation);
-        assert_eq!(
-            err.report().downcast_ref::<OperationError>().copied(),
-            Some(OperationError::NotSupported)
-        );
-    }
-
-    #[test]
-    fn test_checkpoint_operation_error_uses_fallback_reason() {
-        let report =
-            Report::new(OperationError::NotSupported).attach("typed checkpoint operation failure");
-
-        let report =
-            TableCheckpointError::from(report).into_fatal_report(FatalError::CheckpointWrite);
-
-        assert_eq!(*report.current_context(), FatalError::CheckpointWrite);
-        assert_eq!(
-            report.downcast_ref::<OperationError>().copied(),
-            Some(OperationError::NotSupported)
-        );
-        assert!(format!("{report:?}").contains("typed checkpoint operation failure"));
-    }
-
-    #[test]
-    fn test_checkpoint_lifecycle_error_stays_typed_until_resolution() {
-        let err = TableCheckpointError::from(Report::new(LifecycleError::Shutdown));
-        assert!(matches!(&err, TableCheckpointError::Lifecycle(_)));
-
-        let err = err.into_public();
-        assert_eq!(err.kind(), ErrorKind::Lifecycle);
-        assert_eq!(
-            err.report().downcast_ref::<LifecycleError>().copied(),
-            Some(LifecycleError::Shutdown)
-        );
+        assert!(format!("{report:?}").contains("typed checkpoint invariant"));
     }
 
     #[test]
@@ -5633,11 +5809,9 @@ mod tests {
                 prepare_silent_checkpoint_failure(&engine, &mut session).await;
             let guards = session.pool_guards();
             set_test_silent_watermark_mutation_hook(|| async {
-                // TODO(error-boundary): backlog 000160 should replace this
-                // generic hook with the owning catalog-write source domain.
-                Err(Report::new(InternalError::Generic)
+                Err(Report::new(InternalError::SilentWatermarkRedoConflict)
                     .attach("test silent-watermark mutation failure")
-                    .into())
+                    .change_context(RuntimeError::CatalogAccess))
             });
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
@@ -5769,7 +5943,7 @@ mod tests {
                 "uncheckpointed watermark rows must not update durable cache"
             );
 
-            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snapshot = engine.catalog().storage.checkpoint_snapshot();
             let (live_before_catalog_checkpoint, _) = engine
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
@@ -5794,7 +5968,7 @@ mod tests {
                 checkpointed_floor.deletion_cutoff_ts,
                 watermark.deletion_cutoff_ts
             );
-            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snapshot = engine.catalog().storage.checkpoint_snapshot();
             let (live_after_catalog_checkpoint, _) = engine
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);

@@ -305,7 +305,7 @@ impl<'a> RecoveryCoordinator<'a> {
     }
 
     async fn bootstrap_checkpointed_user_tables(&mut self) -> Result<()> {
-        let snapshot = self.resources.catalog.storage.checkpoint_snapshot()?;
+        let snapshot = self.resources.catalog.storage.checkpoint_snapshot();
         self.timeline
             .seed_catalog_checkpoint(snapshot.catalog_replay_start_ts);
 
@@ -771,7 +771,7 @@ impl<'a> RecoveryCoordinator<'a> {
             // protects the log range needed to recover the DROP again.
             self.resources
                 .catalog
-                .insert_dropped_table_floor(table_id, cts, replay_floor)?;
+                .insert_dropped_table_floor(table_id, cts, replay_floor);
         }
         self.timeline.table_bounds.remove(&table_id);
         self.recovered_tables.remove(&table_id);
@@ -948,7 +948,13 @@ impl<'a> RecoveryCoordinator<'a> {
         let active_root = table
             .as_ref()
             .map(|table| table.file().active_root_unchecked());
-        classify_index_ddl_root(kind, table_id, index_no, cts, active_root)
+        Ok(classify_index_ddl_root(
+            kind,
+            table_id,
+            index_no,
+            cts,
+            active_root,
+        )?)
     }
 
     async fn dispatch_dml(&mut self, dml: BTreeMap<TableID, TableDML>, cts: TrxID) -> Result<()> {
@@ -1246,6 +1252,7 @@ mod tests {
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use crate::value::ValKind;
+    use error_stack::Report;
     use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -1277,6 +1284,32 @@ mod tests {
             err.report()
                 .downcast_ref::<CompletionErrorBridge>()
                 .is_none(),
+            "{report}"
+        );
+        assert!(report.contains("table_file"), "{report}");
+        assert!(report.contains(block_kind), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+    }
+
+    fn assert_table_runtime_data_integrity(
+        err: Report<RuntimeError>,
+        block_kind: &str,
+        block_id: BlockID,
+        expected: DataIntegrityError,
+    ) {
+        let report = format!("{err:?}");
+        assert_eq!(
+            err.current_context(),
+            &RuntimeError::IndexAccess,
+            "{report}"
+        );
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected),
+            "{report}"
+        );
+        assert!(
+            err.downcast_ref::<CompletionErrorBridge>().is_none(),
             "{report}"
         );
         assert!(report.contains("table_file"), "{report}");
@@ -1460,7 +1493,6 @@ mod tests {
             .catalog()
             .storage
             .checkpoint_snapshot()
-            .unwrap()
             .catalog_replay_start_ts;
         assert!(replay_floor > MIN_SNAPSHOT_TS);
         drop(engine);
@@ -1744,54 +1776,48 @@ mod tests {
                     .storage
                     .tables()
                     .delete_by_id(stmt, table_id)
-                    .await
+                    .await?
             );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .tables()
-                    .insert(
-                        stmt,
-                        &TableObject {
-                            table_id,
-                            next_index_no: 2,
-                        },
-                    )
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .insert(
-                        stmt,
-                        &IndexObject {
-                            table_id,
-                            index_no: 1,
-                            index_attributes: IndexAttributes::empty(),
-                        },
-                    )
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .index_columns()
-                    .insert(
-                        stmt,
-                        &IndexColumnObject {
-                            table_id,
-                            index_no: 1,
-                            index_column_no: 0,
-                            column_no: 1,
-                            index_order: IndexOrder::Asc,
-                        },
-                    )
-                    .await
-            );
+            engine
+                .catalog()
+                .storage
+                .tables()
+                .insert(
+                    stmt,
+                    &TableObject {
+                        table_id,
+                        next_index_no: 2,
+                    },
+                )
+                .await?;
+            engine
+                .catalog()
+                .storage
+                .indexes()
+                .insert(
+                    stmt,
+                    &IndexObject {
+                        table_id,
+                        index_no: 1,
+                        index_attributes: IndexAttributes::empty(),
+                    },
+                )
+                .await?;
+            engine
+                .catalog()
+                .storage
+                .index_columns()
+                .insert(
+                    stmt,
+                    &IndexColumnObject {
+                        table_id,
+                        index_no: 1,
+                        index_column_no: 0,
+                        column_no: 1,
+                        index_order: IndexOrder::Asc,
+                    },
+                )
+                .await?;
             let old = stmt.effects_mut().set_ddl_redo(DDLRedo::CreateIndex {
                 table_id,
                 index_no: 1,
@@ -1825,7 +1851,7 @@ mod tests {
                     .storage
                     .indexes()
                     .delete_by_id(stmt, table_id, 1)
-                    .await
+                    .await?
             );
             let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
                 table_id,
@@ -2315,7 +2341,7 @@ mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snapshot = engine.catalog().storage.checkpoint_snapshot();
             assert!(snapshot.catalog_replay_start_ts > ddl_cts);
             drop(engine);
 
@@ -2356,7 +2382,7 @@ mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snapshot = engine.catalog().storage.checkpoint_snapshot();
             assert!(snapshot.catalog_replay_start_ts > ddl_cts);
             drop(engine);
 
@@ -2529,7 +2555,7 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::Runtime);
             assert_eq!(
                 err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::RedoLogDiscovery)
+                Some(RuntimeError::RedoLogAccess)
             );
             assert_eq!(
                 err.report().downcast_ref::<DataIntegrityError>().copied(),
@@ -2820,7 +2846,7 @@ mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap = engine.catalog().storage.checkpoint_snapshot();
             assert!(snap.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
             drop(session);
@@ -2917,7 +2943,7 @@ mod tests {
                     .build()
                     .await
                     .unwrap();
-            let snapshot = recovered.catalog().storage.checkpoint_snapshot().unwrap();
+            let snapshot = recovered.catalog().storage.checkpoint_snapshot();
             let (live_before_catalog_checkpoint, _) = recovered
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
@@ -2958,7 +2984,7 @@ mod tests {
                     .build()
                     .await
                     .unwrap();
-            let snapshot = recovered.catalog().storage.checkpoint_snapshot().unwrap();
+            let snapshot = recovered.catalog().storage.checkpoint_snapshot();
             let (live_after_catalog_checkpoint, _) = recovered
                 .catalog()
                 .snapshot_user_table_redo_floors(snapshot.catalog_replay_start_ts);
@@ -3007,7 +3033,6 @@ mod tests {
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
-                .unwrap()
                 .catalog_replay_start_ts;
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -3413,7 +3438,6 @@ mod tests {
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
-                .unwrap()
                 .catalog_replay_start_ts;
             assert!(catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
@@ -3696,7 +3720,6 @@ mod tests {
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
-                .unwrap()
                 .catalog_replay_start_ts;
             assert!(baseline_catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
@@ -3772,7 +3795,6 @@ mod tests {
                 .catalog()
                 .storage
                 .checkpoint_snapshot()
-                .unwrap()
                 .catalog_replay_start_ts;
             assert!(final_catalog_replay_start_ts > baseline_catalog_replay_start_ts);
 
@@ -4121,7 +4143,7 @@ mod tests {
                     Ok(_) => panic!("expected invalid delete blob on delta load"),
                     Err(err) => err,
                 };
-                assert_table_data_integrity(
+                assert_table_runtime_data_integrity(
                     err,
                     "column_deletion_blob",
                     blob_ref.start_block_id,

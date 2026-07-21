@@ -335,8 +335,9 @@ impl TransactionSystem {
             .await
         {
             Ok(retired_row_pages) => Ok(retired_row_pages),
-            Err(_) => {
-                let report = Report::new(FatalError::PurgeAccess)
+            Err(err) => {
+                let report = err
+                    .change_context(FatalError::PurgeAccess)
                     .attach("purge transaction-list access failed");
                 obs::error!(
                     "event=engine_poison component=purge action=poison result=error error={:?}",
@@ -384,7 +385,7 @@ impl TransactionSystem {
         guards: &PoolGuards,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
-    ) -> Result<Vec<RetiredRowPageBatch>> {
+    ) -> RuntimeResult<Vec<RetiredRowPageBatch>> {
         let mut table_cache = TableCache::new(catalog);
         let purge_trx_count = trx_list.len();
         let mut purge_row_count = 0;
@@ -615,10 +616,11 @@ impl TransactionSystem {
         // destroy, unlink failure is retryable and does not poison the engine:
         // retain the catalog floor entry and requeue failed ready items so a
         // later purge wake can retry without scanning every catalog table.
-        let catalog_replay_start_ts = match self.catalog.storage.checkpoint_snapshot() {
-            Ok(snapshot) => snapshot.catalog_replay_start_ts,
-            Err(_) => return,
-        };
+        let catalog_replay_start_ts = self
+            .catalog
+            .storage
+            .checkpoint_snapshot()
+            .catalog_replay_start_ts;
         // Drain only the checkpoint-ready prefix. Newer entries stay queued,
         // preserving order without a full drain-and-requeue pass.
         let file_deletes = self

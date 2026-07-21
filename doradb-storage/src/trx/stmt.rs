@@ -2,7 +2,11 @@ use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
-use crate::error::{FatalError, LifecycleResult, OperationError, OperationResult, Result};
+use crate::error::{
+    FatalError, FatalResult, LifecycleResult, MultiDomainResultExt, OperationError,
+    OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult, Result, RuntimeError,
+    RuntimeResult,
+};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::obs;
@@ -10,7 +14,7 @@ use crate::row::ops::{
     DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 use crate::session::TrxAttachment;
-use crate::table::{DmlValidationResultExt, DmlValidator, LazyRow, Table};
+use crate::table::{DmlValidator, LazyRow, Table};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
@@ -20,6 +24,30 @@ use error_stack::{Report, ResultExt};
 use std::mem;
 use std::ops::RangeBounds;
 use std::sync::Arc;
+
+/// Catalog statement adapters preserve semantic Operation errors while adding
+/// a catalog integration context only to Runtime failures.
+///
+/// `change_runtime_context` is a domain-preserving carrier primitive and owns
+/// no operation identity. Its semantic callers chain `attach_with` immediately
+/// after reclassification.
+trait OperationOrRuntimeResultExt<T>: MultiDomainResultExt {
+    fn change_runtime_context(self, context: RuntimeError) -> Self;
+}
+
+impl<T> OperationOrRuntimeResultExt<T> for OperationOrRuntimeResult<T> {
+    #[inline]
+    fn change_runtime_context(self, context: RuntimeError) -> Self {
+        self.map_err(|error| match error {
+            OperationOrRuntimeError::Operation(report) => {
+                OperationOrRuntimeError::Operation(report)
+            }
+            OperationOrRuntimeError::Runtime(report) => {
+                OperationOrRuntimeError::Runtime(report.change_context(context))
+            }
+        })
+    }
+}
 
 /// Mutable effects accumulated by one statement before success or rollback.
 ///
@@ -162,7 +190,7 @@ impl StmtEffects {
         &mut self,
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         self.row_undo.rollback(table_cache, pool_guards).await
     }
 
@@ -173,7 +201,7 @@ impl StmtEffects {
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
         sts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         #[cfg(test)]
         tests::maybe_force_stmt_index_rollback_error()?;
         self.index_undo
@@ -406,11 +434,11 @@ impl<'stmt> Statement<'stmt> {
             .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
-        table
+        Ok(table
             .accessor_with_layout(&layout)
             .table_scan_mvcc(rt, read_set, row_action)
             .await
-            .map_err(|err| err.attach(format!("operation={OPERATION}, table_id={table_id}")))
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?)
     }
 
     /// Sequentially update callback-selected rows using latest modification reads.
@@ -476,10 +504,13 @@ impl<'stmt> Statement<'stmt> {
             .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
-        table
+        Ok(table
             .accessor_with_layout(&layout)
             .index_lookup_unique_mvcc(rt, index_no, key_vals, user_read_set)
             .await
+            .attach_with(|| {
+                format!("operation={OPERATION}, table_id={table_id}, index_no={index_no}")
+            })?)
     }
 
     /// Looks up one secondary-index key in a catalog-owned user table by table id.
@@ -505,10 +536,13 @@ impl<'stmt> Statement<'stmt> {
             .attach_with(|| format!("operation={OPERATION}"))?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
-        table
+        Ok(table
             .accessor_with_layout(&layout)
             .index_lookup_mvcc(rt, index_no, key_vals, user_read_set)
             .await
+            .attach_with(|| {
+                format!("operation={OPERATION}, table_id={table_id}, index_no={index_no}")
+            })?)
     }
 
     /// Scans one secondary-index range in a catalog-owned user table by table id.
@@ -539,13 +573,17 @@ impl<'stmt> Statement<'stmt> {
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_index_scan(index_no, &range, read_set)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
         let rt = self.runtime();
-        table
+        Ok(table
             .accessor_with_layout(&layout)
             .index_scan_mvcc(rt, index_no, range, read_set)
             .await
+            .attach_with(|| {
+                format!("operation={OPERATION}, table_id={table_id}, index_no={index_no}")
+            })?)
     }
 
     /// Inserts one row into a catalog-owned user table by table id.
@@ -567,7 +605,8 @@ impl<'stmt> Statement<'stmt> {
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_full_row(&cols)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
@@ -604,10 +643,12 @@ impl<'stmt> Statement<'stmt> {
             let validator = DmlValidator::new(layout.metadata());
             validator
                 .validate_full_row(&cols)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
             validator
                 .validate_unique_index(unique_index_no)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
@@ -645,10 +686,12 @@ impl<'stmt> Statement<'stmt> {
             let validator = DmlValidator::new(layout.metadata());
             validator
                 .validate_unique_key(index_no, key_vals)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
             validator
                 .validate_sparse_update(&update)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
@@ -685,7 +728,8 @@ impl<'stmt> Statement<'stmt> {
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_unique_key(index_no, key_vals)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
@@ -703,7 +747,20 @@ impl<'stmt> Statement<'stmt> {
         &mut self,
         table: &CatalogTable,
         cols: Vec<Val>,
-    ) -> Result<RowID> {
+    ) -> RuntimeResult<RowID> {
+        let table_id = table.table_id();
+        let result = self.catalog_insert_mvcc_inner(table, cols).await;
+        assert_catalog_mutation_invariant(table_id, result)
+    }
+
+    /// Performs the catalog insert before the caller asserts catalog-operation
+    /// invariants and narrows the result to the Runtime domain.
+    #[inline]
+    async fn catalog_insert_mvcc_inner(
+        &mut self,
+        table: &CatalogTable,
+        cols: Vec<Val>,
+    ) -> OperationOrRuntimeResult<RowID> {
         const OPERATION: &str = "catalog_insert_mvcc";
         let table_id = table.table_id();
         self.acquire_table_write_metadata_lock(table_id)
@@ -712,13 +769,18 @@ impl<'stmt> Statement<'stmt> {
         if !self.disable_dml_validation {
             DmlValidator::new(table.metadata())
                 .validate_full_row(&cols)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         let (rt, effects) = self.runtime_and_effects_mut();
-        table.insert_mvcc(rt, effects, cols).await
+        table
+            .insert_mvcc(rt, effects, cols)
+            .await
+            .change_runtime_context(RuntimeError::CatalogAccess)
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
     }
 
     /// Deletes one catalog-table row through the foreground lock-aware path.
@@ -729,7 +791,24 @@ impl<'stmt> Statement<'stmt> {
         index_no: usize,
         key_vals: &[Val],
         log_by_key: bool,
-    ) -> Result<DeleteMvcc> {
+    ) -> RuntimeResult<DeleteMvcc> {
+        let table_id = table.table_id();
+        let result = self
+            .catalog_delete_primary_key_mvcc_inner(table, index_no, key_vals, log_by_key)
+            .await;
+        assert_catalog_mutation_invariant(table_id, result)
+    }
+
+    /// Performs the catalog delete before the caller asserts catalog-operation
+    /// invariants and narrows the result to the Runtime domain.
+    #[inline]
+    async fn catalog_delete_primary_key_mvcc_inner(
+        &mut self,
+        table: &CatalogTable,
+        index_no: usize,
+        key_vals: &[Val],
+        log_by_key: bool,
+    ) -> OperationOrRuntimeResult<DeleteMvcc> {
         const OPERATION: &str = "catalog_delete_primary_key_mvcc";
         let table_id = table.table_id();
         self.acquire_table_write_metadata_lock(table_id)
@@ -738,7 +817,8 @@ impl<'stmt> Statement<'stmt> {
         if !self.disable_dml_validation {
             DmlValidator::new(table.metadata())
                 .validate_primary_key(index_no, key_vals)
-                .with_foreground_context(OPERATION, table_id)?;
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
@@ -747,6 +827,10 @@ impl<'stmt> Statement<'stmt> {
         table
             .delete_unique_mvcc(rt, effects, index_no, key_vals, log_by_key)
             .await
+            .change_runtime_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!("operation={OPERATION}, table_id={table_id}, index_no={index_no}")
+            })
     }
 
     /// Moves successful statement effects into transaction effects.
@@ -762,7 +846,7 @@ impl<'stmt> Statement<'stmt> {
     /// pointing at uncommitted row state before row undo is unwound. Statement
     /// locks stay held until this method returns and `Statement` drops.
     #[inline]
-    pub(crate) async fn rollback_effects(&mut self) -> Result<()> {
+    pub(crate) async fn rollback_effects(&mut self) -> FatalResult<()> {
         let sts = self.inner.sts();
         let engine = self.attachment.engine().clone();
         let pool_guards = self.attachment.pool_guards();
@@ -775,13 +859,13 @@ impl<'stmt> Statement<'stmt> {
             let retention = self.effects.take_for_fatal_retention();
             engine.trx_sys.retain_fatal_rollback(retention);
             let report = err
-                .into_fatal_report(FatalError::RollbackAccess)
+                .change_context(FatalError::RollbackAccess)
                 .attach("statement index rollback failed");
             obs::error!(
                 "event=engine_poison component=trx action=poison result=error error={:?}",
                 report
             );
-            return Err(engine.poisoner.poison(report).into());
+            return Err(engine.poisoner.poison(report).into_report());
         }
         if let Err(err) = self
             .effects
@@ -791,13 +875,13 @@ impl<'stmt> Statement<'stmt> {
             let retention = self.effects.take_for_fatal_retention();
             engine.trx_sys.retain_fatal_rollback(retention);
             let report = err
-                .into_fatal_report(FatalError::RollbackAccess)
+                .change_context(FatalError::RollbackAccess)
                 .attach("statement row rollback failed");
             obs::error!(
                 "event=engine_poison component=trx action=poison result=error error={:?}",
                 report
             );
-            return Err(engine.poisoner.poison(report).into());
+            return Err(engine.poisoner.poison(report).into_report());
         }
         self.effects.clear_redo();
         Ok(())
@@ -809,6 +893,23 @@ impl Drop for Statement<'_> {
     fn drop(&mut self) {
         self.stmt_locks
             .release_all(self.attachment.engine().lock_manager());
+    }
+}
+
+/// Catalog mutations use internally derived keys and validated row shapes.
+/// An Operation failure therefore means a catalog key, row shape, transaction,
+/// or lock invariant was violated; only Runtime failures may leave this boundary.
+#[inline]
+fn assert_catalog_mutation_invariant<T>(
+    table_id: TableID,
+    result: OperationOrRuntimeResult<T>,
+) -> RuntimeResult<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(OperationOrRuntimeError::Operation(report)) => {
+            panic!("catalog mutation invariant violated: table_id={table_id}, error={report:?}")
+        }
+        Err(OperationOrRuntimeError::Runtime(report)) => Err(report),
     }
 }
 
@@ -828,8 +929,9 @@ pub(crate) mod tests {
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
     use error_stack::Report;
+    use futures::FutureExt;
     use std::cell::Cell;
-    use std::panic::catch_unwind;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -841,13 +943,13 @@ pub(crate) mod tests {
         TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.set(enabled));
     }
 
-    pub(super) fn maybe_force_stmt_index_rollback_error() -> Result<()> {
+    pub(super) fn maybe_force_stmt_index_rollback_error() -> RuntimeResult<()> {
         if TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.get()) {
             // TODO(error-boundary): backlog 000160 should replace this generic
             // hook with a statement rollback source-domain failure.
             return Err(Report::new(InternalError::Generic)
                 .attach("test statement index rollback failure")
-                .into());
+                .change_context(RuntimeError::TableAccess));
         }
         Ok(())
     }
@@ -929,7 +1031,7 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<bool> {
-        if lock_state.cached_covers(resource, mode)? {
+        if lock_state.cached_covers(resource, mode) {
             return Ok(true);
         }
         let owner = lock_state.owner();
@@ -1007,6 +1109,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_catalog_mutation_operation_errors_violate_invariant() {
+        for error in [OperationError::DuplicateKey, OperationError::WriteConflict] {
+            let panic = catch_unwind(|| {
+                let result: OperationOrRuntimeResult<()> = Err(Report::new(error).into());
+                let _ = assert_catalog_mutation_invariant(TableID::new(42), result);
+            });
+            assert!(panic.is_err(), "operation error did not assert: {error:?}");
+        }
+    }
+
+    #[test]
+    fn test_catalog_mutation_runtime_error_preserves_stack() {
+        let result: OperationOrRuntimeResult<()> =
+            Err(Report::new(InternalError::PoolGuardMissing)
+                .attach("pool_role=Meta")
+                .change_context(RuntimeError::CatalogAccess)
+                .into());
+
+        let err = assert_catalog_mutation_invariant(TableID::new(42), result).unwrap_err();
+
+        assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
+        assert_eq!(
+            err.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::PoolGuardMissing)
+        );
+        assert!(format!("{err:?}").contains("pool_role=Meta"));
+    }
+
+    #[test]
     fn test_catalog_delete_primary_key_mvcc_rejects_non_primary_key() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_catalog_delete_pk_mismatch").await;
@@ -1018,24 +1149,28 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
 
-            let res: Result<()> = trx
-                .exec(async |stmt| {
-                    let key = SelectKey::new(1, vec![Val::from(TableID::new(42))]);
-                    stmt.catalog_delete_primary_key_mvcc(
-                        catalog_table.as_ref(),
-                        key.index_no,
-                        &key.vals,
-                        true,
-                    )
-                    .await?;
-                    Ok(())
-                })
-                .await;
-
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::InvalidDmlInput)
+            let panic = AssertUnwindSafe(trx.exec(async |stmt| {
+                let key = SelectKey::new(1, vec![Val::from(TableID::new(42))]);
+                stmt.catalog_delete_primary_key_mvcc(
+                    catalog_table.as_ref(),
+                    key.index_no,
+                    &key.vals,
+                    true,
+                )
+                .await?;
+                Ok(())
+            }))
+            .catch_unwind()
+            .await
+            .expect_err("non-primary catalog delete must violate the catalog invariant");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            assert!(
+                message.contains("catalog mutation invariant violated"),
+                "unexpected panic: {message}"
             );
             trx.rollback().await.unwrap();
         });

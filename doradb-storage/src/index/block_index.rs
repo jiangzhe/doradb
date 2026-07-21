@@ -2,7 +2,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableColumnLayout;
-use crate::error::Result;
+use crate::error::{RuntimeError, RuntimeOrFatalResult, RuntimeResult};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
@@ -14,6 +14,7 @@ use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::table::ColumnStorage;
+use error_stack::ResultExt;
 use std::sync::Arc;
 
 /// Facade of the hybrid block index.
@@ -39,7 +40,7 @@ impl<P: BufferPool> BlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
         column_root_block_id: BlockID,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         let row = RowPageIndex::new(pool, meta_pool_guard, pivot_row_id).await?;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_block_id);
         Ok(BlockIndex { root, row })
@@ -50,7 +51,7 @@ impl<P: BufferPool> BlockIndex<P> {
     pub(crate) async fn new_catalog(
         pool: QuiescentGuard<P>,
         meta_pool_guard: &PoolGuard,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         Self::new(pool, meta_pool_guard, RowID::new(0), SUPER_BLOCK_ID).await
     }
 
@@ -100,7 +101,7 @@ impl<P: BufferPool> BlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let pivot_row_id = self.root.pivot_row_id();
         self.row
             .destroy(meta_pool_guard, mem_pool, mem_pool_guard, pivot_row_id)
@@ -115,13 +116,28 @@ impl<P: BufferPool> BlockIndex<P> {
         start_row_id: RowID,
         end_row_id: RowID,
         expected_page_ids: &[PageID],
-    ) -> Result<RowPagePrefixPrune> {
+    ) -> RuntimeResult<RowPagePrefixPrune> {
         self.row
             .prune_checkpoint_prefix(meta_pool_guard, start_row_id, end_row_id, expected_page_ids)
             .await
     }
 
-    /// Returns a shared row page suitable for appending rows, recording redo when requested.
+    /// Returns a shared row page suitable for appending rows without recording redo.
+    #[inline]
+    pub(crate) async fn try_get_insert_page<B: BufferPool>(
+        &self,
+        meta_pool_guard: &PoolGuard,
+        mem_pool: &B,
+        mem_pool_guard: &PoolGuard,
+        col_layout: &Arc<TableColumnLayout>,
+        count: usize,
+    ) -> RuntimeResult<PageSharedGuard<RowPage>> {
+        self.row
+            .get_insert_page(meta_pool_guard, mem_pool, mem_pool_guard, col_layout, count)
+            .await
+    }
+
+    /// Returns a shared insert page and publishes its physical creation redo.
     #[inline]
     pub(crate) async fn try_get_insert_page_with_redo<B: BufferPool>(
         &self,
@@ -130,10 +146,10 @@ impl<P: BufferPool> BlockIndex<P> {
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
-        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> Result<PageSharedGuard<RowPage>> {
+        redo_ctx: RowPageCreateRedoCtx<'_>,
+    ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         self.row
-            .get_insert_page(
+            .get_insert_page_with_redo(
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,
@@ -144,26 +160,18 @@ impl<P: BufferPool> BlockIndex<P> {
             .await
     }
 
-    /// Returns an exclusive row page suitable for appending rows, recording redo when requested.
+    /// Returns an exclusive row page suitable for appending rows without recording redo.
     #[inline]
-    pub(crate) async fn get_insert_page_exclusive_with_redo<B: BufferPool>(
+    pub(crate) async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
-        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> Result<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
         self.row
-            .get_insert_page_exclusive(
-                meta_pool_guard,
-                mem_pool,
-                mem_pool_guard,
-                col_layout,
-                count,
-                redo_ctx,
-            )
+            .get_insert_page_exclusive(meta_pool_guard, mem_pool, mem_pool_guard, col_layout, count)
             .await
     }
 
@@ -179,7 +187,7 @@ impl<P: BufferPool> BlockIndex<P> {
         col_layout: &Arc<TableColumnLayout>,
         count: usize,
         page_id: PageID,
-    ) -> Result<PageExclusiveGuard<RowPage>> {
+    ) -> RuntimeResult<PageExclusiveGuard<RowPage>> {
         self.row
             .allocate_row_page_at(
                 meta_pool_guard,
@@ -219,9 +227,13 @@ impl<P: BufferPool> BlockIndex<P> {
         &self,
         meta_pool_guard: &PoolGuard,
         row_id: RowID,
-    ) -> Result<RowLocation> {
+    ) -> RuntimeResult<RowLocation> {
         debug_assert!(!row_id.is_deleted());
-        self.row.find_row(meta_pool_guard, row_id).await
+        self.row
+            .find_row(meta_pool_guard, row_id)
+            .await
+            .change_context(RuntimeError::IndexAccess)
+            .attach_with(|| format!("operation=find_mem_row, row_id={row_id}"))
     }
 
     /// Finds the physical location of one row id with persisted column-path errors surfaced.
@@ -232,7 +244,7 @@ impl<P: BufferPool> BlockIndex<P> {
         disk_pool_guard: Option<&PoolGuard>,
         row_id: RowID,
         storage: Option<&ColumnStorage>,
-    ) -> Result<RowLocation> {
+    ) -> RuntimeResult<RowLocation> {
         debug_assert!(!row_id.is_deleted());
         match self.root.guide(row_id) {
             BlockIndexRoute::Column {
@@ -249,7 +261,7 @@ impl<P: BufferPool> BlockIndex<P> {
                 .await
             }
             BlockIndexRoute::Row => {
-                let found = self.row.find_row(meta_pool_guard, row_id).await?;
+                let found = self.find_mem_row(meta_pool_guard, row_id).await?;
                 if !matches!(found, RowLocation::NotFound) {
                     return Ok(found);
                 }
@@ -279,7 +291,7 @@ impl<P: BufferPool> BlockIndex<P> {
         row_id: RowID,
         pivot_row_id: RowID,
         root_block_id: BlockID,
-    ) -> Result<RowLocation> {
+    ) -> RuntimeResult<RowLocation> {
         // A column route can only be published for a user table, whose runtime
         // resolves both persisted storage and the matching disk-pool guard.
         let index = ColumnBlockIndex::new(
@@ -290,14 +302,13 @@ impl<P: BufferPool> BlockIndex<P> {
             storage.disk_pool(),
             disk_pool_guard,
         );
-        match index.locate_and_resolve_row(row_id).await {
-            Ok(Some(resolved)) => Ok(RowLocation::LwcBlock {
+        match index.locate_and_resolve_row(row_id).await? {
+            Some(resolved) => Ok(RowLocation::LwcBlock {
                 block_id: resolved.block_id(),
                 row_idx: resolved.row_idx(),
                 row_shape_fingerprint: resolved.row_shape_fingerprint(),
             }),
-            Ok(None) => Ok(RowLocation::NotFound),
-            Err(err) => Err(err),
+            None => Ok(RowLocation::NotFound),
         }
     }
 }
@@ -680,14 +691,7 @@ mod tests {
             .expect("test block-index construction should succeed");
 
             let page_guard = blk_idx
-                .get_insert_page_exclusive_with_redo(
-                    &meta_guard,
-                    &*mem_pool,
-                    &mem_guard,
-                    &metadata.col,
-                    100,
-                    None,
-                )
+                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
                 .await
                 .expect("test insert-page allocation should succeed");
             let page_id = page_guard.page_id();
@@ -695,20 +699,14 @@ mod tests {
 
             let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), page_id);
             let res = blk_idx
-                .try_get_insert_page_with_redo(
-                    &meta_guard,
-                    &failing_pool,
-                    &mem_guard,
-                    &metadata.col,
-                    100,
-                    None,
-                )
+                .try_get_insert_page(&meta_guard, &failing_pool, &mem_guard, &metadata.col, 100)
                 .await;
             let err = match res {
                 Ok(_) => panic!("expected cached insert-page reload failure"),
                 Err(err) => err,
             };
-            assert!(err.report().downcast_ref::<IoError>().is_some());
+            assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
+            assert!(err.downcast_ref::<IoError>().is_some());
         });
     }
 }

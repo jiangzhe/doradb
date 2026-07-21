@@ -21,7 +21,10 @@ use crate::buffer::{
     ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
-use crate::error::{DataIntegrityError, Error, OperationError, OperationResult, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, OperationError, OperationResult, RuntimeError,
+    RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::BlockIndex;
@@ -36,7 +39,7 @@ use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::retention::PendingDroppedTableRedoFloor;
 use crate::trx::undo::IndexUndo;
 use dashmap::mapref::entry::Entry::{Occupied, Vacant};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
 use std::ops::Deref;
@@ -67,7 +70,7 @@ impl CatalogTable {
         table_id: TableID,
         blk_idx: BlockIndex,
         metadata: Arc<TableMetadata>,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         let mem = MemTable::new(
             mem_pool.clone(),
             mem_pool.row_pool_role(),
@@ -79,7 +82,9 @@ impl CatalogTable {
             blk_idx,
             MIN_SNAPSHOT_TS,
         )
-        .await?;
+        .await
+        .change_context(RuntimeError::CatalogAccess)
+        .attach_with(|| format!("operation=create_catalog_table, table_id={table_id}"))?;
         Ok(CatalogTable { mem })
     }
 }
@@ -128,12 +133,12 @@ impl Catalog {
         storage: CatalogStorage,
         poisoner: QuiescentGuard<EnginePoisoner>,
         config: CatalogConfig,
-    ) -> Result<Self> {
+    ) -> RuntimeResult<Self> {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, storage.meta_pool.pool_guard())
             .push(PoolRole::Disk, storage.disk_pool.pool_guard())
             .build();
-        let snapshot = storage.checkpoint_snapshot()?;
+        let snapshot = storage.checkpoint_snapshot();
         storage
             .bootstrap_from_checkpoint(
                 &snapshot,
@@ -187,7 +192,7 @@ impl Catalog {
     pub(crate) async fn apply_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
-    ) -> Result<CatalogCheckpointOutcome> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointOutcome> {
         self.storage
             .apply_checkpoint_batch(batch, self.curr_next_table_id())
             .await
@@ -198,7 +203,7 @@ impl Catalog {
     pub(crate) async fn prepare_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
-    ) -> Result<PreparedCatalogCheckpoint> {
+    ) -> RuntimeOrFatalResult<PreparedCatalogCheckpoint> {
         self.storage
             .prepare_checkpoint_batch(batch, self.curr_next_table_id())
             .await
@@ -223,12 +228,11 @@ impl Catalog {
         table_fs: &FileSystem,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         table_id: TableID,
-    ) -> Result<bool> {
-        if self.user_tables.contains_key(&table_id) {
-            return Err(Report::new(OperationError::TableAlreadyExists)
-                .attach(format!("reload user table: table_id={table_id}"))
-                .into());
-        }
+    ) -> RuntimeResult<bool> {
+        assert!(
+            !self.user_tables.contains_key(&table_id),
+            "catalog reload invariant violated: table runtime already exists, table_id={table_id}"
+        );
         let guards = PoolGuards::builder()
             .push(PoolRole::Meta, self.storage.meta_pool.pool_guard())
             .push(PoolRole::Index, index_pool.pool_guard())
@@ -243,7 +247,14 @@ impl Catalog {
 
         let table_file = table_fs
             .open_table_file(table.table_id, disk_pool.clone())
-            .await?;
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=reload_create_table, phase=open_table_file, table_id={}",
+                    table.table_id
+                )
+            })?;
         // `catalog_load_boundary`: loading a user table binds one root for
         // metadata validation and block-index initialization.
         let active_root = table_file.active_root_unchecked();
@@ -254,15 +265,23 @@ impl Catalog {
             table.table_id,
             &metadata_in_catalog,
             metadata_in_file,
-        )? {
+        )
+        .change_context(RuntimeError::CatalogAccess)
+        .attach_with(|| {
+            format!(
+                "operation=reload_create_table, phase=reconcile_metadata, table_id={}",
+                table.table_id
+            )
+        })? {
             false
         } else {
-            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant))
+                .attach("user table metadata mismatch outside index-DDL reconciliation")
+                .change_context(RuntimeError::CatalogAccess)
                 .attach(format!(
-                    "reload user table metadata mismatch outside index-DDL reconciliation: table_id={}",
+                    "operation=reload_create_table, phase=validate_metadata, table_id={}",
                     table.table_id
-                ))
-                .into());
+                ));
         };
 
         let row_id_bound = active_root.pivot_row_id;
@@ -275,7 +294,14 @@ impl Catalog {
             row_id_bound,
             active_root.column_block_index_root,
         )
-        .await?;
+        .await
+        .change_context(RuntimeError::CatalogAccess)
+        .attach_with(|| {
+            format!(
+                "operation=reload_create_table, phase=build_block_index, table_id={}",
+                table.table_id
+            )
+        })?;
         let table = Arc::new(
             Table::new(
                 mem_pool.clone(),
@@ -286,16 +312,21 @@ impl Catalog {
                 table_file,
                 disk_pool.clone(),
             )
-            .await?,
+            .await
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=reload_create_table, phase=build_table_runtime, table_id={table_id}"
+                )
+            })?,
         );
         let old = self
             .user_tables
             .insert(table_id, UserTableEntry::Live { table });
-        if old.is_some() {
-            return Err(Report::new(OperationError::TableAlreadyExists)
-                .attach(format!("insert reloaded user table: table_id={table_id}"))
-                .into());
-        }
+        assert!(
+            old.is_none(),
+            "catalog reload invariant violated: table runtime inserted concurrently, table_id={table_id}"
+        );
         Ok(metadata_matched)
     }
 
@@ -304,18 +335,17 @@ impl Catalog {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<(TableObject, TableMetadata)> {
+    ) -> RuntimeResult<(TableObject, TableMetadata)> {
         let table = self
             .storage
             .tables()
             .find_uncommitted_by_id(guards, table_id)
             .await?
-            .ok_or_else(|| {
-                Error::from(
-                    Report::new(OperationError::TableNotFound)
-                        .attach(format!("reload user table metadata: table_id={table_id}")),
+            .unwrap_or_else(|| {
+                panic!(
+                    "catalog reconstruction invariant violated: known table row is missing, table_id={table_id}"
                 )
-            })?;
+            });
 
         // todo: use secondary index to improve performance
         let mut columns = self
@@ -323,8 +353,19 @@ impl Catalog {
             .columns()
             .list_uncommitted_by_table_id(guards, table_id)
             .await?;
-        debug_assert!(!columns.is_empty());
+        assert!(
+            !columns.is_empty(),
+            "catalog reconstruction invariant violated: table has no columns, table_id={table_id}"
+        );
         columns.sort_by_key(|c| c.column_no);
+        for (expected_column_no, column) in columns.iter().enumerate() {
+            assert_eq!(
+                usize::from(column.column_no),
+                expected_column_no,
+                "catalog reconstruction invariant violated: non-contiguous column number, table_id={table_id}, expected_column_no={expected_column_no}, actual_column_no={}",
+                column.column_no
+            );
+        }
 
         let column_specs = columns
             .into_iter()
@@ -337,6 +378,13 @@ impl Catalog {
             .list_uncommitted_by_table_id(guards, table_id)
             .await?;
         indexes.sort_by_key(|index| index.index_no);
+        for pair in indexes.windows(2) {
+            assert!(
+                pair[0].index_no < pair[1].index_no,
+                "catalog reconstruction invariant violated: duplicate index number, table_id={table_id}, index_no={}",
+                pair[0].index_no
+            );
+        }
 
         let mut index_columns = self
             .storage
@@ -355,10 +403,24 @@ impl Catalog {
         let mut index_specs = vec![];
         for index in indexes {
             let mut index_cols = vec![];
-            for index_column in index_columns_by_index_no
+            let persisted_index_columns = index_columns_by_index_no
                 .remove(&index.index_no)
-                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "catalog reconstruction invariant violated: index has no key columns, table_id={table_id}, index_no={}",
+                        index.index_no
+                    )
+                });
+            for (expected_index_column_no, index_column) in
+                persisted_index_columns.into_iter().enumerate()
             {
+                assert_eq!(
+                    usize::from(index_column.index_column_no),
+                    expected_index_column_no,
+                    "catalog reconstruction invariant violated: non-contiguous index-column number, table_id={table_id}, index_no={}, expected_index_column_no={expected_index_column_no}, actual_index_column_no={}",
+                    index.index_no,
+                    index_column.index_column_no
+                );
                 let ik = IndexKey {
                     col_no: index_column.column_no,
                     order: index_column.index_order,
@@ -379,17 +441,12 @@ impl Catalog {
                 .values()
                 .map(|index_columns| index_columns.len())
                 .sum();
-            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                .attach(format!(
-                    "orphaned catalog index-column rows without matching index rows: table_id={table_id}, index_numbers={index_numbers:?}, count={count}"
-                ))
-                .into());
+            panic!(
+                "catalog reconstruction invariant violated: orphaned index-column rows, table_id={table_id}, index_numbers={index_numbers:?}, count={count}"
+            );
         }
-        let metadata = TableMetadata::try_new_with_next_index_no(
-            column_specs,
-            index_specs,
-            table.next_index_no,
-        )?;
+        let metadata =
+            TableMetadata::from_persisted_parts(column_specs, index_specs, table.next_index_no);
         Ok((table, metadata))
     }
 
@@ -549,16 +606,15 @@ impl Catalog {
 
     /// Insert a user table runtime into the in-memory cache.
     #[inline]
-    pub(crate) fn insert_user_table(&self, table: Arc<Table>) -> Result<()> {
+    pub(crate) fn insert_user_table(&self, table: Arc<Table>) {
         let table_id = table.table_id();
         match self.user_tables.entry(table_id) {
             Vacant(entry) => {
                 entry.insert(UserTableEntry::Live { table });
-                Ok(())
             }
-            Occupied(_) => Err(Report::new(OperationError::TableAlreadyExists)
-                .attach(format!("insert user table runtime: table_id={table_id}"))
-                .into()),
+            Occupied(_) => panic!(
+                "create-table runtime install invariant violated: atomically allocated table_id is already installed, table_id={table_id}"
+            ),
         }
     }
 
@@ -610,20 +666,17 @@ impl Catalog {
         table_id: TableID,
         drop_cts: TrxID,
         replay_floor: TableRedoReplayFloor,
-    ) -> Result<()> {
+    ) {
         match self.user_tables.entry(table_id) {
             Vacant(entry) => {
                 entry.insert(UserTableEntry::DroppedFloor {
                     drop_cts,
                     replay_floor,
                 });
-                Ok(())
             }
-            Occupied(_) => Err(Report::new(OperationError::TableAlreadyExists)
-                .attach(format!(
-                    "insert dropped user table floor: table_id={table_id}"
-                ))
-                .into()),
+            Occupied(_) => panic!(
+                "recovery dropped-floor invariant violated: table entry still exists after runtime removal, table_id={table_id}, drop_cts={drop_cts}"
+            ),
         }
     }
 
@@ -771,7 +824,7 @@ impl Component for Catalog {
     type Config = CatalogConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
-    type Error = Error;
+    type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "catalog";
 
@@ -780,7 +833,7 @@ impl Component for Catalog {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let meta_pool = registry.dependency::<MetaPool>();
         let table_fs = registry.dependency::<FileSystem>();
         let disk_pool = registry.dependency::<DiskPool>();
@@ -903,7 +956,7 @@ impl UserTableCacheEntry {
         entry: IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let table = &self.table;
         let layout = self
             .user_layout
@@ -922,7 +975,7 @@ impl UserTableCacheEntry {
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
-    ) -> Result<bool> {
+    ) -> RuntimeResult<bool> {
         let table = &self.table;
         let layout = self
             .user_layout
@@ -1118,7 +1171,7 @@ fn index_ddl_metadata_reconcilable(
     table_id: TableID,
     catalog: &TableMetadata,
     file: &TableMetadata,
-) -> Result<bool> {
+) -> DataIntegrityResult<bool> {
     // The active table root may be ahead of checkpointed catalog rows: recovery
     // can replay later index-DDL catalog rows to make catalog metadata catch up.
     // The opposite direction is unrecoverable here because replay cannot make a
@@ -1129,8 +1182,7 @@ fn index_ddl_metadata_reconcilable(
                 "index-DDL reconciliation found catalog allocation ahead of table root: table_id={table_id}, catalog_next_index_no={}, file_next_index_no={}",
                 catalog.idx.next_index_no(),
                 file.idx.next_index_no()
-            ))
-            .into());
+            )));
     }
     if catalog.col != file.col {
         return Ok(false);
@@ -1156,7 +1208,6 @@ fn index_ddl_metadata_reconcilable(
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::CatalogCheckpointScanStopReason;
-    use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1165,7 +1216,6 @@ pub(crate) mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::id::BlockID;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
-    use crate::log::redo::DDLRedo;
     use crate::table::tests::assert_freeze_created;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::value::{Val, ValKind};
@@ -1515,92 +1565,13 @@ pub(crate) mod tests {
             index_ddl_metadata_reconcilable(TableID::new(42), &catalog_metadata, &file_metadata)
                 .unwrap_err();
         assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            err.downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
         let report = format!("{err:?}");
         assert!(report.contains("table_id=42"), "{report}");
         assert!(report.contains("catalog_next_index_no=2"), "{report}");
         assert!(report.contains("file_next_index_no=1"), "{report}");
-    }
-
-    #[test]
-    fn test_user_table_metadata_rejects_orphan_index_columns() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = open_catalog_test_engine(
-                temp_dir.path().to_path_buf(),
-                Some("catalog-orphan-index-column"),
-            )
-            .await;
-            let mut session = engine.new_session().unwrap();
-            let table_id = session
-                .create_table(
-                    TableSpec {
-                        columns: vec![ColumnSpec::new(
-                            "id",
-                            ValKind::I32,
-                            ColumnAttributes::empty(),
-                        )],
-                    },
-                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
-                )
-                .await
-                .unwrap();
-            let orphan_index_no = 7;
-
-            let mut trx = session.begin_trx().unwrap();
-            trx.exec(async |stmt| {
-                assert!(
-                    engine
-                        .catalog()
-                        .storage
-                        .index_columns()
-                        .insert(
-                            stmt,
-                            &IndexColumnObject {
-                                table_id,
-                                index_no: orphan_index_no,
-                                index_column_no: 0,
-                                column_no: 0,
-                                index_order: IndexOrder::Asc,
-                            },
-                        )
-                        .await
-                );
-                mark_catalog_ddl(
-                    stmt,
-                    DDLRedo::CreateIndex {
-                        table_id,
-                        index_no: orphan_index_no,
-                    },
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
-            trx.commit().await.unwrap();
-
-            let guards = PoolGuards::builder()
-                .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
-                .build();
-            let err = engine
-                .catalog()
-                .user_table_metadata_from_catalog(&guards, table_id)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidRootInvariant)
-            );
-            let report = format!("{err:?}");
-            assert!(report.contains(&format!("table_id={table_id}")), "{report}");
-            assert!(
-                report.contains(&format!("index_numbers=[{orphan_index_no}]")),
-                "{report}"
-            );
-            assert!(report.contains("count=1"), "{report}");
-        });
     }
 
     #[test]
@@ -1765,7 +1736,7 @@ pub(crate) mod tests {
 
             let engine = open_catalog_test_engine(main_dir, Some("catalog-checkpoint-now")).await;
 
-            let snap0 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap0 = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert!(
                 snap0
@@ -1781,7 +1752,7 @@ pub(crate) mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             assert_eq!(
                 snap1.meta.next_table_id,
@@ -1807,7 +1778,7 @@ pub(crate) mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, snap1.meta.table_roots);
         });
@@ -1832,7 +1803,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap = engine.catalog().storage.checkpoint_snapshot();
             let root = snap
                 .meta
                 .table_roots
@@ -1893,7 +1864,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap = engine.catalog().storage.checkpoint_snapshot();
             let root = snap
                 .meta
                 .table_roots
@@ -1953,7 +1924,7 @@ pub(crate) mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             let roots_before = snap1.meta.table_roots;
 
@@ -1972,7 +1943,7 @@ pub(crate) mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
             assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);
@@ -2012,7 +1983,7 @@ pub(crate) mod tests {
                 .apply_checkpoint_batch(batch1)
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap1.catalog_replay_start_ts, safe_cts_1 + 1);
 
             let batch2 = engine
@@ -2030,7 +2001,7 @@ pub(crate) mod tests {
                 .apply_checkpoint_batch(batch2)
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot();
             assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
         });
     }
@@ -2053,7 +2024,7 @@ pub(crate) mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap1 = engine.catalog().storage.checkpoint_snapshot();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             let roots_before = snap1.meta.table_roots;
 
@@ -2135,7 +2106,7 @@ pub(crate) mod tests {
                 .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
-            let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            let snap2 = engine.catalog().storage.checkpoint_snapshot();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
             assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);

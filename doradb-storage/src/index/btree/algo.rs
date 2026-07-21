@@ -4,7 +4,7 @@
 //! logic only. It does not know about latches, buffer-pool allocation, CoW file
 //! writes, checkpoint publication, or DiskTree batch semantics.
 
-use crate::error::{Error, InternalError, Result};
+use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::id::TrxID;
 use crate::index::btree::{
     BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeNodeBox, BTreeU64, BTreeValue, PackedNodeSpace,
@@ -121,12 +121,19 @@ pub(crate) enum MemTreeSiblingMergePlan {
 pub(crate) fn plan_sibling_node<'a, V>(
     params: PackedNodePlanParams<'a>,
     entries: &'a [PackedNodeEntry<'a, V>],
-) -> Result<PackedNodePlan<'a>>
+) -> RuntimeResult<PackedNodePlan<'a>>
 where
     V: BTreeValue + Copy,
 {
     if params.min_slots > entries.len() {
-        return Err(btree_pack_invariant());
+        return Err(Report::new(InternalError::BTreePackInvariant)
+            .attach(format!(
+                "minimum slot count {} exceeds entry count {}",
+                params.min_slots,
+                entries.len()
+            ))
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=pack_btree_nodes"));
     }
 
     let rightmost_count = entries.len();
@@ -144,15 +151,29 @@ where
     }
 
     if rightmost_count == 0 {
-        return Err(btree_pack_invariant());
+        return Err(Report::new(InternalError::BTreePackInvariant)
+            .attach("rightmost sibling plan contains no entries")
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=pack_btree_nodes"));
     }
 
     let packed = select_finite_packed_count::<V>(params.lower_fence, params.min_slots, entries)?;
     let upper_fence = packed_sibling_upper_fence(entries, packed);
     let space = packed_node_space::<V>(params.lower_fence, upper_fence, entries, packed)
-        .ok_or_else(btree_pack_invariant)?;
+        .ok_or_else(|| {
+            Report::new(InternalError::BTreePackInvariant)
+                .attach("packed sibling fences do not fit")
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=pack_btree_nodes")
+        })?;
     if space.total_space() > BTREE_NODE_USABLE_SIZE {
-        return Err(btree_pack_invariant());
+        return Err(Report::new(InternalError::BTreePackInvariant)
+            .attach(format!(
+                "packed sibling size {} exceeds usable size {BTREE_NODE_USABLE_SIZE}",
+                space.total_space()
+            ))
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=pack_btree_nodes"));
     }
     Ok(PackedNodePlan {
         packed,
@@ -219,12 +240,15 @@ pub(crate) fn pack_fixed_entries<'a, V>(
     node: &mut BTreeNode,
     params: KnownFenceNodeParams<'a>,
     entries: &[PackedNodeEntry<'_, V>],
-) -> Result<PackedNodeResult<'a>>
+) -> RuntimeResult<PackedNodeResult<'a>>
 where
     V: BTreeValue + Copy,
 {
     if !fences_fit(params.lower_fence, params.upper_fence.unwrap_or(&[])) {
-        return Err(btree_pack_invariant());
+        return Err(Report::new(InternalError::BTreePackInvariant)
+            .attach("fixed node fences do not fit")
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=pack_btree_nodes"));
     }
     node.init(
         params.height,
@@ -236,7 +260,14 @@ where
     );
     for entry in entries {
         if !node.can_insert::<V>(entry.key) {
-            return Err(btree_pack_invariant());
+            return Err(Report::new(InternalError::BTreePackInvariant)
+                .attach(format!(
+                    "entry does not fit: key_len={}, existing_slots={}",
+                    entry.key.len(),
+                    node.count()
+                ))
+                .change_context(RuntimeError::IndexAccess)
+                .attach("operation=pack_btree_nodes"));
         }
         let idx = node.count();
         node.insert_at::<V>(idx, entry.key, entry.value);
@@ -305,11 +336,6 @@ where
     } else {
         MemTreeSiblingMergePlan::Partial { right_count }
     }
-}
-
-#[inline]
-fn btree_pack_invariant() -> Error {
-    Report::new(InternalError::BTreePackInvariant).into()
 }
 
 /// Select the exclusive upper fence for a packed sibling.
@@ -408,7 +434,7 @@ fn select_finite_packed_count<V>(
     lower_fence: &[u8],
     min_slots: usize,
     entries: &[PackedNodeEntry<'_, V>],
-) -> Result<usize>
+) -> RuntimeResult<usize>
 where
     V: BTreeValue + Copy,
 {
@@ -439,17 +465,30 @@ where
                     let entry_space = PackedNodeSpace::entry_space::<V>(entry.key, prefix_len)?;
                     total.checked_add(entry_space)
                 })
-                .ok_or_else(btree_pack_invariant)?;
+                .ok_or_else(|| {
+                    Report::new(InternalError::BTreePackInvariant)
+                        .attach("included entry space overflow")
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=pack_btree_nodes")
+                })?;
             active_prefix_len = Some(prefix_len);
             included_count = packed;
         } else {
             while included_count < packed {
                 let entry_space =
                     PackedNodeSpace::entry_space::<V>(entries[included_count].key, prefix_len)
-                        .ok_or_else(btree_pack_invariant)?;
-                included_space = included_space
-                    .checked_add(entry_space)
-                    .ok_or_else(btree_pack_invariant)?;
+                        .ok_or_else(|| {
+                            Report::new(InternalError::BTreePackInvariant)
+                                .attach("entry space cannot be represented")
+                                .change_context(RuntimeError::IndexAccess)
+                                .attach("operation=pack_btree_nodes")
+                        })?;
+                included_space = included_space.checked_add(entry_space).ok_or_else(|| {
+                    Report::new(InternalError::BTreePackInvariant)
+                        .attach("included entry space overflow")
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=pack_btree_nodes")
+                })?;
                 included_count += 1;
             }
         }
@@ -457,7 +496,12 @@ where
         let total_space = space
             .total_space()
             .checked_add(included_space)
-            .ok_or_else(btree_pack_invariant)?;
+            .ok_or_else(|| {
+                Report::new(InternalError::BTreePackInvariant)
+                    .attach("packed node total space overflow")
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=pack_btree_nodes")
+            })?;
         if total_space <= BTREE_NODE_USABLE_SIZE {
             best = Some(packed);
         } else if space.prefix_is_inline() {
@@ -465,7 +509,12 @@ where
         }
     }
 
-    best.ok_or_else(btree_pack_invariant)
+    best.ok_or_else(|| {
+        Report::new(InternalError::BTreePackInvariant)
+            .attach("no finite packed sibling count satisfies node space")
+            .change_context(RuntimeError::IndexAccess)
+            .attach("operation=pack_btree_nodes")
+    })
 }
 
 fn estimate_packed_node_space<V>(
@@ -491,7 +540,7 @@ fn fences_fit(lower_fence: &[u8], upper_fence: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{ErrorKind, InternalError};
+    use crate::error::InternalError;
     use crate::index::btree::{BTREE_NODE_USABLE_SIZE, BTreeNil, BTreeNodeBox};
     use crate::index::util::Maskable;
 
@@ -790,9 +839,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.is_kind(ErrorKind::Internal));
+        assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
         assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
+            err.downcast_ref::<InternalError>().copied(),
             Some(InternalError::BTreePackInvariant)
         );
     }

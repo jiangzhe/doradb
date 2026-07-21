@@ -1,9 +1,7 @@
 use crate::catalog::{IndexSpec, PrimaryKeyMatchError, TableMetadata};
-use crate::error::{DataIntegrityError, DataIntegrityResult, OperationError, OperationResult};
-use crate::id::TableID;
 use crate::row::ops::{RowUpdateView, UpdateCol};
 use crate::value::Val;
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use std::ops::{Bound, RangeBounds};
 use std::result::Result as StdResult;
 use thiserror::Error as ThisError;
@@ -28,47 +26,8 @@ pub(crate) enum DmlValidationError {
     PrimaryKey,
 }
 
-/// Caller-owned conversion from neutral DML validation into an operation domain.
-pub(crate) trait DmlValidationResultExt<T> {
-    /// Classifies caller-supplied DML as invalid foreground input.
-    fn with_foreground_context(
-        self,
-        operation: &'static str,
-        table_id: TableID,
-    ) -> OperationResult<T>;
-
-    /// Classifies replay-sourced DML as an invalid persisted payload.
-    fn with_recovery_context(
-        self,
-        operation: &'static str,
-        table_id: TableID,
-    ) -> DataIntegrityResult<T>;
-}
-
 /// Result carrying caller-neutral DML validation reports.
 pub(crate) type DmlValidationResult<T> = StdResult<T, Report<DmlValidationError>>;
-
-impl<T> DmlValidationResultExt<T> for DmlValidationResult<T> {
-    #[inline]
-    fn with_foreground_context(
-        self,
-        operation: &'static str,
-        table_id: TableID,
-    ) -> OperationResult<T> {
-        self.change_context(OperationError::InvalidDmlInput)
-            .attach_with(|| format!("operation={operation}, table_id={table_id}"))
-    }
-
-    #[inline]
-    fn with_recovery_context(
-        self,
-        operation: &'static str,
-        table_id: TableID,
-    ) -> DataIntegrityResult<T> {
-        self.change_context(DataIntegrityError::InvalidPayload)
-            .attach_with(|| format!("operation={operation}, table_id={table_id}"))
-    }
-}
 
 /// Validates DML payloads against one table's metadata.
 pub(crate) struct DmlValidator<'m> {

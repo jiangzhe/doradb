@@ -5,7 +5,7 @@ use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::{InternalError, Result};
+use crate::error::{InternalError, RuntimeError, RuntimeResult};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::RowPage;
 use crate::trx::undo::{RowUndoKind, UndoStatus};
@@ -111,7 +111,7 @@ impl Table {
         &self,
         guards: &PoolGuards,
         frozen_pages: &[FrozenPage],
-    ) -> Result<Vec<PageSharedGuard<RowPage>>> {
+    ) -> RuntimeResult<Vec<PageSharedGuard<RowPage>>> {
         let mut page_guards = Vec::with_capacity(frozen_pages.len());
         for page_info in frozen_pages {
             page_guards.push(
@@ -251,7 +251,7 @@ impl Table {
         page_guards: &[PageSharedGuard<RowPage>],
         batch: &mut FrozenPageBatch,
         cutoff_ts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         #[cfg(test)]
         use super::test_hooks;
 
@@ -342,7 +342,7 @@ impl Table {
         }
     }
 
-    fn install_transition_markers(&self, plan: &PreparedTransitionPage) -> Result<()> {
+    fn install_transition_markers(&self, plan: &PreparedTransitionPage) -> RuntimeResult<()> {
         for (row_id, marker) in &plan.overlay_markers {
             let result = match marker {
                 DeleteMarker::Ref(status) => {
@@ -352,12 +352,18 @@ impl Table {
                 DeleteMarker::Committed(cts) => self.deletion_buffer().put_committed(*row_id, *cts),
             };
             if let Err(reason) = result {
-                return Err(Report::new(InternalError::Generic)
+                return Err(Report::new(
+                    InternalError::CheckpointTransitionMarkerConflict,
+                )
                     .attach(format!(
                         "transition marker install conflict: table_id={}, page_id={}, row_id={row_id}, reason={reason:?}",
                         self.table_id(), plan.page_id
                     ))
-                    .into());
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach(format!(
+                        "operation=checkpoint_table, phase=install_transition_markers, table_id={}",
+                        self.table_id()
+                    )));
             }
         }
         Ok(())
