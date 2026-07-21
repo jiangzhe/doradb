@@ -1,7 +1,7 @@
 ---
 id: 000230
 title: Stateful Storage Runtime Boundaries and Semantic Consumers
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-20
 github_issue: 868
 ---
@@ -66,14 +66,17 @@ Issue Labels:
 
 Source Backlogs:
 
-- `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md` —
-  prove the stateful-storage portions covering fixed metadata pools,
-  `PoolGuards`, row-page/index-page reachability, and cursor traversal. The
-  transaction-only `TrxInner::checked_engine` portion remains Phase 4 work and
-  will replace this backlog with a narrower follow-up at task resolution.
-- `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md` —
+- `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md` —
   narrow row/index rollback suppliers and remove the temporary public-error
   frame before `FatalError::RollbackAccess`.
+
+Deferred Backlogs:
+
+- `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md` —
+  retained for RFC-0023 Phase 4. Phase 3 narrowed the surrounding stateful
+  storage paths, but did not complete the production ownership/concurrency
+  proof needed to make fixed metadata-pool, `PoolGuards`, row-page/index-page
+  reachability, and cursor traversal infallible.
 
 Current-state evidence:
 
@@ -446,6 +449,56 @@ is not used as evidence for production classification.
 
 ## Implementation Notes
 
+- Added the five Phase 3 Runtime contexts and two constrained peer-domain
+  carriers. `OperationOrRuntimeError` preserves terminal foreground Operation
+  reports alongside Runtime reports; `RuntimeOrFatalError` preserves ordinary
+  Runtime and already-Fatal reports without becoming an `error-stack` context.
+  Local extension traits add diagnostics or change only the Runtime arm, and
+  public conversion remains outward-only.
+- Narrowed row, index, table, catalog, recovery, and the required transaction
+  and log suppliers bottom-up. Reusable index/table mechanics now retain
+  Runtime/native reports, while duplicate keys, write conflicts, DML
+  validation, lookup absence, invalidation, checkpoint delay, and cancellation
+  stay neutral until foreground or replay consumers assign Operation or
+  DataIntegrity meaning. `OperationError::IndexMutation`,
+  `ConfigError::InvalidIndexSpec`, and the public checkpoint error branch were
+  removed.
+- Reworked table/catalog checkpoint and DDL integration around typed
+  Runtime-or-Fatal commit, rollback, publication, and cleanup paths. User DDL
+  metadata validation uses `OperationError::InvalidMetadata`; reconstruction
+  of engine-authored validated metadata and catalog relationships is asserted
+  as an invariant, while physical persisted-data failures remain
+  DataIntegrity. Existing create-table rollback error precedence and
+  `Arc::try_unwrap` panic behavior were deliberately preserved after review.
+- Narrowed row/index undo, statement rollback, failed-precommit cleanup, and
+  redo-log rotation so Fatal is stacked directly on Runtime/native sources.
+  `CompletionErrorBridge` now rejects an embedded public `ErrorKind` instead
+  of deleting it, and the public `Error` fatalization helper was removed.
+  Focused tests prove typed Fatal/Runtime/IO preservation, exactly one public
+  classification at the outward boundary, and no public frame in stored poison
+  reports.
+- Audited catalog and table public convergence from bottom to top. Catalog
+  public `Result` remains only at the four session DDL adapters; `LazyRow::val`
+  remains a public adapter over a typed internal accessor. Explicit table-lock
+  APIs now accept `TableLockMode::Shared` or `TableLockMode::Exclusive`, while
+  internal resource/mode pairs are release-asserted invariants and
+  `Transaction::lock_table` remains available.
+- No production `InternalError::Generic` remains in the Phase 3 modules. The
+  existing test-only catalog/statement fault hooks retain their structured
+  backlog-000160 TODOs. Backlog 000159 remains open by explicit resolution
+  decision: `RowPageIndexMemCursor`, fixed metadata-pool reachability, and
+  required `PoolGuards` need a full production ownership/concurrency proof in
+  Phase 4 rather than a conclusion based on a synthetic failing pool.
+- `docs/error-spec.md` received the concrete Phase 3 contract updates already
+  established by the implementation. Its broader refinement, simplification,
+  final mixed-boundary inventory, and stabilized module snapshot are deferred
+  to RFC-0023 Phase 4.
+- Validation completed with formatting, workspace Clippy, alternate-libaio
+  Clippy, 1,481 workspace nextest cases, 1,406 alternate-libaio nextest cases,
+  and the deterministic style audit over 67 branch-diff Rust files. No unsafe
+  code or unsafe contract changed; the unsafe inventory baseline was refreshed
+  on 2026-07-21.
+
 ## Impacts
 
 Primary code:
@@ -469,8 +522,8 @@ Documentation and tracking:
 - `docs/error-spec.md`
 - `docs/rfcs/0023-storage-error-boundary-propagation-migration.md`
 - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
-- `docs/backlogs/000161-narrow-terminal-rollback-undo-error-boundaries.md`
-- One Phase 4 replacement backlog for transaction-only invariant review
+- `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md`
+- Backlog 000159 retained for the Phase 4 invariant review
 
 Risks:
 
@@ -605,9 +658,11 @@ unsafe inventory only if unsafe-sensitive code or contracts change.
 
 ## Open Questions
 
-None. The Runtime integration operations, `RuntimeOrFatalError` representation,
-Operation-context policy, Fatal bypass, metadata provenance mapping,
-checkpoint policy, rollback boundary, and backlog dispositions are approved.
-If implementation evidence contradicts an invariant proof or makes a
-production Generic fallback unavoidable, stop and return that evidence for
-design review rather than silently broadening this task.
+- Backlog 000159 remains the Phase 4 proof obligation for transaction engine
+  attachment, required `PoolGuards`, fixed metadata-pool page reachability, and
+  row-page-index cursor root/child/sibling/re-seek traversal. Future work must
+  use production ownership and concurrency schedules rather than synthetic
+  test-pool failures.
+- RFC-0023 Phase 4 will refine and simplify `docs/error-spec.md` after the
+  orchestration/public-convergence audit establishes the final module and
+  mixed-boundary inventory.

@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Typed row, index, and statement rollback now stacks FatalError::RollbackAccess directly on Runtime and native reports; CompletionErrorBridge rejects embedded public ErrorKind frames, and focused tests retain Runtime and IO sources.
+- Closed By: backlog close
+- Reference: docs/tasks/000230-stateful-storage-runtime-boundaries-and-semantic-consumers.md
+- Closed At: 2026-07-21
