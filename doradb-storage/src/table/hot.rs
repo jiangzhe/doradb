@@ -254,6 +254,31 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         key_vals: &[Val],
         log_by_key: bool,
     ) -> OperationResult<DeleteInternal> {
+        let redo_kind = if log_by_key {
+            RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
+        } else {
+            RowRedoKind::Delete
+        };
+        self.delete_inner(effects, Some((index_no, key_vals)), redo_kind)
+            .await
+    }
+
+    /// Delete one known page/row without revalidating an index lookup key.
+    #[inline]
+    pub(super) async fn delete_known_row(
+        &self,
+        effects: &mut StmtEffects,
+    ) -> OperationResult<DeleteInternal> {
+        self.delete_inner(effects, None, RowRedoKind::Delete).await
+    }
+
+    #[inline]
+    async fn delete_inner(
+        &self,
+        effects: &mut StmtEffects,
+        lookup_key: Option<(usize, &[Val])>,
+        redo_kind: RowRedoKind,
+    ) -> OperationResult<DeleteInternal> {
         let page_guard = self.page_guard;
         let row_id = self.row_id;
         let page_id = page_guard.page_id();
@@ -264,9 +289,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         // The undo-head lock is the conflict check for hot delete. Once the
         // lock is owned, the row-page delete bit becomes the latest image and
         // the same undo entry is rewritten to `Delete`.
-        let mut lock_row = self
-            .lock_for_write(effects, Some((index_no, key_vals)))
-            .await;
+        let mut lock_row = self.lock_for_write(effects, lookup_key).await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => Ok(DeleteInternal::NotFound),
             LockRowForWrite::WriteConflict => Err(Report::new(OperationError::WriteConflict)
@@ -284,16 +307,14 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 effects.update_last_row_undo(RowUndoKind::Delete);
                 drop(access); // unlock row.
                 drop(lock_row);
-                // The caller retains the page lock in order to update indexes later.
+                // A keyed caller retains the page guard to derive current index
+                // keys. A known-row caller may release it when keys were captured
+                // before mutation.
                 // create redo log.
                 let redo_entry = RowRedo {
                     page_id,
                     row_id,
-                    kind: if log_by_key {
-                        RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
-                    } else {
-                        RowRedoKind::Delete
-                    },
+                    kind: redo_kind,
                 };
                 effects.insert_row_redo(self.table_id, redo_entry);
                 Ok(DeleteInternal::Ok)

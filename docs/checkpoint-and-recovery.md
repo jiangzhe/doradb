@@ -145,7 +145,8 @@ Each RowPage moves through:
    checkpoint. Release fresh grants on published, delayed, cancelled, and error
    returns; preserve any covering explicit session lock. `TableData(IS)` remains
    compatible with ordinary `IX` DML and `S` table readers, but conflicts with
-   the `TableData(X)` held by sequential full-table update.
+   the `TableData(X)` held by sequential full-table mutation, including both
+   update and delete actions.
 2. Asynchronously load a contiguous RowStore-page
    prefix, preflight every selected page as `ACTIVE`, and then publish each page
    as `FROZEN` in a separate short page-state critical section. Allocate

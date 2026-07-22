@@ -11,7 +11,8 @@ use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::obs;
 use crate::row::ops::{
-    DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
+    DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
+    UpdateMvcc, UpsertMvcc,
 };
 use crate::session::TrxAttachment;
 use crate::table::{DmlValidator, LazyRow, Table};
@@ -436,22 +437,29 @@ impl<'stmt> Statement<'stmt> {
             .disclose()
     }
 
-    /// Sequentially update callback-selected rows using latest modification reads.
+    /// Sequentially mutate callback-selected rows using latest modification reads.
     ///
     /// A cold persisted image is exposed only while it remains the current
     /// logical row. Hot-row values come from the latest physical page image
     /// rather than an older version reconstructed for the transaction snapshot.
     /// Another active row owner causes a write conflict; this transaction's own
-    /// active state is followed to its latest hot image. Returning `None` skips
-    /// the row, while `Some(update)` selects it and applies the sparse update. An
-    /// empty update still counts as a selected row without creating physical
-    /// row, index, undo, or redo work.
+    /// active state is followed to its latest hot image. The callback may skip,
+    /// delete, or sparsely update each exposed row. An empty update still counts
+    /// as an update decision without creating physical row, index, undo, or redo
+    /// work. Each eligible original row is exposed at most once, and replacement
+    /// rows inserted by updates are excluded from the same traversal. The result
+    /// reports delete and update decisions independently after all actions
+    /// succeed.
     #[inline]
-    pub async fn table_update_mvcc<F>(&mut self, table_id: TableID, update_row: F) -> Result<usize>
+    pub async fn table_mutate_mvcc<F>(
+        &mut self,
+        table_id: TableID,
+        mutate_row: F,
+    ) -> Result<TableMutationOutcome>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<Option<Vec<UpdateCol>>>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
-        const OPERATION: &str = "table_update_mvcc";
+        const OPERATION: &str = "table_mutate_mvcc";
         let table = self
             .resolve_user_table(table_id)
             .attach_with(|| format!("operation={OPERATION}"))
@@ -477,7 +485,7 @@ impl<'stmt> Statement<'stmt> {
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .table_update_mvcc(rt, effects, validate_updates, update_row)
+            .table_mutate_mvcc(rt, effects, validate_updates, mutate_row)
             .await
     }
 

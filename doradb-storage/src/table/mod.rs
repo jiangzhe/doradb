@@ -1069,6 +1069,11 @@ fn index_key_replace(
     SelectKey::new(key.index_no, vals)
 }
 
+/// Read an index key from the current physical row image.
+///
+/// This helper does not apply MVCC visibility or delete-bit filtering. Update
+/// callers use the result as the new key and reconstruct the old key from saved
+/// pre-update indexed values.
 #[inline]
 fn read_latest_index_key(
     metadata: &TableMetadata,
@@ -1087,6 +1092,23 @@ fn read_latest_index_key(
         new_key.vals[pos] = val;
     }
     new_key
+}
+
+/// Copy every active index key from the current physical row image.
+///
+/// A successful hot delete retains logical write ownership through its undo
+/// head and changes only the row delete bit. Its caller can therefore use one
+/// row read guard to copy stable key values before releasing the page guard.
+#[inline]
+fn read_physical_index_keys_for_delete(
+    metadata: &TableMetadata,
+    page_guard: &PageSharedGuard<RowPage>,
+    row_id: RowID,
+) -> Vec<SelectKey> {
+    let access = page_guard.read_row_by_id(row_id);
+    metadata
+        .idx
+        .keys_for_delete(metadata.col.as_ref(), access.row())
 }
 
 #[inline]

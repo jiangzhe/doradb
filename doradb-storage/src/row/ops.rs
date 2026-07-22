@@ -271,6 +271,34 @@ impl UndoVal for UpdateCol {
     }
 }
 
+/// Callback decision for one latest modifiable row in a full-table mutation.
+///
+/// The callback is invoked at most once for each eligible original row. Update
+/// replacements created by the operation are not offered to the callback again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowMutation {
+    /// Leave the row unchanged.
+    Skip,
+    /// Delete the row and its visible secondary-index entries.
+    Delete,
+    /// Apply the supplied sparse column update to the row.
+    ///
+    /// An empty update is counted but creates no row, index, undo, or redo work.
+    Update(Vec<UpdateCol>),
+}
+
+/// Counts of successful delete and update decisions from a full-table mutation.
+///
+/// Skipped rows increment neither field. A failed operation returns no outcome
+/// and rolls back its statement-local row and index effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableMutationOutcome {
+    /// Number of callback-selected delete actions.
+    pub delete_count: usize,
+    /// Number of callback-selected update actions.
+    pub update_count: usize,
+}
+
 /// Owned transaction-row update input held across retries and terminal effects.
 pub(crate) enum RowUpdateInput {
     /// Sparse update payload supplied by public update APIs.

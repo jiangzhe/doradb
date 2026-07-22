@@ -28,15 +28,15 @@ use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::LwcBlock;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::row::ops::{
-    DeleteMvcc, LinkForUniqueIndex, ReadRow, RowUpdateInput, ScanMvcc, SelectKey, SelectMvcc,
-    UpdateCol, UpdateMvcc, UpsertMvcc,
+    DeleteMvcc, LinkForUniqueIndex, ReadRow, RowMutation, RowUpdateInput, ScanMvcc, SelectKey,
+    SelectMvcc, TableMutationOutcome, UpdateCol, UpdateMvcc, UpsertMvcc,
 };
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionError, DmlValidator, MemTable,
     RowPageDescriptor, Table, TableRootSnapshot, TableRuntimeLayout, UpdateUniqueMvcc,
-    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
-    unique_key_from_full_row,
+    index_key_is_changed, index_key_replace, read_latest_index_key,
+    read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
 };
 use crate::trx::row::{FindOldVersion, IndexCandidateRecheck, ReadLatestRow, RowReadAccess};
 use crate::trx::stmt::StmtEffects;
@@ -87,7 +87,7 @@ impl LazyRowSource<'_> {
     }
 }
 
-/// Lazy accessor for one latest modifiable row in a full-table update callback.
+/// Lazy accessor for one latest modifiable row in a full-table mutation callback.
 ///
 /// The accessor hides whether the row is stored in a persisted column block or
 /// an in-memory row page. Requested values are cached for the callback
@@ -172,6 +172,18 @@ impl<'row> LazyRow<'row> {
             mem::take(&mut self.values),
             vec![Val::default(); column_count],
         ))
+    }
+
+    #[inline]
+    fn into_index_keys(
+        mut self,
+        metadata: &TableMetadata,
+    ) -> DataIntegrityResult<(Vec<SelectKey>, Vec<Val>)> {
+        for &column_no in metadata.idx.index_columns() {
+            let _ = self.val_inner(column_no)?;
+        }
+        let keys = metadata.idx.keys_for_insert(&self.values);
+        Ok((keys, self.into_reusable_buffer()))
     }
 }
 
@@ -263,10 +275,16 @@ impl ScanBoundaryTracker {
     }
 }
 
-struct PendingColdUpdate {
-    row_id: RowID,
-    old_row: Vec<Val>,
-    update: Vec<UpdateCol>,
+enum PendingColdMutation {
+    Delete {
+        row_id: RowID,
+        index_keys: Vec<SelectKey>,
+    },
+    Update {
+        row_id: RowID,
+        old_row: Vec<Val>,
+        update: Vec<UpdateCol>,
+    },
 }
 
 pub(super) enum IndexPurgeDecision {
@@ -1510,25 +1528,6 @@ impl<'a> UserTableAccessor<'a> {
             }
         }
         Ok(())
-    }
-
-    #[inline]
-    async fn defer_delete_indexes(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        row_id: RowID,
-        page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: &TableRootSnapshot<'_>,
-    ) -> RuntimeResult<()> {
-        let metadata = self.metadata();
-        let keys = metadata
-            .idx
-            .active_indexes()
-            .map(|(index_no, _)| read_latest_index_key(metadata, index_no, page_guard, row_id))
-            .collect();
-        self.defer_delete_index_keys(rt, effects, row_id, keys, root_snapshot)
-            .await
     }
 
     #[inline]
@@ -2825,16 +2824,16 @@ impl<'a> UserTableAccessor<'a> {
         .await
     }
 
-    /// Update callback-selected rows from one original latest-read worklist.
-    pub(crate) async fn table_update_mvcc<F>(
+    /// Mutate callback-selected rows from one original latest-read worklist.
+    pub(crate) async fn table_mutate_mvcc<F>(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         validate_updates: bool,
-        mut update_row: F,
-    ) -> Result<usize>
+        mut mutate_row: F,
+    ) -> Result<TableMutationOutcome>
     where
-        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<Option<Vec<UpdateCol>>>,
+        F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
         // Step 1: Freeze the statement's cold root and original hot-page shape
         // before any replacement rows can change scan boundaries.
@@ -2848,7 +2847,7 @@ impl<'a> UserTableAccessor<'a> {
         let validator = validate_updates.then(|| DmlValidator::new(self.metadata()));
         let column_count = self.metadata().col.col_count();
         let mut value_buffer = vec![Val::default(); column_count];
-        let mut matched = 0usize;
+        let mut outcome = TableMutationOutcome::default();
 
         let column_root = root_snapshot.column_block_index_root();
         let pivot_row_id = root_snapshot.pivot_row_id();
@@ -2884,7 +2883,7 @@ impl<'a> UserTableAccessor<'a> {
                     persisted_delete_set_for_scan(file_kind, &entry, delete_deltas).disclose()?;
                 let has_persisted_deletes = !persisted_deleted.is_empty();
                 // Step 3: Check current cold-row ownership before the callback,
-                // then stage selected updates until this block can be released.
+                // then stage selected mutations until this block can be released.
                 let mut pending = Vec::new();
                 for (row_idx, row_id) in row_ids.into_iter().enumerate() {
                     match read_latest_cold_row(
@@ -2898,7 +2897,7 @@ impl<'a> UserTableAccessor<'a> {
                         ReadLatestRow::WriteConflict => {
                             return Err(Report::new(OperationError::WriteConflict)
                                 .attach(format!(
-                                    "full-table update latest cold-row read: row_id={row_id}"
+                                    "full-table mutation latest cold-row read: row_id={row_id}"
                                 ))
                                 .disclose());
                         }
@@ -2911,42 +2910,79 @@ impl<'a> UserTableAccessor<'a> {
                         block_id: entry.block_id(),
                     };
                     let mut lazy_row = LazyRow::new(source, value_buffer, column_count);
-                    let selected = update_row(&mut lazy_row)?;
-                    let Some(update) = selected else {
-                        value_buffer = lazy_row.into_reusable_buffer();
-                        continue;
-                    };
-                    matched += 1;
-                    if let Some(validator) = validator.as_ref() {
-                        validator
-                            .validate_sparse_update(&update)
-                            .change_context(OperationError::InvalidDmlInput)
-                            .attach_with(|| {
-                                format!("operation=table_update_mvcc, table_id={}", self.table_id())
-                            })
-                            .disclose()?;
+                    match mutate_row(&mut lazy_row)? {
+                        RowMutation::Skip => {
+                            value_buffer = lazy_row.into_reusable_buffer();
+                        }
+                        RowMutation::Delete => {
+                            outcome.delete_count += 1;
+                            let (index_keys, reusable) =
+                                lazy_row.into_index_keys(self.metadata()).disclose()?;
+                            value_buffer = reusable;
+                            pending.push(PendingColdMutation::Delete { row_id, index_keys });
+                        }
+                        RowMutation::Update(update) => {
+                            outcome.update_count += 1;
+                            if let Some(validator) = validator.as_ref() {
+                                validator
+                                    .validate_sparse_update(&update)
+                                    .change_context(OperationError::InvalidDmlInput)
+                                    .attach_with(|| {
+                                        format!(
+                                            "operation=table_mutate_mvcc, table_id={}",
+                                            self.table_id()
+                                        )
+                                    })
+                                    .disclose()?;
+                            }
+                            if update.is_empty() {
+                                value_buffer = lazy_row.into_reusable_buffer();
+                                continue;
+                            }
+                            let (old_row, reusable) = lazy_row.into_full_row().disclose()?;
+                            value_buffer = reusable;
+                            pending.push(PendingColdMutation::Update {
+                                row_id,
+                                old_row,
+                                update,
+                            });
+                        }
                     }
-                    if update.is_empty() {
-                        value_buffer = lazy_row.into_reusable_buffer();
-                        continue;
-                    }
-                    let (old_row, reusable) = lazy_row.into_full_row().disclose()?;
-                    value_buffer = reusable;
-                    pending.push(PendingColdUpdate {
-                        row_id,
-                        old_row,
-                        update,
-                    });
                 }
                 // Step 4: Release the read-only block before writing hot
                 // replacements, then record each insertion so it is not scanned
                 // again when the original hot pages are visited.
                 drop(persisted);
-                for pending_update in pending {
-                    let inserted = self
-                        .update_known_cold_row(rt, effects, pending_update, &root_snapshot)
-                        .await?;
-                    tracker.observe_insert(inserted);
+                for mutation in pending {
+                    match mutation {
+                        PendingColdMutation::Delete { row_id, index_keys } => {
+                            self.delete_known_cold_row(
+                                rt,
+                                effects,
+                                row_id,
+                                index_keys,
+                                &root_snapshot,
+                            )
+                            .await?;
+                        }
+                        PendingColdMutation::Update {
+                            row_id,
+                            old_row,
+                            update,
+                        } => {
+                            let inserted = self
+                                .update_known_cold_row(
+                                    rt,
+                                    effects,
+                                    row_id,
+                                    old_row,
+                                    update,
+                                    &root_snapshot,
+                                )
+                                .await?;
+                            tracker.observe_insert(inserted);
+                        }
+                    }
                 }
             }
         }
@@ -2965,7 +3001,7 @@ impl<'a> UserTableAccessor<'a> {
             assert!(
                 page.header.start_row_id == descriptor.start_row_id
                     && actual_end == descriptor.end_row_id,
-                "TableData(X) must preserve the original full-table-update row-page identity: table_id={}, page_id={}, expected_range={}..{}, actual_range={}..{}",
+                "TableData(X) must preserve the original full-table-mutation row-page identity: table_id={}, page_id={}, expected_range={}..{}, actual_range={}..{}",
                 self.table_id(),
                 descriptor.page_id,
                 descriptor.start_row_id,
@@ -2993,7 +3029,7 @@ impl<'a> UserTableAccessor<'a> {
                     ReadLatestRow::WriteConflict => {
                         return Err(Report::new(OperationError::WriteConflict)
                             .attach(format!(
-                                "full-table update latest hot-row read: row_id={row_id}"
+                                "full-table mutation latest hot-row read: row_id={row_id}"
                             ))
                             .disclose());
                     }
@@ -3005,66 +3041,75 @@ impl<'a> UserTableAccessor<'a> {
                     column_layout: self.metadata().col.as_ref(),
                 };
                 let mut lazy_row = LazyRow::new(source, value_buffer, column_count);
-                let selected = update_row(&mut lazy_row)?;
-                let Some(update) = selected else {
-                    value_buffer = lazy_row.into_reusable_buffer();
-                    continue;
-                };
-                matched += 1;
-                if let Some(validator) = validator.as_ref() {
-                    validator
-                        .validate_sparse_update(&update)
-                        .change_context(OperationError::InvalidDmlInput)
-                        .attach_with(|| {
-                            format!("operation=table_update_mvcc, table_id={}", self.table_id())
-                        })
-                        .disclose()?;
-                }
-                value_buffer = lazy_row.into_reusable_buffer();
-                if update.is_empty() {
-                    continue;
-                }
-                // Step 8: Apply the hot update and register an out-of-place
-                // replacement so later page scans retain their original bounds.
-                let inserted = self
-                    .update_known_hot_row(rt, effects, page_guard, row_id, update, &root_snapshot)
-                    .await?;
-                if let Some(inserted) = inserted {
-                    tracker.observe_insert(inserted);
+                match mutate_row(&mut lazy_row)? {
+                    RowMutation::Skip => {
+                        value_buffer = lazy_row.into_reusable_buffer();
+                    }
+                    RowMutation::Delete => {
+                        outcome.delete_count += 1;
+                        let (index_keys, reusable) =
+                            lazy_row.into_index_keys(self.metadata()).disclose()?;
+                        value_buffer = reusable;
+                        self.delete_known_hot_row(
+                            rt,
+                            effects,
+                            page_guard,
+                            row_id,
+                            index_keys,
+                            &root_snapshot,
+                        )
+                        .await?;
+                    }
+                    RowMutation::Update(update) => {
+                        outcome.update_count += 1;
+                        if let Some(validator) = validator.as_ref() {
+                            validator
+                                .validate_sparse_update(&update)
+                                .change_context(OperationError::InvalidDmlInput)
+                                .attach_with(|| {
+                                    format!(
+                                        "operation=table_mutate_mvcc, table_id={}",
+                                        self.table_id()
+                                    )
+                                })
+                                .disclose()?;
+                        }
+                        value_buffer = lazy_row.into_reusable_buffer();
+                        if update.is_empty() {
+                            continue;
+                        }
+                        // Step 8: Apply the hot update and register an out-of-place
+                        // replacement so later page scans retain their original bounds.
+                        let inserted = self
+                            .update_known_hot_row(
+                                rt,
+                                effects,
+                                page_guard,
+                                row_id,
+                                update,
+                                &root_snapshot,
+                            )
+                            .await?;
+                        if let Some(inserted) = inserted {
+                            tracker.observe_insert(inserted);
+                        }
+                    }
                 }
             }
         }
-        Ok(matched)
+        Ok(outcome)
     }
 
     #[inline]
-    async fn update_known_cold_row(
+    async fn install_cold_delete_effects(
         &self,
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
-        pending: PendingColdUpdate,
+        row_id: RowID,
+        index_keys: Vec<SelectKey>,
+        redo_kind: RowRedoKind,
         root_snapshot: &TableRootSnapshot<'_>,
-    ) -> Result<InsertedRow> {
-        let PendingColdUpdate {
-            row_id,
-            old_row,
-            update,
-        } = pending;
-        let deletion_buffer = self.lwc_deletion_buffer();
-        self.debug_assert_table_write_lock_held(rt);
-        match deletion_buffer.put_ref(row_id, rt.status(), rt.sts()) {
-            Ok(()) => (),
-            Err(DeletionError::WriteConflict) => {
-                return Err(Report::new(OperationError::WriteConflict)
-                    .attach("full-table update cold delete marker ownership")
-                    .disclose());
-            }
-            Err(DeletionError::AlreadyDeleted) => {
-                return Err(Report::new(OperationError::WriteConflict)
-                    .attach("full-table update cold row changed after visibility")
-                    .disclose());
-            }
-        }
+    ) -> RuntimeResult<()> {
         effects.push_row_undo(OwnedRowUndo::new(
             self.table_id(),
             None,
@@ -3076,14 +3121,87 @@ impl<'a> UserTableAccessor<'a> {
             RowRedo {
                 page_id: INVALID_PAGE_ID,
                 row_id,
-                kind: RowRedoKind::Delete,
+                kind: redo_kind,
             },
         );
-
-        let old_index_keys = self.metadata().idx.keys_for_insert(&old_row);
-        self.defer_delete_index_keys(rt, effects, row_id, old_index_keys, root_snapshot)
+        self.defer_delete_index_keys(rt, effects, row_id, index_keys, root_snapshot)
             .await
-            .disclose()?;
+    }
+
+    #[inline]
+    async fn delete_known_cold_row(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        index_keys: Vec<SelectKey>,
+        root_snapshot: &TableRootSnapshot<'_>,
+    ) -> Result<()> {
+        let deletion_buffer = self.lwc_deletion_buffer();
+        self.debug_assert_table_write_lock_held(rt);
+        match deletion_buffer.put_ref(row_id, rt.status(), rt.sts()) {
+            Ok(()) => (),
+            Err(DeletionError::WriteConflict) => {
+                return Err(Report::new(OperationError::WriteConflict)
+                    .attach("full-table mutation cold delete marker ownership")
+                    .disclose());
+            }
+            Err(DeletionError::AlreadyDeleted) => {
+                return Err(Report::new(OperationError::WriteConflict)
+                    .attach("full-table mutation cold row changed after visibility")
+                    .disclose());
+            }
+        }
+        self.install_cold_delete_effects(
+            rt,
+            effects,
+            row_id,
+            index_keys,
+            RowRedoKind::Delete,
+            root_snapshot,
+        )
+        .await
+        .attach("full-table mutation cold delete index masking")
+        .disclose()
+    }
+
+    #[inline]
+    async fn update_known_cold_row(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        old_row: Vec<Val>,
+        update: Vec<UpdateCol>,
+        root_snapshot: &TableRootSnapshot<'_>,
+    ) -> Result<InsertedRow> {
+        let deletion_buffer = self.lwc_deletion_buffer();
+        self.debug_assert_table_write_lock_held(rt);
+        match deletion_buffer.put_ref(row_id, rt.status(), rt.sts()) {
+            Ok(()) => (),
+            Err(DeletionError::WriteConflict) => {
+                return Err(Report::new(OperationError::WriteConflict)
+                    .attach("full-table mutation cold update marker ownership")
+                    .disclose());
+            }
+            Err(DeletionError::AlreadyDeleted) => {
+                return Err(Report::new(OperationError::WriteConflict)
+                    .attach("full-table mutation cold row changed after visibility")
+                    .disclose());
+            }
+        }
+        let old_index_keys = self.metadata().idx.keys_for_insert(&old_row);
+        self.install_cold_delete_effects(
+            rt,
+            effects,
+            row_id,
+            old_index_keys,
+            RowRedoKind::Delete,
+            root_snapshot,
+        )
+        .await
+        .attach("full-table mutation cold update delete effects")
+        .disclose()?;
         let new_row = self.build_cold_update_row(old_row, RowUpdateInput::Sparse(update));
         let new_index_keys = self.metadata().idx.keys_for_insert(&new_row);
         let (new_row_id, new_guard) = self
@@ -3093,11 +3211,50 @@ impl<'a> UserTableAccessor<'a> {
         for key in new_index_keys {
             self.insert_index(rt, effects, key, new_row_id, &new_guard, root_snapshot)
                 .await
-                .attach("full-table update cold replacement index claim")
+                .attach("full-table mutation cold replacement index claim")
                 .disclose()?;
         }
         let inserted = InsertedRow::new(new_guard.page_id(), new_row_id);
         Ok(inserted)
+    }
+
+    #[inline]
+    async fn delete_known_hot_row(
+        &self,
+        rt: TrxRuntime<'_>,
+        effects: &mut StmtEffects,
+        page_guard: PageSharedGuard<RowPage>,
+        row_id: RowID,
+        index_keys: Vec<SelectKey>,
+        root_snapshot: &TableRootSnapshot<'_>,
+    ) -> Result<()> {
+        let result = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
+            .delete_known_row(effects)
+            .await
+            .disclose()?;
+        // The successful mutator path has already marked the page dirty,
+        // installed row undo and redo, and released its row write guard. This
+        // full-table path captured every index key before deletion, while its
+        // TableData(X) grant excludes concurrent writers and page transition.
+        // No result branch needs the page image, so release the shared latch and
+        // buffer pin before awaiting secondary-index masking.
+        drop(page_guard);
+        match result {
+            DeleteInternal::Ok => self
+                .defer_delete_index_keys(rt, effects, row_id, index_keys, root_snapshot)
+                .await
+                .attach("full-table mutation hot delete index masking")
+                .disclose(),
+            DeleteInternal::NotFound => Err(Report::new(OperationError::WriteConflict)
+                .attach("full-table mutation hot row changed after visibility")
+                .disclose()),
+            DeleteInternal::RetryInTransition => {
+                unreachable!(
+                    "full-table mutation observed TRANSITION while holding TableData(X): table_id={}, row_id={row_id}",
+                    self.table_id()
+                )
+            }
+        }
     }
 
     #[inline]
@@ -3127,21 +3284,21 @@ impl<'a> UserTableAccessor<'a> {
                         root_snapshot,
                     )
                     .await
-                    .attach("full-table update hot key change")
+                    .attach("full-table mutation hot key change")
                     .disclose()?;
                 }
                 Ok(None)
             }
             UpdateRowInplace::RowDeleted(_) | UpdateRowInplace::RowNotFound(_) => {
                 Err(Report::new(OperationError::WriteConflict)
-                    .attach("full-table update hot row changed after visibility")
+                    .attach("full-table mutation hot row changed after visibility")
                     .disclose())
             }
             UpdateRowInplace::RetryInTransition(_) => {
                 // Checkpoint transition holds TableData(IS), which is
-                // incompatible with the TableData(X) held by full-table update.
+                // incompatible with the TableData(X) held by full-table mutation.
                 unreachable!(
-                    "full-table update observed TRANSITION while holding TableData(X): table_id={}, row_id={row_id}",
+                    "full-table mutation observed TRANSITION while holding TableData(X): table_id={}, row_id={row_id}",
                     self.table_id()
                 )
             }
@@ -3174,7 +3331,7 @@ impl<'a> UserTableAccessor<'a> {
                 };
                 let inserted = InsertedRow::new(new_guard.page_id(), new_row_id);
                 result
-                    .attach("full-table update hot move index update")
+                    .attach("full-table mutation hot move index update")
                     .disclose()?;
                 Ok(Some(inserted))
             }
@@ -3765,13 +3922,6 @@ impl<'a> UserTableAccessor<'a> {
                                     // until success. Row undo removes it on
                                     // rollback; redo rebuilds it as a cold delete
                                     // during recovery.
-                                    let undo = OwnedRowUndo::new(
-                                        self.table_id(),
-                                        None,
-                                        row_id,
-                                        RowUndoKind::Delete,
-                                    );
-                                    effects.push_row_undo(undo);
                                     let redo_kind = if log_by_key {
                                         RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
                                             index_no,
@@ -3780,19 +3930,14 @@ impl<'a> UserTableAccessor<'a> {
                                     } else {
                                         RowRedoKind::Delete
                                     };
-                                    let redo = RowRedo {
-                                        page_id: INVALID_PAGE_ID,
-                                        row_id,
-                                        kind: redo_kind,
-                                    };
-                                    effects.insert_row_redo(self.table_id(), redo);
                                     // Mask old index entries immediately; physical
                                     // deletion remains deferred to index GC.
-                                    self.defer_delete_index_keys(
+                                    self.install_cold_delete_effects(
                                         rt,
                                         effects,
                                         row_id,
                                         index_keys,
+                                        redo_kind,
                                         &root_snapshot,
                                     )
                                     .await
@@ -3845,10 +3990,16 @@ impl<'a> UserTableAccessor<'a> {
                         .disclose()?;
                 }
                 DeleteInternal::Ok => {
-                    // Mask every secondary-index entry for this hot row. The
-                    // physical index entry remains until rollback unmasks it
-                    // or index GC removes it after it is no longer visible.
-                    self.defer_delete_indexes(rt, effects, row_id, &page_guard, &root_snapshot)
+                    // Successful row undo ownership excludes another writer,
+                    // and deletion changed only the row bit. Copy every key
+                    // with one read guard, then release the page latch and
+                    // buffer pin before awaiting secondary-index masking.
+                    let index_keys =
+                        read_physical_index_keys_for_delete(self.metadata(), &page_guard, row_id);
+                    drop(page_guard);
+                    // Physical index entries remain until rollback unmasks
+                    // them or index GC removes them after they are invisible.
+                    self.defer_delete_index_keys(rt, effects, row_id, index_keys, &root_snapshot)
                         .await
                         .disclose()?;
                     return Ok(DeleteMvcc::Deleted);
@@ -4051,7 +4202,8 @@ mod tests {
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::row::RowPage;
     use crate::row::ops::{
-        DeleteMvcc, RowUpdateInput, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc, UpsertMvcc,
+        DeleteMvcc, RowMutation, RowUpdateInput, ScanMvcc, SelectKey, SelectMvcc,
+        TableMutationOutcome, UpdateCol, UpdateMvcc, UpsertMvcc,
     };
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
@@ -6430,7 +6582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_hot_callback_and_statement_rollback() {
+    fn test_table_mutate_mvcc_hot_callback_and_statement_rollback() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6442,24 +6594,30 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 let mut callbacks = 0usize;
-                let matched = stmt
-                    .table_update_mvcc(table_id, |row| {
+                let outcome = stmt
+                    .table_mutate_mvcc(table_id, |row| {
                         callbacks += 1;
                         assert_eq!(row.column_count(), 2);
                         let first = row.val(0)?.as_i32().unwrap();
                         assert_eq!(row.val(0)?.as_i32().unwrap(), first);
                         if first % 2 == 0 {
-                            Ok(Some(vec![UpdateCol {
+                            Ok(RowMutation::Update(vec![UpdateCol {
                                 idx: 1,
                                 val: Val::from(format!("updated-{first}").as_str()),
                             }]))
                         } else {
-                            Ok(None)
+                            Ok(RowMutation::Skip)
                         }
                     })
                     .await?;
                 assert_eq!(callbacks, 5);
-                assert_eq!(matched, 3);
+                assert_eq!(
+                    outcome,
+                    TableMutationOutcome {
+                        delete_count: 0,
+                        update_count: 3,
+                    }
+                );
                 Ok(())
             })
             .await
@@ -6480,12 +6638,12 @@ mod tests {
             let before_error = scan_table_pairs(&mut trx, table_id).await;
             let result: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.table_update_mvcc(table_id, |row| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
                         let id = row.val(0)?.as_i32().unwrap();
                         if id == 2 {
                             _ = row.val(2)?;
                         }
-                        Ok(Some(vec![UpdateCol {
+                        Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 1,
                             val: Val::from("should-rollback"),
                         }]))
@@ -6508,7 +6666,502 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_hot_callback_reads_latest_committed_value() {
+    fn test_table_mutate_mvcc_empty_table_returns_default_outcome() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "full_mutate_empty").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |_| -> Result<RowMutation> {
+                        panic!("empty table must not invoke mutation callback")
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome, TableMutationOutcome::default());
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_mixed_cold_hot_actions_and_outcome() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "full_mutate_mixed").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 3, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 10, 3, "hot").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        Ok(match id {
+                            0 | 10 => RowMutation::Delete,
+                            1 => RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("cold-updated"),
+                            }]),
+                            11 => RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("hot-updated"),
+                            }]),
+                            12 => RowMutation::Update(Vec::new()),
+                            2 => RowMutation::Skip,
+                            _ => unreachable!(),
+                        })
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                TableMutationOutcome {
+                    delete_count: 2,
+                    update_count: 3,
+                }
+            );
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            assert_eq!(
+                scan_table_pairs(&mut trx, table_id).await,
+                vec![
+                    (1, "cold-updated".to_owned()),
+                    (2, "cold".to_owned()),
+                    (11, "hot-updated".to_owned()),
+                    (12, "hot".to_owned()),
+                ]
+            );
+            for id in [0, 10] {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0, 1]).await,
+                    Ok(SelectMvcc::NotFound)
+                ));
+            }
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_mixed_actions_callback_error_rolls_back() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "full_mutate_callback_rollback",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 2, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 10, 2, "hot").await;
+
+            let expected = vec![
+                (0, "cold".to_owned()),
+                (1, "cold".to_owned()),
+                (10, "hot".to_owned()),
+                (11, "hot".to_owned()),
+            ];
+            let mut trx = session.begin_trx().unwrap();
+            let result: Result<()> = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        match id {
+                            0 | 10 => Ok(RowMutation::Delete),
+                            1 => Ok(RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("changed"),
+                            }])),
+                            11 => Err(Report::new(OperationError::NotSupported).disclose()),
+                            _ => unreachable!(),
+                        }
+                    })
+                    .await?;
+                    Ok(())
+                })
+                .await;
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
+                Some(OperationError::NotSupported)
+            );
+            assert_eq!(scan_table_pairs(&mut trx, table_id).await, expected);
+            for id in [0, 1, 10, 11] {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0, 1]).await,
+                    Ok(SelectMvcc::Found(_))
+                ));
+            }
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_transaction_rollback_restores_mixed_actions() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "full_mutate_transaction_rollback",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 2, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 10, 2, "hot").await;
+            let expected = vec![
+                (0, "cold".to_owned()),
+                (1, "cold".to_owned()),
+                (10, "hot".to_owned()),
+                (11, "hot".to_owned()),
+            ];
+
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        Ok(match row.val(0)?.as_i32().unwrap() {
+                            0 | 10 => RowMutation::Delete,
+                            1 | 11 => RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("changed"),
+                            }]),
+                            _ => unreachable!(),
+                        })
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.delete_count, 2);
+            assert_eq!(outcome.update_count, 2);
+            assert_eq!(
+                scan_table_pairs(&mut trx, table_id).await,
+                vec![(1, "changed".to_owned()), (11, "changed".to_owned())]
+            );
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            assert_eq!(scan_table_pairs(&mut trx, table_id).await, expected);
+            for id in [0, 1, 10, 11] {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0, 1]).await,
+                    Ok(SelectMvcc::Found(_))
+                ));
+            }
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_cold_delete_decodes_unread_index_columns() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "full_mutate_cold_index_keys",
+            )
+            .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "shared").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        Ok(if id % 2 == 0 {
+                            RowMutation::Delete
+                        } else {
+                            RowMutation::Skip
+                        })
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.delete_count, 2);
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![vec![Val::from(1i32)], vec![Val::from(3i32)]])
+            );
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_hot_delete_captures_unread_index_columns() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "full_mutate_hot_index_keys")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "shared").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        Ok(if id % 2 == 0 {
+                            RowMutation::Delete
+                        } else {
+                            RowMutation::Skip
+                        })
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.delete_count, 2);
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![vec![Val::from(1i32)], vec![Val::from(3i32)]])
+            );
+            for id in [0, 2] {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0]).await,
+                    Ok(SelectMvcc::NotFound)
+                ));
+            }
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(2i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            for id in 0..4 {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0]).await,
+                    Ok(SelectMvcc::Found(_))
+                ));
+            }
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_hot_point_delete_masks_all_index_keys_and_rolls_back() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "hot_point_delete_index_keys",
+            )
+            .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "shared").await;
+            let key = single_key(2i32);
+
+            let mut trx = session.begin_trx().unwrap();
+            let deleted = trx_delete_row_by_id(&mut trx, table_id, &key).await;
+            assert!(matches!(deleted, Ok(DeleteMvcc::Deleted)));
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            assert!(matches!(
+                trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0]).await,
+                Ok(SelectMvcc::NotFound)
+            ));
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(2i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            assert!(matches!(
+                trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0]).await,
+                Ok(SelectMvcc::Found(_))
+            ));
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let deleted = trx_delete_row_by_id(&mut trx, table_id, &key).await;
+            assert!(matches!(deleted, Ok(DeleteMvcc::Deleted)));
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            assert!(matches!(
+                trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0]).await,
+                Ok(SelectMvcc::NotFound)
+            ));
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_enforces_uniqueness_in_action_order() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "full_mutate_uniqueness_order",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 1, 2, "name").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        Ok(match row.val(0)?.as_i32().unwrap() {
+                            1 => RowMutation::Delete,
+                            2 => RowMutation::Update(vec![UpdateCol {
+                                idx: 0,
+                                val: Val::from(1i32),
+                            }]),
+                            _ => unreachable!(),
+                        })
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.delete_count, 1);
+            assert_eq!(outcome.update_count, 1);
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            assert_eq!(scan_table_i32s(&mut trx, table_id).await, vec![1]);
+            trx.commit().await.unwrap();
+
+            let second_table_id = create_table2_for_test(&engine).await;
+            insert_rows(second_table_id, &mut session, 1, 2, "name").await;
+            let mut trx = session.begin_trx().unwrap();
+            let result: Result<()> = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(second_table_id, |row| {
+                        Ok(match row.val(0)?.as_i32().unwrap() {
+                            1 => RowMutation::Update(vec![UpdateCol {
+                                idx: 0,
+                                val: Val::from(2i32),
+                            }]),
+                            2 => RowMutation::Delete,
+                            _ => unreachable!(),
+                        })
+                    })
+                    .await?;
+                    Ok(())
+                })
+                .await;
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .report()
+                    .downcast_ref::<OperationError>()
+                    .copied(),
+                Some(OperationError::DuplicateKey)
+            );
+            assert_eq!(scan_table_i32s(&mut trx, second_table_id).await, vec![1, 2]);
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_hot_callback_reads_latest_committed_value() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6538,13 +7191,13 @@ mod tests {
 
             older
                 .exec(async |stmt| {
-                    let matched = stmt
-                        .table_update_mvcc(table_id, |row| {
+                    let outcome = stmt
+                        .table_mutate_mvcc(table_id, |row| {
                             assert_eq!(row.val(1)?.as_str(), Some("newer"));
-                            Ok(Some(Vec::new()))
+                            Ok(RowMutation::Update(Vec::new()))
                         })
                         .await?;
-                    assert_eq!(matched, 1);
+                    assert_eq!(outcome.update_count, 1);
                     Ok(())
                 })
                 .await
@@ -6554,7 +7207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_cold_callback_reads_latest_committed_state() {
+    fn test_table_mutate_mvcc_cold_callback_reads_latest_committed_state() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6588,16 +7241,16 @@ mod tests {
             let mut seen = Vec::new();
             older
                 .exec(async |stmt| {
-                    let matched = stmt
-                        .table_update_mvcc(table_id, |row| {
+                    let outcome = stmt
+                        .table_mutate_mvcc(table_id, |row| {
                             seen.push((
                                 row.val(0)?.as_i32().unwrap(),
                                 row.val(1)?.as_str().unwrap().to_owned(),
                             ));
-                            Ok(Some(Vec::new()))
+                            Ok(RowMutation::Update(Vec::new()))
                         })
                         .await?;
-                    assert_eq!(matched, 1);
+                    assert_eq!(outcome.update_count, 1);
                     Ok(())
                 })
                 .await
@@ -6608,7 +7261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_mixed_storage_excludes_replacements() {
+    fn test_table_mutate_mvcc_mixed_storage_excludes_replacements() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6623,16 +7276,19 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                let matched = stmt
-                    .table_update_mvcc(table_id, |row| {
+                let outcome = stmt
+                    .table_mutate_mvcc(table_id, |row| {
                         let id = row.val(0)?.as_i32().unwrap();
-                        Ok(Some(vec![UpdateCol {
+                        Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 0,
                             val: Val::from(id + 100),
                         }]))
                     })
                     .await?;
-                assert_eq!(matched, 5, "replacement rows must not be revisited");
+                assert_eq!(
+                    outcome.update_count, 5,
+                    "replacement rows must not be revisited"
+                );
                 Ok(())
             })
             .await
@@ -6649,7 +7305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_duplicate_rolls_back_all_rows_and_indexes() {
+    fn test_table_mutate_mvcc_duplicate_rolls_back_all_rows_and_indexes() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6662,10 +7318,10 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let result: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.table_update_mvcc(table_id, |row| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
                         let id = row.val(0)?.as_i32().unwrap();
                         let new_id = if id < 2 { 10 } else { id };
-                        Ok(Some(vec![UpdateCol {
+                        Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 0,
                             val: Val::from(new_id),
                         }]))
@@ -6698,7 +7354,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_cold_duplicate_marks_replacement_page_dirty() {
+    fn test_table_mutate_mvcc_cold_duplicate_marks_replacement_page_dirty() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6727,14 +7383,16 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let result: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.table_update_mvcc(table_id, |row| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
                         let id = row.val(0)?.as_i32().unwrap();
-                        Ok((id == 0).then(|| {
-                            vec![UpdateCol {
+                        Ok(if id == 0 {
+                            RowMutation::Update(vec![UpdateCol {
                                 idx: 0,
                                 val: Val::from(1i32),
-                            }]
-                        }))
+                            }])
+                        } else {
+                            RowMutation::Skip
+                        })
                     })
                     .await?;
                     Ok(())
@@ -6773,7 +7431,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_x_blocks_freeze_until_transaction_end() {
+    fn test_table_mutate_mvcc_x_blocks_freeze_until_transaction_end() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6787,9 +7445,12 @@ mod tests {
             writer
                 .exec(async |stmt| {
                     assert_eq!(
-                        stmt.table_update_mvcc(table_id, |_| Ok(Some(Vec::new())))
-                            .await?,
-                        1
+                        stmt.table_mutate_mvcc(table_id, |_| {
+                            Ok(RowMutation::Update(Vec::new()))
+                        })
+                        .await?
+                        .update_count,
+                        1,
                     );
                     Ok(())
                 })
@@ -6818,7 +7479,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_update_mvcc_ix_conversion_failure_has_no_callbacks() {
+    fn test_table_mutate_mvcc_ix_conversion_failure_has_no_callbacks() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -6861,9 +7522,9 @@ mod tests {
             let mut callbacks = 0usize;
             let result: Result<()> = first
                 .exec(async |stmt| {
-                    stmt.table_update_mvcc(table_id, |_| {
+                    stmt.table_mutate_mvcc(table_id, |_| {
                         callbacks += 1;
-                        Ok(None)
+                        Ok(RowMutation::Skip)
                     })
                     .await?;
                     Ok(())
