@@ -5,7 +5,7 @@ pub(crate) use ops::*;
 pub(crate) use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
-use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page};
+use crate::buffer::page::{BufferPage, PAGE_SIZE, assert_buffer_page};
 use crate::catalog::{IndexSpec, TableColumnLayout};
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
 use crate::id::RowID;
@@ -1106,9 +1106,7 @@ impl RowPage {
 // layout, exactly one page of storage, no drop glue, and zero-valid atomic and
 // byte fields. Interior mutation is coordinated by row/page protocols and the
 // buffer-pool latch state.
-unsafe impl BufferPage for RowPage {
-    const KIND: BufferPageKind = BufferPageKind::RowPage;
-}
+unsafe impl BufferPage for RowPage {}
 
 /// Native header stored at the front of every in-memory row page.
 #[repr(C)]

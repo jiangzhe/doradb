@@ -3,7 +3,7 @@ use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
 use crate::error::{
-    FatalError, FatalResult, LifecycleResult, MultiDomainResultExt, OperationError,
+    DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt, OperationError,
     OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult, Result, RuntimeError,
     RuntimeResult,
 };
@@ -257,9 +257,9 @@ impl<'stmt> Statement<'stmt> {
         inner: &'stmt mut TrxInner,
         attachment: &'stmt TrxAttachment,
         owner: LockOwner,
-    ) -> LifecycleResult<Self> {
-        let owner_group = inner.checked_lock_state()?.owner_group();
-        Ok(Statement {
+    ) -> Self {
+        let owner_group = inner.checked_lock_state().owner_group();
+        Statement {
             inner,
             attachment,
             effects: StmtEffects::empty(),
@@ -268,7 +268,7 @@ impl<'stmt> Statement<'stmt> {
                 None => OwnerLockState::new(owner),
             },
             disable_dml_validation: false,
-        })
+        }
     }
 
     /// Disable default DML shape, type, nullability, sparse-update, key, and
@@ -328,9 +328,6 @@ impl<'stmt> Statement<'stmt> {
     }
 
     /// Acquires transaction-lifetime metadata protection for a table write.
-    ///
-    /// An unavailable transaction lock state crosses from Lifecycle into the
-    /// lock operation here. `change_context` retains the prerequisite frame.
     #[inline]
     pub(crate) async fn acquire_table_write_metadata_lock(
         &mut self,
@@ -339,8 +336,6 @@ impl<'stmt> Statement<'stmt> {
         let lock_manager = self.attachment.engine().lock_manager();
         self.inner
             .checked_lock_state_mut()
-            .change_context(OperationError::LockUnavailable)
-            .attach_with(|| "phase=resolve_transaction_lock_state")?
             .acquire(
                 lock_manager,
                 LockResource::TableMetadata(table_id),
@@ -358,8 +353,6 @@ impl<'stmt> Statement<'stmt> {
         let lock_manager = self.attachment.engine().lock_manager();
         self.inner
             .checked_lock_state_mut()
-            .change_context(OperationError::LockUnavailable)
-            .attach_with(|| "phase=resolve_transaction_lock_state")?
             .acquire(
                 lock_manager,
                 LockResource::TableData(table_id),
@@ -377,8 +370,6 @@ impl<'stmt> Statement<'stmt> {
         let lock_manager = self.attachment.engine().lock_manager();
         self.inner
             .checked_lock_state_mut()
-            .change_context(OperationError::LockUnavailable)
-            .attach_with(|| "phase=resolve_transaction_lock_state")?
             .acquire(
                 lock_manager,
                 LockResource::TableData(table_id),
@@ -425,20 +416,24 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_scan_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
-        Ok(table
+        table
             .accessor_with_layout(&layout)
             .table_scan_mvcc(rt, read_set, row_action)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?)
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()
     }
 
     /// Sequentially update callback-selected rows using latest modification reads.
@@ -459,19 +454,24 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_update_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_exclusive_data_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         let validate_updates = !self.disable_dml_validation;
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -495,22 +495,26 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_lookup_unique_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
-        Ok(table
+        table
             .accessor_with_layout(&layout)
             .index_lookup_unique_mvcc(rt, index_no, key_vals, user_read_set)
             .await
             .attach_with(|| {
                 format!("operation={OPERATION}, table_id={table_id}, index_no={index_no}")
-            })?)
+            })
+            .disclose()
     }
 
     /// Looks up one secondary-index key in a catalog-owned user table by table id.
@@ -527,22 +531,26 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_index_lookup_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
-        Ok(table
+        table
             .accessor_with_layout(&layout)
             .index_lookup_mvcc(rt, index_no, key_vals, user_read_set)
             .await
             .attach_with(|| {
                 format!("operation={OPERATION}, table_id={table_id}, index_no={index_no}")
-            })?)
+            })
+            .disclose()
     }
 
     /// Scans one secondary-index range in a catalog-owned user table by table id.
@@ -562,28 +570,33 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_index_scan_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_index_scan(index_no, &range, read_set)
                 .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
         }
         let rt = self.runtime();
-        Ok(table
+        table
             .accessor_with_layout(&layout)
             .index_scan_mvcc(rt, index_no, range, read_set)
             .await
             .attach_with(|| {
                 format!("operation={OPERATION}, table_id={table_id}, index_no={index_no}")
-            })?)
+            })
+            .disclose()
     }
 
     /// Inserts one row into a catalog-owned user table by table id.
@@ -594,23 +607,28 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_insert_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_full_row(&cols)
                 .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -631,28 +649,34 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_upsert_unique_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             let validator = DmlValidator::new(layout.metadata());
             validator
                 .validate_full_row(&cols)
                 .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
             validator
                 .validate_unique_index(unique_index_no)
                 .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -674,28 +698,34 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_update_unique_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             let validator = DmlValidator::new(layout.metadata());
             validator
                 .validate_unique_key(index_no, key_vals)
                 .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
             validator
                 .validate_sparse_update(&update)
                 .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -717,23 +747,28 @@ impl<'stmt> Statement<'stmt> {
         const OPERATION: &str = "table_delete_unique_mvcc";
         let table = self
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))?;
+            .attach_with(|| format!("operation={OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_unique_key(index_no, key_vals)
                 .change_context(OperationError::InvalidDmlInput)
-                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+                .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+                .disclose()?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))?;
+            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
@@ -920,7 +955,10 @@ pub(crate) mod tests {
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{ErrorKind, FatalError, InternalError, LifecycleError, OperationError};
+    use crate::error::{
+        DiscloseError, DiscloseResultExt, ErrorKind, FatalError, InternalError, OperationError,
+        ResourceError,
+    };
     use crate::id::TrxID;
     use crate::lock::LockManager;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
@@ -945,11 +983,8 @@ pub(crate) mod tests {
 
     pub(super) fn maybe_force_stmt_index_rollback_error() -> RuntimeResult<()> {
         if TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.get()) {
-            // TODO(error-boundary): backlog 000160 should replace this generic
-            // hook with a statement rollback source-domain failure.
-            return Err(Report::new(InternalError::Generic)
-                .attach("test statement index rollback failure")
-                .change_context(RuntimeError::TableAccess));
+            return Err(Report::new(RuntimeError::IndexAccess)
+                .attach("operation=test_statement_index_rollback"));
         }
         Ok(())
     }
@@ -979,10 +1014,10 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<()> {
-        Ok(stmt
-            .stmt_locks
+        stmt.stmt_locks
             .acquire(stmt.attachment.engine().lock_manager(), resource, mode)
-            .await?)
+            .await
+            .disclose()
     }
 
     #[inline]
@@ -994,12 +1029,8 @@ pub(crate) mod tests {
 
     #[inline]
     fn trx_lock_owner(trx: &mut Transaction) -> Result<LockOwner> {
-        let checkout = trx.checkout()?;
-        Ok(checkout
-            .inner()
-            .checked_lock_state()
-            .attach("operation=read_transaction_lock_owner")?
-            .owner())
+        let checkout = trx.checkout().disclose()?;
+        Ok(checkout.inner().checked_lock_state().owner())
     }
 
     #[inline]
@@ -1008,20 +1039,10 @@ pub(crate) mod tests {
         resource: LockResource,
         mode: LockMode,
     ) -> Result<bool> {
-        let mut checkout = trx.checkout()?;
+        let mut checkout = trx.checkout().disclose()?;
         let (inner, attachment) = checkout.inner_and_attachment_mut();
         let lock_manager = attachment.engine().lock_manager();
-        try_acquire_owner_lock_state(
-            inner
-                .checked_lock_state_mut()
-                .change_context(OperationError::LockUnavailable)
-                .attach_with(|| {
-                    "operation=try_acquire_transaction_lock, phase=resolve_transaction_lock_state"
-                })?,
-            lock_manager,
-            resource,
-            mode,
-        )
+        try_acquire_owner_lock_state(inner.checked_lock_state_mut(), lock_manager, resource, mode)
     }
 
     #[inline]
@@ -1037,9 +1058,9 @@ pub(crate) mod tests {
         let owner = lock_state.owner();
         let acquired = match lock_state.owner_group() {
             Some(owner_group) => {
-                try_acquire_grouped(lock_manager, resource, mode, owner, owner_group)?
+                try_acquire_grouped(lock_manager, resource, mode, owner, owner_group).disclose()?
             }
-            None => try_acquire(lock_manager, resource, mode, owner)?,
+            None => try_acquire(lock_manager, resource, mode, owner).disclose()?,
         };
         if acquired {
             lock_state.cache_granted(resource, mode);
@@ -1121,18 +1142,17 @@ pub(crate) mod tests {
 
     #[test]
     fn test_catalog_mutation_runtime_error_preserves_stack() {
-        let result: OperationOrRuntimeResult<()> =
-            Err(Report::new(InternalError::PoolGuardMissing)
-                .attach("pool_role=Meta")
-                .change_context(RuntimeError::CatalogAccess)
-                .into());
+        let result: OperationOrRuntimeResult<()> = Err(Report::new(ResourceError::BufferPoolFull)
+            .attach("pool_role=Meta")
+            .change_context(RuntimeError::CatalogAccess)
+            .into());
 
         let err = assert_catalog_mutation_invariant(TableID::new(42), result).unwrap_err();
 
         assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
         assert_eq!(
-            err.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::PoolGuardMissing)
+            err.downcast_ref::<ResourceError>().copied(),
+            Some(ResourceError::BufferPoolFull)
         );
         assert!(format!("{err:?}").contains("pool_role=Meta"));
     }
@@ -1157,7 +1177,8 @@ pub(crate) mod tests {
                     &key.vals,
                     true,
                 )
-                .await?;
+                .await
+                .disclose()?;
                 Ok(())
             }))
             .catch_unwind()
@@ -1201,86 +1222,6 @@ pub(crate) mod tests {
         });
     }
 
-    #[inline]
-    fn assert_lock_state_lifecycle_error(err: Report<LifecycleError>, trx_id: TrxID, reason: &str) {
-        assert_eq!(*err.current_context(), LifecycleError::TransactionDiscarded);
-        assert!(err.downcast_ref::<InternalError>().is_none());
-        let rendered = format!("{err:?}");
-        assert!(rendered.contains(&format!("trx_id={trx_id}")));
-        assert!(rendered.contains(&format!("reason={reason}")));
-    }
-
-    #[test]
-    fn test_checked_lock_state_reports_lifecycle_reasons() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_checked_lock_state_lifecycle").await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let trx_id = trx.trx_id();
-
-            trx.exec(async |stmt| {
-                stmt.inner.active = false;
-                assert_lock_state_lifecycle_error(
-                    stmt.inner.checked_lock_state().err().unwrap(),
-                    trx_id,
-                    "transaction_inactive",
-                );
-                assert_lock_state_lifecycle_error(
-                    stmt.inner.checked_lock_state_mut().err().unwrap(),
-                    trx_id,
-                    "transaction_inactive",
-                );
-                stmt.inner.active = true;
-
-                let lock_state = stmt.inner.lock_state.take();
-                assert_lock_state_lifecycle_error(
-                    stmt.inner.checked_lock_state().err().unwrap(),
-                    trx_id,
-                    "lock_state_missing",
-                );
-                assert_lock_state_lifecycle_error(
-                    stmt.inner.checked_lock_state_mut().err().unwrap(),
-                    trx_id,
-                    "lock_state_missing",
-                );
-                stmt.inner.lock_state = lock_state;
-                Ok(())
-            })
-            .await
-            .unwrap();
-            trx.rollback().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn test_table_write_lock_stacks_operation_over_lifecycle_error() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_table_write_lock_error_stack").await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-
-            trx.exec(async |stmt| {
-                stmt.inner.active = false;
-                let err = stmt
-                    .acquire_table_write_metadata_lock(TableID::new(91_226))
-                    .await
-                    .unwrap_err();
-                stmt.inner.active = true;
-
-                assert_eq!(*err.current_context(), OperationError::LockUnavailable);
-                assert_eq!(
-                    err.downcast_ref::<LifecycleError>().copied(),
-                    Some(LifecycleError::TransactionDiscarded)
-                );
-                assert!(err.downcast_ref::<InternalError>().is_none());
-                Ok(())
-            })
-            .await
-            .unwrap();
-            trx.rollback().await.unwrap();
-        });
-    }
-
     #[test]
     fn test_statement_index_rollback_failure_poisons_and_discards_transaction() {
         smol::block_on(async {
@@ -1320,7 +1261,7 @@ pub(crate) mod tests {
                         true,
                     );
                     set_test_force_stmt_index_rollback_error(true);
-                    Err(Report::new(OperationError::NotSupported).into())
+                    Err(Report::new(OperationError::NotSupported).disclose())
                 })
                 .await;
             set_test_force_stmt_index_rollback_error(false);
@@ -1329,6 +1270,10 @@ pub(crate) mod tests {
             assert_eq!(
                 err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RollbackAccess)
+            );
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::IndexAccess)
             );
             assert!(sys_tests::retains_statement_row_undo(
                 &engine.inner().trx_sys,
@@ -1347,10 +1292,7 @@ pub(crate) mod tests {
             );
 
             let err = trx.commit().await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::ActiveTransactionDiscarded)
-            );
+            assert!(err.report().downcast_ref::<InternalError>().is_none());
         });
     }
 }

@@ -3,7 +3,7 @@ use crate::catalog::Catalog;
 use crate::component::EnginePools;
 use crate::conf::TrxSysConfig;
 use crate::conf::path::validate_log_file_stem;
-use crate::error::Result;
+use crate::error::RuntimeResult;
 use crate::file::fs::FileSystem;
 use crate::io::STORAGE_SECTOR_SIZE;
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
@@ -44,7 +44,11 @@ impl<'a> RecoveryResources<'a> {
 
     /// Prepare startup recovery from validated transaction configuration.
     #[inline]
-    pub(crate) fn prepare(self, config: &TrxSysConfig) -> Result<RecoveryCoordinator<'a>> {
+    pub(crate) fn prepare(
+        self,
+        config: &TrxSysConfig,
+        file_prefix: String,
+    ) -> RuntimeResult<RecoveryCoordinator<'a>> {
         let log_block_size = config.log_block_size.as_u64() as usize;
         let file_max_size = config.log_file_max_size.as_u64() as usize;
         debug_assert!(config.log_write_io_depth != 0);
@@ -58,7 +62,6 @@ impl<'a> RecoveryResources<'a> {
             0
         );
 
-        let file_prefix = config.file_prefix()?;
         let first_retained_file_seq = self
             .catalog
             .storage

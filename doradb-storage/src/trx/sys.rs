@@ -7,9 +7,9 @@ use crate::component::{
 use crate::conf::TrxSysConfig;
 use crate::engine::EngineRef;
 use crate::error::{
-    CompletionErrorBridge, DataIntegrityError, Error, FatalError, FatalResult, InternalError,
-    MultiDomainResultExt, Result, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
-    RuntimeResult,
+    CompletionErrorBridge, DataIntegrityError, DataIntegrityResult, DiscloseError,
+    DiscloseResultExt, Error, FatalError, FatalResult, MultiDomainResultExt, Result, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
@@ -180,7 +180,7 @@ impl Component for TransactionSystemWorkers {
     type Config = ();
     type Owned = TransactionSystemWorkersOwned;
     type Access = ();
-    type Error = Error;
+    type Error = RuntimeOrFatalError;
 
     const NAME: &'static str = "trx_sys_workers";
 
@@ -189,7 +189,7 @@ impl Component for TransactionSystemWorkers {
         _config: Self::Config,
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
+    ) -> RuntimeOrFatalResult<()> {
         let trx_sys = registry.dependency::<TransactionSystem>();
         let startup = shelf.take::<TransactionSystem>();
         registry.register::<Self>(startup.start(trx_sys).await?);
@@ -243,16 +243,19 @@ impl PendingTransactionSystemStartup {
     pub(crate) async fn start(
         self,
         trx_sys: QuiescentGuard<TransactionSystem>,
-    ) -> Result<TransactionSystemWorkersOwned> {
+    ) -> RuntimeOrFatalResult<TransactionSystemWorkersOwned> {
         // Start the log thread first because it owns the redo write driver and
         // must process the initial redo header write submitted during recovery.
         let log_thread = TransactionSystem::start_log_thread(trx_sys.clone())
-            .attach("phase=start_transaction_log_worker")?;
+            .attach("phase=start_transaction_log_worker")
+            .map_err(RuntimeOrFatalError::from)?;
         // Wait until the initial header is durable before exposing transaction
         // workers; later redo records must not be accepted until the active log
         // file has a valid super-block.
         if let Err(report) = self.initial_redo_header.wait_result().await {
-            let mut err = Error::from(report).attach("wait for initial redo super-block write");
+            let mut err = report
+                .into_runtime_or_fatal(RuntimeError::RedoLogAccess)
+                .attach("wait for initial redo super-block write");
             if !trx_sys.rollback_log_thread_startup(log_thread) {
                 err = err.attach(
                     "phase=rollback_initial_redo_header_failure, cleanup=join_log_worker, result=panic",
@@ -272,9 +275,9 @@ impl PendingTransactionSystemStartup {
                         "phase=rollback_purge_spawn_failure, cleanup=join_log_worker, result=panic",
                     );
                 }
-                return Err(report
-                    .attach("phase=start_transaction_purge_workers")
-                    .into());
+                return Err(RuntimeOrFatalError::from(
+                    report.attach("phase=start_transaction_purge_workers"),
+                ));
             }
         };
         let cleanup_thread = match TransactionSystem::start_cleanup_thread(self.cleanup_rx) {
@@ -301,9 +304,9 @@ impl PendingTransactionSystemStartup {
                         "phase=rollback_cleanup_spawn_failure, cleanup=join_purge_workers, join_panics={join_panics}"
                     ));
                 }
-                return Err(report
-                    .attach("phase=start_transaction_cleanup_worker")
-                    .into());
+                return Err(RuntimeOrFatalError::from(
+                    report.attach("phase=start_transaction_cleanup_worker"),
+                ));
             }
         };
         Ok(TransactionSystemWorkersOwned::new(
@@ -663,6 +666,10 @@ pub(crate) struct TransactionSystem {
 
 impl TransactionSystem {
     /// Recover durable state and bootstrap transaction-system startup resources.
+    ///
+    /// This is a genuine mixed startup owner: configuration, recovery IO,
+    /// persisted-data validation, runtime setup, and resource failures meet
+    /// here before engine construction exposes the public result.
     pub(crate) async fn bootstrap(
         config: TrxSysConfig,
         poisoner: QuiescentGuard<EnginePoisoner>,
@@ -681,11 +688,16 @@ impl TransactionSystem {
         let pool_guards = pools.pool_guards();
         let (purge_tx, purge_rx) = flume::unbounded();
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
+        let file_prefix = config.file_prefix().disclose()?;
         let recovery_resources = RecoveryResources::new(pools, table_fs.clone(), &catalog);
-        let coordinator = recovery_resources.prepare(&config)?;
-        let (max_recovered_cts, finalizer) = coordinator.recover_all().await?;
-        let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)?;
-        let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone())?;
+        let coordinator = recovery_resources
+            .prepare(&config, file_prefix)
+            .disclose()?;
+        let (max_recovered_cts, finalizer) = coordinator.recover_all().await.disclose()?;
+        let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)
+            .change_context(RuntimeError::Recovery)
+            .disclose()?;
+        let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone()).disclose()?;
         let redo_log = CachePadded::new(redo_log);
 
         let trx_sys = Self::new(
@@ -1001,11 +1013,17 @@ impl TransactionSystem {
     }
 
     /// Enqueue a prepared transaction and wait for ordered commit completion.
+    ///
+    /// The shared user-commit completion has a closed but genuinely mixed
+    /// producer set: intrinsic Resource rejection, Lifecycle shutdown, or
+    /// Fatal redo/rollback failure. This helper intentionally retains the
+    /// public result rather than introducing a one-use sum carrier.
     #[inline]
     pub(crate) async fn commit_prepared(&self, trx: PreparedTrx) -> Result<TrxID> {
         let (cts, waiter) = self.enqueue_prepared_waiter(trx);
         waiter.wait_result().await.map_err(|report| {
-            Error::from(report)
+            report
+                .disclose()
                 .attach_with(|| format!("wait for redo group commit: commit_ts={cts}"))
         })?;
         assert!(TrxID::new(self.redo_log.persisted_cts.load(Ordering::Relaxed)) >= cts);
@@ -1158,6 +1176,11 @@ impl TransactionSystem {
     }
 
     /// Commit an active transaction.
+    ///
+    /// This is the internal owner of the public user-commit boundary. Its
+    /// failures are limited to Resource, Lifecycle, and Fatal reports from
+    /// ordered completion or mandatory rollback, but remain on `Result` so the
+    /// completion source and commit-timestamp attachment are disclosed once.
     /// The commit process is implemented as group commit.
     /// If multiple transactions are being committed at the same time, one of them
     /// will become leader of the commit group. Others become followers waiting for
@@ -1168,14 +1191,15 @@ impl TransactionSystem {
         if let Err(err) = self.poisoner.ensure_healthy() {
             let completion = self.enqueue_terminal_rollback(claim, "rollback poisoned commit");
             Self::wait_terminal_rollback(completion, "wait for poisoned commit rollback cleanup")
-                .await?;
-            return Err(err.into());
+                .await
+                .disclose()?;
+            return Err(err.disclose());
         }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let (_entry, inner, attachment) = claim.into_parts();
         inner.debug_assert_redo_invariants();
-        let prepared_trx = inner.prepare(attachment)?;
+        let prepared_trx = inner.prepare(attachment);
         if !prepared_trx.require_ordered_commit() {
             // No runtime effects means there is no CTS to publish and no commit
             // order to preserve. Effects without redo still enter group commit
@@ -1206,11 +1230,7 @@ impl TransactionSystem {
         }
         let (_entry, inner, attachment) = claim.into_parts();
         inner.debug_assert_redo_invariants();
-        let prepared_trx = inner
-            .prepare(attachment)
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=commit_catalog_ddl, phase=prepare")
-            .map_err(RuntimeOrFatalError::from)?;
+        let prepared_trx = inner.prepare(attachment);
         if !prepared_trx.require_ordered_commit() {
             self.discard_unordered_prepared(prepared_trx);
             return Ok(TrxID::new(0));
@@ -1225,14 +1245,12 @@ impl TransactionSystem {
             .ensure_healthy()
             .map_err(RuntimeOrFatalError::from)?;
         if trx.redo.is_empty() {
-            if trx.retired_row_pages.is_some() {
-                return Err(RuntimeOrFatalError::from(
-                    Report::new(InternalError::SystemTransactionRedoMissing)
-                        .attach("system row-page retirement requires recovery-visible redo")
-                        .change_context(RuntimeError::SystemTransactionCommit)
-                        .attach("operation=commit_system_transaction"),
-                ));
-            }
+            // Retirement is produced only by a checkpoint that records its
+            // recovery-visible root publication in the same system transaction.
+            assert!(
+                trx.retired_row_pages.is_none(),
+                "system row-page retirement requires recovery-visible redo"
+            );
             // System transaction does not hold any active start timestamp
             // so we can just drop it if there is no change to replay.
             return Ok(TrxID::new(0));
@@ -1248,7 +1266,7 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub(crate) async fn rollback_transaction(&self, claim: TrxCompletionClaim) -> Result<()> {
+    pub(crate) async fn rollback_transaction(&self, claim: TrxCompletionClaim) -> FatalResult<()> {
         let completion = self.enqueue_terminal_rollback(claim, "rollback active transaction");
         Self::wait_terminal_rollback(completion, "wait for terminal rollback cleanup").await
     }
@@ -1315,11 +1333,12 @@ impl TransactionSystem {
     async fn wait_terminal_rollback(
         completion: Arc<Completion<()>>,
         operation: &'static str,
-    ) -> Result<()> {
+    ) -> FatalResult<()> {
         match completion.wait_result().await {
             Ok(()) => Ok(()),
-            Err(bridge) => Err(Error::from(bridge)
-                .attach_with(|| format!("{operation}: terminal rollback cleanup failed"))),
+            Err(bridge) => Err(bridge
+                .into_fatal_report()
+                .attach(format!("{operation}: terminal rollback cleanup failed"))),
         }
     }
 
@@ -1341,10 +1360,9 @@ impl TransactionSystem {
     pub(crate) async fn cleanup_abandoned_transaction(
         &self,
         claim: TrxCompletionClaim,
-    ) -> Result<()> {
-        Ok(self
-            .rollback_claim(claim, "cleanup abandoned transaction")
-            .await?)
+    ) -> FatalResult<()> {
+        self.rollback_claim(claim, "cleanup abandoned transaction")
+            .await
     }
 
     #[inline]
@@ -1691,6 +1709,8 @@ impl Component for TransactionSystem {
     type Config = TrxSysConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
+    // Component construction combines config validation with genuinely mixed
+    // recovery/bootstrap sources, so this is the remaining startup-wide owner.
     type Error = Error;
 
     const NAME: &'static str = "trx_sys";
@@ -1701,7 +1721,7 @@ impl Component for TransactionSystem {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        config.validate()?;
+        config.validate().disclose()?;
         let meta_pool = registry.dependency::<MetaPool>();
         let index_pool = registry.dependency::<IndexPool>();
         let mem_pool = registry.dependency::<MemPool>();
@@ -1738,16 +1758,14 @@ impl Component for TransactionSystem {
 }
 
 #[inline]
-fn recovery_initial_trx_ts(max_recovered_cts: TrxID) -> Result<TrxID> {
+fn recovery_initial_trx_ts(max_recovered_cts: TrxID) -> DataIntegrityResult<TrxID> {
     max_recovered_cts
         .checked_add(1)
         .filter(|ts| *ts < MAX_SNAPSHOT_TS)
         .ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::LogFileCorrupted).attach(format!(
-                    "recovered commit timestamp out of range: max_recovered_cts={max_recovered_cts}"
-                )),
-            )
+            Report::new(DataIntegrityError::LogFileCorrupted).attach(format!(
+                "recovered commit timestamp out of range: max_recovered_cts={max_recovered_cts}"
+            ))
         })
 }
 
@@ -1759,10 +1777,11 @@ async fn run_trx_cleanup_job(job: TrxCleanupJob) {
         trx_id,
         reason,
     } = job;
-    let _ = reason;
-    let (entry, session) = match engine.session_registry.resolve_trx(session_id, trx_id) {
-        Ok(parts) => parts,
-        Err(_) => return,
+    // A stale cleanup hint is a neutral outcome: another owner already moved
+    // the session/transaction pair beyond the abandoned state.
+    let (entry, session) = match engine.session_registry.try_resolve_trx(session_id, trx_id) {
+        Some(parts) => parts,
+        None => return,
     };
     match entry.inspect_state() {
         TrxEntryState::Abandoned => {
@@ -1772,7 +1791,14 @@ async fn run_trx_cleanup_job(job: TrxCleanupJob) {
                 Ok(claim) => claim,
                 Err(_) => return,
             };
-            let _ = trx_sys.cleanup_abandoned_transaction(claim).await;
+            if let Err(report) = trx_sys.cleanup_abandoned_transaction(claim).await {
+                let report = report.attach(format!(
+                    "terminal abandoned transaction cleanup failed: session_id={session_id}, trx_id={trx_id}, reason={reason:?}"
+                ));
+                obs::error!(
+                    "event=transaction_cleanup component=transaction_system action=rollback_abandoned result=error error={report:?}"
+                );
+            }
         }
         TrxEntryState::Active
         | TrxEntryState::CheckedOut
@@ -2331,7 +2357,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_commit_sys_rejects_gc_pages_without_redo() {
+    #[should_panic(expected = "system row-page retirement requires recovery-visible redo")]
+    fn test_commit_sys_asserts_gc_pages_without_redo() {
         smol::block_on(async {
             let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
                 "sys_gc_requires_redo",
@@ -2345,15 +2372,7 @@ pub(crate) mod tests {
                 RowID::new(1),
                 vec![PageID::new(46)].into_boxed_slice(),
             ));
-            let err = engine.inner().trx_sys.commit_sys(sys_trx).unwrap_err();
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("missing system redo should be a Runtime error")
-            };
-            assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::SystemTransactionRedoMissing)
-            );
-            engine.inner().poisoner.ensure_healthy().unwrap();
+            let _ = engine.inner().trx_sys.commit_sys(sys_trx);
         });
     }
 

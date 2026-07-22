@@ -149,13 +149,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         // post-lease liveness check above.
         let mut mutable_file = MutableTableFile::fork(table_file, &table_writes, disk_pool.clone());
         let pivot_row_id = mutable_file.root().pivot_row_id;
-        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)
-            .change_context(RuntimeError::CheckpointExecution)
-            .attach_with(|| {
-                format!(
-                    "operation=checkpoint_table, phase=initialize_secondary_sidecar, table_id={table_id}"
-                )
-            })?;
+        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata);
 
         // Step 2: derive replay and data cutoffs from the explicit batch. The
         // purge-published horizon is the exclusive cutoff for both frozen row
@@ -236,14 +230,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
             let Some(batch) = self.attempt.batch_mut() else {
                 panic!("non-empty checkpoint page list requires frozen source")
             };
-            table
-                .apply_page_transition(&transition_pages, batch, cutoff_ts)
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach_with(|| {
-                    format!(
-                        "operation=checkpoint_table, phase=apply_page_transition, table_id={table_id}"
-                    )
-                })?;
+            table.apply_page_transition(&transition_pages, batch, cutoff_ts);
         }
         #[cfg(test)]
         if !pages.is_empty() {
@@ -287,14 +274,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
         if let Some(last) = lwc_blocks.last_mut()
             && last.shape.end_row_id() < new_pivot_row_id
         {
-            last.shape
-                .set_end_row_id(new_pivot_row_id)
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach_with(|| {
-                    format!(
-                        "operation=checkpoint_table, phase=extend_last_lwc_block, table_id={table_id}, pivot_row_id={new_pivot_row_id}"
-                    )
-                })?;
+            last.shape.set_end_row_id(new_pivot_row_id);
         }
 
         // Step 5: apply checkpoint changes to the already-checked mutable root.
@@ -309,14 +289,7 @@ impl<'table, 'session> TableCheckpointer<'table, 'session> {
                     )
                 })?;
         } else {
-            mutable_file
-                .apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach_with(|| {
-                    format!(
-                        "operation=checkpoint_table, phase=apply_checkpoint_metadata, table_id={table_id}"
-                    )
-                })?;
+            mutable_file.apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts);
         }
 
         // Step 7: merge committed cold-row deletions into column index payloads,
@@ -725,23 +698,23 @@ struct SecondaryCheckpointSidecar {
 }
 
 impl SecondaryCheckpointSidecar {
-    fn new(metadata: &TableMetadata) -> RuntimeResult<Self> {
+    fn new(metadata: &TableMetadata) -> Self {
+        // Active-index iteration and every sidecar shape come from the same
+        // validated immutable metadata snapshot, so construction cannot fail.
         let indexes = metadata
             .idx
             .active_indexes()
-            .map(|(index_no, index_spec)| {
-                Ok(ActiveSecondaryIndexSidecar {
-                    index_no,
-                    key_cols: index_spec
-                        .cols
-                        .iter()
-                        .map(|index_key| index_key.col_no as usize)
-                        .collect(),
-                    sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
-                })
+            .map(|(index_no, index_spec)| ActiveSecondaryIndexSidecar {
+                index_no,
+                key_cols: index_spec
+                    .cols
+                    .iter()
+                    .map(|index_key| index_key.col_no as usize)
+                    .collect(),
+                sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
             })
-            .collect::<RuntimeResult<Vec<_>>>()?;
-        Ok(Self { indexes })
+            .collect();
+        Self { indexes }
     }
 
     #[inline]
@@ -755,9 +728,9 @@ impl SecondaryCheckpointSidecar {
         page: &RowPage,
         row_idx: usize,
         row_id: RowID,
-    ) -> RuntimeResult<()> {
-        // Data checkpoint feeds committed-visible transition rows here, once
-        // per row selected for persistence.
+    ) {
+        // The page and column layout were validated together before the LWC
+        // callback runs, and active key columns come from that same metadata.
         for active in &mut self.indexes {
             let key = active
                 .key_cols
@@ -766,7 +739,6 @@ impl SecondaryCheckpointSidecar {
                 .collect();
             active.sidecar.add_data(key, row_id);
         }
-        Ok(())
     }
 
     fn add_deleted_key_at(
@@ -775,31 +747,22 @@ impl SecondaryCheckpointSidecar {
         index_no: usize,
         row_id: RowID,
         key: Vec<Val>,
-    ) -> RuntimeResult<()> {
+    ) {
+        // `sidecar_pos` is produced by iterating this same active-index vector,
+        // so it must still address the corresponding entry.
         let active = self
             .indexes
             .get_mut(sidecar_pos)
-            .ok_or_else(|| Report::new(InternalError::IndexKeyMissing))
-            .attach_with(|| format!("index_no={index_no}, sidecar_pos={sidecar_pos}"))
-            .change_context(RuntimeError::CheckpointExecution)
-            .attach_with(|| {
-                format!(
-                    "operation=add_secondary_checkpoint_delete, index_no={index_no}, row_id={row_id}"
+            .unwrap_or_else(|| {
+                panic!(
+                    "secondary checkpoint sidecar position missing: sidecar_pos={sidecar_pos}, index_no={index_no}, row_id={row_id}"
                 )
-            })?;
-        if active.index_no != index_no {
-            return Err(Report::new(InternalError::IndexKeyMissing)
-                .attach(format!(
-                    "secondary sidecar index mismatch: sidecar_pos={sidecar_pos}, expected_index_no={index_no}, actual_index_no={}",
-                    active.index_no
-                ))
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach(format!(
-                    "operation=add_secondary_checkpoint_delete, index_no={index_no}, row_id={row_id}"
-                )));
-        }
+            });
+        assert_eq!(
+            active.index_no, index_no,
+            "secondary checkpoint sidecar identity changed: sidecar_pos={sidecar_pos}, row_id={row_id}"
+        );
         active.sidecar.add_delete(key, row_id);
-        Ok(())
     }
 }
 
@@ -997,15 +960,7 @@ impl Table {
         .await?;
         self.collect_root_reachable_blocks(mutable_file.root(), layout, &mut reachable)
             .await?;
-        mutable_file
-            .rebuild_alloc_map_from_reachable(&reachable)
-            .change_context(RuntimeError::CheckpointExecution)
-            .attach_with(|| {
-                format!(
-                    "operation=rebuild_reachable_alloc_map, table_id={}",
-                    self.table_id()
-                )
-            })
+        Ok(mutable_file.rebuild_alloc_map_from_reachable(&reachable))
     }
 
     async fn apply_deletion_checkpoint(
@@ -1161,18 +1116,14 @@ impl Table {
                 });
             }
         }
-        if groups.is_empty() {
-            // Defensive guard: selected markers should either resolve into at
-            // least one patch group or fail above.
-            return Err(Report::new(InternalError::ColumnIndexRewriteMiss)
-                .attach("delete marker selection produced no patch groups")
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach(format!(
-                    "operation=apply_deletion_checkpoint, table_id={}",
-                    self.table_id()
-                ))
-                .into());
-        }
+        // A selected marker either failed validation above or contributed one
+        // delta to a patch group, so a successful non-empty selection cannot
+        // produce an empty rewrite batch.
+        assert!(
+            !groups.is_empty(),
+            "delete marker selection produced no column-index patch groups: table_id={}",
+            self.table_id()
+        );
 
         // Step 4: load authoritative persisted deltas and merge pending row-id deltas.
         let mut patch_storage: Vec<(RowID, Vec<u32>)> = Vec::new();
@@ -1263,16 +1214,13 @@ impl Table {
         let disk_pool_guard = disk_pool.pool_guard();
         for active in &mut sidecar.indexes {
             let index_no = active.index_no;
-            if metadata.idx.index_spec(index_no).is_none() {
-                return Err(Report::new(InternalError::IndexKeyMissing)
-                    .attach(format!("index_no={index_no}"))
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach(format!(
-                        "operation=apply_secondary_checkpoint_sidecar, table_id={}, index_no={index_no}",
-                        self.table_id()
-                    ))
-                    .into());
-            }
+            // The sidecar is built directly from this immutable metadata
+            // snapshot, so each recorded active index must still exist.
+            assert!(
+                metadata.idx.index_spec(index_no).is_some(),
+                "secondary checkpoint sidecar index missing from metadata: table_id={}, index_no={index_no}",
+                self.table_id()
+            );
             let index_sidecar = &mut active.sidecar;
             index_sidecar.normalize();
             if !index_sidecar.has_work() {
@@ -1301,7 +1249,7 @@ impl Table {
                             row_id: entry.row_id,
                         })
                         .collect::<Vec<_>>();
-                    writer.batch_put_encoded(&put_entries)?;
+                    writer.batch_put_encoded(&put_entries);
                     // Deletes for keys with same-run puts were filtered during
                     // accumulation; remaining deletes must still match the old
                     // checkpointed owner before removing the key.
@@ -1312,7 +1260,7 @@ impl Table {
                             expected_old_row_id: entry.row_id,
                         })
                         .collect::<Vec<_>>();
-                    writer.batch_conditional_delete_encoded(&delete_entries)?;
+                    writer.batch_conditional_delete_encoded(&delete_entries);
                     writer.finish().await?
                 }
                 SecondaryIndexSidecar::NonUnique {
@@ -1495,7 +1443,7 @@ impl Table {
                         })?;
                     (active.index_no, key)
                 };
-                secondary_sidecar.add_deleted_key_at(sidecar_pos, index_no, row_id, key)?;
+                secondary_sidecar.add_deleted_key_at(sidecar_pos, index_no, row_id, key);
             }
         }
         Ok(())
@@ -1761,7 +1709,7 @@ impl Table {
         mut collect_visible_row: Option<C>,
     ) -> RuntimeResult<Vec<LwcBlockPersist>>
     where
-        C: FnMut(&RowPage, usize, RowID) -> RuntimeResult<()>,
+        C: FnMut(&RowPage, usize, RowID),
     {
         #[cfg(test)]
         use super::test_hooks as table_test_hooks;
@@ -1804,7 +1752,7 @@ impl Table {
                 if let Some(collect_visible_row) = collect_visible_row.as_mut() {
                     for (start_idx, end_idx) in view.range_non_deleted() {
                         for row_idx in start_idx..end_idx {
-                            collect_visible_row(page, row_idx, page.row_id(row_idx))?;
+                            collect_visible_row(page, row_idx, page.row_id(row_idx));
                         }
                     }
                 }
@@ -1830,14 +1778,7 @@ impl Table {
                         current_end,
                         builder.row_ids().to_vec(),
                         Vec::new(),
-                    )
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach_with(|| {
-                        format!(
-                            "operation=build_lwc_blocks, phase=build_block_shape, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
-                            self.table_id()
-                        )
-                    })?;
+                    );
                     let buf = builder
                         .build(shape.row_shape_fingerprint())
                         .change_context(RuntimeError::CheckpointExecution)
@@ -1885,14 +1826,7 @@ impl Table {
                     current_end,
                     builder.row_ids().to_vec(),
                     Vec::new(),
-                )
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach_with(|| {
-                    format!(
-                        "operation=build_lwc_blocks, phase=build_final_block_shape, table_id={}, start_row_id={current_start}, end_row_id={current_end}",
-                        self.table_id()
-                    )
-                })?;
+                );
                 let buf = builder
                     .build(shape.row_shape_fingerprint())
                     .change_context(RuntimeError::CheckpointExecution)
@@ -2007,7 +1941,7 @@ fn ensure_maintenance_wait_running(
 #[cfg(test)]
 mod tests {
     pub(crate) mod test_hooks {
-        use crate::error::{FatalError, FatalResult, InternalError, RuntimeError, RuntimeResult};
+        use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
         use error_stack::Report;
         use std::cell::{Cell, RefCell};
         use std::future::Future;
@@ -2038,9 +1972,8 @@ mod tests {
 
         pub(crate) fn maybe_force_secondary_sidecar_error() -> RuntimeResult<()> {
             if TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get()) {
-                return Err(Report::new(InternalError::DiskTreeRewriteInvariant)
-                    .attach("test secondary-index sidecar failure")
-                    .change_context(RuntimeError::CheckpointExecution));
+                return Err(Report::new(RuntimeError::CheckpointExecution)
+                    .attach("injected secondary-index sidecar failure"));
             }
             Ok(())
         }
@@ -2730,7 +2663,7 @@ mod tests {
                     &metadata,
                     &guards,
                     &[Some(prepared)],
-                    None::<fn(&RowPage, usize, RowID) -> RuntimeResult<()>>,
+                    None::<fn(&RowPage, usize, RowID)>,
                 )
                 .await
             {
@@ -4860,7 +4793,7 @@ mod tests {
     #[test]
     fn test_checkpoint_runtime_carrier_uses_fallback_reason() {
         let err = RuntimeOrFatalError::Runtime(
-            Report::new(InternalError::MutableRootMetadataRegression)
+            Report::new(InternalError::SecondaryIndexOutOfBounds)
                 .attach("typed checkpoint invariant")
                 .change_context(RuntimeError::CheckpointExecution),
         );
@@ -4874,7 +4807,7 @@ mod tests {
         );
         assert_eq!(
             report.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::MutableRootMetadataRegression)
+            Some(InternalError::SecondaryIndexOutOfBounds)
         );
         assert!(format!("{report:?}").contains("typed checkpoint invariant"));
     }
@@ -5809,7 +5742,7 @@ mod tests {
                 prepare_silent_checkpoint_failure(&engine, &mut session).await;
             let guards = session.pool_guards();
             set_test_silent_watermark_mutation_hook(|| async {
-                Err(Report::new(InternalError::SilentWatermarkRedoConflict)
+                Err(Report::new(InternalError::SecondaryIndexBindingMismatch)
                     .attach("test silent-watermark mutation failure")
                     .change_context(RuntimeError::CatalogAccess))
             });

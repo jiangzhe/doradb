@@ -43,7 +43,8 @@ use crate::component::{
 };
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
-use crate::error::{DataIntegrityResult, FileKind, RuntimeError, RuntimeResult};
+use crate::error::{DataIntegrityResult, RuntimeError, RuntimeResult};
+use crate::file::FileKind;
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::{BlockID, PageID};
 use crate::io::Completion;

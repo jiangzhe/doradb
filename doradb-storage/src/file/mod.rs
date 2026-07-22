@@ -29,6 +29,7 @@ use parking_lot::RawMutex;
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use scopeguard::defer;
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -48,6 +49,23 @@ pub(crate) const MEM_POOL_SWAP_FILE_ID: FileID = FileID::new(u64::MAX - 2);
 
 /// Reserved persisted-file identity of `catalog.mtb`.
 pub(crate) const CATALOG_MTB_FILE_ID: FileID = FileID::new(u64::MAX - 1);
+
+/// Identifies which persisted CoW file surfaced a corruption failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileKind {
+    TableFile,
+    CatalogMultiTableFile,
+}
+
+impl fmt::Display for FileKind {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            FileKind::TableFile => "table_file",
+            FileKind::CatalogMultiTableFile => "catalog.mtb",
+        })
+    }
+}
 
 /// Physical persisted-block identity for cache lookup and shared-storage IO.
 ///
@@ -825,7 +843,7 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::compression::BitPackable;
-    use crate::error::{Error, RuntimeError};
+    use crate::error::{DiscloseError, RuntimeError};
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
     use crate::id::TrxID;
@@ -1176,7 +1194,9 @@ mod tests {
 
             assert_eq!(kind, IOKind::Write);
             let wait_result = waiter.wait_result().await.map_err(|report| {
-                Error::from(report).attach("wait for table file background write")
+                report
+                    .disclose()
+                    .attach_with(|| "wait for table file background write".to_owned())
             });
             assert!(wait_result.as_ref().is_err_and(|err| {
                 err.report()
@@ -1249,7 +1269,9 @@ mod tests {
 
             assert_eq!(kind, IOKind::Fsync);
             let wait_result = waiter.wait_result().await.map_err(|report| {
-                Error::from(report).attach("wait for table file background fsync")
+                report
+                    .disclose()
+                    .attach_with(|| "wait for table file background fsync".to_owned())
             });
             let err = wait_result.expect_err("nonzero fsync completion should fail");
             assert_eq!(
@@ -1291,7 +1313,9 @@ mod tests {
 
             assert_eq!(kind, IOKind::Fsync);
             let wait_result = waiter.wait_result().await.map_err(|report| {
-                Error::from(report).attach("wait for table file background fsync")
+                report
+                    .disclose()
+                    .attach_with(|| "wait for table file background fsync".to_owned())
             });
             let err = wait_result.expect_err("backend fsync completion should fail");
             assert!(

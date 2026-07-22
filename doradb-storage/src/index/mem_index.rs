@@ -2,7 +2,7 @@
 
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
-use crate::error::{InternalError, RuntimeError, RuntimeResult};
+use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 use crate::index::btree::{
     BTreeByte, BTreeKey, BTreeKeyEncoder, BTreeNode, BTreeNodeCursor, BTreeSlot, BTreeU64,
@@ -11,7 +11,6 @@ use crate::index::btree::{
 use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
 use crate::value::ValType;
-use error_stack::Report;
 use std::marker::PhantomData;
 use std::mem;
 
@@ -74,7 +73,7 @@ impl<P: BufferPool> MemIndex<P> {
         while let Some(guard) = cursor.next().await? {
             let node = guard.page();
             for idx in 0..node.count() {
-                S::push_entry(node, idx, &mut entries)?;
+                S::push_entry(node, idx, &mut entries);
             }
         }
         Ok(entries)
@@ -109,11 +108,7 @@ pub(crate) struct MemIndexEntry {
 /// MemIndex-specific encoded-entry decoder used by full scans.
 pub(crate) trait MemIndexEntryScanSpec {
     /// Push one decoded MemIndex entry into `entries`.
-    fn push_entry(
-        node: &BTreeNode,
-        slot_idx: usize,
-        entries: &mut Vec<MemIndexEntry>,
-    ) -> RuntimeResult<()>;
+    fn push_entry(node: &BTreeNode, slot_idx: usize, entries: &mut Vec<MemIndexEntry>);
 }
 
 /// Encoded-entry decoder for unique MemIndex leaves.
@@ -121,24 +116,18 @@ pub(crate) struct UniqueMemIndexEntryScanSpec;
 
 impl MemIndexEntryScanSpec for UniqueMemIndexEntryScanSpec {
     #[inline]
-    fn push_entry(
-        node: &BTreeNode,
-        slot_idx: usize,
-        entries: &mut Vec<MemIndexEntry>,
-    ) -> RuntimeResult<()> {
-        let encoded_key = node.btree_key_checked(slot_idx).ok_or_else(|| {
-            Report::new(InternalError::IndexKeyMissing)
-                .attach(format!("slot_idx={slot_idx}"))
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=read_mem_index_slot_state")
-        })?;
+    fn push_entry(node: &BTreeNode, slot_idx: usize, entries: &mut Vec<MemIndexEntry>) {
+        // Occupied B-tree slots are created with an encoded key and cannot
+        // subsequently lose it while the leaf latch is held.
+        let encoded_key = node.btree_key_checked(slot_idx).unwrap_or_else(|| {
+            panic!("MemIndex key missing from occupied slot: slot_idx={slot_idx}")
+        });
         let value = node.value::<BTreeU64>(slot_idx);
         entries.push(MemIndexEntry {
             encoded_key,
             row_id: value.value().to_row_id(),
             deleted: value.is_deleted(),
         });
-        Ok(())
     }
 }
 
@@ -147,11 +136,7 @@ pub(crate) struct NonUniqueMemIndexEntryScanSpec;
 
 impl MemIndexEntryScanSpec for NonUniqueMemIndexEntryScanSpec {
     #[inline]
-    fn push_entry(
-        node: &BTreeNode,
-        slot_idx: usize,
-        entries: &mut Vec<MemIndexEntry>,
-    ) -> RuntimeResult<()> {
+    fn push_entry(node: &BTreeNode, slot_idx: usize, entries: &mut Vec<MemIndexEntry>) {
         push_non_unique_encoded_entry(node, node.slot(slot_idx), entries)
     }
 }
@@ -176,7 +161,7 @@ pub(crate) struct MemIndexCleanupSlot {
 /// MemIndex-specific slot decoder used by cleanup scans.
 pub(crate) trait MemIndexCleanupSpec {
     /// Decode the row id and delete state for one MemIndex slot.
-    fn slot_state(node: &BTreeNode, slot_idx: usize) -> RuntimeResult<MemIndexCleanupSlot>;
+    fn slot_state(node: &BTreeNode, slot_idx: usize) -> MemIndexCleanupSlot;
 }
 
 /// Cleanup decoder for unique MemIndex leaves.
@@ -184,12 +169,12 @@ pub(crate) struct UniqueMemIndexCleanupSpec;
 
 impl MemIndexCleanupSpec for UniqueMemIndexCleanupSpec {
     #[inline]
-    fn slot_state(node: &BTreeNode, slot_idx: usize) -> RuntimeResult<MemIndexCleanupSlot> {
+    fn slot_state(node: &BTreeNode, slot_idx: usize) -> MemIndexCleanupSlot {
         let value = node.value::<BTreeU64>(slot_idx);
-        Ok(MemIndexCleanupSlot {
+        MemIndexCleanupSlot {
             row_id: value.value().to_row_id(),
             deleted: value.is_deleted(),
-        })
+        }
     }
 }
 
@@ -198,20 +183,20 @@ pub(crate) struct NonUniqueMemIndexCleanupSpec;
 
 impl MemIndexCleanupSpec for NonUniqueMemIndexCleanupSpec {
     #[inline]
-    fn slot_state(node: &BTreeNode, slot_idx: usize) -> RuntimeResult<MemIndexCleanupSlot> {
+    fn slot_state(node: &BTreeNode, slot_idx: usize) -> MemIndexCleanupSlot {
         let slot = node.slot(slot_idx);
         let key_len = node.slot_key_len(slot);
-        if key_len < mem::size_of::<RowID>() {
-            return Err(Report::new(InternalError::MemIndexKeyMalformed)
-                .attach(format!("slot_idx={slot_idx}, key_len={key_len}"))
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=read_mem_index_cleanup_slot"));
-        }
+        // Non-unique MemIndex insertion always appends the row id, so every
+        // occupied exact-key slot must contain that fixed-width suffix.
+        assert!(
+            key_len >= mem::size_of::<RowID>(),
+            "non-unique MemIndex key is missing its row-id suffix: slot_idx={slot_idx}, key_len={key_len}"
+        );
         let value = node.value_for_slot::<BTreeByte>(slot);
-        Ok(MemIndexCleanupSlot {
+        MemIndexCleanupSlot {
             row_id: node.unpack_value::<BTreeU64>(slot).to_row_id(),
             deleted: value.is_deleted(),
-        })
+        }
     }
 }
 
@@ -260,7 +245,7 @@ where
         let node = guard.page();
         let mut batch = MemIndexCleanupBatch::default();
         for idx in 0..node.count() {
-            let slot = S::slot_state(node, idx)?;
+            let slot = S::slot_state(node, idx);
             if slot.row_id >= self.pivot_row_id {
                 if slot.deleted {
                     batch.skipped_hot_deleted += 1;
@@ -273,12 +258,11 @@ where
                 batch.skipped_live += 1;
                 continue;
             }
-            let encoded_key = node.btree_key_checked(idx).ok_or_else(|| {
-                Report::new(InternalError::IndexKeyMissing)
-                    .attach(format!("slot_idx={idx}"))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=read_mem_index_slot_state")
-            })?;
+            // The cleanup cursor only yields occupied leaf slots, whose key
+            // bytes are immutable for the duration of the guard.
+            let encoded_key = node.btree_key_checked(idx).unwrap_or_else(|| {
+                panic!("MemIndex cleanup key missing from occupied slot: slot_idx={idx}")
+            });
             batch.entries.push(MemIndexEntry {
                 encoded_key,
                 row_id: slot.row_id,
@@ -295,14 +279,14 @@ pub(crate) fn push_non_unique_encoded_entry(
     node: &BTreeNode,
     slot: &BTreeSlot,
     entries: &mut Vec<MemIndexEntry>,
-) -> RuntimeResult<()> {
+) {
     let key_len = node.slot_key_len(slot);
-    if key_len < mem::size_of::<RowID>() {
-        return Err(Report::new(InternalError::MemIndexKeyMalformed)
-            .attach(format!("key_len={key_len}"))
-            .change_context(RuntimeError::IndexAccess)
-            .attach("operation=push_non_unique_encoded_entry"));
-    }
+    // Non-unique MemIndex insertion always appends a row id before publishing
+    // the slot, so an encoded entry can never be shorter than that suffix.
+    assert!(
+        key_len >= mem::size_of::<RowID>(),
+        "non-unique MemIndex key is missing its row-id suffix: key_len={key_len}"
+    );
     let mut encoded_key = BTreeKey::arbitrary(key_len);
     let mut buf = encoded_key.modify_inplace();
     node.copy_slot_key(slot, &mut buf);
@@ -314,5 +298,4 @@ pub(crate) fn push_non_unique_encoded_entry(
         row_id,
         deleted: value.is_deleted(),
     });
-    Ok(())
 }

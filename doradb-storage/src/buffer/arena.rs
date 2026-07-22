@@ -235,7 +235,8 @@ impl QuiescentArena {
             debug_assert_eq!(frame as *mut BufferFrame, bf.0);
             frame.page_id = page_id;
             frame.ctx = None;
-            T::init_frame(frame);
+            debug_assert_eq!(frame.kind(), FrameKind::Uninitialized);
+            frame.set_kind(FrameKind::Hot);
             frame.set_dirty(true);
             frame.clear_persisted_block_key();
         }

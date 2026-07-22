@@ -3,7 +3,7 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::{
     Catalog, DroppedTableFileCleanup, DroppedTableRuntime, TableCache, is_catalog_table,
 };
-use crate::error::{FatalError, InternalError, Result, RuntimeError, RuntimeResult};
+use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
 use crate::file::table_file::OldRoot;
 use crate::id::TrxID;
 use crate::map::{FastHashMap, FastHashSet};
@@ -329,7 +329,7 @@ impl TransactionSystem {
         guards: &PoolGuards,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
-    ) -> Result<Vec<RetiredRowPageBatch>> {
+    ) -> FatalResult<Vec<RetiredRowPageBatch>> {
         match self
             .purge_trx_list_inner(catalog, guards, trx_list, min_active_sts)
             .await
@@ -343,7 +343,7 @@ impl TransactionSystem {
                     "event=engine_poison component=purge action=poison result=error error={:?}",
                     report
                 );
-                Err(self.poisoner.poison(report).into())
+                Err(self.poisoner.poison(report).into_report())
             }
         }
     }
@@ -356,15 +356,19 @@ impl TransactionSystem {
         guards: &PoolGuards,
         gc_no: usize,
         min_active_sts: TrxID,
-    ) -> Result<Vec<RetiredRowPageBatch>> {
+    ) -> FatalResult<Vec<RetiredRowPageBatch>> {
         #[cfg(test)]
         if self.run_purge_test_hook(PurgeTestEvent::BucketStarted { gc_no })
             == PurgeTestAction::Fail
         {
             self.observe_purge_test_event(PurgeTestEvent::BucketFailed { gc_no });
-            let report = Report::new(FatalError::PurgeAccess)
-                .attach(format!("purge test hook failed bucket: gc_no={gc_no}"));
-            return Err(self.poisoner.poison(report).into());
+            let report = Report::new(RuntimeError::TableAccess)
+                .attach(format!("purge test hook failed bucket: gc_no={gc_no}"))
+                .change_context(FatalError::PurgeAccess);
+            obs::error!(
+                "event=engine_poison component=purge action=inject_bucket_access_failure result=error error={report:?}"
+            );
+            return Err(self.poisoner.poison(report).into_report());
         }
         let mut trx_list = Vec::new();
         self.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
@@ -507,8 +511,24 @@ impl TransactionSystem {
             };
             let page_ids = match table.mem.unlink_retired_row_pages(guards, &batch).await {
                 Ok(page_ids) if page_ids.as_ref() == batch.page_ids.as_ref() => page_ids,
-                Ok(_) | Err(_) => {
+                Ok(page_ids) => {
                     let report = Report::new(FatalError::PurgeAccess).attach(format!(
+                        "checkpoint retirement prefix mismatch: table_id={}, start_row_id={}, end_row_id={}, expected_page_ids={:?}, actual_page_ids={:?}",
+                        batch.table_id,
+                        batch.start_row_id,
+                        batch.end_row_id,
+                        batch.page_ids,
+                        page_ids
+                    ));
+                    obs::error!(
+                        "event=engine_poison component=purge action=poison result=error error={:?}",
+                        report
+                    );
+                    let _ = self.poisoner.poison(report);
+                    return false;
+                }
+                Err(report) => {
+                    let report = report.change_context(FatalError::PurgeAccess).attach(format!(
                         "checkpoint retirement prefix unlink failed: table_id={}, start_row_id={}, end_row_id={}",
                         batch.table_id, batch.start_row_id, batch.end_row_id
                     ));
@@ -520,16 +540,17 @@ impl TransactionSystem {
                     return false;
                 }
             };
-            if table
+            if let Err(report) = table
                 .mem
                 .deallocate_retired_row_pages(guards, &page_ids)
                 .await
-                .is_err()
             {
-                let report = Report::new(FatalError::PurgeDeallocate).attach(format!(
-                    "checkpoint retirement row-page deallocation failed: table_id={}, start_row_id={}, end_row_id={}",
-                    batch.table_id, batch.start_row_id, batch.end_row_id
-                ));
+                let report = report
+                    .change_context(FatalError::PurgeDeallocate)
+                    .attach(format!(
+                        "checkpoint retirement row-page deallocation failed: table_id={}, start_row_id={}, end_row_id={}",
+                        batch.table_id, batch.start_row_id, batch.end_row_id
+                    ));
                 obs::error!(
                     "event=engine_poison component=purge action=poison result=error error={:?}",
                     report
@@ -551,7 +572,7 @@ impl TransactionSystem {
         &self,
         guards: &PoolGuards,
         min_active_sts: TrxID,
-    ) -> Result<()> {
+    ) -> RuntimeResult<()> {
         let mut stale_handles = Vec::new();
         for DroppedTableRuntime {
             table_id,
@@ -597,13 +618,15 @@ impl TransactionSystem {
             let replay_floor = item.replay_floor;
             let strong_count = Arc::strong_count(&item.table);
             let remaining_stale_handles = stale_handle_count - idx - 1;
-            if !self.catalog.restore_dropped_runtime(item) {
-                return Err(Report::new(InternalError::Generic)
-                    .attach(format!(
-                        "restore dropped table runtime after stale handle: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, strong_count={strong_count}, remaining_stale_handles={remaining_stale_handles}"
-                    ))
-                    .into());
-            }
+            self.catalog.restore_dropped_runtime(item);
+            obs::info!(
+                "event=dropped_table_gc component=purge action=restore_stale_runtime result=ok table_id={} drop_cts={} replay_floor={:?} strong_count={} remaining_stale_handles={}",
+                table_id,
+                drop_cts,
+                replay_floor,
+                strong_count,
+                remaining_stale_handles
+            );
         }
 
         self.process_dropped_table_file_deletes();
@@ -633,7 +656,14 @@ impl TransactionSystem {
 
         let mut failed = Vec::new();
         for item in file_deletes {
-            if self.table_fs.delete_user_table_file(item.table_id).is_err() {
+            if let Err(report) = self.table_fs.delete_user_table_file(item.table_id) {
+                let report = report.attach(format!(
+                    "best-effort dropped-table file unlink failed: table_id={}",
+                    item.table_id
+                ));
+                obs::warn!(
+                    "event=dropped_table_gc component=purge action=unlink_file result=error error={report:?}"
+                );
                 failed.push(item);
                 continue;
             }
@@ -1093,7 +1123,7 @@ struct PurgeTask {
 
 struct PurgeTaskResult {
     gc_no: usize,
-    result: Result<Vec<RetiredRowPageBatch>>,
+    result: FatalResult<Vec<RetiredRowPageBatch>>,
 }
 
 /// Purge coordinator and worker-slot-zero executor.
@@ -1221,12 +1251,12 @@ impl PurgeDispatcher {
             if plan.dropped_table {
                 #[cfg(test)]
                 trx_sys.observe_purge_test_event(PurgeTestEvent::DroppedTableStarted);
-                if trx_sys
+                if let Err(err) = trx_sys
                     .process_dropped_table_gc(&pool_guards, curr_sts)
                     .await
-                    .is_err()
                 {
-                    let report = Report::new(FatalError::PurgeDeallocate)
+                    let report = err
+                        .change_context(FatalError::PurgeDeallocate)
                         .attach("dropped-table garbage collection failed");
                     obs::error!(
                         "event=engine_poison component=purge action=poison result=error error={:?}",
@@ -1400,7 +1430,7 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{FatalError, Result};
+    use crate::error::{FatalError, Result, RuntimeError};
     use crate::id::{PageID, RowID, TableID};
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
@@ -2263,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_purge_trx_list_returns_error_on_row_page_access_failure() {
+    fn test_purge_bucket_access_failure_preserves_runtime_source() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -2284,39 +2314,30 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table_id = table1(&engine).await;
-            let mut row_undo = RowUndoLogs::empty();
-            row_undo.push(OwnedRowUndo::new(
-                table_id,
-                Some(VersionedPageID {
-                    page_id: PageID::from(0u64),
-                    generation: 0,
-                }),
-                RowID::new(0),
-                RowUndoKind::Delete,
-            ));
-            let trx = CommittedTrx {
-                cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload::User {
-                    sts: TrxID::new(1),
-                    gc_no: 0,
-                    row_undo,
-                    index_gc: vec![],
-                }),
-            };
-            let guards = PoolGuards::builder()
-                .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
-                .build();
-
+            let guards = full_pool_guards(&engine);
+            engine
+                .inner()
+                .trx_sys
+                .set_purge_test_hook(Arc::new(|event| {
+                    if matches!(event, PurgeTestEvent::BucketStarted { gc_no: 0 }) {
+                        PurgeTestAction::Fail
+                    } else {
+                        PurgeTestAction::Continue
+                    }
+                }));
             let err = engine
                 .inner()
                 .trx_sys
-                .purge_trx_list(engine.catalog(), &guards, vec![trx], MAX_SNAPSHOT_TS)
+                .purge_gc_bucket(engine.catalog(), &guards, 0, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
+                err.downcast_ref::<FatalError>().copied(),
                 Some(FatalError::PurgeAccess)
+            );
+            assert_eq!(
+                err.downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::TableAccess)
             );
             assert!(
                 engine

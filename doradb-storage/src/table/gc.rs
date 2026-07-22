@@ -249,16 +249,7 @@ impl Table {
         let layout = snapshot.layout();
         let metadata = layout.metadata();
         let column_index = self.cleanup_column_index(guards, snapshot);
-        let index_pool_guard = self
-            .mem
-            .index_pool_guard(guards)
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=cleanup_secondary_mem_indexes, table_id={}, phase=resolve_index_pool_guard",
-                    self.table_id()
-                )
-            })?;
+        let index_pool_guard = self.mem.index_pool_guard(guards);
         let disk_pool_guard = guards.disk_guard();
         let cleanup_context = MemIndexCleanupContext {
             snapshot,

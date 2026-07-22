@@ -7,11 +7,10 @@ use crate::buffer::{
 use crate::catalog::is_user_table;
 use crate::catalog::table::TableMetadata;
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
-use crate::conf::FileSystemConfig;
+use crate::conf::ValidatedFileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::error::{
-    CompletionErrorBridge, Error, FatalError, IoError, IoResult, Result, RuntimeError,
-    RuntimeResult,
+    CompletionErrorBridge, FatalError, IoError, IoResult, RuntimeError, RuntimeResult,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
@@ -43,7 +42,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::ErrorKind as IoErrorKind;
+use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 use std::mem::{forget, replace, take};
 use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
@@ -1894,9 +1893,9 @@ impl FileSystem {
         &self,
         checkpointed_next_table_id: TableID,
         checkpointed_user_table_ids: &FastHashSet<TableID>,
-    ) -> Result<()> {
-        for entry in fs::read_dir(&self.data_dir)? {
-            let entry = entry?;
+    ) -> IoResult<()> {
+        for entry in fs::read_dir(&self.data_dir).map_err(io_report)? {
+            let entry = entry.map_err(io_report)?;
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -1915,7 +1914,7 @@ impl FileSystem {
             match fs::remove_file(entry.path()) {
                 Ok(()) => {}
                 Err(err) if err.kind() == IoErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(io_report(err)),
             }
         }
         Ok(())
@@ -1927,9 +1926,9 @@ impl FileSystem {
         &self,
         recovered_user_table_ids: &FastHashSet<TableID>,
         deferred_drop_table_ids: &FastHashSet<TableID>,
-    ) -> Result<()> {
-        for entry in fs::read_dir(&self.data_dir)? {
-            let entry = entry?;
+    ) -> IoResult<()> {
+        for entry in fs::read_dir(&self.data_dir).map_err(io_report)? {
+            let entry = entry.map_err(io_report)?;
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -1950,7 +1949,7 @@ impl FileSystem {
             match fs::remove_file(entry.path()) {
                 Ok(()) => {}
                 Err(err) if err.kind() == IoErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(io_report(err)),
             }
         }
         Ok(())
@@ -2011,7 +2010,19 @@ impl FileSystem {
                 );
                 if let Err(err) = mutable.commit().await {
                     drop(mtb);
-                    let _ = fs::remove_file(&file_path);
+                    if let Err(source) = fs::remove_file(&file_path)
+                        && source.kind() != IoErrorKind::NotFound
+                    {
+                        let report = Report::new(IoError::from(source.kind()))
+                            .attach(source)
+                            .attach(format!(
+                                "operation=cleanup_failed_multi_table_file_create, path={}",
+                                file_path
+                            ));
+                        obs::error!(
+                            "event=file_cleanup component=file_system action=unlink_failed_create result=error error={report:?}"
+                        );
+                    }
                     return Err(err);
                 }
                 let _ = disk_pool;
@@ -2026,10 +2037,10 @@ impl Supplier<FileSystemWorkers> for FileSystem {
 }
 
 impl Component for FileSystem {
-    type Config = FileSystemConfig;
+    type Config = ValidatedFileSystemConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
-    type Error = Error;
+    type Error = Report<IoError>;
 
     const NAME: &'static str = "fs";
 
@@ -2038,7 +2049,7 @@ impl Component for FileSystem {
         config: Self::Config,
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
+    ) -> IoResult<()> {
         let (fs, builder) = config.build_engine_parts()?;
         registry.register::<Self>(fs);
         shelf.put::<FileSystemWorkers>(builder);
@@ -2060,7 +2071,7 @@ pub(crate) fn build_file_system(
     io_depth: usize,
     data_dir: PathBuf,
     catalog_file_name: String,
-) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
+) -> IoResult<(FileSystem, StorageIOWorkerBuilder)> {
     let backend = StorageBackend::setup(io_depth)?;
     let stats = backend.stats_handle();
     let (builder, table_reads, pool_reads, background_writes) =
@@ -2078,6 +2089,11 @@ pub(crate) fn build_file_system(
         },
         builder,
     ))
+}
+
+#[inline]
+fn io_report(err: StdIoError) -> Report<IoError> {
+    Report::new(IoError::from(err.kind())).attach(err)
 }
 
 #[inline]
@@ -2119,9 +2135,9 @@ pub(crate) mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_TABLE_ID_START,
     };
     use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{ConfigError, ErrorKind, IoError, IoResult};
+    use crate::error::{ConfigError, DiscloseResultExt, ErrorKind, IoError, IoResult, Result};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::table_file::TableFile;
     use crate::file::{BlockKey, UNTRACKED_FILE_ID};
@@ -2219,7 +2235,10 @@ pub(crate) mod tests {
         let (fs, _workers) = FileSystemConfig::default()
             .data_dir(data_dir)
             .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES)
-            .build_engine_parts()?;
+            .validate()
+            .disclose()?
+            .build_engine_parts()
+            .disclose()?;
         Ok(QuiescentBox::new(fs))
     }
 
@@ -2251,22 +2270,27 @@ pub(crate) mod tests {
             let file = file
                 .data_dir(data_dir)
                 .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES);
+            let readonly_buffer_size = file.readonly_buffer_size;
+            let file = file.validate().disclose()?;
             let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await?;
-            builder.build::<FileSystem>(file.clone()).await?;
+            builder.build::<EnginePoisoner>(()).await.unwrap();
+            builder.build::<FileSystem>(file).await.disclose()?;
             builder
-                .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
-                .await?;
+                .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
+                .await
+                .disclose()?;
             builder
                 .build::<MetaPool>(MetaPoolConfig::new(TEST_META_POOL_BYTES))
-                .await?;
+                .await
+                .disclose()?;
             builder
                 .build::<IndexPool>(IndexPoolConfig::new(
                     TEST_INDEX_POOL_BYTES,
                     data_dir.join("index.swp"),
                     TEST_INDEX_MAX_FILE_BYTES,
                 ))
-                .await?;
+                .await
+                .disclose()?;
             builder
                 .build::<MemPool>(
                     EvictableBufferPoolConfig::default()
@@ -2275,9 +2299,13 @@ pub(crate) mod tests {
                         .max_file_size(TEST_DATA_MAX_FILE_BYTES)
                         .data_swap_file(data_dir.join("data.swp")),
                 )
-                .await?;
-            builder.build::<FileSystemWorkers>(()).await?;
-            builder.build::<SharedPoolEvictorWorkers>(()).await?;
+                .await
+                .disclose()?;
+            builder.build::<FileSystemWorkers>(()).await.disclose()?;
+            builder
+                .build::<SharedPoolEvictorWorkers>(())
+                .await
+                .disclose()?;
             let registry = builder.finish();
             let fs = registry.dependency::<FileSystem>();
             Ok(TestFileSystem {

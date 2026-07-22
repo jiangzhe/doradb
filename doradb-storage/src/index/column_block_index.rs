@@ -1,14 +1,14 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult,
-    MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
-use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::file::{FileKind, SparseFile};
 use crate::id::{BlockID, RowID, TrxID};
 use crate::index::column_deletion_blob::{
     BlobRef, COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST, COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
@@ -164,16 +164,16 @@ impl ColumnBlockLeafEntryHeader {
             })
     }
 
-    fn from_encoded(entry: &EncodedLeafEntry) -> InternalResult<Self> {
-        let entry_len = storage_len_u16(entry.payload_len())?;
-        let row_section_len = storage_len_u16(entry.row_section.len())?;
-        Ok(ColumnBlockLeafEntryHeader {
+    fn from_encoded(entry: &EncodedLeafEntry) -> Self {
+        let entry_len = storage_len_u16(entry.payload_len());
+        let row_section_len = storage_len_u16(entry.row_section.len());
+        ColumnBlockLeafEntryHeader {
             block_id: entry.block_id.to_le_bytes(),
             row_shape_fingerprint: entry.row_shape_fingerprint.to_le_bytes(),
             row_id_span: entry.row_id_span.to_le_bytes(),
             entry_len: entry_len.to_le_bytes(),
             row_section_len: row_section_len.to_le_bytes(),
-        })
+        }
     }
 }
 
@@ -458,23 +458,24 @@ impl ColumnBlockEntryShape {
         end_row_id: RowID,
         row_ids: Vec<RowID>,
         mut delete_deltas: Vec<u32>,
-    ) -> InternalResult<Self> {
-        if start_row_id >= end_row_id || row_ids.is_empty() {
-            return Err(column_block_index_invariant_report());
-        }
-        validate_row_ids(&row_ids, start_row_id, end_row_id)?;
+    ) -> Self {
+        assert!(
+            start_row_id < end_row_id && !row_ids.is_empty(),
+            "column block-index invariant violated: entry shape has invalid row range or no rows"
+        );
+        validate_row_ids(&row_ids, start_row_id, end_row_id);
         delete_deltas.sort_unstable();
         delete_deltas.dedup();
         let row_shape_fingerprint =
-            row_shape_fingerprint_for_row_ids(start_row_id, end_row_id, &row_ids)?;
-        Ok(ColumnBlockEntryShape {
+            row_shape_fingerprint_for_row_ids(start_row_id, end_row_id, &row_ids);
+        ColumnBlockEntryShape {
             start_row_id,
             end_row_id,
             row_ids,
             delete_deltas,
             delete_domain: ColumnDeleteDomain::RowIdDelta,
             row_shape_fingerprint,
-        })
+        }
     }
 
     /// Returns the inclusive lower row-id bound of this entry shape.
@@ -496,12 +497,11 @@ impl ColumnBlockEntryShape {
     }
 
     /// Updates the exclusive upper row-id bound and recomputes the row-shape fingerprint.
-    pub(crate) fn set_end_row_id(&mut self, end_row_id: RowID) -> InternalResult<()> {
-        validate_row_ids(&self.row_ids, self.start_row_id, end_row_id)?;
+    pub(crate) fn set_end_row_id(&mut self, end_row_id: RowID) {
+        validate_row_ids(&self.row_ids, self.start_row_id, end_row_id);
         self.end_row_id = end_row_id;
         self.row_shape_fingerprint =
-            row_shape_fingerprint_for_row_ids(self.start_row_id, self.end_row_id, &self.row_ids)?;
-        Ok(())
+            row_shape_fingerprint_for_row_ids(self.start_row_id, self.end_row_id, &self.row_ids);
     }
 
     /// Attaches the backing LWC block id, producing a complete leaf-entry input.
@@ -672,18 +672,15 @@ enum LogicalRowSet {
 }
 
 impl LogicalRowSet {
-    fn from_row_ids(
-        start_row_id: RowID,
-        end_row_id: RowID,
-        row_ids: &[RowID],
-    ) -> InternalResult<Self> {
-        validate_row_ids(row_ids, start_row_id, end_row_id)?;
-        let span_u64 = end_row_id
-            .checked_sub(start_row_id)
-            .ok_or_else(column_block_index_invariant_report)?;
-        if span_u64 == 0 || span_u64 > u32::MAX as u64 {
-            return Err(column_block_index_invariant_report());
-        }
+    fn from_row_ids(start_row_id: RowID, end_row_id: RowID, row_ids: &[RowID]) -> Self {
+        validate_row_ids(row_ids, start_row_id, end_row_id);
+        let span_u64 = end_row_id.checked_sub(start_row_id).unwrap_or_else(|| {
+            panic!("column block-index invariant violated: row-id span underflow")
+        });
+        assert!(
+            span_u64 != 0 && span_u64 <= u32::MAX as u64,
+            "column block-index invariant violated: row-id span {span_u64} is not representable"
+        );
         let row_id_span = span_u64 as u32;
         let dense = row_ids.len() == row_id_span as usize
             && row_ids
@@ -691,28 +688,29 @@ impl LogicalRowSet {
                 .enumerate()
                 .all(|(idx, row_id)| *row_id == start_row_id + idx as u64);
         if dense {
-            return Ok(LogicalRowSet::Dense { row_id_span });
+            return LogicalRowSet::Dense { row_id_span };
         }
         let deltas = row_ids
             .iter()
             .map(|row_id| {
-                let delta = row_id
-                    .checked_sub(start_row_id)
-                    .ok_or_else(column_block_index_invariant_report)?;
-                if delta > u32::MAX as u64 {
-                    return Err(column_block_index_invariant_report());
-                }
-                Ok(delta as u32)
+                let delta = row_id.checked_sub(start_row_id).unwrap_or_else(|| {
+                    panic!("column block-index invariant violated: row-id delta underflow")
+                });
+                u32::try_from(delta).unwrap_or_else(|_| {
+                    panic!(
+                        "column block-index invariant violated: row-id delta is not representable"
+                    )
+                })
             })
-            .collect::<InternalResult<Vec<_>>>()?;
-        let first_present_delta = *deltas
-            .first()
-            .ok_or_else(column_block_index_invariant_report)?;
-        Ok(LogicalRowSet::DeltaList {
+            .collect::<Vec<_>>();
+        let first_present_delta = *deltas.first().unwrap_or_else(|| {
+            panic!("column block-index invariant violated: sparse row set has no deltas")
+        });
+        LogicalRowSet::DeltaList {
             row_id_span,
             first_present_delta,
             deltas,
-        })
+        }
     }
 
     fn contains_delta(&self, delta: u32) -> bool {
@@ -786,13 +784,13 @@ impl LogicalDeleteSet {
     }
 
     #[inline]
-    fn del_count(&self) -> InternalResult<u16> {
+    fn del_count(&self) -> u16 {
         match self {
-            LogicalDeleteSet::None { .. } => Ok(0),
+            LogicalDeleteSet::None { .. } => 0,
             LogicalDeleteSet::Inline { row_id_deltas, .. } => {
                 storage_count_u16(row_id_deltas.len())
             }
-            LogicalDeleteSet::External { del_count, .. } => Ok(*del_count),
+            LogicalDeleteSet::External { del_count, .. } => *del_count,
         }
     }
 }
@@ -852,17 +850,17 @@ struct EncodedLeafEntry {
 }
 
 impl EncodedLeafEntry {
-    fn from_logical(entry: &LogicalLeafEntry) -> InternalResult<Self> {
-        let row_section = encode_row_section(&entry.row_set, entry.delete_set.domain())?;
-        let delete_section = encode_delete_section(&entry.row_set, &entry.delete_set)?;
-        Ok(EncodedLeafEntry {
+    fn from_logical(entry: &LogicalLeafEntry) -> Self {
+        let row_section = encode_row_section(&entry.row_set, entry.delete_set.domain());
+        let delete_section = encode_delete_section(&entry.row_set, &entry.delete_set);
+        EncodedLeafEntry {
             start_row_id: entry.start_row_id,
             block_id: entry.block_id,
             row_id_span: entry.row_set.row_id_span(),
             row_shape_fingerprint: entry.row_shape_fingerprint,
             row_section,
             delete_section,
-        })
+        }
     }
 
     #[inline]
@@ -1737,13 +1735,10 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         start_row_id: RowID,
     ) -> RuntimeResult<(LogicalRowSet, ColumnDeleteDomain)> {
-        if self.root_block_id == SUPER_BLOCK_ID {
-            return Err(column_block_index_invariant_report()
-                .change_context(RuntimeError::IndexAccess)
-                .attach(format!(
-                    "operation=load_column_rewrite_context, start_row_id={start_row_id}"
-                )));
-        }
+        assert_ne!(
+            self.root_block_id, SUPER_BLOCK_ID,
+            "column block-index invariant violated: rewrite context requested from empty root, start_row_id={start_row_id}"
+        );
         let mut block_id = self.root_block_id;
         loop {
             let node = self.read_node(block_id).await?;
@@ -1794,13 +1789,11 @@ impl<'a> ColumnBlockIndex<'a> {
                 return Ok((row_set, delete_domain));
             }
             let entries = node.branch_entries();
-            let idx = search_branch_entry(entries, start_row_id).ok_or_else(|| {
-                column_block_index_invariant_report()
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach(format!(
-                        "operation=load_column_rewrite_context, start_row_id={start_row_id}"
-                    ))
-            })?;
+            let idx = search_branch_entry(entries, start_row_id).unwrap_or_else(|| {
+                panic!(
+                    "column block-index invariant violated: branch cannot route start_row_id={start_row_id}, block_id={block_id}"
+                )
+            });
             block_id = entries[idx].block_id();
         }
     }
@@ -1947,16 +1940,12 @@ impl<'a> ColumnBlockIndex<'a> {
         if patches.is_empty() {
             return Ok(self.root_block_id);
         }
-        if self.root_block_id == SUPER_BLOCK_ID || !delete_delta_patches_sorted_unique(patches) {
-            return Err(column_block_index_invariant_report()
-                .change_context(RuntimeError::IndexAccess)
-                .attach(format!(
-                    "operation=replace_column_delete_deltas, root_block_id={}, patch_count={}",
-                    self.root_block_id,
-                    patches.len()
-                ))
-                .into());
-        }
+        assert!(
+            self.root_block_id != SUPER_BLOCK_ID && delete_delta_patches_sorted_unique(patches),
+            "column block-index invariant violated: invalid delete-delta batch, root_block_id={}, patch_count={}",
+            self.root_block_id,
+            patches.len()
+        );
 
         let resolved = {
             let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
@@ -1988,19 +1977,14 @@ impl<'a> ColumnBlockIndex<'a> {
         let res = self
             .rewrite_subtree_with_patches(mutable_file, self.root_block_id, &resolved, create_ts)
             .await?;
-        if !res.touched {
-            return Err(Report::new(InternalError::ColumnIndexRewriteMiss)
-                .attach(format!(
-                    "delete-delta rewrite missed root_block_id={}",
-                    self.root_block_id
-                ))
-                .change_context(RuntimeError::IndexAccess)
-                .attach(format!(
-                    "operation=replace_column_delete_deltas, patch_count={}",
-                    patches.len()
-                ))
-                .into());
-        }
+        // Every validated patch resolves through this root before rewriting,
+        // so a non-empty patch set must touch at least one descendant leaf.
+        assert!(
+            res.touched,
+            "column block-index rewrite missed validated root: root_block_id={}, patch_count={}",
+            self.root_block_id,
+            patches.len()
+        );
         self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
             .await
     }
@@ -2016,21 +2000,17 @@ impl<'a> ColumnBlockIndex<'a> {
         if entries.is_empty() {
             return Ok(self.root_block_id);
         }
-        if !entry_inputs_sorted(entries)
-            || entries
-                .first()
-                .is_none_or(|entry| entry.start_row_id() < self.end_row_id)
-            || new_end_row_id < self.end_row_id
-        {
-            return Err(column_block_index_invariant_report()
-                .change_context(RuntimeError::IndexAccess)
-                .attach(format!(
-                    "operation=insert_column_block_entries, root_block_id={}, entry_count={}, new_end_row_id={new_end_row_id}",
-                    self.root_block_id,
-                    entries.len()
-                ))
-                .into());
-        }
+        assert!(
+            entry_inputs_sorted(entries)
+                && entries
+                    .first()
+                    .is_some_and(|entry| entry.start_row_id() >= self.end_row_id)
+                && new_end_row_id >= self.end_row_id,
+            "column block-index invariant violated: invalid insert batch, root_block_id={}, entry_count={}, old_end_row_id={}, new_end_row_id={new_end_row_id}",
+            self.root_block_id,
+            entries.len(),
+            self.end_row_id
+        );
 
         let logical_entries = {
             let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
@@ -2097,14 +2077,12 @@ impl<'a> ColumnBlockIndex<'a> {
         for patch in patches {
             let idx = start_row_ids
                 .binary_search(&patch.start_row_id())
-                .map_err(|_| {
-                    column_block_index_invariant_report()
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach(format!(
-                            "operation=rewrite_column_block_leaf, block_id={block_id}, start_row_id={}",
-                            patch.start_row_id()
-                        ))
-                })?;
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "column block-index invariant violated: patch missed leaf, block_id={block_id}, start_row_id={}",
+                        patch.start_row_id()
+                    )
+                });
             let mut replacement = entries[idx].clone();
             patch.apply(&mut replacement);
             entries[idx] = replacement;
@@ -2151,28 +2129,22 @@ impl<'a> ColumnBlockIndex<'a> {
                     create_ts,
                 )
                 .await?;
-            if !child.touched {
-                return Err(Report::new(InternalError::ColumnIndexRewriteMiss)
-                    .attach(format!(
-                        "child rewrite missed branch_block_id={}",
-                        entry.block_id()
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=rewrite_column_block_branch")
-                    .into());
-            }
+            // The branch range above selected at least one validated patch for
+            // this child, which therefore must touch its routed subtree.
+            assert!(
+                child.touched,
+                "column block-index rewrite missed routed child: branch_block_id={}, patch_count={}",
+                entry.block_id(),
+                patch_idx - start_idx
+            );
             touched = true;
             combined.extend(child.entries);
         }
-        if patch_idx != patches.len() {
-            return Err(column_block_index_invariant_report()
-                .change_context(RuntimeError::IndexAccess)
-                .attach(format!(
-                    "operation=rewrite_column_block_branch, applied_patch_count={patch_idx}, patch_count={}",
-                    patches.len()
-                ))
-                .into());
-        }
+        assert_eq!(
+            patch_idx,
+            patches.len(),
+            "column block-index invariant violated: branch rewrite left patches unapplied"
+        );
         if !touched {
             return Ok(NodeRewriteResult {
                 entries: Vec::new(),
@@ -2224,20 +2196,16 @@ impl<'a> ColumnBlockIndex<'a> {
                 .branch_entries()
                 .last()
                 .map(|entry| entry.block_id())
-                .ok_or_else(|| {
-                    Report::new(InternalError::ColumnIndexPathInvariant)
-                        .attach(format!("empty branch block_id={block_id}"))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=append_column_block_rightmost_path")
-                })?;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "column index-path invariant violated: rightmost branch is empty, block_id={block_id}"
+                    )
+                });
         }
 
-        let (leaf_block_id, _) = path.pop().ok_or_else(|| {
-            Report::new(InternalError::ColumnIndexPathInvariant)
-                .attach("rightmost path is empty")
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=append_column_block_rightmost_path")
-        })?;
+        let (leaf_block_id, _) = path.pop().unwrap_or_else(|| {
+            panic!("column index-path invariant violated: rightmost path is empty")
+        });
         let leaf_node = self.read_node(leaf_block_id).await?;
         let mut combined = self.decode_logical_leaf_entries(&leaf_node, leaf_block_id)?;
         combined.extend_from_slice(entries);
@@ -2248,12 +2216,11 @@ impl<'a> ColumnBlockIndex<'a> {
         for (branch_block_id, height) in path.into_iter().rev() {
             let branch_node = self.read_node(branch_block_id).await?;
             let old_entries = branch_node.branch_entries();
-            let last_idx = old_entries.len().checked_sub(1).ok_or_else(|| {
-                Report::new(InternalError::ColumnIndexPathInvariant)
-                    .attach(format!("empty branch block_id={branch_block_id}"))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=append_column_block_rightmost_path")
-            })?;
+            let last_idx = old_entries.len().checked_sub(1).unwrap_or_else(|| {
+                panic!(
+                    "column index-path invariant violated: rightmost branch is empty, block_id={branch_block_id}"
+                )
+            });
             let mut combined_entries =
                 Vec::with_capacity(old_entries.len() - 1 + child_entries.len());
             combined_entries.extend_from_slice(&old_entries[..last_idx]);
@@ -2272,15 +2239,10 @@ impl<'a> ColumnBlockIndex<'a> {
         entries: Vec<ColumnBlockBranchEntry>,
         create_ts: TrxID,
     ) -> RuntimeOrFatalResult<BlockID> {
-        if entries.is_empty() {
-            return Err(Report::new(InternalError::ColumnIndexPathInvariant)
-                .attach(format!(
-                    "old_root_height={old_root_height}, create_ts={create_ts}"
-                ))
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=finalize_column_block_root_rewrite")
-                .into());
-        }
+        assert!(
+            !entries.is_empty(),
+            "column index-path invariant violated: root rewrite produced no entries, old_root_height={old_root_height}, create_ts={create_ts}"
+        );
         if entries.len() == 1 {
             return Ok(entries[0].block_id());
         }
@@ -2339,35 +2301,22 @@ impl<'a> ColumnBlockIndex<'a> {
         let encoded = entries
             .iter()
             .map(EncodedLeafEntry::from_logical)
-            .collect::<InternalResult<Vec<_>>>()
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=write_column_block_leaf_pages, entry_count={}, create_ts={create_ts}",
-                    entries.len()
-                )
-            })?;
+            .collect::<Vec<_>>();
         let mut leaf_entries = Vec::new();
         let mut start = 0usize;
         while start < encoded.len() {
             let mut end = start;
             let mut selected_search_type = None;
             while end < encoded.len() {
-                let search_type = select_leaf_search_type(&encoded[start..=end])
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=write_column_block_leaf_pages")?;
-                let next_len = leaf_chunk_encoded_len(&encoded[start..=end], search_type)
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=write_column_block_leaf_pages")?;
+                let search_type = select_leaf_search_type(&encoded[start..=end]);
+                let next_len = leaf_chunk_encoded_len(&encoded[start..=end], search_type);
                 if end > start && next_len > COLUMN_BLOCK_LEAF_DATA_SIZE {
                     break;
                 }
-                if next_len > COLUMN_BLOCK_LEAF_DATA_SIZE {
-                    return Err(column_block_index_invariant_report()
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=write_column_block_leaf_pages")
-                        .into());
-                }
+                assert!(
+                    next_len <= COLUMN_BLOCK_LEAF_DATA_SIZE,
+                    "column block-index invariant violated: one leaf entry exceeds page capacity: encoded_len={next_len}, capacity={COLUMN_BLOCK_LEAF_DATA_SIZE}"
+                );
                 selected_search_type = Some(search_type);
                 end += 1;
             }
@@ -2375,24 +2324,14 @@ impl<'a> ColumnBlockIndex<'a> {
             let (block_id, mut node) =
                 self.allocate_node(mutable_file, 0, chunk[0].start_row_id, create_ts)?;
             node.header.set_count(chunk.len() as u32);
-            encode_leaf_chunk(
-                node.data_mut(),
-                chunk,
-                selected_search_type.ok_or_else(|| {
-                    Report::new(InternalError::ColumnIndexSearchTypeMissing)
-                        .attach(format!(
-                            "start_row_id={}, chunk_len={}",
-                            chunk[0].start_row_id,
-                            chunk.len()
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=write_column_block_leaf_pages")
-                })?,
-            )
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!("operation=write_column_block_leaf_pages, block_id={block_id}")
-            })?;
+            let search_type = selected_search_type.unwrap_or_else(|| {
+                panic!(
+                    "column block-index invariant violated: leaf search type is missing, start_row_id={}, chunk_len={}",
+                    chunk[0].start_row_id,
+                    chunk.len()
+                )
+            });
+            encode_leaf_chunk(node.data_mut(), chunk, search_type);
             self.write_node(mutable_file, block_id, &node).await?;
             leaf_entries.push(ColumnBlockBranchEntry::new(chunk[0].start_row_id, block_id));
             start = end;
@@ -2496,11 +2435,6 @@ pub(crate) fn validate_persisted_column_block_index_page(
 }
 
 #[inline]
-fn column_block_index_invariant_report() -> Report<InternalError> {
-    Report::new(InternalError::ColumnBlockIndexInvariant)
-}
-
-#[inline]
 fn invalid_node_payload() -> Report<DataIntegrityError> {
     Report::new(DataIntegrityError::InvalidPayload)
 }
@@ -2523,7 +2457,8 @@ fn validate_node_payload(page: &[u8]) -> DataIntegrityResult<&[u8]> {
         "node_header",
     )?;
     let count = header.count() as usize;
-    if (header.height() == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
+    if count == 0
+        || (header.height() == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
         || (header.height() > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
     {
         return Err(invalid_node_payload());
@@ -2553,17 +2488,15 @@ fn row_shape_fingerprint_for_row_ids(
     start_row_id: RowID,
     end_row_id: RowID,
     row_ids: &[RowID],
-) -> InternalResult<u128> {
-    let row_set = LogicalRowSet::from_row_ids(start_row_id, end_row_id, row_ids)?;
+) -> u128 {
+    let row_set = LogicalRowSet::from_row_ids(start_row_id, end_row_id, row_ids);
     logical_row_shape_fingerprint(start_row_id, &row_set)
 }
 
-fn logical_row_shape_fingerprint(
-    start_row_id: RowID,
-    row_set: &LogicalRowSet,
-) -> InternalResult<u128> {
-    let row_count =
-        u32::try_from(row_set.row_count()).map_err(|_| column_block_index_invariant_report())?;
+fn logical_row_shape_fingerprint(start_row_id: RowID, row_set: &LogicalRowSet) -> u128 {
+    let row_count = u32::try_from(row_set.row_count()).unwrap_or_else(|_| {
+        panic!("column block-index invariant violated: row count is not representable")
+    });
     let mut hasher = Hasher::new();
     hasher.update(&[ROW_SHAPE_FINGERPRINT_VERSION]);
     let sparse_deltas = match row_set {
@@ -2585,30 +2518,26 @@ fn logical_row_shape_fingerprint(
     }
     let mut truncated = [0u8; mem::size_of::<u128>()];
     truncated.copy_from_slice(&hasher.finalize().as_bytes()[..mem::size_of::<u128>()]);
-    Ok(u128::from_le_bytes(truncated))
+    u128::from_le_bytes(truncated)
 }
 
-fn validate_row_ids(
-    row_ids: &[RowID],
-    start_row_id: RowID,
-    end_row_id: RowID,
-) -> InternalResult<()> {
-    if row_ids.is_empty() || start_row_id >= end_row_id {
-        return Err(column_block_index_invariant_report());
-    }
+fn validate_row_ids(row_ids: &[RowID], start_row_id: RowID, end_row_id: RowID) {
+    assert!(
+        !row_ids.is_empty() && start_row_id < end_row_id,
+        "column block-index invariant violated: invalid row-id range or empty row set"
+    );
     let mut prev = None;
     for row_id in row_ids {
-        if *row_id < start_row_id || *row_id >= end_row_id {
-            return Err(column_block_index_invariant_report());
-        }
-        if let Some(prev_row_id) = prev
-            && *row_id <= prev_row_id
-        {
-            return Err(column_block_index_invariant_report());
-        }
+        assert!(
+            *row_id >= start_row_id && *row_id < end_row_id,
+            "column block-index invariant violated: row_id={row_id} outside [{start_row_id}, {end_row_id})"
+        );
+        assert!(
+            prev.is_none_or(|prev_row_id| *row_id > prev_row_id),
+            "column block-index invariant violated: row ids are not strictly sorted"
+        );
         prev = Some(*row_id);
     }
-    Ok(())
 }
 
 fn leaf_entry_slice(
@@ -3031,23 +2960,21 @@ fn decode_delete_domain_or_invalid_node(raw: u8) -> DataIntegrityResult<ColumnDe
     ColumnDeleteDomain::decode(raw).map_err(|_| invalid_node_payload())
 }
 
-fn encode_row_section(
-    row_set: &LogicalRowSet,
-    delete_domain: ColumnDeleteDomain,
-) -> InternalResult<Vec<u8>> {
+fn encode_row_section(row_set: &LogicalRowSet, delete_domain: ColumnDeleteDomain) -> Vec<u8> {
     match row_set {
         LogicalRowSet::Dense { row_id_span } => {
-            if *row_id_span > u16::MAX as u32 {
-                return Err(column_block_index_invariant_report());
-            }
-            Ok(SectionHeader {
+            assert!(
+                *row_id_span <= u16::MAX as u32,
+                "column block-index invariant violated: dense row span exceeds u16 storage"
+            );
+            SectionHeader {
                 kind: COLUMN_ROW_CODEC_DENSE,
                 version: COLUMN_ROW_SECTION_VERSION,
                 flags: 0,
                 aux: delete_domain.encode(),
             }
             .encode()
-            .to_vec())
+            .to_vec()
         }
         LogicalRowSet::DeltaList { deltas, .. } => {
             let mut bytes = Vec::with_capacity(4 + deltas.len() * mem::size_of::<u32>());
@@ -3063,29 +2990,27 @@ fn encode_row_section(
             for delta in deltas {
                 bytes.extend_from_slice(&delta.to_le_bytes());
             }
-            Ok(bytes)
+            bytes
         }
     }
 }
 
-fn encode_delete_section(
-    row_set: &LogicalRowSet,
-    delete_set: &LogicalDeleteSet,
-) -> InternalResult<Vec<u8>> {
+fn encode_delete_section(row_set: &LogicalRowSet, delete_set: &LogicalDeleteSet) -> Vec<u8> {
     match delete_set {
-        LogicalDeleteSet::None { .. } => Ok(Vec::new()),
+        LogicalDeleteSet::None { .. } => Vec::new(),
         LogicalDeleteSet::Inline {
             domain,
             row_id_deltas,
         } => {
-            let delete_values = encode_delete_values(row_id_deltas, row_set, *domain)?;
-            if !inline_delete_values_fit(&delete_values)? {
-                return Err(column_block_index_invariant_report());
-            }
+            let delete_values = encode_delete_values(row_id_deltas, row_set, *domain);
+            assert!(
+                inline_delete_values_fit(&delete_values),
+                "column block-index invariant violated: inline delete values exceed capacity"
+            );
             let header = DeleteSectionHeader::new(
                 COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
                 *domain,
-                storage_count_u16(delete_values.len())?,
+                storage_count_u16(delete_values.len()),
                 0,
             );
             let mut bytes = Vec::with_capacity(
@@ -3095,7 +3020,7 @@ fn encode_delete_section(
             for value in delete_values {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
-            Ok(bytes)
+            bytes
         }
         LogicalDeleteSet::External {
             domain, blob_ref, ..
@@ -3103,14 +3028,14 @@ fn encode_delete_section(
             let header = DeleteSectionHeader::new(
                 COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
                 *domain,
-                delete_set.del_count()?,
+                delete_set.del_count(),
                 COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             );
             let mut bytes =
                 Vec::with_capacity(COLUMN_DELETE_SECTION_HEADER_SIZE + COLUMN_BLOB_REF_SIZE);
             bytes.extend_from_slice(layout::bytes_of(&header));
             encode_blob_ref(blob_ref, &mut bytes);
-            Ok(bytes)
+            bytes
         }
     }
 }
@@ -3119,10 +3044,12 @@ fn encode_leaf_chunk(
     buf: &mut [u8],
     entries: &[EncodedLeafEntry],
     search_type: ColumnBlockLeafSearchType,
-) -> InternalResult<()> {
+) {
     let leaf_start_row_id = entries
         .first()
-        .ok_or_else(column_block_index_invariant_report)?
+        .unwrap_or_else(|| {
+            panic!("column block-index invariant violated: cannot encode an empty leaf chunk")
+        })
         .start_row_id;
     buf.fill(0);
     let (leaf_header, leaf_data) = buf.split_at_mut(COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE);
@@ -3133,11 +3060,12 @@ fn encode_leaf_chunk(
     let mut prefix_cursor = 0usize;
     let mut arena_end = leaf_data.len();
     for entry in entries {
-        let entry_range = reserve_tail(&mut arena_end, entry.payload_len(), leaf_data.len())?;
-        if arena_end < prefix_bytes_len {
-            return Err(column_block_index_invariant_report());
-        }
-        let entry_header = ColumnBlockLeafEntryHeader::from_encoded(entry)?;
+        let entry_range = reserve_tail(&mut arena_end, entry.payload_len(), leaf_data.len());
+        assert!(
+            arena_end >= prefix_bytes_len,
+            "column block-index invariant violated: leaf payload overlaps prefix plane"
+        );
+        let entry_header = ColumnBlockLeafEntryHeader::from_encoded(entry);
         let entry_bytes = &mut leaf_data[entry_range.0..entry_range.1];
         entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE]
             .copy_from_slice(layout::bytes_of(&entry_header));
@@ -3151,51 +3079,54 @@ fn encode_leaf_chunk(
             search_type,
             leaf_start_row_id,
             entry.start_row_id,
-            storage_len_u16(entry_range.0)?,
-        )?;
+            storage_len_u16(entry_range.0),
+        );
         prefix_cursor += search_type.prefix_size();
     }
-    Ok(())
 }
 
-fn select_leaf_search_type(
-    entries: &[EncodedLeafEntry],
-) -> InternalResult<ColumnBlockLeafSearchType> {
+fn select_leaf_search_type(entries: &[EncodedLeafEntry]) -> ColumnBlockLeafSearchType {
     let leaf_start_row_id = entries
         .first()
-        .ok_or_else(column_block_index_invariant_report)?
+        .unwrap_or_else(|| {
+            panic!(
+                "column block-index invariant violated: cannot select search type for empty leaf"
+            )
+        })
         .start_row_id;
     let mut max_delta = 0u64;
     for entry in entries {
         let delta = entry
             .start_row_id
             .checked_sub(leaf_start_row_id)
-            .ok_or_else(column_block_index_invariant_report)?;
+            .unwrap_or_else(|| {
+                panic!("column block-index invariant violated: leaf entry order regressed")
+            });
         max_delta = max_delta.max(delta);
     }
-    Ok(if max_delta <= u16::MAX as u64 {
+    if max_delta <= u16::MAX as u64 {
         ColumnBlockLeafSearchType::DeltaU16
     } else if max_delta <= u32::MAX as u64 {
         ColumnBlockLeafSearchType::DeltaU32
     } else {
         ColumnBlockLeafSearchType::Plain
-    })
+    }
 }
 
 fn leaf_chunk_encoded_len(
     entries: &[EncodedLeafEntry],
     search_type: ColumnBlockLeafSearchType,
-) -> InternalResult<usize> {
+) -> usize {
     let mut total = entries
         .len()
         .checked_mul(search_type.prefix_size())
-        .ok_or_else(column_block_index_invariant_report)?;
+        .unwrap_or_else(|| panic!("column block-index invariant violated: prefix size overflow"));
     for entry in entries {
         total = total
             .checked_add(entry.payload_len())
-            .ok_or_else(column_block_index_invariant_report)?;
+            .unwrap_or_else(|| panic!("column block-index invariant violated: leaf size overflow"));
     }
-    Ok(total)
+    total
 }
 
 fn encode_leaf_prefix(
@@ -3204,53 +3135,64 @@ fn encode_leaf_prefix(
     leaf_start_row_id: RowID,
     start_row_id: RowID,
     entry_offset: u16,
-) -> InternalResult<()> {
+) {
     match search_type {
         ColumnBlockLeafSearchType::Plain => {
-            if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE {
-                return Err(column_block_index_invariant_report());
-            }
+            assert_eq!(
+                dst.len(),
+                COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE,
+                "column block-index invariant violated: plain prefix has invalid size"
+            );
             dst[..8].copy_from_slice(&start_row_id.to_le_bytes());
             dst[8..10].copy_from_slice(&entry_offset.to_le_bytes());
         }
         ColumnBlockLeafSearchType::DeltaU32 => {
-            if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE {
-                return Err(column_block_index_invariant_report());
-            }
+            assert_eq!(
+                dst.len(),
+                COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE,
+                "column block-index invariant violated: u32 prefix has invalid size"
+            );
             let delta = start_row_id
                 .checked_sub(leaf_start_row_id)
-                .ok_or_else(column_block_index_invariant_report)?;
-            let delta = u32::try_from(delta).map_err(|_| column_block_index_invariant_report())?;
+                .unwrap_or_else(|| {
+                    panic!("column block-index invariant violated: u32 prefix delta underflow")
+                });
+            let delta = u32::try_from(delta).unwrap_or_else(|_| {
+                panic!("column block-index invariant violated: u32 prefix delta overflow")
+            });
             dst[..4].copy_from_slice(&delta.to_le_bytes());
             dst[4..6].copy_from_slice(&entry_offset.to_le_bytes());
         }
         ColumnBlockLeafSearchType::DeltaU16 => {
-            if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE {
-                return Err(column_block_index_invariant_report());
-            }
+            assert_eq!(
+                dst.len(),
+                COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE,
+                "column block-index invariant violated: u16 prefix has invalid size"
+            );
             let delta = start_row_id
                 .checked_sub(leaf_start_row_id)
-                .ok_or_else(column_block_index_invariant_report)?;
-            let delta = u16::try_from(delta).map_err(|_| column_block_index_invariant_report())?;
+                .unwrap_or_else(|| {
+                    panic!("column block-index invariant violated: u16 prefix delta underflow")
+                });
+            let delta = u16::try_from(delta).unwrap_or_else(|_| {
+                panic!("column block-index invariant violated: u16 prefix delta overflow")
+            });
             dst[..2].copy_from_slice(&delta.to_le_bytes());
             dst[2..4].copy_from_slice(&entry_offset.to_le_bytes());
         }
     }
-    Ok(())
 }
 
-fn reserve_tail(
-    arena_end: &mut usize,
-    len: usize,
-    total_len: usize,
-) -> InternalResult<(usize, usize)> {
-    if len == 0 || *arena_end > total_len || len > *arena_end {
-        return Err(column_block_index_invariant_report());
-    }
+fn reserve_tail(arena_end: &mut usize, len: usize, total_len: usize) -> (usize, usize) {
+    assert!(
+        len != 0 && *arena_end <= total_len && len <= *arena_end,
+        "column block-index invariant violated: invalid leaf arena reservation: arena_end={}, len={len}, total_len={total_len}",
+        *arena_end
+    );
     let start = *arena_end - len;
     let end = *arena_end;
     *arena_end = start;
-    Ok((start, end))
+    (start, end)
 }
 
 fn decode_blob_ref(bytes: &[u8]) -> DataIntegrityResult<BlobRef> {
@@ -3367,46 +3309,46 @@ fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> DataIntegrityRe
     Ok(res)
 }
 
-fn encode_u32_values_bytes(values: &[u32]) -> InternalResult<Vec<u8>> {
-    storage_count_u16(values.len())?;
-    if !delete_deltas_sorted_unique(values) {
-        return Err(column_block_index_invariant_report());
-    }
+fn encode_u32_values_bytes(values: &[u32]) -> Vec<u8> {
+    storage_count_u16(values.len());
+    assert!(
+        delete_deltas_sorted_unique(values),
+        "column block-index invariant violated: u32 values are not strictly sorted and unique"
+    );
     let mut out = Vec::with_capacity(mem::size_of_val(values));
     for value in values {
         out.extend_from_slice(&value.to_le_bytes());
     }
-    Ok(out)
+    out
 }
 
 fn encode_delete_values(
     row_id_deltas: &[u32],
     row_set: &LogicalRowSet,
     delete_domain: ColumnDeleteDomain,
-) -> InternalResult<Vec<u32>> {
-    if !delete_deltas_sorted_unique(row_id_deltas) {
-        return Err(column_block_index_invariant_report());
-    }
+) -> Vec<u32> {
+    assert!(
+        delete_deltas_sorted_unique(row_id_deltas),
+        "column block-index invariant violated: delete deltas are not strictly sorted and unique"
+    );
     match delete_domain {
         ColumnDeleteDomain::RowIdDelta => {
-            if row_id_deltas
-                .iter()
-                .any(|delta| !row_set.contains_delta(*delta))
-            {
-                return Err(column_block_index_invariant_report());
-            }
-            Ok(row_id_deltas.to_vec())
+            assert!(
+                row_id_deltas
+                    .iter()
+                    .all(|delta| row_set.contains_delta(*delta)),
+                "column block-index invariant violated: delete delta is absent from row set"
+            );
+            row_id_deltas.to_vec()
         }
         ColumnDeleteDomain::Ordinal => {
             let mut ordinals = Vec::with_capacity(row_id_deltas.len());
             for delta in row_id_deltas {
-                ordinals.push(
-                    row_set
-                        .ordinal_for_delta(*delta)
-                        .ok_or_else(column_block_index_invariant_report)?,
-                );
+                ordinals.push(row_set.ordinal_for_delta(*delta).unwrap_or_else(|| {
+                    panic!("column block-index invariant violated: delete delta has no ordinal")
+                }));
             }
-            Ok(ordinals)
+            ordinals
         }
     }
 }
@@ -3422,27 +3364,18 @@ async fn build_rewrite_delete_set<M: MutableCowFile>(
             domain: delete_domain,
         });
     }
-    let delete_values = encode_delete_values(delete_deltas, row_set, delete_domain)
-        .change_context(RuntimeError::IndexAccess)
-        .attach("operation=build_column_delete_set")?;
-    if inline_delete_values_fit(&delete_values)
-        .change_context(RuntimeError::IndexAccess)
-        .attach("operation=build_column_delete_set")?
-    {
+    let delete_values = encode_delete_values(delete_deltas, row_set, delete_domain);
+    if inline_delete_values_fit(&delete_values) {
         return Ok(LogicalDeleteSet::Inline {
             domain: delete_domain,
             row_id_deltas: delete_deltas.to_vec(),
         });
     }
-    let bytes = encode_u32_values_bytes(&delete_values)
-        .change_context(RuntimeError::IndexAccess)
-        .attach("operation=build_column_delete_set")?;
+    let bytes = encode_u32_values_bytes(&delete_values);
     let blob_ref = writer.append_delete_payload(&bytes).await?;
     Ok(LogicalDeleteSet::External {
         domain: delete_domain,
-        del_count: storage_count_u16(delete_deltas.len())
-            .change_context(RuntimeError::IndexAccess)
-            .attach("operation=build_column_delete_set")?,
+        del_count: storage_count_u16(delete_deltas.len()),
         blob_ref,
         row_id_deltas: Some(delete_deltas.to_vec()),
     })
@@ -3452,22 +3385,12 @@ async fn build_logical_entry_from_input<M: MutableCowFile>(
     writer: &mut ColumnDeletionBlobWriter<'_, M>,
     input: &ColumnBlockEntryInput,
 ) -> RuntimeResult<LogicalLeafEntry> {
-    if input.block_id == SUPER_BLOCK_ID {
-        return Err(column_block_index_invariant_report()
-            .change_context(RuntimeError::IndexAccess)
-            .attach(format!(
-                "operation=build_column_block_entry, start_row_id={}, end_row_id={}",
-                input.start_row_id, input.end_row_id
-            )));
-    }
-    let row_set = LogicalRowSet::from_row_ids(input.start_row_id, input.end_row_id, &input.row_ids)
-        .change_context(RuntimeError::IndexAccess)
-        .attach_with(|| {
-            format!(
-                "operation=build_column_block_entry, start_row_id={}, end_row_id={}",
-                input.start_row_id, input.end_row_id
-            )
-        })?;
+    assert_ne!(
+        input.block_id, SUPER_BLOCK_ID,
+        "column block-index invariant violated: entry points to empty-root sentinel, start_row_id={}, end_row_id={}",
+        input.start_row_id, input.end_row_id
+    );
+    let row_set = LogicalRowSet::from_row_ids(input.start_row_id, input.end_row_id, &input.row_ids);
     let delete_set =
         build_rewrite_delete_set(writer, &row_set, &input.delete_deltas, input.delete_domain)
             .await?;
@@ -3480,24 +3403,28 @@ async fn build_logical_entry_from_input<M: MutableCowFile>(
     ))
 }
 
-fn inline_delete_values_fit(values: &[u32]) -> InternalResult<bool> {
-    storage_count_u16(values.len())?;
+fn inline_delete_values_fit(values: &[u32]) -> bool {
+    storage_count_u16(values.len());
     let fits_u16 = values.iter().all(|value| *value <= u16::MAX as u32);
-    Ok(if fits_u16 {
+    if fits_u16 {
         values.len() <= LEGACY_INLINE_DELETE_U16_CAPACITY
     } else {
         values.len() <= LEGACY_INLINE_DELETE_U32_CAPACITY
+    }
+}
+
+#[inline]
+fn storage_count_u16(len: usize) -> u16 {
+    u16::try_from(len).unwrap_or_else(|_| {
+        panic!("column block-index invariant violated: count {len} exceeds u16 storage")
     })
 }
 
 #[inline]
-fn storage_count_u16(len: usize) -> InternalResult<u16> {
-    u16::try_from(len).map_err(|_| column_block_index_invariant_report())
-}
-
-#[inline]
-fn storage_len_u16(len: usize) -> InternalResult<u16> {
-    u16::try_from(len).map_err(|_| column_block_index_invariant_report())
+fn storage_len_u16(len: usize) -> u16 {
+    u16::try_from(len).unwrap_or_else(|_| {
+        panic!("column block-index invariant violated: length {len} exceeds u16 storage")
+    })
 }
 
 fn entry_inputs_sorted(entries: &[ColumnBlockEntryInput]) -> bool {
@@ -3557,10 +3484,10 @@ mod tests {
     };
     // Tests below inspect the existing ColumnBlockIndex public orchestration
     // boundary over persisted DataIntegrity, buffer/file IO, and rewrite Internal.
-    use crate::error::{DataIntegrityError, Error, FileKind};
-    use crate::file::build_test_fs;
+    use crate::error::{DataIntegrityError, DiscloseError, Error};
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
+    use crate::file::{FileKind, build_test_fs};
     use crate::layout::LayoutError;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
@@ -3589,6 +3516,21 @@ mod tests {
         assert!(format!("{err:?}").contains("field=test_node_header"));
     }
 
+    #[test]
+    fn test_persisted_empty_column_index_page_is_invalid_payload() {
+        let mut page = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
+        write_block_header(page.data_mut(), COLUMN_BLOCK_INDEX_BLOCK_SPEC);
+        write_block_checksum(page.data_mut());
+
+        let err = validate_persisted_column_block_index_page(
+            page.data(),
+            FileKind::TableFile,
+            test_block_id(42),
+        )
+        .unwrap_err();
+        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
+    }
+
     fn test_row_id_range(start: u64, end: u64) -> Vec<RowID> {
         (start..end).map(RowID::new).collect()
     }
@@ -3613,9 +3555,7 @@ mod tests {
         block_id: impl Into<BlockID>,
     ) -> ColumnBlockEntryInput {
         let row_ids = test_row_id_range(start.as_u64(), end.as_u64());
-        ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
-            .unwrap()
-            .with_block_id(block_id)
+        ColumnBlockEntryShape::new(start, end, row_ids, Vec::new()).with_block_id(block_id)
     }
 
     fn assert_column_index_corruption(err: Error, block_id: BlockID, expected: DataIntegrityError) {
@@ -3635,9 +3575,7 @@ mod tests {
         row_ids: Vec<RowID>,
         block_id: impl Into<BlockID>,
     ) -> ColumnBlockEntryInput {
-        ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
-            .unwrap()
-            .with_block_id(block_id)
+        ColumnBlockEntryShape::new(start, end, row_ids, Vec::new()).with_block_id(block_id)
     }
 
     fn dense_entry_with_delete_domain(
@@ -3648,7 +3586,7 @@ mod tests {
         block_id: impl Into<BlockID>,
     ) -> ColumnBlockEntryInput {
         let row_ids = test_row_id_range(start.as_u64(), end.as_u64());
-        let mut shape = ColumnBlockEntryShape::new(start, end, row_ids, delete_deltas).unwrap();
+        let mut shape = ColumnBlockEntryShape::new(start, end, row_ids, delete_deltas);
         shape.delete_domain = delete_domain;
         shape.with_block_id(block_id)
     }
@@ -3666,7 +3604,7 @@ mod tests {
                 COLUMN_DELETE_SECTION_HEADER_SIZE + 2 * mem::size_of::<u32>()
             ],
         };
-        let header = ColumnBlockLeafEntryHeader::from_encoded(&encoded).unwrap();
+        let header = ColumnBlockLeafEntryHeader::from_encoded(&encoded);
         assert_eq!(header.block_id(), 1001);
         assert_eq!(header.row_id_span(), 32);
         assert_eq!(header.entry_len(), 32 + 32 + 16);
@@ -3686,22 +3624,18 @@ mod tests {
         let sparse_row_ids = test_row_ids([12, 15, 18]);
 
         let dense =
-            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &dense_row_ids)
-                .unwrap();
+            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &dense_row_ids);
         assert_eq!(
             dense,
             row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &dense_row_ids)
-                .unwrap()
         );
 
         let sparse =
-            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &sparse_row_ids)
-                .unwrap();
+            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &sparse_row_ids);
         assert_ne!(dense, sparse);
         assert_eq!(
             sparse,
             row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(99), &sparse_row_ids)
-                .unwrap()
         );
     }
 
@@ -3719,43 +3653,40 @@ mod tests {
         )
         .unwrap_err();
         assert_column_index_corruption(
-            Error::from(err.attach(format!(
+            err.attach(format!(
                 "file={}, block=column_block_index, block_id={}",
                 FileKind::TableFile,
                 test_block_id(42)
-            ))),
+            ))
+            .disclose(),
             test_block_id(42),
             DataIntegrityError::InvalidPayload,
         );
     }
 
     #[test]
+    #[should_panic(
+        expected = "column block-index invariant violated: dense row span exceeds u16 storage"
+    )]
     fn test_encode_row_section_rejects_row_count_above_u16() {
-        assert!(
-            encode_row_section(
-                &LogicalRowSet::Dense {
-                    row_id_span: u16::MAX as u32 + 1,
-                },
-                ColumnDeleteDomain::RowIdDelta
-            )
-            .as_ref()
-            .is_err_and(|err| err
-                .downcast_ref::<crate::error::InternalError>()
-                .copied()
-                == Some(crate::error::InternalError::ColumnBlockIndexInvariant))
+        encode_row_section(
+            &LogicalRowSet::Dense {
+                row_id_span: u16::MAX as u32 + 1,
+            },
+            ColumnDeleteDomain::RowIdDelta,
         );
     }
 
     #[test]
+    #[should_panic(
+        expected = "column block-index invariant violated: count 65536 exceeds u16 storage"
+    )]
     fn test_logical_delete_set_rejects_delete_count_above_u16() {
         let delete_set = LogicalDeleteSet::Inline {
             domain: ColumnDeleteDomain::RowIdDelta,
             row_id_deltas: (0..=u16::MAX as u32).collect(),
         };
-        assert!(delete_set.del_count().as_ref().is_err_and(|err| {
-            err.downcast_ref::<crate::error::InternalError>().copied()
-                == Some(crate::error::InternalError::ColumnBlockIndexInvariant)
-        }));
+        delete_set.del_count();
     }
 
     #[test]
@@ -4003,7 +3934,6 @@ mod tests {
                     RowID::new(4),
                     &test_row_ids([0, 1, 2, 3])
                 )
-                .unwrap()
             );
             assert_eq!(
                 index.load_entry_row_ids(&sparse).await.unwrap(),
@@ -4016,7 +3946,6 @@ mod tests {
                     RowID::new(20),
                     &test_row_ids([12, 15, 18])
                 )
-                .unwrap()
             );
         });
     }
@@ -4218,7 +4147,6 @@ mod tests {
             let delete_deltas: Vec<u32> = (0..96).collect();
             let entry =
                 ColumnBlockEntryShape::new(RowID::new(0), RowID::new(96), row_ids, delete_deltas)
-                    .unwrap()
                     .with_block_id(test_block_id(1001));
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());

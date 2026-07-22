@@ -1,7 +1,7 @@
 // Intentional public trait convergence: `ValKind::try_from(u32)` must expose the
 // crate error while forwarding its sole DataIntegrity report; internal decoders
 // retain `DataIntegrityResult` and do not cross this boundary.
-use crate::error::{DataIntegrityError, DataIntegrityResult, Error, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, DiscloseResultExt, Error, Result};
 use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
@@ -38,6 +38,7 @@ pub(crate) const MEM_VAR_LEN_INLINE: usize = 14;
 /// Prefix bytes stored for outlined in-memory varlen values.
 pub(crate) const MEM_VAR_LEN_PREFIX: usize = 6;
 const _: () = assert!(mem::size_of::<MemVar>() == 16);
+const _: () = assert!(mem::size_of::<ValKind>() == mem::size_of::<u32>());
 
 /// Logical value type and nullability metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +135,6 @@ pub enum ValKind {
     F64 = 10,
     VarByte = 11,
 }
-const _: () = assert!(mem::size_of::<ValKind>() == mem::size_of::<u32>());
-
 impl ValKind {
     /// Returns the inline byte length for this kind.
     #[inline]
@@ -194,7 +193,7 @@ impl TryFrom<u32> for ValKind {
     type Error = Error;
     #[inline]
     fn try_from(value: u32) -> Result<Self> {
-        Self::decode(value).map_err(Error::from)
+        Self::decode(value).disclose()
     }
 }
 

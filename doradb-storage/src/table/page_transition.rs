@@ -5,13 +5,12 @@ use super::{DeleteMarker, Table};
 use crate::bitmap::Bitmap;
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::{InternalError, RuntimeError, RuntimeResult};
+use crate::error::RuntimeResult;
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::RowPage;
 use crate::trx::undo::{RowUndoKind, UndoStatus};
 use crate::trx::ver_map::{RowPageState, RowVersionMap};
 use crate::trx::{MAX_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
-use error_stack::Report;
 use std::mem::take;
 use std::sync::Arc;
 
@@ -251,7 +250,7 @@ impl Table {
         page_guards: &[PageSharedGuard<RowPage>],
         batch: &mut FrozenPageBatch,
         cutoff_ts: TrxID,
-    ) -> RuntimeResult<()> {
+    ) {
         #[cfg(test)]
         use super::test_hooks;
 
@@ -314,7 +313,7 @@ impl Table {
                 }
             };
             *state = RowPageState::Transition;
-            self.install_transition_markers(&plan)?;
+            self.install_transition_markers(&plan);
             batch.prepared[page_idx] = Some(plan);
             // Release each page independently so writers on the still-frozen
             // suffix are not stalled behind the whole batch transition.
@@ -322,7 +321,6 @@ impl Table {
             #[cfg(test)]
             test_hooks::run_test_transition_page_published_hook(page_info.page_id);
         }
-        Ok(())
     }
 
     fn assert_frozen_batch_shape(
@@ -342,7 +340,7 @@ impl Table {
         }
     }
 
-    fn install_transition_markers(&self, plan: &PreparedTransitionPage) -> RuntimeResult<()> {
+    fn install_transition_markers(&self, plan: &PreparedTransitionPage) {
         for (row_id, marker) in &plan.overlay_markers {
             let result = match marker {
                 DeleteMarker::Ref(status) => {
@@ -351,22 +349,17 @@ impl Table {
                 }
                 DeleteMarker::Committed(cts) => self.deletion_buffer().put_committed(*row_id, *cts),
             };
-            if let Err(reason) = result {
-                return Err(Report::new(
-                    InternalError::CheckpointTransitionMarkerConflict,
-                )
-                    .attach(format!(
-                        "transition marker install conflict: table_id={}, page_id={}, row_id={row_id}, reason={reason:?}",
-                        self.table_id(), plan.page_id
-                    ))
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach(format!(
-                        "operation=checkpoint_table, phase=install_transition_markers, table_id={}",
-                        self.table_id()
-                    )));
-            }
+            // The page state lock drains writers, and preparation derives one
+            // marker per row from the same stable image, so no competing or
+            // duplicate deletion-buffer state can exist at publication.
+            assert!(
+                result.is_ok(),
+                "checkpoint transition marker conflicts with existing state: table_id={}, page_id={}, row_id={row_id}, reason={:?}",
+                self.table_id(),
+                plan.page_id,
+                result.unwrap_err()
+            );
         }
-        Ok(())
     }
 }
 

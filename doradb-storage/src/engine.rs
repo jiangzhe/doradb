@@ -12,7 +12,7 @@ use crate::component::{
     RegistryBuilder,
 };
 use crate::conf::EngineConfig;
-use crate::error::{LifecycleError, LifecycleResult, Result};
+use crate::error::{DiscloseResultExt, LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
 use crate::lock::LockManager;
@@ -295,13 +295,18 @@ impl Engine {
     /// Create a new session while the engine is still running.
     #[inline]
     pub fn new_session(&self) -> Result<Session> {
+        self.new_session_inner().disclose()
+    }
+
+    #[inline]
+    fn new_session_inner(&self) -> LifecycleResult<Session> {
         let inner = self.inner();
-        Ok(inner.with_admitted_operation(|| {
+        inner.with_admitted_operation(|| {
             let id = inner.next_session_id();
             inner
                 .session_registry
                 .create_session(inner, EngineRef::new(Arc::clone(inner)), id)
-        })?)
+        })
     }
 
     /// Return the shared catalog handle.
@@ -320,14 +325,11 @@ impl Engine {
 
     /// Try to clone the crate-private shared runtime handle while the engine is
     /// still running.
+    #[cfg(test)]
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "transitional internal runtime handle")
-    )]
-    pub(crate) fn new_ref(&self) -> Result<EngineRef> {
+    pub(crate) fn new_ref(&self) -> LifecycleResult<EngineRef> {
         let inner = self.inner();
-        Ok(inner.with_admitted_operation(|| EngineRef::new(Arc::clone(inner)))?)
+        inner.with_admitted_operation(|| EngineRef::new(Arc::clone(inner)))
     }
 
     /// Try to complete idempotent engine shutdown without waiting for active work.
@@ -342,6 +344,11 @@ impl Engine {
     /// and drop components in the registered order.
     #[inline]
     pub fn try_shutdown(&self) -> Result<()> {
+        self.try_shutdown_inner().disclose()
+    }
+
+    #[inline]
+    fn try_shutdown_inner(&self) -> LifecycleResult<()> {
         let inner = self.inner();
         if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
             return Ok(());
@@ -374,9 +381,7 @@ impl Engine {
                 active_transactions,
                 queued_cleanup
             );
-            return Err(Report::new(LifecycleError::ShutdownBusy)
-                .attach(busy)
-                .into());
+            return Err(Report::new(LifecycleError::ShutdownBusy).attach(busy));
         }
         self.finish_shutdown_locked(inner);
         obs::info!(
@@ -393,6 +398,11 @@ impl Engine {
     /// component shutdown in reverse registration order.
     #[inline]
     pub fn shutdown(&self) -> Result<()> {
+        self.shutdown_inner().disclose()
+    }
+
+    #[inline]
+    fn shutdown_inner(&self) -> LifecycleResult<()> {
         let inner = self.inner();
         if inner.lifecycle.state() == EngineLifecycleState::Shutdown {
             return Ok(());
@@ -485,14 +495,12 @@ impl Engine {
 impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
-        if let Err(err) = self.try_shutdown() {
+        if let Err(err) = self.try_shutdown_inner() {
             obs::error!(
                 "event=engine_lifecycle component=engine action=shutdown_finish result=error mode=drop error={}",
                 err
             );
-            if err.report().downcast_ref::<LifecycleError>().copied()
-                == Some(LifecycleError::ShutdownBusy)
-            {
+            if *err.current_context() == LifecycleError::ShutdownBusy {
                 // Fatal owner-drop violations still need to stop background
                 // workers, but the owner registry cannot be dropped while
                 // leaked runtime refs still retain component guards. This keeps
@@ -540,13 +548,13 @@ impl EngineRef {
         not(test),
         expect(dead_code, reason = "transitional internal runtime handle")
     )]
-    pub(crate) fn new_session(&self) -> Result<Session> {
-        Ok(self.0.with_admitted_operation(|| {
+    pub(crate) fn new_session(&self) -> LifecycleResult<Session> {
+        self.0.with_admitted_operation(|| {
             let id = self.0.next_session_id();
             self.0
                 .session_registry
                 .create_session(&self.0, self.clone(), id)
-        })?)
+        })
     }
 
     /// Return the shared catalog handle.
@@ -766,8 +774,8 @@ impl EngineConfig {
 
     #[inline]
     async fn build_inner(self) -> Result<Engine> {
-        let resolved = self.resolve_storage_paths()?;
-        let marker_was_present = resolved.validate_marker_if_present()?;
+        let resolved = self.resolve_storage_paths().disclose()?;
+        let marker_was_present = resolved.validate_marker_if_present().disclose()?;
         // Marker preflight and the post-build check below do not reserve the
         // storage root. Another process can open or mutate the same files
         // throughout component construction. Until
@@ -777,55 +785,72 @@ impl EngineConfig {
         // to exhaust every possible path conflict up front. It is acceptable for
         // later setup steps to fail, but those failures must not clobber durable
         // files or persist `storage-layout.toml` before the engine is fully built.
-        resolved.ensure_directories()?;
+        resolved.ensure_directories().disclose()?;
 
         let file = self.file.data_dir(resolved.data_dir_path());
         let readonly_buffer_size = file.readonly_buffer_size;
+        let file = file.validate().disclose()?;
         let trx_cfg = self.trx.log_dir(resolved.log_dir_path());
         let catalog_cfg = CatalogConfig::new(trx_cfg.recovery_disable_dml_validation);
         let mut builder = RegistryBuilder::new();
         // Components are registered in one fixed dependency order. Reverse
         // registration order then defines both explicit shutdown order and the
         // final owner drop order.
-        builder.build::<EnginePoisoner>(()).await?;
-        builder.build::<FileSystem>(file).await?;
+        builder
+            .build::<EnginePoisoner>(())
+            .await
+            .unwrap_or_else(|never| match never {});
+        builder.build::<FileSystem>(file).await.disclose()?;
         builder
             .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
-            .await?;
+            .await
+            .disclose()?;
         builder
             .build::<MetaPool>(MetaPoolConfig::new(self.meta_buffer.as_u64() as usize))
-            .await?;
+            .await
+            .disclose()?;
         builder
             .build::<IndexPool>(IndexPoolConfig::new(
                 self.index_buffer.as_u64() as usize,
                 resolved.index_swap_file_path(),
                 self.index_max_file_size.as_u64() as usize,
             ))
-            .await?;
+            .await
+            .disclose()?;
         builder
             .build::<MemPool>(
                 self.data_buffer
                     .role(PoolRole::Mem)
                     .data_swap_file(resolved.data_swap_file_path()),
             )
-            .await?;
-        builder.build::<FileSystemWorkers>(()).await?;
-        builder.build::<SharedPoolEvictorWorkers>(()).await?;
-        builder.build::<LockManager>(()).await?;
+            .await
+            .disclose()?;
+        builder.build::<FileSystemWorkers>(()).await.disclose()?;
+        builder
+            .build::<SharedPoolEvictorWorkers>(())
+            .await
+            .disclose()?;
+        builder
+            .build::<LockManager>(())
+            .await
+            .unwrap_or_else(|never| match never {});
         // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
         // guards for row/index/readonly access. Register catalog after the pools it
         // can pin so reverse shutdown/drop order releases table guards before pool
         // owners are torn down.
-        builder.build::<Catalog>(catalog_cfg).await?;
+        builder.build::<Catalog>(catalog_cfg).await.disclose()?;
         builder.build::<TransactionSystem>(trx_cfg).await?;
-        builder.build::<TransactionSystemWorkers>(()).await?;
+        builder
+            .build::<TransactionSystemWorkers>(())
+            .await
+            .disclose()?;
 
         if marker_was_present {
-            if !resolved.validate_marker_if_present()? {
-                resolved.persist_marker()?;
+            if !resolved.validate_marker_if_present().disclose()? {
+                resolved.persist_marker().disclose()?;
             }
         } else {
-            resolved.persist_marker()?;
+            resolved.persist_marker().disclose()?;
         }
         let registry = builder.finish();
         let poisoner = registry.dependency::<EnginePoisoner>();
@@ -866,8 +891,8 @@ mod tests {
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
-        ConfigError, Error, ErrorKind, FatalError, LifecycleError, OperationError, ResourceError,
-        RuntimeError,
+        ConfigError, DiscloseError, Error, ErrorKind, FatalError, LifecycleError, OperationError,
+        ResourceError, RuntimeError,
     };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::{TableID, TrxID};
@@ -1684,7 +1709,7 @@ mod tests {
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
-                Err(err) => err,
+                Err(err) => err.disclose(),
             };
             assert_runtime_unavailable_after_shutdown(err);
         });
@@ -1710,13 +1735,13 @@ mod tests {
 
             let err = match engine_ref.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
-                Err(err) => err,
+                Err(err) => err.disclose(),
             };
             assert_runtime_unavailable_after_shutdown(err);
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
-                Err(err) => err,
+                Err(err) => err.disclose(),
             };
             assert_runtime_unavailable_after_shutdown(err);
 
@@ -2408,7 +2433,7 @@ mod tests {
 
                 match (shutdown_res, new_ref_res) {
                     (Ok(()), Err(err))
-                        if err.report().downcast_ref::<LifecycleError>().copied()
+                        if err.downcast_ref::<LifecycleError>().copied()
                             == Some(LifecycleError::Shutdown) => {}
                     (Err(err), Ok(engine_ref))
                         if err.report().downcast_ref::<LifecycleError>().copied()

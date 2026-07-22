@@ -10,10 +10,11 @@ use crate::buffer::page::INVALID_PAGE_ID;
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, Error, FatalResult, FileKind, InternalError,
-    MultiDomainResultExt, OperationError, OperationOrRuntimeError, OperationOrRuntimeResult,
-    Result, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, FatalResult,
+    InternalError, MultiDomainResultExt, OperationError, OperationOrRuntimeError,
+    OperationOrRuntimeResult, Result, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
 };
+use crate::file::FileKind;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
@@ -131,9 +132,9 @@ impl<'row> LazyRow<'row> {
                     "lazy row column out of range: column_no={column_no}, column_count={}",
                     self.values.len()
                 ))
-                .into());
+                .disclose());
         }
-        self.val_inner(column_no).map_err(Error::from)
+        self.val_inner(column_no).disclose()
     }
 
     /// Returns one valid latest modifiable column value without crossing the
@@ -2841,7 +2842,8 @@ impl<'a> UserTableAccessor<'a> {
         let (upper_bound, original_pages) = self
             .mem()
             .snapshot_original_row_pages_from(rt.pool_guards(), root_snapshot.pivot_row_id())
-            .await?;
+            .await
+            .disclose()?;
         let mut tracker = ScanBoundaryTracker::new(upper_bound, original_pages);
         let validator = validate_updates.then(|| DmlValidator::new(self.metadata()));
         let column_count = self.metadata().col.col_count();
@@ -2867,14 +2869,19 @@ impl<'a> UserTableAccessor<'a> {
                 storage.disk_pool(),
                 disk_guard,
             );
-            for entry in column_index.collect_leaf_entries().await? {
-                let (delete_deltas, row_ids) =
-                    column_index.load_delete_deltas_and_row_ids(&entry).await?;
-                let persisted = storage.load_lwc_block(disk_guard, entry.block_id()).await?;
+            for entry in column_index.collect_leaf_entries().await.disclose()? {
+                let (delete_deltas, row_ids) = column_index
+                    .load_delete_deltas_and_row_ids(&entry)
+                    .await
+                    .disclose()?;
+                let persisted = storage
+                    .load_lwc_block(disk_guard, entry.block_id())
+                    .await
+                    .disclose()?;
                 let block = persisted.block();
-                validate_cold_scan_entry(file_kind, &entry, block, &row_ids)?;
+                validate_cold_scan_entry(file_kind, &entry, block, &row_ids).disclose()?;
                 let persisted_deleted =
-                    persisted_delete_set_for_scan(file_kind, &entry, delete_deltas)?;
+                    persisted_delete_set_for_scan(file_kind, &entry, delete_deltas).disclose()?;
                 let has_persisted_deletes = !persisted_deleted.is_empty();
                 // Step 3: Check current cold-row ownership before the callback,
                 // then stage selected updates until this block can be released.
@@ -2893,7 +2900,7 @@ impl<'a> UserTableAccessor<'a> {
                                 .attach(format!(
                                     "full-table update latest cold-row read: row_id={row_id}"
                                 ))
-                                .into());
+                                .disclose());
                         }
                     }
                     let source = LazyRowSource::Cold {
@@ -2916,13 +2923,14 @@ impl<'a> UserTableAccessor<'a> {
                             .change_context(OperationError::InvalidDmlInput)
                             .attach_with(|| {
                                 format!("operation=table_update_mvcc, table_id={}", self.table_id())
-                            })?;
+                            })
+                            .disclose()?;
                     }
                     if update.is_empty() {
                         value_buffer = lazy_row.into_reusable_buffer();
                         continue;
                     }
-                    let (old_row, reusable) = lazy_row.into_full_row()?;
+                    let (old_row, reusable) = lazy_row.into_full_row().disclose()?;
                     value_buffer = reusable;
                     pending.push(PendingColdUpdate {
                         row_id,
@@ -2950,7 +2958,8 @@ impl<'a> UserTableAccessor<'a> {
             let page_guard = self
                 .mem()
                 .must_get_row_page_shared(rt.pool_guards(), descriptor.page_id)
-                .await?;
+                .await
+                .disclose()?;
             let page = page_guard.page();
             let actual_end = page.header.start_row_id + u64::from(page.header.max_row_count);
             assert!(
@@ -2975,7 +2984,8 @@ impl<'a> UserTableAccessor<'a> {
                 let page_guard = self
                     .mem()
                     .must_get_row_page_shared(rt.pool_guards(), descriptor.page_id)
-                    .await?;
+                    .await
+                    .disclose()?;
                 let access = page_guard.read_row_by_id(row_id);
                 match access.read_latest(rt.ctx()) {
                     ReadLatestRow::Readable => (),
@@ -2985,7 +2995,7 @@ impl<'a> UserTableAccessor<'a> {
                             .attach(format!(
                                 "full-table update latest hot-row read: row_id={row_id}"
                             ))
-                            .into());
+                            .disclose());
                     }
                 }
                 // Step 7: Retain one latest-row read guard through the callback,
@@ -3007,7 +3017,8 @@ impl<'a> UserTableAccessor<'a> {
                         .change_context(OperationError::InvalidDmlInput)
                         .attach_with(|| {
                             format!("operation=table_update_mvcc, table_id={}", self.table_id())
-                        })?;
+                        })
+                        .disclose()?;
                 }
                 value_buffer = lazy_row.into_reusable_buffer();
                 if update.is_empty() {
@@ -3046,12 +3057,12 @@ impl<'a> UserTableAccessor<'a> {
             Err(DeletionError::WriteConflict) => {
                 return Err(Report::new(OperationError::WriteConflict)
                     .attach("full-table update cold delete marker ownership")
-                    .into());
+                    .disclose());
             }
             Err(DeletionError::AlreadyDeleted) => {
                 return Err(Report::new(OperationError::WriteConflict)
                     .attach("full-table update cold row changed after visibility")
-                    .into());
+                    .disclose());
             }
         }
         effects.push_row_undo(OwnedRowUndo::new(
@@ -3071,16 +3082,19 @@ impl<'a> UserTableAccessor<'a> {
 
         let old_index_keys = self.metadata().idx.keys_for_insert(&old_row);
         self.defer_delete_index_keys(rt, effects, row_id, old_index_keys, root_snapshot)
-            .await?;
+            .await
+            .disclose()?;
         let new_row = self.build_cold_update_row(old_row, RowUpdateInput::Sparse(update));
         let new_index_keys = self.metadata().idx.keys_for_insert(&new_row);
         let (new_row_id, new_guard) = self
             .insert_row_internal(rt, effects, new_row, RowUndoKind::Insert, Vec::new())
-            .await?;
+            .await
+            .disclose()?;
         for key in new_index_keys {
             self.insert_index(rt, effects, key, new_row_id, &new_guard, root_snapshot)
                 .await
-                .attach("full-table update cold replacement index claim")?;
+                .attach("full-table update cold replacement index claim")
+                .disclose()?;
         }
         let inserted = InsertedRow::new(new_guard.page_id(), new_row_id);
         Ok(inserted)
@@ -3098,7 +3112,8 @@ impl<'a> UserTableAccessor<'a> {
     ) -> Result<Option<InsertedRow>> {
         let result = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
             .update_known_row(effects, RowUpdateInput::Sparse(update))
-            .await?;
+            .await
+            .disclose()?;
         match result {
             UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
                 debug_assert_eq!(row_id, new_row_id);
@@ -3112,14 +3127,15 @@ impl<'a> UserTableAccessor<'a> {
                         root_snapshot,
                     )
                     .await
-                    .attach("full-table update hot key change")?;
+                    .attach("full-table update hot key change")
+                    .disclose()?;
                 }
                 Ok(None)
             }
             UpdateRowInplace::RowDeleted(_) | UpdateRowInplace::RowNotFound(_) => {
                 Err(Report::new(OperationError::WriteConflict)
                     .attach("full-table update hot row changed after visibility")
-                    .into())
+                    .disclose())
             }
             UpdateRowInplace::RetryInTransition(_) => {
                 // Checkpoint transition holds TableData(IS), which is
@@ -3132,7 +3148,8 @@ impl<'a> UserTableAccessor<'a> {
             UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, update) => {
                 let (new_row_id, index_change_cols, new_guard) = self
                     .move_update_for_space(rt, effects, old_row, update, old_row_id, page_guard)
-                    .await?;
+                    .await
+                    .disclose()?;
                 let result = if index_change_cols.is_empty() {
                     self.update_indexes_only_row_id_change(
                         rt,
@@ -3156,7 +3173,9 @@ impl<'a> UserTableAccessor<'a> {
                     .await
                 };
                 let inserted = InsertedRow::new(new_guard.page_id(), new_row_id);
-                result.attach("full-table update hot move index update")?;
+                result
+                    .attach("full-table update hot move index update")
+                    .disclose()?;
                 Ok(Some(inserted))
             }
         }
@@ -3346,7 +3365,8 @@ impl<'a> UserTableAccessor<'a> {
         // handle if any following index insert fails.
         let (row_id, page_guard) = self
             .insert_row_internal(rt, effects, cols, RowUndoKind::Insert, Vec::new())
-            .await?;
+            .await
+            .disclose()?;
         // This foreground method is a genuine mixed seam: row allocation above
         // can already contribute Runtime-or-Fatal, while index claims contribute
         // Operation-or-Runtime. Convert each native carrier only here.
@@ -3356,7 +3376,8 @@ impl<'a> UserTableAccessor<'a> {
         for key in keys {
             self.insert_index(rt, effects, key, row_id, &page_guard, &root_snapshot)
                 .await
-                .attach("insert MVCC secondary index claim")?;
+                .attach("insert MVCC secondary index claim")
+                .disclose()?;
         }
         Ok(row_id)
     }
@@ -3375,7 +3396,7 @@ impl<'a> UserTableAccessor<'a> {
             unique_index_no,
             &cols,
             "upsert_unique_mvcc",
-        )?;
+        );
         let input = RowUpdateInput::FullRow(cols);
         match self
             .update_unique_mvcc_input(rt, effects, key.index_no, &key.vals, input, log_by_key)
@@ -3442,9 +3463,13 @@ impl<'a> UserTableAccessor<'a> {
         );
         loop {
             let root_snapshot = self.root_snapshot(rt.ctx());
-            let lookup_root = self.snapshot_secondary_root(&root_snapshot, index_no)?;
-            let index = self.require_unique_index(rt.pool_guards(), index_no, lookup_root)?;
-            let (page_guard, row_id) = match index.lookup(key_vals, rt.sts()).await? {
+            let lookup_root = self
+                .snapshot_secondary_root(&root_snapshot, index_no)
+                .disclose()?;
+            let index = self
+                .require_unique_index(rt.pool_guards(), index_no, lookup_root)
+                .disclose()?;
+            let (page_guard, row_id) = match index.lookup(key_vals, rt.sts()).await.disclose()? {
                 None => return Ok(UpdateUniqueMvcc::NotFound(input)),
                 Some((row_id, _)) => {
                     match self.find_row_location(rt.pool_guards(), row_id).await {
@@ -3471,7 +3496,8 @@ impl<'a> UserTableAccessor<'a> {
                                     row_shape_fingerprint,
                                     |vals| metadata.idx.match_key(index_no, key_vals, vals),
                                 )
-                                .await?
+                                .await
+                                .disclose()?
                             {
                                 ColdRowUpdateRead::Ok(vals) => vals,
                                 ColdRowUpdateRead::NotFound => {
@@ -3480,7 +3506,7 @@ impl<'a> UserTableAccessor<'a> {
                                 ColdRowUpdateRead::WriteConflict => {
                                     return Err(Report::new(OperationError::WriteConflict)
                                         .attach("update MVCC cold row read")
-                                        .into());
+                                        .disclose());
                                 }
                             };
                             let deletion_buffer = self.lwc_deletion_buffer();
@@ -3494,7 +3520,7 @@ impl<'a> UserTableAccessor<'a> {
                                 Err(DeletionError::WriteConflict) => {
                                     return Err(Report::new(OperationError::WriteConflict)
                                         .attach("update MVCC cold delete marker ownership")
-                                        .into());
+                                        .disclose());
                                 }
                                 Err(DeletionError::AlreadyDeleted) => {
                                     return Ok(UpdateUniqueMvcc::NotFound(input));
@@ -3534,7 +3560,8 @@ impl<'a> UserTableAccessor<'a> {
                                 old_index_keys,
                                 &root_snapshot,
                             )
-                            .await?;
+                            .await
+                            .disclose()?;
 
                             let new_row = self.build_cold_update_row(old_vals, input);
                             let new_index_keys = self.metadata().idx.keys_for_insert(&new_row);
@@ -3546,7 +3573,8 @@ impl<'a> UserTableAccessor<'a> {
                                     RowUndoKind::Insert,
                                     Vec::new(),
                                 )
-                                .await?;
+                                .await
+                                .disclose()?;
                             // Row allocation can already contribute Runtime-or-Fatal;
                             // keep index mutation typed until this mixed seam.
                             for key in new_index_keys {
@@ -3559,7 +3587,8 @@ impl<'a> UserTableAccessor<'a> {
                                     &root_snapshot,
                                 )
                                 .await
-                                .attach("update MVCC cold replacement index claim")?;
+                                .attach("update MVCC cold replacement index claim")
+                                .disclose()?;
                             }
                             return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                         }
@@ -3574,19 +3603,21 @@ impl<'a> UserTableAccessor<'a> {
                                     page_id,
                                     row_id,
                                 )
-                                .await?
+                                .await
+                                .disclose()?
                             else {
                                 continue;
                             };
                             (page_guard, row_id)
                         }
-                        Err(err) => return Err(err.into()),
+                        Err(err) => return Err(err.disclose()),
                     }
                 }
             };
             let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
                 .update_inplace(effects, index_no, key_vals, input, log_by_key)
-                .await?;
+                .await
+                .disclose()?;
             match res {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols) => {
                     debug_assert!(row_id == new_row_id);
@@ -3603,7 +3634,8 @@ impl<'a> UserTableAccessor<'a> {
                             &root_snapshot,
                         )
                         .await
-                        .attach("update MVCC key-change index update")?;
+                        .attach("update MVCC key-change index update")
+                        .disclose()?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     } // otherwise, do nothing
                     return Ok(UpdateUniqueMvcc::Updated(row_id));
@@ -3615,7 +3647,9 @@ impl<'a> UserTableAccessor<'a> {
                     input = returned_input;
                     // Release the row page so the checkpoint transition can complete.
                     drop(page_guard);
-                    self.wait_transition_route_or_poison(rt, row_id).await?;
+                    self.wait_transition_route_or_poison(rt, row_id)
+                        .await
+                        .disclose()?;
                 }
                 UpdateRowInplace::NoFreeSpaceOrFrozen(old_row_id, old_row, returned_input) => {
                     // In-place update failed after the old row was locked and
@@ -3631,7 +3665,8 @@ impl<'a> UserTableAccessor<'a> {
                             old_row_id,
                             page_guard,
                         )
-                        .await?;
+                        .await
+                        .disclose()?;
                     if !index_change_cols.is_empty() {
                         // old guard is already marked inside.
                         self.update_indexes_may_both_change(
@@ -3643,7 +3678,8 @@ impl<'a> UserTableAccessor<'a> {
                             &root_snapshot,
                         )
                         .await
-                        .attach("update MVCC moved-row index update")?;
+                        .attach("update MVCC moved-row index update")
+                        .disclose()?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     } else {
                         self.update_indexes_only_row_id_change(
@@ -3655,7 +3691,8 @@ impl<'a> UserTableAccessor<'a> {
                             &root_snapshot,
                         )
                         .await
-                        .attach("update MVCC moved-row index update")?;
+                        .attach("update MVCC moved-row index update")
+                        .disclose()?;
                         return Ok(UpdateUniqueMvcc::Updated(new_row_id));
                     }
                 }
@@ -3687,9 +3724,13 @@ impl<'a> UserTableAccessor<'a> {
         ));
         loop {
             let root_snapshot = self.root_snapshot(rt.ctx());
-            let lookup_root = self.snapshot_secondary_root(&root_snapshot, index_no)?;
-            let index = self.require_unique_index(rt.pool_guards(), index_no, lookup_root)?;
-            let (page_guard, row_id) = match index.lookup(key_vals, rt.sts()).await? {
+            let lookup_root = self
+                .snapshot_secondary_root(&root_snapshot, index_no)
+                .disclose()?;
+            let index = self
+                .require_unique_index(rt.pool_guards(), index_no, lookup_root)
+                .disclose()?;
+            let (page_guard, row_id) = match index.lookup(key_vals, rt.sts()).await.disclose()? {
                 None => return Ok(DeleteMvcc::NotFound),
                 Some((row_id, _)) => {
                     match self.find_row_location(rt.pool_guards(), row_id).await {
@@ -3711,7 +3752,8 @@ impl<'a> UserTableAccessor<'a> {
                                     row_idx,
                                     row_shape_fingerprint,
                                 )
-                                .await?;
+                                .await
+                                .disclose()?;
                             if !index_key_matches(&index_keys, index_no, key_vals) {
                                 return Ok(DeleteMvcc::NotFound);
                             }
@@ -3753,13 +3795,14 @@ impl<'a> UserTableAccessor<'a> {
                                         index_keys,
                                         &root_snapshot,
                                     )
-                                    .await?;
+                                    .await
+                                    .disclose()?;
                                     return Ok(DeleteMvcc::Deleted);
                                 }
                                 Err(DeletionError::WriteConflict) => {
                                     return Err(Report::new(OperationError::WriteConflict)
                                         .attach("delete MVCC cold delete marker ownership")
-                                        .into());
+                                        .disclose());
                                 }
                                 Err(DeletionError::AlreadyDeleted) => {
                                     return Ok(DeleteMvcc::NotFound);
@@ -3777,32 +3820,37 @@ impl<'a> UserTableAccessor<'a> {
                                     page_id,
                                     row_id,
                                 )
-                                .await?
+                                .await
+                                .disclose()?
                             else {
                                 continue;
                             };
                             (page_guard, row_id)
                         }
-                        Err(err) => return Err(err.into()),
+                        Err(err) => return Err(err.disclose()),
                     }
                 }
             };
             let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
                 .delete(effects, index_no, key_vals, log_by_key)
-                .await?;
+                .await
+                .disclose()?;
             match res {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
                 DeleteInternal::RetryInTransition => {
                     // Release the row page so the checkpoint transition can complete.
                     drop(page_guard);
-                    self.wait_transition_route_or_poison(rt, row_id).await?;
+                    self.wait_transition_route_or_poison(rt, row_id)
+                        .await
+                        .disclose()?;
                 }
                 DeleteInternal::Ok => {
                     // Mask every secondary-index entry for this hot row. The
                     // physical index entry remains until rollback unmasks it
                     // or index GC removes it after it is no longer visible.
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard, &root_snapshot)
-                        .await?;
+                        .await
+                        .disclose()?;
                     return Ok(DeleteMvcc::Deleted);
                 }
             }
@@ -3991,8 +4039,8 @@ mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{
-        DataIntegrityError, ErrorKind, FatalError, InternalError, IoError, OperationError, Result,
-        RuntimeError,
+        DataIntegrityError, DiscloseError, DiscloseResultExt, ErrorKind, FatalError, InternalError,
+        IoError, OperationError, Result, RuntimeError,
     };
     use crate::id::{PageID, RowID, SessionID, TableID, TrxID};
     use crate::index::{RowLocation, UniqueIndex};
@@ -5743,8 +5791,12 @@ mod tests {
             let insert = vec![Val::from(2i32), Val::from("insert")];
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(table_id).await?;
-                    stmt.acquire_table_write_data_lock(table_id).await?;
+                    stmt.acquire_table_write_metadata_lock(table_id)
+                        .await
+                        .disclose()?;
+                    stmt.acquire_table_write_data_lock(table_id)
+                        .await
+                        .disclose()?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();
@@ -5783,9 +5835,10 @@ mod tests {
                         RowUpdateInput::Sparse(update),
                         false,
                     )
-                    .await?;
+                    .await
+                    .disclose()?;
                     assert!(matches!(res, UpdateRowInplace::RetryInTransition(_)));
-                    Err(Report::new(OperationError::NotSupported).into())
+                    Err(Report::new(OperationError::NotSupported).disclose())
                 })
                 .await;
             assert_eq!(
@@ -5813,8 +5866,12 @@ mod tests {
                 .unwrap();
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt.acquire_table_write_metadata_lock(table_id).await?;
-                    stmt.acquire_table_write_data_lock(table_id).await?;
+                    stmt.acquire_table_write_metadata_lock(table_id)
+                        .await
+                        .disclose()?;
+                    stmt.acquire_table_write_data_lock(table_id)
+                        .await
+                        .disclose()?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();
@@ -5827,9 +5884,10 @@ mod tests {
                         row_id,
                     )
                     .delete(effects, key.index_no, &key.vals, false)
-                    .await?;
+                    .await
+                    .disclose()?;
                     assert!(matches!(res, DeleteInternal::RetryInTransition));
-                    Err(Report::new(OperationError::NotSupported).into())
+                    Err(Report::new(OperationError::NotSupported).disclose())
                 })
                 .await;
             assert_eq!(
@@ -7234,8 +7292,12 @@ mod tests {
                         .lock_shared_async()
                         .await
                         .unwrap();
-                    stmt.acquire_table_write_metadata_lock(table_id).await?;
-                    stmt.acquire_table_write_data_lock(table_id).await?;
+                    stmt.acquire_table_write_metadata_lock(table_id)
+                        .await
+                        .disclose()?;
+                    stmt.acquire_table_write_data_lock(table_id)
+                        .await
+                        .disclose()?;
                     let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                     let table = table_for_internal_assertion(&engine, table_id);
                     let layout = table.layout_snapshot();
@@ -7281,13 +7343,11 @@ mod tests {
                         .checkpoint_workflow
                         .try_begin_transition(&table.lifecycle)
                         .unwrap();
-                    table
-                        .apply_page_transition(
-                            &transition_pages,
-                            checkpoint_attempt.batch_mut().unwrap(),
-                            stmt.runtime().sts(),
-                        )
-                        .unwrap();
+                    table.apply_page_transition(
+                        &transition_pages,
+                        checkpoint_attempt.batch_mut().unwrap(),
+                        stmt.runtime().sts(),
+                    );
 
                     let marker = table_for_internal_assertion(&engine, table_id)
                         .deletion_buffer()
@@ -7306,7 +7366,7 @@ mod tests {
                     drop(root_lease);
                     drop(lock_row);
                     drop(page_guard);
-                    Err(Report::new(OperationError::NotSupported).into())
+                    Err(Report::new(OperationError::NotSupported).disclose())
                 })
                 .await;
             assert_eq!(
@@ -7928,7 +7988,7 @@ mod tests {
                     hook_guard = Some(install_storage_backend_test_hook(hook.clone()));
                     read_hook = Some(hook);
 
-                    Err(Report::new(OperationError::NotSupported).into())
+                    Err(Report::new(OperationError::NotSupported).disclose())
                 })
                 .await;
 
@@ -7994,10 +8054,7 @@ mod tests {
             assert!(!session.in_trx().unwrap());
 
             let err = trx.rollback().await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<InternalError>().copied(),
-                Some(InternalError::ActiveTransactionDiscarded)
-            );
+            assert!(err.report().downcast_ref::<InternalError>().is_none());
         });
     }
 

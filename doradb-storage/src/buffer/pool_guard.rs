@@ -74,7 +74,26 @@ impl PoolGuards {
         require_guard_slot(self.disk.as_ref(), "disk")
     }
 
+    /// Returns the required guard for a dynamically selected pool role.
+    #[inline]
+    pub(crate) fn guard(&self, role: PoolRole) -> &PoolGuard {
+        match role {
+            PoolRole::Invalid => invalid_guard_slot(),
+            PoolRole::Meta => self.meta_guard(),
+            PoolRole::Index => self.index_guard(),
+            PoolRole::Mem => self.mem_guard(),
+            PoolRole::Disk => self.disk_guard(),
+        }
+    }
+
+    /// Returns the required guard for a table's declared row-page pool role.
+    #[inline]
+    pub(crate) fn row_guard(&self, role: RowPoolRole) -> &PoolGuard {
+        self.guard(role.into())
+    }
+
     /// Returns the guard for `role`, if this bundle contains one.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn try_guard(&self, role: PoolRole) -> Option<&PoolGuard> {
         match role {
@@ -87,6 +106,7 @@ impl PoolGuards {
     }
 
     /// Returns the guard for a row-pool role, if this bundle contains one.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn try_row_guard(&self, role: RowPoolRole) -> Option<&PoolGuard> {
         self.try_guard(role.into())

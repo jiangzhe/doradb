@@ -1,14 +1,11 @@
 use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
-use crate::buffer::page::{
-    BufferPage, BufferPageKind, PAGE_SIZE, VersionedPageID, assert_buffer_page,
-};
-use crate::buffer::{BufferPool, PoolGuard, get_page_versioned_shared};
+use crate::buffer::page::{BufferPage, PAGE_SIZE, VersionedPageID, assert_buffer_page};
+use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, get_page_versioned_shared};
 use crate::catalog::TableColumnLayout;
 use crate::error::{
-    InternalError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
-    Validation,
+    RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult, Validation,
     Validation::{Invalid, Valid},
 };
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
@@ -331,9 +328,7 @@ impl RowPageIndexNode {
 // SAFETY: `RowPageIndexNode` is one explicit `repr(C)` page image, derives the
 // required zerocopy layout traits, has no drop glue, and is accessed through the
 // buffer-pool and row-page-index latch protocol.
-unsafe impl BufferPage for RowPageIndexNode {
-    const KIND: BufferPageKind = BufferPageKind::RowPageIndexNode;
-}
+unsafe impl BufferPage for RowPageIndexNode {}
 
 /// Header metadata for one in-memory row-page-index node.
 #[repr(C)]
@@ -405,19 +400,19 @@ pub(crate) struct RowPagePrefixPrune {
 /// 2. table scan: traverse all column files and row pages to perform
 ///    full table scan.
 ///
-pub(crate) struct RowPageIndex<P: 'static> {
+pub(crate) struct RowPageIndex {
     root_page_id: PageID,
     height: AtomicUsize,
     insert_free_list: Mutex<Vec<VersionedPageID>>,
     // Buffer pool that owns row-page-index nodes.
-    pool: QuiescentGuard<P>,
+    pool: QuiescentGuard<FixedBufferPool>,
 }
 
-impl<P: BufferPool> RowPageIndex<P> {
+impl RowPageIndex {
     /// Creates a new row-page index backed by the buffer pool.
     #[inline]
     pub(crate) async fn new(
-        pool: QuiescentGuard<P>,
+        pool: QuiescentGuard<FixedBufferPool>,
         pool_guard: &PoolGuard,
         start_row_id: RowID,
     ) -> RuntimeResult<Self> {
@@ -479,22 +474,19 @@ impl<P: BufferPool> RowPageIndex<P> {
         while let Some((page_id, visited_children)) = stack.pop() {
             let guard = self
                 .pool
-                .get_page::<RowPageIndexNode>(
+                .must_get_page::<RowPageIndexNode>(
                     meta_pool_guard,
                     page_id,
                     LatchFallbackMode::Exclusive,
                 )
                 .await
-                .change_context(RuntimeError::IndexAccess)
-                .attach_with(|| format!("operation=destroy_row_page_index, page_id={page_id}"))?
                 .lock_exclusive_async()
                 .await
-                .ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!("row-page-index node missing: page_id={page_id}"))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=destroy_row_page_index")
-                })?;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "published row-page-index node could not be locked during destroy: page_id={page_id}"
+                    )
+                });
             if guard.page().is_branch() && !visited_children {
                 let child_page_ids = guard
                     .page()
@@ -528,12 +520,11 @@ impl<P: BufferPool> RowPageIndex<P> {
                         })?
                         .lock_exclusive_async()
                         .await
-                        .ok_or_else(|| {
-                            Report::new(InternalError::RowPageMissing)
-                                .attach(format!("row page missing: page_id={row_page_id}"))
-                                .change_context(RuntimeError::IndexAccess)
-                                .attach("operation=destroy_row_page_index")
-                        })?;
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "published hot row page could not be locked during row-page-index destroy: row_page_id={row_page_id}, pivot_row_id={pivot_row_id}"
+                            )
+                        });
                     mem_pool.deallocate_page(row_page);
                 }
             }
@@ -552,22 +543,15 @@ impl<P: BufferPool> RowPageIndex<P> {
         while let Some(page_id) = stack.pop() {
             let guard = self
                 .pool
-                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Shared)
+                .must_get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
-                .change_context(RuntimeError::IndexAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=validate_row_page_index_destroy, page_id={page_id}, pivot_row_id={pivot_row_id}"
-                    )
-                })?
                 .lock_shared_async()
                 .await
-                .ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!("row-page-index node missing: page_id={page_id}"))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=access_row_page_index_node")
-                })?;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "published row-page-index node could not be locked during destroy validation: page_id={page_id}, pivot_row_id={pivot_row_id}"
+                    )
+                });
             let page = guard.page();
             if page.is_branch() {
                 stack.extend(
@@ -610,30 +594,20 @@ impl<P: BufferPool> RowPageIndex<P> {
 
         let root = self
             .pool
-            .get_page::<RowPageIndexNode>(
+            .must_get_page::<RowPageIndexNode>(
                 pool_guard,
                 self.root_page_id,
                 LatchFallbackMode::Exclusive,
             )
             .await
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=prune_row_page_checkpoint_prefix, page_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
-                    self.root_page_id
-                )
-            })?
             .lock_exclusive_async()
             .await
-            .ok_or_else(|| {
-                Report::new(InternalError::RowPageMissing)
-                    .attach(format!(
-                        "row-page-index node missing: page_id={}",
-                        self.root_page_id
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=access_row_page_index_node")
-            })?;
+            .unwrap_or_else(|| {
+                panic!(
+                    "row-page-index root could not be locked for checkpoint pruning: page_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
+                    self.root_page_id
+                )
+            });
         assert_eq!(
             root.page().header.start_row_id,
             start_row_id,
@@ -670,28 +644,20 @@ impl<P: BufferPool> RowPageIndex<P> {
                     let child_page_id = root.page().branch_entry(0).page_id;
                     let child = self
                         .pool
-                        .get_page::<RowPageIndexNode>(
+                        .must_get_page::<RowPageIndexNode>(
                             pool_guard,
                             child_page_id,
                             LatchFallbackMode::Exclusive,
                         )
                         .await
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach_with(|| {
-                            format!(
-                                "operation=prune_row_page_checkpoint_prefix, phase=collapse_root, page_id={child_page_id}"
-                            )
-                        })?
                         .lock_exclusive_async()
                         .await
-                        .ok_or_else(|| {
-                            Report::new(InternalError::RowPageMissing)
-                                .attach(format!(
-                                    "row-page-index node missing: page_id={child_page_id}"
-                                ))
-                                .change_context(RuntimeError::IndexAccess)
-                                .attach("operation=access_row_page_index_node")
-                        })?;
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "published row-page-index child could not be locked while collapsing root: root_page_id={}, child_page_id={child_page_id}"
+                                , self.root_page_id
+                            )
+                        });
                     root.page_mut().clone_from(child.page());
                     self.height
                         .store(root.page().header.height as usize, Ordering::Relaxed);
@@ -714,22 +680,19 @@ impl<P: BufferPool> RowPageIndex<P> {
         for page_id in detached_nodes {
             let guard = self
                 .pool
-                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Exclusive)
+                .must_get_page::<RowPageIndexNode>(
+                    pool_guard,
+                    page_id,
+                    LatchFallbackMode::Exclusive,
+                )
                 .await
-                .change_context(RuntimeError::IndexAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=prune_row_page_checkpoint_prefix, phase=reclaim_node, page_id={page_id}"
-                    )
-                })?
                 .lock_exclusive_async()
                 .await
-                .ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!("row-page-index node missing: page_id={page_id}"))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=access_row_page_index_node")
-                })?;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "detached row-page-index node could not be locked for reclaim: page_id={page_id}"
+                    )
+                });
             self.pool.deallocate_page(guard);
             reclaimed_nodes += 1;
         }
@@ -774,22 +737,15 @@ impl<P: BufferPool> RowPageIndex<P> {
                 .expect("checkpoint row-page prefix exceeds index");
             let guard = self
                 .pool
-                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Shared)
+                .must_get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
-                .change_context(RuntimeError::IndexAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=validate_row_page_checkpoint_prefix, page_id={page_id}, start_row_id={start_row_id}, end_row_id={end_row_id}"
-                    )
-                })?
                 .lock_shared_async()
                 .await
-                .ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!("row-page-index node missing: page_id={page_id}"))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=access_row_page_index_node")
-                })?;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "published row-page-index node could not be locked while validating checkpoint prefix: page_id={page_id}, start_row_id={start_row_id}, end_row_id={end_row_id}"
+                    )
+                });
             let page = guard.page();
             if page.is_branch() {
                 stack.extend(
@@ -844,28 +800,19 @@ impl<P: BufferPool> RowPageIndex<P> {
             boundary_indexes.push((boundary_idx, true));
             let child = self
                 .pool
-                .get_page::<RowPageIndexNode>(
+                .must_get_page::<RowPageIndexNode>(
                     pool_guard,
                     child_page_id,
                     LatchFallbackMode::Exclusive,
                 )
                 .await
-                .change_context(RuntimeError::IndexAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=apply_row_page_checkpoint_prefix, page_id={child_page_id}, end_row_id={end_row_id}"
-                    )
-                })?
                 .lock_exclusive_async()
                 .await
-                .ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!(
-                            "row-page-index node missing: page_id={child_page_id}"
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=access_row_page_index_node")
-                })?;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "published row-page-index child could not be locked while pruning: child_page_id={child_page_id}, end_row_id={end_row_id}"
+                    )
+                });
             path.push(child);
         }
 
@@ -922,20 +869,19 @@ impl<P: BufferPool> RowPageIndex<P> {
         while let Some(page_id) = stack.pop() {
             let guard = self
                 .pool
-                .get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Exclusive)
+                .must_get_page::<RowPageIndexNode>(
+                    pool_guard,
+                    page_id,
+                    LatchFallbackMode::Exclusive,
+                )
                 .await
-                .change_context(RuntimeError::IndexAccess)
-                .attach_with(|| {
-                    format!("operation=reclaim_row_page_index_subtree, page_id={page_id}")
-                })?
                 .lock_exclusive_async()
                 .await
-                .ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!("row-page-index node missing: page_id={page_id}"))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=access_row_page_index_node")
-                })?;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "detached row-page-index subtree node could not be locked for reclaim: page_id={page_id}"
+                    )
+                });
             if guard.page().is_branch() {
                 stack.extend(
                     guard
@@ -1176,10 +1122,7 @@ impl<P: BufferPool> RowPageIndex<P> {
 
     /// Returns the cursor for range scan.
     #[inline]
-    pub(crate) fn mem_cursor<'a>(
-        &'a self,
-        pool_guard: &'a PoolGuard,
-    ) -> RowPageIndexMemCursor<'a, P> {
+    pub(crate) fn mem_cursor<'a>(&'a self, pool_guard: &'a PoolGuard) -> RowPageIndexMemCursor<'a> {
         RowPageIndexMemCursor {
             blk_idx: self,
             pool_guard,
@@ -1478,9 +1421,12 @@ impl<P: BufferPool> RowPageIndex<P> {
     ) -> Validation<FacadePageGuard<RowPageIndexNode>> {
         let mut p_guard = self
             .pool
-            .get_page::<RowPageIndexNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
-            .await
-            .expect("row-page-index traversal should not ignore buffer-pool errors");
+            .must_get_page::<RowPageIndexNode>(
+                pool_guard,
+                self.root_page_id,
+                LatchFallbackMode::Spin,
+            )
+            .await;
         loop {
             let step = verify!(p_guard.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -1496,19 +1442,17 @@ impl<P: BufferPool> RowPageIndex<P> {
             debug_assert!(height >= 1);
             let c_guard = if height == 1 {
                 self.pool
-                    .get_child_page::<RowPageIndexNode>(pool_guard, &p_guard, page_id, mode)
+                    .must_get_child_page::<RowPageIndexNode>(pool_guard, &p_guard, page_id, mode)
                     .await
-                    .expect("row-page-index traversal should not ignore buffer-pool errors")
             } else {
                 self.pool
-                    .get_child_page::<RowPageIndexNode>(
+                    .must_get_child_page::<RowPageIndexNode>(
                         pool_guard,
                         &p_guard,
                         page_id,
                         LatchFallbackMode::Spin,
                     )
                     .await
-                    .expect("row-page-index traversal should not ignore buffer-pool errors")
             };
             stack.push(p_guard.downgrade());
             p_guard = verify!(c_guard);
@@ -1528,8 +1472,12 @@ impl<P: BufferPool> RowPageIndex<P> {
 
         let mut g = self
             .pool
-            .get_page::<RowPageIndexNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
-            .await?;
+            .must_get_page::<RowPageIndexNode>(
+                pool_guard,
+                self.root_page_id,
+                LatchFallbackMode::Spin,
+            )
+            .await;
         loop {
             let step = match g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -1585,8 +1533,8 @@ impl<P: BufferPool> RowPageIndex<P> {
                 SearchStep::Next(page_id) => {
                     g = match self
                         .pool
-                        .get_child_page(pool_guard, &g, page_id, LatchFallbackMode::Spin)
-                        .await?
+                        .must_get_child_page(pool_guard, &g, page_id, LatchFallbackMode::Spin)
+                        .await
                     {
                         Valid(g) => g,
                         Invalid => return Ok(Invalid),
@@ -1615,15 +1563,15 @@ pub(crate) enum RowLocation {
 }
 
 /// A cursor to read all in-mem leaf values.
-pub(crate) struct RowPageIndexMemCursor<'a, P: 'static> {
-    blk_idx: &'a RowPageIndex<P>,
+pub(crate) struct RowPageIndexMemCursor<'a> {
+    blk_idx: &'a RowPageIndex,
     pool_guard: &'a PoolGuard,
     // The parent node of current located
     parent: Option<ParentPosition<PageSharedGuard<RowPageIndexNode>>>,
     child: Option<PageSharedGuard<RowPageIndexNode>>,
 }
 
-impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
+impl RowPageIndexMemCursor<'_> {
     /// Seeks to the in-memory leaf that can serve `row_id`.
     #[inline]
     pub(crate) async fn seek(&mut self, row_id: RowID) -> RuntimeResult<()> {
@@ -1671,8 +1619,12 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
             let child = self
                 .blk_idx
                 .pool
-                .get_page::<RowPageIndexNode>(self.pool_guard, page_id, LatchFallbackMode::Shared)
-                .await?
+                .must_get_page::<RowPageIndexNode>(
+                    self.pool_guard,
+                    page_id,
+                    LatchFallbackMode::Shared,
+                )
+                .await
                 .lock_shared_async()
                 .await
                 // The held parent prevents the indexed child from being
@@ -1703,12 +1655,12 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
         let mut g = self
             .blk_idx
             .pool
-            .get_page::<RowPageIndexNode>(
+            .must_get_page::<RowPageIndexNode>(
                 self.pool_guard,
                 self.blk_idx.root_page_id,
                 LatchFallbackMode::Shared,
             )
-            .await?;
+            .await;
         'SEARCH: loop {
             let step = match g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -1761,13 +1713,13 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
             let c = self
                 .blk_idx
                 .pool
-                .get_child_page::<RowPageIndexNode>(
+                .must_get_child_page::<RowPageIndexNode>(
                     self.pool_guard,
                     &g,
                     page_id,
                     LatchFallbackMode::Spin,
                 )
-                .await?;
+                .await;
             let c = match c {
                 Valid(c) => c,
                 Invalid => return Ok(Invalid),
@@ -1869,7 +1821,7 @@ mod tests {
     use super::*;
     use crate::buffer::frame::BufferFrame;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-    use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, Page, VersionedPageID};
+    use crate::buffer::page::{BufferPage, Page, VersionedPageID};
     use crate::buffer::test_page_id;
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
@@ -1910,7 +1862,7 @@ mod tests {
     }
 
     async fn append_test_row_pages(
-        index: &RowPageIndex<FixedBufferPool>,
+        index: &RowPageIndex,
         pool_guard: &PoolGuard,
         count: usize,
         rows_per_page: u64,
@@ -1958,7 +1910,7 @@ mod tests {
         assert_eq!(NBR_ROW_PAGE_ENTRIES_IN_LEAF, NBR_ENTRIES_IN_BRANCH);
     }
 
-    async fn fill_root_leaf_full<P: BufferPool>(blk_idx: &RowPageIndex<P>, pool_guard: &PoolGuard) {
+    async fn fill_root_leaf_full(blk_idx: &RowPageIndex, pool_guard: &PoolGuard) {
         let mut root = blk_idx
             .pool
             .get_page::<RowPageIndexNode>(
@@ -1990,12 +1942,6 @@ mod tests {
                 inner,
                 fail_page_id: AtomicU64::new(u64::from(fail_page_id)),
             }
-        }
-
-        #[inline]
-        fn set_fail_page_id(&self, fail_page_id: PageID) {
-            self.fail_page_id
-                .store(u64::from(fail_page_id), Ordering::Release);
         }
     }
 
@@ -2902,34 +2848,6 @@ mod tests {
                     .expect("test row-page lookup should succeed"),
                 RowLocation::NotFound
             ));
-        })
-    }
-
-    #[test]
-    fn test_row_page_index_find_row_returns_error_on_root_lookup_failure() {
-        smol::block_on(async {
-            let inner = owned_index_pool(64 * 1024 * 1024);
-            let pool =
-                QuiescentBox::new(FailingInsertPagePool::new(inner.guard(), INVALID_PAGE_ID));
-            let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
-                .await
-                .expect("test row-page-index construction should succeed");
-            pool.set_fail_page_id(blk_idx.root_page_id());
-
-            let err = match blk_idx.find_row(&pool_guard, RowID::new(0)).await {
-                Ok(_location) => panic!("expected lookup error"),
-                Err(err) => err,
-            };
-            assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
-            assert_eq!(
-                err.downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::BufferPageAccess)
-            );
-            assert_eq!(
-                err.downcast_ref::<IoError>().copied().map(IoError::kind),
-                Some(StdIoError::from_raw_os_error(libc::EIO).kind())
-            );
         })
     }
 

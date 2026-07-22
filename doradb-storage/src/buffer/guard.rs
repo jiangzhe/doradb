@@ -526,7 +526,7 @@ impl<T: 'static> FacadePageGuard<T> {
         }
     }
 
-    /// Rolls back an exclusive-version change after a failed page-kind check.
+    /// Rolls back an exclusive-version change after post-acquisition validation fails.
     #[inline]
     pub(crate) fn rollback_exclusive_version_change(self) {
         assert!(
@@ -869,20 +869,20 @@ unsafe impl<T: Sync + 'static> Sync for PageExclusiveGuard<T> {}
 #[inline]
 fn page_ref<T>(bf: &BufferFrame) -> &T {
     debug_assert_page_cast::<T>(bf);
-    // SAFETY: the owning guard keeps the arena allocation alive, typed
-    // foreground access validates the frame's logical page kind before guard
-    // construction, and internal raw-page IO guards only request `Page` while
-    // holding the frame latch according to their access mode.
+    // SAFETY: the owning guard keeps the arena allocation alive and validates
+    // its captured generation. The owning data structure selects `T` and the
+    // matching pool, while internal raw-page IO guards request only `Page`.
+    // Shared or optimistic access follows the guard's latch protocol.
     unsafe { &*(bf.page.cast::<T>()) }
 }
 
 #[inline]
 fn page_mut<T>(bf: &mut BufferFrame) -> &mut T {
     debug_assert_page_cast::<T>(bf);
-    // SAFETY: the owning guard keeps the arena allocation alive, the exclusive
-    // latch guarantees uniqueness for mutable access, typed foreground access
-    // validates the frame's logical page kind before guard construction, and
-    // internal raw-page IO guards only request `Page` under exclusive ownership.
+    // SAFETY: the owning guard keeps the arena allocation alive and validates
+    // its captured generation. The owning data structure selects `T` and the
+    // matching pool, the exclusive latch guarantees unique mutable access, and
+    // internal raw-page IO guards request only `Page` under exclusive ownership.
     unsafe { &mut *(bf.page.cast::<T>()) }
 }
 

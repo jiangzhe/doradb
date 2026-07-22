@@ -9,7 +9,7 @@ use super::disk_tree::{
 };
 use crate::buffer::BufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::error::{DataIntegrityError, InternalError, RuntimeError, RuntimeResult};
+use crate::error::{DataIntegrityError, RuntimeError, RuntimeResult};
 use crate::id::RowID;
 use crate::index::btree::{BTreeKey, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange};
 use crate::index::util::Maskable;
@@ -59,12 +59,11 @@ impl IndexScanLeaf for PageSharedGuard<BTreeNode> {
 
     #[inline]
     fn key_checked(&self, slot_idx: usize) -> RuntimeResult<BTreeKey> {
-        self.node().btree_key_checked(slot_idx).ok_or_else(|| {
-            Report::new(InternalError::IndexKeyMissing)
-                .attach(format!("slot_idx={slot_idx}"))
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=read_disk_tree_scan_key")
-        })
+        // MemIndex leaves are in-memory typed pages; an occupied slot is
+        // published atomically with its key while this shared guard is held.
+        Ok(self.node().btree_key_checked(slot_idx).unwrap_or_else(|| {
+            panic!("MemIndex key missing from occupied slot: slot_idx={slot_idx}")
+        }))
     }
 }
 
@@ -196,7 +195,7 @@ impl IndexScanProjector for NonUniqueMemIndexLookupCandidateProjector {
         slot_idx: usize,
         encoded_key: BTreeKey,
     ) -> RuntimeResult<Option<Self::Output>> {
-        validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx)?;
+        validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx);
         let node = leaf.node();
         let slot = node.slot(slot_idx);
         Ok(Some(IndexLookupCandidate {
@@ -404,18 +403,12 @@ pub(crate) type NonUniqueDiskTreeCandidateStream<'a, 'r> =
 
 /// Validate that an encoded non-unique key contains a trailing row id.
 #[inline]
-pub(crate) fn validate_non_unique_exact_key(
-    encoded_key: &[u8],
-    slot_idx: usize,
-) -> RuntimeResult<()> {
-    if encoded_key.len() < mem::size_of::<RowID>() {
-        return Err(Report::new(InternalError::MemIndexKeyMalformed)
-            .attach(format!(
-                "slot_idx={slot_idx}, key_len={}",
-                encoded_key.len()
-            ))
-            .change_context(RuntimeError::IndexAccess)
-            .attach("operation=validate_non_unique_exact_key"));
-    }
-    Ok(())
+pub(crate) fn validate_non_unique_exact_key(encoded_key: &[u8], slot_idx: usize) {
+    // Non-unique MemIndex keys are formed by appending the row id before the
+    // slot is published, so every exact key must retain that suffix.
+    assert!(
+        encoded_key.len() >= mem::size_of::<RowID>(),
+        "non-unique MemIndex key is missing its row-id suffix: slot_idx={slot_idx}, key_len={}",
+        encoded_key.len()
+    );
 }

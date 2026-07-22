@@ -18,9 +18,10 @@ use crate::catalog::{
     catalog_table_id_from_slot, catalog_table_slot,
 };
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FileKind, MultiDomainResultExt, RuntimeError,
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
     RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
+use crate::file::FileKind;
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
@@ -393,14 +394,7 @@ impl CatalogStorage {
         // Publishing the metadata block advances the durable catalog replay
         // boundary even for metadata-only checkpoints, such as DML-only
         // heartbeat batches.
-        mutable
-            .apply_checkpoint_metadata(next_catalog_replay_start_ts, next_table_id, new_roots)
-            .change_context(RuntimeError::CatalogAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=prepare_catalog_checkpoint, phase=apply_checkpoint_metadata, replay_start_ts={next_catalog_replay_start_ts}, next_table_id={next_table_id}"
-                )
-            })?;
+        mutable.apply_checkpoint_metadata(next_catalog_replay_start_ts, next_table_id, new_roots);
         if catalog_blocks_changed {
             // Rewriting catalog table roots can make arbitrary old catalog
             // blocks unreachable, so rebuild the allocation map from the new
@@ -496,10 +490,7 @@ impl CatalogStorage {
         let reachable = self
             .collect_catalog_reachable_blocks(mutable.root())
             .await?;
-        mutable
-            .rebuild_alloc_map_from_reachable(&reachable)
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=rebuild_catalog_alloc_map, phase=publish_alloc_map")
+        Ok(mutable.rebuild_alloc_map_from_reachable(&reachable))
     }
 
     async fn collect_catalog_reachable_blocks(
@@ -1170,9 +1161,7 @@ fn build_lwc_blocks_from_row_records(
                 builder_end,
                 builder.row_ids().to_vec(),
                 Vec::new(),
-            )
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=build_catalog_lwc_blocks, phase=build_block_shape")?;
+            );
             let buf = builder
                 .build(shape.row_shape_fingerprint())
                 .change_context(RuntimeError::CatalogAccess)
@@ -1215,9 +1204,7 @@ fn build_lwc_blocks_from_row_records(
             builder_end,
             builder.row_ids().to_vec(),
             Vec::new(),
-        )
-        .change_context(RuntimeError::CatalogAccess)
-        .attach("operation=build_catalog_lwc_blocks, phase=build_final_block_shape")?;
+        );
         let buf = builder
             .build(shape.row_shape_fingerprint())
             .change_context(RuntimeError::CatalogAccess)
@@ -1286,7 +1273,9 @@ pub(crate) mod tests {
     use crate::catalog::{
         CatalogCheckpointBatch, CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec,
     };
-    use crate::error::{DataIntegrityError, Result, RuntimeError, RuntimeOrFatalError};
+    use crate::error::{
+        DataIntegrityError, DiscloseResultExt, Result, RuntimeError, RuntimeOrFatalError,
+    };
     use crate::file::BlockKey;
     use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
@@ -1395,10 +1384,11 @@ pub(crate) mod tests {
         next_table_id: TableID,
     ) -> Result<()> {
         let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
-        Ok(storage
+        storage
             .apply_checkpoint_batch(metadata_only_batch(replay_start_ts), next_table_id)
             .await
-            .map(|_| ())?)
+            .map(|_| ())
+            .disclose()
     }
 
     fn checkpoint_batch_with_ops(
@@ -2270,13 +2260,11 @@ pub(crate) mod tests {
 
             let mut mutable =
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
-            mutable
-                .apply_checkpoint_metadata(
-                    active_root_ts_before.saturating_add(1),
-                    engine.catalog().curr_next_table_id(),
-                    roots,
-                )
-                .unwrap();
+            mutable.apply_checkpoint_metadata(
+                active_root_ts_before.saturating_add(1),
+                engine.catalog().curr_next_table_id(),
+                roots,
+            );
             let err = storage
                 .rebuild_catalog_alloc_map(&mut mutable)
                 .await

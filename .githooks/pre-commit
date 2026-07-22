@@ -7,8 +7,21 @@ if [[ -z "${ROOT}" ]]; then
 fi
 cd "${ROOT}"
 
-if [[ "${SKIP_UNSAFE_BASELINE_HOOK:-0}" == "1" ]]; then
-  exit 0
+unstaged_changes="$(git diff --name-status --)"
+untracked_files="$(git ls-files --others --exclude-standard)"
+if [[ -n "${unstaged_changes}" || -n "${untracked_files}" ]]; then
+  echo "[pre-commit] Unstaged files are not allowed. Stage or stash them before committing."
+  if [[ -n "${unstaged_changes}" ]]; then
+    echo "[pre-commit] Tracked unstaged changes:"
+    printf '%s\n' "${unstaged_changes}"
+  fi
+  if [[ -n "${untracked_files}" ]]; then
+    echo "[pre-commit] Untracked files:"
+    while IFS= read -r path; do
+      printf '??\t%s\n' "${path}"
+    done <<< "${untracked_files}"
+  fi
+  exit 1
 fi
 
 tmp_before_fmt="$(mktemp)"
@@ -17,6 +30,7 @@ tmp_fmt_log="$(mktemp)"
 tmp_clippy_log="$(mktemp)"
 tmp_deny_log="$(mktemp)"
 tmp_baseline_log="/tmp/unsafe-baseline-hook.log"
+tmp_error_audit_log="/tmp/public-error-audit-hook.log"
 cleanup() {
   rm -f "${tmp_before_fmt}" "${tmp_after_fmt}" "${tmp_fmt_log}" "${tmp_clippy_log}" "${tmp_deny_log}"
 }
@@ -50,6 +64,21 @@ if ! cargo deny check --disable-fetch >"${tmp_deny_log}" 2>&1; then
   exit 1
 fi
 
+baseline_mismatch=0
+echo "[public-error-audit] Refreshing docs/public-error-audit.csv"
+if ! cargo +nightly -Zscript tools/error_audit.rs --write docs/public-error-audit.csv >"${tmp_error_audit_log}" 2>&1; then
+  echo "[public-error-audit] Failed to run audit script."
+  cat "${tmp_error_audit_log}"
+  exit 1
+fi
+
+if ! git diff --quiet -- docs/public-error-audit.csv; then
+  echo "[public-error-audit] Audit changed. Stage it and commit again:"
+  echo "  git add docs/public-error-audit.csv"
+  git diff -- docs/public-error-audit.csv
+  baseline_mismatch=1
+fi
+
 staged="$(git diff --cached --name-only --diff-filter=ACMR)"
 needs_baseline=0
 while IFS= read -r path; do
@@ -72,21 +101,20 @@ while IFS= read -r path; do
   esac
 done <<< "${staged}"
 
-if [[ "${needs_baseline}" -eq 0 ]]; then
-  exit 0
+if [[ "${SKIP_UNSAFE_BASELINE_HOOK:-0}" != "1" && "${needs_baseline}" -eq 1 ]]; then
+  echo "[unsafe-baseline] Refreshing docs/unsafe-usage-baseline.md"
+  if ! cargo +nightly -Zscript tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md >"${tmp_baseline_log}" 2>&1; then
+    echo "[unsafe-baseline] Failed to run inventory script."
+    cat "${tmp_baseline_log}"
+    exit 1
+  fi
+
+  if ! git diff --quiet -- docs/unsafe-usage-baseline.md; then
+    echo "[unsafe-baseline] Baseline changed. Stage it and commit again:"
+    echo "  git add docs/unsafe-usage-baseline.md"
+    git diff -- docs/unsafe-usage-baseline.md
+    baseline_mismatch=1
+  fi
 fi
 
-echo "[unsafe-baseline] Refreshing docs/unsafe-usage-baseline.md"
-if ! cargo +nightly -Zscript tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md >"${tmp_baseline_log}" 2>&1; then
-  echo "[unsafe-baseline] Failed to run inventory script."
-  cat "${tmp_baseline_log}"
-  exit 1
-fi
-
-if ! git diff --quiet -- docs/unsafe-usage-baseline.md; then
-  echo "[unsafe-baseline] Baseline changed. Stage it and commit again:"
-  echo "  git add docs/unsafe-usage-baseline.md"
-  exit 1
-fi
-
-exit 0
+exit "${baseline_mismatch}"

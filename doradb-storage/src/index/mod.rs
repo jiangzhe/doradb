@@ -14,8 +14,6 @@ mod unique_index;
 pub(crate) mod util;
 
 pub(crate) use block_index::BlockIndex;
-#[cfg(test)]
-pub(crate) use btree::BTreeNode;
 pub(crate) use btree::{BTreeKey, BTreeKeyEncoder, KeyRange};
 #[cfg(test)]
 pub(crate) use column_block_index::{

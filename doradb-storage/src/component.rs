@@ -583,7 +583,7 @@ impl DiskPoolConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{Error, ErrorKind, RuntimeError};
+    use crate::error::{DiscloseError, ErrorKind, RuntimeError};
     use error_stack::Report;
     use parking_lot::Mutex;
     use std::convert::Infallible;
@@ -774,7 +774,7 @@ mod tests {
             let err = smol::block_on(builder.build::<FailingBuildComponent>(Arc::clone(&events)))
                 .unwrap_err();
             assert_eq!(err.current_context(), &RuntimeError::BackgroundSpawn);
-            let err = Error::from(err);
+            let err = err.disclose();
             assert_eq!(err.kind(), ErrorKind::Runtime);
             assert_eq!(
                 err.report().downcast_ref::<RuntimeError>().copied(),

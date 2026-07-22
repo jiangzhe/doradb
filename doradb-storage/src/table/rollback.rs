@@ -1,13 +1,12 @@
 use super::{MemTable, Table, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::CatalogTable;
-use crate::error::{InternalError, RuntimeError, RuntimeResult};
+use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 use crate::index::util::Maskable;
 use crate::index::{IndexCompareExchange, NonUniqueIndex, UniqueIndex};
 use crate::row::ops::SelectKey;
 use crate::trx::undo::{IndexUndo, IndexUndoKind};
-use error_stack::{Report, ResultExt};
 
 /// Rollback adapter for table-specific secondary-index runtimes.
 ///
@@ -90,16 +89,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> RuntimeResult<()> {
         let table = self.mem_table();
-        let index_pool_guard = table
-            .index_pool_guard(guards)
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=rollback_index_entry, table_id={}, row_id={}",
-                    table.table_id(),
-                    entry.row_id
-                )
-            })?;
+        let index_pool_guard = table.index_pool_guard(guards);
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 if merge_old_deleted {
@@ -343,12 +333,8 @@ impl IndexRollback for CatalogTable {
         self.mem
             .require_sec_idx(key.index_no)?
             .unique()
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexKindMismatch)
-                    .attach("operation=rollback_unique_mask_deleted, expected=unique")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=rollback_secondary_index_entry")
-            })?
+            // The undo variant is emitted from this index's immutable kind.
+            .expect("unique rollback undo referenced a non-unique catalog index")
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
             .await
@@ -366,12 +352,8 @@ impl IndexRollback for CatalogTable {
         self.mem
             .require_sec_idx(key.index_no)?
             .unique()
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexKindMismatch)
-                    .attach("operation=rollback_unique_compare_delete, expected=unique")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=rollback_secondary_index_entry")
-            })?
+            // The undo variant is emitted from this index's immutable kind.
+            .expect("unique rollback undo referenced a non-unique catalog index")
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
@@ -389,12 +371,8 @@ impl IndexRollback for CatalogTable {
         self.mem
             .require_sec_idx(key.index_no)?
             .unique()
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexKindMismatch)
-                    .attach("operation=rollback_unique_compare_exchange, expected=unique")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=rollback_secondary_index_entry")
-            })?
+            // The undo variant is emitted from this index's immutable kind.
+            .expect("unique rollback undo referenced a non-unique catalog index")
             .bind(index_pool_guard)
             .compare_exchange(&key.vals, old_row_id, new_row_id, ts)
             .await
@@ -411,12 +389,8 @@ impl IndexRollback for CatalogTable {
         self.mem
             .require_sec_idx(key.index_no)?
             .non_unique()
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexKindMismatch)
-                    .attach("operation=rollback_non_unique_mask_deleted, expected=non_unique")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=rollback_secondary_index_entry")
-            })?
+            // The undo variant is emitted from this index's immutable kind.
+            .expect("non-unique rollback undo referenced a unique catalog index")
             .bind(index_pool_guard)
             .mask_as_deleted(&key.vals, row_id, ts)
             .await
@@ -433,12 +407,8 @@ impl IndexRollback for CatalogTable {
         self.mem
             .require_sec_idx(key.index_no)?
             .non_unique()
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexKindMismatch)
-                    .attach("operation=rollback_non_unique_mask_active, expected=non_unique")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=rollback_secondary_index_entry")
-            })?
+            // The undo variant is emitted from this index's immutable kind.
+            .expect("non-unique rollback undo referenced a unique catalog index")
             .bind(index_pool_guard)
             .mask_as_active(&key.vals, row_id, ts)
             .await
@@ -456,12 +426,8 @@ impl IndexRollback for CatalogTable {
         self.mem
             .require_sec_idx(key.index_no)?
             .non_unique()
-            .ok_or_else(|| {
-                Report::new(InternalError::SecondaryIndexKindMismatch)
-                    .attach("operation=rollback_non_unique_compare_delete, expected=non_unique")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=rollback_secondary_index_entry")
-            })?
+            // The undo variant is emitted from this index's immutable kind.
+            .expect("non-unique rollback undo referenced a unique catalog index")
             .bind(index_pool_guard)
             .compare_delete(&key.vals, row_id, ignore_del_mask, ts)
             .await
@@ -473,7 +439,7 @@ mod tests {
     use crate::buffer::PoolRole;
     use crate::catalog::tests::table4;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{OperationError, Result};
+    use crate::error::{DiscloseError, OperationError, Result};
     use crate::id::RowID;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
@@ -668,7 +634,7 @@ mod tests {
                         false,
                     )
                     .await;
-                    Err(Report::new(OperationError::NotSupported).into())
+                    Err(Report::new(OperationError::NotSupported).disclose())
                 })
                 .await;
             assert_eq!(
@@ -781,7 +747,7 @@ mod tests {
                         false,
                     )
                     .await;
-                    Err(Report::new(OperationError::NotSupported).into())
+                    Err(Report::new(OperationError::NotSupported).disclose())
                 })
                 .await;
             assert_eq!(
