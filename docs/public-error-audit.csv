@@ -35,9 +35,11 @@ doradb-storage/src/session.rs,Session::wait_for_gc_horizon_after,2
 doradb-storage/src/session.rs,Session::wait_for_purge_completion_after,2
 doradb-storage/src/session.rs,wait_for_maintenance_boundary,4
 doradb-storage/src/table/access.rs,LazyRow::val,2
+doradb-storage/src/table/access.rs,UserTableAccessor::delete_known_cold_row,3
+doradb-storage/src/table/access.rs,UserTableAccessor::delete_known_hot_row,3
 doradb-storage/src/table/access.rs,UserTableAccessor::delete_unique_mvcc,11
 doradb-storage/src/table/access.rs,UserTableAccessor::insert_mvcc,2
-doradb-storage/src/table/access.rs,UserTableAccessor::table_update_mvcc,13
+doradb-storage/src/table/access.rs,UserTableAccessor::table_mutate_mvcc,14
 doradb-storage/src/table/access.rs,UserTableAccessor::update_known_cold_row,5
 doradb-storage/src/table/access.rs,UserTableAccessor::update_known_hot_row,5
 doradb-storage/src/table/access.rs,UserTableAccessor::update_unique_mvcc_input,17
@@ -50,8 +52,8 @@ doradb-storage/src/trx/stmt.rs,Statement::table_index_lookup_mvcc,4
 doradb-storage/src/trx/stmt.rs,Statement::table_index_scan_mvcc,5
 doradb-storage/src/trx/stmt.rs,Statement::table_insert_mvcc,5
 doradb-storage/src/trx/stmt.rs,Statement::table_lookup_unique_mvcc,4
+doradb-storage/src/trx/stmt.rs,Statement::table_mutate_mvcc,5
 doradb-storage/src/trx/stmt.rs,Statement::table_scan_mvcc,4
-doradb-storage/src/trx/stmt.rs,Statement::table_update_mvcc,5
 doradb-storage/src/trx/stmt.rs,Statement::table_update_unique_mvcc,6
 doradb-storage/src/trx/stmt.rs,Statement::table_upsert_unique_mvcc,6
 doradb-storage/src/trx/stream_stmt.rs,IndexScanMvccStream::next,2

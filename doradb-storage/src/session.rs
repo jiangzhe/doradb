@@ -497,7 +497,7 @@ impl Session {
 
         // Acquire maintenance admission before entering the freeze workflow. The
         // grouped helper orders TableMetadata(S) before TableData(IS), excluding
-        // metadata-X DDL and data-X full-table updates while remaining compatible
+        // metadata-X DDL and data-X full-table mutations while remaining compatible
         // with ordinary IX DML. Keep the scoped guards through batch publication.
         let lock_manager = session.engine.lock_manager();
         let owner = LockOwner::Session(session.id());
@@ -535,7 +535,7 @@ impl Session {
 
         // Acquire maintenance admission before entering the checkpoint workflow.
         // The grouped helper orders TableMetadata(S) before TableData(IS), excluding
-        // metadata-X DDL and data-X full-table updates while remaining compatible
+        // metadata-X DDL and data-X full-table mutations while remaining compatible
         // with ordinary IX DML. Keep the scoped guards through root publication.
         let lock_manager = session.engine.lock_manager();
         let owner = LockOwner::Session(session.id());

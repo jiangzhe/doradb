@@ -1269,7 +1269,7 @@ mod tests {
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::recovery::{RecoveryResources, RowRecoveryMap, TableReplayBounds};
     use crate::row::RowRead;
-    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{DeleteMvcc, RowMutation, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::serde::Ser;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::assert_freeze_created;
@@ -3454,6 +3454,142 @@ mod tests {
             trx.commit().await.unwrap();
 
             drop(table);
+            drop(session);
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_full_table_mutation_mixed_cold_hot_actions() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let log_file_stem = "recover-full-table-mutation";
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                log_file_stem,
+            ))
+            .await
+            .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    ],
+                )
+                .await
+                .unwrap();
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            for id in 0u32..3 {
+                trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(id), Val::from("cold")])
+                    .await
+                    .unwrap();
+            }
+            trx.commit().await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+
+            let mut trx = session.begin_trx().unwrap();
+            for id in [10u32, 11] {
+                trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(id), Val::from("hot")])
+                    .await
+                    .unwrap();
+            }
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        Ok(match row.val(0)?.as_u32().unwrap() {
+                            0 | 10 => RowMutation::Delete,
+                            1 => RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("cold-updated"),
+                            }]),
+                            11 => RowMutation::Update(vec![UpdateCol {
+                                idx: 1,
+                                val: Val::from("hot-updated"),
+                            }]),
+                            2 => RowMutation::Skip,
+                            _ => unreachable!(),
+                        })
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.delete_count, 2);
+            assert_eq!(outcome.update_count, 2);
+            trx.commit().await.unwrap();
+
+            drop(session);
+            drop(engine);
+
+            let engine =
+                Engine::bootstrap(lightweight_recovery_engine_config(main_dir, log_file_stem))
+                    .await
+                    .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let mut rows = trx
+                .exec(async |stmt| {
+                    let mut rows = Vec::new();
+                    stmt.table_scan_mvcc(table_id, &[0, 1], |row| {
+                        rows.push((
+                            row[0].as_u32().unwrap(),
+                            row[1].as_str().unwrap().to_owned(),
+                        ));
+                        true
+                    })
+                    .await?;
+                    Ok(rows)
+                })
+                .await
+                .unwrap();
+            rows.sort_unstable();
+            assert_eq!(
+                rows,
+                vec![
+                    (1, "cold-updated".to_owned()),
+                    (2, "cold".to_owned()),
+                    (11, "hot-updated".to_owned()),
+                ]
+            );
+            let cold_rows = trx
+                .exec(async |stmt| {
+                    Ok(stmt
+                        .table_index_lookup_mvcc(table_id, 1, &[Val::from("cold")], &[0])
+                        .await?
+                        .unwrap_rows())
+                })
+                .await
+                .unwrap();
+            assert_eq!(cold_rows, vec![vec![Val::from(2u32)]]);
+            for deleted_id in [0u32, 10] {
+                let deleted = trx
+                    .exec(async |stmt| {
+                        stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(deleted_id)], &[0])
+                            .await
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(deleted, SelectMvcc::NotFound);
+            }
+            trx.commit().await.unwrap();
+
             drop(session);
             drop(engine);
         })

@@ -46,7 +46,10 @@ pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LogSyn
 pub use engine::Engine;
 pub use error::{Error, ErrorKind, Result};
 pub use lock::TableLockMode;
-pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+pub use row::ops::{
+    DeleteMvcc, RowMutation, ScanMvcc, SelectKey, SelectMvcc, TableMutationOutcome, UpdateCol,
+    UpdateMvcc,
+};
 pub use session::{
     CatalogRedoMaintenanceOutcome, RedoTruncationBlockerInfo, RedoTruncationOutcome, Session,
 };
