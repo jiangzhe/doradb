@@ -185,11 +185,12 @@ fn prepare_storage_root(storage_root: &Path) -> Result<()> {
 }
 
 async fn open_engine(storage_root: &Path, log_sync: LogSyncMode) -> Result<Engine> {
-    Ok(EngineConfig::default()
-        .storage_root(storage_root)
-        .trx(TrxSysConfig::default().log_sync(log_sync.as_storage()))
-        .build()
-        .await?)
+    Ok(Engine::bootstrap(
+        EngineConfig::default()
+            .storage_root(storage_root)
+            .trx(TrxSysConfig::default().log_sync(log_sync.as_storage())),
+    )
+    .await?)
 }
 
 fn benchmark_table_spec() -> TableSpec {

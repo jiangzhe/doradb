@@ -160,21 +160,22 @@ impl QualifiedPathVisitor<'_> {
         self.generic_type_params.pop();
     }
 
-    fn path_is_associated_type_rooted(&self, path: &SynPath) -> bool {
-        let Some(root) = path
-            .segments
-            .first()
-            .map(|segment| segment.ident.to_string())
-        else {
-            return false;
-        };
-        root == "Self"
+    fn name_is_type_root(&self, name: &str) -> bool {
+        name == "Self"
             || self
                 .generic_type_params
                 .iter()
                 .rev()
-                .any(|params| params.contains(&root))
-            || root.chars().next().is_some_and(char::is_uppercase)
+                .any(|params| params.contains(name))
+            || name.chars().next().is_some_and(char::is_uppercase)
+    }
+
+    fn path_has_short_type_root(&self, path: &SynPath) -> bool {
+        path.segments
+            .iter()
+            .take(2)
+            .map(|segment| segment.ident.to_string())
+            .any(|name| self.name_is_type_root(&name))
     }
 }
 
@@ -211,7 +212,7 @@ impl<'ast> Visit<'ast> for QualifiedPathVisitor<'_> {
 
     fn visit_path(&mut self, path: &'ast SynPath) {
         let separators = path.segments.len().saturating_sub(1);
-        if separators > 1 && !self.path_is_associated_type_rooted(path) {
+        if separators > 1 && !self.path_has_short_type_root(path) {
             let line = span_line(path.span());
             let path_text = path
                 .segments

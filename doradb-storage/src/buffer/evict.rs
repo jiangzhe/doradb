@@ -2162,21 +2162,22 @@ pub(crate) mod tests {
             };
             let config = config.data_swap_file(data_swap_file);
             let engine = smol::block_on(async {
-                EngineConfig::default()
-                    .storage_root(storage_root)
-                    .meta_buffer(TEST_META_POOL_BYTES)
-                    .index_buffer(TEST_INDEX_POOL_BYTES)
-                    .index_max_file_size(TEST_INDEX_MAX_FILE_BYTES)
-                    .data_buffer(config)
-                    .file(
-                        FileSystemConfig::default()
-                            .data_dir(".")
-                            .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES),
-                    )
-                    .trx(TrxSysConfig::default())
-                    .build()
-                    .await
-                    .unwrap()
+                Engine::bootstrap(
+                    EngineConfig::default()
+                        .storage_root(storage_root)
+                        .meta_buffer(TEST_META_POOL_BYTES)
+                        .index_buffer(TEST_INDEX_POOL_BYTES)
+                        .index_max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                        .data_buffer(config)
+                        .file(
+                            FileSystemConfig::default()
+                                .data_dir(".")
+                                .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES),
+                        )
+                        .trx(TrxSysConfig::default()),
+                )
+                .await
+                .unwrap()
             });
             Self { engine }
         }

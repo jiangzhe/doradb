@@ -4038,6 +4038,7 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::engine::Engine;
     use crate::error::{
         DataIntegrityError, DiscloseError, DiscloseResultExt, ErrorKind, FatalError, InternalError,
         IoError, OperationError, Result, RuntimeError,
@@ -8067,20 +8068,21 @@ mod tests {
             use crate::value::ValKind;
 
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path())
-                .index_buffer(16u64 * 1024 * 1024)
-                .index_max_file_size(32u64 * 1024 * 1024)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64u64 * 1024 * 1024)
-                        .max_file_size(128u64 * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_index_evict"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .index_buffer(16u64 * 1024 * 1024)
+                    .index_max_file_size(32u64 * 1024 * 1024)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64u64 * 1024 * 1024)
+                            .max_file_size(128u64 * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_index_evict")),
+            )
+            .await
+            .unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
             let mut index_specs = vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)];
@@ -8207,13 +8209,14 @@ mod tests {
     fn test_secondary_index_scan_mvcc_reads_lwc_projection_without_index_column() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path())
-                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
-                .trx(TrxSysConfig::default().log_file_stem("redo_secidx_lwc_projection"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .trx(TrxSysConfig::default().log_file_stem("redo_secidx_lwc_projection")),
+            )
+            .await
+            .unwrap();
             let table_id = table4(&engine).await;
             let mut session = engine.new_session().unwrap();
 
@@ -8269,13 +8272,14 @@ mod tests {
     fn test_stream_stmt_validation_opt_out_is_stream_local() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path())
-                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
-                .trx(TrxSysConfig::default().log_file_stem("redo_stream_validation_opt_out"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .trx(TrxSysConfig::default().log_file_stem("redo_stream_validation_opt_out")),
+            )
+            .await
+            .unwrap();
             let table_id = table4(&engine).await;
             let mut session = engine.new_session().unwrap();
 
@@ -8332,13 +8336,14 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
-                .trx(TrxSysConfig::default().log_file_stem("redo_secidx1"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .trx(TrxSysConfig::default().log_file_stem("redo_secidx1")),
+            )
+            .await
+            .unwrap();
             let table_id = table4(&engine).await;
             {
                 let mut session = engine.new_session().unwrap();
@@ -8599,13 +8604,14 @@ mod tests {
     fn test_secondary_index_scan_mvcc_uncommitted_delete_candidate_visibility() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path())
-                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
-                .trx(TrxSysConfig::default().log_file_stem("redo_secidx_uncommitted_delete"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .trx(TrxSysConfig::default().log_file_stem("redo_secidx_uncommitted_delete")),
+            )
+            .await
+            .unwrap();
             let table_id = table4(&engine).await;
             let mut session = engine.new_session().unwrap();
 
@@ -8650,13 +8656,14 @@ mod tests {
     fn test_secondary_index_scan_mvcc_delete_committed_after_snapshot() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path())
-                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
-                .trx(TrxSysConfig::default().log_file_stem("redo_secidx_late_delete"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .trx(TrxSysConfig::default().log_file_stem("redo_secidx_late_delete")),
+            )
+            .await
+            .unwrap();
             let table_id = table4(&engine).await;
             let mut session = engine.new_session().unwrap();
 

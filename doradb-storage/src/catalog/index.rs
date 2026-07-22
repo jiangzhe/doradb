@@ -2081,10 +2081,12 @@ mod tests {
 
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir.clone(), "create_index_recover")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir.clone(),
+                "create_index_recover",
+            ))
+            .await
+            .unwrap();
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
@@ -2115,10 +2117,12 @@ mod tests {
             drop(table);
             drop(engine);
 
-            let engine = lightweight_test_engine_config(main_dir, "create_index_recover")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_index_recover",
+            ))
+            .await
+            .unwrap();
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert!(table.metadata().idx.index_spec(1).is_some());
@@ -2143,10 +2147,10 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
             let log_stem = "drop-index-recover";
-            let engine = lightweight_test_engine_config(main_dir.clone(), log_stem)
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                Engine::bootstrap(lightweight_test_engine_config(main_dir.clone(), log_stem))
+                    .await
+                    .unwrap();
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
@@ -2188,8 +2192,7 @@ mod tests {
             drop(table);
             drop(engine);
 
-            let engine = lightweight_test_engine_config(main_dir, log_stem)
-                .build()
+            let engine = Engine::bootstrap(lightweight_test_engine_config(main_dir, log_stem))
                 .await
                 .unwrap();
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -2339,10 +2342,12 @@ mod tests {
     }
 
     async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
-        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
-            .build()
-            .await
-            .unwrap()
+        Engine::bootstrap(lightweight_test_engine_config(
+            temp_dir.path().to_path_buf(),
+            log_file_stem,
+        ))
+        .await
+        .unwrap()
     }
 
     fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {

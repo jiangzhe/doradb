@@ -1,6 +1,6 @@
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, EngineConfig, IndexAttributes, IndexKey, IndexSpec, SelectKey,
-    TableSpec, UpdateCol, Val, ValKind,
+    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
+    SelectKey, TableSpec, UpdateCol, Val, ValKind,
 };
 use futures::executor;
 use std::error::Error;
@@ -20,10 +20,7 @@ fn main() {
 async fn run() -> ExampleResult<()> {
     // Build an engine using a temporary storage root for this example run.
     let temp_dir = TempDir::new()?;
-    let engine = EngineConfig::default()
-        .storage_root(temp_dir.path())
-        .build()
-        .await?;
+    let engine = Engine::bootstrap(EngineConfig::default().storage_root(temp_dir.path())).await?;
     let mut session = engine.new_session()?;
 
     // Create a table with a unique id index and a secondary name index.

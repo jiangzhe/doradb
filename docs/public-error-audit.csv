@@ -6,7 +6,7 @@ doradb-storage/src/catalog/table.rs,drop_table_for_session,12
 doradb-storage/src/engine.rs,Engine::new_session,1
 doradb-storage/src/engine.rs,Engine::shutdown,1
 doradb-storage/src/engine.rs,Engine::try_shutdown,1
-doradb-storage/src/engine.rs,EngineConfig::build_inner,16
+doradb-storage/src/engine.rs,bootstrap_inner,20
 doradb-storage/src/error.rs,OperationOrRuntimeError::disclose,2
 doradb-storage/src/error.rs,RuntimeOrFatalError::disclose,2
 doradb-storage/src/error.rs,SharedFatalError::disclose,1

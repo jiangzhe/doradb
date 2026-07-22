@@ -12,13 +12,16 @@ use crate::component::{
     RegistryBuilder,
 };
 use crate::conf::EngineConfig;
-use crate::error::{DiscloseResultExt, LifecycleError, LifecycleResult, Result};
+use crate::error::{
+    ConfigError, DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, Result,
+};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
 use crate::lock::LockManager;
 use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
+use crate::root::{StorageRootLease, StorageRootLeaseAttempt};
 use crate::session::{Session, SessionRegistry};
 use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers};
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
@@ -279,6 +282,23 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Bootstrap the storage engine and all registered components.
+    #[inline]
+    pub async fn bootstrap(config: EngineConfig) -> Result<Self> {
+        obs::info!("event=engine_lifecycle component=engine action=build_start result=ok");
+        bootstrap_inner(config)
+            .await
+            .inspect(|_| {
+                obs::info!("event=engine_lifecycle component=engine action=build_finish result=ok");
+            })
+            .inspect_err(|err| {
+                obs::error!(
+                    "event=engine_lifecycle component=engine action=build_finish result=error error={}",
+                    err
+                );
+            })
+    }
+
     /// Returns the shared engine runtime state.
     #[inline]
     pub(crate) fn inner(&self) -> &Arc<EngineInner> {
@@ -754,133 +774,149 @@ impl EngineInner {
     }
 }
 
-impl EngineConfig {
-    /// Build the storage engine and all registered components.
-    #[inline]
-    pub async fn build(self) -> Result<Engine> {
-        obs::info!("event=engine_lifecycle component=engine action=build_start result=ok");
-        self.build_inner()
-            .await
-            .inspect(|_| {
-                obs::info!("event=engine_lifecycle component=engine action=build_finish result=ok");
-            })
-            .inspect_err(|err| {
-                obs::error!(
-                    "event=engine_lifecycle component=engine action=build_finish result=error error={}",
-                    err
-                );
-            })
-    }
-
-    #[inline]
-    async fn build_inner(self) -> Result<Engine> {
-        let resolved = self.resolve_storage_paths().disclose()?;
-        let marker_was_present = resolved.validate_marker_if_present().disclose()?;
-        // Marker preflight and the post-build check below do not reserve the
-        // storage root. Another process can open or mutate the same files
-        // throughout component construction. Until
-        // `docs/backlogs/000162-single-process-storage-bootstrap-lock.md` is
-        // implemented, engine startup assumes one live owner per storage root.
-        // Startup prefers a small, durable-safety-focused preflight over trying
-        // to exhaust every possible path conflict up front. It is acceptable for
-        // later setup steps to fail, but those failures must not clobber durable
-        // files or persist `storage-layout.toml` before the engine is fully built.
-        resolved.ensure_directories().disclose()?;
-
-        let file = self.file.data_dir(resolved.data_dir_path());
-        let readonly_buffer_size = file.readonly_buffer_size;
-        let file = file.validate().disclose()?;
-        let trx_cfg = self.trx.log_dir(resolved.log_dir_path());
-        let catalog_cfg = CatalogConfig::new(trx_cfg.recovery_disable_dml_validation);
-        let mut builder = RegistryBuilder::new();
-        // Components are registered in one fixed dependency order. Reverse
-        // registration order then defines both explicit shutdown order and the
-        // final owner drop order.
-        builder
-            .build::<EnginePoisoner>(())
-            .await
-            .unwrap_or_else(|never| match never {});
-        builder.build::<FileSystem>(file).await.disclose()?;
-        builder
-            .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
-            .await
-            .disclose()?;
-        builder
-            .build::<MetaPool>(MetaPoolConfig::new(self.meta_buffer.as_u64() as usize))
-            .await
-            .disclose()?;
-        builder
-            .build::<IndexPool>(IndexPoolConfig::new(
-                self.index_buffer.as_u64() as usize,
-                resolved.index_swap_file_path(),
-                self.index_max_file_size.as_u64() as usize,
-            ))
-            .await
-            .disclose()?;
-        builder
-            .build::<MemPool>(
-                self.data_buffer
-                    .role(PoolRole::Mem)
-                    .data_swap_file(resolved.data_swap_file_path()),
-            )
-            .await
-            .disclose()?;
-        builder.build::<FileSystemWorkers>(()).await.disclose()?;
-        builder
-            .build::<SharedPoolEvictorWorkers>(())
-            .await
-            .disclose()?;
-        builder
-            .build::<LockManager>(())
-            .await
-            .unwrap_or_else(|never| match never {});
-        // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
-        // guards for row/index/readonly access. Register catalog after the pools it
-        // can pin so reverse shutdown/drop order releases table guards before pool
-        // owners are torn down.
-        builder.build::<Catalog>(catalog_cfg).await.disclose()?;
-        builder.build::<TransactionSystem>(trx_cfg).await?;
-        builder
-            .build::<TransactionSystemWorkers>(())
-            .await
-            .disclose()?;
-
-        if marker_was_present {
-            if !resolved.validate_marker_if_present().disclose()? {
-                resolved.persist_marker().disclose()?;
-            }
-        } else {
-            resolved.persist_marker().disclose()?;
+#[inline]
+async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
+    let resolved = config
+        .resolve_storage_paths()
+        .disclose()?
+        .prepare_storage_root()
+        .disclose()?;
+    let lock_path = resolved.lock_path();
+    let lease = match StorageRootLease::try_acquire(&resolved).disclose()? {
+        StorageRootLeaseAttempt::Acquired(lease) => lease,
+        StorageRootLeaseAttempt::Contended {
+            diagnostic,
+            diagnostic_status,
+        } => {
+            let report = Report::new(LifecycleError::StorageRootInUse).attach(format!(
+                    "operation=acquire_storage_root, storage_root={}, lock_path={}, owner_diagnostic={diagnostic_status}",
+                    resolved.storage_root_path().display(),
+                    lock_path.display()
+                ));
+            let report = if let Some(diagnostic) = diagnostic {
+                report.attach(format!(
+                    "owner_pid={}, owner_acquired_unix_ms={}",
+                    diagnostic.pid, diagnostic.acquired_unix_ms
+                ))
+            } else {
+                report
+            };
+            return Err(report.disclose());
         }
-        let registry = builder.finish();
-        let poisoner = registry.dependency::<EnginePoisoner>();
-        let catalog = registry.dependency::<Catalog>();
-        let trx_sys = registry.dependency::<TransactionSystem>();
-        let meta_pool = registry.dependency::<MetaPool>();
-        let index_pool = registry.dependency::<IndexPool>();
-        let mem_pool = registry.dependency::<MemPool>();
-        let table_fs = registry.dependency::<FileSystem>();
-        let disk_pool = registry.dependency::<DiskPool>();
-        let lock_manager = registry.dependency::<LockManager>();
-        let engine_inner = EngineInner {
-            poisoner,
-            catalog,
-            trx_sys,
-            meta_pool,
-            index_pool,
-            mem_pool,
-            table_fs,
-            disk_pool,
-            lock_manager,
-            session_registry: SessionRegistry::new(),
-            next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
-            lifecycle: EngineLifecycle::new(),
-        };
-        Ok(Engine {
-            inner: Arc::new(engine_inner),
-            components: Some(registry),
-        })
+    };
+    let mut builder = RegistryBuilder::new();
+    // Root ownership is registered first so every failure and reverse
+    // shutdown path releases it only after all subordinate components stop.
+    builder
+        .build::<StorageRootLease>(lease)
+        .await
+        .unwrap_or_else(|never| match never {});
+    resolved.cleanup_stale_marker_temps().disclose()?;
+    let marker_was_present = resolved.validate_marker_if_present().disclose()?;
+    // Startup prefers a small, durable-safety-focused preflight over trying
+    // to exhaust every possible path conflict up front. It is acceptable for
+    // later setup steps to fail, but those failures must not clobber durable
+    // files or persist `storage-layout.toml` before the engine is fully built.
+    resolved.ensure_directories().disclose()?;
+
+    let file = config.file.data_dir(resolved.data_dir_path());
+    let readonly_buffer_size = file.readonly_buffer_size;
+    let file = file.validate().disclose()?;
+    let trx_cfg = config.trx.log_dir(resolved.log_dir_path());
+    let catalog_cfg = CatalogConfig::new(trx_cfg.recovery_disable_dml_validation);
+    // Components are registered in one fixed dependency order. Reverse
+    // registration order then defines both explicit shutdown order and the
+    // final owner drop order.
+    builder
+        .build::<EnginePoisoner>(())
+        .await
+        .unwrap_or_else(|never| match never {});
+    builder.build::<FileSystem>(file).await.disclose()?;
+    builder
+        .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
+        .await
+        .disclose()?;
+    builder
+        .build::<MetaPool>(MetaPoolConfig::new(config.meta_buffer.as_u64() as usize))
+        .await
+        .disclose()?;
+    builder
+        .build::<IndexPool>(IndexPoolConfig::new(
+            config.index_buffer.as_u64() as usize,
+            resolved.index_swap_file_path(),
+            config.index_max_file_size.as_u64() as usize,
+        ))
+        .await
+        .disclose()?;
+    builder
+        .build::<MemPool>(
+            config
+                .data_buffer
+                .role(PoolRole::Mem)
+                .data_swap_file(resolved.data_swap_file_path()),
+        )
+        .await
+        .disclose()?;
+    builder.build::<FileSystemWorkers>(()).await.disclose()?;
+    builder
+        .build::<SharedPoolEvictorWorkers>(())
+        .await
+        .disclose()?;
+    builder
+        .build::<LockManager>(())
+        .await
+        .unwrap_or_else(|never| match never {});
+    // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
+    // guards for row/index/readonly access. Register catalog after the pools it
+    // can pin so reverse shutdown/drop order releases table guards before pool
+    // owners are torn down.
+    builder.build::<Catalog>(catalog_cfg).await.disclose()?;
+    builder.build::<TransactionSystem>(trx_cfg).await?;
+    builder
+        .build::<TransactionSystemWorkers>(())
+        .await
+        .disclose()?;
+
+    if marker_was_present {
+        if !resolved.validate_marker_if_present().disclose()? {
+            return Err(Report::new(ConfigError::StorageLayoutMismatch)
+                    .attach(format!(
+                        "operation=revalidate_storage_layout_marker, phase=post_component_build, marker_path={}, reason=initially_present_marker_disappeared",
+                        resolved.marker_path().display()
+                    ))
+                    .disclose());
+        }
+    } else {
+        resolved.persist_marker().disclose()?;
     }
+    let registry = builder.finish();
+    let poisoner = registry.dependency::<EnginePoisoner>();
+    let catalog = registry.dependency::<Catalog>();
+    let trx_sys = registry.dependency::<TransactionSystem>();
+    let meta_pool = registry.dependency::<MetaPool>();
+    let index_pool = registry.dependency::<IndexPool>();
+    let mem_pool = registry.dependency::<MemPool>();
+    let table_fs = registry.dependency::<FileSystem>();
+    let disk_pool = registry.dependency::<DiskPool>();
+    let lock_manager = registry.dependency::<LockManager>();
+    let engine_inner = EngineInner {
+        poisoner,
+        catalog,
+        trx_sys,
+        meta_pool,
+        index_pool,
+        mem_pool,
+        table_fs,
+        disk_pool,
+        lock_manager,
+        session_registry: SessionRegistry::new(),
+        next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
+        lifecycle: EngineLifecycle::new(),
+    };
+    Ok(Engine {
+        inner: Arc::new(engine_inner),
+        components: Some(registry),
+    })
 }
 
 #[cfg(test)]
@@ -888,7 +924,6 @@ mod tests {
     use super::*;
     use crate::buffer::test_io_backend_stats_handle_identity as pool_stats_handle_identity;
     use crate::catalog::tests::table1;
-    use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
         ConfigError, DiscloseError, Error, ErrorKind, FatalError, LifecycleError, OperationError,
@@ -902,12 +937,14 @@ mod tests {
     };
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
+    use crate::root::STORAGE_LAYOUT_FILE_NAME;
     use crate::session::tests::{SessionTestExt, session_registry_len};
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
     use crate::trx::tests::add_pseudo_redo_log_entry;
     use smol::Timer;
     use std::fs;
     use std::io::Error as StdIoError;
+    use std::os::unix::fs::symlink;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
@@ -1018,7 +1055,7 @@ mod tests {
                 let _ = event_tx.send(event);
             });
 
-            let err = match smol::block_on(test_engine_config_for(root.path()).build()) {
+            let err = match smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))) {
                 Ok(_) => panic!("injected worker spawn must fail engine startup"),
                 Err(err) => err,
             };
@@ -1072,7 +1109,7 @@ mod tests {
             let _ = event_tx.send(event);
         });
 
-        let err = match smol::block_on(test_engine_config_for(root.path()).build()) {
+        let err = match smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))) {
             Ok(_) => panic!("initial redo-header write failure must fail engine startup"),
             Err(err) => err,
         };
@@ -1127,7 +1164,7 @@ mod tests {
         let config =
             test_engine_config_for(root.path()).trx(TrxSysConfig::default().purge_threads(3));
 
-        let err = match smol::block_on(config.build()) {
+        let err = match smol::block_on(Engine::bootstrap(config)) {
             Ok(_) => panic!("second purge-executor spawn failure must fail engine startup"),
             Err(err) => err,
         };
@@ -1178,7 +1215,7 @@ mod tests {
             }
         });
 
-        let err = match smol::block_on(test_engine_config_for(root.path()).build()) {
+        let err = match smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))) {
             Ok(_) => panic!("injected purge dispatcher spawn must fail engine startup"),
             Err(err) => err,
         };
@@ -1255,16 +1292,16 @@ mod tests {
     fn test_catalog_checkpoint_scan_io_depth_comes_from_trx_config() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path())
-                .trx(
+            let engine = Engine::bootstrap(
+                test_engine_config_for(root.path()).trx(
                     TrxSysConfig::default()
                         .log_write_io_depth(2)
                         .recovery_io_depth(3)
                         .catalog_checkpoint_scan_io_depth(4),
-                )
-                .build()
-                .await
-                .unwrap();
+                ),
+            )
+            .await
+            .unwrap();
 
             let scan_cfg = engine
                 .inner()
@@ -1279,7 +1316,9 @@ mod tests {
     fn test_session_ids_are_monotonic_across_engine_handles() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let engine_ref = engine.new_ref().unwrap();
 
             let session1 = engine.new_session().unwrap();
@@ -1296,7 +1335,9 @@ mod tests {
     fn test_engine_lock_manager_is_shared_across_runtime_handles() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let engine_ref = engine.new_ref().unwrap();
             let resource = LockResource::TableMetadata(TableID::new(10));
             let owner = LockOwner::Session(SessionID::new(10));
@@ -1330,7 +1371,9 @@ mod tests {
     fn test_session_drop_releases_session_owned_locks() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let session = engine.new_session().unwrap();
             let resource = LockResource::TableData(TableID::new(91_200));
 
@@ -1361,7 +1404,9 @@ mod tests {
     fn test_session_drop_releases_session_owned_waiters() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let resource = LockResource::TableMetadata(TableID::new(91_202));
             let blocking_owner = LockOwner::Session(SessionID::new(91_203));
             assert!(
@@ -1407,21 +1452,22 @@ mod tests {
     fn test_engine_shared_storage_runtime_reuses_one_backend_stats_handle() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path())
-                .file(
-                    FileSystemConfig::default()
-                        .io_depth(7)
-                        .readonly_buffer_size(TEST_POOL_BYTES),
-                )
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(TEST_POOL_BYTES)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                test_engine_config_for(root.path())
+                    .file(
+                        FileSystemConfig::default()
+                            .io_depth(7)
+                            .readonly_buffer_size(TEST_POOL_BYTES),
+                    )
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(TEST_POOL_BYTES)
+                            .max_file_size(128usize * 1024 * 1024),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let table_stats = fs_stats_handle_identity(&engine.inner().table_fs);
             let mem_stats = pool_stats_handle_identity(&engine.inner().mem_pool);
@@ -1436,21 +1482,22 @@ mod tests {
     fn test_engine_shared_storage_io_depth_comes_from_file_system_config() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path())
-                .file(
-                    FileSystemConfig::default()
-                        .io_depth(7)
-                        .readonly_buffer_size(TEST_POOL_BYTES),
-                )
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(TEST_POOL_BYTES)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                test_engine_config_for(root.path())
+                    .file(
+                        FileSystemConfig::default()
+                            .io_depth(7)
+                            .readonly_buffer_size(TEST_POOL_BYTES),
+                    )
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(TEST_POOL_BYTES)
+                            .max_file_size(128usize * 1024 * 1024),
+                    ),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(engine.inner().table_fs.configured_io_depth(), 7);
             assert_eq!(
@@ -1468,20 +1515,22 @@ mod tests {
     fn test_storage_layout_marker_allows_data_swap_change() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             drop(engine);
 
-            let engine = test_engine_config_for(root.path())
-                .data_buffer(
+            let engine = Engine::bootstrap(
+                test_engine_config_for(root.path()).data_buffer(
                     EvictableBufferPoolConfig::default()
                         .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024)
                         .data_swap_file("alt-data.swp"),
-                )
-                .build()
-                .await
-                .unwrap();
+                ),
+            )
+            .await
+            .unwrap();
             drop(engine);
         });
     }
@@ -1490,14 +1539,16 @@ mod tests {
     fn test_storage_layout_marker_allows_index_swap_change() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            drop(engine);
-
-            let engine = test_engine_config_for(root.path())
-                .index_swap_file("alt-index.swp")
-                .build()
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
                 .await
                 .unwrap();
+            drop(engine);
+
+            let engine = Engine::bootstrap(
+                test_engine_config_for(root.path()).index_swap_file("alt-index.swp"),
+            )
+            .await
+            .unwrap();
             drop(engine);
         });
     }
@@ -1506,7 +1557,9 @@ mod tests {
     fn test_engine_startup_creates_default_swap_files() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             drop(engine);
 
             assert!(root.path().join("data.swp").exists());
@@ -1518,13 +1571,16 @@ mod tests {
     fn test_storage_layout_marker_rejects_data_dir_change() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             drop(engine);
 
-            let err = match test_engine_config_for(root.path())
-                .file(FileSystemConfig::default().data_dir("data"))
-                .build()
-                .await
+            let err = match Engine::bootstrap(
+                test_engine_config_for(root.path())
+                    .file(FileSystemConfig::default().data_dir("data")),
+            )
+            .await
             {
                 Ok(_) => panic!("expected storage layout mismatch"),
                 Err(err) => err,
@@ -1541,16 +1597,19 @@ mod tests {
     fn test_storage_layout_mismatch_does_not_create_new_directories() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             drop(engine);
 
             let new_data_dir = root.path().join("other-data");
             assert!(!new_data_dir.exists());
 
-            let err = match test_engine_config_for(root.path())
-                .file(FileSystemConfig::default().data_dir("other-data"))
-                .build()
-                .await
+            let err = match Engine::bootstrap(
+                test_engine_config_for(root.path())
+                    .file(FileSystemConfig::default().data_dir("other-data")),
+            )
+            .await
             {
                 Ok(_) => panic!("expected storage layout mismatch"),
                 Err(err) => err,
@@ -1571,12 +1630,58 @@ mod tests {
             let root_a = parent.path().join("root-a");
             let root_b = parent.path().join("root-b");
 
-            let engine = test_engine_config_for(&root_a).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(&root_a))
+                .await
+                .unwrap();
             drop(engine);
 
             fs::rename(&root_a, &root_b).unwrap();
 
-            let engine = test_engine_config_for(&root_b).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(&root_b))
+                .await
+                .unwrap();
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_active_engine_excludes_aliases_and_shutdown_releases_root() {
+        smol::block_on(async {
+            let parent = TempDir::new().unwrap();
+            let root = parent.path().join("storage");
+            let engine = Engine::bootstrap(test_engine_config_for(&root))
+                .await
+                .unwrap();
+            let alias = parent.path().join("storage-alias");
+            symlink(&root, &alias).unwrap();
+            let alternate_data = root.join("alternate-data");
+
+            let err = match Engine::bootstrap(
+                test_engine_config_for(&alias).file(
+                    FileSystemConfig::default()
+                        .data_dir("alternate-data")
+                        .readonly_buffer_size(TEST_POOL_BYTES),
+                ),
+            )
+            .await
+            {
+                Ok(_) => panic!("active canonical storage root must reject a second engine"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::StorageRootInUse)
+            );
+            let output = format!("{err:?}");
+            assert!(output.contains("owner_pid="), "{output}");
+            assert!(!alternate_data.exists());
+
+            engine.shutdown().unwrap();
+            let replacement = Engine::bootstrap(test_engine_config_for(&root))
+                .await
+                .unwrap();
+            drop(replacement);
             drop(engine);
         });
     }
@@ -1587,20 +1692,21 @@ mod tests {
             let root = TempDir::new().unwrap();
             let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
 
-            let err = match EngineConfig::default()
-                .storage_root(root.path())
-                .meta_buffer(TEST_POOL_BYTES)
-                .index_buffer(TEST_POOL_BYTES)
-                .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(1024usize * 1024)
-                        .max_file_size(2usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
+            let err = match Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(root.path())
+                    .meta_buffer(TEST_POOL_BYTES)
+                    .index_buffer(TEST_POOL_BYTES)
+                    .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(1024usize * 1024)
+                            .max_file_size(2usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default()),
+            )
+            .await
             {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
@@ -1619,15 +1725,15 @@ mod tests {
             );
             assert!(!marker_path.exists());
 
-            let engine = test_engine_config_for(root.path())
-                .file(
+            let engine = Engine::bootstrap(
+                test_engine_config_for(root.path()).file(
                     FileSystemConfig::default()
                         .data_dir("data")
                         .readonly_buffer_size(TEST_POOL_BYTES),
-                )
-                .build()
-                .await
-                .unwrap();
+                ),
+            )
+            .await
+            .unwrap();
             drop(engine);
             assert!(marker_path.exists());
         });
@@ -1638,10 +1744,11 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
-            let err = match test_engine_config_for(root.path())
-                .file(FileSystemConfig::default().readonly_buffer_size(1usize))
-                .build()
-                .await
+            let err = match Engine::bootstrap(
+                test_engine_config_for(root.path())
+                    .file(FileSystemConfig::default().readonly_buffer_size(1usize)),
+            )
+            .await
             {
                 Ok(_) => panic!("undersized readonly buffer pool should fail"),
                 Err(err) => err,
@@ -1669,16 +1776,16 @@ mod tests {
             let root = TempDir::new().unwrap();
             let marker_path = root.path().join(STORAGE_LAYOUT_FILE_NAME);
 
-            let err = match test_engine_config_for(root.path())
-                .data_buffer(
+            let err = match Engine::bootstrap(
+                test_engine_config_for(root.path()).data_buffer(
                     EvictableBufferPoolConfig::default()
                         .role(PoolRole::Mem)
                         .max_mem_size(TEST_POOL_BYTES)
                         .max_file_size(128usize * 1024 * 1024)
                         .data_swap_file("catalog.mtb/data.swp"),
-                )
-                .build()
-                .await
+                ),
+            )
+            .await
             {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
@@ -1696,7 +1803,9 @@ mod tests {
     fn test_engine_shutdown_is_idempotent_and_rejects_new_work() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
 
             engine.shutdown().unwrap();
             engine.shutdown().unwrap();
@@ -1719,7 +1828,9 @@ mod tests {
     fn test_engine_ref_rejected_once_shutdown_begins() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let engine_ref = engine.new_ref().unwrap();
 
             let err = match engine.try_shutdown() {
@@ -1754,7 +1865,9 @@ mod tests {
     fn test_engine_shutdown_ignores_live_idle_session_handle() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
@@ -1791,7 +1904,9 @@ mod tests {
     fn test_engine_shutdown_busy_keeps_pinned_idle_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let session_handle = engine.new_session().unwrap();
             let session = session_handle.pin().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -1818,7 +1933,9 @@ mod tests {
     fn test_engine_shutdown_busy_until_active_transaction_finishes() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
 
@@ -1843,7 +1960,9 @@ mod tests {
     fn test_engine_shutdown_rejects_non_terminal_transaction_work() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
@@ -1875,7 +1994,9 @@ mod tests {
     fn test_transaction_handle_does_not_retain_runtime_ref() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             assert_eq!(engine.inner().lifecycle.runtime_refs(), 0);
 
@@ -1894,7 +2015,8 @@ mod tests {
     #[test]
     fn test_engine_shutdown_waits_for_engine_ref_to_drop() {
         let root = TempDir::new().unwrap();
-        let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let engine_ref = engine.new_ref().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
 
@@ -1925,7 +2047,8 @@ mod tests {
     #[test]
     fn test_engine_shutdown_waits_for_pinned_idle_session() {
         let root = TempDir::new().unwrap();
-        let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let session_handle = engine.new_session().unwrap();
         let session = session_handle.pin().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
@@ -1960,7 +2083,8 @@ mod tests {
     #[test]
     fn test_engine_shutdown_wakes_maintenance_progress_wait() {
         let root = TempDir::new().unwrap();
-        let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let session = engine.new_session().unwrap();
         let (started_tx, started_rx) = mpsc::channel();
 
@@ -1983,7 +2107,8 @@ mod tests {
     #[test]
     fn test_engine_shutdown_waits_for_active_transaction_to_finish() {
         let root = TempDir::new().unwrap();
-        let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let mut session = engine.new_session().unwrap();
         let trx = session.begin_trx().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2016,7 +2141,8 @@ mod tests {
     #[test]
     fn test_engine_shutdown_waits_for_checked_out_abandoned_transaction_to_return() {
         let root = TempDir::new().unwrap();
-        let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
+        let engine =
+            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let checkout = trx.checkout().unwrap();
@@ -2053,7 +2179,9 @@ mod tests {
     fn test_session_close_rejects_active_transaction_then_retries_after_rollback() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
 
@@ -2078,7 +2206,9 @@ mod tests {
     fn test_session_in_trx_returns_error_after_session_close() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
 
             assert!(!session.in_trx().unwrap());
@@ -2098,7 +2228,9 @@ mod tests {
     fn test_session_in_trx_returns_error_after_engine_shutdown() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let session = engine.new_session().unwrap();
 
             assert!(!session.in_trx().unwrap());
@@ -2113,7 +2245,9 @@ mod tests {
     fn test_dropped_active_session_is_removed_after_transaction_terminal() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -2130,7 +2264,9 @@ mod tests {
     fn test_dropped_transaction_handle_cleanup_releases_locks_and_reuses_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
@@ -2158,7 +2294,9 @@ mod tests {
     fn test_checked_out_abandoned_cleanup_runs_after_checkout_return() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
@@ -2191,7 +2329,9 @@ mod tests {
     fn test_dropped_session_live_transaction_can_commit() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             add_pseudo_redo_log_entry(&mut trx).await;
@@ -2210,7 +2350,9 @@ mod tests {
     fn test_dropping_session_then_transaction_removes_abandoned_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -2231,7 +2373,9 @@ mod tests {
     fn test_admitted_operation_token_releases_before_shutdown_completes() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let admission = engine.inner().acquire_admission().unwrap();
             let (started_tx, started_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
@@ -2264,7 +2408,9 @@ mod tests {
     fn test_same_session_rejects_overlapping_transactions() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
@@ -2287,7 +2433,9 @@ mod tests {
     fn test_same_session_reuse_after_commit() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -2305,7 +2453,9 @@ mod tests {
     fn test_same_session_reuse_after_rollback() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
@@ -2321,7 +2471,9 @@ mod tests {
     fn test_stale_transaction_commit_does_not_update_session_state() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
@@ -2348,7 +2500,9 @@ mod tests {
     fn test_same_session_reuse_after_readonly_commit() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
@@ -2365,7 +2519,9 @@ mod tests {
     fn test_distinct_sessions_can_hold_overlapping_transactions() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let mut session1 = engine.new_session().unwrap();
             let mut session2 = engine.new_session().unwrap();
 
@@ -2384,7 +2540,9 @@ mod tests {
     fn test_drop_engine_without_explicit_shutdown_succeeds_without_extra_refs() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
 
             let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
             assert!(res.is_ok());
@@ -2395,7 +2553,9 @@ mod tests {
     fn test_drop_engine_panics_when_extra_refs_exist() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let leaked_ref = engine.new_ref().unwrap();
 
             let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
@@ -2409,7 +2569,9 @@ mod tests {
     fn test_shutdown_race_with_owner_ref_creation() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
             let barrier = Arc::new(Barrier::new(3));
             let engine = &engine;
 
@@ -2471,16 +2633,17 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let log_dir = temp_dir.path().join("log");
             fs::create_dir_all(&log_dir).unwrap();
-            let engine = test_engine_config_for(temp_dir.path())
-                .file(
-                    FileSystemConfig::default()
-                        .data_dir("data")
-                        .readonly_buffer_size(TEST_POOL_BYTES),
-                )
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                test_engine_config_for(temp_dir.path())
+                    .file(
+                        FileSystemConfig::default()
+                            .data_dir("data")
+                            .readonly_buffer_size(TEST_POOL_BYTES),
+                    )
+                    .trx(TrxSysConfig::default()),
+            )
+            .await
+            .unwrap();
 
             let mut config = TrxSysConfig::default()
                 .log_dir(&log_dir)

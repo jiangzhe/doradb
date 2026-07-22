@@ -25,6 +25,7 @@ mod poison;
 mod ptr;
 mod quiescent;
 mod recovery;
+mod root;
 mod row;
 mod runtime;
 mod serde;

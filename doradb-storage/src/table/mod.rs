@@ -1666,32 +1666,35 @@ pub(crate) mod tests {
         max_mem_size: u64,
         log_file_stem: &str,
     ) -> Engine {
-        EngineConfig::default()
-            .storage_root(temp_dir.path().to_path_buf())
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .max_mem_size(max_mem_size)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .trx(TrxSysConfig::default().log_file_stem(log_file_stem))
-            .file(
-                FileSystemConfig::default()
-                    .io_depth(16)
-                    .readonly_buffer_size(128 * 1024 * 1024)
-                    .data_dir("."),
-            )
-            .build()
-            .await
-            .unwrap()
+        Engine::bootstrap(
+            EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(max_mem_size)
+                        .max_file_size(128u64 * 1024 * 1024),
+                )
+                .trx(TrxSysConfig::default().log_file_stem(log_file_stem))
+                .file(
+                    FileSystemConfig::default()
+                        .io_depth(16)
+                        .readonly_buffer_size(128 * 1024 * 1024)
+                        .data_dir("."),
+                ),
+        )
+        .await
+        .unwrap()
     }
 
     #[inline]
     pub(crate) async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
-        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
-            .build()
-            .await
-            .unwrap()
+        Engine::bootstrap(lightweight_test_engine_config(
+            temp_dir.path().to_path_buf(),
+            log_file_stem,
+        ))
+        .await
+        .unwrap()
     }
 
     #[inline]

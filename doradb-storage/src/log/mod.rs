@@ -2990,26 +2990,27 @@ mod tests {
         log_file_max_size: usize,
     ) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
-        let engine = EngineConfig::default()
-            .storage_root(temp_dir.path().to_path_buf())
-            .trx(
-                TrxSysConfig::default()
-                    .log_file_stem(log_file_stem)
-                    .log_write_io_depth(1)
-                    .recovery_io_depth(1)
-                    .catalog_checkpoint_scan_io_depth(1)
-                    .log_sync(log_sync)
-                    .log_file_max_size(log_file_max_size),
-            )
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .build()
-            .await
-            .unwrap();
+        let engine = Engine::bootstrap(
+            EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem(log_file_stem)
+                        .log_write_io_depth(1)
+                        .recovery_io_depth(1)
+                        .catalog_checkpoint_scan_io_depth(1)
+                        .log_sync(log_sync)
+                        .log_file_max_size(log_file_max_size),
+                )
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64u64 * 1024 * 1024)
+                        .max_file_size(128u64 * 1024 * 1024),
+                ),
+        )
+        .await
+        .unwrap();
         (temp_dir, engine)
     }
 
@@ -5149,11 +5150,12 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             File::create(temp_dir.path().join("invalid_redo.0.00000000")).unwrap();
 
-            let err = match EngineConfig::default()
-                .storage_root(temp_dir.path())
-                .trx(TrxSysConfig::default().log_file_stem("invalid_redo"))
-                .build()
-                .await
+            let err = match Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .trx(TrxSysConfig::default().log_file_stem("invalid_redo")),
+            )
+            .await
             {
                 Ok(_) => panic!("engine startup should reject invalid redo file names"),
                 Err(err) => err,
@@ -5181,11 +5183,12 @@ mod tests {
             legacy.set_len(128 * 1024).unwrap();
             drop(legacy);
 
-            let err = match EngineConfig::default()
-                .storage_root(temp_dir.path())
-                .trx(TrxSysConfig::default().log_file_stem("legacy_redo"))
-                .build()
-                .await
+            let err = match Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path())
+                    .trx(TrxSysConfig::default().log_file_stem("legacy_redo")),
+            )
+            .await
             {
                 Ok(_) => panic!("engine startup should reject legacy zero-header redo files"),
                 Err(err) => err,
@@ -5204,21 +5207,22 @@ mod tests {
 
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem(String::from("direct_redo_stream_reader.log")),
-                )
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64u64 * 1024 * 1024)
-                        .max_file_size(128u64 * 1024 * 1024),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .trx(
+                        TrxSysConfig::default()
+                            .log_file_stem(String::from("direct_redo_stream_reader.log")),
+                    )
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64u64 * 1024 * 1024)
+                            .max_file_size(128u64 * 1024 * 1024),
+                    ),
+            )
+            .await
+            .unwrap();
             let table_id = table2(&engine).await;
 
             let mut session = engine.new_session().unwrap();

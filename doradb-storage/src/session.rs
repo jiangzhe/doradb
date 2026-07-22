@@ -1986,9 +1986,7 @@ pub(crate) mod tests {
     fn test_session_table_cache_owns_active_user_insert_page() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let mut session = engine.new_session().unwrap();
@@ -2039,9 +2037,7 @@ pub(crate) mod tests {
     fn test_catalog_insert_pages_use_shared_free_list() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let catalog_tables = engine
@@ -2088,9 +2084,7 @@ pub(crate) mod tests {
     fn test_shutdown_cleanup_candidate_claims_abandoned_active() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let session_id = SessionID::new(1);
@@ -2113,9 +2107,7 @@ pub(crate) mod tests {
     fn test_shutdown_cleanup_candidate_skips_unclaimable_abandoned_active() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let session_id = SessionID::new(1);
@@ -2181,9 +2173,7 @@ pub(crate) mod tests {
     fn test_session_list_table_ids_empty_and_sorted() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let session = engine.new_session().unwrap();
@@ -2204,9 +2194,7 @@ pub(crate) mod tests {
     fn test_session_checkpoint_catalog_requires_idle_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let mut session = engine.new_session().unwrap();
@@ -2226,9 +2214,7 @@ pub(crate) mod tests {
     fn test_session_maintenance_progress_waits_and_idle_requirement() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             table2(&engine).await;
@@ -2277,9 +2263,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(&main_dir)
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(&main_dir))
                 .await
                 .unwrap();
             let table_id = table1(&engine).await;
@@ -2302,9 +2286,7 @@ pub(crate) mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(&main_dir)
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(&main_dir))
                 .await
                 .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_some());
@@ -2322,9 +2304,7 @@ pub(crate) mod tests {
     fn test_session_truncate_redo_log_requires_idle_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let mut session = engine.new_session().unwrap();
@@ -2344,9 +2324,7 @@ pub(crate) mod tests {
     fn test_session_combined_catalog_redo_maintenance_requires_idle_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let mut session = engine.new_session().unwrap();
@@ -2371,8 +2349,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_combined_checkpoint_marker";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
@@ -2424,10 +2401,10 @@ pub(crate) mod tests {
             drop(session);
             drop(engine);
 
-            let restarted = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
-                .await
-                .unwrap();
+            let restarted =
+                Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
+                    .await
+                    .unwrap();
             assert_eq!(
                 restarted.new_session().unwrap().list_table_ids().unwrap(),
                 vec![table_id]
@@ -2441,8 +2418,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_combined_marker_only";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
@@ -2482,8 +2458,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_combined_silent_watermark";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
@@ -2584,8 +2559,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_combined_checkpoint_fail";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
@@ -2657,8 +2631,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_combined_marker_fail";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
@@ -2731,8 +2704,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_combined_cleanup_gate";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
@@ -2793,8 +2765,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_combined_poison_wait";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
@@ -2850,9 +2821,7 @@ pub(crate) mod tests {
     fn test_session_truncate_redo_log_no_candidates_reports_unsealed_blocker() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let mut session = engine.new_session().unwrap();
@@ -2878,8 +2847,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_truncate_dropped_floor";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
@@ -2915,9 +2883,7 @@ pub(crate) mod tests {
     fn test_session_truncate_redo_log_waits_for_catalog_metadata_change() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let metadata_lease = engine.catalog().begin_metadata_change().await;
@@ -2946,8 +2912,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_truncate_candidate";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
@@ -2985,10 +2950,10 @@ pub(crate) mod tests {
             drop(session);
             drop(engine);
 
-            let restarted = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
-                .await
-                .unwrap();
+            let restarted =
+                Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
+                    .await
+                    .unwrap();
             let session = restarted.new_session().unwrap();
             assert_eq!(session.list_table_ids().unwrap(), vec![table_id]);
             drop(session);
@@ -3000,13 +2965,15 @@ pub(crate) mod tests {
                 outcome.new_first_retained_file_seq,
             ))
             .unwrap();
-            let err = match redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
-                .await
-            {
-                Ok(_) => panic!("engine startup should reject missing first retained redo file"),
-                Err(err) => err,
-            };
+            let err =
+                match Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
+                    .await
+                {
+                    Ok(_) => {
+                        panic!("engine startup should reject missing first retained redo file")
+                    }
+                    Err(err) => err,
+                };
             assert_eq!(err.kind(), ErrorKind::Runtime, "{err:?}");
             assert_eq!(
                 err.report().downcast_ref::<RuntimeError>().copied(),
@@ -3025,8 +2992,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_truncate_marker_fail";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
@@ -3097,8 +3063,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_truncate_cleanup_gate";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
@@ -3153,8 +3118,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_truncate_poison_wait";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
@@ -3201,8 +3165,7 @@ pub(crate) mod tests {
             let root = TempDir::new().unwrap();
             let main_dir = root.path().to_path_buf();
             let log_file_stem = "redo_truncate_retry";
-            let engine = redo_truncation_engine_config(&main_dir, log_file_stem)
-                .build()
+            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
                 .await
                 .unwrap();
             create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
@@ -3264,9 +3227,7 @@ pub(crate) mod tests {
     fn test_session_overlapping_checkpoint_catalog_calls_complete() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let _table_id = table1(&engine).await;
@@ -3285,9 +3246,7 @@ pub(crate) mod tests {
     fn test_session_stats_snapshots_are_monotonic() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let session = engine.new_session().unwrap();
@@ -3323,9 +3282,7 @@ pub(crate) mod tests {
     fn test_session_query_methods_require_registered_running_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let session = engine.new_session().unwrap();
@@ -3355,9 +3312,7 @@ pub(crate) mod tests {
     fn test_session_query_methods_fail_after_engine_shutdown() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let session = engine.new_session().unwrap();
@@ -3377,9 +3332,7 @@ pub(crate) mod tests {
     fn test_session_diagnostics_remain_visible_after_storage_poison() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .build()
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
             let table_id = table1(&engine).await;

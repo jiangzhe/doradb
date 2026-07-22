@@ -192,6 +192,8 @@ pub(crate) enum DataIntegrityError {
 /// Fieldless lifecycle-domain errors carried underneath `ErrorKind::Lifecycle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum LifecycleError {
+    #[error("storage root is already in use")]
+    StorageRootInUse,
     #[error("runtime is unavailable")]
     RuntimeUnavailable,
     #[error("storage engine is shut down")]

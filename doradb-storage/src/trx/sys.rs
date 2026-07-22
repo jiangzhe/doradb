@@ -1941,26 +1941,27 @@ pub(crate) mod tests {
         log_file_max_size: usize,
     ) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
-        let engine = EngineConfig::default()
-            .storage_root(temp_dir.path().to_path_buf())
-            .trx(
-                TrxSysConfig::default()
-                    .log_file_stem(log_file_stem)
-                    .log_write_io_depth(1)
-                    .recovery_io_depth(1)
-                    .catalog_checkpoint_scan_io_depth(1)
-                    .log_sync(LogSync::None)
-                    .log_file_max_size(log_file_max_size),
-            )
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .build()
-            .await
-            .unwrap();
+        let engine = Engine::bootstrap(
+            EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem(log_file_stem)
+                        .log_write_io_depth(1)
+                        .recovery_io_depth(1)
+                        .catalog_checkpoint_scan_io_depth(1)
+                        .log_sync(LogSync::None)
+                        .log_file_max_size(log_file_max_size),
+                )
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64u64 * 1024 * 1024)
+                        .max_file_size(128u64 * 1024 * 1024),
+                ),
+        )
+        .await
+        .unwrap();
         (temp_dir, engine)
     }
 
@@ -2010,12 +2011,13 @@ pub(crate) mod tests {
     fn test_catalog_redo_retention_progress_records_monotonic_merge() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path().to_path_buf())
-                .trx(TrxSysConfig::default().log_file_stem("redo_catalog_retention"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path().to_path_buf())
+                    .trx(TrxSysConfig::default().log_file_stem("redo_catalog_retention")),
+            )
+            .await
+            .unwrap();
             let trx_sys = &engine.inner().trx_sys;
 
             assert_eq!(trx_sys.catalog_redo_retention_progress(), None);
@@ -2083,18 +2085,19 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_trx"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(128usize * 1024 * 1024)
+                            .max_file_size(256usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_trx")),
+            )
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             {
                 let trx = session.begin_trx().unwrap();
@@ -2121,18 +2124,19 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_poison_concurrent"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(128usize * 1024 * 1024)
+                            .max_file_size(256usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_poison_concurrent")),
+            )
+            .await
+            .unwrap();
 
             let trx_sys = engine.inner().trx_sys.clone();
             let barrier = Arc::new(Barrier::new(3));
@@ -2187,18 +2191,19 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_poison_listener"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(128usize * 1024 * 1024)
+                            .max_file_size(256usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_poison_listener")),
+            )
+            .await
+            .unwrap();
 
             let trx_sys = engine.inner().trx_sys.clone();
             let listener = trx_sys.poisoner.listener();
@@ -2257,22 +2262,23 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(128usize * 1024 * 1024)
-                        .max_file_size(256usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_rotate")
-                        .log_file_max_size(1024u64 * 1024),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(128usize * 1024 * 1024)
+                            .max_file_size(256usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .log_file_stem("redo_rotate")
+                            .log_file_max_size(1024u64 * 1024),
+                    ),
+            )
+            .await
+            .unwrap();
             let table_id = table2(&engine).await;
 
             let mut session = engine.new_session().unwrap();

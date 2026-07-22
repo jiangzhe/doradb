@@ -1255,8 +1255,7 @@ pub(crate) mod tests {
         main_dir: impl Into<PathBuf>,
         log_file_stem: Option<&str>,
     ) -> Engine {
-        catalog_test_engine_config(main_dir, log_file_stem)
-            .build()
+        Engine::bootstrap(catalog_test_engine_config(main_dir, log_file_stem))
             .await
             .unwrap()
     }
@@ -1267,10 +1266,7 @@ pub(crate) mod tests {
         log_file_stem: Option<&str>,
         expected_message: &str,
     ) -> Error {
-        match catalog_test_engine_config(main_dir, log_file_stem)
-            .build()
-            .await
-        {
+        match Engine::bootstrap(catalog_test_engine_config(main_dir, log_file_stem)).await {
             Ok(_) => panic!("{expected_message}"),
             Err(err) => err,
         }

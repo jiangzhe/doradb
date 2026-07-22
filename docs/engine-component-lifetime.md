@@ -43,35 +43,55 @@ indirect access to teardown-only owner state.
 
 ## Build Sequence
 
-Engine startup resolves storage paths, validates layout markers, then registers
-components in one fixed dependency order:
+Engine startup resolves storage paths, creates and canonicalizes the storage
+root, and acquires the persistent `storage.lock` file before it reads the
+layout marker or creates any subordinate storage path. The operating-system
+file lock is the ownership authority; the synced PID and acquisition timestamp
+stored in the file are diagnostics only. Startup then registers components in
+one fixed dependency order:
 
-1. `EnginePoisoner`
-2. `FileSystem`
-3. `DiskPool`
-4. `MetaPool`
-5. `IndexPool`
-6. `MemPool`
-7. `FileSystemWorkers`
-8. `SharedPoolEvictorWorkers`
-9. `LockManager`
-10. `Catalog`
-11. `TransactionSystem`
-12. `TransactionSystemWorkers`
+1. `StorageRootLease`
+2. `EnginePoisoner`
+3. `FileSystem`
+4. `DiskPool`
+5. `MetaPool`
+6. `IndexPool`
+7. `MemPool`
+8. `FileSystemWorkers`
+9. `SharedPoolEvictorWorkers`
+10. `LockManager`
+11. `Catalog`
+12. `TransactionSystem`
+13. `TransactionSystemWorkers`
 
 Every entry is an explicit `RegistryBuilder::build` call in
-`EngineConfig::build_inner`. Components register only themselves. Upstream
+`bootstrap_inner`. Components register only themselves. Upstream
 components may publish typed startup provisions to the shared build shelf, but
 the downstream component remains a separate explicit build step.
+
+While the lease is held, bootstrap removes only names matching DoraDB's exact
+marker-temporary grammar and syncs the root directory before marker validation.
+A new `storage-layout.toml` is written and synced under a unique temporary
+name, installed without clobbering through a same-directory hard link, cleaned
+up, and followed by a root-directory sync. A visible final marker is therefore
+never a partially written file, and an existing marker is never overwritten.
 
 `DiskPool`, `IndexPool`, and `MemPool` depend on `FileSystem` directly because
 their cache and swap-file IO is dispatched through the shared storage worker
 rather than file-scoped wrappers.
 
-`EnginePoisoner` is registered first because runtime poison is engine-level
-admission state. Lower-level workers such as shared storage IO can poison the
-engine without depending on `TransactionSystem`; components that publish or
-inspect fatal state retain their own direct poisoner dependency.
+`StorageRootLease` is registered first and has no runtime access handle. This
+makes it the last component shut down and ensures canonical-root ownership
+brackets marker handling, component construction, all runtime storage
+activity, and reverse-order teardown. A failed build uses the same reverse
+shutdown path, so it releases the root only after every component already
+registered by that build has stopped.
+
+`EnginePoisoner` is the first runtime-facing component because runtime poison
+is engine-level admission state. Lower-level workers such as shared storage IO
+can poison the engine without depending on `TransactionSystem`; components
+that publish or inspect fatal state retain their own direct poisoner
+dependency.
 
 Registration order is the dependency order. Reverse registration order is both:
 
@@ -135,6 +155,13 @@ Normal shutdown is:
 6. remove idle registry-owned sessions
 7. call `ComponentRegistry::shutdown_all()` in reverse registration order
 8. mark lifecycle state as `Shutdown`
+
+The final reverse-order shutdown step releases `StorageRootLease`. A later
+engine can therefore acquire the root immediately after explicit shutdown,
+even while the shut-down `Engine` owner value remains allocated. Normal owner
+drop and failed bootstrap release the same OS lock through registry teardown;
+process termination releases it when the locked file descriptor closes. The
+persistent `storage.lock` directory entry is never removed.
 
 After shutdown succeeds, `Engine` field order makes the final owner-drop
 sequence deterministic:

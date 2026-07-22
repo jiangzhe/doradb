@@ -1296,6 +1296,7 @@ pub(crate) mod tests {
     use crate::buffer::test_page_id;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_TABLE_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+    use crate::engine::Engine;
     use crate::error::{
         DataIntegrityError, LifecycleError, ResourceError, RuntimeError, RuntimeResult,
     };
@@ -3211,22 +3212,23 @@ pub(crate) mod tests {
             const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
 
             let root = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(root.path())
-                .meta_buffer(TEST_POOL_BYTES)
-                .index_buffer(TEST_POOL_BYTES)
-                .index_max_file_size(128usize * 1024 * 1024)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(TEST_POOL_BYTES)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .file(FileSystemConfig::default().readonly_buffer_size(frame_page_bytes(1)))
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(root.path())
+                    .meta_buffer(TEST_POOL_BYTES)
+                    .index_buffer(TEST_POOL_BYTES)
+                    .index_max_file_size(128usize * 1024 * 1024)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(TEST_POOL_BYTES)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .file(FileSystemConfig::default().readonly_buffer_size(frame_page_bytes(1)))
+                    .trx(TrxSysConfig::default()),
+            )
+            .await
+            .unwrap();
 
             let table_file = engine
                 .inner()

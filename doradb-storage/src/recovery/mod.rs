@@ -1455,10 +1455,12 @@ mod tests {
         main_dir: &Path,
         log_file_stem: &str,
     ) -> (Engine, TableID) {
-        let engine = retention_marker_recovery_engine_config(main_dir, log_file_stem)
-            .build()
-            .await
-            .unwrap();
+        let engine = Engine::bootstrap(retention_marker_recovery_engine_config(
+            main_dir,
+            log_file_stem,
+        ))
+        .await
+        .unwrap();
         let table_id = create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
         let mut session = engine.new_session().unwrap();
         for value in 0..32 {
@@ -1501,8 +1503,7 @@ mod tests {
     }
 
     async fn prepare_checkpointed_recovery_floor(main_dir: &Path, log_file_stem: &str) -> TrxID {
-        let engine = corruption_recovery_engine_config(main_dir, log_file_stem)
-            .build()
+        let engine = Engine::bootstrap(corruption_recovery_engine_config(main_dir, log_file_stem))
             .await
             .unwrap();
         let table_id = create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
@@ -1601,16 +1602,16 @@ mod tests {
     }
 
     async fn expect_log_recovery_corruption(main_dir: &Path, log_file_stem: &str) {
-        let err = match corruption_recovery_engine_config(main_dir, log_file_stem)
-            .build()
-            .await
-        {
-            Ok(engine) => {
-                drop(engine);
-                panic!("engine startup should fail on redo corruption");
-            }
-            Err(err) => err,
-        };
+        let err =
+            match Engine::bootstrap(corruption_recovery_engine_config(main_dir, log_file_stem))
+                .await
+            {
+                Ok(engine) => {
+                    drop(engine);
+                    panic!("engine startup should fail on redo corruption");
+                }
+                Err(err) => err,
+            };
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::LogFileCorrupted),
@@ -2056,11 +2057,10 @@ mod tests {
     fn test_log_recovery_skips_checkpoint_covered_unknown_user_table_redo() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_recovery_engine_config(
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
                 temp_dir.path().to_path_buf(),
                 "recover-unknown-table-skip",
-            )
-            .build()
+            ))
             .await
             .unwrap();
             let unknown_table_id = USER_TABLE_ID_START + 142;
@@ -2096,11 +2096,10 @@ mod tests {
     fn test_log_recovery_fails_unknown_user_table_redo_at_catalog_boundary() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_recovery_engine_config(
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
                 temp_dir.path().to_path_buf(),
                 "recover-unknown-table-invalid",
-            )
-            .build()
+            ))
             .await
             .unwrap();
             let unknown_table_id = USER_TABLE_ID_START + 143;
@@ -2147,11 +2146,10 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_recovery_engine_config(
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
                 main_dir.clone(),
                 "recover-provisional-create-index",
-            )
-            .build()
+            ))
             .await
             .unwrap();
             let table_id =
@@ -2165,11 +2163,12 @@ mod tests {
             let _cts = commit_create_index_catalog_ddl(&engine, table_id).await;
             drop(engine);
 
-            let recovered =
-                lightweight_recovery_engine_config(main_dir, "recover-provisional-create-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "recover-provisional-create-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 1, false).await;
             drop(recovered);
         });
@@ -2180,11 +2179,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine =
-                lightweight_recovery_engine_config(main_dir.clone(), "recover-create-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-create-index",
+            ))
+            .await
+            .unwrap();
             let table_id =
                 create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             engine
@@ -2197,10 +2197,12 @@ mod tests {
             publish_index_metadata_root(&engine, table_id, created_index_metadata(), cts).await;
             drop(engine);
 
-            let recovered = lightweight_recovery_engine_config(main_dir, "recover-create-index")
-                .build()
-                .await
-                .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "recover-create-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 2, true).await;
             drop(recovered);
         });
@@ -2211,10 +2213,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_recovery_engine_config(main_dir.clone(), "recover-drop-index")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-drop-index",
+            ))
+            .await
+            .unwrap();
             let table_id = create_index_ddl_base_table(
                 &engine,
                 vec![base_unique_index_spec(), added_index_spec()],
@@ -2230,10 +2234,12 @@ mod tests {
             publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), cts).await;
             drop(engine);
 
-            let recovered = lightweight_recovery_engine_config(main_dir, "recover-drop-index")
-                .build()
-                .await
-                .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "recover-drop-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 2, false).await;
             drop(recovered);
         });
@@ -2244,11 +2250,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine =
-                lightweight_recovery_engine_config(main_dir.clone(), "recover-create-drop-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-create-drop-index",
+            ))
+            .await
+            .unwrap();
             let table_id =
                 create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             engine
@@ -2265,11 +2272,12 @@ mod tests {
                 .await;
             drop(engine);
 
-            let recovered =
-                lightweight_recovery_engine_config(main_dir, "recover-create-drop-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "recover-create-drop-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 2, false).await;
             drop(recovered);
         });
@@ -2280,11 +2288,10 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_recovery_engine_config(
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
                 main_dir.clone(),
                 "recover-new-table-create-index",
-            )
-            .build()
+            ))
             .await
             .unwrap();
             engine
@@ -2300,11 +2307,12 @@ mod tests {
                 .await;
             drop(engine);
 
-            let recovered =
-                lightweight_recovery_engine_config(main_dir, "recover-new-table-create-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "recover-new-table-create-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 2, true).await;
             drop(recovered);
         });
@@ -2315,11 +2323,10 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_recovery_engine_config(
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
                 main_dir.clone(),
                 "recover-new-table-create-drop-index",
-            )
-            .build()
+            ))
             .await
             .unwrap();
             engine
@@ -2338,11 +2345,12 @@ mod tests {
                 .await;
             drop(engine);
 
-            let recovered =
-                lightweight_recovery_engine_config(main_dir, "recover-new-table-create-drop-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "recover-new-table-create-drop-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 2, false).await;
             drop(recovered);
         });
@@ -2353,11 +2361,10 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_recovery_engine_config(
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
                 main_dir.clone(),
                 "checkpoint-skip-provisional-index",
-            )
-            .build()
+            ))
             .await
             .unwrap();
             let table_id =
@@ -2378,11 +2385,12 @@ mod tests {
             assert!(snapshot.catalog_replay_start_ts > ddl_cts);
             drop(engine);
 
-            let recovered =
-                lightweight_recovery_engine_config(main_dir, "checkpoint-skip-provisional-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "checkpoint-skip-provisional-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 1, false).await;
             drop(recovered);
         });
@@ -2393,11 +2401,10 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_recovery_engine_config(
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
                 main_dir.clone(),
                 "checkpoint-include-durable-index",
-            )
-            .build()
+            ))
             .await
             .unwrap();
             let table_id =
@@ -2419,11 +2426,12 @@ mod tests {
             assert!(snapshot.catalog_replay_start_ts > ddl_cts);
             drop(engine);
 
-            let recovered =
-                lightweight_recovery_engine_config(main_dir, "checkpoint-include-durable-index")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir,
+                "checkpoint-include-durable-index",
+            ))
+            .await
+            .unwrap();
             assert_recovered_index_state(&recovered, table_id, 2, true).await;
             drop(recovered);
         });
@@ -2491,10 +2499,10 @@ mod tests {
             let skipped_max_cts = TrxID::new(replay_floor.as_u64() - 1);
             write_bad_checksum_redo_file(main_dir, log_file_stem, skipped_max_cts, true);
 
-            let recovered = corruption_recovery_engine_config(main_dir, log_file_stem)
-                .build()
-                .await
-                .unwrap();
+            let recovered =
+                Engine::bootstrap(corruption_recovery_engine_config(main_dir, log_file_stem))
+                    .await
+                    .unwrap();
             let mut session = recovered.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
             assert!(
@@ -2530,10 +2538,10 @@ mod tests {
             let replay_floor = prepare_checkpointed_recovery_floor(main_dir, log_file_stem).await;
             write_bad_checksum_redo_file(main_dir, log_file_stem, replay_floor, false);
 
-            let recovered = corruption_recovery_engine_config(main_dir, log_file_stem)
-                .build()
-                .await
-                .unwrap();
+            let recovered =
+                Engine::bootstrap(corruption_recovery_engine_config(main_dir, log_file_stem))
+                    .await
+                    .unwrap();
             let bytes = fs::read(main_dir.join(format!("{log_file_stem}.00000000"))).unwrap();
             let open = parse_redo_super_block(&bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 0, 0).unwrap();
             assert!(!open.is_sealed());
@@ -2555,10 +2563,12 @@ mod tests {
             drop(engine);
             remove_redo_file(main_dir, log_file_stem, 0);
 
-            let recovered = retention_marker_recovery_engine_config(main_dir, log_file_stem)
-                .build()
-                .await
-                .unwrap();
+            let recovered = Engine::bootstrap(retention_marker_recovery_engine_config(
+                main_dir,
+                log_file_stem,
+            ))
+            .await
+            .unwrap();
             drop(recovered);
         });
     }
@@ -2575,9 +2585,11 @@ mod tests {
             remove_redo_file(main_dir, log_file_stem, 0);
             remove_redo_file(main_dir, log_file_stem, 1);
 
-            let err = match retention_marker_recovery_engine_config(main_dir, log_file_stem)
-                .build()
-                .await
+            let err = match Engine::bootstrap(retention_marker_recovery_engine_config(
+                main_dir,
+                log_file_stem,
+            ))
+            .await
             {
                 Ok(engine) => {
                     drop(engine);
@@ -2644,18 +2656,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover1"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover1")),
+            )
+            .await
+            .unwrap();
 
             drop(engine);
         })
@@ -2666,18 +2679,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover2"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover2")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec::new(vec![
@@ -2708,18 +2722,19 @@ mod tests {
             drop(engine);
 
             // second recovery.
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover2"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover2")),
+            )
+            .await
+            .unwrap();
 
             assert!(engine.catalog().get_table(table_id).await.is_some());
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -2740,18 +2755,19 @@ mod tests {
 
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover3"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover3")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec::new(vec![
@@ -2808,18 +2824,19 @@ mod tests {
             drop(engine);
 
             // second recovery.
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover3"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover3")),
+            )
+            .await
+            .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let session = engine.new_session().unwrap();
@@ -2849,18 +2866,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover4"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover4")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -2885,18 +2903,19 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover4"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover4")),
+            )
+            .await
+            .unwrap();
 
             assert!(engine.catalog().get_table(table_id).await.is_some());
             drop(engine);
@@ -2910,10 +2929,10 @@ mod tests {
             log_file_stem: &'static str,
             checkpoint_catalog: bool,
         ) -> (TableID, TableRedoReplayFloor, TableRedoReplayFloor) {
-            let engine = lightweight_recovery_engine_config(main_dir, log_file_stem)
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                Engine::bootstrap(lightweight_recovery_engine_config(main_dir, log_file_stem))
+                    .await
+                    .unwrap();
             let table_id =
                 create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -2971,11 +2990,12 @@ mod tests {
             let (table_id, root_floor, watermark_floor) =
                 prepare_silent_watermark(unchecked_dir.clone(), "recover-silent-unchecked", false)
                     .await;
-            let recovered =
-                lightweight_recovery_engine_config(unchecked_dir, "recover-silent-unchecked")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                unchecked_dir,
+                "recover-silent-unchecked",
+            ))
+            .await
+            .unwrap();
             let snapshot = recovered.catalog().storage.checkpoint_snapshot();
             let (live_before_catalog_checkpoint, _) = recovered
                 .catalog()
@@ -3012,11 +3032,12 @@ mod tests {
 
             let (_table_id, _, expected_floor) =
                 prepare_silent_watermark(checked_dir.clone(), "recover-silent-checked", true).await;
-            let recovered =
-                lightweight_recovery_engine_config(checked_dir, "recover-silent-checked")
-                    .build()
-                    .await
-                    .unwrap();
+            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
+                checked_dir,
+                "recover-silent-checked",
+            ))
+            .await
+            .unwrap();
             let snapshot = recovered.catalog().storage.checkpoint_snapshot();
             let (live_after_catalog_checkpoint, _) = recovered
                 .catalog()
@@ -3032,18 +3053,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover5"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover5")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -3098,18 +3120,19 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover5"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover5")),
+            )
+            .await
+            .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
@@ -3159,18 +3182,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover11"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover11")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -3237,18 +3261,19 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover11"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover11")),
+            )
+            .await
+            .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
@@ -3298,10 +3323,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_recovery_engine_config(main_dir.clone(), "recover12")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover12",
+            ))
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -3366,10 +3393,10 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = lightweight_recovery_engine_config(main_dir, "recover12")
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                Engine::bootstrap(lightweight_recovery_engine_config(main_dir, "recover12"))
+                    .await
+                    .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
@@ -3437,18 +3464,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover6"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover6")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -3512,18 +3540,19 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover6"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover6")),
+            )
+            .await
+            .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
@@ -3558,18 +3587,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover10"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover10")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -3643,18 +3673,19 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover10"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover10")),
+            )
+            .await
+            .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(
@@ -3709,18 +3740,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover7"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover7")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let checkpointed_table_id = session
@@ -3837,18 +3869,19 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover7"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover7")),
+            )
+            .await
+            .unwrap();
 
             let checkpointed_table = engine
                 .catalog()
@@ -3910,18 +3943,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover8"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover8")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -3990,18 +4024,19 @@ mod tests {
 
             corrupt_page_checksum(table_file_path, block_id);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover8"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover8")),
+            )
+            .await
+            .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
@@ -4031,18 +4066,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover9"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir.clone())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover9")),
+            )
+            .await
+            .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -4141,18 +4177,19 @@ mod tests {
                 blob_ref.start_offset,
             );
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("recover9"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("recover9")),
+            )
+            .await
+            .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let session = engine.new_session().unwrap();
