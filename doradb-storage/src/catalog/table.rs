@@ -3,9 +3,9 @@ use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexN
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableObject, is_user_table};
 use crate::engine::EngineRef;
 use crate::error::{
-    FatalError, FatalResult, InternalError, InternalResult, IoResult, OperationError,
-    OperationOrRuntimeResult, OperationResult, Result, RuntimeError, RuntimeOrFatalError,
-    RuntimeOrFatalResult, RuntimeResult,
+    DiscloseError, DiscloseResultExt, FatalError, FatalResult, InternalError, InternalResult,
+    IoResult, OperationError, OperationOrRuntimeResult, OperationResult, Result, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::id::{TableID, TrxID};
@@ -1133,20 +1133,21 @@ pub(crate) async fn create_table_for_session(
     table_spec: super::TableSpec,
     index_specs: Vec<IndexSpec>,
 ) -> Result<TableID> {
-    let ctx = SessionDdlContext::new(&session).attach("operation=create_table")?;
+    let ctx = SessionDdlContext::new(&session)
+        .attach("operation=create_table")
+        .disclose()?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
-    reject_user_table_primary_key_indexes(&index_specs, "create_table")?;
+    reject_user_table_primary_key_indexes(&index_specs, "create_table").disclose()?;
 
     let table_id = engine.catalog().next_table_id();
-    let metadata = Arc::new(TableMetadata::try_new(
-        table_spec.columns.clone(),
-        index_specs.clone(),
-    )?);
-    let uninit_table_file =
-        engine
-            .table_fs
-            .create_table_file(table_id, Arc::clone(&metadata), false)?;
+    let metadata = Arc::new(
+        TableMetadata::try_new(table_spec.columns.clone(), index_specs.clone()).disclose()?,
+    );
+    let uninit_table_file = engine
+        .table_fs
+        .create_table_file(table_id, Arc::clone(&metadata), false)
+        .disclose()?;
 
     let table_object = TableObject {
         table_id,
@@ -1195,7 +1196,7 @@ pub(crate) async fn create_table_for_session(
                 ))),
             };
             progress.phase = CreateTablePhase::Aborted;
-            return Err(err.into());
+            return Err(err.disclose());
         }
     };
 
@@ -1214,7 +1215,7 @@ pub(crate) async fn create_table_for_session(
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "catalog_staging", err)
             .await
-            .into());
+            .disclose());
     }
     progress.mark_catalog_staged();
 
@@ -1223,14 +1224,14 @@ pub(crate) async fn create_table_for_session(
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "test_after_catalog_staging", err)
             .await
-            .into());
+            .disclose());
     }
 
     if let Err(err) = progress.publish_file(&engine).await {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "file_publish", err)
             .await
-            .into());
+            .disclose());
     }
 
     #[cfg(test)]
@@ -1238,14 +1239,14 @@ pub(crate) async fn create_table_for_session(
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "test_after_file_publish", err)
             .await
-            .into());
+            .disclose());
     }
 
     if let Err(err) = progress.build_runtime(&guards, &engine).await {
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "runtime_build", err)
             .await
-            .into());
+            .disclose());
     }
 
     #[cfg(test)]
@@ -1253,7 +1254,7 @@ pub(crate) async fn create_table_for_session(
         return Err(progress
             .abort_before_catalog_commit(&engine, &guards, "test_after_runtime_build", err)
             .await
-            .into());
+            .disclose());
     }
 
     #[cfg(test)]
@@ -1263,7 +1264,7 @@ pub(crate) async fn create_table_for_session(
         return Err(progress
             .abort_after_root_publish_commit_error(&engine, &guards, "catalog_commit", err)
             .await
-            .into());
+            .disclose());
     }
 
     progress.install_runtime(&engine);
@@ -1273,29 +1274,40 @@ pub(crate) async fn create_table_for_session(
 
 /// Logically drop an existing user table for a session-level DDL request.
 pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableID) -> Result<()> {
-    let ctx = SessionDdlContext::new(&session).attach("operation=drop_table")?;
+    let ctx = SessionDdlContext::new(&session)
+        .attach("operation=drop_table")
+        .disclose()?;
     let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
-    validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
+    validated_drop_table_target(&ctx.pool_guards, &engine, table_id)
+        .await
+        .disclose()?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=drop_table")?;
+        .attach("operation=drop_table")
+        .disclose()?;
     let mut table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
         .await
-        .attach_with(|| format!("operation=drop_table, table_id={table_id}"))?;
-    let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
-    engine.poisoner.ensure_healthy()?;
+        .attach_with(|| format!("operation=drop_table, table_id={table_id}"))
+        .disclose()?;
+    let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id)
+        .await
+        .disclose()?;
+    engine.poisoner.ensure_healthy().disclose()?;
 
-    let mut trx = session.begin_trx().attach("operation=drop_table")?;
+    let mut trx = session
+        .begin_trx()
+        .attach("operation=drop_table")
+        .disclose()?;
 
     let drain = match table.start_drop_lifecycle() {
         Ok(drain) => drain,
         Err(err) => {
             if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
-                return Err(rollback_err.into());
+                return Err(rollback_err.disclose());
             }
-            return Err(err.into());
+            return Err(err.disclose());
         }
     };
     let mut drop_progress = DropTableProgressGuard::new(engine.clone(), table_id);
@@ -1308,7 +1320,16 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         // The lifecycle gate is already irreversible. Preserve the catalog
         // cascade failure as the poison source; rollback is best-effort cleanup
         // and its error must not replace the failure that crossed the gate.
-        let _ = trx.rollback_catalog_ddl().await;
+        if let Err(rollback_err) = trx.rollback_catalog_ddl().await {
+            let rollback_err = rollback_err.attach_with(|| {
+                format!(
+                    "best-effort DROP TABLE rollback failed after lifecycle gate: table_id={table_id}"
+                )
+            });
+            obs::error!(
+                "event=ddl_cleanup component=catalog action=rollback_drop_table result=error error={rollback_err:?}"
+            );
+        }
         return Err(poison_error_source(
             &engine,
             RuntimeOrFatalError::from(err),
@@ -1317,7 +1338,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
                 "drop table failed after lifecycle gate: table_id={table_id}, operation=catalog_cascade"
             ),
         )
-        .into());
+        .disclose());
     }
 
     let drop_cts = match trx.commit_catalog_ddl().await {
@@ -1331,14 +1352,15 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
                     "drop table failed after lifecycle gate: table_id={table_id}, operation=commit"
                 ),
             )
-            .into());
+            .disclose());
         }
     };
 
     let replay_floor = engine
         .catalog()
         .effective_user_table_redo_replay_floor(table_id, table.redo_replay_floor_snapshot());
-    finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)?;
+    finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)
+        .disclose()?;
     drop_progress.disarm();
     table_locks.fail_waiters_on_release(OperationError::TableNotFound);
     // Foreground DROP TABLE stops at logical removal. The catalog map retains
@@ -1501,19 +1523,15 @@ async fn execute_create_table_catalog_staging(
                 .await?;
         }
 
-        if let Some(existing) = stmt
+        let existing = stmt
             .effects_mut()
-            .set_ddl_redo(DDLRedo::CreateTable(table_id))
-        {
-            return Err(Report::new(InternalError::CatalogDdlRedoConflict)
-                .attach(format!(
-                    "operation=create_table_catalog_staging, table_id={table_id}, existing_ddl={existing:?}"
-                ))
-                .change_context(RuntimeError::CatalogAccess)
-                .attach(format!(
-                    "operation=create_table, phase=stage_catalog_redo, table_id={table_id}"
-                )));
-        }
+            .set_ddl_redo(DDLRedo::CreateTable(table_id));
+        // A catalog DDL statement stages exactly one logical DDL effect; the
+        // create-table path owns the empty redo slot until this point.
+        assert!(
+            existing.is_none(),
+            "create-table catalog staging found existing DDL redo: table_id={table_id}, existing_ddl={existing:?}"
+        );
         Ok(())
     })
     .await
@@ -1722,7 +1740,8 @@ mod tests {
         IndexSpec, TableSpec,
     };
     use crate::error::{
-        Error, ErrorKind, FatalError, InternalError, IoError, OperationError, RuntimeError,
+        DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError, IoError, OperationError,
+        RuntimeError,
     };
     use crate::id::TrxID;
     use crate::io::install_storage_backend_test_hook;
@@ -1758,11 +1777,7 @@ mod tests {
 
     pub(super) fn maybe_fail_create_table(failure: CreateTableTestFailure) -> RuntimeResult<()> {
         if CREATE_TABLE_FAILURE.with(|slot| slot.get()) == Some(failure) {
-            // TODO(error-boundary): backlog 000160 should replace this generic
-            // hook with a create-table phase-specific source-domain failure.
-            return Err(Report::new(InternalError::Generic)
-                .attach("test create-table phase failure")
-                .change_context(RuntimeError::CatalogAccess)
+            return Err(Report::new(RuntimeError::CatalogAccess)
                 .attach("operation=test_create_table_phase_failure"));
         }
         Ok(())
@@ -1778,8 +1793,7 @@ mod tests {
         }
     }
 
-    fn assert_invalid_metadata(err: impl Into<Error>, expected_message: &str) {
-        let err = err.into();
+    fn assert_invalid_metadata(err: Error, expected_message: &str) {
         assert!(err.is_kind(crate::error::ErrorKind::Operation));
         assert_eq!(
             err.report().downcast_ref::<OperationError>().copied(),
@@ -2015,7 +2029,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_metadata(err, "multiple primary keys");
+        assert_invalid_metadata(err.disclose(), "multiple primary keys");
     }
 
     #[test]
@@ -2041,7 +2055,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_metadata(err, "multiple primary keys");
+        assert_invalid_metadata(err.disclose(), "multiple primary keys");
     }
 
     #[test]
@@ -2056,7 +2070,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_metadata(err, "primary key index_no 0 references nullable column 0");
+        assert_invalid_metadata(
+            err.disclose(),
+            "primary key index_no 0 references nullable column 0",
+        );
     }
 
     #[test]
@@ -2072,7 +2089,7 @@ mod tests {
             vec![IndexSpec::new(vec![], IndexAttributes::PK)],
         )
         .unwrap_err();
-        assert_invalid_metadata(err, "index_no 0 has no key columns");
+        assert_invalid_metadata(err.disclose(), "index_no 0 has no key columns");
 
         let err = TableMetadata::try_new_with_next_index_no(
             columns.clone(),
@@ -2083,14 +2100,17 @@ mod tests {
             2,
         )
         .unwrap_err();
-        assert_invalid_metadata(err, "index_no 1 has no key columns");
+        assert_invalid_metadata(err.disclose(), "index_no 1 has no key columns");
 
         let err = TableMetadata::try_new(
             columns,
             vec![IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK)],
         )
         .unwrap_err();
-        assert_invalid_metadata(err, "index_no 0 references column 1 outside column count 1");
+        assert_invalid_metadata(
+            err.disclose(),
+            "index_no 0 references column 1 outside column count 1",
+        );
     }
 
     #[test]
@@ -2473,7 +2493,11 @@ mod tests {
             let res = session.create_table(table_spec, index_specs).await;
             set_create_table_failure(None);
 
-            res.unwrap_err();
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::CatalogAccess)
+            );
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
@@ -2538,7 +2562,11 @@ mod tests {
             let res = session.create_table(table_spec, index_specs).await;
             set_create_table_failure(None);
 
-            res.unwrap_err();
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::CatalogAccess)
+            );
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
@@ -2563,7 +2591,11 @@ mod tests {
             let res = session.create_table(table_spec, index_specs).await;
             set_create_table_failure(None);
 
-            res.unwrap_err();
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::CatalogAccess)
+            );
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
@@ -3148,7 +3180,8 @@ mod tests {
                         .storage
                         .tables()
                         .delete_by_id(stmt, table_id)
-                        .await?;
+                        .await
+                        .disclose()?;
                     assert!(deleted);
                     let old = stmt
                         .effects_mut()

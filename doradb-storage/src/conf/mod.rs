@@ -13,5 +13,6 @@ pub use self::consts::{
 };
 pub use self::engine::EngineConfig;
 pub use self::fs::FileSystemConfig;
+pub(crate) use self::fs::ValidatedFileSystemConfig;
 pub use self::trx::TrxSysConfig;
 pub use crate::log::LogSync;

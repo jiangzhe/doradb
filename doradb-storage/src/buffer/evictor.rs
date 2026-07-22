@@ -1011,7 +1011,7 @@ mod tests {
     };
     use crate::component::{ComponentRegistry, DiskPoolConfig, IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
-    use crate::error::FileKind;
+    use crate::file::FileKind;
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::fs::{FileSystem, FileSystemWorkers};
     use crate::file::table_file::{MutableTableFile, TableFile};
@@ -1270,10 +1270,12 @@ mod tests {
                 let file = FileSystemConfig::default()
                     .data_dir(root)
                     .readonly_buffer_size(frame_page_bytes(256));
+                let readonly_buffer_size = file.readonly_buffer_size;
+                let file = file.validate().unwrap();
                 builder.build::<EnginePoisoner>(()).await.unwrap();
-                builder.build::<FileSystem>(file.clone()).await.unwrap();
+                builder.build::<FileSystem>(file).await.unwrap();
                 builder
-                    .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
+                    .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
                     .await
                     .unwrap();
                 builder

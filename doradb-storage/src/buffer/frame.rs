@@ -1,4 +1,4 @@
-use crate::buffer::page::{BufferPageKind, Page};
+use crate::buffer::page::Page;
 use crate::catalog::TableColumnLayout;
 use crate::file::cow_file::INVALID_BLOCK_ID;
 use crate::id::{BlockID, FileID, PageID, TrxID};
@@ -37,7 +37,6 @@ pub(crate) struct BufferFrame {
     pub(super) page_id: PageID,
     generation: AtomicU64,
     frame_kind: AtomicU8,
-    page_kind: AtomicU8,
     dirty: AtomicBool,
     has_persisted_block_key: AtomicBool,
     persisted_file_id: AtomicU64,
@@ -60,19 +59,6 @@ impl BufferFrame {
     #[inline]
     pub(crate) fn set_kind(&self, kind: FrameKind) {
         self.frame_kind.store(kind as u8, Ordering::Release);
-    }
-
-    /// Returns the logical page image kind stored in this frame.
-    #[inline]
-    pub(crate) fn page_kind(&self) -> BufferPageKind {
-        let value = self.page_kind.load(Ordering::Acquire);
-        BufferPageKind::from(value)
-    }
-
-    /// Stores the logical page image kind for this frame.
-    #[inline]
-    pub(crate) fn set_page_kind(&self, kind: BufferPageKind) {
-        self.page_kind.store(kind as u8, Ordering::Release);
     }
 
     /// Attempts to swap the physical residency state and returns the observed value.
@@ -208,7 +194,6 @@ impl Default for BufferFrame {
             latch: HybridLatch::new(),
             page_id: PageID::new(0),
             frame_kind: AtomicU8::new(FrameKind::Uninitialized as u8),
-            page_kind: AtomicU8::new(BufferPageKind::Uninitialized as u8),
             generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),

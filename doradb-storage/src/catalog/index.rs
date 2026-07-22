@@ -7,9 +7,9 @@ use crate::catalog::{
 };
 use crate::engine::EngineRef;
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, Error, FatalError, OperationError,
-    OperationOrRuntimeResult, OperationResult, Result, RuntimeError, RuntimeOrFatalError,
-    RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, FatalError,
+    OperationError, OperationOrRuntimeResult, OperationResult, Result, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
@@ -262,8 +262,16 @@ impl<'a> CreateIndexProgress<'a> {
         self.new_layout = None;
         if let Some(index) = self.staged_index.take() {
             // Preserve the existing best-effort cleanup policy. A destroy
-            // failure is intentionally not allowed to replace the DDL source.
-            let _ = destroy_uninstalled_staged_index(index, self.guards).await;
+            // failure is observed but does not replace the DDL source.
+            if let Err(report) = destroy_uninstalled_staged_index(index, self.guards).await {
+                let report = report.attach(format!(
+                    "operation=cleanup_create_index_staged_runtime, table_id={}, index_no={}",
+                    self.table_id, self.index_no
+                ));
+                obs::error!(
+                    "event=index_ddl_cleanup component=catalog_index action=destroy_staged result=error error={report:?}"
+                );
+            }
         }
     }
 }
@@ -435,35 +443,44 @@ pub(crate) async fn create_index_for_session(
     table_id: TableID,
     index_spec: IndexSpec,
 ) -> Result<IndexNo> {
-    let ctx = SessionDdlContext::new(&session).attach("operation=create_index")?;
+    let ctx = SessionDdlContext::new(&session)
+        .attach("operation=create_index")
+        .disclose()?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
-    reject_user_table_primary_key_index(&index_spec, "create_index")?;
+    reject_user_table_primary_key_index(&index_spec, "create_index").disclose()?;
 
     // 1. Validate the target and acquire table-local DDL exclusion before
     // deriving any new metadata or touching mutable table roots.
-    precheck_index_ddl_target(&guards, &engine, table_id, "create_index").await?;
+    precheck_index_ddl_target(&guards, &engine, table_id, "create_index")
+        .await
+        .disclose()?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=create_index")?;
+        .attach("operation=create_index")
+        .disclose()?;
     // Keep these DDL locks alive through root publish and runtime layout
     // install so foreground readers/writers cannot observe a partial index.
     let _table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
         .await
-        .attach_with(|| format!("operation=create_index, table_id={table_id}"))?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "create_index").await?;
-    engine.poisoner.ensure_healthy()?;
+        .attach_with(|| format!("operation=create_index, table_id={table_id}"))
+        .disclose()?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "create_index")
+        .await
+        .disclose()?;
+    engine.poisoner.ensure_healthy().disclose()?;
     table
         .check_foreground_live()
-        .attach("operation=create_index")?;
+        .attach("operation=create_index")
+        .disclose()?;
 
     // 2. Exclude table and catalog checkpoints while catalog metadata,
     // table-file roots, and runtime layout are temporarily out of sync.
     // Keep both metadata-change leases alive until after the matching table
     // root is published and the new runtime layout is installed.
-    let _table_metadata_lease = table.begin_metadata_change().await?;
+    let _table_metadata_lease = table.begin_metadata_change().await.disclose()?;
     let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
 
     // 3. Allocate the stable table-local index number and prepare the new
@@ -471,11 +488,16 @@ pub(crate) async fn create_index_for_session(
     let old_layout = table.layout_snapshot();
     let old_metadata = old_layout.metadata();
     let active_root = table.file().active_root_unchecked().clone();
-    validate_create_index_root_shape(table_id, &active_root, old_metadata)?;
-    let (index_no, new_metadata_value) = old_metadata.try_with_created_index(index_spec)?;
+    validate_create_index_root_shape(table_id, &active_root, old_metadata).disclose()?;
+    let (index_no, new_metadata_value) =
+        old_metadata.try_with_created_index(index_spec).disclose()?;
     let new_metadata = Arc::new(new_metadata_value);
     let index_no_usize = usize::from(index_no);
-    let new_index_spec = new_metadata.idx.require_index_spec(index_no_usize)?.clone();
+    let new_index_spec = new_metadata
+        .idx
+        .require_index_spec(index_no_usize)
+        .expect("newly created index metadata must contain its allocated slot")
+        .clone();
 
     let mut secondary_index_roots = active_root.secondary_index_roots.clone();
     secondary_index_roots.resize(new_metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
@@ -484,11 +506,15 @@ pub(crate) async fn create_index_for_session(
         Arc::clone(&new_metadata),
         Arc::clone(table.file()),
         table.disk_pool().clone(),
-    )?;
+    )
+    .disclose()?;
 
     // 4. Start the implicit DDL transaction and let the progress state own all
     // rollback/destroy transitions from this point onward.
-    let trx = session.begin_trx().attach("operation=create_index")?;
+    let trx = session
+        .begin_trx()
+        .attach("operation=create_index")
+        .disclose()?;
     let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
     let build_ts = progress.build_ts();
 
@@ -512,11 +538,8 @@ pub(crate) async fn create_index_for_session(
     let cold_rows = match cold_rows {
         Ok(cold_rows) => cold_rows,
         Err(err) => {
-            progress
-                .rollback_before_catalog_commit()
-                .await
-                .map_err(Error::from)?;
-            return Err(err.into());
+            progress.rollback_before_catalog_commit().await.disclose()?;
+            return Err(err.disclose());
         }
     };
 
@@ -527,11 +550,8 @@ pub(crate) async fn create_index_for_session(
     ) {
         Ok(keys) => keys,
         Err(err) => {
-            progress
-                .rollback_before_catalog_commit()
-                .await
-                .map_err(Error::from)?;
-            return Err(err.into());
+            progress.rollback_before_catalog_commit().await.disclose()?;
+            return Err(err.disclose());
         }
     };
     if let Err(err) = validate_create_index_cold_non_unique_keys(
@@ -539,11 +559,8 @@ pub(crate) async fn create_index_for_session(
         &new_index_spec,
         &cold_rows,
     ) {
-        progress
-            .rollback_before_catalog_commit()
-            .await
-            .map_err(Error::from)?;
-        return Err(err.into());
+        progress.rollback_before_catalog_commit().await.disclose()?;
+        return Err(err.disclose());
     }
 
     let cold_root = match build_create_index_disk_tree(
@@ -559,24 +576,15 @@ pub(crate) async fn create_index_for_session(
     {
         Ok(res) => res,
         Err(err) => {
-            progress
-                .rollback_before_catalog_commit()
-                .await
-                .map_err(Error::from)?;
-            return Err(err.into());
+            progress.rollback_before_catalog_commit().await.disclose()?;
+            return Err(err.disclose());
         }
     };
     secondary_index_roots[index_no_usize] = cold_root;
-    if let Err(err) = mutable_file.replace_metadata_and_secondary_index_roots(
+    mutable_file.replace_metadata_and_secondary_index_roots(
         Arc::clone(&new_metadata),
         secondary_index_roots,
-    ) {
-        progress
-            .rollback_before_catalog_commit()
-            .await
-            .map_err(Error::from)?;
-        return Err(err.into());
-    }
+    );
 
     // 6. Build the hot MemIndex from row-store rows and assemble a runtime
     // layout that future readers can install atomically.
@@ -584,11 +592,8 @@ pub(crate) async fn create_index_for_session(
         match collect_create_index_hot_rows(&table, &old_layout, &guards, &new_index_spec).await {
             Ok(hot_rows) => hot_rows,
             Err(err) => {
-                progress
-                    .rollback_before_catalog_commit()
-                    .await
-                    .map_err(Error::from)?;
-                return Err(err.into());
+                progress.rollback_before_catalog_commit().await.disclose()?;
+                return Err(err.disclose());
             }
         };
     match build_create_index_runtime_index(CreateIndexRuntimeBuild {
@@ -607,11 +612,8 @@ pub(crate) async fn create_index_for_session(
             progress.stage_runtime_index(index);
         }
         Err(err) => {
-            progress
-                .rollback_before_catalog_commit()
-                .await
-                .map_err(Error::from)?;
-            return Err(err.into());
+            progress.rollback_before_catalog_commit().await.disclose()?;
+            return Err(err.disclose());
         }
     }
     let new_layout = build_created_index_runtime_layout(
@@ -627,9 +629,10 @@ pub(crate) async fn create_index_for_session(
     // provisional.
     progress
         .execute_catalog_update(new_metadata.as_ref(), &new_index_spec)
-        .await?;
+        .await
+        .disclose()?;
 
-    let create_cts = progress.commit_catalog().await?;
+    let create_cts = progress.commit_catalog().await.disclose()?;
 
     // 8. Publish the table root that proves the new index metadata durable.
     // Failure after catalog commit poisons storage per the RFC 0018 policy.
@@ -643,7 +646,7 @@ pub(crate) async fn create_index_for_session(
             return progress
                 .cleanup_after_catalog_commit_failure("table_root_publish", err.into())
                 .await
-                .map_err(Error::from);
+                .disclose();
         }
     }
 
@@ -662,26 +665,35 @@ pub(crate) async fn drop_index_for_session(
     table_id: TableID,
     index_no: IndexNo,
 ) -> Result<()> {
-    let ctx = SessionDdlContext::new(&session).attach("operation=drop_index")?;
+    let ctx = SessionDdlContext::new(&session)
+        .attach("operation=drop_index")
+        .disclose()?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
 
-    precheck_index_ddl_target(&guards, &engine, table_id, "drop_index").await?;
+    precheck_index_ddl_target(&guards, &engine, table_id, "drop_index")
+        .await
+        .disclose()?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
-        .attach("operation=drop_index")?;
+        .attach("operation=drop_index")
+        .disclose()?;
     let _table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
         .await
-        .attach_with(|| format!("operation=drop_index, table_id={table_id}"))?;
-    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop_index").await?;
-    engine.poisoner.ensure_healthy()?;
+        .attach_with(|| format!("operation=drop_index, table_id={table_id}"))
+        .disclose()?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop_index")
+        .await
+        .disclose()?;
+    engine.poisoner.ensure_healthy().disclose()?;
     table
         .check_foreground_live()
-        .attach("operation=drop_index")?;
+        .attach("operation=drop_index")
+        .disclose()?;
 
-    let _table_metadata_lease = table.begin_metadata_change().await?;
+    let _table_metadata_lease = table.begin_metadata_change().await.disclose()?;
     let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
 
     let old_layout = table.layout_snapshot();
@@ -691,12 +703,16 @@ pub(crate) async fn drop_index_for_session(
     let old_index_spec = old_metadata
         .idx
         .index_spec(index_no_usize)
-        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive_metadata_slot"))?
+        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive_metadata_slot"))
+        .disclose()?
         .clone();
-    old_layout.secondary_index(index_no_usize)?;
+    old_layout
+        .secondary_index(index_no_usize)
+        .expect("active index metadata must have a matching runtime index");
 
     let active_root = table.file().active_root_unchecked().clone();
-    validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)?;
+    validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)
+        .disclose()?;
     // The active slot was required above while holding the metadata-change
     // lease, so rebuilding without that exact slot is infallible.
     let new_metadata = Arc::new(old_metadata.without_index(index_no));
@@ -711,16 +727,22 @@ pub(crate) async fn drop_index_for_session(
     mutable_file.replace_metadata_and_secondary_index_roots(
         Arc::clone(&new_metadata),
         secondary_index_roots,
-    )?;
+    );
 
     let new_layout =
         build_dropped_index_runtime_layout(&old_layout, Arc::clone(&new_metadata), index_no_usize);
 
-    let trx = session.begin_trx().attach("operation=drop_index")?;
+    let trx = session
+        .begin_trx()
+        .attach("operation=drop_index")
+        .disclose()?;
     let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);
     progress.stage_layout(new_layout);
-    progress.execute_catalog_update(&old_index_spec).await?;
-    let drop_cts = progress.commit_catalog().await?;
+    progress
+        .execute_catalog_update(&old_index_spec)
+        .await
+        .disclose()?;
+    let drop_cts = progress.commit_catalog().await.disclose()?;
 
     let root_publish = engine
         .trx_sys
@@ -732,7 +754,7 @@ pub(crate) async fn drop_index_for_session(
             return progress
                 .cleanup_after_catalog_commit_failure("table_root_publish", err.into())
                 .await
-                .map_err(Error::from);
+                .disclose();
         }
     }
 
@@ -750,7 +772,7 @@ pub(crate) async fn drop_index_for_session(
             "retired_secondary_index_cleanup",
             err.into(),
         )
-        .into());
+        .disclose());
     }
 
     Ok(())
@@ -1112,7 +1134,7 @@ async fn build_create_index_disk_tree(
             .collect::<Vec<_>>();
         let tree = disk_runtime.open_unique_at(SUPER_BLOCK_ID, guards.disk_guard())?;
         let mut writer = tree.batch_writer(mutable_file, build_ts);
-        writer.batch_put_encoded(&batch)?;
+        writer.batch_put_encoded(&batch);
         writer.finish().await
     } else {
         let encoder = secondary_disk_tree_encoder(metadata, index_spec, true);
@@ -1247,7 +1269,15 @@ async fn build_create_index_runtime_index(
         let insert_res =
             insert_create_index_unique_hot_rows(&mem, index_guard, &hot_rows, build_ts).await;
         if let Err(err) = insert_res {
-            let _ = mem.destroy(index_guard).await;
+            if let Err(report) = mem.destroy(index_guard).await {
+                let report = report.attach(format!(
+                    "operation=rollback_create_unique_index_build, index_no={}",
+                    disk_runtime.index_no()
+                ));
+                obs::error!(
+                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
+                );
+            }
             return Err(err);
         }
         Ok(SecondaryIndex::Unique {
@@ -1260,7 +1290,15 @@ async fn build_create_index_runtime_index(
         let insert_res =
             insert_create_index_non_unique_hot_rows(&mem, index_guard, &hot_rows, build_ts).await;
         if let Err(err) = insert_res {
-            let _ = mem.destroy(index_guard).await;
+            if let Err(report) = mem.destroy(index_guard).await {
+                let report = report.attach(format!(
+                    "operation=rollback_create_non_unique_index_build, index_no={}",
+                    disk_runtime.index_no()
+                ));
+                obs::error!(
+                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
+                );
+            }
             return Err(err.into());
         }
         Ok(SecondaryIndex::NonUnique {

@@ -183,7 +183,7 @@ fn parse_positive_usize(flag: &'static str, value: &str) -> ToolResult<usize> {
 }
 
 async fn run_baseline(args: &Args) -> StorageResult<Vec<BenchRow>> {
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new().expect("create weak-handle benchmark temp directory");
     let engine = baseline_engine_config(temp_dir.path()).build().await?;
     let setup_rows = args.scan_rows.max(args.iterations);
     let resolution_table_id = if should_run(args, BenchOperation::FirstResolutionEmptyScan)

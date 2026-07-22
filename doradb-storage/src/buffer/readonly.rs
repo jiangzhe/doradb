@@ -16,11 +16,11 @@ use crate::buffer::{
     ReadonlyBlockValidator, pool_role_name,
 };
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, FileKind, InternalError, InternalResult, IoError,
+    CompletionErrorBridge, CompletionResult, InternalError, InternalResult, IoError,
     LifecycleError, LifecycleResult, ResourceError, ResourceResult, RuntimeError, RuntimeResult,
 };
 use crate::file::fs::FileSystem;
-use crate::file::{BlockKey, SparseFile};
+use crate::file::{BlockKey, FileKind, SparseFile};
 use crate::id::{BlockID, FileID, PageID};
 use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
 use crate::latch::LatchFallbackMode;
@@ -399,12 +399,15 @@ impl ReadonlyBufferPool {
         guard: &PoolGuard,
         frame_id: PageID,
         mode: LatchFallbackMode,
-    ) -> InternalResult<FacadePageGuard<T>> {
+    ) -> FacadePageGuard<T> {
         self.validate_guard(guard);
-        if usize::from(frame_id) >= self.size {
-            return Err(Report::new(InternalError::ReadonlyFrameIndexOutOfBounds)
-                .attach(format!("frame_id={frame_id}, size={}", self.size)));
-        }
+        // Frame ids come only from this pool's fixed residency/free sets, both
+        // of which are initialized from the arena's exact frame range.
+        assert!(
+            usize::from(frame_id) < self.size,
+            "readonly frame index out of bounds: frame_id={frame_id}, size={}",
+            self.size
+        );
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(frame_id);
         let g = self
@@ -413,7 +416,7 @@ impl ReadonlyBufferPool {
             .latch
             .optimistic_fallback_raw(mode)
             .await;
-        Ok(FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf))
+        FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf)
     }
 
     #[inline]
@@ -471,8 +474,8 @@ impl QuiescentGuard<ReadonlyBufferPool> {
     ///
     /// Add future callers with caution. This API does not provide the
     /// pre-publication validation contract of [`Self::read_validated_block`],
-    /// so pages that require page-kind validation should use the validated
-    /// entrypoint instead. If a new raw-read caller could overlap with a
+    /// so persisted formats that require content validation should use the
+    /// validated entrypoint instead. If a new raw-read caller could overlap with a
     /// validated read for the same page, revisit the inflight-load semantics
     /// before expanding this API's usage.
     #[inline]
@@ -671,8 +674,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             };
             let guard = self
                 .get_page_internal::<Page>(guard, frame_id, LatchFallbackMode::Shared)
-                .await
-                .change_context(RuntimeError::BufferPageAccess)?;
+                .await;
             if !self.validate_guarded_frame_key(&guard, key) {
                 self.invalidate_stale_mapping_if_same_frame(key, frame_id);
                 continue;
@@ -687,7 +689,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                     // became resident without miss-time validation. In current
                     // runtime usage that raw-read path is limited to CowFile
                     // super/meta-block loading, which does not overlap with the
-                    // validated page kinds that reach this branch. Drop the
+                    // validated persisted page formats that reach this branch. Drop the
                     // shared guard before invalidation so the retry loop does
                     // not contend with our own latch; revisit this synchronous
                     // path if raw readonly usage expands in the future.
@@ -993,7 +995,7 @@ impl Drop for ReadSubmission {
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(CompletionErrorBridge::capture(
-            Report::new(InternalError::CompletionDropped).attach(format!(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe)).attach(format!(
                 "drop readonly read submission before completion: key={:?}",
                 self.key
             )),
@@ -1295,7 +1297,7 @@ pub(crate) mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_TABLE_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{
-        DataIntegrityError, FileKind, LifecycleError, ResourceError, RuntimeError, RuntimeResult,
+        DataIntegrityError, LifecycleError, ResourceError, RuntimeError, RuntimeResult,
     };
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
@@ -1308,7 +1310,7 @@ pub(crate) mod tests {
     use crate::file::fs::FileSystem;
     use crate::file::fs::tests::{TestFileSystem, build_test_fs_owner_in};
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::file::{CATALOG_MTB_FILE_ID, test_block_id, test_file_id};
+    use crate::file::{CATALOG_MTB_FILE_ID, FileKind, test_block_id, test_file_id};
     use crate::id::{RowID, TableID, TrxID};
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
@@ -1964,7 +1966,6 @@ pub(crate) mod tests {
             let shared = global
                 .get_page_internal::<Page>(&pool_guard, frame_id, LatchFallbackMode::Shared)
                 .await
-                .unwrap()
                 .lock_shared_async()
                 .await
                 .unwrap();
@@ -2383,8 +2384,7 @@ pub(crate) mod tests {
                     test_page_id(0),
                     LatchFallbackMode::Shared,
                 )
-                .await
-                .unwrap();
+                .await;
         });
     }
 

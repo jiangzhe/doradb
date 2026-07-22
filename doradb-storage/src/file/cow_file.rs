@@ -2,20 +2,24 @@ use crate::bitmap::AllocMap;
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::{ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier};
 use crate::error::{
-    CompletionResult, DataIntegrityError, DataIntegrityResult, FileKind, InternalError,
-    InternalResult, IoError, IoResult, ResourceError, ResourceResult, RuntimeError, RuntimeResult,
+    CompletionResult, DataIntegrityError, DataIntegrityResult, InternalResult, IoError, IoResult,
+    ResourceError, ResourceResult, RuntimeError, RuntimeResult,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
-use crate::file::{BlockKey, SparseFile, fsync_direct, write_direct, write_direct_with_lease};
+use crate::file::{
+    BlockKey, FileKind, SparseFile, fsync_direct, write_direct, write_direct_with_lease,
+};
 use crate::id::{BlockID, FileID, TrxID};
 use crate::io::{DirectBuf, IOClient};
+use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::trx::MAX_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
+use std::io::ErrorKind as IoErrorKind;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::{NonNull, null_mut};
@@ -259,41 +263,39 @@ impl<M> MutableCowRoot<M> {
     pub(crate) fn rebuild_alloc_map_from_reachable(
         &mut self,
         reachable: &BTreeSet<BlockID>,
-    ) -> InternalResult<usize> {
+    ) -> usize {
         let old_allocated = self.root.alloc_map.allocated();
         let rebuilt = AllocMap::new(self.root.alloc_map.len());
         assert!(rebuilt.allocate_at(usize::from(SUPER_BLOCK_ID)));
         for block_id in reachable {
             let idx = usize::from(*block_id);
-            if idx >= rebuilt.len() {
-                return Err(Report::new(InternalError::CowFileAllocationInvariant)
-                    .attach(format!(
-                        "reachable block id exceeds allocation map: block_id={block_id}, alloc_map_len={}",
-                        rebuilt.len()
-                    )));
-            }
+            assert!(
+                idx < rebuilt.len(),
+                "CoW allocation invariant violated: reachable block exceeds allocation map, block_id={block_id}, alloc_map_len={}",
+                rebuilt.len()
+            );
             if *block_id != SUPER_BLOCK_ID {
                 let allocated = rebuilt.allocate_at(idx);
-                debug_assert!(allocated);
+                assert!(
+                    allocated,
+                    "CoW allocation invariant violated: duplicate reachable block, block_id={block_id}"
+                );
             }
         }
         let meta_block_idx = usize::from(self.root.meta_block_id);
-        if meta_block_idx >= rebuilt.len() {
-            return Err(
-                Report::new(InternalError::CowFileAllocationInvariant).attach(format!(
-                    "meta block id exceeds allocation map: block_id={}, alloc_map_len={}",
-                    self.root.meta_block_id,
-                    rebuilt.len()
-                )),
-            );
-        }
+        assert!(
+            meta_block_idx < rebuilt.len(),
+            "CoW allocation invariant violated: meta block exceeds allocation map, block_id={}, alloc_map_len={}",
+            self.root.meta_block_id,
+            rebuilt.len()
+        );
         let _ = rebuilt.allocate_at(meta_block_idx);
         let new_allocated = rebuilt.allocated();
         self.root.alloc_map = rebuilt;
         self.unpublished_blocks.retain(|block_id| {
             *block_id == self.root.meta_block_id || reachable.contains(block_id)
         });
-        Ok(old_allocated.saturating_sub(new_allocated))
+        old_allocated.saturating_sub(new_allocated)
     }
 
     /// Reserve the meta block that will anchor this root publication.
@@ -697,13 +699,7 @@ impl<M> CowFile<M> {
     ) -> RuntimeResult<Option<OldCowRoot<M>>> {
         let file_id = self.file.file_id();
         let meta_block_id = new_root.root.meta_block_id;
-        self.validate_prepared_publish_root(&new_root)
-            .change_context(RuntimeError::FileRootAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=publish_file_root, file_id={file_id}, phase=validate_prepared_root, block_id={meta_block_id}"
-                )
-            })?;
+        self.assert_prepared_publish_root(&new_root);
         let meta_buf = (self.codec.build_meta_block)(&new_root.root)
             .change_context(RuntimeError::FileRootAccess)
             .attach_with(|| {
@@ -755,26 +751,33 @@ impl<M> CowFile<M> {
     }
 
     #[inline]
-    fn validate_prepared_publish_root(&self, new_root: &MutableCowRoot<M>) -> InternalResult<()> {
+    fn assert_prepared_publish_root(&self, new_root: &MutableCowRoot<M>) {
         let meta_block_id = new_root.root.meta_block_id;
         let meta_idx = usize::from(meta_block_id);
-        if meta_block_id == SUPER_BLOCK_ID
-            || meta_idx >= new_root.root.alloc_map.len()
-            || !new_root.root.alloc_map.is_allocated(meta_idx)
-            || !new_root.unpublished_blocks.contains(&meta_block_id)
-        {
-            return Err(Report::new(InternalError::CowFileAllocationInvariant).attach(format!(
-                    "prepared publish meta block is not an unpublished allocation: block_id={meta_block_id}, alloc_map_len={}",
-                    new_root.root.alloc_map.len()
-                )));
-        }
-        Ok(())
+        assert!(
+            meta_block_id != SUPER_BLOCK_ID
+                && meta_idx < new_root.root.alloc_map.len()
+                && new_root.root.alloc_map.is_allocated(meta_idx)
+                && new_root.unpublished_blocks.contains(&meta_block_id),
+            "CoW allocation invariant violated: prepared publish meta block is not an unpublished allocation, file_id={}, block_id={meta_block_id}, alloc_map_len={}",
+            self.file.file_id(),
+            new_root.root.alloc_map.len()
+        );
     }
 
     /// Delete underlying file by fd path.
     #[inline]
     pub(crate) fn delete(self) {
-        let _ = remove_file_by_fd(self.file.as_raw_fd());
+        let file_id = self.file.file_id();
+        if let Err(report) = remove_file_by_fd(self.file.as_raw_fd()) {
+            if report.current_context().kind() == IoErrorKind::NotFound {
+                return;
+            }
+            let report = report.attach(format!("operation=delete_cow_file, file_id={file_id}"));
+            obs::error!(
+                "event=file_cleanup component=cow_file action=unlink result=error error={report:?}"
+            );
+        }
     }
 
     /// Pick latest valid super block from the reserved super-block image.
@@ -922,7 +925,8 @@ fn remove_file_by_fd(fd: RawFd) -> IoResult<()> {
 pub(crate) mod tests {
     use super::{ActiveRoot, MutableCowRoot, SUPER_BLOCK_ID, validate_active_meta_block_id};
     use crate::bitmap::AllocMap;
-    use crate::error::{DataIntegrityError, FileKind, InternalError};
+    use crate::error::DataIntegrityError;
+    use crate::file::FileKind;
     use crate::id::{BlockID, TrxID};
     use crate::map::FastHashMap;
     use std::collections::BTreeSet;
@@ -972,7 +976,7 @@ pub(crate) mod tests {
         root.unpublished_blocks.insert(BlockID::new(7));
 
         let reachable = BTreeSet::from([BlockID::new(2)]);
-        let reclaimed = root.rebuild_alloc_map_from_reachable(&reachable).unwrap();
+        let reclaimed = root.rebuild_alloc_map_from_reachable(&reachable);
 
         assert_eq!(reclaimed, 1);
         assert!(
@@ -1001,7 +1005,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rebuild_alloc_map_rejects_out_of_range_meta_block_id() {
+    #[should_panic(
+        expected = "CoW allocation invariant violated: meta block exceeds allocation map"
+    )]
+    fn rebuild_alloc_map_asserts_out_of_range_meta_block_id() {
         let alloc_map = AllocMap::new(8);
         assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
 
@@ -1012,14 +1019,7 @@ pub(crate) mod tests {
             alloc_map,
             (),
         ));
-        let err = root
-            .rebuild_alloc_map_from_reachable(&BTreeSet::new())
-            .unwrap_err();
-
-        assert_eq!(
-            err.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::CowFileAllocationInvariant)
-        );
+        root.rebuild_alloc_map_from_reachable(&BTreeSet::new());
     }
 
     #[inline]

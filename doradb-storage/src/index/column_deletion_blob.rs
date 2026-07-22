@@ -1,14 +1,14 @@
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, FileKind, InternalError, InternalResult,
-    MultiDomainResultExt, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, RuntimeError,
+    RuntimeOrFatalResult, RuntimeResult,
 };
-use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_DELETION_BLOB_BLOCK_SPEC, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::file::{FileKind, SparseFile};
 use crate::id::BlockID;
 use crate::io::DirectBuf;
 use crate::quiescent::QuiescentGuard;
@@ -71,22 +71,23 @@ impl ColumnAuxBlobHeader {
         codec_version: u8,
         flags: u8,
         payload_len: usize,
-    ) -> InternalResult<Self> {
-        if payload_len == 0 || payload_len > u32::MAX as usize {
-            return Err(column_deletion_blob_invariant());
-        }
-        Ok(ColumnAuxBlobHeader {
+    ) -> Self {
+        assert!(
+            payload_len != 0 && payload_len <= u32::MAX as usize,
+            "column deletion-blob invariant violated: payload length {payload_len} is not representable"
+        );
+        ColumnAuxBlobHeader {
             blob_kind,
             codec_kind,
             codec_version,
             flags,
             payload_len: payload_len as u32,
-        })
+        }
     }
 
     /// Creates a header for row-id-delta delete payload bytes.
     #[inline]
-    pub(crate) fn delete_payload(payload_len: usize) -> InternalResult<Self> {
+    pub(crate) fn delete_payload(payload_len: usize) -> Self {
         Self::new(
             COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
             COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST,
@@ -225,14 +226,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
     /// Appends one framed delete payload and returns the persisted blob
     /// reference.
     pub(super) async fn append_delete_payload(&mut self, bytes: &[u8]) -> RuntimeResult<BlobRef> {
-        let header = ColumnAuxBlobHeader::delete_payload(bytes.len())
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=append_column_delete_payload, byte_len={}",
-                    bytes.len()
-                )
-            })?;
+        let header = ColumnAuxBlobHeader::delete_payload(bytes.len());
         self.append_framed_blob(header, bytes).await
     }
 
@@ -241,22 +235,23 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         header: ColumnAuxBlobHeader,
         bytes: &[u8],
     ) -> RuntimeResult<BlobRef> {
-        let framed_len = COLUMN_AUX_BLOB_HEADER_SIZE + bytes.len();
-        if framed_len > u32::MAX as usize {
-            return Err(column_deletion_blob_invariant()
-                .change_context(RuntimeError::IndexAccess)
-                .attach(format!(
-                    "operation=append_column_deletion_blob, framed_len={framed_len}"
-                )));
-        }
+        let framed_len = COLUMN_AUX_BLOB_HEADER_SIZE
+            .checked_add(bytes.len())
+            .unwrap_or_else(|| {
+                panic!("column deletion-blob invariant violated: framed length overflow")
+            });
+        assert!(
+            framed_len <= u32::MAX as usize,
+            "column deletion-blob invariant violated: framed length {framed_len} exceeds u32 storage"
+        );
         self.ensure_current_block()?;
         let (start_block_id, start_offset) = {
-            let current = self.current_page.as_ref().ok_or_else(|| {
-                Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                    .attach("current block missing after ensure_current_block")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=append_column_deletion_blob")
-            })?;
+            // `ensure_current_block` either installs a writable page or
+            // returns the allocation failure before control reaches here.
+            let current = self
+                .current_page
+                .as_ref()
+                .expect("column deletion blob current page missing after successful ensure");
             (current.block_id, current.used_size)
         };
         let header_bytes = header.encode();
@@ -287,14 +282,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
                 &mut sealed.page.buf.data_mut()[BLOCK_INTEGRITY_HEADER_SIZE..payload_end],
                 sealed.next_block_id,
                 sealed.page.used_size,
-            )
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=finish_column_deletion_blob, block_id={}",
-                    sealed.page.block_id
-                )
-            })?;
+            );
             write_block_checksum(sealed.page.buf.data_mut());
             writes.push(
                 self.mutable_file
@@ -330,24 +318,19 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
             let free_space = self
                 .current_page
                 .as_ref()
-                .ok_or_else(|| {
-                    Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                        .attach("current page missing while writing stream")
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=write_column_deletion_blob_stream")
-                })?
+                // The append path ensures the first page and every roll
+                // replaces the taken page before the next loop iteration.
+                .expect("column deletion blob current page missing while writing stream")
                 .free_space();
             if free_space == 0 {
                 self.roll_to_next_block()?;
                 continue;
             }
             let take = bytes.len().min(free_space);
-            let current = self.current_page.as_mut().ok_or_else(|| {
-                Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                    .attach("current page missing before write")
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=write_column_deletion_blob_stream")
-            })?;
+            let current = self
+                .current_page
+                .as_mut()
+                .expect("column deletion blob current page missing before write");
             current.write_bytes(&bytes[..take]);
             bytes = &bytes[take..];
         }
@@ -360,14 +343,12 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
             .allocate_block()
             .change_context(RuntimeError::IndexAccess)
             .attach("operation=roll_column_deletion_blob_block")?;
-        let page = self.current_page.take().ok_or_else(|| {
-            Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                .attach("current block missing during block roll")
-                .change_context(RuntimeError::IndexAccess)
-                .attach(format!(
-                    "operation=roll_column_deletion_blob_block, next_block_id={next_block_id}"
-                ))
-        })?;
+        // Rolls are requested only after observing a full current page; the
+        // new allocation above cannot invalidate that writer state.
+        let page = self
+            .current_page
+            .take()
+            .expect("column deletion blob current page missing during block roll");
         self.sealed_pages.push(SealedBlobPage {
             page,
             next_block_id,
@@ -629,11 +610,6 @@ pub(crate) fn validate_persisted_blob_page(
         .map(|_| ())
 }
 
-#[inline]
-fn column_deletion_blob_invariant() -> Report<InternalError> {
-    Report::new(InternalError::ColumnDeletionBlobInvariant)
-}
-
 fn decode_blob_page_header(page: &[u8]) -> DataIntegrityResult<BlobPageHeader> {
     let next_block_id = u64::from_le_bytes(
         page[COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET
@@ -677,20 +653,16 @@ fn validated_blob_page_payload(page: &[u8]) -> &[u8] {
     &page[payload_start..payload_end]
 }
 
-fn encode_blob_page_header(
-    buf: &mut [u8],
-    next_block_id: BlockID,
-    used_size: usize,
-) -> InternalResult<()> {
-    if used_size > COLUMN_DELETION_BLOB_PAGE_BODY_SIZE {
-        return Err(column_deletion_blob_invariant());
-    }
+fn encode_blob_page_header(buf: &mut [u8], next_block_id: BlockID, used_size: usize) {
+    assert!(
+        used_size <= COLUMN_DELETION_BLOB_PAGE_BODY_SIZE,
+        "column deletion-blob invariant violated: used size {used_size} exceeds body capacity {COLUMN_DELETION_BLOB_PAGE_BODY_SIZE}"
+    );
     buf[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
     buf[COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET..COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET + 8]
         .copy_from_slice(&next_block_id.to_le_bytes());
     buf[COLUMN_DELETION_BLOB_USED_SIZE_OFFSET..COLUMN_DELETION_BLOB_USED_SIZE_OFFSET + 2]
         .copy_from_slice(&(used_size as u16).to_le_bytes());
-    Ok(())
 }
 
 #[cfg(test)]
@@ -722,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_blob_header_roundtrip() {
-        let header = ColumnAuxBlobHeader::delete_payload(27).unwrap();
+        let header = ColumnAuxBlobHeader::delete_payload(27);
         let bytes = header.encode();
         let decoded = ColumnAuxBlobHeader::decode(&bytes).unwrap();
         assert_eq!(decoded, header);
@@ -773,10 +745,7 @@ mod tests {
                 &disk_pool_guard,
             );
             let (header, payload) = reader.read_framed_blob(blob_ref).await.unwrap();
-            assert_eq!(
-                header,
-                ColumnAuxBlobHeader::delete_payload(blob.len()).unwrap()
-            );
+            assert_eq!(header, ColumnAuxBlobHeader::delete_payload(blob.len()));
             assert_eq!(payload, blob);
         });
     }
@@ -863,10 +832,7 @@ mod tests {
                 &disk_pool_guard,
             );
             let (header, payload) = reader.read_framed_blob(blob_ref).await.unwrap();
-            assert_eq!(
-                header,
-                ColumnAuxBlobHeader::delete_payload(blob.len()).unwrap()
-            );
+            assert_eq!(header, ColumnAuxBlobHeader::delete_payload(blob.len()));
             assert_eq!(payload, blob);
         });
     }
@@ -962,11 +928,11 @@ mod tests {
                 reader.read_framed_blob(second_ref).await.unwrap();
             assert_eq!(
                 first_header,
-                ColumnAuxBlobHeader::delete_payload(first_blob.len()).unwrap()
+                ColumnAuxBlobHeader::delete_payload(first_blob.len())
             );
             assert_eq!(
                 second_header,
-                ColumnAuxBlobHeader::delete_payload(second_blob.len()).unwrap()
+                ColumnAuxBlobHeader::delete_payload(second_blob.len())
             );
             assert_eq!(first_payload, first_blob);
             assert_eq!(second_payload, second_blob);

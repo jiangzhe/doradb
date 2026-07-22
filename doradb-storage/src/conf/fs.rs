@@ -1,5 +1,5 @@
 use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
-use crate::error::{ConfigError, ConfigResult, Error, Result};
+use crate::error::{ConfigError, ConfigResult, IoResult};
 use crate::file::fs::{FileSystem, StorageIOWorkerBuilder, build_file_system};
 use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,14 @@ pub struct FileSystemConfig {
     pub readonly_buffer_size: usize,
     /// Catalog multi-table file name.
     pub catalog_file_name: String,
+}
+
+/// Validated construction inputs for the table and catalog file system.
+#[derive(Debug)]
+pub(crate) struct ValidatedFileSystemConfig {
+    io_depth: usize,
+    data_dir: PathBuf,
+    catalog_file_name: String,
 }
 
 impl FileSystemConfig {
@@ -53,7 +61,7 @@ impl FileSystemConfig {
     }
 
     #[inline]
-    fn validate_parts(self) -> ConfigResult<(PathBuf, String, usize)> {
+    pub(crate) fn validate(self) -> ConfigResult<ValidatedFileSystemConfig> {
         if !validate_catalog_file_name(&self.catalog_file_name) {
             return Err(
                 Report::new(ConfigError::InvalidCatalogFileName).attach(format!(
@@ -64,14 +72,19 @@ impl FileSystemConfig {
         }
         let data_dir = validate_data_dir(&self.data_dir)
             .attach_with(|| format!("invalid data_dir: {}", self.data_dir.display()))?;
-        Ok((data_dir, self.catalog_file_name, self.io_depth))
+        Ok(ValidatedFileSystemConfig {
+            io_depth: self.io_depth,
+            data_dir,
+            catalog_file_name: self.catalog_file_name,
+        })
     }
+}
 
+impl ValidatedFileSystemConfig {
     /// Build the table file-system and its storage IO worker.
     #[inline]
-    pub(crate) fn build_engine_parts(self) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
-        let (data_dir, catalog_file_name, io_depth) = self.validate_parts().map_err(Error::from)?;
-        build_file_system(io_depth, data_dir, catalog_file_name)
+    pub(crate) fn build_engine_parts(self) -> IoResult<(FileSystem, StorageIOWorkerBuilder)> {
+        build_file_system(self.io_depth, self.data_dir, self.catalog_file_name)
     }
 }
 
@@ -125,7 +138,7 @@ mod tests {
     fn test_file_system_config_validation_reports_details() {
         let err = FileSystemConfig::default()
             .catalog_file_name("catalog.bin")
-            .validate_parts()
+            .validate()
             .unwrap_err();
         assert_config_report(
             err,

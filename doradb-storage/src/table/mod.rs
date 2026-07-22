@@ -49,6 +49,7 @@ use crate::index::{
     UniqueMemIndex,
 };
 use crate::map::FastHashMap;
+use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{RowUpdateInput, RowUpdateView, SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
@@ -528,27 +529,19 @@ impl Table {
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let meta_pool_guard = guards
-            .try_guard(PoolRole::Meta)
-            .ok_or_else(|| {
-                Report::new(InternalError::PoolGuardMissing).attach(format!(
-                    "operation=table_mem_scan, table_id={}, missing meta pool guard",
-                    self.table_id()
-                ))
-            })
-            .change_context(RuntimeError::TableAccess)?;
+        // Admitted table scans always carry the metadata guard; catalog-only
+        // bundles are partial only for roles the catalog does not access.
+        let meta_pool_guard = guards.meta_guard();
         let pivot_row_id = self.mem.pivot_row_id();
         let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(pivot_row_id).await?;
         while let Some(leaf) = cursor.next().await? {
-            let Some(g) = leaf.lock_shared_async().await else {
-                return Err(Report::new(InternalError::BlockIndexLeafStale)
-                    .attach(format!(
-                        "operation=table_mem_scan, table_id={}, stale block-index leaf lock",
-                        self.table_id()
-                    ))
-                    .change_context(RuntimeError::TableAccess));
-            };
+            let g = leaf.lock_shared_async().await.unwrap_or_else(|| {
+                panic!(
+                    "cursor-held row-page-index leaf could not be locked: operation=table_mem_scan, table_id={}",
+                    self.table_id()
+                )
+            });
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
             for page_entry in entries {
@@ -903,8 +896,17 @@ impl SecondaryIndexScopedBuilder {
     #[inline]
     async fn rollback(&mut self, pool_guard: &PoolGuard) {
         for index in take(&mut self.staged).into_iter().rev().flatten() {
-            // Keep the original construction error as the function result.
-            let _ = index.destroy(pool_guard).await;
+            let index_no = index.index_no();
+            // Keep the original construction error as the function result,
+            // but observe this terminal best-effort cleanup report first.
+            if let Err(report) = index.destroy(pool_guard).await {
+                let report = report.attach(format!(
+                    "operation=rollback_secondary_index_build, index_no={index_no}"
+                ));
+                obs::error!(
+                    "event=secondary_index_cleanup component=table action=destroy_staged result=error error={report:?}"
+                );
+            }
         }
     }
 
@@ -1093,24 +1095,31 @@ fn unique_key_from_full_row(
     unique_index_no: usize,
     cols: &[Val],
     operation: &'static str,
-) -> InternalResult<SelectKey> {
+) -> SelectKey {
     debug_assert!(cols.len() == metadata.col.col_count());
     debug_assert!(
         cols.iter()
             .enumerate()
             .all(|(idx, val)| metadata.col.col_type_match(idx, val))
     );
-    let index_spec = metadata.idx.require_index_spec(unique_index_no)?;
-    if !index_spec.unique() {
-        return Err(Report::new(InternalError::SecondaryIndexKindMismatch)
-            .attach(format!("operation={operation}, expected=unique")));
-    }
+    let index_spec = metadata
+        .idx
+        .index_spec(unique_index_no)
+        .unwrap_or_else(|| {
+            panic!(
+                "unique-key construction requires an active index: operation={operation}, index_no={unique_index_no}"
+            )
+        });
+    assert!(
+        index_spec.unique(),
+        "unique-key construction requires a unique index: operation={operation}, index_no={unique_index_no}"
+    );
     let vals = index_spec
         .cols
         .iter()
         .map(|key| cols[key.col_no as usize].clone())
         .collect();
-    Ok(SelectKey::new(unique_index_no, vals))
+    SelectKey::new(unique_index_no, vals)
 }
 
 #[inline]
@@ -1131,13 +1140,13 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        CompletionErrorBridge, DataIntegrityError, Error, FatalError, FileKind, OperationError,
-        Result, RuntimeResult,
+        CompletionErrorBridge, DataIntegrityError, Error, FatalError, OperationError, Result,
+        RuntimeResult,
     };
-    use crate::file::SparseFile;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::ActiveRoot;
+    use crate::file::{FileKind, SparseFile};
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex,

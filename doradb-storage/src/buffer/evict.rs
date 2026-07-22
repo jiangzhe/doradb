@@ -7,9 +7,7 @@ use crate::buffer::evictor::{
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
 use crate::buffer::load::{PageReservation, PageReservationGuard};
-use crate::buffer::page::{
-    BufferPage, IOKind, PAGE_SIZE, Page, PageIO, VersionedPageID, validate_frame_page_kind,
-};
+use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
     BufferPool, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
@@ -549,11 +547,6 @@ impl BufferPool for EvictableBufferPool {
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
-            if frame.kind() != FrameKind::Uninitialized {
-                validate_frame_page_kind::<T>(frame)
-                    .change_context(RuntimeError::BufferPageAccess)
-                    .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
-            }
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
@@ -561,9 +554,6 @@ impl BufferPool for EvictableBufferPool {
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
-                    validate_frame_page_kind::<T>(guard.bf())
-                        .change_context(RuntimeError::BufferPageAccess)
-                        .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
                     self.stats.record_cache_hit();
                     return Ok(guard);
                 }
@@ -577,9 +567,6 @@ impl BufferPool for EvictableBufferPool {
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
-                    validate_frame_page_kind::<T>(guard.bf())
-                        .change_context(RuntimeError::BufferPageAccess)
-                        .attach_with(|| self.page_operation_diagnostic("get_page", page_id))?;
                     self.stats.record_cache_hit();
                     return Ok(guard);
                 }
@@ -631,15 +618,6 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
-                    validate_frame_page_kind::<T>(bf)
-                        .change_context(RuntimeError::BufferPageAccess)
-                        .attach_with(|| {
-                            format!(
-                                "{}, generation={}",
-                                self.page_operation_diagnostic("get_page_versioned", id.page_id),
-                                id.generation
-                            )
-                        })?;
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
@@ -658,15 +636,6 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
-                    validate_frame_page_kind::<T>(bf)
-                        .change_context(RuntimeError::BufferPageAccess)
-                        .attach_with(|| {
-                            format!(
-                                "{}, generation={}",
-                                self.page_operation_diagnostic("get_page_versioned", id.page_id),
-                                id.generation
-                            )
-                        })?;
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
@@ -701,7 +670,7 @@ impl BufferPool for EvictableBufferPool {
         let page_id = g.page_id();
         g.page_mut().zero(); // zero the page
         g.bf_mut().ctx = None;
-        T::deinit_frame(g.bf_mut());
+        g.bf_mut().set_kind(FrameKind::Uninitialized);
         g.bf_mut().bump_generation();
         self.in_mem.unpin(page_id);
         self.in_mem.mark_page_dontneed(g);
@@ -721,17 +690,6 @@ impl BufferPool for EvictableBufferPool {
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
-            if frame.kind() != FrameKind::Uninitialized {
-                validate_frame_page_kind::<T>(frame)
-                    .change_context(RuntimeError::BufferPageAccess)
-                    .attach_with(|| {
-                        format!(
-                            "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
-                            pool_role_name(self.role),
-                            p_guard.page_id()
-                        )
-                    })?;
-            }
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
@@ -743,15 +701,6 @@ impl BufferPool for EvictableBufferPool {
                     // page is acquired.
                     if p_guard.validate_bool() {
                         let child = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
-                        validate_frame_page_kind::<T>(child.bf())
-                            .change_context(RuntimeError::BufferPageAccess)
-                            .attach_with(|| {
-                                format!(
-                                    "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
-                                    pool_role_name(self.role),
-                                    p_guard.page_id()
-                                )
-                            })?;
                         self.stats.record_cache_hit();
                         return Ok(Valid(child));
                     }
@@ -779,17 +728,6 @@ impl BufferPool for EvictableBufferPool {
                         ))
                     });
                     if matches!(validated, Validation::Valid(_)) {
-                        if let Validation::Valid(child) = &validated {
-                            validate_frame_page_kind::<T>(child.bf())
-                                .change_context(RuntimeError::BufferPageAccess)
-                                .attach_with(|| {
-                                    format!(
-                                        "buffer_pool_type=evictable, buffer_pool_role={}, operation=get_child_page, parent_page_id={}, child_page_id={page_id}",
-                                        pool_role_name(self.role),
-                                        p_guard.page_id()
-                                    )
-                                })?;
-                        }
                         self.stats.record_cache_hit();
                     }
                     return Ok(validated);
@@ -1646,7 +1584,7 @@ impl Drop for EvictReadSubmission {
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
         self.complete_waiters(Err(CompletionErrorBridge::capture(
-            Report::new(InternalError::CompletionDropped).attach(format!(
+            Report::new(IoError::from(IoErrorKind::BrokenPipe)).attach(format!(
                 "drop evict read submission before completion: page_id={}",
                 self.key
             )),
@@ -1930,12 +1868,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::EvictionArbiterBuilder;
     use crate::buffer::guard::PageGuard;
-    use crate::buffer::page::BufferPageKind;
     use crate::buffer::test_page_id;
     use crate::component::{IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{ConfigError, DataIntegrityError, Result};
+    use crate::error::{ConfigError, DataIntegrityError, DiscloseResultExt, Result};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_TRAILER_SIZE, checksum_offset as block_checksum_offset,
         validate_block_checksum as validate_block_checksum_for_test,
@@ -1945,7 +1882,6 @@ pub(crate) mod tests {
     use crate::file::fs::tests::{
         build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
     };
-    use crate::index::BTreeNode;
     use crate::io::BackendError;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
@@ -2034,19 +1970,6 @@ pub(crate) mod tests {
             thread::sleep(TEST_WAIT_INTERVAL);
         }
         panic!("condition was not satisfied before timeout");
-    }
-
-    fn assert_internal_error<T>(result: RuntimeResult<T>) {
-        match result {
-            Ok(_) => panic!("expected internal buffer-page kind mismatch"),
-            Err(err) => {
-                assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
-                assert_eq!(
-                    err.downcast_ref::<InternalError>().copied(),
-                    Some(InternalError::BufferPageKindMismatch)
-                );
-            }
-        }
     }
 
     fn assert_pending_once<F: Future>(future: Pin<&mut F>) {
@@ -2211,7 +2134,7 @@ pub(crate) mod tests {
         };
         let fs_owner = build_test_fs_owner_in(&storage_root)?;
         let fs = fs_owner.guard();
-        let (pool, storage) = EvictableBufferPool::create(config, fs)?;
+        let (pool, storage) = EvictableBufferPool::create(config, fs).disclose()?;
         Ok((fs_owner, pool, storage))
     }
 
@@ -2639,15 +2562,12 @@ pub(crate) mod tests {
                     .max_file_size(1024u64 * 1024 * 256),
             );
             let pool_guard = pool.pool_guard();
-            let mut page_guard = pool
+            let page_guard = pool
                 .allocate_page::<RowPage>(&pool_guard)
                 .await
                 .expect("test page allocation should succeed");
             let versioned = page_guard.versioned_page_id();
 
-            page_guard
-                .bf_mut()
-                .set_page_kind(BufferPageKind::Uninitialized);
             let mut get_page_versioned = Box::pin(pool.get_page_versioned::<RowPage>(
                 &pool_guard,
                 versioned,
@@ -2774,43 +2694,6 @@ pub(crate) mod tests {
 
             let page_guard = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
             assert_eq!(page_guard.page()[0], 0);
-        });
-    }
-
-    #[test]
-    fn test_evictable_buffer_pool_rejects_evicted_page_kind_mismatch_before_reload() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
-            let pool_guard = pool.pool_guard();
-            let page = pool
-                .allocate_page::<RowPage>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = page.page_id();
-            drop(page);
-
-            let mut raw_page = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
-            raw_page.bf_mut().set_kind(FrameKind::Evicting);
-            pool.in_mem.evict_page(raw_page);
-            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
-
-            let baseline = pool.stats();
-            assert_internal_error(
-                pool.get_page::<BTreeNode>(&pool_guard, page_id, LatchFallbackMode::Shared)
-                    .await,
-            );
-            let delta = pool.stats().delta_since(baseline);
-            assert_eq!(delta.cache_misses, 0);
-            assert_eq!(delta.queued_reads, 0);
-            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
         });
     }
 
@@ -3669,7 +3552,12 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let mut builder = RegistryBuilder::new();
             builder
-                .build::<FileSystem>(FileSystemConfig::default().data_dir(temp_dir.path()))
+                .build::<FileSystem>(
+                    FileSystemConfig::default()
+                        .data_dir(temp_dir.path())
+                        .validate()
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             let err = builder
@@ -3693,7 +3581,12 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let mut builder = RegistryBuilder::new();
             builder
-                .build::<FileSystem>(FileSystemConfig::default().data_dir(temp_dir.path()))
+                .build::<FileSystem>(
+                    FileSystemConfig::default()
+                        .data_dir(temp_dir.path())
+                        .validate()
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             let err = builder

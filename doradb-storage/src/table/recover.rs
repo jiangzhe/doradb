@@ -153,16 +153,7 @@ impl Table {
         let page_guard = self.mem.must_get_row_page_shared(guards, page_id).await?;
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
-        let index_pool_guard = self
-            .mem
-            .index_pool_guard(guards)
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=populate_index_via_row_page, table_id={}, page_id={page_id}",
-                    self.table_id()
-                )
-            })?;
+        let index_pool_guard = self.mem.index_pool_guard(guards);
         for (index_no, index_spec) in metadata.idx.active_indexes() {
             let sec_idx = layout
                 .secondary_index(index_no)

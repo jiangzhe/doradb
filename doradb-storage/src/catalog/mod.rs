@@ -734,25 +734,38 @@ impl Catalog {
 
     /// Restore a detached dropped runtime after purge observes stale handles.
     #[inline]
-    pub(crate) fn restore_dropped_runtime(&self, item: DroppedTableRuntime) -> bool {
-        match self.user_tables.entry(item.table_id) {
+    pub(crate) fn restore_dropped_runtime(&self, item: DroppedTableRuntime) {
+        let table_id = item.table_id;
+        let drop_cts = item.drop_cts;
+        let replay_floor = item.replay_floor;
+        match self.user_tables.entry(table_id) {
             Occupied(mut entry) => match entry.get() {
                 UserTableEntry::DroppedFloor {
-                    drop_cts,
-                    replay_floor,
-                } if *drop_cts == item.drop_cts && *replay_floor == item.replay_floor => {
+                    drop_cts: observed_drop_cts,
+                    replay_floor: observed_replay_floor,
+                } if *observed_drop_cts == drop_cts && *observed_replay_floor == replay_floor => {
                     entry.insert(UserTableEntry::DroppedRuntime {
                         table: item.table,
-                        drop_cts: item.drop_cts,
-                        replay_floor: item.replay_floor,
+                        drop_cts,
+                        replay_floor,
                     });
-                    true
                 }
-                UserTableEntry::Live { .. }
-                | UserTableEntry::DroppedRuntime { .. }
-                | UserTableEntry::DroppedFloor { .. } => false,
+                UserTableEntry::Live { .. } => panic!(
+                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=live"
+                ),
+                UserTableEntry::DroppedRuntime { .. } => panic!(
+                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=dropped_runtime"
+                ),
+                UserTableEntry::DroppedFloor {
+                    drop_cts: observed_drop_cts,
+                    replay_floor: observed_replay_floor,
+                } => panic!(
+                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=dropped_floor(observed_drop_cts={observed_drop_cts}, observed_replay_floor={observed_replay_floor:?})"
+                ),
             },
-            Vacant(_) => false,
+            Vacant(_) => panic!(
+                "purge must retain a dropped floor while a detached runtime is checked for stale handles: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=vacant"
+            ),
         }
     }
 

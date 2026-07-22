@@ -1,7 +1,7 @@
 //! B+Tree index is the most commonly used data structure for database indexing.
 //! This module provide an implementation of B+Tree backed by buffer pool and hybrid latch.
 
-use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page};
+use crate::buffer::page::{BufferPage, PAGE_SIZE, assert_buffer_page};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_TRAILER_SIZE, BlockIntegrityTrailer};
 use crate::id::{PageID, TrxID};
 use crate::index::btree::BTreeKey;
@@ -391,9 +391,7 @@ pub(crate) struct BTreeNode {
 // SAFETY: `BTreeNode` is an explicit `repr(C)` page image, derives the
 // required zerocopy layout traits, has no drop glue, and is mutated only while
 // protected by the buffer-pool/index latch protocol.
-unsafe impl BufferPage for BTreeNode {
-    const KIND: BufferPageKind = BufferPageKind::BTreeNode;
-}
+unsafe impl BufferPage for BTreeNode {}
 
 impl BTreeNode {
     /// Initialize B-Tree node.

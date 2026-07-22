@@ -536,7 +536,7 @@ impl BTreeSlotCallback for CollectEncodedExactEntries<'_> {
     #[inline]
     fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> RuntimeResult<bool> {
         // In-memory BTree slot data has already been validated by the scanner.
-        push_non_unique_encoded_entry(node, slot, self.0)?;
+        push_non_unique_encoded_entry(node, slot, self.0);
         Ok(true)
     }
 }
@@ -545,7 +545,6 @@ impl BTreeSlotCallback for CollectEncodedExactEntries<'_> {
 mod tests {
     use super::*;
     use crate::buffer::{FixedBufferPool, PoolRole};
-    use crate::error::InternalError;
     use crate::index::btree::BTree;
     use crate::index::util::tests::drain_row_ids;
     use crate::quiescent::QuiescentBox;
@@ -650,7 +649,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_encoded_entries_propagates_malformed_exact_key() {
+    #[should_panic(expected = "non-unique MemIndex key is missing its row-id suffix")]
+    fn test_lookup_encoded_entries_asserts_malformed_exact_key() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
@@ -689,14 +689,10 @@ mod tests {
                 .await
                 .expect("test btree insert should succeed");
 
-            let err = index
+            let _ = index
                 .lookup_encoded_entries(&pool_guard, &key)
                 .await
-                .expect_err("malformed exact key should fail encoded-entry lookup");
-            assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::MemIndexKeyMalformed)
-            );
+                .unwrap();
         })
     }
 

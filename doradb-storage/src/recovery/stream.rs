@@ -1,6 +1,5 @@
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, InternalError, InternalResult, IoError, IoResult,
-    RuntimeError, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, IoError, IoResult, RuntimeError, RuntimeResult,
 };
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::id::TrxID;
@@ -583,12 +582,10 @@ impl RedoLogStream {
     /// Try to read the next transaction redo record, reading direct-IO blocks on demand.
     #[inline]
     pub(crate) async fn try_next(&mut self) -> RuntimeResult<Option<TrxLog>> {
-        if self.state == RedoLogStreamState::Failed {
-            return Err(Report::new(InternalError::RedoReadProtocolInvariant)
-                .attach("redo stream read after terminal error")
-                .change_context(RuntimeError::RedoLogAccess)
-                .attach("operation=read_redo_stream"));
-        }
+        assert!(
+            self.state != RedoLogStreamState::Failed,
+            "redo read-protocol invariant violated: stream read after terminal error"
+        );
         match self.buffer.pop_front() {
             res @ Some(_) => Ok(res),
             None => {
@@ -604,12 +601,9 @@ impl RedoLogStream {
             match self.state {
                 RedoLogStreamState::Active => {}
                 RedoLogStreamState::Ended => return Ok(None),
-                RedoLogStreamState::Failed => {
-                    return Err(Report::new(InternalError::RedoReadProtocolInvariant)
-                        .attach("redo stream read after terminal error")
-                        .change_context(RuntimeError::RedoLogAccess)
-                        .attach("operation=read_redo_stream"));
-                }
+                RedoLogStreamState::Failed => panic!(
+                    "redo read-protocol invariant violated: stream read after terminal error"
+                ),
             }
             let mut state = match self.current_segment.take() {
                 Some(state) => state,
@@ -655,17 +649,13 @@ impl RedoLogStream {
             RedoReadItem::Error(err) => Err(err),
             RedoReadItem::Block { buf, .. } => {
                 self.recycle_buf(buf);
-                Err(Report::new(InternalError::RedoReadProtocolInvariant)
-                    .attach("redo read-ahead emitted block before segment start")
-                    .change_context(RuntimeError::RedoLogAccess)
-                    .attach("operation=receive_redo_segment"))
+                panic!(
+                    "redo read-protocol invariant violated: worker emitted block before segment start"
+                );
             }
-            RedoReadItem::SegmentEnd { .. } => {
-                Err(Report::new(InternalError::RedoReadProtocolInvariant)
-                    .attach("redo read-ahead emitted segment end before segment start")
-                    .change_context(RuntimeError::RedoLogAccess)
-                    .attach("operation=receive_redo_segment"))
-            }
+            RedoReadItem::SegmentEnd { .. } => panic!(
+                "redo read-protocol invariant violated: worker emitted segment end before segment start"
+            ),
         }
     }
 
@@ -826,18 +816,14 @@ impl RedoLogStream {
 
     #[inline]
     async fn recv_item(&mut self) -> RuntimeResult<RedoReadItem> {
-        let reader = self.reader.as_ref().ok_or_else(|| {
-            Report::new(InternalError::RedoReadProtocolInvariant)
-                .attach("redo read-ahead receive before worker start")
-                .change_context(RuntimeError::RedoLogAccess)
-                .attach("operation=receive_redo_item")
-        })?;
-        reader.items.recv_async().await.map_err(|_| {
-            Report::new(InternalError::RedoReadProtocolInvariant)
-                .attach("redo read-ahead worker channel closed")
-                .change_context(RuntimeError::RedoLogAccess)
-                .attach("operation=receive_redo_item")
-        })
+        let reader = self.reader.as_ref().unwrap_or_else(|| {
+            panic!("redo read-protocol invariant violated: receive before worker start")
+        });
+        Ok(reader.items.recv_async().await.unwrap_or_else(|_| {
+            panic!(
+                "redo read-protocol invariant violated: worker channel closed without terminal item"
+            )
+        }))
     }
 
     #[inline]
@@ -1103,12 +1089,10 @@ impl RedoReadAheadWorker {
                 let buf = self.take_buf(log_block_size);
                 let submission =
                     RedoReadSubmission::new(file_seq, next_submit_offset, file.as_raw_fd(), buf);
-                if driver.push(submission).is_err() {
-                    return Err(Report::new(InternalError::RedoReadProtocolInvariant)
-                        .attach("redo read-ahead driver rejected submission despite capacity")
-                        .change_context(RuntimeError::RedoLogAccess)
-                        .attach("operation=submit_redo_read"));
-                }
+                assert!(
+                    driver.push(submission).is_ok(),
+                    "redo read-protocol invariant violated: driver rejected submission despite capacity"
+                );
                 next_submit_offset =
                     next_submit_offset
                         .checked_add(log_block_size)
@@ -1178,11 +1162,7 @@ impl RedoReadAheadWorker {
                 Ok(completed) => completed,
                 Err(err) => return Err(self.handle_backend_progress_error(driver, err)),
             };
-            let completion = take_read_completion(completed_submission)
-                .change_context(RuntimeError::RedoLogAccess)
-                .attach(format!(
-                    "operation=complete_redo_read, file_seq={file_seq:08x}"
-                ))?;
+            let completion = take_read_completion(completed_submission);
             let (completed_file_seq, completed_offset, buf) =
                 match completion.validate() {
                     Ok(completed) => completed,
@@ -1195,12 +1175,9 @@ impl RedoReadAheadWorker {
                 };
             if completed_file_seq != file_seq || completed.insert(completed_offset, buf).is_some() {
                 self.drain_driver(driver);
-                return Err(Report::new(InternalError::RedoReadProtocolInvariant)
-                    .attach(format!(
-                        "redo read-ahead duplicate or mismatched completion: file_seq={completed_file_seq:08x}, offset={completed_offset}"
-                    ))
-                    .change_context(RuntimeError::RedoLogAccess)
-                    .attach("operation=order_redo_read_completions"));
+                panic!(
+                    "redo read-protocol invariant violated: duplicate or mismatched completion: expected_file_seq={file_seq:08x}, completed_file_seq={completed_file_seq:08x}, offset={completed_offset}"
+                );
             }
         }
         if self.send_item(RedoReadItem::SegmentEnd { file_seq }) {
@@ -1291,9 +1268,8 @@ impl RedoReadAheadWorker {
                 retained += self.cleanup_driver_after_backend_failure(driver);
                 break;
             };
-            if let Ok(completion) = take_read_completion(completed) {
-                drop(completion.buf);
-            }
+            let completion = take_read_completion(completed);
+            drop(completion.buf);
         }
         self.drain_recycled();
         retained
@@ -1768,22 +1744,19 @@ fn segment_scan_end_offset(segment: &RedoLogSegment) -> RuntimeResult<usize> {
 }
 
 #[inline]
-fn take_read_completion(
-    completed: CompletedSubmission<RedoReadSubmission>,
-) -> InternalResult<RedoReadCompletion> {
+fn take_read_completion(completed: CompletedSubmission<RedoReadSubmission>) -> RedoReadCompletion {
     let mut submission = completed.submission;
     let expected_bytes = submission.operation.len();
-    let buf = submission.operation.take_buf().ok_or_else(|| {
-        Report::new(InternalError::RedoReadProtocolInvariant)
-            .attach("redo direct read completion did not return owned buffer")
-    })?;
-    Ok(RedoReadCompletion {
+    let buf = submission.operation.take_buf().unwrap_or_else(|| {
+        panic!("redo read-protocol invariant violated: completion did not return owned buffer")
+    });
+    RedoReadCompletion {
         file_seq: submission.file_seq,
         offset: submission.offset,
         expected_bytes,
         actual_bytes: completed.result,
         buf,
-    })
+    }
 }
 
 #[inline]
@@ -1836,9 +1809,11 @@ mod tests {
     };
     use crate::serde::Ser;
     use crate::thread::fail_spawn_named;
+    use futures::FutureExt;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{Error as StdIoError, Write};
     use std::num::NonZeroUsize;
+    use std::panic::AssertUnwindSafe;
     use std::path::Path;
     use std::thread::spawn;
 
@@ -2193,16 +2168,21 @@ mod tests {
         assert_eq!(terminals[0].redo_range, redo_range);
     }
 
-    fn assert_read_after_failed(err: Report<RuntimeError>) {
-        assert_eq!(*err.current_context(), RuntimeError::RedoLogAccess);
-        assert_eq!(
-            err.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::RedoReadProtocolInvariant),
-            "{err:?}"
-        );
+    async fn assert_read_after_failed(stream: &mut RedoLogStream) {
+        let panic = AssertUnwindSafe(stream.try_next())
+            .catch_unwind()
+            .await
+            .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
         assert!(
-            format!("{err:?}").contains("redo stream read after terminal error"),
-            "{err:?}"
+            message.contains(
+                "redo read-protocol invariant violated: stream read after terminal error"
+            ),
+            "{message}"
         );
     }
 
@@ -2619,8 +2599,7 @@ mod tests {
             let mut stream = planned.stream;
 
             assert_stream_corrupted(&mut stream).await;
-            let err = stream.try_next().await.unwrap_err();
-            assert_read_after_failed(err);
+            assert_read_after_failed(&mut stream).await;
         });
     }
 
@@ -2641,8 +2620,7 @@ mod tests {
             ]);
 
             assert_stream_corrupted(&mut stream).await;
-            let err = stream.try_next().await.unwrap_err();
-            assert_read_after_failed(err);
+            assert_read_after_failed(&mut stream).await;
         });
     }
 
@@ -2661,8 +2639,7 @@ mod tests {
             ]);
 
             assert_stream_corrupted(&mut stream).await;
-            let err = stream.try_next().await.unwrap_err();
-            assert_read_after_failed(err);
+            assert_read_after_failed(&mut stream).await;
         });
     }
 
@@ -2795,8 +2772,7 @@ mod tests {
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
-            let err = stream.try_next().await.unwrap_err();
-            assert_read_after_failed(err);
+            assert_read_after_failed(&mut stream).await;
         });
     }
 

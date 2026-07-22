@@ -1,6 +1,6 @@
 use crate::buffer::EvictableBufferPool;
 use crate::catalog::is_catalog_table;
-use crate::error::{OperationError, OperationResult, Result};
+use crate::error::{DiscloseResultExt, OperationError, OperationResult, Result, RuntimeResult};
 use crate::id::TableID;
 use crate::index::{
     BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, OwnedSecondaryIndexCandidateStream,
@@ -115,7 +115,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
             return Ok(None);
         }
         loop {
-            let candidate = match self.next_candidate().await {
+            let candidate = match self.next_candidate().await.disclose() {
                 Ok(Some(candidate)) => candidate,
                 Ok(None) => {
                     self.exhausted = true;
@@ -127,7 +127,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
                     return Err(err);
                 }
             };
-            match self.lookup_candidate(&candidate).await {
+            match self.lookup_candidate(&candidate).await.disclose() {
                 Ok(SelectMvcc::Found(vals)) => return Ok(Some(vals)),
                 Ok(SelectMvcc::NotFound) => (),
                 Err(err) => {
@@ -139,7 +139,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
     }
 
     #[inline]
-    async fn fill_candidates(&mut self) -> Result<bool> {
+    async fn fill_candidates(&mut self) -> RuntimeResult<bool> {
         if !self.candidates.is_empty() {
             return Ok(true);
         }
@@ -160,7 +160,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
     }
 
     #[inline]
-    async fn next_candidate(&mut self) -> Result<Option<IndexLookupCandidate>> {
+    async fn next_candidate(&mut self) -> RuntimeResult<Option<IndexLookupCandidate>> {
         if self.fill_candidates().await? {
             Ok(self.candidates.pop_front())
         } else {
@@ -169,14 +169,17 @@ impl<'trx> IndexScanMvccStream<'trx> {
     }
 
     #[inline]
-    async fn lookup_candidate(&mut self, candidate: &IndexLookupCandidate) -> Result<SelectMvcc> {
+    async fn lookup_candidate(
+        &mut self,
+        candidate: &IndexLookupCandidate,
+    ) -> RuntimeResult<SelectMvcc> {
         let state = self
             .state
             .as_mut()
             .expect("stream state is present until exhaustion or error");
         let rt = state.stmt_state.runtime();
         let accessor = state.table.accessor_with_layout(&state.layout);
-        Ok(accessor
+        accessor
             .index_lookup_candidate_row_mvcc(
                 rt,
                 state.index_no,
@@ -193,7 +196,7 @@ impl<'trx> IndexScanMvccStream<'trx> {
                     state.index_no,
                     candidate.row_id
                 )
-            })?)
+            })
     }
 
     #[inline]
@@ -261,18 +264,12 @@ impl<'trx> StreamStmt<'trx> {
         let mut checkout = self
             .trx
             .checkout()
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
+            .disclose()?;
         let trx_id = checkout.inner().trx_id();
-        let stmt_no = checkout
-            .inner_mut()
-            .next_stmt_no()
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
+        let stmt_no = checkout.inner_mut().next_stmt_no();
         let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
-        let owner_group = checkout
-            .inner()
-            .checked_lock_state()
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?
-            .owner_group();
+        let owner_group = checkout.inner().checked_lock_state().owner_group();
         let stmt_locks = match owner_group {
             Some(owner_group) => OwnerLockState::new_grouped(stmt_owner, owner_group),
             None => OwnerLockState::new(stmt_owner),
@@ -280,16 +277,17 @@ impl<'trx> StreamStmt<'trx> {
         let mut stmt_state = StreamStmtState::new(checkout, stmt_locks);
         let table = stmt_state
             .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
+            .disclose()?;
         stmt_state
             .acquire_table_read_lock(table_id)
             .await
-            .attach_with(|| {
-                format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}")
-            })?;
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}"))
+            .disclose()?;
         table
             .check_foreground_live()
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))?;
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
+            .disclose()?;
         let layout = table.layout_snapshot();
         if !self.disable_validation {
             DmlValidator::new(layout.metadata())
@@ -297,9 +295,10 @@ impl<'trx> StreamStmt<'trx> {
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| {
                     format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}")
-                })?;
+                })
+                .disclose()?;
         }
-        let index = layout.secondary_index(index_no)?;
+        let index = layout.secondary_index(index_no).disclose()?;
         let unique = index.is_unique();
         let encoder = index.key_encoder();
         let range = if unique {
@@ -309,7 +308,9 @@ impl<'trx> StreamStmt<'trx> {
         };
         let rt = stmt_state.runtime();
         let accessor = table.accessor_with_layout(&layout);
-        let candidate_stream = accessor.index_scan_candidates(rt, index_no, range)?;
+        let candidate_stream = accessor
+            .index_scan_candidates(rt, index_no, range)
+            .disclose()?;
         let state = IndexScanMvccStreamState {
             stmt_state,
             table,

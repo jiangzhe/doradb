@@ -153,7 +153,7 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::tests::{open_catalog_test_engine, table1};
-    use crate::error::InternalError;
+    use crate::error::DiscloseResultExt;
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
@@ -181,13 +181,15 @@ mod tests {
                     .storage
                     .tables()
                     .insert(stmt, &table100)
-                    .await?;
+                    .await
+                    .disclose()?;
                 engine
                     .catalog()
                     .storage
                     .tables()
                     .insert(stmt, &table101)
-                    .await?;
+                    .await
+                    .disclose()?;
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(table100.table_id));
                 Ok(())
             })
@@ -203,7 +205,8 @@ mod tests {
                         .storage
                         .tables()
                         .delete_by_id(stmt, table100.table_id)
-                        .await?
+                        .await
+                        .disclose()?
                 );
                 assert!(
                     !engine
@@ -211,7 +214,8 @@ mod tests {
                         .storage
                         .tables()
                         .delete_by_id(stmt, TableID::new(999))
-                        .await?
+                        .await
+                        .disclose()?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(table100.table_id));
                 Ok(())
@@ -269,19 +273,6 @@ mod tests {
                         .is_some()
                 );
             }
-
-            let err = engine
-                .catalog()
-                .storage
-                .tables()
-                .find_uncommitted_by_id(&PoolGuards::builder().build(), table_id)
-                .await
-                .unwrap_err();
-            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
-            assert_eq!(
-                err.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::PoolGuardMissing)
-            );
 
             drop(engine);
         });

@@ -2,12 +2,12 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableColumnLayout};
-use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind, RuntimeResult};
-use crate::file::SparseFile;
+use crate::error::{DataIntegrityError, DataIntegrityResult, RuntimeResult};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
 };
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::file::{FileKind, SparseFile};
 use crate::id::BlockID;
 use crate::layout;
 use crate::lwc::{LwcData, LwcNullBitmap};
@@ -529,11 +529,11 @@ mod tests {
     };
     // Test helper inspects the intentional `PersistedLwcBlock::load` public
     // convergence over read/completion and DataIntegrity domains.
-    use crate::error::{DataIntegrityError, Error, FileKind};
+    use crate::error::{DataIntegrityError, DiscloseError, Error};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
     };
-    use crate::file::test_block_id;
+    use crate::file::{FileKind, test_block_id};
     use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::DirectBuf;
@@ -552,7 +552,6 @@ mod tests {
             row_ids.to_vec(),
             Vec::new(),
         )
-        .unwrap()
         .row_shape_fingerprint()
     }
 
@@ -755,7 +754,7 @@ mod tests {
             Err(err) => err,
         };
         assert_lwc_data_integrity(
-            Error::from(err),
+            err.disclose(),
             test_block_id(7),
             DataIntegrityError::ChecksumMismatch,
         );
@@ -865,7 +864,7 @@ mod tests {
             Err(err) => err,
         };
         assert_lwc_data_integrity(
-            Error::from(err),
+            err.disclose(),
             test_block_id(9),
             DataIntegrityError::InvalidPayload,
         );
@@ -912,7 +911,7 @@ mod tests {
         let report = format!("{err:?}");
         assert_eq!(report.matches("block_id=10").count(), 1, "{report}");
         assert_lwc_data_integrity(
-            err.into(),
+            err.disclose(),
             test_block_id(10),
             DataIntegrityError::InvalidPayload,
         );

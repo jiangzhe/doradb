@@ -1,5 +1,8 @@
 use crate::catalog::CatalogCheckpointOutcome;
-use crate::error::{DataIntegrityError, FatalError, IoError, Result};
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, FatalError, IoError, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
+};
 use crate::id::{TableID, TrxID};
 use crate::log::{
     discover_redo_log_files, next_redo_file_seq, obsolete_redo_log_files_below_marker,
@@ -13,7 +16,7 @@ use crate::session::{
 };
 use crate::table::{LiveTableRedoReplayFloor, TableRedoReplayFloor};
 use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
@@ -112,7 +115,7 @@ impl PendingDroppedTableRedoFloor {
 impl TransactionSystem {
     /// Compute a side-effect-free redo truncation plan.
     #[inline]
-    pub(crate) fn plan_redo_truncation(&self) -> Result<RedoTruncationPlan> {
+    pub(crate) fn plan_redo_truncation(&self) -> RuntimeResult<RedoTruncationPlan> {
         let snapshot = self.catalog.storage.checkpoint_snapshot();
         let first_retained_file_seq = snapshot.meta.first_redo_log_seq;
         let catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
@@ -137,8 +140,11 @@ impl TransactionSystem {
         live_table_floors: Vec<LiveTableRedoReplayFloor>,
         pending_dropped_table_floors: Vec<PendingDroppedTableRedoFloor>,
         catalog_redo_retention_progress: Option<CatalogRedoRetentionProgress>,
-    ) -> Result<RedoTruncationPlan> {
-        let file_prefix = self.config.file_prefix()?;
+    ) -> RuntimeResult<RedoTruncationPlan> {
+        let file_prefix = self
+            .config
+            .file_prefix()
+            .change_context(RuntimeError::RedoLogAccess)?;
         let discovered = discover_redo_log_files(&file_prefix, first_retained_file_seq, false)?;
         let segments = RedoReplayPlanner::new(discovered).plan_retention_segments()?;
         let catalog_safe_segments = catalog_safe_segments_for_plan(
@@ -156,6 +162,7 @@ impl TransactionSystem {
             segments,
             catalog_safe_segments,
         )
+        .change_context(RuntimeError::RedoLogAccess)
     }
 
     /// Advance the durable redo retention marker and unlink obsolete redo files.
@@ -167,17 +174,23 @@ impl TransactionSystem {
     /// progress cache, and cleanup below the marker. They are separate because
     /// the marker is catalog bootstrap metadata, but unlink races are about the
     /// redo file family rather than catalog metadata shape.
-    pub(crate) async fn truncate_redo_log(&self) -> Result<RedoTruncationOutcome> {
+    pub(crate) async fn truncate_redo_log(&self) -> RuntimeOrFatalResult<RedoTruncationOutcome> {
         let catalog_checkpoint_lease = self.catalog.begin_checkpoint().await;
         let _redo_retention_lease = self.begin_redo_retention().await;
         // Session admission happens before the async gate waits above. Recheck
         // here so poison published while truncation was queued prevents marker
         // publication and physical redo cleanup.
-        self.poisoner.ensure_healthy()?;
-        let plan = self.plan_redo_truncation()?;
+        self.poisoner
+            .ensure_healthy()
+            .map_err(RuntimeOrFatalError::from)?;
+        let plan = self
+            .plan_redo_truncation()
+            .map_err(RuntimeOrFatalError::from)?;
         let previous_first_retained_file_seq = plan.first_retained_file_seq;
         let target_marker = match plan.candidates.last() {
-            Some(candidate) => next_redo_file_seq(candidate.file_seq)?,
+            Some(candidate) => next_redo_file_seq(candidate.file_seq)
+                .change_context(RuntimeError::RedoLogAccess)
+                .map_err(RuntimeOrFatalError::from)?,
             None => previous_first_retained_file_seq,
         };
         let advanced_files = plan.candidates.len();
@@ -197,17 +210,24 @@ impl TransactionSystem {
                         "event=engine_poison component=redo_retention action=poison result=error error={:?}",
                         report
                     );
-                    return Err(self.poisoner.poison(report).into_report().into());
+                    return Err(RuntimeOrFatalError::from(
+                        self.poisoner.poison(report).into_report(),
+                    ));
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(RuntimeOrFatalError::from(err)),
             }
         } else {
             previous_first_retained_file_seq
         };
 
         drop(catalog_checkpoint_lease);
-        let file_prefix = self.config.file_prefix()?;
-        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)?;
+        let file_prefix = self
+            .config
+            .file_prefix()
+            .change_context(RuntimeError::RedoLogAccess)
+            .map_err(RuntimeOrFatalError::from)?;
+        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)
+            .map_err(RuntimeOrFatalError::from)?;
 
         Ok(RedoTruncationOutcome {
             previous_first_retained_file_seq,
@@ -227,7 +247,7 @@ impl TransactionSystem {
     /// Run catalog checkpoint and redo truncation from one gated retention observation.
     pub(crate) async fn checkpoint_catalog_and_truncate_redo_log(
         &self,
-    ) -> Result<CatalogRedoMaintenanceOutcome> {
+    ) -> RuntimeOrFatalResult<CatalogRedoMaintenanceOutcome> {
         // 1. Acquire gates in the same order as standalone truncation. The
         // catalog gate protects the `catalog.mtb` root writer, while the redo
         // retention gate stays held until obsolete-file cleanup is finished.
@@ -236,16 +256,21 @@ impl TransactionSystem {
         // Session admission happened before these async waits. Recheck after
         // the gates so queued storage poison cannot publish metadata or unlink
         // redo files.
-        self.poisoner.ensure_healthy()?;
+        self.poisoner
+            .ensure_healthy()
+            .map_err(RuntimeOrFatalError::from)?;
 
         // 2. Scan exactly one catalog checkpoint batch and prepare, but do not
         // commit, the projected catalog root. Keeping the root mutable lets the
         // same publication also carry an advanced first-retained redo marker.
-        let scan_cfg = self.catalog_checkpoint_scan_config()?;
+        let scan_cfg = self
+            .catalog_checkpoint_scan_config()
+            .map_err(RuntimeOrFatalError::from)?;
         let batch = self
             .catalog
             .scan_checkpoint_batch(self.persisted_watermark_cts(), scan_cfg)
-            .await?;
+            .await
+            .map_err(RuntimeOrFatalError::from)?;
         let checkpoint_progress = batch.redo_retention_progress();
         let mut prepared = self.catalog.prepare_checkpoint_batch(batch).await?;
         let checkpoint_will_publish = prepared.will_publish();
@@ -298,16 +323,20 @@ impl TransactionSystem {
         // 4. Plan truncation against the projected catalog boundary, projected
         // live-table floors, pending dropped-table floors, and the best
         // catalog-safe segment proof available from this scan plus cache.
-        let plan = self.plan_redo_truncation_with_floors(
-            first_retained_file_seq,
-            projected_catalog_replay_start_ts,
-            live_table_floors,
-            pending_dropped_table_floors,
-            projected_catalog_progress,
-        )?;
+        let plan = self
+            .plan_redo_truncation_with_floors(
+                first_retained_file_seq,
+                projected_catalog_replay_start_ts,
+                live_table_floors,
+                pending_dropped_table_floors,
+                projected_catalog_progress,
+            )
+            .map_err(RuntimeOrFatalError::from)?;
         let previous_first_retained_file_seq = plan.first_retained_file_seq;
         let target_marker = match plan.candidates.last() {
-            Some(candidate) => next_redo_file_seq(candidate.file_seq)?,
+            Some(candidate) => next_redo_file_seq(candidate.file_seq)
+                .change_context(RuntimeError::RedoLogAccess)
+                .map_err(RuntimeOrFatalError::from)?,
             None => previous_first_retained_file_seq,
         };
         let advanced_files = plan.candidates.len();
@@ -336,9 +365,11 @@ impl TransactionSystem {
                         "event=engine_poison component=redo_retention action=poison result=error error={:?}",
                         report
                     );
-                    return Err(self.poisoner.poison(report).into_report().into());
+                    return Err(RuntimeOrFatalError::from(
+                        self.poisoner.poison(report).into_report(),
+                    ));
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(RuntimeOrFatalError::from(err)),
             }
         } else {
             if target_marker > previous_first_retained_file_seq {
@@ -357,9 +388,11 @@ impl TransactionSystem {
                             "event=engine_poison component=redo_retention action=poison result=error error={:?}",
                             report
                         );
-                        return Err(self.poisoner.poison(report).into_report().into());
+                        return Err(RuntimeOrFatalError::from(
+                            self.poisoner.poison(report).into_report(),
+                        ));
                     }
-                    Err(err) => return Err(err.into()),
+                    Err(err) => return Err(RuntimeOrFatalError::from(err)),
                 };
             }
             CatalogCheckpointOutcome::Noop
@@ -387,8 +420,13 @@ impl TransactionSystem {
         // retention lease remains held through cleanup so checkpoint scans
         // cannot race disappearing retained redo files.
         drop(catalog_checkpoint_lease);
-        let file_prefix = self.config.file_prefix()?;
-        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)?;
+        let file_prefix = self
+            .config
+            .file_prefix()
+            .change_context(RuntimeError::RedoLogAccess)
+            .map_err(RuntimeOrFatalError::from)?;
+        let cleanup = cleanup_obsolete_redo_files(&file_prefix, new_first_retained_file_seq)
+            .map_err(RuntimeOrFatalError::from)?;
 
         // 8. Return both halves of the maintenance result. The redo outcome
         // reports marker advancement, retryable cleanup counts, and the
@@ -489,7 +527,7 @@ fn catalog_progress_for_final_marker(
 fn cleanup_obsolete_redo_files(
     file_prefix: &str,
     first_retained_file_seq: u32,
-) -> Result<RedoCleanupCounts> {
+) -> RuntimeResult<RedoCleanupCounts> {
     let mut counts = RedoCleanupCounts::default();
     for descriptor in obsolete_redo_log_files_below_marker(file_prefix, first_retained_file_seq)? {
         debug_assert!(descriptor.seq < first_retained_file_seq);
@@ -500,7 +538,16 @@ fn cleanup_obsolete_redo_files(
             Err(err) if err.kind() == IoErrorKind::NotFound => {
                 counts.already_missing_files = counts.already_missing_files.saturating_add(1);
             }
-            Err(_) => {
+            Err(err) => {
+                let report = Report::new(IoError::from(err.kind()))
+                    .attach(err)
+                    .attach(format!(
+                        "best-effort obsolete redo unlink failed: path={}",
+                        descriptor.path.display()
+                    ));
+                obs::warn!(
+                    "event=redo_cleanup component=redo_retention action=unlink result=error error={report:?}"
+                );
                 counts.failed_unlink_files = counts.failed_unlink_files.saturating_add(1);
             }
         }
@@ -550,7 +597,7 @@ fn build_redo_truncation_plan(
     pending_dropped_table_floors: Vec<PendingDroppedTableRedoFloor>,
     segments: Vec<RedoRetentionSegment>,
     catalog_safe_segments: BTreeMap<u32, Option<RedoSegmentCtsRange>>,
-) -> Result<RedoTruncationPlan> {
+) -> DataIntegrityResult<RedoTruncationPlan> {
     let global_floor = global_floor(
         catalog_replay_start_ts,
         &live_table_floors,
@@ -567,8 +614,7 @@ fn build_redo_truncation_plan(
                     "retention planner observed non-contiguous retained redo sequence: expected={:?}, actual={:08x}",
                     expected_file_seq.map(|seq| format!("{seq:08x}")),
                     segment.file_seq
-                ))
-                .into());
+                )));
         }
         expected_file_seq = segment.file_seq.checked_add(1);
 

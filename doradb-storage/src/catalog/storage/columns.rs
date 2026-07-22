@@ -221,6 +221,7 @@ mod tests {
     use super::*;
     use crate::catalog::storage::tests::mark_catalog_ddl;
     use crate::catalog::tests::open_catalog_test_engine;
+    use crate::error::DiscloseResultExt;
     use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
@@ -262,19 +263,22 @@ mod tests {
                     .storage
                     .columns()
                     .insert(stmt, &col_42_0)
-                    .await?;
+                    .await
+                    .disclose()?;
                 engine
                     .catalog()
                     .storage
                     .columns()
                     .insert(stmt, &col_42_1)
-                    .await?;
+                    .await
+                    .disclose()?;
                 engine
                     .catalog()
                     .storage
                     .columns()
                     .insert(stmt, &col_43_0)
-                    .await?;
+                    .await
+                    .disclose()?;
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())
             })
@@ -290,7 +294,8 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 1)
-                        .await?
+                        .await
+                        .disclose()?
                 );
                 assert!(
                     !engine
@@ -298,7 +303,8 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 9)
-                        .await?
+                        .await
+                        .disclose()?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
@@ -335,7 +341,8 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 1)
-                        .await?
+                        .await
+                        .disclose()?
                 );
                 assert!(
                     engine
@@ -343,7 +350,8 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(42), 0)
-                        .await?
+                        .await
+                        .disclose()?
                 );
                 assert!(
                     engine
@@ -351,7 +359,8 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_id(stmt, TableID::new(43), 0)
-                        .await?
+                        .await
+                        .disclose()?
                 );
                 mark_catalog_ddl(stmt, DDLRedo::DropTable(TableID::new(42)));
                 Ok(())
@@ -426,7 +435,8 @@ mod tests {
                         .storage
                         .columns()
                         .insert(stmt, column)
-                        .await?;
+                        .await
+                        .disclose()?;
                 }
                 mark_catalog_ddl(stmt, DDLRedo::CreateTable(TableID::new(42)));
                 Ok(())

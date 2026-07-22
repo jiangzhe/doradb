@@ -2,11 +2,10 @@ use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::table::TableMetadata;
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, DataIntegrityResult, FileKind, InternalError,
-    InternalResult, IoResult, MultiDomainResultExt, ResourceError, ResourceResult, Result,
-    RuntimeError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityResult, InternalError, InternalResult,
+    IoResult, MultiDomainResultExt, ResourceError, ResourceResult, RuntimeError,
+    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
-use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -24,6 +23,7 @@ use crate::file::super_block::{
     SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
     SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
+use crate::file::{FileKind, SparseFile};
 use crate::id::{BlockID, FileID, RowID, TableID, TrxID};
 use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{DirectBuf, IOBuf, IOClient};
@@ -330,22 +330,25 @@ impl MutableTableFile {
         &mut self,
         metadata: Arc<TableMetadata>,
         roots: Vec<BlockID>,
-    ) -> InternalResult<()> {
-        if roots.len() != metadata.idx.index_slot_count() {
-            return Err(secondary_index_root_count_mismatch(
-                roots.len(),
-                metadata.idx.index_slot_count(),
-            ));
-        }
+    ) {
+        // Callers derive the replacement root vector from this metadata's
+        // stable sparse slot layout, so their counts must agree exactly.
+        assert_eq!(
+            roots.len(),
+            metadata.idx.index_slot_count(),
+            "secondary-index root count does not match metadata slot count"
+        );
         for (index_no, root) in roots.iter().copied().enumerate() {
-            if metadata.idx.index_spec(index_no).is_none() && root != SUPER_BLOCK_ID {
-                return Err(secondary_index_root_inactive_slot_mismatch(index_no, root));
-            }
+            // Dropped/inactive slots remain as sparse sentinels and can never
+            // retain a live root in a replacement snapshot.
+            assert!(
+                metadata.idx.index_spec(index_no).is_some() || root == SUPER_BLOCK_ID,
+                "inactive secondary-index slot has a live root: index_no={index_no}, root={root}, expected={SUPER_BLOCK_ID}"
+            );
         }
         let root = &mut self.new_root.root;
         root.metadata = metadata;
         root.secondary_index_roots = roots;
-        Ok(())
     }
 
     /// Updates mutable root checkpoint metadata.
@@ -354,19 +357,17 @@ impl MutableTableFile {
         &mut self,
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
-    ) -> InternalResult<()> {
+    ) {
         let root = &mut self.new_root.root;
-        if pivot_row_id < root.pivot_row_id {
-            return Err(
-                Report::new(InternalError::MutableRootMetadataRegression).attach(format!(
-                    "pivot_row_id regressed: current={}, new={pivot_row_id}",
-                    root.pivot_row_id
-                )),
-            );
-        }
+        // Checkpoint selection advances from the currently published pivot;
+        // applying it to the forked root cannot move that frontier backward.
+        assert!(
+            pivot_row_id >= root.pivot_row_id,
+            "table checkpoint pivot regressed: current={}, new={pivot_row_id}",
+            root.pivot_row_id
+        );
         root.pivot_row_id = pivot_row_id;
         root.heap_redo_start_ts = heap_redo_start_ts;
-        Ok(())
     }
 
     /// Advances mutable root cold-delete replay watermark without regressing it.
@@ -385,8 +386,8 @@ impl MutableTableFile {
     pub(crate) fn rebuild_alloc_map_from_reachable(
         &mut self,
         reachable: &BTreeSet<BlockID>,
-    ) -> Result<usize> {
-        Ok(self.new_root.rebuild_alloc_map_from_reachable(reachable)?)
+    ) -> usize {
+        self.new_root.rebuild_alloc_map_from_reachable(reachable)
     }
 
     /// Commit the modification of table file.
@@ -454,6 +455,11 @@ impl MutableTableFile {
         for block in lwc_blocks {
             let start_row_id = block.shape.start_row_id();
             let end_row_id = block.shape.end_row_id();
+            assert!(
+                start_row_id >= last_end,
+                "column block-index invariant violated: LWC block start row regressed: start_row_id={start_row_id}, last_end={last_end}, file_id={}",
+                self.file.sparse_file().file_id()
+            );
             let block_id = allocate_cow_block(
                 &mut self.new_root,
                 "table file could not allocate LWC block",
@@ -466,18 +472,6 @@ impl MutableTableFile {
                 )
             })?;
             max_row_id = max_row_id.max(end_row_id);
-            if start_row_id < last_end {
-                return Err(Report::new(InternalError::ColumnBlockIndexInvariant)
-                    .attach(format!(
-                        "LWC block start row regressed: start_row_id={start_row_id}, last_end={last_end}"
-                    ))
-                    .change_context(RuntimeError::FileRootAccess)
-                    .attach(format!(
-                        "operation=apply_lwc_blocks, phase=validate_row_order, file_id={}",
-                        self.file.sparse_file().file_id()
-                    ))
-                    .into());
-            }
             last_end = end_row_id;
             new_entries.push(block.shape.with_block_id(block_id));
             let write_lease = self
@@ -567,9 +561,13 @@ impl MutableCowFile for MutableTableFile {
             .as_cow_write_barrier()
             .begin_write(self.file.sparse_file().file_id(), block_id)
             .map_err(|report| {
-                CompletionErrorBridge::capture(report.attach(format!(
-                    "begin table CoW write barrier: block_id={block_id}"
-                )))
+                CompletionErrorBridge::capture(
+                    report
+                        .change_context(RuntimeError::FileRootAccess)
+                        .attach(format!(
+                            "begin table CoW write barrier: block_id={block_id}"
+                        )),
+                )
             })?;
         self.file
             .file()
@@ -610,26 +608,6 @@ pub(crate) type OldRoot = OldCowRoot<TableMeta>;
 fn missing_secondary_index(index_no: usize, index_count: usize) -> Report<InternalError> {
     Report::new(InternalError::SecondaryIndexOutOfBounds)
         .attach(format!("index_no={index_no}, index_count={index_count}"))
-}
-
-#[inline]
-fn secondary_index_root_count_mismatch(
-    root_count: usize,
-    index_count: usize,
-) -> Report<InternalError> {
-    Report::new(InternalError::SecondaryIndexRootCountMismatch).attach(format!(
-        "root_count={root_count}, index_count={index_count}"
-    ))
-}
-
-#[inline]
-fn secondary_index_root_inactive_slot_mismatch(
-    index_no: usize,
-    root: BlockID,
-) -> Report<InternalError> {
-    Report::new(InternalError::SecondaryIndexRootCountMismatch).attach(format!(
-        "inactive index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
-    ))
 }
 
 #[inline]
@@ -740,9 +718,12 @@ mod tests {
         PoolRole, ReadonlyBufferPool, global_readonly_pool_scope, table_readonly_pool,
     };
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use crate::error::{DataIntegrityError, Error, ErrorKind, FileKind, RuntimeError};
+    use crate::error::{
+        DataIntegrityError, DiscloseError, DiscloseResultExt, Error, ErrorKind, Result,
+        RuntimeError,
+    };
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
-    use crate::file::{BlockKey, build_test_fs, build_test_fs_in, test_block_id};
+    use crate::file::{BlockKey, FileKind, build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
     use crate::quiescent::QuiescentBox;
     use crate::table::test_user_table_id;
@@ -781,7 +762,8 @@ mod tests {
         let disk_pool_guard = disk_pool.pool_guard();
         let page = disk_pool
             .read_validated_block(&disk_pool_guard, page_id, accept_any_page)
-            .await?;
+            .await
+            .disclose()?;
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(page.page());
         Ok(buf)
@@ -796,8 +778,9 @@ mod tests {
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         mutable_file
             .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool)
-            .await?;
-        Ok(mutable_file.commit(ts, false).await?)
+            .await
+            .disclose()?;
+        mutable_file.commit(ts, false).await.disclose()
     }
 
     #[test]
@@ -860,16 +843,13 @@ mod tests {
             mutable.set_secondary_index_root(0, secondary_root).unwrap();
             assert_eq!(mutable.secondary_index_root(0).unwrap(), secondary_root);
             let metadata = Arc::clone(&mutable.root().metadata);
-            let err = mutable
-                .replace_metadata_and_secondary_index_roots(
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                mutable.replace_metadata_and_secondary_index_roots(
                     metadata,
                     vec![SUPER_BLOCK_ID, secondary_root],
-                )
-                .unwrap_err();
-            assert_eq!(
-                *err.current_context(),
-                crate::error::InternalError::SecondaryIndexRootCountMismatch
-            );
+                );
+            }));
+            assert!(panic.is_err());
             let (table_file3, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
             let active_root = table_file3
@@ -1074,8 +1054,7 @@ mod tests {
                         RowID::new(10),
                         (0..10).map(RowID::new).collect(),
                         Vec::new(),
-                    )
-                    .unwrap(),
+                    ),
                     buf: page_buf(b"reuse-lwc-1"),
                 },
                 LwcBlockPersist {
@@ -1084,8 +1063,7 @@ mod tests {
                         RowID::new(20),
                         (10..20).map(RowID::new).collect(),
                         Vec::new(),
-                    )
-                    .unwrap(),
+                    ),
                     buf: page_buf(b"reuse-lwc-2"),
                 },
             ];
@@ -1240,12 +1218,7 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    fn assert_table_meta_corruption(
-        err: impl Into<Error>,
-        page_id: BlockID,
-        expected: DataIntegrityError,
-    ) {
-        let err = err.into();
+    fn assert_table_meta_corruption(err: Error, page_id: BlockID, expected: DataIntegrityError) {
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
             err.report().downcast_ref::<RuntimeError>().copied(),
@@ -1287,7 +1260,7 @@ mod tests {
                 Err(err) => err,
             };
             assert_table_meta_corruption(
-                err,
+                err.disclose(),
                 active_meta_block_id,
                 DataIntegrityError::ChecksumMismatch,
             );
@@ -1324,7 +1297,7 @@ mod tests {
                 Err(err) => err,
             };
             assert_table_meta_corruption(
-                err,
+                err.disclose(),
                 active_meta_block_id,
                 DataIntegrityError::InvalidVersion,
             );
@@ -1349,8 +1322,7 @@ mod tests {
                         RowID::new(10),
                         (0..10).map(RowID::new).collect(),
                         Vec::new(),
-                    )
-                    .unwrap(),
+                    ),
                     buf: page_buf(b"lwc-page-1"),
                 },
                 LwcBlockPersist {
@@ -1359,8 +1331,7 @@ mod tests {
                         RowID::new(20),
                         (10..20).map(RowID::new).collect(),
                         Vec::new(),
-                    )
-                    .unwrap(),
+                    ),
                     buf: page_buf(b"lwc-page-2"),
                 },
             ];
@@ -1424,6 +1395,9 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(
+        expected = "column block-index invariant violated: LWC block start row regressed"
+    )]
     fn test_persist_lwc_blocks_rejects_overlapping_ranges() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
@@ -1441,8 +1415,7 @@ mod tests {
                         RowID::new(10),
                         (0..10).map(RowID::new).collect(),
                         Vec::new(),
-                    )
-                    .unwrap(),
+                    ),
                     buf: page_buf(b"lwc-overlap-1"),
                 },
                 LwcBlockPersist {
@@ -1451,15 +1424,14 @@ mod tests {
                         RowID::new(15),
                         (5..15).map(RowID::new).collect(),
                         Vec::new(),
-                    )
-                    .unwrap(),
+                    ),
                     buf: page_buf(b"lwc-overlap-2"),
                 },
             ];
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let result = persist_lwc_blocks_for_test(
+            persist_lwc_blocks_for_test(
                 MutableTableFile::fork(
                     &table_file,
                     background_writes,
@@ -1470,25 +1442,8 @@ mod tests {
                 TrxID::new(2),
                 disk_pool.global_pool(),
             )
-            .await;
-
-            assert!(result.as_ref().is_err_and(|err| {
-                err.is_kind(crate::error::ErrorKind::Runtime)
-                    && err.report().downcast_ref::<RuntimeError>().copied()
-                        == Some(RuntimeError::FileRootAccess)
-                    && err
-                        .report()
-                        .downcast_ref::<crate::error::InternalError>()
-                        .copied()
-                        == Some(crate::error::InternalError::ColumnBlockIndexInvariant)
-            }));
-            let active_root = table_file.active_root_unchecked();
-            assert_eq!(active_root.pivot_row_id, RowID::new(0));
-            assert_eq!(active_root.column_block_index_root, SUPER_BLOCK_ID);
-            assert_eq!(active_root.deletion_cutoff_ts, TrxID::new(1));
-
-            drop(table_file);
-            drop(fs);
+            .await
+            .unwrap();
         });
     }
 

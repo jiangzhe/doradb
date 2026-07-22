@@ -1,24 +1,39 @@
 use crate::id::RowID;
 use crate::io::BackendError;
 use error_stack::{AttachmentKind, Frame, FrameKind, Report};
-use std::array::TryFromSliceError;
 use std::backtrace::Backtrace;
-use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug, Display};
-use std::io::{self, ErrorKind as IoErrorKind};
-use std::num::ParseIntError;
+use std::io::ErrorKind as IoErrorKind;
 use std::ops::ControlFlow;
 use std::panic::Location;
 use std::result;
-use std::str::Utf8Error;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error as ThisError;
 
+/// Explicitly converges one audited typed error into the public wrapper.
+pub(crate) trait DiscloseError {
+    /// Applies the audited public classification without replacing source frames.
+    fn disclose(self) -> Error;
+}
+
+/// Explicitly converges an audited typed result into the public result.
+pub(crate) trait DiscloseResultExt<T> {
+    /// Discloses only the error arm and preserves a successful value unchanged.
+    fn disclose(self) -> Result<T>;
+}
+
 /// Storage result using the public storage error wrapper.
 pub type Result<T> = result::Result<T, Error>;
+
+impl<T, E: DiscloseError> DiscloseResultExt<T> for result::Result<T, E> {
+    #[inline]
+    fn disclose(self) -> Result<T> {
+        self.map_err(DiscloseError::disclose)
+    }
+}
 /// Result carrying configuration-domain reports.
 pub(crate) type ConfigResult<T> = result::Result<T, Report<ConfigError>>;
 /// Result carrying operation-domain reports.
@@ -89,9 +104,6 @@ pub enum ErrorKind {
     /// A recoverable engine-owned runtime operation could not complete.
     #[error("storage runtime error")]
     Runtime,
-    /// An internal invariant or component construction contract was violated.
-    #[error("internal storage error")]
-    Internal,
     /// A fatal runtime failure poisoned future storage admission.
     #[error("fatal storage error")]
     Fatal,
@@ -215,6 +227,9 @@ pub(crate) enum RuntimeError {
     /// Redo discovery, recovery planning, or stream access could not complete.
     #[error("redo log access failed")]
     RedoLogAccess,
+    /// Startup recovery could not complete because IO or durable state was invalid.
+    #[error("startup recovery failed")]
+    Recovery,
     /// Lookup, traversal, mutation, binding, or stream integration failed.
     #[error("index access failed")]
     IndexAccess,
@@ -252,8 +267,6 @@ pub(crate) enum OperationError {
     TableNotFound,
     #[error("table is dropping")]
     TableDropping,
-    #[error("table already exists")]
-    TableAlreadyExists,
     #[error("index not found")]
     IndexNotFound,
     #[error("not supported")]
@@ -301,93 +314,27 @@ pub(crate) enum FatalError {
     RollbackAccess,
 }
 
-/// Fieldless internal-domain errors carried underneath `ErrorKind::Internal`.
+/// Fieldless internal-domain errors used beneath typed crate-private owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum InternalError {
-    #[error("internal storage error")]
-    Generic,
     #[error("secondary index binding mismatch")]
     SecondaryIndexBindingMismatch,
     #[error("buffer page already allocated")]
     BufferPageAlreadyAllocated,
-    #[error("buffer page kind mismatch")]
-    BufferPageKindMismatch,
-    #[error("completion dropped")]
-    CompletionDropped,
     #[error("readonly write barrier encountered an in-flight load")]
     ReadonlyWriteInflight,
     #[error("readonly block is blocked by a write barrier")]
     ReadonlyWriteBlocked,
-    #[error("row page missing")]
-    RowPageMissing,
     #[error("row page scan start is not a page boundary")]
     RowPageScanStartInvalid,
-    #[error("pool guard missing")]
-    PoolGuardMissing,
-    #[error("block-index leaf stale")]
-    BlockIndexLeafStale,
-    #[error("index key missing")]
-    IndexKeyMissing,
     #[error("lwc builder misuse")]
     LwcBuilderMisuse,
-    #[error("mem index key malformed")]
-    MemIndexKeyMalformed,
-    #[error("column deletion blob writer state mismatch")]
-    ColumnDeletionBlobWriterStateMismatch,
-    #[error("cow file allocation invariant violated")]
-    CowFileAllocationInvariant,
-    #[error("column index rewrite did not touch target")]
-    ColumnIndexRewriteMiss,
-    #[error("column index path invariant violated")]
-    ColumnIndexPathInvariant,
-    #[error("column index search type missing")]
-    ColumnIndexSearchTypeMissing,
     #[error("secondary index out of bounds")]
     SecondaryIndexOutOfBounds,
-    #[error("secondary index kind mismatch")]
-    SecondaryIndexKindMismatch,
-    #[error("secondary index root count mismatch")]
-    SecondaryIndexRootCountMismatch,
-    #[error("mutable root metadata regression")]
-    MutableRootMetadataRegression,
-    #[error("catalog root descriptor invariant violated")]
-    CatalogRootDescriptorInvariant,
-    #[error("catalog primary key missing")]
-    CatalogPrimaryKeyMissing,
-    #[error("catalog table unexpectedly resolved a persisted LWC row")]
-    CatalogTableUnexpectedLwcRow,
     #[error("LWC block encoding contract is unsatisfied")]
     LwcBlockEncodingContract,
-    #[error("checkpoint transition marker conflicts with existing state")]
-    CheckpointTransitionMarkerConflict,
-    #[error("readonly frame index out of bounds")]
-    ReadonlyFrameIndexOutOfBounds,
-    #[error("B-tree pack invariant violated")]
-    BTreePackInvariant,
-    #[error("DiskTree rewrite invariant violated")]
-    DiskTreeRewriteInvariant,
-    #[error("DiskTree batch order invariant violated")]
-    DiskTreeBatchOrderInvariant,
-    #[error("column block index invariant violated")]
-    ColumnBlockIndexInvariant,
-    #[error("column deletion blob invariant violated")]
-    ColumnDeletionBlobInvariant,
-    #[error("active transaction is discarded")]
-    ActiveTransactionDiscarded,
-    #[error("system transaction redo missing")]
-    SystemTransactionRedoMissing,
-    #[error("silent-watermark system transaction redo conflicts with existing redo")]
-    SilentWatermarkRedoConflict,
-    #[error("catalog DDL redo conflicts with existing statement redo")]
-    CatalogDdlRedoConflict,
-    #[error("statement number overflow")]
-    StatementNumberOverflow,
-    #[error("current redo log file is missing")]
-    CurrentRedoLogFileMissing,
     #[error("redo writer format encoding failed")]
     RedoFormatEncoding,
-    #[error("redo read protocol invariant violated")]
-    RedoReadProtocolInvariant,
 }
 
 /// IO-domain errors carried underneath `ErrorKind::Io`.
@@ -420,10 +367,10 @@ pub(crate) enum CompletionSourceReport {
     DataIntegrity(Report<DataIntegrityError>),
     /// Lifecycle-domain completion source.
     Lifecycle(Report<LifecycleError>),
+    /// Runtime-domain completion source.
+    Runtime(Report<RuntimeError>),
     /// Fatal-domain completion source.
     Fatal(Report<FatalError>),
-    /// Internal-domain completion source.
-    Internal(Report<InternalError>),
 }
 
 impl From<Report<IoError>> for CompletionSourceReport {
@@ -454,17 +401,17 @@ impl From<Report<LifecycleError>> for CompletionSourceReport {
     }
 }
 
+impl From<Report<RuntimeError>> for CompletionSourceReport {
+    #[inline]
+    fn from(report: Report<RuntimeError>) -> Self {
+        Self::Runtime(report)
+    }
+}
+
 impl From<Report<FatalError>> for CompletionSourceReport {
     #[inline]
     fn from(report: Report<FatalError>) -> Self {
         Self::Fatal(report)
-    }
-}
-
-impl From<Report<InternalError>> for CompletionSourceReport {
-    #[inline]
-    fn from(report: Report<InternalError>) -> Self {
-        Self::Internal(report)
     }
 }
 
@@ -476,8 +423,8 @@ impl Debug for CompletionSourceReport {
             Self::Resource(report) => Debug::fmt(report, f),
             Self::DataIntegrity(report) => Debug::fmt(report, f),
             Self::Lifecycle(report) => Debug::fmt(report, f),
+            Self::Runtime(report) => Debug::fmt(report, f),
             Self::Fatal(report) => Debug::fmt(report, f),
-            Self::Internal(report) => Debug::fmt(report, f),
         }
     }
 }
@@ -494,8 +441,8 @@ impl CompletionSourceReport {
             Self::Resource(report) => report.downcast_ref(),
             Self::DataIntegrity(report) => report.downcast_ref(),
             Self::Lifecycle(report) => report.downcast_ref(),
+            Self::Runtime(report) => report.downcast_ref(),
             Self::Fatal(report) => report.downcast_ref(),
-            Self::Internal(report) => report.downcast_ref(),
         }
     }
 
@@ -507,7 +454,7 @@ impl CompletionSourceReport {
             | Self::Resource(_)
             | Self::DataIntegrity(_)
             | Self::Lifecycle(_)
-            | Self::Internal(_) => None,
+            | Self::Runtime(_) => None,
         }
     }
 }
@@ -605,6 +552,19 @@ impl CompletionErrorBridge {
         }
     }
 
+    /// Reconstructs a completion whose producer contract guarantees Fatal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the canonical completion source is not Fatal. Callers may
+    /// use this only at a handoff whose completion type is generic but whose
+    /// sole error producer is statically audited as [`FatalError`].
+    #[inline]
+    pub(crate) fn into_fatal_report(self) -> Report<FatalError> {
+        self.reconstruct_fatal()
+            .expect("Fatal-only completion must retain a canonical Fatal source")
+    }
+
     /// Inspects the canonical physical report without reconstructing a new stack.
     #[inline]
     #[cfg(test)]
@@ -636,7 +596,7 @@ impl CompletionErrorBridge {
             .iter()
             .rev()
             .find_map(|frame| match frame {
-                ReplayFrame::Context(context) => Some(context.error_kind()),
+                ReplayFrame::Context(context) => context.error_kind(),
                 ReplayFrame::Attachment(_) => None,
             })
             .expect("validated completion bridge must contain a real context")
@@ -661,8 +621,8 @@ impl CompletionErrorBridge {
             CompletionSourceReport::Resource(report) => Self::capture_typed_replay(report),
             CompletionSourceReport::DataIntegrity(report) => Self::capture_typed_replay(report),
             CompletionSourceReport::Lifecycle(report) => Self::capture_typed_replay(report),
+            CompletionSourceReport::Runtime(report) => Self::capture_typed_replay(report),
             CompletionSourceReport::Fatal(report) => Self::capture_typed_replay(report),
-            CompletionSourceReport::Internal(report) => Self::capture_typed_replay(report),
         }
     }
 
@@ -768,6 +728,14 @@ impl Debug for CompletionErrorBridge {
     }
 }
 
+impl DiscloseError for CompletionErrorBridge {
+    #[inline]
+    fn disclose(self) -> Error {
+        let kind = self.public_error_kind();
+        Error(self.replace_context(kind))
+    }
+}
+
 /// Cloneable source-bearing failure whose current context is always Fatal.
 ///
 /// This wrapper carries fatal policy state through redo, transaction cleanup,
@@ -823,6 +791,13 @@ impl Debug for SharedFatalError {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Debug::fmt(&self.0, f)
+    }
+}
+
+impl DiscloseError for SharedFatalError {
+    #[inline]
+    fn disclose(self) -> Error {
+        self.into_report().disclose()
     }
 }
 
@@ -885,6 +860,16 @@ impl From<Report<RuntimeError>> for OperationOrRuntimeError {
     }
 }
 
+impl DiscloseError for OperationOrRuntimeError {
+    #[inline]
+    fn disclose(self) -> Error {
+        match self {
+            OperationOrRuntimeError::Operation(report) => report.disclose(),
+            OperationOrRuntimeError::Runtime(report) => report.disclose(),
+        }
+    }
+}
+
 /// Result carrying either a terminal Operation report or a Runtime report.
 pub(crate) type OperationOrRuntimeResult<T> = result::Result<T, OperationOrRuntimeError>;
 
@@ -920,6 +905,16 @@ impl Debug for RuntimeOrFatalError {
         match self {
             Self::Runtime(report) => Debug::fmt(report, f),
             Self::Fatal(report) => Debug::fmt(report, f),
+        }
+    }
+}
+
+impl Display for RuntimeOrFatalError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(report) => Display::fmt(report.current_context(), f),
+            Self::Fatal(report) => Display::fmt(report.current_context(), f),
         }
     }
 }
@@ -990,6 +985,16 @@ impl From<SharedFatalError> for RuntimeOrFatalError {
     #[inline]
     fn from(error: SharedFatalError) -> Self {
         Self::Fatal(error.into_report())
+    }
+}
+
+impl DiscloseError for RuntimeOrFatalError {
+    #[inline]
+    fn disclose(self) -> Error {
+        match self {
+            RuntimeOrFatalError::Runtime(report) => report.disclose(),
+            RuntimeOrFatalError::Fatal(report) => report.disclose(),
+        }
     }
 }
 
@@ -1107,17 +1112,17 @@ impl ReplayContext {
     }
 
     #[inline]
-    const fn error_kind(self) -> ErrorKind {
+    const fn error_kind(self) -> Option<ErrorKind> {
         match self {
-            ReplayContext::Config(_) => ErrorKind::Config,
-            ReplayContext::Operation(_) => ErrorKind::Operation,
-            ReplayContext::Resource(_) => ErrorKind::Resource,
-            ReplayContext::Io(_) => ErrorKind::Io,
-            ReplayContext::DataIntegrity(_) => ErrorKind::DataIntegrity,
-            ReplayContext::Lifecycle(_) => ErrorKind::Lifecycle,
-            ReplayContext::Runtime(_) => ErrorKind::Runtime,
-            ReplayContext::Fatal(_) => ErrorKind::Fatal,
-            ReplayContext::Internal(_) => ErrorKind::Internal,
+            ReplayContext::Config(_) => Some(ErrorKind::Config),
+            ReplayContext::Operation(_) => Some(ErrorKind::Operation),
+            ReplayContext::Resource(_) => Some(ErrorKind::Resource),
+            ReplayContext::Io(_) => Some(ErrorKind::Io),
+            ReplayContext::DataIntegrity(_) => Some(ErrorKind::DataIntegrity),
+            ReplayContext::Lifecycle(_) => Some(ErrorKind::Lifecycle),
+            ReplayContext::Runtime(_) => Some(ErrorKind::Runtime),
+            ReplayContext::Fatal(_) => Some(ErrorKind::Fatal),
+            ReplayContext::Internal(_) => None,
         }
     }
 }
@@ -1232,23 +1237,6 @@ impl ReplayReportBuilder {
     }
 }
 
-/// Identifies which persisted CoW file surfaced a corruption failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    TableFile,
-    CatalogMultiTableFile,
-}
-
-impl fmt::Display for FileKind {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            FileKind::TableFile => "table_file",
-            FileKind::CatalogMultiTableFile => "catalog.mtb",
-        })
-    }
-}
-
 /// Printable secondary-index binding mismatch context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecondaryIndexBinding {
@@ -1315,12 +1303,6 @@ impl Error {
         self.0
     }
 
-    /// Adds boundary context without changing the existing error classification.
-    #[inline]
-    pub(crate) fn attach(self, attachment: &'static str) -> Self {
-        Error(self.0.attach(attachment))
-    }
-
     /// Lazily adds boundary context without changing the existing error classification.
     #[inline]
     pub(crate) fn attach_with<F>(self, attachment: F) -> Self
@@ -1357,158 +1339,6 @@ impl Error {
     }
 }
 
-impl From<Report<ConfigError>> for Error {
-    #[inline]
-    fn from(report: Report<ConfigError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Config))
-    }
-}
-
-impl From<Report<DataIntegrityError>> for Error {
-    #[inline]
-    fn from(report: Report<DataIntegrityError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::DataIntegrity))
-    }
-}
-
-impl From<Report<LifecycleError>> for Error {
-    #[inline]
-    fn from(report: Report<LifecycleError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Lifecycle))
-    }
-}
-
-impl From<Report<FatalError>> for Error {
-    #[inline]
-    fn from(report: Report<FatalError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Fatal))
-    }
-}
-
-impl From<SharedFatalError> for Error {
-    #[inline]
-    fn from(error: SharedFatalError) -> Self {
-        error.into_report().into()
-    }
-}
-
-impl From<Report<ResourceError>> for Error {
-    #[inline]
-    fn from(report: Report<ResourceError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Resource))
-    }
-}
-
-impl From<Report<OperationError>> for Error {
-    #[inline]
-    fn from(report: Report<OperationError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Operation))
-    }
-}
-
-impl From<Report<IoError>> for Error {
-    #[inline]
-    fn from(report: Report<IoError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Io))
-    }
-}
-
-impl From<Report<RuntimeError>> for Error {
-    #[inline]
-    fn from(report: Report<RuntimeError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Runtime))
-    }
-}
-
-impl From<OperationOrRuntimeError> for Error {
-    #[inline]
-    fn from(error: OperationOrRuntimeError) -> Self {
-        match error {
-            OperationOrRuntimeError::Operation(report) => report.into(),
-            OperationOrRuntimeError::Runtime(report) => report.into(),
-        }
-    }
-}
-
-impl From<RuntimeOrFatalError> for Error {
-    #[inline]
-    fn from(error: RuntimeOrFatalError) -> Self {
-        match error {
-            RuntimeOrFatalError::Runtime(report) => report.into(),
-            RuntimeOrFatalError::Fatal(report) => report.into(),
-        }
-    }
-}
-
-impl From<CompletionErrorBridge> for Error {
-    #[inline]
-    fn from(bridge: CompletionErrorBridge) -> Self {
-        let kind = bridge.public_error_kind();
-        Error(bridge.replace_context(kind))
-    }
-}
-
-impl From<Report<InternalError>> for Error {
-    #[inline]
-    fn from(report: Report<InternalError>) -> Self {
-        // This structural public classification adds no caller-owned diagnostic.
-        Error(report.change_context(ErrorKind::Internal))
-    }
-}
-
-impl From<Infallible> for Error {
-    #[inline]
-    fn from(src: Infallible) -> Self {
-        match src {}
-    }
-}
-
-impl From<TryFromSliceError> for Error {
-    #[inline]
-    fn from(_src: TryFromSliceError) -> Error {
-        Report::new(DataIntegrityError::InvalidPayload).into()
-    }
-}
-
-impl From<io::Error> for Error {
-    #[inline]
-    fn from(src: io::Error) -> Self {
-        let kind = src.kind();
-        Report::new(IoError::from(kind)).attach(src).into()
-    }
-}
-
-impl From<Utf8Error> for Error {
-    #[inline]
-    fn from(_src: Utf8Error) -> Error {
-        Report::new(DataIntegrityError::InvalidPayload).into()
-    }
-}
-
-impl From<ParseIntError> for Error {
-    #[inline]
-    fn from(_src: ParseIntError) -> Error {
-        Report::new(DataIntegrityError::InvalidPayload).into()
-    }
-}
-
-impl From<glob::GlobError> for Error {
-    #[inline]
-    fn from(src: glob::GlobError) -> Self {
-        Report::new(IoError::from(src.error().kind()))
-            .attach(format!("{}", src))
-            .into()
-    }
-}
-
 impl fmt::Display for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1524,6 +1354,70 @@ impl fmt::Debug for Error {
 }
 
 impl StdError for Error {}
+
+impl DiscloseError for Report<ConfigError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::Config))
+    }
+}
+
+impl DiscloseError for Report<DataIntegrityError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::DataIntegrity))
+    }
+}
+
+impl DiscloseError for Report<LifecycleError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::Lifecycle))
+    }
+}
+
+impl DiscloseError for Report<FatalError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::Fatal))
+    }
+}
+
+impl DiscloseError for Report<ResourceError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::Resource))
+    }
+}
+
+impl DiscloseError for Report<OperationError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::Operation))
+    }
+}
+
+impl DiscloseError for Report<IoError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::Io))
+    }
+}
+
+impl DiscloseError for Report<RuntimeError> {
+    #[inline]
+    fn disclose(self) -> Error {
+        // This structural public classification adds no caller-owned diagnostic.
+        Error(self.change_context(ErrorKind::Runtime))
+    }
+}
 
 /// Validation of optimistic lock
 pub enum Validation<T> {
@@ -1649,8 +1543,9 @@ mod tests {
     #[test]
     fn test_io_report_converts_to_top_level_io() {
         let source = StdIoError::new(IoErrorKind::WouldBlock, "not ready");
-        let err =
-            Error::from(Report::new(IoError::from(source.kind())).attach(format!("{source}")));
+        let err = Report::new(IoError::from(source.kind()))
+            .attach(format!("{source}"))
+            .disclose();
 
         assert_eq!(err.kind(), ErrorKind::Io);
         assert_eq!(
@@ -1664,8 +1559,11 @@ mod tests {
     }
 
     #[test]
-    fn test_std_io_error_conversion_preserves_owned_source() {
-        let err = Error::from(StdIoError::from_raw_os_error(libc::EIO));
+    fn test_std_io_error_disclosure_preserves_owned_source() {
+        let source = StdIoError::from_raw_os_error(libc::EIO);
+        let err = Report::new(IoError::from(source.kind()))
+            .attach(source)
+            .disclose();
 
         assert_eq!(err.kind(), ErrorKind::Io);
         assert_eq!(
@@ -1684,7 +1582,7 @@ mod tests {
             .change_context(RuntimeError::BackgroundSpawn)
             .attach("thread_name=Runtime-Conversion-Test");
 
-        let err = Error::from(report);
+        let err = report.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -1708,7 +1606,7 @@ mod tests {
         )
         .attach("table_id=42");
 
-        let err = Error::from(carrier);
+        let err = carrier.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Operation);
         assert_eq!(
@@ -1729,7 +1627,7 @@ mod tests {
         )
         .attach("operation=insert_index");
 
-        let err = Error::from(carrier);
+        let err = carrier.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -1858,7 +1756,7 @@ mod tests {
                 .change_context(RuntimeError::CheckpointExecution),
         );
 
-        let err = Error::from(carrier);
+        let err = carrier.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -1880,7 +1778,7 @@ mod tests {
                 .change_context(FatalError::CheckpointWrite),
         );
 
-        let err = Error::from(carrier);
+        let err = carrier.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Fatal);
         assert_eq!(
@@ -1904,7 +1802,7 @@ mod tests {
             .change_context(RuntimeError::BufferPoolInit)
             .attach("buffer_pool_type=fixed, buffer_pool_role=meta");
 
-        let err = Error::from(report);
+        let err = report.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -1925,7 +1823,7 @@ mod tests {
             .change_context(RuntimeError::BufferPageAllocation)
             .attach("buffer_pool_type=fixed, buffer_pool_role=meta, operation=allocate_page");
 
-        let err = Error::from(report);
+        let err = report.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -1948,7 +1846,7 @@ mod tests {
                 "buffer_pool_type=evictable, buffer_pool_role=mem, operation=get_page, page_id=7",
             );
 
-        let err = Error::from(report);
+        let err = report.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -1974,7 +1872,7 @@ mod tests {
                 "operation=load_file_root, file_kind=table_file, file_id=42, phase=validate_root",
             );
 
-        let err = Error::from(report);
+        let err = report.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -1995,7 +1893,7 @@ mod tests {
             .change_context(RuntimeError::RedoLogAccess)
             .attach("phase=enumerate_redo_log_family, file_prefix=redo.log");
 
-        let err = Error::from(report);
+        let err = report.disclose();
 
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -2010,9 +1908,53 @@ mod tests {
     }
 
     #[test]
+    fn test_recovery_io_report_converts_losslessly_to_public_runtime() {
+        let report = Report::new(IoError::from(IoErrorKind::PermissionDenied))
+            .attach("operation=open_recovery_file")
+            .change_context(RuntimeError::Recovery);
+
+        let err = report.disclose();
+
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::Recovery)
+        );
+        assert_eq!(
+            err.report()
+                .downcast_ref::<IoError>()
+                .copied()
+                .map(IoError::kind),
+            Some(IoErrorKind::PermissionDenied)
+        );
+        assert!(format!("{err:?}").contains("operation=open_recovery_file"));
+    }
+
+    #[test]
+    fn test_recovery_integrity_report_converts_losslessly_to_public_runtime() {
+        let report = Report::new(DataIntegrityError::LogFileCorrupted)
+            .attach("phase=replay_redo")
+            .change_context(RuntimeError::Recovery);
+
+        let err = report.disclose();
+
+        assert_eq!(err.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::Recovery)
+        );
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::LogFileCorrupted)
+        );
+        assert!(format!("{err:?}").contains("phase=replay_redo"));
+    }
+
+    #[test]
     fn test_storage_error_display_includes_config_detail() {
-        let err =
-            Error::from(Report::new(ConfigError::InvalidIoDepth).attach("recovery_io_depth=0"));
+        let err = Report::new(ConfigError::InvalidIoDepth)
+            .attach("recovery_io_depth=0")
+            .disclose();
 
         assert_eq!(
             format!("{err}"),
@@ -2023,9 +1965,9 @@ mod tests {
     #[test]
     fn test_storage_error_display_includes_io_detail() {
         let source = StdIoError::new(IoErrorKind::PermissionDenied, "open denied");
-        let err = Error::from(
-            Report::new(IoError::from(source.kind())).attach(format!("op=file_open, {source}")),
-        );
+        let err = Report::new(IoError::from(source.kind()))
+            .attach(format!("op=file_open, {source}"))
+            .disclose();
 
         let output = format!("{err}");
         assert!(output.contains("io error"), "{output}");
@@ -2036,7 +1978,7 @@ mod tests {
 
     #[test]
     fn test_typed_index_access_context_preserves_lower_error() {
-        let lower: InternalResult<()> = Err(Report::new(InternalError::IndexKeyMissing)
+        let lower: InternalResult<()> = Err(Report::new(InternalError::SecondaryIndexOutOfBounds)
             .attach("secondary index key is unavailable"));
         let report = lower
             .change_context(RuntimeError::IndexAccess)
@@ -2046,10 +1988,10 @@ mod tests {
         assert_eq!(report.current_context(), &RuntimeError::IndexAccess);
         assert_eq!(
             report.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::IndexKeyMissing)
+            Some(InternalError::SecondaryIndexOutOfBounds)
         );
 
-        let err: Error = report.attach("secondary index claim").into();
+        let err = report.attach("secondary index claim").disclose();
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
             err.report().downcast_ref::<RuntimeError>().copied(),
@@ -2057,7 +1999,7 @@ mod tests {
         );
         assert_eq!(
             err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::IndexKeyMissing)
+            Some(InternalError::SecondaryIndexOutOfBounds)
         );
         assert!(format!("{err}").contains("secondary index claim"));
     }
@@ -2124,7 +2066,9 @@ mod tests {
         assert!(second_output.contains("op_kind=read"));
         assert!(second_output.contains("complete test backend read"));
 
-        let err = Error::from(bridge).attach("public completion boundary");
+        let err = bridge
+            .disclose()
+            .attach_with(|| "public completion boundary".to_owned());
         assert_eq!(err.kind(), ErrorKind::Io);
         assert!(err.report().downcast_ref::<BackendError>().is_some());
         assert!(
@@ -2192,13 +2136,14 @@ mod tests {
         );
 
         let internal = CompletionErrorBridge::capture(
-            Report::new(InternalError::CompletionDropped)
-                .attach("internal source, completion owner"),
+            Report::new(InternalError::SecondaryIndexOutOfBounds)
+                .attach("internal source, completion owner")
+                .change_context(RuntimeError::IndexAccess),
         )
         .replace_context(RuntimeError::BufferPageAccess);
         assert_eq!(
             internal.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::CompletionDropped)
+            Some(InternalError::SecondaryIndexOutOfBounds)
         );
 
         let send = CompletionErrorBridge::capture(
@@ -2215,7 +2160,9 @@ mod tests {
     #[test]
     fn test_completion_bridge_runtime_conversion_composes_static_attachment() {
         let bridge = CompletionErrorBridge::capture(
-            Report::new(InternalError::CompletionDropped).attach("completion source"),
+            Report::new(InternalError::SecondaryIndexOutOfBounds)
+                .attach("completion source")
+                .change_context(RuntimeError::IndexAccess),
         );
         let result: RuntimeOrFatalResult<()> =
             Err(bridge.into_runtime_or_fatal(RuntimeError::SystemTransactionCommit));
@@ -2233,7 +2180,7 @@ mod tests {
         );
         assert_eq!(
             report.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::CompletionDropped)
+            Some(InternalError::SecondaryIndexOutOfBounds)
         );
         let output = format!("{report:?}");
         assert!(output.contains("completion source"), "{output}");
@@ -2326,7 +2273,7 @@ mod tests {
         );
         assert!(reconstructed.downcast_ref::<ErrorKind>().is_none());
 
-        let public = Error::from(bridge);
+        let public = bridge.disclose();
         assert_eq!(public.kind(), ErrorKind::Fatal);
         assert_eq!(
             public
@@ -2391,8 +2338,10 @@ mod tests {
         assert!(output.contains("redo write source"), "{output}");
         assert!(output.contains("redo write policy"), "{output}");
 
-        let public =
-            Error::from(shared.into_completion_bridge()).attach("wait for shared fatal completion");
+        let public = shared
+            .into_completion_bridge()
+            .disclose()
+            .attach_with(|| "wait for shared fatal completion".to_owned());
         assert_eq!(public.kind(), ErrorKind::Fatal);
         assert_eq!(
             public.report().downcast_ref::<FatalError>().copied(),

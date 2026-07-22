@@ -2023,8 +2023,8 @@ fn read_i8(input: &[u8]) -> DataIntegrityResult<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
-    use crate::error::{DataIntegrityError, DataIntegrityResult, FileKind, InternalError};
-    use crate::file::test_block_id;
+    use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError};
+    use crate::file::{FileKind, test_block_id};
     use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::IOBuf;
@@ -2039,7 +2039,6 @@ mod tests {
             row_ids.to_vec(),
             Vec::new(),
         )
-        .unwrap()
         .row_shape_fingerprint()
     }
 

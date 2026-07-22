@@ -168,7 +168,7 @@ impl SecondaryDiskTreeRuntime {
                 file_kind,
                 file,
                 disk_pool,
-            )?)
+            ))
         } else {
             SecondaryDiskTreeRuntimeKind::NonUnique(NonUniqueDiskTreeRuntime::new(
                 index_spec,
@@ -176,7 +176,7 @@ impl SecondaryDiskTreeRuntime {
                 file_kind,
                 file,
                 disk_pool,
-            )?)
+            ))
         };
         let runtime = Self { index_no, kind };
         Ok(runtime)
@@ -1134,7 +1134,6 @@ mod tests {
                 Arc::clone($disk_pool.sparse_file()),
                 $disk_pool.global_pool().clone(),
             )
-            .unwrap()
         };
     }
 
@@ -1147,7 +1146,6 @@ mod tests {
                 Arc::clone($disk_pool.sparse_file()),
                 $disk_pool.global_pool().clone(),
             )
-            .unwrap()
         };
     }
 
@@ -1197,9 +1195,7 @@ mod tests {
                 },
             ];
             let encoded_puts = encode_unique_puts(&puts);
-            writer
-                .batch_put_encoded(&unique_put_refs(&encoded_puts))
-                .unwrap();
+            writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
             let root = writer.finish().await.unwrap();
             let table = publish_secondary_root(mutable, 0, root, TrxID::new(2)).await;
 
@@ -1385,9 +1381,7 @@ mod tests {
                     row_id: RowID::new(10),
                 }];
                 let encoded_puts = encode_unique_puts(&puts);
-                writer
-                    .batch_put_encoded(&unique_put_refs(&encoded_puts))
-                    .unwrap();
+                writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
                 writer.finish().await.unwrap()
             };
             let table = publish_secondary_root(mutable, 0, root_a, TrxID::new(2)).await;
@@ -1416,9 +1410,7 @@ mod tests {
                     row_id: RowID::new(20),
                 }];
                 let encoded_puts = encode_unique_puts(&puts);
-                writer
-                    .batch_put_encoded(&unique_put_refs(&encoded_puts))
-                    .unwrap();
+                writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
                 writer.finish().await.unwrap()
             };
             assert_ne!(root_a, root_b);
@@ -1678,9 +1670,7 @@ mod tests {
                     },
                 ];
                 let encoded_puts = encode_unique_puts(&puts);
-                writer
-                    .batch_put_encoded(&unique_put_refs(&encoded_puts))
-                    .unwrap();
+                writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
                 let root = writer.finish().await.unwrap();
                 let table = publish_secondary_root(mutable, 0, root, TrxID::new(2)).await;
 

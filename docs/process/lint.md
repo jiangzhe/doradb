@@ -64,8 +64,16 @@ Repository hook (`.githooks/pre-commit`) enforces:
 1. `cargo fmt`
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo deny check`
+4. `tools/error_audit.rs --write docs/public-error-audit.csv`
 
-If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe baseline docs.
+The public-error audit runs for every commit. If its tracked CSV changes, the
+hook prints the diff and requires the refreshed audit to be staged.
+
+If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe
+baseline docs. A changed unsafe baseline likewise prints its diff and blocks
+the commit until staged. `SKIP_UNSAFE_BASELINE_HOOK=1` skips only this
+conditional unsafe-baseline refresh; the standard gates and public-error audit
+still run.
 
 ## CI Enforcement
 

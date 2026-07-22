@@ -8,8 +8,8 @@ use self::prefix::{LogPrefixEntry, LogPrefixId, LogPrefixKind, LogPrefixTracker}
 pub(crate) use self::seal::LogFileSealer;
 use crate::conf::TrxSysConfig;
 use crate::error::{
-    ConfigError, DataIntegrityError, DataIntegrityResult, Error, FatalError, InternalError,
-    InternalResult, IoError, ResourceError, ResourceResult, Result, RuntimeError, RuntimeResult,
+    ConfigError, DataIntegrityError, DataIntegrityResult, DiscloseError, Error, FatalError,
+    InternalResult, IoError, ResourceError, ResourceResult, RuntimeError, RuntimeResult,
     SharedFatalError,
 };
 use crate::file::{SparseFile, UNTRACKED_FILE_ID};
@@ -36,7 +36,7 @@ use crate::trx::purge::Purge;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, FailedPrecommitCleanupJob, FailedPrecommitReason, PrecommitTrx};
 use crossbeam_utils::CachePadded;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use flume::Sender;
 use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
@@ -338,8 +338,9 @@ impl RedoLogFinalizer {
     pub(crate) fn finalize(
         self,
         purge_tx: Sender<Purge>,
-    ) -> Result<(RedoLog, Arc<Completion<()>>)> {
-        let ctx = StorageBackend::setup(self.log_write_io_depth)?;
+    ) -> RuntimeResult<(RedoLog, Arc<Completion<()>>)> {
+        let ctx = StorageBackend::setup(self.log_write_io_depth)
+            .change_context(RuntimeError::Recovery)?;
         let mut file_seq = self.next_file_seq;
         let (
             CreatedLogFile {
@@ -354,7 +355,7 @@ impl RedoLogFinalizer {
             self.log_block_size,
             self.create_mode,
         )?;
-        file_seq = next_redo_file_seq(file_seq)?;
+        file_seq = next_redo_file_seq(file_seq).change_context(RuntimeError::Recovery)?;
 
         let ended_log_file = self
             .recovered_seal
@@ -671,12 +672,12 @@ impl RedoLog {
         &self,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
     ) -> RuntimeResult<()> {
-        let Some(old_log_file) = group_commit_g.log_file.take() else {
-            return Err(Report::new(InternalError::CurrentRedoLogFileMissing)
-                .attach("redo log rotation requires current log file")
-                .change_context(RuntimeError::RedoLogAccess)
-                .attach("operation=rotate_redo_log_file"));
-        };
+        // Group commit is initialized with one current file, and rotation
+        // replaces it while holding this same mutex before releasing control.
+        let old_log_file = group_commit_g
+            .log_file
+            .take()
+            .expect("redo log rotation requires a current log file");
         let CreatedLogFile {
             log_file: new_log_file,
             header_write,
@@ -729,18 +730,13 @@ impl RedoLog {
                     });
                 }
             };
-            let Some(log_file) = group_commit_g.log_file.as_ref() else {
-                return Err(EnqueuePrecommitError {
-                    trx: Box::new(trx),
-                    reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
-                        Report::new(InternalError::CurrentRedoLogFileMissing)
-                            .attach("enqueue redo group requires current log file")
-                            .change_context(FatalError::RedoWrite)
-                            .attach("operation=enqueue_precommit, phase=resolve_current_redo_file"),
-                    )),
-                    close_admission: true,
-                });
-            };
+            // The group-commit mutex protects a continuously installed current
+            // file; only the rotation path may take it, and that path replaces
+            // it before returning.
+            let log_file = group_commit_g
+                .log_file
+                .as_ref()
+                .expect("enqueue redo group requires a current log file");
             let group_physical_len = log_group.physical_len();
             let (file_seq, fd, offset, end_offset) = match log_file.alloc(group_physical_len) {
                 Ok((offset, end_offset)) => (
@@ -764,20 +760,12 @@ impl RedoLog {
                         });
                     }
 
-                    let Some(new_log_file) = group_commit_g.log_file.as_ref() else {
-                        return Err(EnqueuePrecommitError {
-                            trx: Box::new(trx),
-                            reason: FailedPrecommitReason::Fatal(SharedFatalError::capture(
-                                Report::new(InternalError::CurrentRedoLogFileMissing)
-                                    .attach("redo rotation did not install a current log file")
-                                    .change_context(FatalError::RedoWrite)
-                                    .attach(
-                                        "operation=enqueue_precommit, phase=resolve_rotated_redo_file",
-                                    ),
-                            )),
-                            close_admission: true,
-                        });
-                    };
+                    // Successful rotation installs the replacement before it
+                    // queues the boundary record and returns.
+                    let new_log_file = group_commit_g
+                        .log_file
+                        .as_ref()
+                        .expect("redo rotation did not install a current log file");
                     match new_log_file.alloc(group_physical_len) {
                         Ok((offset, end_offset)) => (
                             new_log_file.file_seq(),
@@ -1042,7 +1030,7 @@ impl FromStr for LogSync {
         } else {
             Err(Report::new(ConfigError::InvalidLogSync)
                 .attach(format!("value={s}"))
-                .into())
+                .disclose())
         }
     }
 }
@@ -2347,16 +2335,19 @@ fn prepare_initial_redo_super_block(
 }
 
 #[inline]
-fn open_recovered_seal_file(recovered: RecoveredRedoSeal) -> Result<RedoLogFile> {
-    let path = recovered.path.to_str().ok_or_else(|| {
-        Error::from(
+fn open_recovered_seal_file(recovered: RecoveredRedoSeal) -> RuntimeResult<RedoLogFile> {
+    let path = recovered
+        .path
+        .to_str()
+        .ok_or_else(|| {
             Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                 "redo log path is not valid UTF-8: path={}",
                 recovered.path.display()
-            )),
-        )
-    })?;
-    let sparse_file = SparseFile::open(path, UNTRACKED_FILE_ID)?;
+            ))
+        })
+        .change_context(RuntimeError::RedoLogAccess)?;
+    let sparse_file =
+        SparseFile::open(path, UNTRACKED_FILE_ID).change_context(RuntimeError::RedoLogAccess)?;
     Ok(RedoLogFile::new(sparse_file, recovered.super_block).with_seal_metadata(recovered.metadata))
 }
 
@@ -2445,8 +2436,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
     use crate::error::{
-        DataIntegrityError, ErrorKind, FatalError, InternalError, IoError, IoResult,
-        LifecycleError, RuntimeError, RuntimeOrFatalError, SharedFatalError,
+        DataIntegrityError, ErrorKind, FatalError, IoError, IoResult, LifecycleError, Result,
+        RuntimeError, SharedFatalError,
     };
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
@@ -3045,7 +3036,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rotate_log_file_missing_current_file_returns_error() {
+    #[should_panic(expected = "redo log rotation requires a current log file")]
+    fn test_rotate_log_file_asserts_current_file() {
         let temp_dir = TempDir::new().unwrap();
         let file_prefix = temp_dir
             .path()
@@ -3055,22 +3047,16 @@ mod tests {
             .to_owned();
         let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
 
-        let err = {
+        {
             let mut group_commit_g = redo_log.group_commit.lock();
             drop(group_commit_g.log_file.take().unwrap());
-            redo_log.rotate_log_file(&mut group_commit_g).unwrap_err()
-        };
-
-        assert_eq!(
-            err.downcast_ref::<InternalError>().copied(),
-            Some(InternalError::CurrentRedoLogFileMissing),
-            "{err:?}"
-        );
-        assert_eq!(err.current_context(), &RuntimeError::RedoLogAccess);
+            let _ = redo_log.rotate_log_file(&mut group_commit_g);
+        }
     }
 
     #[test]
-    fn test_commit_sys_missing_current_log_file_rejects_without_panic() {
+    #[should_panic(expected = "enqueue redo group requires a current log file")]
+    fn test_commit_sys_asserts_current_log_file() {
         smol::block_on(async {
             let (_temp_dir, engine) =
                 build_redo_test_engine("commit_missing_current_log_file", LogSync::None).await;
@@ -3086,24 +3072,7 @@ mod tests {
                 RowID::new(0),
                 RowID::new(1),
             );
-            let res = engine.inner().trx_sys.commit_sys(sys_trx);
-
-            let err = res.expect_err("missing current log file should fail system commit");
-            let RuntimeOrFatalError::Fatal(err) = err else {
-                panic!("redo publication failure should be Fatal")
-            };
-            assert_eq!(err.current_context(), &FatalError::RedoWrite);
-            let poison = engine
-                .inner()
-                .poisoner
-                .ensure_healthy()
-                .expect_err("redo write failure must poison runtime admission");
-            assert_eq!(*poison.current_context(), FatalError::RedoWrite);
-            assert_eq!(
-                poison.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::CurrentRedoLogFileMissing),
-                "{poison:?}"
-            );
+            let _ = engine.inner().trx_sys.commit_sys(sys_trx);
         });
     }
 
@@ -4640,7 +4609,7 @@ mod tests {
         assert!(report.contains("prefix"), "{report}");
         assert!(report.contains(file_prefix), "{report}");
 
-        let err = Error::from(err);
+        let err = err.disclose();
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
             err.report().downcast_ref::<RuntimeError>().copied(),

@@ -6,7 +6,7 @@ use crate::catalog::{
 };
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
-    Error, InternalError, InternalResult, LifecycleError, LifecycleResult, MultiDomainResultExt,
+    DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, MultiDomainResultExt,
     OperationError, OperationResult, Result,
 };
 use crate::id::{SessionID, TableID, TrxID};
@@ -235,15 +235,24 @@ impl Session {
     /// in-flight DDL rows that have not installed a user-table runtime.
     #[inline]
     pub fn list_table_ids(&self) -> Result<Vec<TableID>> {
-        let session = self.query_session().attach("operation=list_table_ids")?;
+        let session = self
+            .query_session()
+            .attach("operation=list_table_ids")
+            .disclose()?;
         Ok(session.engine.catalog().list_user_table_ids_now())
     }
 
     /// Begin a new transaction if the session is currently idle.
     #[inline]
     pub fn begin_trx(&mut self) -> Result<Transaction> {
-        let session = self.pin().attach("operation=begin_transaction")?;
-        Ok(session.begin_trx().attach("operation=begin_transaction")?)
+        let session = self
+            .pin()
+            .attach("operation=begin_transaction")
+            .disclose()?;
+        session
+            .begin_trx()
+            .attach("operation=begin_transaction")
+            .disclose()
     }
 
     /// Close this session when it has no active transaction.
@@ -252,19 +261,25 @@ impl Session {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let engine = self.engine.upgrade().attach_with(|| {
-            format!(
-                "operation=close_session, session_id={}, phase=upgrade_engine_runtime",
-                self.id
-            )
-        })?;
+        let engine = self
+            .engine
+            .upgrade()
+            .attach_with(|| {
+                format!(
+                    "operation=close_session, session_id={}, phase=upgrade_engine_runtime",
+                    self.id
+                )
+            })
+            .disclose()?;
         let _admission = engine
             .acquire_admission()
-            .attach_with(|| format!("operation=close_session, session_id={}", self.id))?;
+            .attach_with(|| format!("operation=close_session, session_id={}", self.id))
+            .disclose()?;
         engine
             .session_registry
             .close_idle(self.id)
-            .attach("operation=close_session")?;
+            .attach("operation=close_session")
+            .disclose()?;
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -276,7 +291,7 @@ impl Session {
         table_spec: TableSpec,
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
-        let session = self.pin().attach("operation=create_table")?;
+        let session = self.pin().attach("operation=create_table").disclose()?;
         create_table_for_session(session, table_spec, index_specs).await
     }
 
@@ -287,21 +302,21 @@ impl Session {
         table_id: TableID,
         index_spec: IndexSpec,
     ) -> Result<IndexNo> {
-        let session = self.pin().attach("operation=create_index")?;
+        let session = self.pin().attach("operation=create_index").disclose()?;
         create_index_for_session(session, table_id, index_spec).await
     }
 
     /// Logically drop an active secondary index from an existing user table.
     #[inline]
     pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
-        let session = self.pin().attach("operation=drop_index")?;
+        let session = self.pin().attach("operation=drop_index").disclose()?;
         drop_index_for_session(session, table_id, index_no).await
     }
 
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
-        let session = self.pin().attach("operation=drop_table")?;
+        let session = self.pin().attach("operation=drop_table").disclose()?;
         drop_table_for_session(session, table_id).await
     }
 
@@ -313,18 +328,25 @@ impl Session {
     /// truncation planning.
     #[inline]
     pub async fn checkpoint_catalog(&mut self) -> Result<()> {
-        let session = self.pin().attach("operation=checkpoint_catalog")?;
-        if session.in_trx().attach("operation=checkpoint_catalog")? {
+        let session = self
+            .pin()
+            .attach("operation=checkpoint_catalog")
+            .disclose()?;
+        if session
+            .in_trx()
+            .attach("operation=checkpoint_catalog")
+            .disclose()?
+        {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("catalog checkpoint requires an idle session")
-                .into());
+                .disclose());
         }
         session
             .engine
             .catalog()
             .checkpoint_now(&session.engine.trx_sys)
             .await
-            .map_err(Error::from)
+            .disclose()
             .map(|_| ())
     }
 
@@ -339,20 +361,23 @@ impl Session {
     ) -> Result<CatalogRedoMaintenanceOutcome> {
         let session = self
             .pin()
-            .attach("operation=checkpoint_catalog_and_truncate_redo_log")?;
+            .attach("operation=checkpoint_catalog_and_truncate_redo_log")
+            .disclose()?;
         if session
             .in_trx()
-            .attach("operation=checkpoint_catalog_and_truncate_redo_log")?
+            .attach("operation=checkpoint_catalog_and_truncate_redo_log")
+            .disclose()?
         {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("combined catalog checkpoint and redo truncation requires an idle session")
-                .into());
+                .disclose());
         }
         session
             .engine
             .trx_sys
             .checkpoint_catalog_and_truncate_redo_log()
             .await
+            .disclose()
     }
 
     /// Physically remove recovery-obsolete sealed redo prefix files.
@@ -363,13 +388,20 @@ impl Session {
     /// summarized in the returned outcome and can be retried by a later call.
     #[inline]
     pub async fn truncate_redo_log(&mut self) -> Result<RedoTruncationOutcome> {
-        let session = self.pin().attach("operation=truncate_redo_log")?;
-        if session.in_trx().attach("operation=truncate_redo_log")? {
+        let session = self
+            .pin()
+            .attach("operation=truncate_redo_log")
+            .disclose()?;
+        if session
+            .in_trx()
+            .attach("operation=truncate_redo_log")
+            .disclose()?
+        {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("redo log truncation requires an idle session")
-                .into());
+                .disclose());
         }
-        session.engine.trx_sys.truncate_redo_log().await
+        session.engine.trx_sys.truncate_redo_log().await.disclose()
     }
 
     /// Return a monotonic transaction-system statistics snapshot.
@@ -382,7 +414,8 @@ impl Session {
     pub fn transaction_system_stats(&self) -> Result<TransactionSystemStats> {
         let session = self
             .query_session()
-            .attach("operation=query_transaction_system_stats")?;
+            .attach("operation=query_transaction_system_stats")
+            .disclose()?;
         let engine = &session.engine;
         Ok(transaction_system_stats_snapshot(
             engine.trx_sys.trx_sys_stats(),
@@ -399,7 +432,8 @@ impl Session {
     pub fn storage_io_stats(&self) -> Result<StorageIoStats> {
         let session = self
             .query_session()
-            .attach("operation=query_storage_io_stats")?;
+            .attach("operation=query_storage_io_stats")
+            .disclose()?;
         let engine = &session.engine;
         Ok(storage_io_stats_snapshot(
             engine.table_fs.io_backend_stats(),
@@ -417,7 +451,8 @@ impl Session {
     pub fn buffer_pool_stats(&self) -> Result<BufferPoolStats> {
         let session = self
             .query_session()
-            .attach("operation=query_buffer_pool_stats")?;
+            .attach("operation=query_buffer_pool_stats")
+            .disclose()?;
         let engine = &session.engine;
         Ok(BufferPoolStats {
             meta: buffer_pool_runtime_stats_snapshot(
@@ -450,12 +485,15 @@ impl Session {
         table_id: TableID,
         max_rows: usize,
     ) -> Result<FreezeOutcome> {
-        let session = self.pin().attach("operation=freeze_table")?;
-        ensure_idle_maintenance_session(&session).attach("operation=freeze_table")?;
+        let session = self.pin().attach("operation=freeze_table").disclose()?;
+        ensure_idle_maintenance_session(&session)
+            .attach("operation=freeze_table")
+            .disclose()?;
         let table = session
             .resolve_user_table(table_id)
             .await
-            .attach("operation=freeze_table")?;
+            .attach("operation=freeze_table")
+            .disclose()?;
 
         // Acquire maintenance admission before entering the freeze workflow. The
         // grouped helper orders TableMetadata(S) before TableData(IS), excluding
@@ -467,27 +505,33 @@ impl Session {
         let (_metadata_lock, _data_lock) = lock_manager
             .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
             .await
-            .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))?;
+            .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
+            .disclose()?;
         // Lock acquisition can wait, so the table may have started dropping since
         // resolution. Revalidate only after both maintenance locks are granted.
         table
             .check_foreground_live()
-            .attach("operation=freeze_table")?;
-        Ok(table
+            .attach("operation=freeze_table")
+            .disclose()?;
+        table
             .freeze(&session, max_rows)
             .await
-            .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))?)
+            .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
+            .disclose()
     }
 
     /// Persist eligible state using the table-owned canonical frozen batch.
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
-        let session = self.pin().attach("operation=checkpoint_table")?;
-        ensure_idle_maintenance_session(&session).attach("operation=checkpoint_table")?;
+        let session = self.pin().attach("operation=checkpoint_table").disclose()?;
+        ensure_idle_maintenance_session(&session)
+            .attach("operation=checkpoint_table")
+            .disclose()?;
         let table = session
             .resolve_existing_user_table(table_id)
             .await
-            .attach("operation=checkpoint_table")?;
+            .attach("operation=checkpoint_table")
+            .disclose()?;
 
         // Acquire maintenance admission before entering the checkpoint workflow.
         // The grouped helper orders TableMetadata(S) before TableData(IS), excluding
@@ -499,16 +543,19 @@ impl Session {
         let (_metadata_lock, _data_lock) = lock_manager
             .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
             .await
-            .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))?;
+            .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
+            .disclose()?;
         // Lock acquisition can wait, so the table may have started dropping since
         // resolution. Revalidate only after both maintenance locks are granted.
         table
             .check_foreground_live()
-            .attach("operation=checkpoint_table")?;
-        table.checkpoint(&session).await.map_err(|err| {
-            Error::from(err)
-                .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
-        })
+            .attach("operation=checkpoint_table")
+            .disclose()?;
+        table
+            .checkpoint(&session)
+            .await
+            .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
+            .disclose()
     }
 
     /// Wait until retry may be useful for one self-identifying checkpoint delay.
@@ -516,8 +563,13 @@ impl Session {
     /// Completion means the observed predicate is satisfied or obsolete; a
     /// later checkpoint attempt can still encounter a different delay.
     pub async fn wait_for_checkpoint_retry(&self, reason: CheckpointDelayReason) -> Result<()> {
-        let session = self.pin().attach("operation=wait_for_checkpoint_retry")?;
-        ensure_idle_maintenance_session(&session).attach("operation=wait_for_checkpoint_retry")?;
+        let session = self
+            .pin()
+            .attach("operation=wait_for_checkpoint_retry")
+            .disclose()?;
+        ensure_idle_maintenance_session(&session)
+            .attach("operation=wait_for_checkpoint_retry")
+            .disclose()?;
         let table_id = match reason {
             CheckpointDelayReason::ActiveRoot { table_id, .. }
             | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
@@ -532,10 +584,11 @@ impl Session {
                 table
             }
         };
-        Ok(table
+        table
             .wait_for_checkpoint_retry(&session, reason)
             .await
-            .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))?)
+            .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))
+            .disclose()
     }
 
     /// Retry delayed table checkpoints through their exact production wait predicate.
@@ -561,8 +614,13 @@ impl Session {
     /// This boundary is published before physical purge work completes and is
     /// suitable for checkpoint cutoff and active-snapshot readiness decisions.
     pub async fn wait_for_gc_horizon_after(&self, ts: TrxID) -> Result<TrxID> {
-        let session = self.pin().attach("operation=wait_for_gc_horizon")?;
-        ensure_idle_maintenance_session(&session).attach("operation=wait_for_gc_horizon")?;
+        let session = self
+            .pin()
+            .attach("operation=wait_for_gc_horizon")
+            .disclose()?;
+        ensure_idle_maintenance_session(&session)
+            .attach("operation=wait_for_gc_horizon")
+            .disclose()?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon).await
     }
 
@@ -571,32 +629,47 @@ impl Session {
     /// The returned boundary is published only after eligible undo/index,
     /// retired-page, retained-root, and coalesced cleanup work completes.
     pub async fn wait_for_purge_completion_after(&self, ts: TrxID) -> Result<TrxID> {
-        let session = self.pin().attach("operation=wait_for_purge_completion")?;
-        ensure_idle_maintenance_session(&session).attach("operation=wait_for_purge_completion")?;
+        let session = self
+            .pin()
+            .attach("operation=wait_for_purge_completion")
+            .disclose()?;
+        ensure_idle_maintenance_session(&session)
+            .attach("operation=wait_for_purge_completion")
+            .disclose()?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::PurgeCompletion).await
     }
 
     /// Wait until ordered commit payloads through `ts` reach purge coordination.
     #[cfg(test)]
     pub(crate) async fn wait_for_purge_handoff_for_test(&self, ts: TrxID) -> Result<()> {
-        let session = self.pin().attach("operation=wait_for_purge_handoff")?;
-        ensure_idle_maintenance_session(&session).attach("operation=wait_for_purge_handoff")?;
+        let session = self
+            .pin()
+            .attach("operation=wait_for_purge_handoff")
+            .disclose()?;
+        ensure_idle_maintenance_session(&session)
+            .attach("operation=wait_for_purge_handoff")
+            .disclose()?;
         wait_for_purge_handoff(&session, ts).await
     }
 
     /// Returns total number of hot row pages for an existing user table.
     #[inline]
     pub async fn total_row_pages(&self, table_id: TableID) -> Result<usize> {
-        let session = self.pin().attach("operation=count_table_row_pages")?;
+        let session = self
+            .pin()
+            .attach("operation=count_table_row_pages")
+            .disclose()?;
         let table = session
             .resolve_user_table(table_id)
             .await
-            .attach("operation=count_table_row_pages")?;
+            .attach("operation=count_table_row_pages")
+            .disclose()?;
         let guards = session.pool_guards();
-        Ok(table
+        table
             .total_row_pages(&guards)
             .await
-            .attach_with(|| format!("operation=count_table_row_pages, table_id={table_id}"))?)
+            .attach_with(|| format!("operation=count_table_row_pages, table_id={table_id}"))
+            .disclose()
     }
 
     /// Full-scan cleanup for an existing user table's secondary MemIndex entries.
@@ -608,39 +681,49 @@ impl Session {
     ) -> Result<SecondaryMemIndexCleanupStats> {
         let session = self
             .pin()
-            .attach("operation=cleanup_secondary_mem_indexes")?;
+            .attach("operation=cleanup_secondary_mem_indexes")
+            .disclose()?;
         ensure_idle_maintenance_session(&session)
-            .attach("operation=cleanup_secondary_mem_indexes")?;
+            .attach("operation=cleanup_secondary_mem_indexes")
+            .disclose()?;
         let table = session
             .resolve_user_table(table_id)
             .await
-            .attach("operation=cleanup_secondary_mem_indexes")?;
-        Ok(table
+            .attach("operation=cleanup_secondary_mem_indexes")
+            .disclose()?;
+        table
             .cleanup_secondary_mem_indexes(session, clean_live_entries)
             .await
-            .attach_with(|| {
-                format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}")
-            })?)
+            .attach_with(|| format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}"))
+            .disclose()
     }
 
     /// Acquires an explicit session-lifetime table lock.
     #[inline]
     pub async fn lock_table(&self, table_id: TableID, mode: TableLockMode) -> Result<()> {
         let mode = LockMode::from(mode);
-        let session = self.pin().attach("operation=lock_explicit_table")?;
-        Ok(session
+        let session = self
+            .pin()
+            .attach("operation=lock_explicit_table")
+            .disclose()?;
+        session
             .lock_table(table_id, mode)
             .await
-            .attach_with(|| format!("operation=lock_explicit_table, table_id={table_id}"))?)
+            .attach_with(|| format!("operation=lock_explicit_table, table_id={table_id}"))
+            .disclose()
     }
 
     /// Releases an explicit session-lifetime table lock when no transaction is active.
     #[inline]
     pub fn unlock_table(&self, table_id: TableID) -> Result<()> {
-        let session = self.pin().attach("operation=unlock_explicit_table")?;
-        Ok(session
+        let session = self
+            .pin()
+            .attach("operation=unlock_explicit_table")
+            .disclose()?;
+        session
             .unlock_table(table_id)
-            .attach_with(|| format!("operation=unlock_explicit_table, table_id={table_id}"))?)
+            .attach_with(|| format!("operation=unlock_explicit_table, table_id={table_id}"))
+            .disclose()
     }
 }
 
@@ -878,13 +961,24 @@ impl SessionRegistry {
                 "session_id={session_id}, trx_id={trx_id}, reason=session_missing"
             ))
         })?;
-        let entry = session
-            .resolve_trx(trx_id)
-            .change_context(LifecycleError::TransactionDiscarded)
-            .attach_with(|| {
-                format!("session_id={session_id}, trx_id={trx_id}, phase=resolve_transaction_entry")
-            })?;
+        let entry = session.resolve_trx(trx_id).ok_or_else(|| {
+            Report::new(LifecycleError::TransactionDiscarded).attach(format!(
+                "session_id={session_id}, trx_id={trx_id}, reason=transaction_entry_missing"
+            ))
+        })?;
         Ok((entry, session))
+    }
+
+    /// Resolves a cleanup hint without turning staleness into an error.
+    #[inline]
+    pub(crate) fn try_resolve_trx(
+        &self,
+        session_id: SessionID,
+        trx_id: TrxID,
+    ) -> Option<(Arc<TrxEntry>, Arc<SessionState>)> {
+        let session = self.session_state(session_id)?;
+        let entry = session.resolve_trx(trx_id)?;
+        Some((entry, session))
     }
 
     /// Mark a public transaction handle abandoned if it still names the active entry.
@@ -1196,23 +1290,20 @@ impl SessionState {
     }
 
     #[inline]
-    fn resolve_trx(&self, trx_id: TrxID) -> InternalResult<Arc<TrxEntry>> {
+    fn resolve_trx(&self, trx_id: TrxID) -> Option<Arc<TrxEntry>> {
         let lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningActive { entry }
             | SessionLifecycle::AbandonedActive { entry }
                 if entry.trx_id() == trx_id =>
             {
-                Ok(Arc::clone(entry))
+                Some(Arc::clone(entry))
             }
             SessionLifecycle::RunningActive { .. }
             | SessionLifecycle::AbandonedActive { .. }
             | SessionLifecycle::RunningIdle
             | SessionLifecycle::AbandonedIdle
-            | SessionLifecycle::Closed => {
-                Err(Report::new(InternalError::ActiveTransactionDiscarded)
-                    .attach(format!("session_id={}, trx_id={trx_id}", self.id)))
-            }
+            | SessionLifecycle::Closed => None,
         }
     }
 
@@ -1481,9 +1572,14 @@ async fn wait_for_maintenance_boundary(
 ) -> Result<TrxID> {
     let trx_sys = &session.engine.trx_sys;
     loop {
-        session.engine.poisoner.ensure_healthy()?;
+        session.engine.poisoner.ensure_healthy().disclose()?;
         if session.engine.shutdown_started() {
-            return Err(maintenance_boundary_shutdown_err(boundary, ts));
+            return Err(Report::new(LifecycleError::Shutdown)
+                .attach(format!(
+                    "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
+                    boundary.name()
+                ))
+                .disclose());
         }
         let observed = boundary.observed(session);
         if observed > ts {
@@ -1495,9 +1591,14 @@ async fn wait_for_maintenance_boundary(
         let poison_listener = session.engine.poisoner.listener();
         let shutdown_listener = session.engine.shutdown_listener();
 
-        session.engine.poisoner.ensure_healthy()?;
+        session.engine.poisoner.ensure_healthy().disclose()?;
         if session.engine.shutdown_started() {
-            return Err(maintenance_boundary_shutdown_err(boundary, ts));
+            return Err(Report::new(LifecycleError::Shutdown)
+                .attach(format!(
+                    "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
+                    boundary.name()
+                ))
+                .disclose());
         }
         let observed = boundary.observed(session);
         if observed > ts {
@@ -1507,25 +1608,15 @@ async fn wait_for_maintenance_boundary(
     }
 }
 
-#[inline]
-fn maintenance_boundary_shutdown_err(boundary: MaintenanceBoundary, ts: TrxID) -> Error {
-    Report::new(LifecycleError::Shutdown)
-        .attach(format!(
-            "maintenance progress wait observed engine shutdown: boundary={}, target_ts={ts}",
-            boundary.name()
-        ))
-        .into()
-}
-
 #[cfg(test)]
 async fn wait_for_purge_handoff(session: &SessionPin, ts: TrxID) -> Result<()> {
     let trx_sys = &session.engine.trx_sys;
     loop {
-        session.engine.poisoner.ensure_healthy()?;
+        session.engine.poisoner.ensure_healthy().disclose()?;
         if session.engine.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach("completed-purge wait observed engine shutdown before ordered handoff")
-                .into());
+                .disclose());
         }
         if trx_sys.purge_handoff_cts() >= ts {
             return Ok(());
@@ -1533,11 +1624,11 @@ async fn wait_for_purge_handoff(session: &SessionPin, ts: TrxID) -> Result<()> {
         let handoff_listener = trx_sys.purge_handoff_listener();
         let poison_listener = session.engine.poisoner.listener();
         let shutdown_listener = session.engine.shutdown_listener();
-        session.engine.poisoner.ensure_healthy()?;
+        session.engine.poisoner.ensure_healthy().disclose()?;
         if session.engine.shutdown_started() {
             return Err(Report::new(LifecycleError::Shutdown)
                 .attach("completed-purge wait observed engine shutdown before ordered handoff")
-                .into());
+                .disclose());
         }
         if trx_sys.purge_handoff_cts() >= ts {
             return Ok(());
@@ -1845,11 +1936,13 @@ pub(crate) mod tests {
             const OPERATION: &str = "test_query_session_transaction_state";
             let session = self
                 .query_session()
-                .attach_with(|| format!("operation={OPERATION}"))?;
-            Ok(session
+                .attach_with(|| format!("operation={OPERATION}"))
+                .disclose()?;
+            session
                 ._state
                 .in_trx()
-                .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))?)
+                .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))
+                .disclose()
         }
 
         #[inline]

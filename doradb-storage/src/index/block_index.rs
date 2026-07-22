@@ -24,19 +24,19 @@ use std::sync::Arc;
 /// - the on-disk column-store index (`ColumnBlockIndex`)
 ///
 /// Routing decisions are made by `BlockIndexRoot`.
-pub(crate) struct BlockIndex<P: 'static = FixedBufferPool> {
+pub(crate) struct BlockIndex {
     root: BlockIndexRoot,
-    row: RowPageIndex<P>,
+    row: RowPageIndex,
 }
 
-impl<P: BufferPool> BlockIndex<P> {
+impl BlockIndex {
     /// Creates a block-index facade for one table.
     ///
     /// `pivot_row_id` and `column_root_block_id` define the boundary and root of
     /// persisted columnar data at startup.
     #[inline]
     pub(crate) async fn new(
-        pool: QuiescentGuard<P>,
+        pool: QuiescentGuard<FixedBufferPool>,
         meta_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
         column_root_block_id: BlockID,
@@ -49,7 +49,7 @@ impl<P: BufferPool> BlockIndex<P> {
     /// Creates block index for catalog-table runtime without table-file backing.
     #[inline]
     pub(crate) async fn new_catalog(
-        pool: QuiescentGuard<P>,
+        pool: QuiescentGuard<FixedBufferPool>,
         meta_pool_guard: &PoolGuard,
     ) -> RuntimeResult<Self> {
         Self::new(pool, meta_pool_guard, RowID::new(0), SUPER_BLOCK_ID).await
@@ -217,7 +217,7 @@ impl<P: BufferPool> BlockIndex<P> {
     pub(crate) fn mem_cursor<'a>(
         &'a self,
         meta_pool_guard: &'a PoolGuard,
-    ) -> RowPageIndexMemCursor<'a, P> {
+    ) -> RowPageIndexMemCursor<'a> {
         self.row.mem_cursor(meta_pool_guard)
     }
 
@@ -317,7 +317,7 @@ impl<P: BufferPool> BlockIndex<P> {
 mod tests {
     use super::*;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-    use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
+    use crate::buffer::page::{BufferPage, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolRole};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
@@ -331,122 +331,8 @@ mod tests {
     use semistr::SemiStr;
     use std::future::Future;
     use std::io::Error as StdIoError;
-    use std::panic::resume_unwind;
     use std::sync::Arc;
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::thread::scope;
-
-    // Test helper that lets us pause one row-index page fetch at a precise point.
-    // The fallback test uses this to hold `find_row()` after the initial route
-    // decision but before the row-store lookup completes, so we can move the pivot
-    // and force the fallback-to-column path deterministically.
-    struct StallingBufferPool {
-        inner: QuiescentGuard<FixedBufferPool>,
-        stall_page_id: AtomicU64,
-        entered: Arc<Barrier>,
-        release: Arc<Barrier>,
-    }
-
-    impl StallingBufferPool {
-        #[inline]
-        fn new(
-            inner: QuiescentGuard<FixedBufferPool>,
-            entered: Arc<Barrier>,
-            release: Arc<Barrier>,
-        ) -> Self {
-            StallingBufferPool {
-                inner,
-                stall_page_id: AtomicU64::new(u64::from(INVALID_PAGE_ID)),
-                entered,
-                release,
-            }
-        }
-
-        #[inline]
-        fn set_stall_page_id(&self, page_id: PageID) {
-            self.stall_page_id
-                .store(u64::from(page_id), Ordering::Release);
-        }
-    }
-
-    impl BufferPool for StallingBufferPool {
-        #[inline]
-        fn capacity(&self) -> usize {
-            self.inner.capacity()
-        }
-
-        #[inline]
-        fn allocated(&self) -> usize {
-            self.inner.allocated()
-        }
-
-        #[inline]
-        fn pool_guard(&self) -> PoolGuard {
-            self.inner.pool_guard()
-        }
-
-        #[inline]
-        fn allocate_page<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
-            self.inner.allocate_page(guard)
-        }
-
-        #[inline]
-        fn allocate_page_at<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-            page_id: PageID,
-        ) -> impl Future<Output = RuntimeResult<PageExclusiveGuard<T>>> + Send {
-            self.inner.allocate_page_at(guard, page_id)
-        }
-
-        #[inline]
-        async fn get_page<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-            page_id: PageID,
-            mode: LatchFallbackMode,
-        ) -> RuntimeResult<FacadePageGuard<T>> {
-            // Only stall the specific spin-mode read we care about; everything
-            // else should behave exactly like the wrapped fixed buffer pool.
-            if mode == LatchFallbackMode::Spin
-                && page_id == self.stall_page_id.load(Ordering::Acquire)
-            {
-                self.entered.wait();
-                self.release.wait();
-            }
-            self.inner.get_page(guard, page_id, mode).await
-        }
-
-        #[inline]
-        fn get_page_versioned<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-            id: VersionedPageID,
-            mode: LatchFallbackMode,
-        ) -> impl Future<Output = RuntimeResult<Option<FacadePageGuard<T>>>> + Send {
-            self.inner.get_page_versioned(guard, id, mode)
-        }
-
-        #[inline]
-        fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>) {
-            self.inner.deallocate_page(g)
-        }
-
-        #[inline]
-        fn get_child_page<T: BufferPage>(
-            &self,
-            guard: &PoolGuard,
-            p_guard: &FacadePageGuard<T>,
-            page_id: PageID,
-            mode: LatchFallbackMode,
-        ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send {
-            self.inner.get_child_page(guard, p_guard, page_id, mode)
-        }
-    }
 
     struct FailingInsertPagePool {
         inner: QuiescentGuard<FixedBufferPool>,
@@ -621,56 +507,6 @@ mod tests {
         // Row id 9 is below the pivot, so lookup goes straight to the column
         // path and enforces the user-table storage contract.
         let _ = smol::block_on(blk_idx.find_row(&meta_guard, None, RowID::new(9), None));
-    }
-
-    #[test]
-    #[should_panic(expected = "block-index column route requires column storage")]
-    fn test_find_row_panics_when_column_fallback_has_no_storage() {
-        let inner = QuiescentBox::new(
-            FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
-        );
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let pool = QuiescentBox::new(StallingBufferPool::new(
-            inner.guard(),
-            Arc::clone(&entered),
-            Arc::clone(&release),
-        ));
-        let meta_guard = (*pool).pool_guard();
-        let blk_idx = smol::block_on(BlockIndex::new(
-            pool.guard(),
-            &meta_guard,
-            RowID::new(10),
-            test_block_id(77),
-        ))
-        .expect("test block-index construction should succeed");
-        pool.set_stall_page_id(blk_idx.row.root_page_id());
-
-        scope(|s| {
-            // Start with row_id == pivot so the first route decision picks the row path.
-            let blk_idx = &blk_idx;
-            let meta_guard = meta_guard.clone();
-            let handle = s.spawn(move || {
-                smol::block_on(async {
-                    blk_idx
-                        .find_row(&meta_guard, None, RowID::new(10), None)
-                        .await
-                })
-            });
-
-            // Wait until the row-store root fetch is paused, then move the pivot past
-            // row_id so the subsequent `try_column()` fallback becomes eligible.
-            // This avoids relying on timing-sensitive races to exercise the fallback.
-            entered.wait();
-            smol::block_on(blk_idx.update_column_root(RowID::new(11), test_block_id(88)));
-            release.wait();
-
-            let panic = match handle.join() {
-                Ok(_) => panic!("column fallback without storage must panic"),
-                Err(panic) => panic,
-            };
-            resume_unwind(panic);
-        });
     }
 
     #[test]
