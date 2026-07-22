@@ -249,6 +249,7 @@ mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::PAGE_SIZE;
     use crate::catalog::{TableMetadata, USER_TABLE_ID_START};
+    use crate::engine::Engine;
     use crate::error::{DataIntegrityError, RecoveryDuplicateKey, RuntimeError};
     use crate::id::RowID;
     use crate::id::{PageID, TrxID};
@@ -485,11 +486,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine =
-                lightweight_test_engine_config(main_dir.clone(), "drop_recover_uncommitted")
-                    .build()
-                    .await
-                    .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir.clone(),
+                "drop_recover_uncommitted",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
@@ -507,10 +509,12 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = lightweight_test_engine_config(main_dir, "drop_recover_uncommitted")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "drop_recover_uncommitted",
+            ))
+            .await
+            .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_some());
         });
     }
@@ -520,10 +524,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir.clone(), "drop_recover_replay")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir.clone(),
+                "drop_recover_replay",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
@@ -535,10 +541,12 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = lightweight_test_engine_config(main_dir, "drop_recover_replay")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "drop_recover_replay",
+            ))
+            .await
+            .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert_eq!(
                 engine.catalog().retained_dropped_table_ids_now(),
@@ -563,10 +571,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir.clone(), "create_orphan_recover")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir.clone(),
+                "create_orphan_recover",
+            ))
+            .await
+            .unwrap();
             let table_id = USER_TABLE_ID_START + 99;
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
@@ -584,10 +594,12 @@ mod tests {
 
             drop(engine);
 
-            let engine = lightweight_test_engine_config(main_dir, "create_orphan_recover")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_orphan_recover",
+            ))
+            .await
+            .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_none());
             wait_path_exists(&table_file_path, false).await;
         });

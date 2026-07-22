@@ -439,6 +439,7 @@ mod tests {
     use crate::buffer::PoolRole;
     use crate::catalog::tests::table4;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::engine::Engine;
     use crate::error::{DiscloseError, OperationError, Result};
     use crate::id::RowID;
     use crate::index::{RowLocation, UniqueIndex};
@@ -845,13 +846,14 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
-                .trx(TrxSysConfig::default().log_file_stem("redo_secidx2"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(EvictableBufferPoolConfig::default().role(PoolRole::Mem))
+                    .trx(TrxSysConfig::default().log_file_stem("redo_secidx2")),
+            )
+            .await
+            .unwrap();
             let table_id = table4(&engine).await;
             {
                 let mut session = engine.new_session().unwrap();

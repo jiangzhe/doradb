@@ -1828,6 +1828,7 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::engine::Engine;
     use crate::error::{
         FatalError, IoError, ResourceError, RuntimeError, RuntimeOrFatalError, RuntimeResult,
         Validation,
@@ -2039,18 +2040,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx")),
+            )
+            .await
+            .unwrap();
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.inner().meta_pool.pool_guard();
@@ -2098,18 +2100,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx")),
+            )
+            .await
+            .unwrap();
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.inner().meta_pool.pool_guard();
@@ -2479,18 +2482,19 @@ mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let row_pages = 1024usize;
             // 1024 row pages ~= 64MB.
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(100usize * 1024 * 1024)
-                        .max_file_size(1024usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(100usize * 1024 * 1024)
+                            .max_file_size(1024usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx")),
+            )
+            .await
+            .unwrap();
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.inner().meta_pool.pool_guard();
@@ -2920,18 +2924,19 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx")),
+            )
+            .await
+            .unwrap();
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.inner().meta_pool.pool_guard();
@@ -3003,18 +3008,19 @@ mod tests {
     fn test_row_page_index_redo_failure_keeps_published_page_initialized() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path().to_path_buf())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_failure"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path().to_path_buf())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_failure")),
+            )
+            .await
+            .unwrap();
             let metadata = make_test_metadata();
             let meta_guard = engine.inner().meta_pool.pool_guard();
             let blk_idx = RowPageIndex::new(
@@ -3081,12 +3087,13 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
             let table_id = TableID::new(205);
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_order"))
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_order")),
+            )
+            .await
+            .unwrap();
             {
                 let meta_pool = &engine.inner().meta_pool;
                 let meta_guard = meta_pool.pool_guard();

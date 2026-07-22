@@ -24,14 +24,14 @@ Create a table with a schema and indexes, then drop it from an idle session.
 
 ```rust
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, EngineConfig, IndexAttributes, IndexKey, IndexSpec, TableSpec,
-    ValKind,
+    ColumnAttributes, ColumnSpec, Engine, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
+    TableSpec, ValKind,
 };
 
-let engine = EngineConfig::default()
-    .storage_root("target/doradb-quick-start")
-    .build()
-    .await?;
+let engine = Engine::bootstrap(
+    EngineConfig::default().storage_root("target/doradb-quick-start"),
+)
+.await?;
 let mut session = engine.new_session()?;
 
 let table_id = session

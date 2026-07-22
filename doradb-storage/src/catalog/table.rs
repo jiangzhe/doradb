@@ -1739,6 +1739,7 @@ mod tests {
         CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
         IndexSpec, TableSpec,
     };
+    use crate::engine::Engine;
     use crate::error::{
         DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError, IoError, OperationError,
         RuntimeError,
@@ -2413,10 +2414,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_invalid_metadata")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_invalid_metadata",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -2448,10 +2451,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_pk_rejected")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_pk_rejected",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -2480,10 +2485,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_fail_catalog")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_fail_catalog",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -2509,10 +2516,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_fail_publish")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_fail_publish",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -2549,10 +2558,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_fail_after_file")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_fail_after_file",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -2578,10 +2589,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_fail_runtime")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_fail_runtime",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -2607,10 +2620,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_fail_commit")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_fail_commit",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -3690,10 +3705,10 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "drop_gc_destroy")
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                Engine::bootstrap(lightweight_test_engine_config(main_dir, "drop_gc_destroy"))
+                    .await
+                    .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
@@ -3930,10 +3945,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir.clone(), "drop_recover_absence")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir.clone(),
+                "drop_recover_absence",
+            ))
+            .await
+            .unwrap();
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
@@ -3969,10 +3986,12 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = lightweight_test_engine_config(main_dir, "drop_recover_absence")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "drop_recover_absence",
+            ))
+            .await
+            .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_none());
             assert!(!Path::new(&table_file_path).exists());
         });

@@ -1,11 +1,6 @@
 use crate::log::LogSync;
 use byte_unit::Byte;
 
-/// Marker file stored at `storage_root` that records the durable storage layout.
-pub(crate) const STORAGE_LAYOUT_FILE_NAME: &str = "storage-layout.toml";
-/// Storage-layout marker version used for durable compatibility checks.
-pub(crate) const STORAGE_LAYOUT_VERSION: u32 = 3;
-
 /// Default bytes reserved for the fully resident metadata pool.
 pub(crate) const DEFAULT_ENGINE_META_BUFFER: usize = 32 * 1024 * 1024;
 /// Default in-memory budget for the user secondary-index buffer pool.

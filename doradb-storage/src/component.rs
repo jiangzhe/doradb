@@ -97,24 +97,28 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// - reverse-order final owner drop in [`Drop`]
 ///
 /// Current engine registration order:
-/// 1. `EnginePoisoner`
-/// 2. `FileSystem`
-/// 3. `DiskPool` -> `FileSystem`
-/// 4. `MetaPool`
-/// 5. `IndexPool` -> `FileSystem`
-/// 6. `MemPool` -> `FileSystem`
-/// 7. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
+/// 1. `StorageRootLease`
+/// 2. `EnginePoisoner`
+/// 3. `FileSystem`
+/// 4. `DiskPool` -> `FileSystem`
+/// 5. `MetaPool`
+/// 6. `IndexPool` -> `FileSystem`
+/// 7. `MemPool` -> `FileSystem`
+/// 8. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
 ///    `MemPool`
-/// 8. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
-/// 9. `LockManager`
-/// 10. `Catalog` -> `EnginePoisoner`, `MetaPool`, `FileSystem`, `DiskPool`
-/// 11. `TransactionSystem` -> `EnginePoisoner`, `MetaPool`, `IndexPool`,
+/// 9. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
+/// 10. `LockManager`
+/// 11. `Catalog` -> `EnginePoisoner`, `MetaPool`, `FileSystem`, `DiskPool`
+/// 12. `TransactionSystem` -> `EnginePoisoner`, `MetaPool`, `IndexPool`,
 ///     `MemPool`, `FileSystem`, `DiskPool`, `Catalog`
-/// 12. `TransactionSystemWorkers` -> `TransactionSystem`
+/// 13. `TransactionSystemWorkers` -> `TransactionSystem`
 ///
 /// Every entry above is an explicit [`RegistryBuilder::build`] call in the
 /// engine build program; component builds do not invoke downstream component
 /// builds themselves.
+/// `StorageRootLease` intentionally has no runtime dependency handle. Its first
+/// position makes it the final shutdown target, bracketing all subordinate
+/// storage activity with canonical-root ownership.
 ///
 /// Each arrow points from a component to a direct registry dependency fetched
 /// during its build. `FileSystemWorkers` also consumes shelf provisions from

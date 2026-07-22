@@ -3763,10 +3763,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir.clone(), "workflow-recovery")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir.clone(),
+                "workflow-recovery",
+            ))
+            .await
+            .unwrap();
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
@@ -3780,10 +3782,12 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let recovered = lightweight_test_engine_config(main_dir, "workflow-recovery")
-                .build()
-                .await
-                .unwrap();
+            let recovered = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "workflow-recovery",
+            ))
+            .await
+            .unwrap();
             let session = recovered.new_session().unwrap();
             let table = table_for_internal_assertion(&recovered, table_id);
             assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
@@ -4704,10 +4708,12 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "drop-delayed-batch")
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "drop-delayed-batch",
+            ))
+            .await
+            .unwrap();
             let table_id = create_table2_for_test(&engine).await;
             let mut setup = engine.new_session().unwrap();
             insert_rows(table_id, &mut setup, 1, 1, "before").await;
@@ -6046,18 +6052,18 @@ mod tests {
         log_file_stem: &str,
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let engine = lightweight_test_engine_config(temp_dir.path(), log_file_stem)
-            .trx(
+        let engine = Engine::bootstrap(
+            lightweight_test_engine_config(temp_dir.path(), log_file_stem).trx(
                 TrxSysConfig::default()
                     .log_write_io_depth(1)
                     .recovery_io_depth(1)
                     .catalog_checkpoint_scan_io_depth(1)
                     .log_file_stem(log_file_stem)
                     .purge_threads(purge_threads),
-            )
-            .build()
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
         let table_id = create_table2_for_test(&engine).await;
         let mut checkpoint_session = engine.new_session().unwrap();
         insert_rows(

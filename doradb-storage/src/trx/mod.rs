@@ -2398,22 +2398,23 @@ pub(crate) mod tests {
         max_mem_size: usize,
     ) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
-        let engine = EngineConfig::default()
-            .storage_root(temp_dir.path().to_path_buf())
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .max_mem_size(max_mem_size)
-                    .max_file_size(128usize * 1024 * 1024),
-            )
-            .trx(
-                TrxSysConfig::default()
-                    .purge_threads(1)
-                    .log_file_stem(log_file_stem),
-            )
-            .build()
-            .await
-            .unwrap();
+        let engine = Engine::bootstrap(
+            EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(max_mem_size)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .purge_threads(1)
+                        .log_file_stem(log_file_stem),
+                ),
+        )
+        .await
+        .unwrap();
         (temp_dir, engine)
     }
 

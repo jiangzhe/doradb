@@ -1485,11 +1485,14 @@ mod tests {
         purge_threads: usize,
     ) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
-        let engine =
-            purge_test_engine_config(temp_dir.path(), log_file_stem, gc_buckets, purge_threads)
-                .build()
-                .await
-                .unwrap();
+        let engine = Engine::bootstrap(purge_test_engine_config(
+            temp_dir.path(),
+            log_file_stem,
+            gc_buckets,
+            purge_threads,
+        ))
+        .await
+        .unwrap();
         (temp_dir, engine)
     }
 
@@ -2209,17 +2212,25 @@ mod tests {
     fn test_gc_bucket_count_can_change_across_restart_without_migration() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = purge_test_engine_config(temp_dir.path(), "redo_gc_restart", 2, 1)
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(purge_test_engine_config(
+                temp_dir.path(),
+                "redo_gc_restart",
+                2,
+                1,
+            ))
+            .await
+            .unwrap();
             assert_eq!(engine.inner().trx_sys.gc_buckets.len(), 2);
             engine.shutdown().unwrap();
 
-            let engine = purge_test_engine_config(temp_dir.path(), "redo_gc_restart", 4, 1)
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(purge_test_engine_config(
+                temp_dir.path(),
+                "redo_gc_restart",
+                4,
+                1,
+            ))
+            .await
+            .unwrap();
             assert_eq!(engine.inner().trx_sys.gc_buckets.len(), 4);
             engine.shutdown().unwrap();
         });
@@ -2230,22 +2241,23 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem("redo_purge_poison"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("redo_purge_poison"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let guards = full_pool_guards(&engine);
             assert!(
@@ -2297,22 +2309,23 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem("redo_purge_access_error"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("redo_purge_access_error"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let guards = full_pool_guards(&engine);
             engine
@@ -2355,22 +2368,23 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem("redo_purge_promote"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("redo_purge_promote"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -2438,22 +2452,23 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem("redo_purge_no_promote"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("redo_purge_no_promote"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -2525,22 +2540,23 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem("redo_purge_promote_missing_page"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("redo_purge_promote_missing_page"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -2631,22 +2647,23 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem("redo_purge_no_promote_missing_page"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("redo_purge_no_promote_missing_page"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
@@ -3176,22 +3193,23 @@ mod tests {
     fn test_dispatcher_skips_non_global_progress_and_enqueues_remote_work_first() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path().to_path_buf())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(2)
-                        .log_file_stem("redo_purge_schedule"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(temp_dir.path().to_path_buf())
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(2)
+                            .log_file_stem("redo_purge_schedule"),
+                    ),
+            )
+            .await
+            .unwrap();
             let mut setup = engine.new_session().unwrap();
             let initial_target = engine.inner().trx_sys.purge_handoff_cts();
             setup.begin_trx().unwrap().commit().await.unwrap();
@@ -3292,22 +3310,23 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(1)
-                        .log_file_stem("redo_purge"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(1)
+                            .log_file_stem("redo_purge"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
@@ -3373,22 +3392,23 @@ mod tests {
             const PURGE_SIZE: usize = 100;
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .purge_threads(2)
-                        .log_file_stem("redo_purge"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(main_dir)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(64usize * 1024 * 1024)
+                            .max_file_size(128usize * 1024 * 1024),
+                    )
+                    .trx(
+                        TrxSysConfig::default()
+                            .purge_threads(2)
+                            .log_file_stem("redo_purge"),
+                    ),
+            )
+            .await
+            .unwrap();
 
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();

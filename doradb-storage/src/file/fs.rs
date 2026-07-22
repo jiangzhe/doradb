@@ -2244,21 +2244,22 @@ pub(crate) mod tests {
 
     fn build_test_engine(storage_root: &Path, file: FileSystemConfig) -> Result<Engine> {
         smol::block_on(async {
-            EngineConfig::default()
-                .storage_root(storage_root)
-                .meta_buffer(TEST_META_POOL_BYTES)
-                .index_buffer(TEST_INDEX_POOL_BYTES)
-                .index_max_file_size(TEST_INDEX_MAX_FILE_BYTES)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(TEST_DATA_POOL_BYTES)
-                        .max_file_size(TEST_DATA_MAX_FILE_BYTES),
-                )
-                .file(file)
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
+            Engine::bootstrap(
+                EngineConfig::default()
+                    .storage_root(storage_root)
+                    .meta_buffer(TEST_META_POOL_BYTES)
+                    .index_buffer(TEST_INDEX_POOL_BYTES)
+                    .index_max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                    .data_buffer(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(TEST_DATA_POOL_BYTES)
+                            .max_file_size(TEST_DATA_MAX_FILE_BYTES),
+                    )
+                    .file(file)
+                    .trx(TrxSysConfig::default()),
+            )
+            .await
         })
     }
 

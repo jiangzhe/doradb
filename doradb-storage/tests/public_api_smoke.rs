@@ -27,11 +27,10 @@ mod tests {
     fn public_facade_supports_table_id_mvcc_dml() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine: Engine = EngineConfig::default()
-                .storage_root(root.path().to_path_buf())
-                .build()
-                .await
-                .unwrap();
+            let engine: Engine =
+                Engine::bootstrap(EngineConfig::default().storage_root(root.path().to_path_buf()))
+                    .await
+                    .unwrap();
             let mut session = engine.new_session().unwrap();
 
             let table_id = session
