@@ -1,7 +1,7 @@
 ---
 id: 000231
 title: Close Orchestration and Public Error Boundaries
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-21
 github_issue: 871
 ---
@@ -66,8 +66,8 @@ Issue Labels:
 
 Source Backlogs:
 
-- `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
-- `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
+- `docs/backlogs/closed/000159-reassess-invariant-oriented-table-scan-errors.md`
+- `docs/backlogs/closed/000160-harden-domain-specific-fault-injection-critical-workflows.md`
 
 Current-state evidence:
 
@@ -591,6 +591,52 @@ During `$task-resolve`:
 
 ## Implementation Notes
 
+- Added the crate-private `DiscloseError` and `DiscloseResultExt` policy
+  surface, removed every implicit conversion to public `Error`, and migrated
+  public, external-trait, and genuine mixed owners to explicit disclosure.
+  Typed source frames and attachments now survive constrained carriers,
+  completion fanout, Fatal policy, and public convergence. The producer audit
+  found no public Internal owner, so `ErrorKind::Internal`, Internal disclosure,
+  and the obsolete invariant-oriented Internal variants were removed.
+- Specialized `BlockIndex`, `RowPageIndex`, and `RowPageIndexMemCursor` to the
+  production `FixedBufferPool` metadata owner while retaining method-local
+  polymorphism for the fallible row-data pool. Root, child, sibling, required
+  pool-role, transaction-attachment, published-page, and dropped-runtime
+  lifetime proofs are enforced by infallible accessors or release assertions;
+  optimistic structural races remain retry outcomes. Synthetic metadata-pool
+  failure scaffolding was removed while production-reachable row-data failures
+  remain typed and covered.
+- Narrowed engine/session lifecycle, transaction and statement/stream,
+  retention, purge, recovery, file, table, catalog, and compiler-fallout
+  helpers to their owning typed domains or existing constrained carriers.
+  Recovery's sequential dispatch placeholders were removed, and terminal
+  best-effort owners now observe complete source-bearing reports before
+  counting, retrying, poisoning, or returning a neutral outcome.
+- Completed the critical-workflow fault matrix with production-shaped IO,
+  Runtime, DataIntegrity, completion, rollback, purge, DDL, B-tree, DiskTree,
+  and cleanup paths. Tests assert outer contexts, initiating source frames,
+  poison state, waiter fanout, and cleanup/failure atomicity. Rewrote
+  `docs/error-spec.md` around the stabilized typed-domain, disclosure,
+  completion, invariant, and terminal-observation rules.
+- Plan deviation: the implementation added `tools/error_audit.rs`, the tracked
+  `docs/public-error-audit.csv`, and mandatory pre-commit refresh despite the
+  original non-goal of adding a persistent source audit. This makes the final
+  bounded disclosure inventory deterministic and causes new or relocated
+  convergence sites to require explicit review. Resolution review also made
+  the pre-commit hook reject unstaged tracked changes and non-ignored untracked
+  files before formatting or inventory generation, ensuring the public-error
+  and unsafe inventories describe the staged source snapshot.
+- No persisted format or unsafe contract changed. The unsafe inventory refresh
+  changed only its generation date. Source review found no implicit public
+  conversion, public Internal classification, `InternalError::Generic`, or
+  retired transaction/guard/page invariant producer remaining.
+- Validation passed on 2026-07-22: `cargo fmt --check`, workspace build, strict
+  workspace Clippy via the style gate, 1,477 default-backend nextest cases,
+  strict `libaio` Clippy, 1,402 `libaio` nextest cases, the 65-file branch-diff
+  style audit, and `git diff --check`. Resolution review found and corrected
+  five mechanical style findings before the final clean audit.
+- No follow-up implementation was deferred. Source backlogs 000159 and 000160
+  were completed by this task and closed during resolution.
 
 ## Impacts
 

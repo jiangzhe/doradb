@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::process::exit;
 
 use syn::visit::{self, Visit};
 use syn::{Attribute, ImplItem, ItemImpl, ItemMod, ItemStruct, ItemTrait, TraitItem, Type};
@@ -216,7 +217,7 @@ fn usage() -> &'static str {
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
-        std::process::exit(1);
+        exit(1);
     }
 }
 

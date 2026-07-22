@@ -15,6 +15,8 @@ git config core.hooksPath .githooks
 ```
 
 Hook behavior (`.githooks/pre-commit`):
+- Reject tracked unstaged changes and non-ignored untracked files before running
+  any checks, so filesystem-based inventories match the Git index.
 - Always run:
   - `cargo fmt` (commit blocked if it changes files)
   - `cargo clippy --workspace --all-targets -- -D warnings` (commit blocked on any warning; production crate roots carry `clippy::undocumented_unsafe_blocks` via crate-level lint attributes)

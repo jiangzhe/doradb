@@ -248,10 +248,10 @@ Issue Labels:
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
+- [B1] `docs/backlogs/closed/000159-reassess-invariant-oriented-table-scan-errors.md`
   - production reachability and assertion-versus-recoverable decisions for
   fixed-buffer/index access.
-- [B2] `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
+- [B2] `docs/backlogs/closed/000160-harden-domain-specific-fault-injection-critical-workflows.md`
   - initiating-domain and retained-source coverage across B-tree, DiskTree,
   recovery, and poison-worthy workflows.
 
@@ -792,7 +792,7 @@ RFC. [D17], [D18]
   - Phase Status: done
   - Implementation Summary: Implemented typed infrastructure error boundaries across IO, file, buffer, log, configuration, catalog, and targeted transaction completion paths; preserved source reports through Runtime and Completion contexts; validated both IO backends and deferred lower rollback supplier narrowing to Phase 3. [Task Resolve Sync: docs/tasks/000228-typed-infrastructure-error-boundaries.md @ 2026-07-18]
   - Related Backlogs:
-    - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
+    - `docs/backlogs/closed/000159-reassess-invariant-oriented-table-scan-errors.md`
     - `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 2: Completion Bridge and Infrastructure Closure**
@@ -849,7 +849,7 @@ RFC. [D17], [D18]
   - Phase Status: done
   - Implementation Summary: Implemented the Arc-backed CompletionErrorBridge with checked ordered replay, lazy per-owner reconstruction, concrete BackendError progress transport, SharedFatalError poison propagation, and end-to-end producer and consumer migration; validated both IO backends and representative focused coverage. [Task Resolve Sync: docs/tasks/000229-completion-bridge-and-infrastructure-closure.md @ 2026-07-20]
   - Related Backlogs:
-    - `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
+    - `docs/backlogs/closed/000160-harden-domain-specific-fault-injection-critical-workflows.md`
     - `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 3: Stateful Storage and Semantic Consumers**
@@ -895,7 +895,7 @@ RFC. [D17], [D18]
   - Phase Status: done
   - Implementation Summary: Implemented typed stateful-storage Runtime boundaries, peer-domain carriers, neutral semantic outcomes, typed checkpoint/catalog/rollback flows, and strict monotonic Fatal completion propagation; validated both IO backends. Fixed-pool invariant proof in backlog 000159 and final error-spec refinement remain Phase 4 work. [Task Resolve Sync: docs/tasks/000230-stateful-storage-runtime-boundaries-and-semantic-consumers.md @ 2026-07-21]
   - Related Backlogs:
-    - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
+    - `docs/backlogs/closed/000159-reassess-invariant-oriented-table-scan-errors.md`
     - `docs/backlogs/closed/000161-narrow-terminal-rollback-undo-error-boundaries.md`
 
 - **Phase 4: Orchestration, Public Convergence, and Documentation Closure**
@@ -922,20 +922,25 @@ RFC. [D17], [D18]
     boundaries and no lower module requires an unclassified public-result
     adapter. Backlog 000159 is an explicit accepted carryover rather than an
     untracked Phase 3 boundary.
-  - Phase-local Choices: The exact grouping of focused fault-injection tests
-    and the clearest final documentation of approved public and mixed-domain
-    convergence sites.
+  - Phase-local Choices: Implemented crate-private explicit disclosure at
+    audited public, external-trait, and genuine mixed owners; specialized the
+    metadata index to `FixedBufferPool` while retaining fallible row-data-pool
+    polymorphism; completed production-shaped fault coverage; and added a
+    tracked pre-commit disclosure inventory so convergence changes require
+    explicit review.
   - After This Phase: Every production top-level error site is typed or
     explicitly approved, every module has a final verdict, bridge and Fatal
-    conversions retain their initiating sources for every waiter, and the
-    implementation snapshot reflects the stabilized boundary model.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    conversions retain their initiating sources for every waiter, public
+    Internal classification and unreachable invariant errors are absent, both
+    source backlogs are closed, and `docs/error-spec.md` plus the tracked
+    disclosure audit reflect the stabilized boundary model.
+  - Task Doc: `docs/tasks/000231-close-orchestration-and-public-error-boundaries.md`
+  - Task Issue: `#871`
+  - Phase Status: done
+  - Implementation Summary: Implemented explicit public disclosure, typed orchestration, fixed metadata-pool invariants, source-preserving terminal and fault coverage, deterministic disclosure auditing, and the stabilized error specification; validated default and libaio backends. [Task Resolve Sync: docs/tasks/000231-close-orchestration-and-public-error-boundaries.md @ 2026-07-22]
   - Related Backlogs:
-    - `docs/backlogs/000159-reassess-invariant-oriented-table-scan-errors.md`
-    - `docs/backlogs/000160-harden-domain-specific-fault-injection-critical-workflows.md`
+    - `docs/backlogs/closed/000159-reassess-invariant-oriented-table-scan-errors.md`
+    - `docs/backlogs/closed/000160-harden-domain-specific-fault-injection-critical-workflows.md`
 
 ## Test Strategy and Acceptance
 

@@ -43,3 +43,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Task 000231 completed production-shaped critical-workflow fault coverage, source-preserving Fatal and completion propagation, and cleanup atomicity checks across both storage backends.
+- Closed By: backlog close
+- Reference: docs/tasks/000231-close-orchestration-and-public-error-boundaries.md; GitHub issue 871
+- Closed At: 2026-07-22

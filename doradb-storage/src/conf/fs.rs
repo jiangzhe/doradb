@@ -23,14 +23,6 @@ pub struct FileSystemConfig {
     pub catalog_file_name: String,
 }
 
-/// Validated construction inputs for the table and catalog file system.
-#[derive(Debug)]
-pub(crate) struct ValidatedFileSystemConfig {
-    io_depth: usize,
-    data_dir: PathBuf,
-    catalog_file_name: String,
-}
-
 impl FileSystemConfig {
     /// Set async IO queue depth used by table-file subsystem.
     #[inline]
@@ -60,6 +52,7 @@ impl FileSystemConfig {
         self
     }
 
+    /// Validate and normalize construction inputs for the file system.
     #[inline]
     pub(crate) fn validate(self) -> ConfigResult<ValidatedFileSystemConfig> {
         if !validate_catalog_file_name(&self.catalog_file_name) {
@@ -80,14 +73,6 @@ impl FileSystemConfig {
     }
 }
 
-impl ValidatedFileSystemConfig {
-    /// Build the table file-system and its storage IO worker.
-    #[inline]
-    pub(crate) fn build_engine_parts(self) -> IoResult<(FileSystem, StorageIOWorkerBuilder)> {
-        build_file_system(self.io_depth, self.data_dir, self.catalog_file_name)
-    }
-}
-
 impl Default for FileSystemConfig {
     #[inline]
     fn default() -> Self {
@@ -97,6 +82,22 @@ impl Default for FileSystemConfig {
             readonly_buffer_size: DEFAULT_TABLE_FILE_READONLY_BUFFER_SIZE,
             catalog_file_name: String::from(DEFAULT_CATALOG_FILE_NAME),
         }
+    }
+}
+
+/// Validated construction inputs for the table and catalog file system.
+#[derive(Debug)]
+pub(crate) struct ValidatedFileSystemConfig {
+    io_depth: usize,
+    data_dir: PathBuf,
+    catalog_file_name: String,
+}
+
+impl ValidatedFileSystemConfig {
+    /// Build the table file-system and its storage IO worker.
+    #[inline]
+    pub(crate) fn build_engine_parts(self) -> IoResult<(FileSystem, StorageIOWorkerBuilder)> {
+        build_file_system(self.io_depth, self.data_dir, self.catalog_file_name)
     }
 }
 

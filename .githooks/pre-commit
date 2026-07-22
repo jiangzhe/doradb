@@ -7,6 +7,23 @@ if [[ -z "${ROOT}" ]]; then
 fi
 cd "${ROOT}"
 
+unstaged_changes="$(git diff --name-status --)"
+untracked_files="$(git ls-files --others --exclude-standard)"
+if [[ -n "${unstaged_changes}" || -n "${untracked_files}" ]]; then
+  echo "[pre-commit] Unstaged files are not allowed. Stage or stash them before committing."
+  if [[ -n "${unstaged_changes}" ]]; then
+    echo "[pre-commit] Tracked unstaged changes:"
+    printf '%s\n' "${unstaged_changes}"
+  fi
+  if [[ -n "${untracked_files}" ]]; then
+    echo "[pre-commit] Untracked files:"
+    while IFS= read -r path; do
+      printf '??\t%s\n' "${path}"
+    done <<< "${untracked_files}"
+  fi
+  exit 1
+fi
+
 tmp_before_fmt="$(mktemp)"
 tmp_after_fmt="$(mktemp)"
 tmp_fmt_log="$(mktemp)"

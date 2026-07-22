@@ -106,3 +106,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Task 000231 completed the fixed metadata pool, guard, transaction attachment, page lifetime, and dropped-runtime ownership proofs and replaced unreachable failures with enforced invariants.
+- Closed By: backlog close
+- Reference: docs/tasks/000231-close-orchestration-and-public-error-boundaries.md; GitHub issue 871
+- Closed At: 2026-07-22
