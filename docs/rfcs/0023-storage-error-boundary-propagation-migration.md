@@ -1,7 +1,7 @@
 ---
 id: 0023
 title: Storage Error Boundary and Propagation Migration
-status: proposal
+status: implemented
 tags: [error-handling, architecture, migration]
 created: 2026-07-17
 github_issue: 862
