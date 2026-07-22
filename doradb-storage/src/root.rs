@@ -136,6 +136,7 @@ pub(crate) struct StoragePathResolveInput<'a> {
 }
 
 impl<'a> StoragePathResolveInput<'a> {
+    /// Construct storage-root path resolution input from projected configuration values.
     #[inline]
     pub(crate) fn new(
         storage_root: &'a Path,
@@ -176,6 +177,7 @@ pub(crate) struct ResolvedStoragePaths {
 }
 
 impl ResolvedStoragePaths {
+    /// Validate and resolve storage-root configuration into absolute engine paths.
     pub(crate) fn resolve(input: StoragePathResolveInput<'_>) -> ConfigResult<Self> {
         if !validate_catalog_file_name(input.catalog_file_name) {
             return Err(
@@ -656,6 +658,7 @@ impl ResolvedStoragePaths {
         })
     }
 
+    /// Return the durable storage-layout marker path.
     pub(crate) fn marker_path(&self) -> PathBuf {
         self.storage_root.join(STORAGE_LAYOUT_FILE_NAME)
     }

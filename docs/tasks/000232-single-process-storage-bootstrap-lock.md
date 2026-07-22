@@ -1,7 +1,7 @@
 ---
 id: 000232
 title: Enforce Single-Process Storage Bootstrap Lock
-status: proposal
+status: implemented
 created: 2026-07-22
 github_issue: 874
 ---
@@ -61,7 +61,7 @@ Issue Labels:
 
 Source Backlogs:
 
-- docs/backlogs/000162-single-process-storage-bootstrap-lock.md
+- docs/backlogs/closed/000162-single-process-storage-bootstrap-lock.md
 
 ## Goals
 
@@ -389,6 +389,53 @@ Source Backlogs:
 
 ## Implementation Notes
 
+- Storage-root configuration projection and resolution now live in the
+  dedicated `root` module. Preparation creates and canonicalizes the root,
+  rebases configured data/log/swap paths from retained relative inputs, keeps
+  durable marker contents root-relative, and rejects reserved lock and marker
+  temporary names before storage components open files.
+- `StorageRootLease` opens the persistent `storage.lock` without following a
+  final-component symlink, requires a regular file, acquires a nonblocking OS
+  lock, and writes and syncs a versioned PID/acquisition-time record only after
+  ownership succeeds. Contenders never mutate the record and return optional
+  bounded diagnostics beneath `LifecycleError::StorageRootInUse`.
+- Bootstrap registers the acquired lease as the first component before marker
+  access or subordinate storage setup. Reverse component shutdown therefore
+  releases it last after normal shutdown, failed construction, ordinary drop,
+  and fatal busy-drop teardown; explicit shutdown permits a new owner while
+  the old `Engine` allocation remains alive.
+- Marker validation now reads directly and treats only `NotFound` as absence.
+  Startup removes only recognized non-directory stale temporaries under the
+  lease and syncs the canonical root before validation, preserving native IO
+  sources and operation/stage/path diagnostics for other failures.
+- New markers are serialized into a same-directory `create_new` temporary,
+  fully written and synced, installed without clobber through `hard_link`,
+  unlinked from the temporary name, and committed with a root-directory sync.
+  Pre-install and post-install failures retain explicit publication stage and
+  `NotInstalled` or `InstalledDurabilityUnknown` state, preserve the initiating
+  error, and attach any cleanup failure without rolling back a visible final
+  marker.
+- Deterministic thread-local hooks and subprocess helpers cover lease record
+  faults, same-process and cross-process contention, alias canonicalization,
+  shutdown and crash release, stale cleanup, no-clobber installation, handled
+  publication failures, and crash-visible publication stages without sleeps
+  or retry-based synchronization. Component-lifetime and example documentation
+  now describe the ownership boundary and persistent control files.
+- Resolution review found that the style audit counted the type-to-associated
+  item separator in paths such as `tests::Enum::Variant` as excess module
+  qualification. The audit now permits a type root after at most one module
+  segment for enum, struct, trait, and associated-item paths while retaining
+  diagnostics for deeper module paths; the three genuinely undocumented
+  crate-visible root methods were documented.
+- Verification passed 1,494 default workspace tests and 1,419 alternate
+  `libaio` storage tests. Default and `libaio` Clippy passed with warnings
+  denied, and the style gate passed all 31 branch-diff Rust files. Focused line
+  coverage was 82.81% for `root.rs`, 95.90% for `engine.rs`, and 89.57% in
+  aggregate. `git diff --check` also passed.
+- No unsafe code, dependency, persisted marker/catalog/table/redo format, or
+  RFC phase plan changed. No implementation follow-up was deferred; source
+  backlog 000162 is closed as implemented by this task.
+
 ## Impacts
 
 | Area | Expected impact |
@@ -400,7 +447,7 @@ Source Backlogs:
 | `doradb-storage/src/error.rs` | New fieldless `LifecycleError::StorageRootInUse`; no new public kind |
 | `docs/engine-component-lifetime.md` | Root ownership in build order, reverse shutdown, failed bootstrap, and owner-drop behavior |
 | `.config/nextest.toml` | No expected change; its existing 60-second global timeout remains authoritative for subprocess tests |
-| `docs/rfcs/0023-storage-error-boundary-propagation-migration.md` | No change; completed phase prerequisites are consumed without reopening phase choices |
+| RFC-0023 | No change; completed phase prerequisites are consumed without reopening phase choices |
 | Durable storage | Adds persistent `storage.lock` and transient reserved marker names; does not change marker, catalog, table, or redo formats |
 
 The only intentional pre-marker mutation is creation/canonicalization of the
