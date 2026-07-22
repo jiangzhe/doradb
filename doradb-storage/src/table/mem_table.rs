@@ -1,8 +1,9 @@
 use super::{
     DmlValidator, UpdateUniqueMvcc,
     hot::{DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace},
-    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
-    unique_key_from_full_row, validate_page_row_range,
+    index_key_is_changed, index_key_replace, read_latest_index_key,
+    read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
+    validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
@@ -1316,24 +1317,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             }
             IndexInsert::DuplicateKey(..) => unreachable!(),
         }
-    }
-
-    #[inline]
-    async fn defer_delete_indexes(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        row_id: RowID,
-        page_guard: &PageSharedGuard<RowPage>,
-    ) -> RuntimeResult<()> {
-        let metadata = self.metadata();
-        let keys = metadata
-            .idx
-            .active_indexes()
-            .map(|(index_no, _)| read_latest_index_key(metadata, index_no, page_guard, row_id))
-            .collect();
-        self.defer_delete_index_keys(rt, effects, row_id, keys)
-            .await
     }
 
     #[inline]
@@ -2987,7 +2970,14 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                     unreachable!("standalone MemTable delete observed TRANSITION row page");
                 }
                 DeleteInternal::Ok => {
-                    self.defer_delete_indexes(rt, effects, row_id, &page_guard)
+                    // Successful row undo ownership excludes another writer,
+                    // and deletion changed only the row bit. Copy every key
+                    // with one read guard, then release the page latch and
+                    // buffer pin before awaiting secondary-index masking.
+                    let index_keys =
+                        read_physical_index_keys_for_delete(self.metadata(), &page_guard, row_id);
+                    drop(page_guard);
+                    self.defer_delete_index_keys(rt, effects, row_id, index_keys)
                         .await?;
                     return Ok(DeleteMvcc::Deleted);
                 }

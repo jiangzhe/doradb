@@ -35,8 +35,8 @@ use crate::row::{Row, RowPage, RowRead, estimate_max_row_count};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionError, DmlValidator, MemTable,
     RowPageDescriptor, Table, TableRootSnapshot, TableRuntimeLayout, UpdateUniqueMvcc,
-    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
-    unique_key_from_full_row,
+    index_key_is_changed, index_key_replace, read_latest_index_key,
+    read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
 };
 use crate::trx::row::{FindOldVersion, IndexCandidateRecheck, ReadLatestRow, RowReadAccess};
 use crate::trx::stmt::StmtEffects;
@@ -1528,25 +1528,6 @@ impl<'a> UserTableAccessor<'a> {
             }
         }
         Ok(())
-    }
-
-    #[inline]
-    async fn defer_delete_indexes(
-        &self,
-        rt: TrxRuntime<'_>,
-        effects: &mut StmtEffects,
-        row_id: RowID,
-        page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: &TableRootSnapshot<'_>,
-    ) -> RuntimeResult<()> {
-        let metadata = self.metadata();
-        let keys = metadata
-            .idx
-            .active_indexes()
-            .map(|(index_no, _)| read_latest_index_key(metadata, index_no, page_guard, row_id))
-            .collect();
-        self.defer_delete_index_keys(rt, effects, row_id, keys, root_snapshot)
-            .await
     }
 
     #[inline]
@@ -3066,9 +3047,18 @@ impl<'a> UserTableAccessor<'a> {
                     }
                     RowMutation::Delete => {
                         outcome.delete_count += 1;
-                        value_buffer = lazy_row.into_reusable_buffer();
-                        self.delete_known_hot_row(rt, effects, page_guard, row_id, &root_snapshot)
-                            .await?;
+                        let (index_keys, reusable) =
+                            lazy_row.into_index_keys(self.metadata()).disclose()?;
+                        value_buffer = reusable;
+                        self.delete_known_hot_row(
+                            rt,
+                            effects,
+                            page_guard,
+                            row_id,
+                            index_keys,
+                            &root_snapshot,
+                        )
+                        .await?;
                     }
                     RowMutation::Update(update) => {
                         outcome.update_count += 1;
@@ -3235,15 +3225,23 @@ impl<'a> UserTableAccessor<'a> {
         effects: &mut StmtEffects,
         page_guard: PageSharedGuard<RowPage>,
         row_id: RowID,
+        index_keys: Vec<SelectKey>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<()> {
         let result = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
             .delete_known_row(effects)
             .await
             .disclose()?;
+        // The successful mutator path has already marked the page dirty,
+        // installed row undo and redo, and released its row write guard. This
+        // full-table path captured every index key before deletion, while its
+        // TableData(X) grant excludes concurrent writers and page transition.
+        // No result branch needs the page image, so release the shared latch and
+        // buffer pin before awaiting secondary-index masking.
+        drop(page_guard);
         match result {
             DeleteInternal::Ok => self
-                .defer_delete_indexes(rt, effects, row_id, &page_guard, root_snapshot)
+                .defer_delete_index_keys(rt, effects, row_id, index_keys, root_snapshot)
                 .await
                 .attach("full-table mutation hot delete index masking")
                 .disclose(),
@@ -3992,10 +3990,16 @@ impl<'a> UserTableAccessor<'a> {
                         .disclose()?;
                 }
                 DeleteInternal::Ok => {
-                    // Mask every secondary-index entry for this hot row. The
-                    // physical index entry remains until rollback unmasks it
-                    // or index GC removes it after it is no longer visible.
-                    self.defer_delete_indexes(rt, effects, row_id, &page_guard, &root_snapshot)
+                    // Successful row undo ownership excludes another writer,
+                    // and deletion changed only the row bit. Copy every key
+                    // with one read guard, then release the page latch and
+                    // buffer pin before awaiting secondary-index masking.
+                    let index_keys =
+                        read_physical_index_keys_for_delete(self.metadata(), &page_guard, row_id);
+                    drop(page_guard);
+                    // Physical index entries remain until rollback unmasks
+                    // them or index GC removes them after they are invisible.
+                    self.defer_delete_index_keys(rt, effects, row_id, index_keys, &root_snapshot)
                         .await
                         .disclose()?;
                     return Ok(DeleteMvcc::Deleted);
@@ -6917,6 +6921,170 @@ mod tests {
                 rows,
                 ScanMvcc::Rows(vec![vec![Val::from(1i32)], vec![Val::from(3i32)]])
             );
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_mutate_mvcc_hot_delete_captures_unread_index_columns() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "full_mutate_hot_index_keys")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "shared").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .exec(async |stmt| {
+                    stmt.table_mutate_mvcc(table_id, |row| {
+                        let id = row.val(0)?.as_i32().unwrap();
+                        Ok(if id % 2 == 0 {
+                            RowMutation::Delete
+                        } else {
+                            RowMutation::Skip
+                        })
+                    })
+                    .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.delete_count, 2);
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![vec![Val::from(1i32)], vec![Val::from(3i32)]])
+            );
+            for id in [0, 2] {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0]).await,
+                    Ok(SelectMvcc::NotFound)
+                ));
+            }
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(2i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            for id in 0..4 {
+                assert!(matches!(
+                    trx_select_row_mvcc_by_id(&mut trx, table_id, &single_key(id), &[0]).await,
+                    Ok(SelectMvcc::Found(_))
+                ));
+            }
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_hot_point_delete_masks_all_index_keys_and_rolls_back() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "hot_point_delete_index_keys",
+            )
+            .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "shared").await;
+            let key = single_key(2i32);
+
+            let mut trx = session.begin_trx().unwrap();
+            let deleted = trx_delete_row_by_id(&mut trx, table_id, &key).await;
+            assert!(matches!(deleted, Ok(DeleteMvcc::Deleted)));
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            assert!(matches!(
+                trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0]).await,
+                Ok(SelectMvcc::NotFound)
+            ));
+            trx.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(2i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            assert!(matches!(
+                trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0]).await,
+                Ok(SelectMvcc::Found(_))
+            ));
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let deleted = trx_delete_row_by_id(&mut trx, table_id, &key).await;
+            assert!(matches!(deleted, Ok(DeleteMvcc::Deleted)));
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let rows = trx
+                .exec(async |stmt| {
+                    stmt.table_index_lookup_mvcc(table_id, 1, &[Val::from("shared")], &[0])
+                        .await
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                ScanMvcc::Rows(vec![
+                    vec![Val::from(0i32)],
+                    vec![Val::from(1i32)],
+                    vec![Val::from(3i32)],
+                ])
+            );
+            assert!(matches!(
+                trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0]).await,
+                Ok(SelectMvcc::NotFound)
+            ));
             trx.commit().await.unwrap();
         });
     }

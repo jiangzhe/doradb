@@ -39,7 +39,7 @@ doradb-storage/src/table/access.rs,UserTableAccessor::delete_known_cold_row,3
 doradb-storage/src/table/access.rs,UserTableAccessor::delete_known_hot_row,3
 doradb-storage/src/table/access.rs,UserTableAccessor::delete_unique_mvcc,11
 doradb-storage/src/table/access.rs,UserTableAccessor::insert_mvcc,2
-doradb-storage/src/table/access.rs,UserTableAccessor::table_mutate_mvcc,14
+doradb-storage/src/table/access.rs,UserTableAccessor::table_mutate_mvcc,15
 doradb-storage/src/table/access.rs,UserTableAccessor::update_known_cold_row,5
 doradb-storage/src/table/access.rs,UserTableAccessor::update_known_hot_row,5
 doradb-storage/src/table/access.rs,UserTableAccessor::update_unique_mvcc_input,17

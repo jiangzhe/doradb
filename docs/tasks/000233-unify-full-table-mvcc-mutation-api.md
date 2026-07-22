@@ -1,7 +1,7 @@
 ---
 id: 000233
 title: Unify full-table MVCC mutation API
-status: proposal
+status: implemented
 created: 2026-07-22
 github_issue: 876
 ---
@@ -328,6 +328,43 @@ Retain the existing straightforward performance properties:
 Do not add a benchmark threshold or speculative general mutation framework.
 
 ## Implementation Notes
+
+- Replaced the update-only public facade with
+  `Statement::table_mutate_mvcc`, added the exhaustive public `RowMutation`
+  decision enum and `TableMutationOutcome`, migrated repository callers, and
+  preserved the documented action-count behavior including counted no-op
+  updates. The old compatibility facade was not retained.
+- Generalized the original-row traversal without changing its admission or
+  scan boundaries. Cold deletes stage index-column-only keys and install the
+  existing deletion-buffer, undo, redo, and index effects after releasing the
+  LWC guard. Hot deletes use the shared keyed/known mutator core and physical
+  `Delete` redo; updates retain the existing in-place and replacement paths.
+- Preserved transaction-duration `TableMetadata(S)` plus `TableData(X)`, lazy
+  callback reads, original hot-page worklists, replacement exclusion,
+  immediate uniqueness, and statement-wide rollback. Transaction and
+  checkpoint/recovery documentation plus the public error audit were updated
+  for the unified operation.
+- Review hardening changed the planned hot-delete guard lifetime. Full-table
+  hot deletes capture every active index key from the pre-delete `LazyRow`,
+  then release the row-page latch and buffer pin after undo/redo installation
+  but before asynchronous index masking. The update-only
+  `read_latest_index_key` helper is documented as a physical-image read so old
+  update keys continue to be reconstructed from saved before-images.
+- The same guard-lifetime reduction was extended internally to keyed point
+  delete without changing its public API or redo behavior. After the keyed
+  mutator validates and deletes the row, one row read guard copies all stable
+  physical index keys under transaction-owned undo ownership; the page guard
+  is then released before index masking. User-table and catalog/standalone
+  point paths share this key-capture helper.
+- Added inline production-path coverage for mixed cold/hot actions, callback
+  and uniqueness rollback, lock exclusion, recovery, unread delete-index
+  columns, and point-delete unique/non-unique masking across rollback and
+  commit. The standalone `public_api_smoke.rs` integration test was removed in
+  favor of this behavior-focused inline coverage.
+- Verification completed with `cargo build --workspace`, 1,501 passing tests
+  from `cargo nextest run --workspace`, 1,426 passing tests from the alternate
+  `libaio` nextest run, strict Clippy, formatting and diff checks, and a
+  passing style audit across 9 branch-diff Rust files.
 
 ## Impacts
 

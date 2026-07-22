@@ -307,7 +307,9 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 effects.update_last_row_undo(RowUndoKind::Delete);
                 drop(access); // unlock row.
                 drop(lock_row);
-                // The caller retains the page lock in order to update indexes later.
+                // A keyed caller retains the page guard to derive current index
+                // keys. A known-row caller may release it when keys were captured
+                // before mutation.
                 // create redo log.
                 let redo_entry = RowRedo {
                     page_id,
