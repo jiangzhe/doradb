@@ -11,8 +11,8 @@ use std::mem;
 
 /// Magic bytes stored in every redo file super-block header.
 pub(crate) const REDO_FILE_MAGIC: [u8; 8] = *b"DREDO\0\0\0";
-/// Redo file format version for fixed-block redo data framing.
-pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 4;
+/// Redo file format version for framing and serialized redo payloads.
+pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 5;
 /// Shared block-integrity envelope used by redo super-block slots.
 pub(crate) const REDO_SUPER_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(REDO_FILE_MAGIC, REDO_FILE_FORMAT_VERSION);
@@ -984,7 +984,7 @@ mod tests {
             (
                 "version",
                 Box::new(|buf| {
-                    let _ = buf.ser_u64(8, 999);
+                    let _ = buf.ser_u64(8, REDO_FILE_FORMAT_VERSION - 1);
                 }),
                 DataIntegrityError::InvalidVersion,
             ),

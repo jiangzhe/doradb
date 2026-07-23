@@ -1514,7 +1514,7 @@ pub(crate) mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
             .await
     }
 
@@ -1955,7 +1955,7 @@ pub(crate) mod tests {
             let err = trx
                 .exec(async |stmt| {
                     let key = SelectKey::new(1, vec![Val::from("old")]);
-                    stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+                    stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
                         .await?;
                     Ok(())
                 })

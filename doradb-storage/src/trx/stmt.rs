@@ -164,6 +164,13 @@ impl StmtEffects {
         self.redo.insert_dml(table_id, entry);
     }
 
+    /// Borrow statement-local redo for producer assertions.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn redo_for_test(&self) -> &RedoLogs {
+        &self.redo
+    }
+
     /// Replace the statement's deferred DDL redo payload.
     #[inline]
     pub(crate) fn set_ddl_redo(&mut self, ddl: DDLRedo) -> Option<Box<DDLRedo>> {
@@ -750,7 +757,6 @@ impl<'stmt> Statement<'stmt> {
         table_id: TableID,
         index_no: usize,
         key_vals: &[Val],
-        log_by_key: bool,
     ) -> Result<DeleteMvcc> {
         const OPERATION: &str = "table_delete_unique_mvcc";
         let table = self
@@ -780,7 +786,7 @@ impl<'stmt> Statement<'stmt> {
         let (rt, effects) = self.runtime_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .delete_unique_mvcc(rt, effects, index_no, key_vals, log_by_key)
+            .delete_unique_mvcc(rt, effects, index_no, key_vals)
             .await
     }
 

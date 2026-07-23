@@ -54,9 +54,8 @@ pub(crate) enum NoTrxUpsertChange {
         row_id: RowID,
         vals: Vec<Val>,
     },
-    /// An existing logical row was updated at the reported final runtime location.
+    /// An existing logical row was updated with its stable runtime row identity.
     Updated {
-        page_id: PageID,
         row_id: RowID,
         key: SelectKey,
         cols: Vec<UpdateCol>,
@@ -1745,7 +1744,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         if update.is_empty() {
             return Ok(());
         }
-        let (page_id, row_id) = self
+        let (_, row_id) = self
             .update_primary_key_no_trx_location(
                 guards,
                 key.index_no,
@@ -1755,7 +1754,6 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             )
             .await?;
         on_change(NoTrxUpsertChange::Updated {
-            page_id,
             row_id,
             key,
             cols: update,
@@ -3784,14 +3782,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let (insert_page_id, insert_row_id) = match inserted.unwrap() {
-                NoTrxUpsertChange::Inserted {
-                    page_id,
-                    row_id,
-                    vals,
-                } => {
+            let insert_row_id = match inserted.unwrap() {
+                NoTrxUpsertChange::Inserted { row_id, vals, .. } => {
                     assert_eq!(vals, initial);
-                    (page_id, row_id)
+                    row_id
                 }
                 NoTrxUpsertChange::Updated { .. } => panic!("first upsert must insert"),
             };
@@ -3815,13 +3809,7 @@ mod tests {
                 .await
                 .unwrap();
             match updated.unwrap() {
-                NoTrxUpsertChange::Updated {
-                    page_id,
-                    row_id,
-                    key,
-                    cols,
-                } => {
-                    assert_eq!(page_id, insert_page_id);
+                NoTrxUpsertChange::Updated { row_id, key, cols } => {
                     assert_eq!(row_id, insert_row_id);
                     assert_eq!(key, single_key(1i32));
                     assert_eq!(

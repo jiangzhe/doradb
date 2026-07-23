@@ -1970,9 +1970,8 @@ pub(crate) mod tests {
         sys_trx.redo.insert_dml(
             TableID::from(1u64),
             RowRedo {
-                page_id: PageID::from(1u64),
                 row_id: RowID::new(0),
-                kind: RowRedoKind::Insert(values),
+                kind: RowRedoKind::Insert(PageID::from(1u64), values),
             },
         );
     }

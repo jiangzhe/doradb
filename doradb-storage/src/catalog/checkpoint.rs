@@ -699,7 +699,7 @@ fn drop_table_has_catalog_table_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{PageID, RowID};
+    use crate::id::RowID;
     use crate::log::redo::RowRedo;
     use crate::recovery::stream::RedoSegmentCtsRange;
     use crate::row::ops::SelectKey;
@@ -714,11 +714,7 @@ mod tests {
 
     fn catalog_tables_dml(kind: RowRedoKind) -> BTreeMap<TableID, TableDML> {
         let row_id = RowID::new(1);
-        let row = RowRedo {
-            page_id: PageID::new(0),
-            row_id,
-            kind,
-        };
+        let row = RowRedo { row_id, kind };
         let mut rows = BTreeMap::new();
         rows.insert(row_id, row);
         let mut dml = BTreeMap::new();

@@ -572,7 +572,7 @@ async fn measure_delete(
         let key = SelectKey::new(0, vec![Val::from(id)]);
         let start = Instant::now();
         trx.exec(async |stmt| {
-            stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+            stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
                 .await
         })
         .await?;

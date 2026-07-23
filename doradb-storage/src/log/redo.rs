@@ -1,7 +1,7 @@
 use crate::error::DataIntegrityError;
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UpdateCol};
-use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
+use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::BTreeMap;
@@ -39,9 +39,9 @@ impl TryFrom<u8> for RowRedoCode {
 /// Defines the kind of redo operation on a row.
 #[derive(Debug)]
 pub(crate) enum RowRedoKind {
-    Insert(Vec<Val>),
-    Delete,
-    Update(Vec<UpdateCol>),
+    Insert(PageID, Vec<Val>),
+    Delete(Option<PageID>),
+    Update(PageID, Vec<UpdateCol>),
     /// This is special kind for catalog update/delete.
     DeleteByPrimaryKey(SelectKey),
     /// Catalog update selected by the table primary key instead of runtime row id.
@@ -54,7 +54,7 @@ impl RowRedoKind {
     pub(crate) fn code(&self) -> RowRedoCode {
         match self {
             RowRedoKind::Insert(..) => RowRedoCode::Insert,
-            RowRedoKind::Delete => RowRedoCode::Delete,
+            RowRedoKind::Delete(_) => RowRedoCode::Delete,
             RowRedoKind::Update(..) => RowRedoCode::Update,
             RowRedoKind::DeleteByPrimaryKey(_) => RowRedoCode::DeleteByPrimaryKey,
             RowRedoKind::UpdateByPrimaryKey(..) => RowRedoCode::UpdateByPrimaryKey,
@@ -66,9 +66,9 @@ impl Ser<'_> for RowRedoKind {
     fn ser_len(&self) -> usize {
         mem::size_of::<u8>()
             + match self {
-                RowRedoKind::Insert(vals) => vals.ser_len(),
-                RowRedoKind::Delete => 0,
-                RowRedoKind::Update(cols) => cols.ser_len(),
+                RowRedoKind::Insert(_, vals) => mem::size_of::<PageID>() + vals.ser_len(),
+                RowRedoKind::Delete(page_id) => page_id.ser_len(),
+                RowRedoKind::Update(_, cols) => mem::size_of::<PageID>() + cols.ser_len(),
                 RowRedoKind::DeleteByPrimaryKey(key) => key.ser_len(),
                 RowRedoKind::UpdateByPrimaryKey(key, cols) => key.ser_len() + cols.ser_len(),
             }
@@ -79,11 +79,15 @@ impl Ser<'_> for RowRedoKind {
         let mut idx = start_idx;
         idx = out.ser_u8(idx, self.code() as u8);
         match self {
-            RowRedoKind::Insert(vals) => {
+            RowRedoKind::Insert(page_id, vals) => {
+                idx = page_id.ser(out, idx);
                 idx = vals.ser(out, idx);
             }
-            RowRedoKind::Delete => (),
-            RowRedoKind::Update(cols) => {
+            RowRedoKind::Delete(page_id) => {
+                idx = page_id.ser(out, idx);
+            }
+            RowRedoKind::Update(page_id, cols) => {
+                idx = page_id.ser(out, idx);
                 idx = cols.ser(out, idx);
             }
             RowRedoKind::DeleteByPrimaryKey(key) => {
@@ -99,13 +103,12 @@ impl Ser<'_> for RowRedoKind {
 }
 
 impl Deser for RowRedoKind {
-    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
+        ensure_deser_remaining(input, start_idx, mem::size_of::<u8>() * 2, "row redo kind")?;
         let (idx, code) = input.deser_u8(start_idx)?;
         let code = RowRedoCode::try_from(code).map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload)
@@ -113,20 +116,67 @@ impl Deser for RowRedoKind {
         })?;
         match code {
             RowRedoCode::Insert => {
+                ensure_deser_remaining(
+                    input,
+                    idx,
+                    mem::size_of::<PageID>() + mem::size_of::<u64>(),
+                    "row redo insert",
+                )?;
+                let (idx, page_id) = PageID::deser(input, idx)?;
                 let (idx, vals) = Vec::<Val>::deser(input, idx)?;
-                Ok((idx, RowRedoKind::Insert(vals)))
+                Ok((idx, RowRedoKind::Insert(page_id, vals)))
             }
-            RowRedoCode::Delete => Ok((idx, RowRedoKind::Delete)),
+            RowRedoCode::Delete => {
+                let (idx, present) = input.deser_bool(idx)?;
+                let (idx, page_id) = if present {
+                    ensure_deser_remaining(
+                        input,
+                        idx,
+                        mem::size_of::<PageID>(),
+                        "row redo delete page identity",
+                    )?;
+                    let (idx, page_id) = PageID::deser(input, idx)?;
+                    (idx, Some(page_id))
+                } else {
+                    (idx, None)
+                };
+                Ok((idx, RowRedoKind::Delete(page_id)))
+            }
             RowRedoCode::Update => {
+                ensure_deser_remaining(
+                    input,
+                    idx,
+                    mem::size_of::<PageID>() + mem::size_of::<u64>(),
+                    "row redo update",
+                )?;
+                let (idx, page_id) = PageID::deser(input, idx)?;
                 let (idx, cols) = Vec::<UpdateCol>::deser(input, idx)?;
-                Ok((idx, RowRedoKind::Update(cols)))
+                Ok((idx, RowRedoKind::Update(page_id, cols)))
             }
             RowRedoCode::DeleteByPrimaryKey => {
+                ensure_deser_remaining(
+                    input,
+                    idx,
+                    mem::size_of::<u32>() + mem::size_of::<u64>(),
+                    "row redo delete-by-primary-key",
+                )?;
                 let (idx, key) = SelectKey::deser(input, idx)?;
                 Ok((idx, RowRedoKind::DeleteByPrimaryKey(key)))
             }
             RowRedoCode::UpdateByPrimaryKey => {
+                ensure_deser_remaining(
+                    input,
+                    idx,
+                    mem::size_of::<u32>() + mem::size_of::<u64>(),
+                    "row redo update-by-primary-key",
+                )?;
                 let (idx, key) = SelectKey::deser(input, idx)?;
+                ensure_deser_remaining(
+                    input,
+                    idx,
+                    mem::size_of::<u64>(),
+                    "row redo update-by-primary-key columns",
+                )?;
                 let (idx, cols) = Vec::<UpdateCol>::deser(input, idx)?;
                 Ok((idx, RowRedoKind::UpdateByPrimaryKey(key, cols)))
             }
@@ -137,8 +187,6 @@ impl Deser for RowRedoKind {
 /// Represents a redo operation on a row.
 #[derive(Debug)]
 pub(crate) struct RowRedo {
-    /// Row page containing the changed row.
-    pub(crate) page_id: PageID,
     /// Logical row identifier affected by this redo operation.
     pub(crate) row_id: RowID,
     /// Redo operation payload for the row.
@@ -148,13 +196,12 @@ pub(crate) struct RowRedo {
 impl Ser<'_> for RowRedo {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<PageID>() + mem::size_of::<RowID>() + self.kind.ser_len()
+        mem::size_of::<RowID>() + self.kind.ser_len()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = out.ser_u64(idx, self.page_id.into());
         idx = out.ser_u64(idx, self.row_id.as_u64());
         self.kind.ser(out, idx)
     }
@@ -162,24 +209,19 @@ impl Ser<'_> for RowRedo {
 
 impl Deser for RowRedo {
     const MIN_BYTES_HINT: MinBytesHint =
-        min_bytes_hint(mem::size_of::<PageID>() + mem::size_of::<RowID>() + mem::size_of::<u8>());
+        min_bytes_hint(mem::size_of::<RowID>() + mem::size_of::<u8>() * 2);
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
-        let (idx, page_id) = input.deser_u64(start_idx)?;
-        let (idx, row_id) = RowID::deser(input, idx)?;
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
+        ensure_deser_remaining(
+            input,
+            start_idx,
+            mem::size_of::<RowID>() + mem::size_of::<u8>() * 2,
+            "row redo",
+        )?;
+        let (idx, row_id) = RowID::deser(input, start_idx)?;
         let (idx, kind) = RowRedoKind::deser(input, idx)?;
-        Ok((
-            idx,
-            RowRedo {
-                page_id: PageID::from(page_id),
-                row_id,
-                kind,
-            },
-        ))
+        Ok((idx, RowRedo { row_id, kind }))
     }
 }
 
@@ -335,10 +377,7 @@ impl Deser for DDLRedo {
         min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<TableID>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
         let code = DDLRedoCode::try_from(code).map_err(|_| {
             Report::new(DataIntegrityError::InvalidPayload)
@@ -481,10 +520,7 @@ impl Deser for RedoLogs {
         min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, ddl) = Option::<Box<DDLRedo>>::deser(input, start_idx)?;
         let (idx, dml) = BTreeMap::<TableID, TableDML>::deser(input, idx)?;
         Ok((idx, RedoLogs { ddl, dml }))
@@ -540,10 +576,7 @@ impl Deser for RedoHeader {
         min_bytes_hint(mem::size_of::<TrxID>() + mem::size_of::<u8>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, cts) = TrxID::deser(input, start_idx)?;
         let (idx, code) = u8::deser(input, idx)?;
         let trx_kind = RedoTrxKind::try_from(code).map_err(|_| {
@@ -572,7 +605,7 @@ impl TableDML {
             Entry::Occupied(mut occ) => {
                 let old = occ.get_mut();
                 match (&mut old.kind, entry.kind) {
-                    (RowRedoKind::Delete | RowRedoKind::DeleteByPrimaryKey(_), _) => {
+                    (RowRedoKind::Delete(_) | RowRedoKind::DeleteByPrimaryKey(_), _) => {
                         // Once the old RowID is deleted, there is impossible
                         // to have another operation on the same RowID.
                         unreachable!()
@@ -582,8 +615,8 @@ impl TableDML {
                         unreachable!()
                     }
                     (
-                        RowRedoKind::Insert(vals),
-                        RowRedoKind::Update(upd_cols)
+                        RowRedoKind::Insert(_, vals),
+                        RowRedoKind::Update(_, upd_cols)
                         | RowRedoKind::UpdateByPrimaryKey(_, upd_cols),
                     ) => {
                         // Apply update to inserted rows.
@@ -594,13 +627,13 @@ impl TableDML {
                     }
                     (
                         RowRedoKind::Insert(..),
-                        RowRedoKind::Delete | RowRedoKind::DeleteByPrimaryKey(_),
+                        RowRedoKind::Delete(_) | RowRedoKind::DeleteByPrimaryKey(_),
                     ) => {
                         // Insert and then delete the same RowID.
                         // Remove this entry.
                         occ.remove_entry();
                     }
-                    (RowRedoKind::Update(vals), RowRedoKind::Update(upd_cols)) => {
+                    (RowRedoKind::Update(_, vals), RowRedoKind::Update(_, upd_cols)) => {
                         // Apply update to updated rows.
                         // Update any indexed columns that are not included in new update.
                         merge_update_cols(vals, upd_cols);
@@ -615,13 +648,13 @@ impl TableDML {
                         );
                         merge_update_cols(vals, upd_cols);
                     }
-                    (RowRedoKind::Update(_), RowRedoKind::DeleteByPrimaryKey(_)) => {
+                    (RowRedoKind::Update(..), RowRedoKind::DeleteByPrimaryKey(_)) => {
                         // We do not allow Update and then DeleteByPrimaryKey,
                         // because DeleteByPrimaryKey is only used for catalog tables.
                         // And they are not allow to update, instead we perform delete+insert.
                         unreachable!()
                     }
-                    (RowRedoKind::Update(_), RowRedoKind::UpdateByPrimaryKey(..)) => {
+                    (RowRedoKind::Update(..), RowRedoKind::UpdateByPrimaryKey(..)) => {
                         unreachable!("row-id update cannot be followed by keyed update")
                     }
                     (
@@ -630,21 +663,19 @@ impl TableDML {
                     ) => {
                         let key = key.clone();
                         *old = RowRedo {
-                            page_id: entry.page_id,
                             row_id: entry.row_id,
                             kind: RowRedoKind::DeleteByPrimaryKey(key),
                         };
                     }
-                    (RowRedoKind::Update(..), RowRedoKind::Delete) => {
+                    (RowRedoKind::Update(..), RowRedoKind::Delete(page_id)) => {
                         // Update and then delete the same RowID.
                         // Replace Update with Delete.
                         *old = RowRedo {
-                            page_id: entry.page_id,
                             row_id: entry.row_id,
-                            kind: RowRedoKind::Delete,
+                            kind: RowRedoKind::Delete(page_id),
                         };
                     }
-                    (RowRedoKind::UpdateByPrimaryKey(..), RowRedoKind::Delete) => {
+                    (RowRedoKind::UpdateByPrimaryKey(..), RowRedoKind::Delete(_)) => {
                         unreachable!("catalog keyed update must delete by primary key")
                     }
                     (
@@ -656,7 +687,7 @@ impl TableDML {
                         // is already inserted.
                         unreachable!()
                     }
-                    (RowRedoKind::UpdateByPrimaryKey(..), RowRedoKind::Update(_)) => {
+                    (RowRedoKind::UpdateByPrimaryKey(..), RowRedoKind::Update(..)) => {
                         unreachable!("catalog keyed update must remain keyed")
                     }
                 }
@@ -689,13 +720,31 @@ impl Deser for TableDML {
     const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>());
 
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        data: &S,
-        start_idx: usize,
-    ) -> crate::serde::DeserResult<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(data: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
         let (idx, rows) = BTreeMap::<RowID, RowRedo>::deser(data, start_idx)?;
         Ok((idx, TableDML { rows }))
     }
+}
+
+#[inline]
+fn ensure_deser_remaining<S: Serde + ?Sized>(
+    input: &S,
+    start_idx: usize,
+    required: usize,
+    payload: &str,
+) -> DeserResult<()> {
+    let remaining = input.size().checked_sub(start_idx).ok_or_else(|| {
+        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "deserialize {payload} start exceeds input: start_idx={start_idx}, input_size={}",
+            input.size()
+        ))
+    })?;
+    if remaining < required {
+        return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "deserialize {payload} exceeds remaining input: remaining={remaining}, required={required}"
+        )));
+    }
+    Ok(())
 }
 
 #[inline]
@@ -724,9 +773,8 @@ mod tests {
 
         // Test case 1: Simple insert
         let insert_entry = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(100),
-            kind: RowRedoKind::Insert(vec![Val::U64(42)]),
+            kind: RowRedoKind::Insert(test_page_id(1), vec![Val::U64(42)]),
         };
         redo_logs.insert_dml(TableID::new(1), insert_entry);
         assert_eq!(redo_logs.dml.len(), 1);
@@ -735,16 +783,20 @@ mod tests {
 
         // Test case 2: Update after insert
         let update_entry = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(100),
-            kind: RowRedoKind::Update(vec![UpdateCol {
-                idx: 0,
-                val: Val::U64(43),
-            }]),
+            kind: RowRedoKind::Update(
+                test_page_id(2),
+                vec![UpdateCol {
+                    idx: 0,
+                    val: Val::U64(43),
+                }],
+            ),
         };
         redo_logs.insert_dml(TableID::new(1), update_entry);
         let table = redo_logs.dml.get(&TableID::new(1)).unwrap();
-        if let RowRedoKind::Insert(vals) = &table.rows.get(&RowID::new(100)).unwrap().kind {
+        if let RowRedoKind::Insert(page_id, vals) = &table.rows.get(&RowID::new(100)).unwrap().kind
+        {
+            assert_eq!(*page_id, test_page_id(1));
             assert_eq!(vals[0], Val::U64(43));
         } else {
             panic!("Expected Insert kind");
@@ -752,9 +804,8 @@ mod tests {
 
         // Test case 3: Delete after update
         let delete_entry = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(100),
-            kind: RowRedoKind::Delete,
+            kind: RowRedoKind::Delete(Some(test_page_id(2))),
         };
         redo_logs.insert_dml(TableID::new(1), delete_entry);
         let table = redo_logs.dml.get(&TableID::new(1)).unwrap();
@@ -762,34 +813,39 @@ mod tests {
 
         // Test case 4: Multiple updates
         let insert_entry = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(200),
-            kind: RowRedoKind::Insert(vec![Val::U64(1), Val::U64(2)]),
+            kind: RowRedoKind::Insert(test_page_id(1), vec![Val::U64(1), Val::U64(2)]),
         };
         redo_logs.insert_dml(TableID::new(1), insert_entry);
 
         let update1 = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(200),
-            kind: RowRedoKind::Update(vec![UpdateCol {
-                idx: 0,
-                val: Val::U64(3),
-            }]),
+            kind: RowRedoKind::Update(
+                test_page_id(2),
+                vec![UpdateCol {
+                    idx: 0,
+                    val: Val::U64(3),
+                }],
+            ),
         };
         redo_logs.insert_dml(TableID::new(1), update1);
 
         let update2 = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(200),
-            kind: RowRedoKind::Update(vec![UpdateCol {
-                idx: 1,
-                val: Val::U64(4),
-            }]),
+            kind: RowRedoKind::Update(
+                test_page_id(3),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::U64(4),
+                }],
+            ),
         };
         redo_logs.insert_dml(TableID::new(1), update2);
 
         let table = redo_logs.dml.get(&TableID::new(1)).unwrap();
-        if let RowRedoKind::Insert(vals) = &table.rows.get(&RowID::new(200)).unwrap().kind {
+        if let RowRedoKind::Insert(page_id, vals) = &table.rows.get(&RowID::new(200)).unwrap().kind
+        {
+            assert_eq!(*page_id, test_page_id(1));
             assert_eq!(vals[0], Val::U64(3));
             assert_eq!(vals[1], Val::U64(4));
         } else {
@@ -798,9 +854,8 @@ mod tests {
 
         // Test case 5: Multiple tables
         let another_insert = RowRedo {
-            page_id: test_page_id(2),
             row_id: RowID::new(300),
-            kind: RowRedoKind::Insert(vec![Val::U64(50)]),
+            kind: RowRedoKind::Insert(test_page_id(2), vec![Val::U64(50)]),
         };
         redo_logs.insert_dml(TableID::new(2), another_insert);
         assert_eq!(redo_logs.dml.len(), 2);
@@ -816,16 +871,14 @@ mod tests {
 
         // 测试用例1：合并不同表的日志
         let insert1 = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(100),
-            kind: RowRedoKind::Insert(vec![Val::U64(42)]),
+            kind: RowRedoKind::Insert(test_page_id(1), vec![Val::U64(42)]),
         };
         redo_logs1.insert_dml(TableID::new(1), insert1);
 
         let insert2 = RowRedo {
-            page_id: test_page_id(2),
             row_id: RowID::new(200),
-            kind: RowRedoKind::Insert(vec![Val::U64(43)]),
+            kind: RowRedoKind::Insert(test_page_id(2), vec![Val::U64(43)]),
         };
         redo_logs2.insert_dml(TableID::new(2), insert2);
 
@@ -837,37 +890,40 @@ mod tests {
         // 测试用例2：合并相同表中的不同行
         let mut redo_logs2 = RedoLogs::default();
         let insert3 = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(101),
-            kind: RowRedoKind::Insert(vec![Val::U64(44)]),
+            kind: RowRedoKind::Insert(test_page_id(1), vec![Val::U64(44)]),
         };
         redo_logs2.insert_dml(TableID::new(1), insert3);
 
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
         assert_eq!(table1.rows.len(), 2);
-        if let RowRedoKind::Insert(vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind {
+        if let RowRedoKind::Insert(_, vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind {
             assert_eq!(vals[0], Val::U64(42));
         }
-        if let RowRedoKind::Insert(vals) = &table1.rows.get(&RowID::new(101)).unwrap().kind {
+        if let RowRedoKind::Insert(_, vals) = &table1.rows.get(&RowID::new(101)).unwrap().kind {
             assert_eq!(vals[0], Val::U64(44));
         }
 
         // 测试用例3：合并相同表相同行的操作
         let mut redo_logs2 = RedoLogs::default();
         let update1 = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(100),
-            kind: RowRedoKind::Update(vec![UpdateCol {
-                idx: 0,
-                val: Val::U64(45),
-            }]),
+            kind: RowRedoKind::Update(
+                test_page_id(2),
+                vec![UpdateCol {
+                    idx: 0,
+                    val: Val::U64(45),
+                }],
+            ),
         };
         redo_logs2.insert_dml(TableID::new(1), update1);
 
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
-        if let RowRedoKind::Insert(vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind {
+        if let RowRedoKind::Insert(page_id, vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind
+        {
+            assert_eq!(*page_id, test_page_id(1));
             assert_eq!(vals[0], Val::U64(45));
         }
 
@@ -880,9 +936,8 @@ mod tests {
         // 测试用例5：删除操作的合并
         let mut redo_logs2 = RedoLogs::default();
         let delete1 = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(101),
-            kind: RowRedoKind::Delete,
+            kind: RowRedoKind::Delete(Some(test_page_id(1))),
         };
         redo_logs2.insert_dml(TableID::new(1), delete1);
 
@@ -892,34 +947,208 @@ mod tests {
     }
 
     #[test]
+    fn test_row_redo_variants_round_trip_and_reject_truncation() {
+        let key = SelectKey::new(0, vec![Val::U64(7)]);
+        let cases = [
+            RowRedo {
+                row_id: RowID::new(1),
+                kind: RowRedoKind::Insert(test_page_id(11), vec![Val::U64(13)]),
+            },
+            RowRedo {
+                row_id: RowID::new(2),
+                kind: RowRedoKind::Delete(Some(test_page_id(12))),
+            },
+            RowRedo {
+                row_id: RowID::new(3),
+                kind: RowRedoKind::Delete(None),
+            },
+            RowRedo {
+                row_id: RowID::new(4),
+                kind: RowRedoKind::Update(
+                    test_page_id(14),
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::U64(17),
+                    }],
+                ),
+            },
+            RowRedo {
+                row_id: RowID::new(5),
+                kind: RowRedoKind::DeleteByPrimaryKey(key.clone()),
+            },
+            RowRedo {
+                row_id: RowID::new(6),
+                kind: RowRedoKind::UpdateByPrimaryKey(
+                    key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::U64(19),
+                    }],
+                ),
+            },
+        ];
+
+        assert_eq!(RowRedoKind::MIN_BYTES_HINT.unwrap().get(), 2);
+        assert_eq!(RowRedo::MIN_BYTES_HINT.unwrap().get(), 10);
+        for expected in cases {
+            let start_idx = 3;
+            let expected_end = start_idx + expected.ser_len();
+            let mut buf = vec![0; expected_end];
+            assert_eq!(expected.ser(&mut buf[..], start_idx), expected_end);
+            let (decoded_end, decoded) = RowRedo::deser(&buf[..], start_idx).unwrap();
+            assert_eq!(decoded_end, expected_end);
+            assert_eq!(decoded.row_id, expected.row_id);
+            match (expected.kind, decoded.kind) {
+                (
+                    RowRedoKind::Insert(expected_page, expected_vals),
+                    RowRedoKind::Insert(decoded_page, decoded_vals),
+                ) => {
+                    assert_eq!(decoded_page, expected_page);
+                    assert_eq!(decoded_vals, expected_vals);
+                }
+                (RowRedoKind::Delete(expected_page), RowRedoKind::Delete(decoded_page)) => {
+                    assert_eq!(decoded_page, expected_page)
+                }
+                (
+                    RowRedoKind::Update(expected_page, expected_cols),
+                    RowRedoKind::Update(decoded_page, decoded_cols),
+                ) => {
+                    assert_eq!(decoded_page, expected_page);
+                    assert_eq!(decoded_cols, expected_cols);
+                }
+                (
+                    RowRedoKind::DeleteByPrimaryKey(expected_key),
+                    RowRedoKind::DeleteByPrimaryKey(decoded_key),
+                ) => assert_eq!(decoded_key, expected_key),
+                (
+                    RowRedoKind::UpdateByPrimaryKey(expected_key, expected_cols),
+                    RowRedoKind::UpdateByPrimaryKey(decoded_key, decoded_cols),
+                ) => {
+                    assert_eq!(decoded_key, expected_key);
+                    assert_eq!(decoded_cols, expected_cols);
+                }
+                (expected, decoded) => {
+                    panic!("row redo kind mismatch: expected={expected:?}, decoded={decoded:?}")
+                }
+            }
+        }
+
+        let truncation_cases = [
+            RowRedo {
+                row_id: RowID::new(1),
+                kind: RowRedoKind::Insert(test_page_id(11), Vec::new()),
+            },
+            RowRedo {
+                row_id: RowID::new(2),
+                kind: RowRedoKind::Delete(Some(test_page_id(12))),
+            },
+            RowRedo {
+                row_id: RowID::new(3),
+                kind: RowRedoKind::Delete(None),
+            },
+            RowRedo {
+                row_id: RowID::new(4),
+                kind: RowRedoKind::Update(test_page_id(14), Vec::new()),
+            },
+        ];
+        for expected in truncation_cases {
+            let start_idx = 3;
+            let expected_end = start_idx + expected.ser_len();
+            let mut buf = vec![0; expected_end];
+            assert_eq!(expected.ser(&mut buf[..], start_idx), expected_end);
+            for truncated_end in start_idx..expected_end {
+                assert!(
+                    RowRedo::deser(&buf[..truncated_end], start_idx).is_err(),
+                    "truncated row redo unexpectedly decoded: truncated_end={truncated_end}, expected_end={expected_end}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_table_dml_physical_update_retains_page_and_adopts_delete_page() {
+        for delete_page in [Some(test_page_id(3)), None] {
+            let mut table = TableDML::default();
+            table.insert(RowRedo {
+                row_id: RowID::new(10),
+                kind: RowRedoKind::Update(
+                    test_page_id(1),
+                    vec![UpdateCol {
+                        idx: 0,
+                        val: Val::U64(11),
+                    }],
+                ),
+            });
+            table.insert(RowRedo {
+                row_id: RowID::new(10),
+                kind: RowRedoKind::Update(
+                    test_page_id(2),
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::U64(13),
+                    }],
+                ),
+            });
+            match &table.rows.get(&RowID::new(10)).unwrap().kind {
+                RowRedoKind::Update(page_id, cols) => {
+                    assert_eq!(*page_id, test_page_id(1));
+                    assert_eq!(
+                        cols,
+                        &vec![
+                            UpdateCol {
+                                idx: 0,
+                                val: Val::U64(11),
+                            },
+                            UpdateCol {
+                                idx: 1,
+                                val: Val::U64(13),
+                            },
+                        ]
+                    );
+                }
+                kind => panic!("expected physical update, got {kind:?}"),
+            }
+
+            table.insert(RowRedo {
+                row_id: RowID::new(10),
+                kind: RowRedoKind::Delete(delete_page),
+            });
+            match &table.rows.get(&RowID::new(10)).unwrap().kind {
+                RowRedoKind::Delete(page_id) => assert_eq!(*page_id, delete_page),
+                kind => panic!("expected physical delete, got {kind:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_table_dml_serde() {
         // 创建测试数据
         let mut table_dml = TableDML::default();
 
         // 测试用例1：插入操作
         let insert_entry = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(100),
-            kind: RowRedoKind::Insert(vec![Val::U64(42)]),
+            kind: RowRedoKind::Insert(test_page_id(1), vec![Val::U64(42)]),
         };
         table_dml.insert(insert_entry);
 
         // 测试用例2：更新操作
         let update_entry = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(200),
-            kind: RowRedoKind::Update(vec![UpdateCol {
-                idx: 0,
-                val: Val::U64(43),
-            }]),
+            kind: RowRedoKind::Update(
+                test_page_id(2),
+                vec![UpdateCol {
+                    idx: 0,
+                    val: Val::U64(43),
+                }],
+            ),
         };
         table_dml.insert(update_entry);
 
         // 测试用例3：删除操作
         let delete_entry = RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(300),
-            kind: RowRedoKind::Delete,
+            kind: RowRedoKind::Delete(None),
         };
         table_dml.insert(delete_entry);
 
@@ -935,10 +1164,10 @@ mod tests {
 
         // 验证插入操作
         let insert_redo = deserialized.rows.get(&RowID::new(100)).unwrap();
-        assert_eq!(insert_redo.page_id, 1);
         assert_eq!(insert_redo.row_id, RowID::new(100));
         match &insert_redo.kind {
-            RowRedoKind::Insert(vals) => {
+            RowRedoKind::Insert(page_id, vals) => {
+                assert_eq!(*page_id, test_page_id(1));
                 assert_eq!(vals.len(), 1);
                 assert_eq!(vals[0], Val::U64(42));
             }
@@ -947,10 +1176,10 @@ mod tests {
 
         // 验证更新操作
         let update_redo = deserialized.rows.get(&RowID::new(200)).unwrap();
-        assert_eq!(update_redo.page_id, 1);
         assert_eq!(update_redo.row_id, RowID::new(200));
         match &update_redo.kind {
-            RowRedoKind::Update(cols) => {
+            RowRedoKind::Update(page_id, cols) => {
+                assert_eq!(*page_id, test_page_id(2));
                 assert_eq!(cols.len(), 1);
                 assert_eq!(cols[0].idx, 0);
                 assert_eq!(cols[0].val, Val::U64(43));
@@ -960,10 +1189,9 @@ mod tests {
 
         // 验证删除操作
         let delete_redo = deserialized.rows.get(&RowID::new(300)).unwrap();
-        assert_eq!(delete_redo.page_id, 1);
         assert_eq!(delete_redo.row_id, RowID::new(300));
         match &delete_redo.kind {
-            RowRedoKind::Delete => (),
+            RowRedoKind::Delete(None) => (),
             _ => panic!("Expected Delete kind"),
         }
 
@@ -1031,12 +1259,10 @@ mod tests {
         let key = SelectKey::new(0, vec![Val::U64(1)]);
         let mut table = TableDML::default();
         table.insert(RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(10),
-            kind: RowRedoKind::Insert(vec![Val::U64(1), Val::U64(2)]),
+            kind: RowRedoKind::Insert(test_page_id(1), vec![Val::U64(1), Val::U64(2)]),
         });
         table.insert(RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(10),
             kind: RowRedoKind::UpdateByPrimaryKey(
                 key.clone(),
@@ -1047,7 +1273,8 @@ mod tests {
             ),
         });
         match &table.rows.get(&RowID::new(10)).unwrap().kind {
-            RowRedoKind::Insert(vals) => {
+            RowRedoKind::Insert(page_id, vals) => {
+                assert_eq!(*page_id, test_page_id(1));
                 assert_eq!(vals, &vec![Val::U64(1), Val::U64(3)]);
             }
             _ => panic!("Expected folded Insert kind"),
@@ -1055,7 +1282,6 @@ mod tests {
 
         let mut table = TableDML::default();
         table.insert(RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(20),
             kind: RowRedoKind::UpdateByPrimaryKey(
                 key.clone(),
@@ -1066,7 +1292,6 @@ mod tests {
             ),
         });
         table.insert(RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(20),
             kind: RowRedoKind::UpdateByPrimaryKey(
                 key.clone(),
@@ -1103,7 +1328,6 @@ mod tests {
         }
 
         table.insert(RowRedo {
-            page_id: test_page_id(1),
             row_id: RowID::new(20),
             kind: RowRedoKind::DeleteByPrimaryKey(key.clone()),
         });

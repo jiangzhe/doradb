@@ -591,7 +591,7 @@ impl CatalogStorage {
 
         for kind in table_ops {
             match kind {
-                RowRedoKind::Insert(vals) => folded
+                RowRedoKind::Insert(_, vals) => folded
                     .fold_insert(metadata, vals.clone())
                     .change_context(RuntimeError::CatalogAccess)
                     .attach_with(|| {
@@ -617,7 +617,7 @@ impl CatalogStorage {
                             )
                         })?;
                 }
-                RowRedoKind::Delete | RowRedoKind::Update(_) => {
+                RowRedoKind::Delete(_) | RowRedoKind::Update(..) => {
                     return Err(RuntimeOrFatalError::from(
                         Report::new(DataIntegrityError::InvalidPayload)
                             .attach(
@@ -1279,7 +1279,7 @@ pub(crate) mod tests {
     use crate::file::BlockKey;
     use crate::file::multi_table_file::publish_first_redo_log_seq_for_test as publish_mtb_first_redo_log_seq_for_test;
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
-    use crate::id::BlockID;
+    use crate::id::{BlockID, PageID};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
     use crate::log::redo::{DDLRedo, RowRedoKind};
     use crate::row::ops::{SelectKey, UpdateCol};
@@ -1416,13 +1416,16 @@ pub(crate) mod tests {
         name[0] = b'a' + (column_no % 26) as u8;
         CatalogRedoEntry {
             table_id: TABLE_ID_COLUMNS,
-            kind: RowRedoKind::Insert(vec![
-                Val::from(table_id),
-                Val::from(column_no),
-                Val::from(name),
-                Val::from(ValKind::U64 as u32),
-                Val::from(0u32),
-            ]),
+            kind: RowRedoKind::Insert(
+                PageID::new(0),
+                vec![
+                    Val::from(table_id),
+                    Val::from(column_no),
+                    Val::from(name),
+                    Val::from(ValKind::U64 as u32),
+                    Val::from(0u32),
+                ],
+            ),
         }
     }
 
@@ -1668,7 +1671,7 @@ pub(crate) mod tests {
                 sealed_redo_segments: Vec::new(),
                 catalog_ops: vec![CatalogRedoEntry {
                     table_id: invalid_table_id,
-                    kind: RowRedoKind::Insert(Vec::new()),
+                    kind: RowRedoKind::Insert(PageID::new(0), Vec::new()),
                 }],
                 catalog_ddl_txn_count: 0,
                 stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
@@ -2062,7 +2065,10 @@ pub(crate) mod tests {
                 catalog_ops: vec![
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                        kind: RowRedoKind::Insert(
+                            PageID::new(0),
+                            vec![Val::from(table_id), Val::from(0u16)],
+                        ),
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
@@ -2110,7 +2116,10 @@ pub(crate) mod tests {
                 vec![
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                        kind: RowRedoKind::Insert(
+                            PageID::new(0),
+                            vec![Val::from(table_id), Val::from(0u16)],
+                        ),
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
@@ -2155,7 +2164,10 @@ pub(crate) mod tests {
                 vec![
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
-                        kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                        kind: RowRedoKind::Insert(
+                            PageID::new(0),
+                            vec![Val::from(table_id), Val::from(0u16)],
+                        ),
                     },
                     CatalogRedoEntry {
                         table_id: TABLE_ID_TABLES,
@@ -2299,7 +2311,7 @@ pub(crate) mod tests {
             };
             let table_id = USER_TABLE_ID_START + 42;
             let table_ops = vec![
-                RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                RowRedoKind::Insert(PageID::new(0), vec![Val::from(table_id), Val::from(0u16)]),
                 RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
             ];
             let mut mutable =
@@ -2348,7 +2360,7 @@ pub(crate) mod tests {
 
             let table_id = USER_TABLE_ID_START + 4242;
             let table_ops = vec![
-                RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                RowRedoKind::Insert(PageID::new(0), vec![Val::from(table_id), Val::from(0u16)]),
                 RowRedoKind::DeleteByPrimaryKey(SelectKey::new(0, vec![Val::from(table_id)])),
             ];
             let mut mutable =

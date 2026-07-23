@@ -74,7 +74,7 @@ async fn run() -> ExampleResult<()> {
     write_trx
         .exec(async |stmt| {
             let res = stmt
-                .table_delete_unique_mvcc(table_id, id_two.index_no, &id_two.vals, false)
+                .table_delete_unique_mvcc(table_id, id_two.index_no, &id_two.vals)
                 .await?;
             assert!(res.is_deleted());
             Ok(())
