@@ -1,178 +1,215 @@
-# Data Checkpoint (Tuple Mover)
+# Data Checkpoint
 
-## 1. Overview
+## Overview
 
-The **Data Checkpoint**, executed by the background **Tuple Mover** thread, is the mechanism responsible for migrating data from the in-memory **RowStore** (Hot/Volatile) to the on-disk **LWC ColumnStore** (Cold/Persistent).
+Data checkpoint moves a contiguous prefix of hot RowStore pages into immutable
+LWC blocks. It is driven by the tuple-mover maintenance path and runs as one
+part of the table checkpoint described in [Checkpoint](./checkpoint.md).
 
-### Core Objectives
-1.  **Memory Reclamation**: Convert volatile RowPages into compact, immutable LWC (LightWeight Columnar) blocks to free up RAM.
-2.  **Log Truncation**: Advance the Table's persistence watermark (`Pivot_RowID`), allowing the global Commit Log to be truncated.
-3.  **Read Optimization**: Transform row-oriented data into column-oriented format to accelerate analytical scans.
+Its responsibilities are deliberately narrow:
 
-### Design Principles
-*   **No-Steal / No-Force**: Only committed data is persisted. No dirty pages are written to disk.
-*   **Clean Payload Invariant**: The transformation process guarantees that the generated LWC block contains **only committed data**. Active transactions modifying payloads are aborted; active locks are offloaded.
-*   **Vectorized Transformation**: The conversion pipeline utilizes vectorized reads (SIMD) for high performance, avoiding expensive row-by-row version reconstruction.
+- freeze a stable hot-page prefix without exposing partial persistence
+- choose the committed row image covered by the purge-published cutoff
+- build LWC blocks and matching secondary-index `DiskTree` entries from that
+  same image
+- atomically advance `pivot_row_id`, `heap_redo_start_ts`, and the relevant CoW
+  roots
+- hand the retired hot-page prefix to transaction GC after ordered publication
 
-## 2. Row Page Lifecycle & State Machine
+Data checkpoint contributes a heap replay boundary; it does not decide global
+redo retention by itself. Recovery combines that boundary with catalog and
+deletion bounds as described in [Recovery](./recovery.md).
 
-To enable non-blocking persistence, in-memory RowPages transition through three states managed via atomic CAS (Compare-And-Swap) operations.
+## Row-Page Lifecycle
 
-| State | Definition | Foreground Behavior | Background Behavior |
-| :--- | :--- | :--- | :--- |
-| **ACTIVE** | Normal operational state. | Insert, Update, Delete, Lock allowed. | Candidate for selection. |
-| **FROZEN** | Pending stabilization. | **Insert/Update**: Rejected. Redirect to "Cold Update" (Delete Old + Insert New to Tail).<br>**Delete/Lock**: Allowed (modify metadata only). | Analyzed for active transactions. |
-| **TRANSITION** | Being converted to LWC. | **Read**: Allowed (Snapshot Read).<br>**Write**: Backoff & Retry (Reroute to ColumnDeletionBuffer). | Data is immutable. Source for LWC generation. |
+Each selected RowPage moves monotonically through three states:
 
-> **Note**: The state `INVALID` from previous designs has been renamed to **TRANSITION** to better reflect that the page is still valid for readers but is in the process of being retired.
+| State | Foreground behavior | Checkpoint role |
+| --- | --- | --- |
+| `ACTIVE` | Accepts normal inserts, updates, deletes, and locks | Candidate for a future frozen prefix |
+| `FROZEN` | Rejects new insert/update payload changes; delete/lock metadata may still change while existing writers drain | Source of readiness analysis and transition planning |
+| `TRANSITION` | Payload is immutable; foreground access follows transition routing | Source of LWC construction until the new root is installed |
 
-## 3. Detailed Process Flow
+Every row or undo mutation allowed on a frozen page is bracketed by paired
+mutation-version increments. The value is a change detector, not an odd/even
+seqlock: different row writers may overlap, so a plan is reusable only when the
+complete value is equal before and after preparation.
 
-The Tuple Mover executes the checkpoint in a **checkpoint transaction** context. The process consists of five phases.
+## Table-Owned Workflow
 
-### Phase 1: Stabilization (Non-Transactional)
-*Context: No transaction active.*
+One live table owns at most one canonical frozen-page batch. The workflow
+retains:
 
-1.  **Selection**: Select a batch of the oldest `ACTIVE` RowPages (contiguous range starting from `Start_RowID`).
-2.  **Freeze**: Atomic `CAS(State, ACTIVE, FROZEN)`.
-3.  **Clean Payload Enforcement**: Scan transaction slots on `FROZEN` pages.
-    *   **Uncommitted Insert/Update**: **Force Abort**. Wait for rollback to ensure the payload is clean (matches the committed state or is free).
-    *   **Uncommitted Delete/Lock**: **Mark for Offload**. The payload is clean; the intent will be migrated later.
+- the selected pages and their RowID boundaries
+- `frozen_ts`, allocated after every selected page is visibly frozen
+- the first surviving hot page's creation timestamp when one was observed
+- per-page readiness state and exact blocker generations
+- cutoff-specific prepared transition plans that remain reusable
 
-### Phase 2: Transaction Initiation
-*Context: Start checkpoint transaction ($T_{cp}$).*
+The state belongs to the table rather than to one caller. A delayed or
+cancelled attempt restores the same batch and cache so a later retry cannot
+silently extend the frozen prefix or move its original fence.
 
-1.  **Begin Transaction**: Acquire a Start Timestamp (`CP.STS`).
-    *   **Significance**: `CP.STS` acts as the **Logical Snapshot Time**. All data committed before this timestamp in the selected pages will be materialized into the LWC blocks.
-2.  **State Transition**: Atomic `CAS(State, FROZEN, TRANSITION)`.
-3.  **Calculate Log Watermark (`Heap_Redo_Start_TS`)**:
-    *   Scan the remaining `ACTIVE` pages (those *not* selected for this checkpoint).
-    *   If active pages exist: `Heap_Redo_Start_TS = Min(Remaining_Pages.Creation_CTS)`.
-    *   If no active pages exist (Full Checkpoint): `Heap_Redo_Start_TS = CP.STS`.
+## Freeze
 
-### Phase 3: Vectorized Conversion (Row to LWC)
-Once stabilized, the page state is set to `TRANSITION`. The conversion pipeline runs in memory without holding page locks.
+Freeze runs from an idle session under scoped `TableMetadata(S)` and
+`TableData(IS)` locks. It revalidates the live table before claiming the
+workflow and retains the locks through frozen-state publication. A covering
+explicit session lock is preserved when the scoped grants are released.
 
-**Input**: RowPage (PAX format).
-**Output**: LWC Block (Columnar format).
+The freeze path:
 
-1.  **Selection Vector Construction**:
-    *   Scan Row Header / Delete Bitmap.
-    *   `Bitmask[i] = 1` if (Row `i` is Committed AND NOT Deleted).
-    *   *Optimization*: Since Uncommitted Inserts were aborted, we treat them as "Deleted/Free". Uncommitted Deletes are treated as "Alive" (data is written to LWC, deletion intent is in DeletionBuffer).
+1. Scans a contiguous prefix of the oldest hot pages up to the requested row
+   budget and records the next page's creation timestamp when a successor is
+   already visible.
+2. Loads every selected page and preflights the full batch while all pages are
+   still `ACTIVE`.
+3. Publishes each page as `FROZEN` in its own short page-state critical section.
+4. Allocates `frozen_ts` only after the final page has been frozen.
+5. Installs the batch and returns a read-only summary to the caller.
 
-2.  **Explicit RowID Generation**:
-    *   Since deleted rows are filtered out, the LWC block becomes **sparse**.
-    *   A system column `_rowid` is generated.
-    *   **Compression**: Use **Frame-of-Reference (FOR)** packing (e.g., `Base: 1000, Deltas: [0, 1, 3, 5...]`).
+If a canonical batch already exists, another freeze request returns that same
+summary. It does not append newly created hot pages.
 
-3.  **Columnar Gather & Compress**:
-    *   Loop through each column $C$ in the schema.
-    *   **Gather**: Load data from PAX blocks using the Selection Vector.
-    *   **Compress**: Apply datatype-specific encoding (Bitpacking for Ints, Dictionary/FSST for Strings).
-    *   **Write**: Append to the LWC Buffer.
+`TableData(IS)` remains compatible with ordinary `IX` DML and shared table
+readers. It conflicts with the `TableData(X)` used by sequential full-table
+update or delete, so those operations cannot cross the freeze/publication
+boundary ambiguously.
 
-### Phase 4: Persist & Commit
-*Context: Persist checkpoint metadata, then commit $T_{cp}$.*
+## Readiness and Cutoff
 
-1.  **Construct New MetaBlock**:
-    *   **`Pivot_RowID`**: Advanced to the end of the converted range.
-    *   **`Heap_Redo_Start_TS`**: The value calculated in Phase 2.
-    *   **`Last_Checkpoint_STS`**: Set to **`CP.STS`**. (Crucial for recovery).
-    *   **`Block_Index_Root`**: Point to the new index root.
-2.  **Atomic Persistence**:
-    *   Write the new MetaBlock to disk.
-    *   Update **SuperBlock** to point to the new MetaBlock.
-    *   Perform `fdatasync`.
-3.  **Commit Transaction**: Commit $T_{cp}$ after the file root update.
-4.  **Completion**:
-    *   Update in-memory metadata (Pivot, Block Index).
-    *   Mark `TRANSITION` pages as **Retired** (hand over to Epoch-based GC).
+Checkpoint uses the purge-published GC horizon as an exclusive cutoff for the
+entire frozen batch. A page is ready only when checkpoint can produce its
+cutoff-visible committed image without losing an unresolved pre-fence row
+image.
 
-## 4. Recovery & Log Replay Logic
+Readiness is incremental and ordered:
 
-During crash recovery, the system uses the persisted metadata to determine which Redo Log entries to replay. This involves a two-level filtering process.
+1. Reanalyze only pages whose state is `Unchecked` or `Blocked`.
+2. Reuse a `Stable` image proof rather than rescanning its undo state.
+3. Stop at the first unsafe page and preserve the stable prefix before it.
+4. Leave the suffix unchecked until that canonical blocker has progressed.
 
-**Inputs from MetaBlock:**
-1.  `Pivot_RowID`: The boundary separating the on-disk ColumnStore from the in-memory RowStore.
-2.  `Heap_Redo_Start_TS`: The **physical starting point** for scanning the log. This is a coarse-grained filter that allows the Log Manager to skip old log files entirely.
-3.  `Last_Checkpoint_STS`: The **logical snapshot time** of the persistent ColumnStore. This is a fine-grained filter used to determine if a specific change within the log is already reflected in the on-disk data.
+A stable page may still require a newer cutoff because of a committed image.
+That requirement is cached; the page is not rescanned while the published
+horizon remains too old.
 
-**Replay Algorithm:**
+If any page is unready, checkpoint returns `FrozenPageCutoff` with the table,
+page, selected cutoff, known required cutoff, stable-prefix count, and whether
+an unresolved status remains. No page enters `TRANSITION` and no persistent
+state is applied on this outcome.
 
-The recovery process begins by seeking to the `Heap_Redo_Start_TS` in the commit log. It then reads logs sequentially from that point. For each log entry $L$ (with timestamp $L.CTS$ and target $L.RowID$), the following logic is applied:
+## Transition Planning
 
-```rust
-// First-level check: Is the log entry for hot or cold data?
-if L.RowID >= MetaBlock.Pivot_RowID {
-    // Case 1: Hot Data (In-Memory RowStore)
-    // The row belongs to an Active RowPage that was not checkpointed.
-    // The Heap_Redo_Start_TS check was already implicitly handled by the
-    // initial log seek. We must replay all subsequent records to rebuild
-    // the in-memory RowStore.
-    replay_into_row_store(L);
+After every page has a stable readiness proof, checkpoint performs one full
+optimistic plan-refresh pass before acquiring page-state write locks.
 
-} else {
-    // Case 2: Cold Data (On-Disk LWC ColumnStore)
-    // The row falls within the range of persisted LWC blocks.
-    // We must apply a second, logical filter to see if this specific
-    // change is already included in those blocks.
-    
-    if L.CTS <= MetaBlock.Last_Checkpoint_STS {
-        // Case 2a: Change is Already Persisted
-        // The change's commit timestamp is older than the logical snapshot
-        // time of the on-disk data. This means the change is guaranteed
-        // to be physically present in the LWC block.
-        skip(L);
-    } else {
-        // Case 2b: Late-Arriving Change (Cold Modification)
-        // The change happened AFTER the checkpoint's logical snapshot was taken
-        // (e.g., a delete on cold data that happened during the checkpoint process).
-        // This change is NOT in the LWC block's primary data.
-        // It must be replayed into the in-memory deletion structure.
-        replay_into_deletion_buffer(L);
-    }
-}
-```
+For each page, one undo walk follows leading lock and delete records through
+the first image-producing insert or update. It produces an owned plan containing:
 
-## 5. Metadata Structure Summary
+- the cutoff-visible deletion bitmap used to filter the LWC image
+- the minimum cutoff required by committed row images
+- transition overlay markers that preserve representable post-fence ownership
+- the page identity, cutoff, and mutation version that validate reuse
 
-To support this logic, the **MetaBlock** (referenced by SuperBlock) must strictly contain:
+Checkpoint loads the mutation version before and after plan construction. Full
+equality retains the plan; any change discards its attempt-local bitmap and
+markers immediately. The stable readiness proof remains cached because later
+lock/delete ownership on a frozen page is representable once its original
+image-producing obligations are resolved.
 
-| Field | Description | Usage |
-| :--- | :--- | :--- |
-| `Pivot_RowID` | High watermark of ColumnStore. | Separates Hot vs. Cold data. |
-| `Block_Index_Root` | Root PageID of Block Index. | locating LWC blocks. |
-| `Heap_Redo_Start_TS` | Min CTS of oldest active page. | Tells Log Manager where to truncate. |
-| **`Last_Checkpoint_STS`** | STS of the last CP transaction. | **Recovery Filter**: Distinguishes "Baked-in" data from "Deletion" data. |
+## Irreversible Transition
 
-## 6. Concurrency Handling
+Only a fully ready attempt may acquire lifecycle publication admission and
+cross the irreversible boundary. It then visits pages in canonical order,
+holding one page-state write lock at a time.
 
-*   **Foreground Writer**:
-    *   If encountering a `TRANSITION` page: Backoff (sleep) -> Retry.
-    *   On Retry: Check Block Index.
-        *   If `RowID < Pivot`: Reroute to DeletionBuffer (Conversion finished).
-        *   If `RowID >= Pivot`: Wait again (Conversion pending).
-*   **Foreground Reader**:
-    *   Snapshot Reads access `TRANSITION` pages directly.
-    *   Page memory is reclaimed only after all concurrent readers finish (Epoch GC).
+Under each lock, checkpoint revalidates page identity, cutoff, and the complete
+mutation version. A matching optimistic plan is reused. A missing or stale plan
+is rebuilt under that page-local lock without repeating the initial pre-fence
+blocker test; frozen pages cannot introduce a new insert/update image after the
+stable proof.
 
-## 7. Unified Garbage Collection (Memory)
+The page becomes `TRANSITION`, its prepared markers are installed, and the lock
+is released immediately. During this phase the batch may contain a growing
+`TRANSITION` prefix followed by a `FROZEN` suffix. Once the first page changes
+state, unexpected analysis, marker, build, publication, or system-commit
+failure is fatal and wakes transition-route waiters through storage poison.
 
-Instead of maintaining a separate Epoch-based mechanism for page reclamation, the system **reuses the existing Transaction/Undo GC logic**. The lifecycle of retired RowPages is bound to the **Checkpoint System Transaction ($T_{cp}$)**.
+## LWC and Secondary-Index Construction
 
-### Mechanism
+LWC construction reads immutable page values through each prepared deletion
+bitmap. Deleted or otherwise cutoff-invisible rows are omitted while explicit
+RowIDs preserve the sparse logical range. If an output block must split, the
+same prepared bitmap is reused rather than walking undo state again.
 
-1.  **Resource Attachment**:
-    *   When the Tuple Mover commits the System Transaction ($T_{cp}$), it attaches the list of converted RowPages (those in `TRANSITION` state) to $T_{cp}$'s context.
-    *   This is conceptually similar to how a normal write transaction attaches its Undo Logs and Write Buffers to its context.
+For every row accepted into an LWC block, checkpoint sends the identical
+visible value and RowID to the secondary-index sidecar. This produces companion
+`DiskTree` entries from exactly the rows represented by the new cold data.
+There is no later scan of arbitrary `MemIndex` state.
 
-2.  **GC Condition**:
-    *   Transaction purge coordination periodically calculates the **`Global_Min_Active_STS`** (the Start Timestamp of the oldest active transaction in the system).
-    *   It scans the list of committed transactions (including System Transactions).
-    *   The reclamation trigger is:
-        $$ T_{cp}.CTS < \text{Global\_Min\_Active\_STS} $$
+The frozen prefix determines the next `pivot_row_id`. The next surviving hot
+page determines `heap_redo_start_ts` when one was observed. If no successor was
+visible at freeze time, checkpoint resolves the hot boundary after allocating
+`checkpoint_ts`; when the heap is empty, that timestamp becomes the fallback
+heap replay floor.
 
-3.  **Reclamation Action**:
-    *   **Logic**: If the condition is met, it implies that every currently active transaction started *after* the checkpoint committed. Therefore, all active readers view the system state *after* the Pivot advancement and will access the new LWC blocks on disk. No reader holds a reference to the old RowPages.
-    *   **Execution**: Purge workers free the $T_{cp}$ transaction object, its associated Undo logs (if any), and physically deallocate the attached **RowPages**.
+## Atomic Publication
+
+The data phase updates one mutable table-file fork with:
+
+- new LWC blocks
+- matching `ColumnBlockIndex` entries
+- the advanced `pivot_row_id`
+- the new `heap_redo_start_ts`
+- companion secondary-index roots
+
+Deletion checkpoint may add cold-delete state and more secondary-index work to
+the same fork before publication. Checkpoint then rebuilds allocation
+reachability and publishes one root, so readers cannot observe new LWC data
+without its block-index and secondary-index state.
+
+The system transaction records the data-checkpoint marker with
+`checkpoint_ts`. Root publication becomes durable before the system work
+receives its ordered `redo_cts` and is accepted for enqueue. The table-owned
+workflow completes only after this handoff succeeds.
+
+If the run advances only replay bounds and changes no table-file state, the
+generic checkpoint path publishes a catalog-backed silent watermark instead
+of a metadata-only table root. That decision and its durability rule belong to
+[Checkpoint](./checkpoint.md#replay-bound-only-checkpoints).
+
+## Waiting and Retry
+
+`wait_for_checkpoint_retry` can wait on the exact delayed page. It retains the
+complete current blocker generation, waits for every unresolved
+image-producing status in that generation, and reanalyzes once after they are
+terminal. A replacement blocker generation is handled the same way. A stable
+page that only needs a newer cutoff waits on purge-horizon progress.
+
+Listener registration always rechecks the underlying predicate, so progress
+racing registration is not lost. Table drop makes the delayed batch obsolete;
+storage poison and shutdown terminate the wait. A successful wait does not
+promise publication because another page or root-liveness gate may become the
+next canonical delay.
+
+## Retirement and Recovery Boundary
+
+A nonempty publication collapses the frozen prefix into one
+`RetiredRowPageBatch` containing the table id, RowID bounds, and ordered page
+ids. It travels as a volatile system payload through table-affine transaction
+GC. It is eligible only when its ordered system CTS is strictly older than the
+active snapshot horizon. GC validates and unlinks the exact hot-index prefix
+before deallocating the returned pages.
+
+The batch is not redo. Restart loads the durable pivot and block-index root,
+creates a fresh empty hot index beginning at that pivot, and never replays
+runtime page retirement. See [Garbage Collection](./garbage-collect.md) for the
+physical cleanup protocol and [Recovery](./recovery.md) for heap replay.
+
+## Summary
+
+Data checkpoint is safe because the batch and fence remain stable across
+retries, readiness is proven before transition, LWC and secondary-index entries
+share one committed image, and the resulting roots and replay boundary are
+published atomically before row-page retirement becomes eligible.

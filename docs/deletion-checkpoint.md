@@ -1,250 +1,203 @@
 # Deletion Checkpoint
 
-## 1. Overview
+## Overview
 
-The **Deletion Checkpoint** subsystem is responsible for persisting row deletions and updates from the in-memory buffer to the immutable storage on disk.
+Deletion checkpoint persists committed deletes against cold, immutable LWC
+rows. It converts the eligible prefix of the in-memory
+`ColumnDeletionBuffer` into persistent `ColumnBlockIndex` delete metadata and
+applies matching secondary-index deletes to `DiskTree`.
 
-In Doradb's HTAP architecture, data blocks (LWC Blocks) are immutable. Modifications are handled via a **Delete Bitmap** mechanism. The Deletion Checkpoint bridges the gap between the mutable, high-concurrency in-memory **ColumnDeletionBuffer** and the persistent, compressed **Table File**.
+Deletion checkpoint is not an independent root publisher. It runs inside the
+user-table checkpoint described in [Checkpoint](./checkpoint.md), shares that
+attempt's mutable CoW root and cutoff, and publishes delete metadata together
+with all companion index state.
 
-### Core Design Principles
+Its central durability boundary is `deletion_cutoff_ts`: cold-row deletes with
+commit timestamps below this exclusive cutoff are already covered by durable
+table state.
 
-1.  **No-Steal / No-Force**: Only committed data is persisted.
-2.  **Commit-Only Disk Persistence**: The on-disk Bitmap represents committed
-    deletes that have crossed the deletion checkpoint cutoff. Newer committed
-    deletes remain in `ColumnDeletionBuffer` until a later checkpoint.
-    *   **Disk State**: "Physically Deleted".
-    *   **Memory State**: "Logically Visible" (Undo information).
-3.  **Hybrid Storage Layout**: Small bitmaps are inlined in the Block Index; large bitmaps are offloaded to immutable shared slotted blob pages.
-4.  **Decoupled GC**: Persistence (I/O) is decoupled from Memory Garbage Collection (Visibility). Data remains in memory after flushing to serve as an Undo Log for active long-running transactions.
+## State Model
 
-## 2. Data Structures
+### In-Memory Delete Markers
 
-### 2.1 In-Memory: `ColumnDeletionBuffer`
+`ColumnDeletionBuffer` is a concurrent table-level map keyed by RowID. It is
+both the write-ownership record for a cold row and the MVCC overlay above
+persistent delete metadata.
 
-A concurrent table-level map serving as both the cold-row write ownership
-record and the MVCC undo cache above persisted delete bitmaps.
+| Marker state | Meaning |
+| --- | --- |
+| Shared transaction status | The delete/update is still owned by a transaction, or its final status is observed through that shared record |
+| Compacted commit timestamp | Maintenance has replaced a committed shared status with its immutable CTS |
 
-```rust
-struct ColumnDeletionBuffer {
-    entries: DashMap<RowID, DeleteMarker>,
-}
+Foreground cold delete/update, rollback, purge, checkpoint selection, and
+recovery replay all use this map. Commit becomes visible atomically through the
+shared transaction status; maintenance may compact the marker later without
+changing its MVCC meaning.
 
-enum DeleteMarker {
-    Ref(Arc<SharedTrxStatus>),
-    Committed(TrxID),
-}
-```
+### Persistent Delete Metadata
 
-*   **Concurrency**: Uses `DashMap` for concurrent foreground delete/update,
-    rollback, purge, checkpoint selection, and recovery replay.
-*   **Write Ownership**: An uncommitted `Ref` is the row-level ownership record
-    for a cold delete/update. It also acts as the conflict point for other
-    writers.
-*   **Atomic Commit**: Transaction commit updates the shared transaction status
-    observed by every `Ref` owned by that transaction. Maintenance paths may
-    later compact a committed `Ref` into `Committed(cts)`.
+Each `ColumnBlockIndex` leaf describes one LWC RowID range and stores a sorted
+set of deleted row-id deltas. A small encoded set remains inline in the leaf.
+A larger set is stored in immutable framed deletion-blob pages and referenced
+from the leaf.
 
-### 2.2 On-Disk: Hybrid Bitmap Storage
+The persisted set is the cold base state. Blob references, payload framing,
+delete counts, domains, and row ranges are validated when the delete set is
+loaded. Replacement uses CoW block-index nodes and immutable blob pages, so an
+unpublished mutable fork cannot alter the active delete state.
 
-We utilize a **Hybrid / Adaptive** strategy to manage `RoaringBitmap` persistence, leveraging the `Block Index` for navigation and immutable blob pages for bulk storage.
+### Secondary-Index State
 
-#### A. Block Index (Primary)
-The Block Index Leaf Entry keeps either an inline deletion-delta list or an offloaded blob reference:
+Persistent cold secondary-index entries live in per-index `DiskTree` roots.
+Deleting a cold row therefore has two durable effects:
 
-```rust
-struct BlobRef {
-    start_page_id: u64,
-    start_offset: u16,
-    byte_len: u32,
-}
-```
+- add its delta to the owning LWC block's persistent delete set
+- remove or replace the corresponding cold secondary-index entries
 
-#### B. Deletion Blob Pages (Overflow)
-*   **Implementation**: Immutable shared slotted blob pages in table file.
-*   **Layout**: 64KB page with `(magic/version, next_page_id, used_size)` header + packed byte body.
-*   **Reference**: `BlobRef` points to start page+offset and total byte length.
-*   **Spill**: Large bitmaps can continue through linked pages (`next_page_id`).
-*   **Reclaim**: Sweep/compaction is deferred to a dedicated follow-up task.
+Both effects must be present in one table-root publication. A delete cutoff
+must never advance past a row whose persistent delete set changed without the
+matching `DiskTree` update.
 
-## 3. Transaction & Visibility Model
+## Read Visibility
 
-The visibility check logic determines whether a cold row is "alive" for a
-reader transaction $T_{reader}$.
+The in-memory marker is the newest authority when one exists; persistent delete
+metadata is consulted only when the marker is absent.
 
-**Logic**: the in-memory marker is the newest authority when present; the
-persisted bitmap is the base state when the marker is absent. A memory marker
-can hide an uncheckpointed delete even when the disk bitmap is still clear, or
-can make a disk-deleted row visible to an older snapshot when the marker's CTS
-is newer than the reader snapshot.
+For a committed memory marker:
 
-### The Read Path
-1.  **Check Memory Tail**:
-    *   Query `ColumnDeletionBuffer` for the RowID.
-    *   **Committed marker with `CTS <= T.STS`**: the delete is visible to the
-        reader, so the row is deleted.
-    *   **Committed marker with `CTS > T.STS`**: the delete happened after the
-        reader started, so the old cold row remains visible as undo.
-    *   **Uncommitted marker owned by the reader transaction**: the transaction
-        already consumed the cold row, so the row is deleted for that
-        transaction.
-    *   **Uncommitted marker owned by another transaction**: readers keep
-        snapshot visibility, while writers treat the marker as a write
-        conflict.
-2.  **Check Persisted Bitmap When No Marker Exists**:
-    *   Query Block Index. Get Bitmap (Inline or fetch via `BlobRef` from blob
-        pages).
-    *   If `Bitmap.contains(RowID) == true`: the delete was committed,
-        checkpointed, and no in-memory undo marker remains, so the row is
-        deleted.
-    *   If `Bitmap.contains(RowID) == false`: no memory or disk delete applies,
-        so the row is visible.
+- when its CTS is visible to the reader snapshot, the row is deleted
+- when its CTS is newer than the reader snapshot, the marker provides the undo
+  fact that keeps the older row visible
 
-## 4. Deletion Checkpoint Workflow
+For an uncommitted marker, the owning transaction sees its own delete while
+other readers preserve snapshot visibility. Competing writers use the marker
+as the cold-row ownership conflict.
 
-The process moves committed deletions from memory to disk. Crucially, the **System Transaction Timestamp (`Checkpoint_STS`)** defines the persistence boundary, ensuring that the recovery watermark advances even if data is sparse.
+When no memory marker exists, membership in the persisted delete set is final
+for all active readers: membership means deleted; absence means no cold delete
+applies.
 
-### Phase 1: Snapshot & Barrier
-*   **Action**: The Checkpoint Coordinator starts a system transaction and acquires the current global timestamp: **`Checkpoint_STS`**.
-*   **Semantic**: This timestamp acts as a **Read View**. The system guarantees that upon successful completion of this checkpoint, selected cold deletes below this exclusive cutoff are persisted.
-*   **Scan & Filter**:
-    *   Iterate through `ColumnDeletionBuffer`.
-    *   Collect `RowID`s where:
-        1.  the marker is committed, either `Committed(cts)` or committed `Ref`.
-        2.  `previous_deletion_cutoff_ts <= CTS < Checkpoint_STS`.
-        3.  `row_id < pivot_row_id`.
-*   **Output**: A list of RowIDs grouped by `LWC Block ID`.
+This ordering is why persistence and in-memory cleanup are separate. A marker
+may remain necessary for an old snapshot after its delete is present on disk.
 
-### Phase 2: Merge & Encode (Pure Computation)
-*   **Condition**: If the list from Phase 1 is empty, skip to **Phase 4 (Heartbeat Path)**.
-*   **Action**: For each affected LWC Block:
-    1.  **Load Old Bitmap**: Fetch from Block Index (Inline) or blob pages (Offload).
-    2.  **Merge**: `New_Bitmap = Old_Bitmap | New_Deletes`.
-    3.  **Decode Rows Once**: Decode the affected LWC block once and
-        reconstruct old row values for every selected RowID in this block.
-    4.  **Build Secondary Deletes**: Decode old secondary-index keys from those
-        reconstructed row values and append per-index companion `DiskTree`
-        delete/update work:
-        *   Unique indexes conditionally delete/update only when the stored
-            owner still matches the deleted old RowID.
-        *   Non-unique indexes remove the exact `(logical_key, old_row_id)`
-            entry.
-    5.  **Optimize**: Serialize `New_Bitmap`.
-        *   If `Size < Threshold`: Mark as `Inline`.
-        *   If `Size >= Threshold`: Mark as `Offload`.
+## Selection Boundary
 
-This block-grouped reconstruction is the baseline algorithm. Row values for
-deleted cold rows must remain reconstructible until the checkpoint publication
-durably includes both the persistent delete metadata and the companion
-secondary-index `DiskTree` delete/update work.
+One table-checkpoint attempt uses the purge-published GC horizon as its
+exclusive `cutoff_ts`. It reads the mutable root's previous
+`deletion_cutoff_ts` and selects only markers that satisfy all of these rules:
 
-### Phase 3: CoW Persistence (I/O)
-*   **Write Blob Pages** (Only for Offload blocks):
-    *   Append serialized bytes into immutable shared slotted blob pages.
-    *   Capture `BlobRef` for each updated block.
-*   **Update Block Index**:
-    *   Perform a **Batch Put** on the Block Index.
-    *   Update values to inline deletion list or offloaded `BlobRef`.
-    *   Generate new Block Index Root via CoW.
-*   **Update Secondary DiskTrees**:
-    *   Apply the per-index companion delete/update batches generated in Phase
-        2.
-    *   Generate new secondary-index `DiskTree` roots via CoW.
+- the marker is committed
+- `previous deletion_cutoff_ts <= cts < cutoff_ts`
+- `row_id < pivot_row_id`
 
-### Phase 4: Commit & Watermark Advancement
-*   **Lock**: Acquire `SuperBlock Lock`.
-*   **New MetaBlock**: Create a new `MetaBlock`.
-    *   Update `BlockIndexRoot` (if changed).
-    *   Update secondary-index `DiskTree` roots (if changed).
-    *   **Crucial Update**: Set `Table.watermarks.deletion_cutoff_ts = Checkpoint_STS`.
-    *   *Note*: This is set to the system timestamp acquired in Phase 1, regardless of the actual data timestamps.
-*   **Persist**: Write MetaBlock to disk.
-*   **Switch**: Update `SuperBlock` to point to the new MetaBlock.
-*   **Atomic Outcome**: Persistent delete metadata and companion
-    secondary-index `DiskTree` roots become visible together through the same
-    MetaBlock.
+The lower bound avoids reapplying markers already covered by an earlier
+checkpoint but retained in memory for MVCC. The upper bound excludes newer
+commits and deletes just transferred from transitioning row pages. The pivot
+excludes hot rows whose state is owned by the RowStore image.
 
-## Heartbeat Checkpoint (Log Truncation)
+Selection is sorted and deduplicated before persistent lookup. If eligible
+markers exist but the active root has no usable column index or a selected
+RowID cannot be resolved to an LWC block, checkpoint fails closed and does not
+advance the cutoff.
 
-To prevent "cold" tables (tables with no recent deletions) from blocking the global truncation of the Redo Log, the system implements a Heartbeat mechanism.
+## Block-Grouped Reconstruction
 
-*   **Problem**: If we relied on data timestamps (`Batch_Max_CTS`) for the watermark, a table with no writes would keep its `deletion_cutoff_ts` stuck in the past. The Log Manager cannot truncate logs older than the minimum table replay boundary, leading to disk exhaustion.
-*   **Trigger**:
-    *   Periodic timer (e.g., every minute) IF no regular Deletion Checkpoint has occurred.
-    *   Or triggered explicitly by the Log Manager when log usage is high.
-*   **Process**:
-    1.  Acquire `Checkpoint_STS`.
-    2.  Verify the current scan has no eligible committed markers in
-        `[deletion_cutoff_ts, Checkpoint_STS)`.
-    3.  **Fast Path**: Skip Phases 2 and 3 (No Data I/O).
-    4.  **Meta Update**: Directly generate a new MetaBlock with `deletion_cutoff_ts = Checkpoint_STS` and perform the SuperBlock switch.
-*   **Result**: The watermark advances, allowing the Log Manager to safely discard old logs.
+Selected RowIDs are resolved and grouped by their persisted LWC block. For each
+affected block, checkpoint:
 
-## 5. Garbage Collection (Memory Cleanup)
+1. Loads the authoritative persisted delete deltas and RowID array.
+2. Removes selected deltas already present in the durable set.
+3. Decodes the LWC block once for the remaining newly deleted rows.
+4. Reconstructs each row's old secondary-index keys.
+5. Adds the new deltas to the sorted persistent set.
 
-A key distinction in this design is that **Flushing $\neq$ Cleaning**.
-Memory entries are retained after the checkpoint to provide MVCC visibility (Undo) for active long-running transactions.
+Old row values must remain decodable until this work publishes. Compaction,
+vacuum, or page reclamation cannot discard them after a foreground delete but
+before the table root contains both its delete metadata and companion
+secondary-index work.
 
-*   **Trigger**: Periodic background task or Memory Pressure.
-*   **Condition**: An entry can be removed **only if**:
-    $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
-    and the delete is already covered by durable delete-bitmap state.
-*   **Logic**:
-    1.  Acquire `Global_Min_Active_STS` from the Transaction Manager.
-    2.  Scan `ColumnDeletionBuffer`.
-    3.  Remove entries satisfying the condition.
-    *   *Reasoning*: If the delete commit time is older than the oldest active transaction and the delete has been checkpointed, then strictly **everyone** sees the row as deleted. The Disk Bitmap is now the absolute truth, and the "Undo" info in memory is obsolete.
+## Companion Secondary-Index Deletes
 
+The reconstructed old key determines the exact `DiskTree` change:
 
-## 6. Crash Recovery
+- a unique index removes or replaces the mapping only when the stored owner
+  still matches the deleted old RowID
+- a non-unique index removes the exact logical-key and old-RowID entry
 
-Recovery relies on `deletion_cutoff_ts` as an exclusive **Persistence Barrier**.
+The changes accumulate in the same secondary-index sidecar used by data
+checkpoint. They are applied to the same mutable table-file fork after all data
+and deletion work has been collected. No `DiskTree` root can be published on
+its own.
 
-1.  **Load State**: Read the latest valid MetaBlock from SuperBlock.
-2.  **Determine Replay Start**:
-    *   Retrieve `Deletion_Cutoff_TS = MetaBlock.deletion_cutoff_ts`.
-    *   This timestamp guarantees that cold-row deletes with `cts < Deletion_Cutoff_TS` and `row_id < pivot_row_id` have already been processed (either persisted to the Bitmap or confirmed non-existent).
-3.  **Log Replay**:
-    *   The Log Reader scans entries starting from the coarse global replay floor.
-    *   **Filter**: Only replay cold-row delete operations where `row_id < pivot_row_id` and `Entry.CTS >= Deletion_Cutoff_TS`.
-    *   **Action**: Insert these replayed entries into the `ColumnDeletionBuffer`.
-4.  **Consistency**:
-    *   The system is now consistent. The on-disk Bitmap acts as the base state, and the `ColumnDeletionBuffer` contains the "tail" of deletions that occurred after the last checkpoint (Heartbeat or Data) but before the crash.
+## CoW Persistence and Cutoff Advancement
 
+For every changed LWC range, checkpoint encodes the merged sorted delete set.
+It retains small sets inline and writes larger payloads to immutable deletion
+blob pages. A typed batch replacement produces the new
+`ColumnBlockIndex` root.
 
-## 7. Process Flow Diagram
+After all patches are represented, the mutable root advances
+`deletion_cutoff_ts` to `cutoff_ts`. The generic table-checkpoint path then
+applies companion secondary roots, rebuilds allocation reachability, and
+publishes one atomic root containing:
 
-```mermaid
-sequenceDiagram
-    participant FG as Foreground TRX
-    participant Mem as ColumnDeletionBuffer
-    participant CP as Checkpoint Thread
-    participant IO as Disk (TableFile)
-    participant IDX as BlockIndex
+- the replacement persistent delete metadata
+- updated secondary-index `DiskTree` roots
+- the new exclusive deletion cutoff
+- any data-checkpoint state produced by the same attempt
 
-    %% Phase 1
-    CP->>Mem: 1. Snapshot (Scan previous cutoff <= CTS < Checkpoint_STS)
-    Note right of CP: Group RowIDs by Block
+An error before root publication discards the mutable fork. After publication
+becomes irreversible, a later checkpoint system-transaction failure poisons
+storage rather than exposing the root as a retryable partial outcome.
 
-    %% Phase 2 & 3
-    loop For Each Affected Block
-        CP->>IDX: Get Old Bitmap (Inline/Offload Ref)
-        CP->>CP: Merge & Serialize
-        alt Size >= Threshold
-            CP->>IO: Append immutable blob pages
-            Note right of CP: Prepare IndexVal = Offload(BlobRef)
-        else Size < Threshold
-            Note right of CP: Prepare IndexVal = Inline(Blob)
-        end
-    end
+## Empty Selection and Silent Progress
 
-    CP->>IDX: 2. Batch Update Block Index (CoW)
-    Note right of IDX: Returns New Index Root
+An empty selection still proves that no committed cold delete exists in the
+scanned timestamp interval. The mutable checkpoint state may therefore advance
+`deletion_cutoff_ts` even when it writes no delete payload.
 
-    %% Phase 4
-    CP->>IO: 3. Write New MetaBlock (Update Roots & Watermark)
-    CP->>IO: 4. Atomic SuperBlock Switch
+If some real table-file state changes in the same attempt, the new cutoff is
+carried by the published user-table root. If only replay bounds advance, the
+checkpoint does not write a metadata-only table root. It upserts the monotonic
+table bounds in `catalog.table_replay_silent_watermarks`; those bounds become
+restart proof only after catalog checkpoint folds the row into `catalog.mtb`.
 
-    %% GC (Independent)
-    Note over Mem: Later: GC Task
-    Mem->>Mem: Remove if CTS < Global_Min_Active_STS
-```
+The silent-watermark publication and fieldwise overlay rules are defined in
+[Checkpoint](./checkpoint.md#replay-bound-only-checkpoints).
+
+## Memory Cleanup
+
+Publishing a delete does not immediately remove its marker from
+`ColumnDeletionBuffer`. Cleanup additionally needs:
+
+- durable delete coverage for the marker
+- a snapshot horizon strictly newer than the marker's commit timestamp
+
+Until both proofs hold, the marker may still make a disk-deleted row visible to
+an older reader. Secondary `MemIndex` cleanup has additional row and root
+proofs and must not infer safety from deletion-buffer absence alone.
+
+See [Garbage Collection](./garbage-collect.md) for the authoritative cleanup
+rules.
+
+## Recovery Boundary
+
+Recovery loads the persistent delete sets from the selected table root and
+reconstructs only the newer tail in memory. For a cold RowID, redo is replayed
+into `ColumnDeletionBuffer` when its CTS is at or above the effective
+`deletion_cutoff_ts`; older delete redo is already covered by persistent state.
+
+Checkpointed silent watermarks may raise the effective cutoff above the value
+stored in the table root. The complete replay-floor calculation and restart
+ordering belong to [Recovery](./recovery.md), avoiding a second recovery
+algorithm in this document.
+
+## Summary
+
+Deletion checkpoint keeps three ideas aligned:
+
+1. The in-memory marker remains the MVCC authority until cleanup is safe.
+2. Persistent delete metadata and companion `DiskTree` changes publish through
+   one table root.
+3. `deletion_cutoff_ts` advances only across a fully examined, durably covered
+   timestamp interval.
