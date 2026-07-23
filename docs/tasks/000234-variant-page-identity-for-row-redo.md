@@ -1,7 +1,7 @@
 ---
 id: 000234
 title: Variant Page Identity for Row Redo
-status: proposal
+status: implemented
 created: 2026-07-23
 github_issue: 878
 ---
@@ -207,6 +207,31 @@ Issue Labels:
     change storage-backend or backend-neutral I/O behavior.
 
 ## Implementation Notes
+
+- Implemented the planned `RowRedo` and `RowRedoKind` shapes, including
+  variant-owned page identity, the version-5 wire layout, minimum-size hints,
+  explicit truncated-payload rejection, and updated `TableDML` folding.
+- Updated all redo producers, recovery and catalog consumers, transaction and
+  recovery fixtures, and `docs/redo-log.md`. Cold user-table deletes now emit
+  `Delete(None)`; hot physical operations carry their concrete page id; keyed
+  catalog operations remain page-independent.
+- Recovery now selects delete replay from the recovered table pivot. Cold
+  replay accepts either optional-page form, while hot replay rejects
+  `Delete(None)` with `DataIntegrityError::InvalidPayload` at the table-access
+  recovery boundary.
+- Review tightened the producer invariant beyond the original call shape:
+  `install_cold_delete_effects` constructs `Delete(None)` internally, and
+  `log_by_key` was removed from the public user-table unique-delete API and
+  accessor. Catalog `MemTable` paths retain keyed redo support.
+- Added coverage for every variant and changed encoding, folding with distinct
+  page ids, hot and cold delete recovery, format-version rejection, and hot
+  versus cold producer behavior through both full-table mutation and unique
+  delete paths.
+- Verification passed with `rtk cargo build --workspace`,
+  `rtk cargo nextest run --workspace` (1,505 tests), and
+  `tools/style_audit.rs --diff-base origin/main` (22 branch-diff Rust files).
+  The alternate `libaio` pass was intentionally omitted because no storage-I/O
+  behavior changed.
 
 ## Impacts
 
