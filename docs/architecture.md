@@ -152,4 +152,5 @@ or after the coarse replay floor derived from `catalog_replay_start_ts`, loaded
 tables' `heap_redo_start_ts` values, and loaded tables' `deletion_cutoff_ts`
 values.
 
-For more details, see [Checkpoint and Recovery](./checkpoint-and-recovery.md).
+For publication and replay-bound details, see [Checkpoint](./checkpoint.md).
+For restart ordering and redo replay, see [Recovery](./recovery.md).

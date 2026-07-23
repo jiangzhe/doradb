@@ -584,9 +584,9 @@ Cold-row delete:
 The key rule is that secondary-index persistence is a companion of table
 checkpoint, not an independent MemIndex flush.
 
-The detailed table-level cutoff and replay contract is defined in
-[`checkpoint-and-recovery.md`](./checkpoint-and-recovery.md). This document
-only summarizes the index-relevant parts:
+The table-level publication and cutoff contract is defined in
+[Checkpoint](./checkpoint.md). This document only summarizes the
+index-relevant parts:
 
 - data checkpoint uses the same GC-visible `cutoff_ts` as the table checkpoint
   pass after frozen-page stabilization
@@ -674,6 +674,9 @@ The baseline mitigation is to sort and batch updates by target tree order before
 performing CoW merges.
 
 ## 10. Recovery
+
+The complete restart sequence and replay-boundary rules are defined in
+[Recovery](./recovery.md). This section focuses on secondary-index state.
 
 ### 10.1 Startup State
 
