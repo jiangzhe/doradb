@@ -6,7 +6,6 @@ use super::{
     missing_secondary_index,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::INVALID_PAGE_ID;
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{
@@ -3107,7 +3106,6 @@ impl<'a> UserTableAccessor<'a> {
         effects: &mut StmtEffects,
         row_id: RowID,
         index_keys: Vec<SelectKey>,
-        redo_kind: RowRedoKind,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> RuntimeResult<()> {
         effects.push_row_undo(OwnedRowUndo::new(
@@ -3119,9 +3117,8 @@ impl<'a> UserTableAccessor<'a> {
         effects.insert_row_redo(
             self.table_id(),
             RowRedo {
-                page_id: INVALID_PAGE_ID,
                 row_id,
-                kind: redo_kind,
+                kind: RowRedoKind::Delete(None),
             },
         );
         self.defer_delete_index_keys(rt, effects, row_id, index_keys, root_snapshot)
@@ -3152,17 +3149,10 @@ impl<'a> UserTableAccessor<'a> {
                     .disclose());
             }
         }
-        self.install_cold_delete_effects(
-            rt,
-            effects,
-            row_id,
-            index_keys,
-            RowRedoKind::Delete,
-            root_snapshot,
-        )
-        .await
-        .attach("full-table mutation cold delete index masking")
-        .disclose()
+        self.install_cold_delete_effects(rt, effects, row_id, index_keys, root_snapshot)
+            .await
+            .attach("full-table mutation cold delete index masking")
+            .disclose()
     }
 
     #[inline]
@@ -3191,17 +3181,10 @@ impl<'a> UserTableAccessor<'a> {
             }
         }
         let old_index_keys = self.metadata().idx.keys_for_insert(&old_row);
-        self.install_cold_delete_effects(
-            rt,
-            effects,
-            row_id,
-            old_index_keys,
-            RowRedoKind::Delete,
-            root_snapshot,
-        )
-        .await
-        .attach("full-table mutation cold update delete effects")
-        .disclose()?;
+        self.install_cold_delete_effects(rt, effects, row_id, old_index_keys, root_snapshot)
+            .await
+            .attach("full-table mutation cold update delete effects")
+            .disclose()?;
         let new_row = self.build_cold_update_row(old_row, RowUpdateInput::Sparse(update));
         let new_index_keys = self.metadata().idx.keys_for_insert(&new_row);
         let (new_row_id, new_guard) = self
@@ -3683,11 +3666,10 @@ impl<'a> UserTableAccessor<'a> {
                                     return Ok(UpdateUniqueMvcc::NotFound(input));
                                 }
                             }
-                            // Cold delete undo has no row page. Rollback routes
-                            // page_id=None to CDB marker removal; redo uses
-                            // INVALID_PAGE_ID so recovery replays the delete into
-                            // the deletion buffer when it is newer than the
-                            // deletion checkpoint cutoff.
+                            // Cold delete undo and redo have no row page. Rollback
+                            // routes page_id=None to CDB marker removal, while
+                            // recovery routes Delete(None) through the current
+                            // pivot into the deletion buffer.
                             effects.push_row_undo(OwnedRowUndo::new(
                                 self.table_id(),
                                 None,
@@ -3697,9 +3679,8 @@ impl<'a> UserTableAccessor<'a> {
                             effects.insert_row_redo(
                                 self.table_id(),
                                 RowRedo {
-                                    page_id: INVALID_PAGE_ID,
                                     row_id,
-                                    kind: RowRedoKind::Delete,
+                                    kind: RowRedoKind::Delete(None),
                                 },
                             );
 
@@ -3864,7 +3845,6 @@ impl<'a> UserTableAccessor<'a> {
         effects: &mut StmtEffects,
         index_no: usize,
         key_vals: &[Val],
-        log_by_key: bool,
     ) -> Result<DeleteMvcc> {
         debug_assert!(index_no < self.sec_idx_len());
         debug_assert!(
@@ -3922,14 +3902,6 @@ impl<'a> UserTableAccessor<'a> {
                                     // until success. Row undo removes it on
                                     // rollback; redo rebuilds it as a cold delete
                                     // during recovery.
-                                    let redo_kind = if log_by_key {
-                                        RowRedoKind::DeleteByPrimaryKey(SelectKey::new(
-                                            index_no,
-                                            key_vals.to_vec(),
-                                        ))
-                                    } else {
-                                        RowRedoKind::Delete
-                                    };
                                     // Mask old index entries immediately; physical
                                     // deletion remains deferred to index GC.
                                     self.install_cold_delete_effects(
@@ -3937,7 +3909,6 @@ impl<'a> UserTableAccessor<'a> {
                                         effects,
                                         row_id,
                                         index_keys,
-                                        redo_kind,
                                         &root_snapshot,
                                     )
                                     .await
@@ -3977,7 +3948,7 @@ impl<'a> UserTableAccessor<'a> {
                 }
             };
             let res = HotRowMutator::new(self.table_id(), self.metadata(), rt, &page_guard, row_id)
-                .delete(effects, index_no, key_vals, log_by_key)
+                .delete(effects, index_no, key_vals, false)
                 .await
                 .disclose()?;
             match res {
@@ -4200,6 +4171,7 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::lock::tests::LockDebugEntryState;
     use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::log::redo::RowRedoKind;
     use crate::row::RowPage;
     use crate::row::ops::{
         DeleteMvcc, RowMutation, RowUpdateInput, ScanMvcc, SelectKey, SelectMvcc,
@@ -6689,6 +6661,64 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_unique_mvcc_emits_physical_hot_and_cold_redo() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = evictable_test_engine(
+                &temp_dir,
+                64u64 * 1024 * 1024,
+                "delete_unique_physical_redo",
+            )
+            .await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "cold").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            insert_rows(table_id, &mut session, 10, 1, "hot").await;
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                for id in [0, 10] {
+                    let key = single_key(id);
+                    assert_eq!(
+                        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
+                            .await?,
+                        DeleteMvcc::Deleted
+                    );
+                }
+
+                let rows = &stmt
+                    .effects_mut()
+                    .redo_for_test()
+                    .dml
+                    .get(&table_id)
+                    .unwrap()
+                    .rows;
+                let mut cold_deletes = 0;
+                let mut hot_deletes = 0;
+                for row in rows.values() {
+                    match row.kind {
+                        RowRedoKind::Delete(None) => cold_deletes += 1,
+                        RowRedoKind::Delete(Some(_)) => hot_deletes += 1,
+                        RowRedoKind::Insert(..)
+                        | RowRedoKind::Update(..)
+                        | RowRedoKind::DeleteByPrimaryKey(_)
+                        | RowRedoKind::UpdateByPrimaryKey(..) => {
+                            panic!("user-table delete must emit physical delete redo")
+                        }
+                    }
+                }
+                assert_eq!((cold_deletes, hot_deletes), (1, 1));
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_table_mutate_mvcc_mixed_cold_hot_actions_and_outcome() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -6704,24 +6734,50 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let outcome = trx
                 .exec(async |stmt| {
-                    stmt.table_mutate_mvcc(table_id, |row| {
-                        let id = row.val(0)?.as_i32().unwrap();
-                        Ok(match id {
-                            0 | 10 => RowMutation::Delete,
-                            1 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("cold-updated"),
-                            }]),
-                            11 => RowMutation::Update(vec![UpdateCol {
-                                idx: 1,
-                                val: Val::from("hot-updated"),
-                            }]),
-                            12 => RowMutation::Update(Vec::new()),
-                            2 => RowMutation::Skip,
-                            _ => unreachable!(),
+                    let outcome = stmt
+                        .table_mutate_mvcc(table_id, |row| {
+                            let id = row.val(0)?.as_i32().unwrap();
+                            Ok(match id {
+                                0 | 10 => RowMutation::Delete,
+                                1 => RowMutation::Update(vec![UpdateCol {
+                                    idx: 1,
+                                    val: Val::from("cold-updated"),
+                                }]),
+                                11 => RowMutation::Update(vec![UpdateCol {
+                                    idx: 1,
+                                    val: Val::from("hot-updated"),
+                                }]),
+                                12 => RowMutation::Update(Vec::new()),
+                                2 => RowMutation::Skip,
+                                _ => unreachable!(),
+                            })
                         })
-                    })
-                    .await
+                        .await?;
+                    let rows = &stmt
+                        .effects_mut()
+                        .redo_for_test()
+                        .dml
+                        .get(&table_id)
+                        .unwrap()
+                        .rows;
+                    let mut cold_deletes = 0;
+                    let mut hot_deletes = 0;
+                    let mut inserts = 0;
+                    let mut updates = 0;
+                    for row in rows.values() {
+                        match row.kind {
+                            RowRedoKind::Delete(None) => cold_deletes += 1,
+                            RowRedoKind::Delete(Some(_)) => hot_deletes += 1,
+                            RowRedoKind::Insert(..) => inserts += 1,
+                            RowRedoKind::Update(..) => updates += 1,
+                            RowRedoKind::DeleteByPrimaryKey(_)
+                            | RowRedoKind::UpdateByPrimaryKey(..) => {
+                                panic!("user-table mutation must emit physical redo")
+                            }
+                        }
+                    }
+                    assert_eq!((cold_deletes, hot_deletes, inserts, updates), (2, 1, 1, 1));
+                    Ok(outcome)
                 })
                 .await
                 .unwrap();

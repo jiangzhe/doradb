@@ -450,9 +450,11 @@ mod tests {
         rows.insert(
             RowID::new(1u64),
             RowRedo {
-                page_id: test_page_id(5),
                 row_id: RowID::new(100),
-                kind: RowRedoKind::Insert(vec![Val::from(1u32), Val::from(&s[..])]),
+                kind: RowRedoKind::Insert(
+                    test_page_id(5),
+                    vec![Val::from(1u32), Val::from(&s[..])],
+                ),
             },
         );
         let mut dml = BTreeMap::new();

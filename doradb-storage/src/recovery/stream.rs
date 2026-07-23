@@ -2950,9 +2950,8 @@ mod tests {
             rows.insert(
                 RowID::new(100),
                 RowRedo {
-                    page_id: test_page_id(5),
                     row_id: RowID::new(100),
-                    kind: RowRedoKind::Delete,
+                    kind: RowRedoKind::Delete(Some(test_page_id(5))),
                 },
             );
             let mut dml = BTreeMap::new();

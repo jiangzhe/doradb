@@ -1067,7 +1067,7 @@ impl<'a> RecoveryCoordinator<'a> {
     ) -> RuntimeResult<()> {
         for row in rows.values() {
             match &row.kind {
-                RowRedoKind::Insert(vals) => {
+                RowRedoKind::Insert(_, vals) => {
                     table
                         .insert_no_trx(
                             &self.resources.pool_guards,
@@ -1097,7 +1097,7 @@ impl<'a> RecoveryCoordinator<'a> {
                         )
                         .await?;
                 }
-                RowRedoKind::Delete | RowRedoKind::Update(_) => {
+                RowRedoKind::Delete(_) | RowRedoKind::Update(..) => {
                     // Catalog row-id redo is invalid because catalog row IDs
                     // are rebuilt when checkpointed rows are loaded.
                     unreachable!()
@@ -1123,14 +1123,14 @@ impl<'a> RecoveryCoordinator<'a> {
         let pivot_row_id = table.file().active_root_unchecked().pivot_row_id;
         for row in rows.values() {
             match &row.kind {
-                RowRedoKind::Insert(vals) => {
+                RowRedoKind::Insert(page_id, vals) => {
                     if cts < heap_redo_start_ts {
                         continue;
                     }
                     table
                         .recover_row_insert(
                             &self.resources.pool_guards,
-                            row.page_id,
+                            *page_id,
                             row.row_id,
                             vals,
                             cts,
@@ -1138,14 +1138,14 @@ impl<'a> RecoveryCoordinator<'a> {
                         )
                         .await?;
                 }
-                RowRedoKind::Update(vals) => {
+                RowRedoKind::Update(page_id, vals) => {
                     if cts < heap_redo_start_ts {
                         continue;
                     }
                     table
                         .recover_row_update(
                             &self.resources.pool_guards,
-                            row.page_id,
+                            *page_id,
                             row.row_id,
                             vals,
                             cts,
@@ -1153,7 +1153,7 @@ impl<'a> RecoveryCoordinator<'a> {
                         )
                         .await?;
                 }
-                RowRedoKind::Delete => {
+                RowRedoKind::Delete(page_id) => {
                     if row.row_id < pivot_row_id {
                         if cts < deletion_cutoff_ts {
                             continue;
@@ -1162,12 +1162,7 @@ impl<'a> RecoveryCoordinator<'a> {
                         continue;
                     }
                     table
-                        .recover_row_delete(
-                            &self.resources.pool_guards,
-                            row.page_id,
-                            row.row_id,
-                            cts,
-                        )
+                        .recover_row_delete(&self.resources.pool_guards, *page_id, row.row_id, cts)
                         .await?;
                 }
                 RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
@@ -1231,8 +1226,8 @@ fn invalid_user_table_keyed_redo(
 ) -> Report<DataIntegrityError> {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(format!(
-            "key-based catalog redo is invalid for user table replay: table_id={table_id}, page_id={}, row_id={}, cts={cts}, kind={:?}",
-            row.page_id, row.row_id, row.kind
+            "key-based catalog redo is invalid for user table replay: table_id={table_id}, row_id={}, cts={cts}, kind={:?}",
+            row.row_id, row.kind
         ))
 }
 
@@ -1365,7 +1360,6 @@ mod tests {
 
         for (expected_kind, kind) in cases {
             let row = RowRedo {
-                page_id: PageID::new(7),
                 row_id: RowID::new(9),
                 kind,
             };
@@ -1378,7 +1372,7 @@ mod tests {
             );
             assert!(report.contains("key-based catalog redo"), "{report}");
             assert!(report.contains("table_id=42"), "{report}");
-            assert!(report.contains("page_id=7"), "{report}");
+            assert!(!report.contains("page_id="), "{report}");
             assert!(report.contains("row_id=9"), "{report}");
             assert!(report.contains("cts=11"), "{report}");
             assert!(report.contains(expected_kind), "{report}");
@@ -1648,9 +1642,8 @@ mod tests {
         redo.insert_dml(
             table_id,
             RowRedo {
-                page_id: PageID::new(1),
                 row_id: RowID::new(0),
-                kind: RowRedoKind::Insert(vec![Val::from(1u32)]),
+                kind: RowRedoKind::Insert(PageID::new(1), vec![Val::from(1u32)]),
             },
         );
         TrxLog::new(redo_header(cts), redo)
@@ -1712,7 +1705,7 @@ mod tests {
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
         trx.exec(async |stmt| {
-            stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+            stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
                 .await
         })
         .await

@@ -2729,15 +2729,17 @@ pub(crate) mod tests {
             stmt.effects_mut().insert_row_redo(
                 USER_TABLE_ID_START,
                 RowRedo {
-                    page_id: PageID::new(0),
                     row_id: RowID::new(0),
-                    kind: RowRedoKind::Insert(vec![
-                        Val::U64(123),
-                        Val::U32(1),
-                        Val::U32(2),
-                        Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
-                        Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
-                    ]),
+                    kind: RowRedoKind::Insert(
+                        PageID::new(0),
+                        vec![
+                            Val::U64(123),
+                            Val::U32(1),
+                            Val::U32(2),
+                            Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
+                            Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
+                        ],
+                    ),
                 },
             );
             Ok(())
@@ -3172,9 +3174,8 @@ pub(crate) mod tests {
                 effects.insert_row_redo(
                     TableID::new(12),
                     RowRedo {
-                        page_id: PageID::new(0),
                         row_id: RowID::new(23),
-                        kind: RowRedoKind::Delete,
+                        kind: RowRedoKind::Delete(Some(PageID::new(0))),
                     },
                 );
                 Ok(())
@@ -3201,9 +3202,8 @@ pub(crate) mod tests {
         effects.redo.insert_dml(
             TABLE_ID_TABLES,
             RowRedo {
-                page_id: PageID::new(0),
                 row_id: RowID::new(0),
-                kind: RowRedoKind::Insert(vec![Val::U64(1)]),
+                kind: RowRedoKind::Insert(PageID::new(0), vec![Val::U64(1)]),
             },
         );
         effects.debug_assert_redo_invariants();
@@ -3219,9 +3219,8 @@ pub(crate) mod tests {
                 stmt.effects_mut().insert_row_redo(
                     TableID::new(12),
                     RowRedo {
-                        page_id: PageID::new(0),
                         row_id: RowID::new(23),
-                        kind: RowRedoKind::Delete,
+                        kind: RowRedoKind::Delete(Some(PageID::new(0))),
                     },
                 );
                 Ok(())
@@ -3234,9 +3233,8 @@ pub(crate) mod tests {
                     stmt.effects_mut().insert_row_redo(
                         TableID::new(12),
                         RowRedo {
-                            page_id: PageID::new(0),
                             row_id: RowID::new(24),
-                            kind: RowRedoKind::Delete,
+                            kind: RowRedoKind::Delete(Some(PageID::new(0))),
                         },
                     );
                     Err(Report::new(OperationError::NotSupported).disclose())

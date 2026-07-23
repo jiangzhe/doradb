@@ -139,9 +139,8 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         //
         // create redo log.
         let redo_entry = RowRedo {
-            page_id,
             row_id,
-            kind: RowRedoKind::Insert(cols),
+            kind: RowRedoKind::Insert(page_id, cols),
         };
         // Store redo in the statement buffer until the statement succeeds.
         effects.insert_row_redo(self.table_id, redo_entry);
@@ -257,7 +256,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         let redo_kind = if log_by_key {
             RowRedoKind::DeleteByPrimaryKey(SelectKey::new(index_no, key_vals.to_vec()))
         } else {
-            RowRedoKind::Delete
+            RowRedoKind::Delete(Some(self.page_guard.page_id()))
         };
         self.delete_inner(effects, Some((index_no, key_vals)), redo_kind)
             .await
@@ -269,7 +268,12 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         &self,
         effects: &mut StmtEffects,
     ) -> OperationResult<DeleteInternal> {
-        self.delete_inner(effects, None, RowRedoKind::Delete).await
+        self.delete_inner(
+            effects,
+            None,
+            RowRedoKind::Delete(Some(self.page_guard.page_id())),
+        )
+        .await
     }
 
     #[inline]
@@ -281,7 +285,6 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
     ) -> OperationResult<DeleteInternal> {
         let page_guard = self.page_guard;
         let row_id = self.row_id;
-        let page_id = page_guard.page_id();
         let page = page_guard.page();
         if !page.row_id_in_valid_range(row_id) {
             return Ok(DeleteInternal::NotFound);
@@ -312,7 +315,6 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 // before mutation.
                 // create redo log.
                 let redo_entry = RowRedo {
-                    page_id,
                     row_id,
                     kind: redo_kind,
                 };
@@ -410,13 +412,12 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                             // update and link undo entries of two rows via index branches.
                             // The re-lock of current undo is required.
                             let redo_entry = RowRedo {
-                                page_id,
                                 row_id,
                                 // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
                                 kind: redo_key
                                     .clone()
                                     .map(RowRedoKind::DeleteByPrimaryKey)
-                                    .unwrap_or(RowRedoKind::Delete),
+                                    .unwrap_or(RowRedoKind::Delete(Some(page_id))),
                             };
                             effects.insert_row_redo(self.table_id, redo_entry);
                             UpdateRowInplace::NoFreeSpaceOrFrozen(row_id, old_row, update)
@@ -457,13 +458,12 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                                 // A no-op update still used a row lock, but only a
                                 // real value change needs redo.
                                 let redo_entry = RowRedo {
-                                    page_id,
                                     row_id,
                                     kind: redo_key
                                         .map(|key| {
                                             RowRedoKind::UpdateByPrimaryKey(key, redo_cols.clone())
                                         })
-                                        .unwrap_or(RowRedoKind::Update(redo_cols)),
+                                        .unwrap_or(RowRedoKind::Update(page_id, redo_cols)),
                                 };
                                 effects.insert_row_redo(self.table_id, redo_entry);
                             }

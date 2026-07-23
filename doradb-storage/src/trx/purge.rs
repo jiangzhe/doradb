@@ -1546,7 +1546,7 @@ mod tests {
         table_id: TableID,
         key: &SelectKey,
     ) -> Result<DeleteMvcc> {
-        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals, false)
+        stmt.table_delete_unique_mvcc(table_id, key.index_no, &key.vals)
             .await
     }
 

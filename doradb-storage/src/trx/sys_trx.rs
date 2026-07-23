@@ -148,17 +148,12 @@ impl SysTrx {
                         row_id,
                         vals,
                     } => RowRedo {
-                        page_id,
                         row_id,
-                        kind: RowRedoKind::Insert(vals),
+                        kind: RowRedoKind::Insert(page_id, vals),
                     },
                     NoTrxUpsertChange::Updated {
-                        page_id,
-                        row_id,
-                        key,
-                        cols,
+                        row_id, key, cols, ..
                     } => RowRedo {
-                        page_id,
                         row_id,
                         kind: RowRedoKind::UpdateByPrimaryKey(key, cols),
                     },

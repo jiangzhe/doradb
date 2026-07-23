@@ -215,11 +215,13 @@ Value encoding:
 
 ## Fixed-Block Data Format
 
-Redo file format version `3` is the fixed-block data format. The selected redo
+Redo file format version `5` combines the fixed-block data format with the
+variant-owned row-page identity payload described below. The selected redo
 super-block slot is the format-version authority; individual data blocks do not
 carry a version field. The data region is a sequence of fixed-size redo data
 blocks, and every physical redo payload read or write is exactly the persisted
-`log_block_size` for that file.
+`log_block_size` for that file. Older redo file versions are rejected rather
+than decoded through a compatibility path.
 
 One logical redo group is assembled from one or more consecutive fixed data
 blocks. Groups are strictly sequential, are never interleaved, and never cross
@@ -325,16 +327,16 @@ TableDML :=
     BTreeMap<RowID, RowRedo>
 
 RowRedo :=
-    u64 page_id
     u64 row_id
     RowRedoKind
 ```
 
 `RowRedoKind` codes:
 
-- `1 Insert`: `Vec<Val>` full inserted row image.
-- `2 Delete`: no payload.
-- `3 Update`: `Vec<UpdateCol>`, where `UpdateCol = u32 col_idx + Val`.
+- `1 Insert`: `PageID + Vec<Val>` full inserted row image.
+- `2 Delete`: `Option<PageID>` using the generic one-byte presence tag.
+- `3 Update`: `PageID + Vec<UpdateCol>`, where
+  `UpdateCol = u32 col_idx + Val`.
 - `4 DeleteByPrimaryKey`: `SelectKey`, where
   `SelectKey = u32 index_no + Vec<Val>`.
 - `5 UpdateByPrimaryKey`: `SelectKey + Vec<UpdateCol>`.
@@ -354,9 +356,13 @@ variable-length update does not fit the current in-memory row page.
 - `134 DataCheckpoint`: `TableID + pivot RowID + STS`.
 - `135 TableReplaySilentWatermark`: `TableID`.
 
-The DML map is keyed by table and row. `RowRedo` still repeats `row_id`, and
-also carries `page_id`, because replay of user-table heap records needs the
-physical row page.
+The DML map is keyed by table and row, and `RowRedo` still repeats `row_id`.
+Physical insert and update variants carry the row page required by heap replay.
+Physical delete carries `Option<PageID>` because a hot delete has a page while a
+cold delete does not. Recovery chooses the hot or cold delete destination from
+the recovered table pivot: cold replay accepts and ignores either option,
+whereas hot replay requires `Some(PageID)`. Keyed catalog delete and update
+remain page-independent.
 
 ## Write Path
 
@@ -616,8 +622,8 @@ lose recent log writes.
 
 - Redo is a logical value log. It assumes committed checkpoint roots plus replay
   are sufficient; there is no undo phase.
-- Redo files use format version `3` fixed-block data framing and require a
-  valid fixed A/B super-block slot.
+- Redo files use format version `5` fixed-block framing and variant-owned row
+  page identity, and require a valid fixed A/B super-block slot.
 - Physical redo data blocks are checksummed. Sealed files validate their
   durable end offset and real redo CTS range during replay, but active crash
   files can remain unsealed and are scanned sequentially.

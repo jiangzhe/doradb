@@ -101,7 +101,7 @@ impl Table {
     pub(crate) async fn recover_row_delete(
         &self,
         guards: &PoolGuards,
-        page_id: PageID,
+        page_id: Option<PageID>,
         row_id: RowID,
         cts: TrxID,
     ) -> RuntimeResult<()> {
@@ -120,13 +120,24 @@ impl Table {
                         .attach(format!("row_id={row_id}, cts={cts}"))
                         .change_context(RuntimeError::TableAccess)
                         .attach(format!(
-                            "operation=recover_row_delete, table_id={}, page_id={page_id}",
+                            "operation=recover_row_delete, table_id={}, row_id={row_id}",
                             self.table_id()
                         )));
                 }
             }
         }
 
+        let page_id = page_id.ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "hot row delete redo requires page identity: row_id={row_id}, cts={cts}"
+                ))
+                .change_context(RuntimeError::TableAccess)
+                .attach(format!(
+                    "operation=recover_row_delete, table_id={}",
+                    self.table_id()
+                ))
+        })?;
         let mut page_guard = self
             .mem
             .must_get_row_page_exclusive(guards, page_id)
@@ -303,22 +314,79 @@ mod tests {
             assert!(row_id < active_root.pivot_row_id);
             let cts = active_root.deletion_cutoff_ts;
             table
-                .recover_row_delete(&session.pool_guards(), PageID::from(0u64), row_id, cts)
+                .recover_row_delete(&session.pool_guards(), None, row_id, cts)
                 .await
                 .unwrap();
             table
-                .recover_row_delete(&session.pool_guards(), PageID::from(0u64), row_id, cts)
+                .recover_row_delete(
+                    &session.pool_guards(),
+                    Some(PageID::from(0u64)),
+                    row_id,
+                    cts,
+                )
                 .await
                 .unwrap();
 
             let err = table
-                .recover_row_delete(&session.pool_guards(), PageID::from(0u64), row_id, cts + 1)
+                .recover_row_delete(&session.pool_guards(), None, row_id, cts + 1)
                 .await
                 .unwrap_err();
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
             );
+        });
+    }
+
+    #[test]
+    fn test_recover_hot_delete_requires_page_identity() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let metadata = table.metadata();
+            let mut page_guard = table
+                .mem
+                .get_insert_page_exclusive(&session.pool_guards(), 2)
+                .await
+                .unwrap();
+            let page_id = page_guard.page_id();
+            let row_id = page_guard.page().header.start_row_id;
+            let insert_cts = TrxID::new(10);
+            page_guard.bf_mut().init_recover_map(insert_cts);
+            table
+                .recover_row_insert_to_page(
+                    metadata.as_ref(),
+                    &mut page_guard,
+                    row_id,
+                    &[Val::from(1i32), Val::from("name")],
+                    insert_cts,
+                )
+                .unwrap();
+            drop(page_guard);
+
+            assert!(row_id >= table.file().active_root_unchecked().pivot_row_id);
+            let delete_cts = TrxID::new(11);
+            let err = table
+                .recover_row_delete(&session.pool_guards(), None, row_id, delete_cts)
+                .await
+                .unwrap_err();
+            assert_eq!(*err.current_context(), RuntimeError::TableAccess);
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidPayload)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("requires page identity"), "{report}");
+            assert!(report.contains(&format!("row_id={row_id}")), "{report}");
+
+            table
+                .recover_row_delete(&session.pool_guards(), Some(page_id), row_id, delete_cts)
+                .await
+                .unwrap();
         });
     }
 
