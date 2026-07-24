@@ -3,11 +3,11 @@ use super::{
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
         read_hot_row_mvcc,
     },
-    missing_secondary_index,
+    missing_secondary_index, secondary_disk_tree_encoder,
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
-use crate::catalog::{TableColumnLayout, TableMetadata};
+use crate::catalog::{IndexSpec, TableColumnLayout, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, FatalResult,
     InternalError, MultiDomainResultExt, OperationError, OperationOrRuntimeError,
@@ -38,7 +38,10 @@ use crate::table::{
     index_key_is_changed, index_key_replace, read_latest_index_key,
     read_physical_index_keys_for_delete, row_len, unique_key_from_full_row,
 };
-use crate::trx::row::{FindOldVersion, IndexCandidateRecheck, ReadLatestRow, RowReadAccess};
+use crate::trx::row::{
+    CreateIndexNonUniqueCandidate, FindOldVersion, IndexCandidateRecheck, ReadLatestRow,
+    RowReadAccess,
+};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
@@ -908,14 +911,6 @@ impl<'a> UserTableAccessor<'a> {
     #[inline]
     fn table_id(&self) -> TableID {
         self.mem().table_id()
-    }
-
-    #[inline]
-    async fn mem_scan<F>(&self, guards: &PoolGuards, page_action: F) -> RuntimeResult<()>
-    where
-        F: FnMut(PageSharedGuard<RowPage>) -> bool,
-    {
-        self.mem().scan(guards, page_action).await
     }
 
     #[inline]
@@ -3154,15 +3149,33 @@ impl<'a> UserTableAccessor<'a> {
     /// It includes rows marked deleted and intentionally does not visit
     /// persisted column-store rows. Foreground logical reads must use
     /// `table_scan_mvcc`, which binds cold and hot phases to one root snapshot.
+    #[cfg(test)]
     pub(crate) async fn mem_scan_uncommitted<F>(
         &self,
         guards: &PoolGuards,
+        row_action: F,
+    ) -> RuntimeResult<()>
+    where
+        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
+    {
+        self.mem_scan_uncommitted_from(guards, self.mem().pivot_row_id(), row_action)
+            .await
+    }
+
+    /// Scans raw latest row versions from an explicit captured hot-row boundary.
+    ///
+    /// CREATE INDEX uses this form so its row-page scan is bound to the same
+    /// pivot as its captured column-block root.
+    pub(crate) async fn mem_scan_uncommitted_from<F>(
+        &self,
+        guards: &PoolGuards,
+        start_row_id: RowID,
         mut row_action: F,
     ) -> RuntimeResult<()>
     where
         F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
-        self.mem_scan(guards, |page_guard| {
+        self.mem_scan_from(guards, start_row_id, |page_guard| {
             let col_layout = page_guard.unwrap_vmap().column_layout.as_ref();
             for row_access in page_guard.read_all_rows() {
                 if !row_action(col_layout, row_access.row()) {
@@ -3172,6 +3185,46 @@ impl<'a> UserTableAccessor<'a> {
             true
         })
         .await
+    }
+
+    /// Collect current and retained historical hot candidates for non-unique CREATE INDEX.
+    ///
+    /// Each row is traversed while its version-map read latch is held by
+    /// [`RowReadAccess`], so concurrent purge cannot rewrite the main undo
+    /// branch during collection.
+    pub(crate) async fn collect_non_unique_create_index_hot_candidates(
+        &self,
+        guards: &PoolGuards,
+        index_spec: &IndexSpec,
+        history_cutoff: TrxID,
+        start_row_id: RowID,
+    ) -> OperationOrRuntimeResult<Vec<CreateIndexNonUniqueCandidate>> {
+        let mut candidates = Vec::new();
+        let mut operation_error = None;
+        let encoder = secondary_disk_tree_encoder(self.metadata(), index_spec, true);
+        self.mem_scan_from(guards, start_row_id, |page_guard| {
+            let column_layout = page_guard.unwrap_vmap().column_layout.as_ref();
+            for row_access in page_guard.read_all_rows() {
+                match row_access.collect_non_unique_create_index_candidates(
+                    column_layout,
+                    index_spec,
+                    &encoder,
+                    history_cutoff,
+                ) {
+                    Ok(mut row_candidates) => candidates.append(&mut row_candidates),
+                    Err(err) => {
+                        operation_error = Some(err);
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .await?;
+        if let Some(err) = operation_error {
+            return Err(err.into());
+        }
+        Ok(candidates)
     }
 
     /// Scan cold and hot table rows visible to the transaction snapshot.

@@ -82,6 +82,12 @@ impl BlockIndex {
         self.root.pivot_row_id()
     }
 
+    /// Returns one atomic snapshot of the persisted column route.
+    #[inline]
+    pub(crate) fn column_route_snapshot(&self) -> (RowID, BlockID) {
+        self.root.snapshot()
+    }
+
     /// Returns the route-publication notification epoch.
     #[inline]
     pub(crate) fn route_epoch(&self) -> u64 {
