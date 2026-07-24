@@ -2,8 +2,9 @@ use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
-use crate::index::btree::{BTREE_BYTE_ZERO, BTreeByte};
-use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate};
+use crate::index::btree::{
+    BTREE_BYTE_ZERO, BTreeByte, BTreeDelete, BTreeInsert, BTreeKey, BTreeUpdate,
+};
 use crate::index::index_stream::NonUniqueMemIndexCandidateStream;
 use crate::index::mem_index::{MemIndex, MemIndexCleanupScan, NonUniqueMemIndexCleanupSpec};
 use crate::index::util::Maskable;
@@ -22,6 +23,15 @@ pub(crate) enum IndexMask {
     AlreadyMasked,
     /// The exact entry does not exist in MemIndex.
     NotFound,
+}
+
+/// Initial delete-mask state for an exact non-unique MemIndex build entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NonUniqueIndexBuildState {
+    /// The exact candidate represents the current live row version.
+    Active,
+    /// The exact candidate exists only for retained MVCC history.
+    DeleteMasked,
 }
 
 /// Generic non-unique-index implementation backed by a generic B-Tree.
@@ -138,6 +148,37 @@ pub(crate) struct GuardedNonUniqueMemIndex<'a, 'g, P: 'static> {
 }
 
 impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
+    /// Insert one exact CREATE INDEX candidate with its initial mask state.
+    ///
+    /// This build-only path neither consults DiskTree nor creates foreground
+    /// index undo. Callers must normalize exact `(key, row_id)` candidates
+    /// before insertion.
+    #[inline]
+    pub(crate) async fn insert_encoded_build_candidate(
+        &self,
+        encoded_key: &BTreeKey,
+        row_id: RowID,
+        state: NonUniqueIndexBuildState,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexInsert> {
+        debug_assert!(!row_id.is_deleted());
+        let value = match state {
+            NonUniqueIndexBuildState::Active => BTREE_BYTE_ZERO,
+            NonUniqueIndexBuildState::DeleteMasked => BTREE_BYTE_ZERO.deleted(),
+        };
+        Ok(
+            match self
+                .index
+                .tree()
+                .insert::<BTreeByte>(self.pool_guard, encoded_key.as_bytes(), value, false, ts)
+                .await?
+            {
+                BTreeInsert::Ok(merged) => IndexInsert::Ok(merged),
+                BTreeInsert::DuplicateKey(v) => IndexInsert::DuplicateKey(row_id, v.is_deleted()),
+            },
+        )
+    }
+
     /// Atomically mask one exact entry without a preliminary lookup.
     #[inline]
     pub(crate) async fn mask_if_present(
@@ -362,6 +403,46 @@ mod tests {
         }
         assert_eq!(entries.len(), 1);
         entries.pop().unwrap()
+    }
+
+    #[test]
+    fn test_build_candidate_preserves_initial_delete_mask() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let index = test_non_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![ValType::new(ValKind::I32, false)],
+            )
+            .await;
+            let bound = index.bind(&pool_guard);
+            let key = [Val::from(7i32)];
+            let row_id = RowID::new(42);
+            let encoded_key = index.encoder().encode_pair(&key, Val::from(row_id));
+
+            assert!(matches!(
+                bound
+                    .insert_encoded_build_candidate(
+                        &encoded_key,
+                        row_id,
+                        NonUniqueIndexBuildState::DeleteMasked,
+                        TrxID::new(101),
+                    )
+                    .await
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            ));
+            assert_eq!(
+                bound
+                    .lookup_unique(&key, row_id, TrxID::new(102))
+                    .await
+                    .unwrap(),
+                Some(false)
+            );
+        });
     }
 
     #[test]

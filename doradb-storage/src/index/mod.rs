@@ -30,7 +30,9 @@ pub(crate) use column_deletion_blob::{
 };
 pub(crate) use index_stream::{IndexBatchStream, IndexLookupCandidate};
 pub(crate) use mem_index::MemIndexEntry;
-pub(crate) use non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemIndex};
+pub(crate) use non_unique_index::{
+    GuardedNonUniqueMemIndex, IndexMask, NonUniqueIndexBuildState, NonUniqueMemIndex,
+};
 pub(crate) use owned_stream::OwnedSecondaryIndexCandidateStream;
 pub(crate) use row_page_index::RowLocation;
 #[cfg(test)]

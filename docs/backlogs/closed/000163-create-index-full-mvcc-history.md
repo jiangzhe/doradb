@@ -52,3 +52,17 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Non-unique CREATE INDEX historical candidate completeness was implemented by
+task 000236. The broad remainder was decomposed before closure: unique
+ownership history remains in backlog 000164, and deterministic reclamation of
+non-unique build-created history remains in backlog 000165.
+- Closed By: backlog close
+- Reference: `docs/tasks/000236-non-unique-create-index-mvcc-candidate-complete.md`;
+`docs/backlogs/000164-create-unique-index-full-mvcc-history.md`;
+`docs/backlogs/000165-reclaim-non-unique-create-index-history.md`
+
+- Closed At: 2026-07-24

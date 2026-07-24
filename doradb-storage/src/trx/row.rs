@@ -1,9 +1,9 @@
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableColumnLayout, TableMetadata};
+use crate::catalog::{IndexSpec, TableColumnLayout, TableMetadata};
 use crate::error::{OperationError, OperationResult};
 use crate::id::{RowID, TableID, TrxID};
-use crate::index::{BTreeKeyEncoder, IndexLookupCandidate};
+use crate::index::{BTreeKey, BTreeKeyEncoder, IndexLookupCandidate, NonUniqueIndexBuildState};
 use crate::map::FastHashMap;
 use crate::recovery::RowRecoveryMap;
 use crate::row::ops::{ReadRow, RowUpdateView, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
@@ -33,6 +33,17 @@ pub(crate) enum ReadLatestRow {
     NotFound,
     /// Another active transaction owns the latest page image.
     WriteConflict,
+}
+
+/// One current or retained historical hot-row candidate for non-unique CREATE INDEX.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateIndexNonUniqueCandidate {
+    /// Exact memory-comparable secondary-index key, including RowID.
+    pub(crate) encoded_key: BTreeKey,
+    /// Physical row version identified by the exact index candidate.
+    pub(crate) row_id: RowID,
+    /// Initial active or delete-masked MemIndex state.
+    pub(crate) state: NonUniqueIndexBuildState,
 }
 
 /// Read row with latest or visible version.
@@ -95,6 +106,99 @@ impl<'a> RowReadAccess<'a> {
         column_no: usize,
     ) -> Val {
         self.row().val(column_layout, column_no)
+    }
+
+    /// Collect current and retained main-branch keys for non-unique CREATE INDEX.
+    ///
+    /// The row-version read latch held by this access object prevents purge
+    /// from mutating the traversed chain. DDL table-data exclusion proves every
+    /// transition is committed; an unresolved status therefore fails closed.
+    /// Repeated exact keys within this RowID are merged locally, with active
+    /// current state taking precedence over retained delete-masked history.
+    pub(crate) fn collect_non_unique_create_index_candidates(
+        &self,
+        column_layout: &TableColumnLayout,
+        index_spec: &IndexSpec,
+        encoder: &BTreeKeyEncoder,
+        history_cutoff: TrxID,
+    ) -> OperationResult<Vec<CreateIndexNonUniqueCandidate>> {
+        let row = self.row();
+        let row_id = row.row_id();
+        let mut key = index_spec
+            .cols
+            .iter()
+            .map(|index_key| row.val(column_layout, index_key.col_no as usize))
+            .collect::<Vec<_>>();
+        let mut deleted = row.is_deleted();
+        let mut candidates = Vec::new();
+        if !deleted {
+            candidates.push(CreateIndexNonUniqueCandidate {
+                encoded_key: encoder.encode_pair(&key, Val::from(row_id)),
+                row_id,
+                state: NonUniqueIndexBuildState::Active,
+            });
+        }
+
+        let RowReadState::RowVer(undo) = &self.state else {
+            unreachable!("CREATE INDEX hot-row collection requires a row version map")
+        };
+        let Some(undo_head) = &**undo else {
+            return Ok(candidates);
+        };
+        let key_positions = index_spec
+            .cols
+            .iter()
+            .enumerate()
+            .map(|(key_pos, index_key)| (index_key.col_no as usize, key_pos))
+            .collect::<FastHashMap<_, _>>();
+        let mut next = &undo_head.next;
+        loop {
+            let transition_cts = next.main.status.ts();
+            if !trx_is_committed(transition_cts) {
+                return Err(Report::new(OperationError::WriteConflict).attach(format!(
+                    "create index found uncommitted hot-row transition: row_id={row_id}, transition_ts={transition_cts}"
+                )));
+            }
+            // Equality is retained: a reader whose STS equals the invalidating
+            // CTS still sees the reconstructed older version.
+            if transition_cts < history_cutoff {
+                break;
+            }
+
+            let entry = next.main.entry.as_ref();
+            match &entry.kind {
+                RowUndoKind::Lock => (),
+                RowUndoKind::Insert => {
+                    debug_assert!(!deleted);
+                    deleted = true;
+                }
+                RowUndoKind::Update(undo_vals) => {
+                    debug_assert!(!deleted);
+                    for undo_col in undo_vals {
+                        if let Some(key_pos) = key_positions.get(&undo_col.idx) {
+                            key[*key_pos] = undo_col.val.clone();
+                        }
+                    }
+                }
+                RowUndoKind::Delete => {
+                    debug_assert!(deleted);
+                    deleted = false;
+                }
+            }
+            if !deleted {
+                insert_create_index_non_unique_historical_candidate(
+                    &mut candidates,
+                    encoder,
+                    &key,
+                    row_id,
+                );
+            }
+            let Some(older) = entry.next.as_ref() else {
+                break;
+            };
+            next = older;
+        }
+        Ok(candidates)
     }
 
     /// Returns the timestamp associated with this row read state, if present.
@@ -1470,12 +1574,35 @@ pub(crate) enum FindOldVersion {
     None,
 }
 
+#[inline]
+fn insert_create_index_non_unique_historical_candidate(
+    candidates: &mut Vec<CreateIndexNonUniqueCandidate>,
+    encoder: &BTreeKeyEncoder,
+    key: &[Val],
+    row_id: RowID,
+) {
+    let encoded_key = encoder.encode_pair(key, Val::from(row_id));
+    if let Err(position) =
+        candidates.binary_search_by(|candidate| candidate.encoded_key.cmp(&encoded_key))
+    {
+        candidates.insert(
+            position,
+            CreateIndexNonUniqueCandidate {
+                encoded_key,
+                row_id,
+                state: NonUniqueIndexBuildState::DeleteMasked,
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
     };
+    use crate::table::secondary_disk_tree_encoder;
     use crate::trx::undo::RowUndoHead;
     use crate::trx::{MIN_ACTIVE_TRX_ID, ver_map::RowVersionMap};
     use crate::value::ValKind;
@@ -1496,6 +1623,25 @@ pub(crate) mod tests {
             2,
         )
         .unwrap()
+    }
+
+    fn committed_status(cts: TrxID) -> Arc<SharedTrxStatus> {
+        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + cts.as_u64()));
+        status.commit_for_test(cts);
+        status
+    }
+
+    fn create_index_non_unique_candidate(
+        encoder: &BTreeKeyEncoder,
+        key: i32,
+        state: NonUniqueIndexBuildState,
+    ) -> CreateIndexNonUniqueCandidate {
+        let row_id = RowID::new(100);
+        CreateIndexNonUniqueCandidate {
+            encoded_key: encoder.encode_pair(&[Val::from(key)], Val::from(row_id)),
+            row_id,
+            state,
+        }
     }
 
     fn row_page(metadata: &TableMetadata) -> RowPage {
@@ -1612,6 +1758,271 @@ pub(crate) mod tests {
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
         status.commit_for_test(TrxID::new(10));
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::NotFound);
+    }
+
+    #[test]
+    fn test_create_index_hot_history_retains_cutoff_equality_and_marks_old_key_deleted() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let undo = OwnedRowUndo::new(
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 1,
+                val: Val::from(19i32),
+                var_offset: None,
+            }]),
+        );
+        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
+        status.commit_for_test(TrxID::new(10));
+        *row_ver.write_latch(0) =
+            Some(Box::new(RowUndoHead::new(Arc::clone(&status), undo.leak())));
+        let access = test_row_read_access(&page, &row_ver, 0);
+        let index_spec = IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let encoder = secondary_disk_tree_encoder(&metadata, &index_spec, true);
+
+        let candidates = access
+            .collect_non_unique_create_index_candidates(
+                metadata.col.as_ref(),
+                &index_spec,
+                &encoder,
+                TrxID::new(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![
+                create_index_non_unique_candidate(
+                    &encoder,
+                    19,
+                    NonUniqueIndexBuildState::DeleteMasked,
+                ),
+                create_index_non_unique_candidate(&encoder, 20, NonUniqueIndexBuildState::Active,),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_index_hot_history_deduplicates_reappearing_active_key() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let mut newest = OwnedRowUndo::new(
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 1,
+                val: Val::from(19i32),
+                var_offset: None,
+            }]),
+        );
+        let older = OwnedRowUndo::new(
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 1,
+                val: Val::from(20i32),
+                var_offset: None,
+            }]),
+        );
+        newest.next = Some(NextRowUndo::new(MainBranch {
+            entry: older.leak(),
+            status: UndoStatus::Ref(committed_status(TrxID::new(10))),
+        }));
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            committed_status(TrxID::new(11)),
+            newest.leak(),
+        )));
+        let access = test_row_read_access(&page, &row_ver, 0);
+        let index_spec = IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let encoder = secondary_disk_tree_encoder(&metadata, &index_spec, true);
+
+        let candidates = access
+            .collect_non_unique_create_index_candidates(
+                metadata.col.as_ref(),
+                &index_spec,
+                &encoder,
+                TrxID::new(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![
+                create_index_non_unique_candidate(
+                    &encoder,
+                    19,
+                    NonUniqueIndexBuildState::DeleteMasked,
+                ),
+                create_index_non_unique_candidate(&encoder, 20, NonUniqueIndexBuildState::Active,),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_index_hot_history_deduplicates_repeated_masked_key() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        assert!(page.set_deleted(0, true));
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let mut newest =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Delete);
+        let older = OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        newest.next = Some(NextRowUndo::new(MainBranch {
+            entry: older.leak(),
+            status: UndoStatus::Ref(committed_status(TrxID::new(10))),
+        }));
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            committed_status(TrxID::new(11)),
+            newest.leak(),
+        )));
+        let access = test_row_read_access(&page, &row_ver, 0);
+        let index_spec = IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let encoder = secondary_disk_tree_encoder(&metadata, &index_spec, true);
+
+        let candidates = access
+            .collect_non_unique_create_index_candidates(
+                metadata.col.as_ref(),
+                &index_spec,
+                &encoder,
+                TrxID::new(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![create_index_non_unique_candidate(
+                &encoder,
+                20,
+                NonUniqueIndexBuildState::DeleteMasked,
+            )]
+        );
+    }
+
+    #[test]
+    fn test_create_index_hot_history_deduplicates_unchanged_active_key() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let mut newest =
+            OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
+        let older = OwnedRowUndo::new(
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 0,
+                val: Val::from(9i32),
+                var_offset: None,
+            }]),
+        );
+        newest.next = Some(NextRowUndo::new(MainBranch {
+            entry: older.leak(),
+            status: UndoStatus::Ref(committed_status(TrxID::new(10))),
+        }));
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            committed_status(TrxID::new(11)),
+            newest.leak(),
+        )));
+        let access = test_row_read_access(&page, &row_ver, 0);
+        let index_spec = IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let encoder = secondary_disk_tree_encoder(&metadata, &index_spec, true);
+
+        let candidates = access
+            .collect_non_unique_create_index_candidates(
+                metadata.col.as_ref(),
+                &index_spec,
+                &encoder,
+                TrxID::new(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![create_index_non_unique_candidate(
+                &encoder,
+                20,
+                NonUniqueIndexBuildState::Active,
+            )]
+        );
+    }
+
+    #[test]
+    fn test_create_index_hot_history_stops_before_transition_below_cutoff() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let undo = OwnedRowUndo::new(
+            TableID::new(1),
+            None,
+            RowID::new(100),
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 1,
+                val: Val::from(19i32),
+                var_offset: None,
+            }]),
+        );
+        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99));
+        status.commit_for_test(TrxID::new(9));
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(status, undo.leak())));
+        let access = test_row_read_access(&page, &row_ver, 0);
+        let index_spec = IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let encoder = secondary_disk_tree_encoder(&metadata, &index_spec, true);
+
+        let candidates = access
+            .collect_non_unique_create_index_candidates(
+                metadata.col.as_ref(),
+                &index_spec,
+                &encoder,
+                TrxID::new(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![create_index_non_unique_candidate(
+                &encoder,
+                20,
+                NonUniqueIndexBuildState::Active,
+            )]
+        );
+    }
+
+    #[test]
+    fn test_create_index_hot_history_fails_closed_on_active_transition() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
+        let undo = OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Delete);
+        *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
+            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99)),
+            undo.leak(),
+        )));
+        let access = test_row_read_access(&page, &row_ver, 0);
+        let index_spec = IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+        let encoder = secondary_disk_tree_encoder(&metadata, &index_spec, true);
+
+        let err = access
+            .collect_non_unique_create_index_candidates(
+                metadata.col.as_ref(),
+                &index_spec,
+                &encoder,
+                TrxID::new(10),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<OperationError>().copied(),
+            Some(OperationError::WriteConflict)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("row_id=100"), "{report}");
+        assert!(report.contains("transition_ts="), "{report}");
     }
 
     #[test]

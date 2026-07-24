@@ -16,14 +16,16 @@ use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::disk_tree::{NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut};
 use crate::index::{
-    ColumnBlockIndex, IndexInsert, NonUniqueMemIndex, SecondaryDiskTreeRuntime, SecondaryIndex,
-    UniqueMemIndex,
+    ColumnBlockIndex, IndexInsert, NonUniqueIndexBuildState, NonUniqueMemIndex,
+    SecondaryDiskTreeRuntime, SecondaryIndex, UniqueMemIndex,
 };
 use crate::log::redo::DDLRedo;
 use crate::obs;
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowRead;
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
+use crate::trx::row::CreateIndexNonUniqueCandidate;
 use crate::trx::{Transaction, trx_is_committed};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
@@ -64,15 +66,354 @@ struct CreateIndexEncodedRowEntry {
     row_id: RowID,
 }
 
-struct CreateIndexRuntimeBuild<'a> {
-    engine: &'a EngineRef,
+struct CreateIndexColdRows {
+    durable_rows: Vec<CreateIndexRowEntry>,
+    historical_candidates: Vec<CreateIndexNonUniqueCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateIndexColdRowDisposition {
+    Durable,
+    Historical,
+    Excluded,
+}
+
+struct CreateIndexCollector<'a> {
+    table: &'a Table,
     guards: &'a PoolGuards,
-    metadata: Arc<TableMetadata>,
+    layout: &'a TableRuntimeLayout,
     index_spec: &'a IndexSpec,
-    disk_runtime: SecondaryDiskTreeRuntime,
-    hot_rows: Vec<CreateIndexRowEntry>,
-    cold_unique_keys: &'a BTreeSet<Vec<u8>>,
+    column_block_index_root: BlockID,
+    pivot_row_id: RowID,
+}
+
+impl<'a> CreateIndexCollector<'a> {
+    #[inline]
+    fn new(
+        table: &'a Table,
+        guards: &'a PoolGuards,
+        layout: &'a TableRuntimeLayout,
+        index_spec: &'a IndexSpec,
+        active_root: &ActiveRoot,
+    ) -> Self {
+        let column_block_index_root = active_root.column_block_index_root;
+        let pivot_row_id = active_root.pivot_row_id;
+        assert_create_index_block_index_snapshot(
+            table.table_id(),
+            (pivot_row_id, column_block_index_root),
+            table.mem.blk_idx().column_route_snapshot(),
+        );
+        Self {
+            table,
+            guards,
+            layout,
+            index_spec,
+            column_block_index_root,
+            pivot_row_id,
+        }
+    }
+
+    // Future improvement: stream/batch and parallelize this cold-row build to
+    // avoid materializing every persisted row. See docs/backlogs/000104.
+    async fn collect_unique_cold(&self) -> OperationOrRuntimeResult<Vec<CreateIndexRowEntry>> {
+        let rows = self
+            .collect_cold_with(create_index_unique_cold_row_disposition)
+            .await?;
+        assert!(
+            rows.historical_candidates.is_empty(),
+            "create-index build invariant violated: unique cold collection emitted historical candidates, table_id={}",
+            self.table.table_id()
+        );
+        Ok(rows.durable_rows)
+    }
+
+    async fn collect_non_unique_cold(
+        &self,
+        history_cutoff: TrxID,
+    ) -> OperationOrRuntimeResult<CreateIndexColdRows> {
+        self.collect_cold_with(|table, row_id| {
+            create_index_non_unique_cold_row_disposition(table, row_id, history_cutoff)
+        })
+        .await
+    }
+
+    async fn collect_cold_with<F>(
+        &self,
+        mut row_disposition: F,
+    ) -> OperationOrRuntimeResult<CreateIndexColdRows>
+    where
+        F: FnMut(&Table, RowID) -> OperationResult<CreateIndexColdRowDisposition>,
+    {
+        let table = self.table;
+        let guards = self.guards;
+        let metadata = self.layout.metadata();
+        let index_spec = self.index_spec;
+        let column_block_index_root = self.column_block_index_root;
+        let pivot_row_id = self.pivot_row_id;
+        if !create_index_cold_root_has_rows(column_block_index_root, pivot_row_id) {
+            return Ok(CreateIndexColdRows {
+                durable_rows: Vec::new(),
+                historical_candidates: Vec::new(),
+            });
+        }
+        let disk_guard = guards.disk_guard();
+        let column_index = ColumnBlockIndex::new(
+            column_block_index_root,
+            pivot_row_id,
+            table.file().file_kind(),
+            table.file().sparse_file(),
+            table.disk_pool(),
+            disk_guard,
+        );
+        let read_set = index_spec
+            .cols
+            .iter()
+            .map(|index_key| index_key.col_no as usize)
+            .collect::<Vec<_>>();
+        let exact_encoder = secondary_disk_tree_encoder(metadata, index_spec, true);
+        let mut durable_rows = Vec::new();
+        let mut historical_candidates = Vec::new();
+        let file_kind = table.file().file_kind();
+        for entry in column_index.collect_leaf_entries().await? {
+            let (delete_deltas, row_ids) =
+                column_index.load_delete_deltas_and_row_ids(&entry).await?;
+            let block_id = entry.block_id();
+            let persisted = table.storage.load_lwc_block(disk_guard, block_id).await?;
+            let block = persisted.block();
+            if usize::from(entry.row_count()) != row_ids.len() || block.row_count() != row_ids.len()
+            {
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC row count mismatch: entry_rows={}, block_rows={}, row_ids={}",
+                    entry.row_count(),
+                    block.row_count(),
+                    row_ids.len()
+                ))
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=create_index, phase=validate_index_build_input")
+                .into());
+            }
+            if block.row_shape_fingerprint() != entry.row_shape_fingerprint() {
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC row shape mismatch"
+                ))
+                .change_context(RuntimeError::CatalogAccess)
+                .attach("operation=create_index, phase=validate_index_build_input")
+                .into());
+            }
+
+            let mut persisted_deleted = BTreeSet::new();
+            for delta in delete_deltas {
+                let row_id = entry
+                    .start_row_id
+                    .checked_add(u64::from(delta))
+                    .ok_or_else(|| {
+                        Report::new(DataIntegrityError::InvalidPayload)
+                            .attach(format!(
+                                "file={file_kind}, block=lwc_block, block_id={block_id}, create index delete delta overflows row id: start_row_id={}, delta={delta}",
+                                entry.start_row_id
+                            ))
+                            .change_context(RuntimeError::CatalogAccess)
+                            .attach("operation=create_index, phase=validate_index_build_input")
+                    })?;
+                persisted_deleted.insert(row_id);
+            }
+
+            for (row_idx, row_id) in row_ids.into_iter().enumerate() {
+                // Persisted delete deltas were selected strictly below the root's
+                // deletion cutoff. Non-unique builds validated that cutoff is no
+                // newer than history_cutoff, so these rows are globally obsolete.
+                if persisted_deleted.contains(&row_id) {
+                    continue;
+                }
+                let disposition = row_disposition(table, row_id)?;
+                if disposition == CreateIndexColdRowDisposition::Excluded {
+                    continue;
+                }
+                let key = block
+                    .decode_row_values(&metadata.col, row_idx, &read_set)
+                    .attach_with(|| {
+                        format!("file={file_kind}, block=lwc_block, block_id={block_id}")
+                    })
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| {
+                        format!(
+                            "operation=create_index, phase=decode_cold_row, table_id={}, row_id={row_id}",
+                            table.table_id()
+                        )
+                    })?;
+                match disposition {
+                    CreateIndexColdRowDisposition::Durable => {
+                        durable_rows.push(CreateIndexRowEntry { key, row_id });
+                    }
+                    CreateIndexColdRowDisposition::Historical => {
+                        historical_candidates.push(CreateIndexNonUniqueCandidate {
+                            encoded_key: exact_encoder.encode_pair(&key, Val::from(row_id)),
+                            row_id,
+                            state: NonUniqueIndexBuildState::DeleteMasked,
+                        });
+                    }
+                    CreateIndexColdRowDisposition::Excluded => unreachable!(),
+                }
+            }
+        }
+        Ok(CreateIndexColdRows {
+            durable_rows,
+            historical_candidates,
+        })
+    }
+
+    async fn collect_unique_hot(&self) -> RuntimeResult<Vec<CreateIndexRowEntry>> {
+        let mut rows = Vec::new();
+        self.table
+            .accessor_with_layout(self.layout)
+            .mem_scan_uncommitted_from(self.guards, self.pivot_row_id, |col_layout, row| {
+                if row.is_deleted() {
+                    return true;
+                }
+                let key = self
+                    .index_spec
+                    .cols
+                    .iter()
+                    .map(|index_key| row.val(col_layout, index_key.col_no as usize))
+                    .collect();
+                rows.push(CreateIndexRowEntry {
+                    key,
+                    row_id: row.row_id(),
+                });
+                true
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    async fn collect_non_unique_hot(
+        &self,
+        history_cutoff: TrxID,
+    ) -> OperationOrRuntimeResult<Vec<CreateIndexNonUniqueCandidate>> {
+        self.table
+            .accessor_with_layout(self.layout)
+            .collect_non_unique_create_index_hot_candidates(
+                self.guards,
+                self.index_spec,
+                history_cutoff,
+                self.pivot_row_id,
+            )
+            .await
+    }
+}
+
+struct CreateIndexRuntimeBuilder<'a> {
+    index_pool: QuiescentGuard<EvictableBufferPool>,
+    index_guard: &'a PoolGuard,
+    metadata: &'a TableMetadata,
+    index_spec: &'a IndexSpec,
     build_ts: TrxID,
+}
+
+impl<'a> CreateIndexRuntimeBuilder<'a> {
+    #[inline]
+    fn new(
+        engine: &EngineRef,
+        guards: &'a PoolGuards,
+        metadata: &'a TableMetadata,
+        index_spec: &'a IndexSpec,
+        build_ts: TrxID,
+    ) -> Self {
+        Self {
+            index_pool: engine.index_pool.clone_inner(),
+            index_guard: guards.index_guard(),
+            metadata,
+            index_spec,
+            build_ts,
+        }
+    }
+
+    async fn build_unique(
+        self,
+        disk_runtime: SecondaryDiskTreeRuntime,
+        hot_rows: Vec<CreateIndexRowEntry>,
+        cold_unique_keys: &BTreeSet<Vec<u8>>,
+    ) -> OperationOrRuntimeResult<SecondaryIndex<EvictableBufferPool>> {
+        let Self {
+            index_pool,
+            index_guard,
+            metadata,
+            index_spec,
+            build_ts,
+        } = self;
+        validate_create_index_hot_unique_keys(metadata, index_spec, &hot_rows, cold_unique_keys)?;
+        let ty_infer = |col_no| metadata.col.col_type(col_no);
+        let mem =
+            UniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
+        let insert_res =
+            insert_create_index_unique_hot_rows(&mem, index_guard, &hot_rows, build_ts).await;
+        if let Err(err) = insert_res {
+            if let Err(report) = mem.destroy(index_guard).await {
+                let report = report.attach(format!(
+                    "operation=rollback_create_unique_index_build, index_no={}",
+                    disk_runtime.index_no()
+                ));
+                obs::error!(
+                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
+                );
+            }
+            return Err(err);
+        }
+        Ok(SecondaryIndex::Unique {
+            mem,
+            disk: disk_runtime,
+        })
+    }
+
+    async fn build_non_unique(
+        self,
+        disk_runtime: SecondaryDiskTreeRuntime,
+        candidates: Vec<CreateIndexNonUniqueCandidate>,
+    ) -> OperationOrRuntimeResult<SecondaryIndex<EvictableBufferPool>> {
+        #[cfg(test)]
+        use tests::{CreateIndexTestFailure, maybe_fail_create_index};
+
+        let Self {
+            index_pool,
+            index_guard,
+            metadata,
+            index_spec,
+            build_ts,
+        } = self;
+        let ty_infer = |col_no| metadata.col.col_type(col_no);
+        let mem =
+            NonUniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
+        #[cfg(test)]
+        let forced_population_failure =
+            maybe_fail_create_index(CreateIndexTestFailure::PopulateNonUnique);
+        #[cfg(not(test))]
+        let forced_population_failure: RuntimeResult<()> = Ok(());
+        let insert_res = match forced_population_failure {
+            Ok(()) => {
+                insert_create_index_non_unique_candidates(&mem, index_guard, &candidates, build_ts)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(err) = insert_res {
+            if let Err(report) = mem.destroy(index_guard).await {
+                let report = report.attach(format!(
+                    "operation=rollback_create_non_unique_index_build, index_no={}",
+                    disk_runtime.index_no()
+                ));
+                obs::error!(
+                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
+                );
+            }
+            return Err(err.into());
+        }
+        Ok(SecondaryIndex::NonUnique {
+            mem,
+            disk: disk_runtime,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -443,6 +784,9 @@ pub(crate) async fn create_index_for_session(
     table_id: TableID,
     index_spec: IndexSpec,
 ) -> Result<IndexNo> {
+    #[cfg(test)]
+    use tests::{CreateIndexTestFailure, maybe_fail_create_index};
+
     let ctx = SessionDdlContext::new(&session)
         .attach("operation=create_index")
         .disclose()?;
@@ -515,6 +859,24 @@ pub(crate) async fn create_index_for_session(
         .begin_trx()
         .attach("operation=create_index")
         .disclose()?;
+    let history_cutoff = if new_index_spec.unique() {
+        None
+    } else {
+        let history_cutoff = engine.trx_sys.published_gc_horizon();
+        assert_create_index_history_cutoff(
+            table_id,
+            active_root.deletion_cutoff_ts,
+            history_cutoff,
+        );
+        Some(history_cutoff)
+    };
+    let collector = CreateIndexCollector::new(
+        &table,
+        &guards,
+        old_layout.as_ref(),
+        &new_index_spec,
+        &active_root,
+    );
     let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
     let build_ts = progress.build_ts();
 
@@ -526,15 +888,22 @@ pub(crate) async fn create_index_for_session(
 
     // 5. Build the cold DiskTree from the currently persisted live rows and
     // stage the resulting root in the forked table file.
-    let cold_rows = collect_create_index_cold_rows(
-        &table,
-        &guards,
-        old_metadata,
-        &new_index_spec,
-        active_root.column_block_index_root,
-        active_root.pivot_row_id,
-    )
-    .await;
+    let cold_rows = if new_index_spec.unique() {
+        collector
+            .collect_unique_cold()
+            .await
+            .map(|durable_rows| CreateIndexColdRows {
+                durable_rows,
+                historical_candidates: Vec::new(),
+            })
+    } else {
+        let history_cutoff = history_cutoff.unwrap_or_else(|| {
+            panic!(
+                "create-index build invariant violated: non-unique history cutoff is missing during cold collection, table_id={table_id}, index_no={index_no}"
+            )
+        });
+        collector.collect_non_unique_cold(history_cutoff).await
+    };
     let cold_rows = match cold_rows {
         Ok(cold_rows) => cold_rows,
         Err(err) => {
@@ -542,6 +911,10 @@ pub(crate) async fn create_index_for_session(
             return Err(err.disclose());
         }
     };
+    let CreateIndexColdRows {
+        durable_rows: cold_rows,
+        historical_candidates: cold_historical_candidates,
+    } = cold_rows;
 
     let cold_unique_keys = match validate_create_index_cold_unique_keys(
         new_metadata.as_ref(),
@@ -588,26 +961,48 @@ pub(crate) async fn create_index_for_session(
 
     // 6. Build the hot MemIndex from row-store rows and assemble a runtime
     // layout that future readers can install atomically.
-    let hot_rows =
-        match collect_create_index_hot_rows(&table, &old_layout, &guards, &new_index_spec).await {
+    let runtime_builder = CreateIndexRuntimeBuilder::new(
+        &engine,
+        &guards,
+        new_metadata.as_ref(),
+        &new_index_spec,
+        build_ts,
+    );
+    let runtime_index = if new_index_spec.unique() {
+        let hot_rows = match collector.collect_unique_hot().await {
             Ok(hot_rows) => hot_rows,
             Err(err) => {
                 progress.rollback_before_catalog_commit().await.disclose()?;
                 return Err(err.disclose());
             }
         };
-    match build_create_index_runtime_index(CreateIndexRuntimeBuild {
-        engine: &engine,
-        guards: &guards,
-        metadata: Arc::clone(&new_metadata),
-        index_spec: &new_index_spec,
-        disk_runtime,
-        hot_rows,
-        cold_unique_keys: &cold_unique_keys,
-        build_ts,
-    })
-    .await
-    {
+        runtime_builder
+            .build_unique(disk_runtime, hot_rows, &cold_unique_keys)
+            .await
+    } else {
+        let history_cutoff = history_cutoff.unwrap_or_else(|| {
+            panic!(
+                "create-index build invariant violated: non-unique history cutoff is missing, table_id={table_id}, index_no={index_no}"
+            )
+        });
+        let hot_candidates = collector.collect_non_unique_hot(history_cutoff).await;
+        let hot_candidates = match hot_candidates {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                progress.rollback_before_catalog_commit().await.disclose()?;
+                return Err(err.disclose());
+            }
+        };
+        // The captured pivot makes cold and hot RowID ranges disjoint. Cold
+        // collection emits at most one candidate per RowID, while each hot
+        // undo chain is normalized before it leaves RowReadAccess.
+        let mut candidates = cold_historical_candidates;
+        candidates.extend(hot_candidates);
+        runtime_builder
+            .build_non_unique(disk_runtime, candidates)
+            .await
+    };
+    match runtime_index {
         Ok(index) => {
             progress.stage_runtime_index(index);
         }
@@ -615,6 +1010,11 @@ pub(crate) async fn create_index_for_session(
             progress.rollback_before_catalog_commit().await.disclose()?;
             return Err(err.disclose());
         }
+    }
+    #[cfg(test)]
+    if let Err(err) = maybe_fail_create_index(CreateIndexTestFailure::AfterRuntimeStaged) {
+        progress.rollback_before_catalog_commit().await.disclose()?;
+        return Err(err.disclose());
     }
     let new_layout = build_created_index_runtime_layout(
         &old_layout,
@@ -981,121 +1381,92 @@ fn create_index_cold_root_has_rows(column_block_index_root: BlockID, pivot_row_i
     true
 }
 
-// Future improvement: stream/batch and parallelize this cold-row build to avoid
-// materializing every persisted row. See docs/backlogs/000104.
-async fn collect_create_index_cold_rows(
-    table: &Table,
-    guards: &PoolGuards,
-    metadata: &TableMetadata,
-    index_spec: &IndexSpec,
-    column_block_index_root: BlockID,
-    pivot_row_id: RowID,
-) -> OperationOrRuntimeResult<Vec<CreateIndexRowEntry>> {
-    if !create_index_cold_root_has_rows(column_block_index_root, pivot_row_id) {
-        return Ok(Vec::new());
-    }
-    let disk_guard = guards.disk_guard();
-    let column_index = ColumnBlockIndex::new(
-        column_block_index_root,
-        pivot_row_id,
-        table.file().file_kind(),
-        table.file().sparse_file(),
-        table.disk_pool(),
-        disk_guard,
+#[inline]
+fn assert_create_index_history_cutoff(
+    table_id: TableID,
+    deletion_cutoff_ts: TrxID,
+    history_cutoff: TrxID,
+) {
+    assert!(
+        deletion_cutoff_ts <= history_cutoff,
+        "create-index history cutoff invariant violated: table_id={table_id}, deletion_cutoff_ts={deletion_cutoff_ts}, history_cutoff={history_cutoff}"
     );
-    let read_set = index_spec
-        .cols
-        .iter()
-        .map(|index_key| index_key.col_no as usize)
-        .collect::<Vec<_>>();
-    let mut rows = Vec::new();
-    for entry in column_index.collect_leaf_entries().await? {
-        let (delete_deltas, row_ids) = column_index.load_delete_deltas_and_row_ids(&entry).await?;
-        let file_kind = table.file().file_kind();
-        let block_id = entry.block_id();
-        let persisted = table.storage.load_lwc_block(disk_guard, block_id).await?;
-        let block = persisted.block();
-        if usize::from(entry.row_count()) != row_ids.len() || block.row_count() != row_ids.len() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC row count mismatch: entry_rows={}, block_rows={}, row_ids={}",
-                    entry.row_count(),
-                    block.row_count(),
-                    row_ids.len()
-                ))
-                .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=create_index, phase=validate_index_build_input")
-                .into());
-        }
-        if block.row_shape_fingerprint() != entry.row_shape_fingerprint() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC row shape mismatch"
-                ))
-                .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=create_index, phase=validate_index_build_input")
-                .into());
-        }
-
-        let mut persisted_deleted = BTreeSet::new();
-        for delta in delete_deltas {
-            let row_id = entry
-                .start_row_id
-                .checked_add(u64::from(delta))
-                .ok_or_else(|| {
-                    Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
-                            "file={file_kind}, block=lwc_block, block_id={block_id}, create index delete delta overflows row id: start_row_id={}, delta={delta}",
-                            entry.start_row_id
-                        ))
-                        .change_context(RuntimeError::CatalogAccess)
-                        .attach("operation=create_index, phase=validate_index_build_input")
-                })?;
-            persisted_deleted.insert(row_id);
-        }
-
-        for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-            if persisted_deleted.contains(&row_id) {
-                continue;
-            }
-            if create_index_cold_row_deleted_by_buffer(table, row_id)? {
-                continue;
-            }
-            let key = block
-                .decode_row_values(&metadata.col, row_idx, &read_set)
-                .attach_with(|| {
-                    format!("file={file_kind}, block=lwc_block, block_id={block_id}")
-                })
-                .change_context(RuntimeError::CatalogAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=create_index, phase=decode_cold_row, table_id={}, row_id={row_id}",
-                        table.table_id()
-                    )
-                })?;
-            rows.push(CreateIndexRowEntry { key, row_id });
-        }
-    }
-    Ok(rows)
 }
 
 #[inline]
-fn create_index_cold_row_deleted_by_buffer(table: &Table, row_id: RowID) -> OperationResult<bool> {
+fn assert_create_index_block_index_snapshot(
+    table_id: TableID,
+    captured: (RowID, BlockID),
+    runtime: (RowID, BlockID),
+) {
+    assert!(
+        captured == runtime,
+        "create-index block-index snapshot invariant violated: table_id={table_id}, captured_pivot_row_id={}, captured_column_block_index_root={}, runtime_pivot_row_id={}, runtime_column_block_index_root={}",
+        captured.0,
+        captured.1,
+        runtime.0,
+        runtime.1
+    );
+}
+
+#[inline]
+fn create_index_unique_cold_row_disposition(
+    table: &Table,
+    row_id: RowID,
+) -> OperationResult<CreateIndexColdRowDisposition> {
     match table.deletion_buffer().get(row_id) {
-        Some(DeleteMarker::Committed(_)) => Ok(true),
+        Some(DeleteMarker::Committed(_)) => Ok(CreateIndexColdRowDisposition::Excluded),
+        Some(DeleteMarker::Ref(status)) if trx_is_committed(status.ts()) => {
+            Ok(CreateIndexColdRowDisposition::Excluded)
+        }
+        Some(DeleteMarker::Ref(_)) => Err(create_index_uncommitted_cold_delete(table, row_id)),
+        None => Ok(CreateIndexColdRowDisposition::Durable),
+    }
+}
+
+#[inline]
+fn create_index_non_unique_cold_row_disposition(
+    table: &Table,
+    row_id: RowID,
+    history_cutoff: TrxID,
+) -> OperationResult<CreateIndexColdRowDisposition> {
+    match table.deletion_buffer().get(row_id) {
+        Some(DeleteMarker::Committed(delete_cts)) => Ok(
+            create_index_committed_cold_row_disposition(delete_cts, history_cutoff),
+        ),
         Some(DeleteMarker::Ref(status)) => {
-            if trx_is_committed(status.ts()) {
-                Ok(true)
+            let delete_cts = status.ts();
+            if trx_is_committed(delete_cts) {
+                Ok(create_index_committed_cold_row_disposition(
+                    delete_cts,
+                    history_cutoff,
+                ))
             } else {
-                Err(Report::new(OperationError::WriteConflict)
-                    .attach(format!(
-                        "create index found uncommitted cold-row delete marker: table_id={}, row_id={row_id}",
-                        table.table_id()
-                    )))
+                Err(create_index_uncommitted_cold_delete(table, row_id))
             }
         }
-        None => Ok(false),
+        None => Ok(CreateIndexColdRowDisposition::Durable),
     }
+}
+
+#[inline]
+fn create_index_committed_cold_row_disposition(
+    delete_cts: TrxID,
+    history_cutoff: TrxID,
+) -> CreateIndexColdRowDisposition {
+    if delete_cts >= history_cutoff {
+        CreateIndexColdRowDisposition::Historical
+    } else {
+        CreateIndexColdRowDisposition::Excluded
+    }
+}
+
+#[inline]
+fn create_index_uncommitted_cold_delete(table: &Table, row_id: RowID) -> Report<OperationError> {
+    Report::new(OperationError::WriteConflict).attach(format!(
+        "create index found uncommitted cold-row delete marker: table_id={}, row_id={row_id}",
+        table.table_id()
+    ))
 }
 
 async fn build_create_index_disk_tree(
@@ -1213,101 +1584,6 @@ fn validate_create_index_cold_non_unique_keys(
     Ok(())
 }
 
-async fn collect_create_index_hot_rows(
-    table: &Table,
-    layout: &Arc<TableRuntimeLayout>,
-    guards: &PoolGuards,
-    index_spec: &IndexSpec,
-) -> RuntimeResult<Vec<CreateIndexRowEntry>> {
-    let mut rows = Vec::new();
-    table
-        .accessor_with_layout(layout.as_ref())
-        .mem_scan_uncommitted(guards, |col_layout, row| {
-            if row.is_deleted() {
-                return true;
-            }
-            let key = index_spec
-                .cols
-                .iter()
-                .map(|index_key| row.val(col_layout, index_key.col_no as usize))
-                .collect();
-            rows.push(CreateIndexRowEntry {
-                key,
-                row_id: row.row_id(),
-            });
-            true
-        })
-        .await?;
-    Ok(rows)
-}
-
-async fn build_create_index_runtime_index(
-    build: CreateIndexRuntimeBuild<'_>,
-) -> OperationOrRuntimeResult<SecondaryIndex<EvictableBufferPool>> {
-    let CreateIndexRuntimeBuild {
-        engine,
-        guards,
-        metadata,
-        index_spec,
-        disk_runtime,
-        hot_rows,
-        cold_unique_keys,
-        build_ts,
-    } = build;
-    let index_pool = engine.index_pool.clone_inner();
-    let index_guard = guards.index_guard();
-    let ty_infer = |col_no| metadata.col.col_type(col_no);
-    if index_spec.unique() {
-        validate_create_index_hot_unique_keys(
-            metadata.as_ref(),
-            index_spec,
-            &hot_rows,
-            cold_unique_keys,
-        )?;
-        let mem =
-            UniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
-        let insert_res =
-            insert_create_index_unique_hot_rows(&mem, index_guard, &hot_rows, build_ts).await;
-        if let Err(err) = insert_res {
-            if let Err(report) = mem.destroy(index_guard).await {
-                let report = report.attach(format!(
-                    "operation=rollback_create_unique_index_build, index_no={}",
-                    disk_runtime.index_no()
-                ));
-                obs::error!(
-                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
-                );
-            }
-            return Err(err);
-        }
-        Ok(SecondaryIndex::Unique {
-            mem,
-            disk: disk_runtime,
-        })
-    } else {
-        let mem =
-            NonUniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
-        let insert_res =
-            insert_create_index_non_unique_hot_rows(&mem, index_guard, &hot_rows, build_ts).await;
-        if let Err(err) = insert_res {
-            if let Err(report) = mem.destroy(index_guard).await {
-                let report = report.attach(format!(
-                    "operation=rollback_create_non_unique_index_build, index_no={}",
-                    disk_runtime.index_no()
-                ));
-                obs::error!(
-                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
-                );
-            }
-            return Err(err.into());
-        }
-        Ok(SecondaryIndex::NonUnique {
-            mem,
-            disk: disk_runtime,
-        })
-    }
-}
-
 fn validate_create_index_hot_unique_keys(
     metadata: &TableMetadata,
     index_spec: &IndexSpec,
@@ -1359,26 +1635,28 @@ async fn insert_create_index_unique_hot_rows(
     Ok(())
 }
 
-async fn insert_create_index_non_unique_hot_rows(
+async fn insert_create_index_non_unique_candidates(
     mem: &NonUniqueMemIndex<EvictableBufferPool>,
     index_guard: &PoolGuard,
-    hot_rows: &[CreateIndexRowEntry],
+    candidates: &[CreateIndexNonUniqueCandidate],
     build_ts: TrxID,
 ) -> RuntimeResult<()> {
-    for row in hot_rows {
+    for candidate in candidates {
         match mem
             .bind(index_guard)
-            .insert_if_not_exists(&row.key, row.row_id, false, build_ts)
+            .insert_encoded_build_candidate(
+                &candidate.encoded_key,
+                candidate.row_id,
+                candidate.state,
+                build_ts,
+            )
             .await?
         {
             IndexInsert::Ok(_) => (),
             IndexInsert::DuplicateKey(..) => {
-                // Non-unique keys encode RowID as the final key component and
-                // this build scans each hot row once. A duplicate therefore
-                // requires the same row identity to have been emitted twice.
                 panic!(
-                    "create-index build invariant violated: non-unique hot exact key duplicated for row_id={}",
-                    row.row_id
+                    "create-index build invariant violated: normalized non-unique exact key duplicated for row_id={}",
+                    candidate.row_id
                 );
             }
         }
@@ -1602,23 +1880,25 @@ fn poison_index_after_catalog_commit_with_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::PoolRole;
+    use crate::buffer::{BufferPool, PoolRole};
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
-        TableMetadata, tests::table2,
+        TableMetadata, TableSpec, tests::table2,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::index::IndexBatchStream;
-    use crate::row::ops::{DeleteMvcc, SelectKey};
+    use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, UpdateCol, UpdateMvcc};
     use crate::session::Session;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::assert_freeze_created;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use smol::Timer;
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1627,6 +1907,29 @@ mod tests {
     const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
     const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
     const LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum CreateIndexTestFailure {
+        PopulateNonUnique,
+        AfterRuntimeStaged,
+    }
+
+    thread_local! {
+        static CREATE_INDEX_FAILURE: Cell<Option<CreateIndexTestFailure>> =
+            const { Cell::new(None) };
+    }
+
+    fn set_create_index_failure(failure: Option<CreateIndexTestFailure>) {
+        CREATE_INDEX_FAILURE.with(|slot| slot.set(failure));
+    }
+
+    pub(super) fn maybe_fail_create_index(failure: CreateIndexTestFailure) -> RuntimeResult<()> {
+        if CREATE_INDEX_FAILURE.with(|slot| slot.get()) == Some(failure) {
+            return Err(Report::new(RuntimeError::IndexAccess)
+                .attach("operation=test_create_index_phase_failure"));
+        }
+        Ok(())
+    }
 
     fn columns() -> Vec<ColumnSpec> {
         vec![
@@ -1803,6 +2106,84 @@ mod tests {
     }
 
     #[test]
+    fn create_index_history_cutoff_accepts_root_cutoff_equality() {
+        assert_create_index_history_cutoff(TableID::new(42), TrxID::new(10), TrxID::new(10));
+    }
+
+    #[test]
+    fn create_index_history_cutoff_panics_with_root_diagnostic() {
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            assert_create_index_history_cutoff(TableID::new(42), TrxID::new(11), TrxID::new(10));
+        }))
+        .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(message.contains("table_id=42"), "{message}");
+        assert!(message.contains("deletion_cutoff_ts=11"), "{message}");
+        assert!(message.contains("history_cutoff=10"), "{message}");
+    }
+
+    #[test]
+    fn create_index_block_index_snapshot_accepts_exact_match() {
+        assert_create_index_block_index_snapshot(
+            TableID::new(42),
+            (RowID::new(100), BlockID::new(10)),
+            (RowID::new(100), BlockID::new(10)),
+        );
+    }
+
+    #[test]
+    fn create_index_block_index_snapshot_panics_with_boundary_diagnostic() {
+        for runtime in [
+            (RowID::new(101), BlockID::new(10)),
+            (RowID::new(100), BlockID::new(11)),
+        ] {
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                assert_create_index_block_index_snapshot(
+                    TableID::new(42),
+                    (RowID::new(100), BlockID::new(10)),
+                    runtime,
+                );
+            }))
+            .unwrap_err();
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(message.contains("table_id=42"), "{message}");
+            assert!(message.contains("captured_pivot_row_id=100"), "{message}");
+            assert!(
+                message.contains("captured_column_block_index_root=10"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("runtime_pivot_row_id={}", runtime.0)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("runtime_column_block_index_root={}", runtime.1)),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_index_cold_history_uses_strict_cutoff() {
+        assert_eq!(
+            create_index_committed_cold_row_disposition(TrxID::new(10), TrxID::new(10)),
+            CreateIndexColdRowDisposition::Historical
+        );
+        assert_eq!(
+            create_index_committed_cold_row_disposition(TrxID::new(9), TrxID::new(10)),
+            CreateIndexColdRowDisposition::Excluded
+        );
+    }
+
+    #[test]
     fn test_create_index_builds_non_unique_hot_runtime() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -1870,6 +2251,376 @@ mod tests {
     }
 
     #[test]
+    fn test_create_index_build_failures_destroy_unpublished_runtime() {
+        smol::block_on(async {
+            assert_create_index_build_failure_cleanup(CreateIndexTestFailure::PopulateNonUnique)
+                .await;
+            assert_create_index_build_failure_cleanup(CreateIndexTestFailure::AfterRuntimeStaged)
+                .await;
+        });
+    }
+
+    #[test]
+    fn test_create_index_retains_hot_key_history_for_older_reader() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_hot_history").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut writer_session = engine.new_session().unwrap();
+            let row_id = insert_one_row(
+                &table,
+                &mut writer_session,
+                vec![Val::from(1), Val::from("alpha")],
+            )
+            .await;
+            let mut reader_session = engine.new_session().unwrap();
+            let mut old_reader = reader_session.begin_trx().unwrap();
+
+            let updated = update_one_row(
+                &table,
+                &mut writer_session,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("bravo"),
+                }],
+            )
+            .await;
+            assert_eq!(updated, row_id);
+            assert_eq!(
+                writer_session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            writer_session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
+                vec![vec![Val::from(1), Val::from("alpha")]]
+            );
+            assert!(
+                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "bravo")
+                    .await
+                    .is_empty()
+            );
+            old_reader.commit().await.unwrap();
+
+            let mut fresh_reader = writer_session.begin_trx().unwrap();
+            assert!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "alpha")
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "bravo").await,
+                vec![vec![Val::from(1), Val::from("bravo")]]
+            );
+            fresh_reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_create_index_retains_multiple_hot_snapshot_keys() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_multi_history").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut writer_session = engine.new_session().unwrap();
+            insert_one_row(
+                &table,
+                &mut writer_session,
+                vec![Val::from(1), Val::from("alpha")],
+            )
+            .await;
+            let mut first_reader_session = engine.new_session().unwrap();
+            let mut first_reader = first_reader_session.begin_trx().unwrap();
+            update_one_row(
+                &table,
+                &mut writer_session,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("bravo"),
+                }],
+            )
+            .await;
+            let mut second_reader_session = engine.new_session().unwrap();
+            let mut second_reader = second_reader_session.begin_trx().unwrap();
+            update_one_row(
+                &table,
+                &mut writer_session,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("cider"),
+                }],
+            )
+            .await;
+            writer_session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut first_reader, table_id, 1, "alpha").await,
+                vec![vec![Val::from(1), Val::from("alpha")]]
+            );
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut second_reader, table_id, 1, "bravo").await,
+                vec![vec![Val::from(1), Val::from("bravo")]]
+            );
+            first_reader.commit().await.unwrap();
+            second_reader.commit().await.unwrap();
+
+            let mut fresh_reader = writer_session.begin_trx().unwrap();
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "cider").await,
+                vec![vec![Val::from(1), Val::from("cider")]]
+            );
+            fresh_reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_create_index_retains_uncheckpointed_cold_delete_for_older_reader() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_cold_history").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut writer_session = engine.new_session().unwrap();
+            insert_one_row(
+                &table,
+                &mut writer_session,
+                vec![Val::from(1), Val::from("cold")],
+            )
+            .await;
+            assert_freeze_created(
+                writer_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            assert_checkpoint_published(&mut writer_session, table_id).await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut old_reader = reader_session.begin_trx().unwrap();
+            delete_one_row(&table, &mut writer_session, &single_key(1)).await;
+            assert_eq!(
+                writer_session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "cold").await,
+                vec![vec![Val::from(1), Val::from("cold")]]
+            );
+            old_reader.commit().await.unwrap();
+
+            let mut fresh_reader = writer_session.begin_trx().unwrap();
+            assert!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "cold")
+                    .await
+                    .is_empty()
+            );
+            fresh_reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_create_index_retains_cold_to_hot_update_across_distinct_row_ids() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_cold_hot_history").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut writer_session = engine.new_session().unwrap();
+            let cold_row_id = insert_one_row(
+                &table,
+                &mut writer_session,
+                vec![Val::from(1), Val::from("alpha")],
+            )
+            .await;
+            assert_freeze_created(
+                writer_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            assert_checkpoint_published(&mut writer_session, table_id).await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let mut old_reader = reader_session.begin_trx().unwrap();
+            let hot_row_id = update_one_row(
+                &table,
+                &mut writer_session,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("bravo"),
+                }],
+            )
+            .await;
+            assert_ne!(hot_row_id, cold_row_id);
+            writer_session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
+                vec![vec![Val::from(1), Val::from("alpha")]]
+            );
+            assert!(
+                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "bravo")
+                    .await
+                    .is_empty()
+            );
+            old_reader.commit().await.unwrap();
+
+            let mut fresh_reader = writer_session.begin_trx().unwrap();
+            assert!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "alpha")
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "bravo").await,
+                vec![vec![Val::from(1), Val::from("bravo")]]
+            );
+            fresh_reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_create_index_retains_hot_move_update_across_distinct_row_ids() {
+        smol::block_on(async {
+            const ROWS: i32 = 60;
+            const BASE_PAYLOAD_SIZE: usize = 1_000;
+            const LARGE_PAYLOAD_SIZE: usize = 50_000;
+
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_hot_move_history").await;
+            let mut writer_session = engine.new_session().unwrap();
+            let table_id = writer_session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                        ColumnSpec::new("payload", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+                )
+                .await
+                .unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let base_payload = vec![b'a'; BASE_PAYLOAD_SIZE];
+            let mut old_row_id = None;
+            for id in 0..ROWS {
+                let name = if id == 0 {
+                    "alpha".to_owned()
+                } else {
+                    format!("name{id}")
+                };
+                let row_id = insert_one_row(
+                    &table,
+                    &mut writer_session,
+                    vec![
+                        Val::from(id),
+                        Val::from(name.as_str()),
+                        Val::from(base_payload.as_slice()),
+                    ],
+                )
+                .await;
+                if id == 0 {
+                    old_row_id = Some(row_id);
+                }
+            }
+            let old_row_id = old_row_id.unwrap();
+            let mut reader_session = engine.new_session().unwrap();
+            let mut old_reader = reader_session.begin_trx().unwrap();
+            let large_payload = vec![b'b'; LARGE_PAYLOAD_SIZE];
+            let new_row_id = update_one_row(
+                &table,
+                &mut writer_session,
+                &single_key(0),
+                vec![
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("bravo"),
+                    },
+                    UpdateCol {
+                        idx: 2,
+                        val: Val::from(large_payload.as_slice()),
+                    },
+                ],
+            )
+            .await;
+            assert_ne!(new_row_id, old_row_id);
+            writer_session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
+                vec![vec![Val::from(0), Val::from("alpha")]]
+            );
+            assert!(
+                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "bravo")
+                    .await
+                    .is_empty()
+            );
+            old_reader.commit().await.unwrap();
+
+            let mut fresh_reader = writer_session.begin_trx().unwrap();
+            assert!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "alpha")
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, "bravo").await,
+                vec![vec![Val::from(0), Val::from("bravo")]]
+            );
+            fresh_reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_create_index_historical_key_reuse_commit_and_rollback() {
+        smol::block_on(async {
+            assert_create_index_historical_key_reuse(false).await;
+            assert_create_index_historical_key_reuse(true).await;
+        });
+    }
+
+    #[test]
     fn test_create_index_builds_non_unique_cold_disk_tree() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -1901,6 +2652,104 @@ mod tests {
                     .await;
             rows.sort_unstable();
             assert_eq!(rows.len(), 8);
+        });
+    }
+
+    #[test]
+    fn test_create_index_uses_one_cold_hot_boundary() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_boundary").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+
+            let mut cold_rows = Vec::new();
+            for primary_key in 0..4 {
+                cold_rows.push(
+                    insert_one_row(
+                        &table,
+                        &mut session,
+                        vec![Val::from(primary_key), Val::from("boundary")],
+                    )
+                    .await,
+                );
+            }
+            assert_freeze_created(
+                session
+                    .freeze_table(table.table_id(), usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+
+            let mut hot_rows = Vec::new();
+            for primary_key in 100..103 {
+                hot_rows.push(
+                    insert_one_row(
+                        &table,
+                        &mut session,
+                        vec![Val::from(primary_key), Val::from("boundary")],
+                    )
+                    .await,
+                );
+            }
+            assert_checkpoint_published(&mut session, table.table_id()).await;
+
+            let captured_root = table.file().active_root_unchecked().clone();
+            assert!(
+                cold_rows
+                    .iter()
+                    .all(|row_id| *row_id < captured_root.pivot_row_id)
+            );
+            assert!(
+                hot_rows
+                    .iter()
+                    .all(|row_id| *row_id >= captured_root.pivot_row_id)
+            );
+
+            assert_eq!(
+                session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            cold_rows.sort_unstable();
+            hot_rows.sort_unstable();
+            let key = name_key("boundary");
+            let mut disk_rows =
+                non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &key).await;
+            disk_rows.sort_unstable();
+            assert_eq!(disk_rows, cold_rows);
+
+            let layout = table.layout_snapshot();
+            let mut mem_rows = non_unique_mem_index_prefix_scan(
+                &layout,
+                &session.pool_guards(),
+                key.index_no,
+                &key.vals,
+            )
+            .await;
+            mem_rows.sort_unstable();
+            assert_eq!(mem_rows, hot_rows);
+
+            let mut expected_rows = cold_rows;
+            expected_rows.extend(hot_rows);
+            expected_rows.sort_unstable();
+            let mut runtime_rows = non_unique_runtime_lookup(
+                &layout,
+                active_secondary_root(&table, key.index_no),
+                &session.pool_guards(),
+                key.index_no,
+                &key.vals,
+            )
+            .await;
+            runtime_rows.sort_unstable();
+            assert_eq!(runtime_rows, expected_rows);
         });
     }
 
@@ -2428,6 +3277,195 @@ mod tests {
         trx.commit().await.unwrap();
     }
 
+    async fn update_one_row(
+        table: &Table,
+        session: &mut Session,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> RowID {
+        let mut trx = session.begin_trx().unwrap();
+        let result = trx
+            .exec(async |stmt| {
+                stmt.table_update_unique_mvcc(table.table_id(), key.index_no, &key.vals, update)
+                    .await
+            })
+            .await;
+        let Ok(UpdateMvcc::Updated(row_id)) = result else {
+            panic!("update should succeed: {result:?}");
+        };
+        trx.commit().await.unwrap();
+        row_id
+    }
+
+    async fn non_unique_mvcc_lookup(
+        trx: &mut Transaction,
+        table_id: TableID,
+        index_no: usize,
+        key: &str,
+    ) -> Vec<Vec<Val>> {
+        let key = [Val::from(key)];
+        let result = trx
+            .exec(async |stmt| {
+                stmt.table_index_lookup_mvcc(table_id, index_no, &key, &[0, 1])
+                    .await
+            })
+            .await
+            .unwrap();
+        match result {
+            ScanMvcc::Rows(rows) => rows,
+        }
+    }
+
+    async fn assert_create_index_historical_key_reuse(rollback: bool) {
+        let temp_dir = TempDir::new().unwrap();
+        let log_stem = if rollback {
+            "create_index_key_reuse_rollback"
+        } else {
+            "create_index_key_reuse_commit"
+        };
+        let engine = lightweight_test_engine(&temp_dir, log_stem).await;
+        let table_id = table2(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let mut writer_session = engine.new_session().unwrap();
+        let row_id = insert_one_row(
+            &table,
+            &mut writer_session,
+            vec![Val::from(1), Val::from("alpha")],
+        )
+        .await;
+        let mut reader_session = engine.new_session().unwrap();
+        let mut old_reader = reader_session.begin_trx().unwrap();
+        assert_eq!(
+            update_one_row(
+                &table,
+                &mut writer_session,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("bravo"),
+                }],
+            )
+            .await,
+            row_id
+        );
+        writer_session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            non_unique_mem_state(&table, &writer_session.pool_guards(), 1, "alpha", row_id).await,
+            Some(false)
+        );
+        assert_eq!(
+            non_unique_mem_state(&table, &writer_session.pool_guards(), 1, "bravo", row_id).await,
+            Some(true)
+        );
+
+        let mut reuse = writer_session.begin_trx().unwrap();
+        let update = reuse
+            .exec(async |stmt| {
+                stmt.table_update_unique_mvcc(
+                    table_id,
+                    0,
+                    &[Val::from(1)],
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("alpha"),
+                    }],
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(update, UpdateMvcc::Updated(row_id));
+        if rollback {
+            reuse.rollback().await.unwrap();
+        } else {
+            reuse.commit().await.unwrap();
+        }
+
+        let expected_alpha_active = !rollback;
+        assert_eq!(
+            non_unique_mem_state(&table, &writer_session.pool_guards(), 1, "alpha", row_id).await,
+            Some(expected_alpha_active)
+        );
+        assert_eq!(
+            non_unique_mem_state(&table, &writer_session.pool_guards(), 1, "bravo", row_id).await,
+            Some(rollback)
+        );
+        assert_eq!(
+            non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
+            vec![vec![Val::from(1), Val::from("alpha")]]
+        );
+        old_reader.commit().await.unwrap();
+
+        let mut fresh_reader = writer_session.begin_trx().unwrap();
+        let current_key = if rollback { "bravo" } else { "alpha" };
+        assert_eq!(
+            non_unique_mvcc_lookup(&mut fresh_reader, table_id, 1, current_key).await,
+            vec![vec![Val::from(1), Val::from(current_key)]]
+        );
+        fresh_reader.commit().await.unwrap();
+    }
+
+    async fn assert_create_index_build_failure_cleanup(failure: CreateIndexTestFailure) {
+        let temp_dir = TempDir::new().unwrap();
+        let log_stem = match failure {
+            CreateIndexTestFailure::PopulateNonUnique => "create_index_population_failure",
+            CreateIndexTestFailure::AfterRuntimeStaged => "create_index_staged_failure",
+        };
+        let engine = lightweight_test_engine(&temp_dir, log_stem).await;
+        let table_id = table2(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let mut session = engine.new_session().unwrap();
+        insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("alpha")]).await;
+        let root_before = table.file().active_root_unchecked().clone();
+        let generation_before = table.layout_snapshot().generation();
+        let allocated_before = engine.inner().index_pool.allocated();
+
+        set_create_index_failure(Some(failure));
+        let result = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            )
+            .await;
+        set_create_index_failure(None);
+        let err = result.unwrap_err();
+
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::IndexAccess)
+        );
+        assert_eq!(engine.inner().index_pool.allocated(), allocated_before);
+        assert_root_metadata_unchanged(&root_before, &table);
+        assert_eq!(table.layout_snapshot().generation(), generation_before);
+        assert_eq!(table.metadata().idx.next_index_no(), 1);
+        assert!(table.metadata().idx.index_spec(1).is_none());
+    }
+
+    async fn non_unique_mem_state(
+        table: &Table,
+        guards: &PoolGuards,
+        index_no: usize,
+        key: &str,
+        row_id: RowID,
+    ) -> Option<bool> {
+        let layout = table.layout_snapshot();
+        layout
+            .secondary_index(index_no)
+            .unwrap()
+            .non_unique_mem()
+            .unwrap()
+            .bind(guards.index_guard())
+            .lookup_unique(&[Val::from(key)], row_id, MAX_SNAPSHOT_TS)
+            .await
+            .unwrap()
+    }
+
     fn single_key<V: Into<Val>>(value: V) -> SelectKey {
         SelectKey {
             index_no: 0,
@@ -2475,6 +3513,23 @@ mod tests {
         let mut stream = bound
             .equal_scan_candidates(&range, MAX_SNAPSHOT_TS)
             .unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
+        rows
+    }
+
+    async fn non_unique_mem_index_prefix_scan(
+        layout: &Arc<TableRuntimeLayout>,
+        guards: &PoolGuards,
+        index_no: usize,
+        key: &[Val],
+    ) -> Vec<RowID> {
+        let index = layout.secondary_index(index_no).unwrap();
+        let range = index.key_encoder().encode_non_unique_equal_range(key);
+        let mem = index.non_unique_mem().unwrap().bind(guards.index_guard());
+        let mut stream = mem.equal_scan_candidates(&range, MAX_SNAPSHOT_TS).unwrap();
         let mut rows = Vec::new();
         while let Some(batch) = stream.next_batch().await.unwrap() {
             rows.extend(batch.into_iter().map(|candidate| candidate.row_id));

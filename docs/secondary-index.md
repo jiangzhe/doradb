@@ -33,9 +33,10 @@ User-table secondary indexes must satisfy the following constraints:
    index writes.
 2. Persistent secondary-index state is always committed state.
 3. Restart only needs to restore the latest committed state.
-4. Runtime MVCC for old versions remains heap-based. Old snapshots are served by
-   row undo chains and deletion buffers, not by keeping arbitrary historical
-   index versions on disk.
+4. Runtime MVCC visibility for old versions remains heap-based. Candidate
+   structures may retain runtime historical entries, but row undo chains and
+   deletion buffers remain the visibility authority and historical index
+   entries are never persisted in `DiskTree`.
 5. Cold-row checkpoint and cold-row deletion checkpoint are the only operations
    that publish new `DiskTree` roots.
 
@@ -479,9 +480,11 @@ every active secondary sidecar and publishing the column root and all secondary
 roots atomically. Foreground insert/recovery establishes the Mem-required half
 before another transaction can independently own the row.
 
-This is current-row completeness, not historical candidate completeness.
-`CREATE INDEX` history construction is separately tracked by
-[`000163-create-index-full-mvcc-history.md`](./backlogs/000163-create-index-full-mvcc-history.md).
+This current-row completeness invariant applies to every active secondary
+index. Runtime non-unique `CREATE INDEX` additionally establishes the
+historical candidate invariant below. Full runtime-created unique-index
+history remains unresolved and is tracked by
+[`000164-create-unique-index-full-mvcc-history.md`](./backlogs/000164-create-unique-index-full-mvcc-history.md).
 
 After definitive RowPage write ownership or current-LWC validation plus CDB
 ownership, operations that consume every old index entry create one opaque,
@@ -530,6 +533,43 @@ conflicts without overwrite. This consumes the captured immutable owner
 without rereading DiskTree. The source-selection Mem lookup precedes owner
 validation and is separate from this one-traversal claim. This token is for new
 claims only; it does not authorize old-row index-set masking.
+
+### 7.7 Runtime Non-Unique CREATE INDEX History
+
+Non-unique `CREATE INDEX` captures one
+`TransactionSystem::published_gc_horizon()` after its implicit DDL transaction
+starts. The captured cutoff is conservative: every hot main-branch transition
+or cold CDB delete whose committed CTS is equal to or newer than the cutoff is
+still potentially visible to a transaction active across index publication.
+The build therefore retains equality and excludes history only with the strict
+comparison:
+
+```text
+invalidation_or_delete_cts < history_cutoff => globally invisible
+```
+
+Current live cold rows are written only to the new `DiskTree`. Current hot rows
+are inserted into the runtime `MemIndex` as active exact candidates. Retained
+hot versions and retained CDB-deleted cold rows are inserted into `MemIndex` as
+delete-masked exact `(logical_key, row_id)` candidates. If the same exact
+candidate appears both currently and historically within one hot RowID's undo
+chain, row-local encoded normalization keeps one entry and active state wins.
+The captured pivot makes cold and hot RowID ranges disjoint, so cold historical
+candidates and normalized hot candidates are combined without a global
+normalization pass.
+
+The delete mask reproduces the state foreground maintenance would have left
+after an update or delete. Candidate scans may still emit the entry; the normal
+row/CDB MVCC recheck decides whether the transaction can see that version.
+Later same-RowID key reuse can reactivate the entry through the existing
+merge-and-undo path.
+
+Historical build entries are runtime-only. Restart rebuilds current hot
+MemIndex state over current durable `DiskTree` roots and does not reconstruct
+pre-crash history because no pre-crash transaction snapshot survives recovery.
+This completeness contract is specific to non-unique indexes. Runtime-created
+unique indexes still lack full historical cross-RowID owner construction and
+remain tracked by backlog 000164.
 
 ## 8. Write Path
 
@@ -802,6 +842,8 @@ This works because:
 
 - `DiskTree` already contains the checkpointed cold state
 - `MemIndex` only needs to represent post-checkpoint hot changes
+- non-unique CREATE INDEX historical candidates are runtime-only and no
+  pre-crash reader remains to require them
 - runtime unique-key links are not part of durable `DiskTree` state and do not
   need to be reconstructed as historical visibility structures after restart
 - no pre-crash active snapshot survives restart, so recovery does not need to

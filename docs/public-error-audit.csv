@@ -1,5 +1,5 @@
 file,function_or_method,disclose_calls
-doradb-storage/src/catalog/index.rs,create_index_for_session,28
+doradb-storage/src/catalog/index.rs,create_index_for_session,30
 doradb-storage/src/catalog/index.rs,drop_index_for_session,15
 doradb-storage/src/catalog/table.rs,create_table_for_session,9
 doradb-storage/src/catalog/table.rs,drop_table_for_session,12
