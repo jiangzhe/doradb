@@ -64,6 +64,18 @@ impl TableRuntimeLayout {
                 "table runtime layout invariant violated: runtime index number mismatch, slot={index_no}, runtime={}",
                 index.index_no()
             );
+            let index_spec = self
+                .metadata
+                .idx
+                .index_spec(index_no)
+                .expect("runtime slot was already proven active");
+            assert_eq!(
+                index.is_unique(),
+                index_spec.unique(),
+                "table runtime layout invariant violated: runtime index kind mismatch, index_no={index_no}, runtime_unique={}, metadata_unique={}",
+                index.is_unique(),
+                index_spec.unique()
+            );
         }
     }
 
@@ -151,10 +163,20 @@ pub(crate) struct RetiredSecondaryIndex {
 mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
-    use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::catalog::{
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+    };
     use crate::table::tests::*;
     use crate::value::ValKind;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use tempfile::TempDir;
+
+    fn table2_columns() -> Vec<ColumnSpec> {
+        vec![
+            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+        ]
+    }
 
     fn metadata_without_indexes() -> Arc<TableMetadata> {
         Arc::new(
@@ -182,6 +204,85 @@ mod tests {
         assert_eq!(layout.generation(), 7);
         assert_eq!(layout.metadata().idx.index_slot_count(), 0);
         assert_eq!(layout.index_slot_count(), 0);
+    }
+
+    #[test]
+    fn runtime_layout_rejects_structural_mismatches() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "runtime_layout_validation").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let runtime = Arc::clone(layout.secondary_indexes()[0].as_ref().unwrap());
+
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    TableRuntimeLayout::new(
+                        layout.generation() + 1,
+                        Arc::clone(layout.metadata_arc()),
+                        vec![None].into_boxed_slice(),
+                    )
+                }))
+                .is_err()
+            );
+
+            let inactive_metadata = Arc::new(
+                TableMetadata::try_new_with_next_index_no(table2_columns(), vec![], 1).unwrap(),
+            );
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    TableRuntimeLayout::new(
+                        layout.generation() + 1,
+                        inactive_metadata,
+                        vec![Some(Arc::clone(&runtime))].into_boxed_slice(),
+                    )
+                }))
+                .is_err()
+            );
+
+            let shifted_metadata = Arc::new(
+                TableMetadata::try_new_with_next_index_no(
+                    table2_columns(),
+                    vec![ActiveIndexSpec::new(
+                        1,
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                    )],
+                    2,
+                )
+                .unwrap(),
+            );
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    TableRuntimeLayout::new(
+                        layout.generation() + 1,
+                        shifted_metadata,
+                        vec![None, Some(Arc::clone(&runtime))].into_boxed_slice(),
+                    )
+                }))
+                .is_err()
+            );
+
+            let non_unique_metadata = Arc::new(
+                TableMetadata::try_new(
+                    table2_columns(),
+                    vec![IndexSpec::new(
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::empty(),
+                    )],
+                )
+                .unwrap(),
+            );
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    TableRuntimeLayout::new(
+                        layout.generation() + 1,
+                        non_unique_metadata,
+                        vec![Some(runtime)].into_boxed_slice(),
+                    )
+                }))
+                .is_err()
+            );
+        });
     }
 
     #[test]

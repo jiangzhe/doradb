@@ -6,7 +6,7 @@ use crate::error::{
     RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
-use crate::id::{BlockID, RowID, TrxID};
+use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::{
     ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
     UniqueMemIndex,
@@ -19,9 +19,31 @@ use std::sync::Arc;
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SecondaryMemIndexCleanupStats {
+pub struct MemIndexCleanupStats {
     /// One row per secondary index scanned by this pass.
     pub indexes: Vec<SecondaryMemIndexCleanupIndexStats>,
+}
+
+/// Result of a full-scan user-table secondary MemIndex cleanup pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemIndexCleanupOutcome {
+    /// Cleanup accounting for all active secondary indexes scanned by the pass.
+    pub stats: MemIndexCleanupStats,
+    /// Reason requested live-entry cleanup could not run against the captured root.
+    ///
+    /// Delete-overlay cleanup still completes and is represented in [`Self::stats`].
+    pub live_delay: Option<MemIndexCleanupDelay>,
+}
+
+/// Diagnostic payload for a retryable live-entry cleanup delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemIndexCleanupDelay {
+    /// Table whose captured root was not yet older than every active snapshot.
+    pub table_id: TableID,
+    /// Runtime post-publication root-observation boundary.
+    pub effective_ts: TrxID,
+    /// Global minimum active snapshot timestamp observed by cleanup.
+    pub min_active_sts: TrxID,
 }
 
 /// Cleanup result for one secondary MemIndex.
@@ -101,6 +123,11 @@ impl MemIndexCleanupSnapshot<'_> {
     }
 
     #[inline]
+    fn root_is_older_than_active_horizon(&self) -> bool {
+        self.effective_ts() < self.min_active_sts
+    }
+
+    #[inline]
     fn pivot_row_id(&self) -> RowID {
         self.root.pivot_row_id()
     }
@@ -159,13 +186,16 @@ impl Table {
     /// missing delete proof as a retention decision for delete overlays.
     ///
     /// When `clean_live_entries` is `true`, redundant live MemIndex entries are
-    /// removed as part of the pass. When `false`, live MemIndex cache entries
-    /// are retained and only obsolete delete overlays are cleaned.
+    /// removed only after the captured root is older than every active snapshot.
+    /// Otherwise live entries are retained and [`MemIndexCleanupOutcome::live_delay`]
+    /// reports the retry boundary. When `false`, live MemIndex cache entries are
+    /// retained by policy and no live delay is reported. Obsolete delete overlays
+    /// are cleaned independently in either case.
     pub(crate) async fn cleanup_secondary_mem_indexes(
         &self,
         session: SessionPin,
         clean_live_entries: bool,
-    ) -> RuntimeOrFatalResult<SecondaryMemIndexCleanupStats> {
+    ) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
         let trx_sys = session.engine.trx_sys.clone();
         let pool_guards = session.pool_guards();
         loop {
@@ -181,6 +211,8 @@ impl Table {
                 .map_err(RuntimeOrFatalError::from)?;
             let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+            #[cfg(test)]
+            tests::run_test_cleanup_after_trx_start_hook().await;
             let cleanup_res = {
                 let checkout = trx
                     .checkout()
@@ -243,9 +275,18 @@ impl Table {
         guards: &PoolGuards,
         snapshot: &MemIndexCleanupSnapshot<'_>,
         clean_live_entries: bool,
-    ) -> RuntimeResult<SecondaryMemIndexCleanupStats> {
+    ) -> RuntimeResult<MemIndexCleanupOutcome> {
         debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_ts());
 
+        let root_is_older_than_active_horizon = snapshot.root_is_older_than_active_horizon();
+        let live_delay = (clean_live_entries && !root_is_older_than_active_horizon).then_some(
+            MemIndexCleanupDelay {
+                table_id: self.table_id(),
+                effective_ts: snapshot.effective_ts(),
+                min_active_sts: snapshot.min_active_sts,
+            },
+        );
+        let clean_live_entries = clean_live_entries && root_is_older_than_active_horizon;
         let layout = snapshot.layout();
         let metadata = layout.metadata();
         let column_index = self.cleanup_column_index(guards, snapshot);
@@ -259,7 +300,7 @@ impl Table {
             index_pool_guard,
             disk_pool_guard,
         };
-        let mut stats = SecondaryMemIndexCleanupStats {
+        let mut stats = MemIndexCleanupStats {
             indexes: Vec::with_capacity(metadata.idx.active_index_count()),
         };
 
@@ -304,7 +345,7 @@ impl Table {
             stats.indexes.push(index_stats);
         }
 
-        Ok(stats)
+        Ok(MemIndexCleanupOutcome { stats, live_delay })
     }
 
     #[inline]
@@ -459,7 +500,7 @@ impl Table {
         snapshot: &MemIndexCleanupSnapshot<'_>,
     ) -> Option<ColumnBlockIndex<'a>> {
         if snapshot.column_block_index_root() == SUPER_BLOCK_ID
-            || snapshot.effective_ts() >= snapshot.min_active_sts
+            || !snapshot.root_is_older_than_active_horizon()
         {
             return None;
         }
@@ -540,7 +581,7 @@ impl Table {
         // mismatch only after it is older than every active snapshot. Otherwise
         // removing the overlay could expose this newer cold-root fact to a
         // transaction that still depends on the MemIndex delete marker.
-        if snapshot.effective_ts() >= snapshot.min_active_sts {
+        if !snapshot.root_is_older_than_active_horizon() {
             return Ok(DeleteOverlayProof::NotProven);
         }
         let Some(column_index) = cleanup_context.column_index else {
@@ -608,11 +649,11 @@ impl Table {
 
 #[inline]
 fn finish_secondary_mem_index_cleanup(
-    cleanup_res: RuntimeResult<SecondaryMemIndexCleanupStats>,
+    cleanup_res: RuntimeResult<MemIndexCleanupOutcome>,
     rollback_res: RuntimeOrFatalResult<()>,
-) -> RuntimeOrFatalResult<SecondaryMemIndexCleanupStats> {
+) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
     match (cleanup_res, rollback_res) {
-        (Ok(stats), Ok(())) => Ok(stats),
+        (Ok(outcome), Ok(())) => Ok(outcome),
         (Err(err), Ok(())) => Err(RuntimeOrFatalError::from(err)),
         (_, Err(err)) => Err(err),
     }
@@ -671,13 +712,53 @@ mod tests {
         DataIntegrityError, LifecycleError, OperationError, RuntimeError, RuntimeOrFatalError,
     };
     use crate::id::{RowID, TrxID};
-    use crate::index::{IndexInsert, NonUniqueIndex, UniqueIndex};
-    use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
+    use crate::index::IndexMask;
+    use crate::session::Session;
+    use crate::session::tests::{
+        SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
+    };
+    use crate::table::CheckpointOutcome;
+    use crate::table::persistence::test_hooks::set_test_checkpoint_after_trx_start_hook;
     use crate::table::tests::*;
-    use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use error_stack::Report;
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
     use tempfile::TempDir;
+
+    type CleanupAfterTrxStartHook =
+        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+
+    thread_local! {
+        static TEST_CLEANUP_AFTER_TRX_START_HOOK:
+            RefCell<Option<CleanupAfterTrxStartHook>> = RefCell::new(None);
+    }
+
+    fn set_test_cleanup_after_trx_start_hook<F, Fut>(hook: F)
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        TEST_CLEANUP_AFTER_TRX_START_HOOK.with(|slot| {
+            let old = slot
+                .borrow_mut()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "MemIndex cleanup transaction-start hook already installed"
+            );
+        });
+    }
+
+    pub(super) async fn run_test_cleanup_after_trx_start_hook() {
+        let hook = TEST_CLEANUP_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
 
     #[test]
     fn test_secondary_mem_index_cleanup_rollback_error_overrides_cleanup_error() {
@@ -698,6 +779,163 @@ mod tests {
             Some(LifecycleError::Shutdown)
         );
         assert!(err.downcast_ref::<DataIntegrityError>().is_none());
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_retries_root_capture_race() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut cleanup_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut cleanup_session, 0, 1, "name").await;
+            assert_freeze_created(
+                cleanup_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            set_test_cleanup_after_trx_start_hook(move || async move {
+                assert_checkpoint_published(&mut checkpoint_session, table_id).await;
+            });
+
+            let outcome = cleanup_session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert!(!cleanup_session.in_trx().unwrap());
+            assert_eq!(outcome.live_delay, None);
+            assert_eq!(outcome.stats.indexes.len(), 1);
+            assert_eq!(outcome.stats.indexes[0].removed, 1);
+            assert_eq!(outcome.stats.indexes[0].skipped_live, 0);
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_retains_live_entries_for_old_root_views() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut insert = session.begin_trx().unwrap();
+            insert = expect_trx_insert(
+                table_id,
+                insert,
+                vec![Val::from(0i32), Val::from("old-root")],
+            )
+            .await;
+            let insert_cts = insert.commit().await.unwrap();
+            wait_for_checkpoint_purge(&session, insert_cts).await;
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let pool_guards = session.pool_guards();
+            let old_unique = bound_unique_index(&table, &pool_guards, 0);
+            let old_non_unique = bound_non_unique_index_no(&table, &pool_guards, 1);
+            let primary_key = single_key(0i32);
+            let non_unique_key = name_key("old-root");
+            let row_id = old_unique
+                .lookup(&primary_key.vals, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
+                Rc::new(RefCell::new(None));
+            let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
+            let hook_reader_holder = Rc::clone(&reader_holder);
+            let hook_reader_sts = Rc::clone(&reader_sts);
+            let hook_engine = engine.new_ref().unwrap();
+            set_test_checkpoint_after_trx_start_hook(move || async move {
+                let mut reader_session = hook_engine.new_session().unwrap();
+                let reader = reader_session.begin_trx().unwrap();
+                hook_reader_sts.set(reader.sts());
+                *hook_reader_holder.borrow_mut() = Some((reader_session, reader));
+            });
+
+            let checkpoint = session.checkpoint_table(table_id).await.unwrap();
+            let CheckpointOutcome::Published { checkpoint_ts, .. } = checkpoint else {
+                panic!("expected published checkpoint, got {checkpoint:?}");
+            };
+            let published_root = table.file().active_root_unchecked().clone();
+            let effective_ts = published_root.effective_ts();
+            assert!(checkpoint_ts < reader_sts.get());
+            assert!(reader_sts.get() < effective_ts);
+
+            let delayed = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            let delay = delayed
+                .live_delay
+                .expect("old root reader must delay live-entry cleanup");
+            assert_eq!(delay.table_id, table_id);
+            assert_eq!(delay.effective_ts, effective_ts);
+            assert!(delay.min_active_sts <= reader_sts.get());
+            assert_eq!(delayed.stats.indexes.len(), 2);
+            for index_stats in &delayed.stats.indexes {
+                assert_eq!(index_stats.scanned, 0);
+                assert_eq!(index_stats.removed, 0);
+                assert_eq!(index_stats.retained, 0);
+                assert_eq!(index_stats.skipped_live, 1);
+                assert_eq!(index_stats.skipped_hot_deleted, 0);
+            }
+
+            assert_eq!(
+                old_unique
+                    .lookup(&primary_key.vals, MAX_SNAPSHOT_TS)
+                    .await
+                    .unwrap(),
+                Some((row_id, false))
+            );
+            let mut old_root_rows = Vec::new();
+            old_non_unique
+                .lookup(&non_unique_key.vals, &mut old_root_rows, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
+            assert_eq!(old_root_rows, vec![row_id]);
+
+            let (_, reader) = reader_holder
+                .borrow_mut()
+                .take()
+                .expect("checkpoint hook must retain the old-root reader");
+            reader.commit().await.unwrap();
+            session
+                .wait_for_gc_horizon_after(effective_ts)
+                .await
+                .unwrap();
+
+            let completed = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(completed.live_delay, None);
+            assert_eq!(completed.stats.indexes[0].removed, 1);
+            assert_eq!(completed.stats.indexes[1].removed, 1);
+
+            let current_unique = bound_unique_index(&table, &pool_guards, 0);
+            assert_eq!(
+                current_unique
+                    .lookup(&primary_key.vals, MAX_SNAPSHOT_TS)
+                    .await
+                    .unwrap(),
+                Some((row_id, false))
+            );
+            let current_non_unique = bound_non_unique_index_no(&table, &pool_guards, 1);
+            let mut current_rows = Vec::new();
+            current_non_unique
+                .lookup(&non_unique_key.vals, &mut current_rows, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
+            assert_eq!(current_rows, vec![row_id]);
+        });
     }
 
     #[test]
@@ -722,7 +960,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert!(!session.in_trx().unwrap());
             assert_eq!(stats.indexes.len(), 1);
             assert_eq!(stats.indexes[0].index_no, 0);
@@ -810,7 +1049,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes.len(), 2);
             assert_eq!(stats.indexes[1].index_no, 1);
             assert!(!stats.indexes[1].unique);
@@ -855,7 +1095,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[1].scanned, row_count as usize);
             assert_eq!(stats.indexes[1].removed, row_count as usize);
             assert_eq!(stats.indexes[1].retained, 0);
@@ -889,10 +1130,12 @@ mod tests {
                 &pool_guards,
                 1,
             );
-            let stats = session
+            let outcome = session
                 .cleanup_secondary_mem_indexes(table_id, false)
                 .await
                 .unwrap();
+            assert_eq!(outcome.live_delay, None);
+            let stats = outcome.stats;
             assert_eq!(stats.indexes.len(), 2);
             for index_stats in &stats.indexes {
                 assert_eq!(index_stats.scanned, 0);
@@ -960,14 +1203,14 @@ mod tests {
                 .0;
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -975,7 +1218,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[0].scanned, 0);
             assert_eq!(stats.indexes[0].removed, 0);
             assert_eq!(stats.indexes[0].retained, 0);
@@ -1008,6 +1252,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 1, "name").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
             assert_checkpoint_published(&mut session, table_id).await;
 
             let current_key = single_key(0i32);
@@ -1027,14 +1273,14 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1043,14 +1289,20 @@ mod tests {
                 .put_committed(row_id, TrxID::new(1))
                 .unwrap();
 
-            let stats = session
+            let outcome = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
                 .unwrap();
-            assert_eq!(stats.indexes[0].scanned, 2);
-            assert_eq!(stats.indexes[0].removed, 2);
+            let delay = outcome
+                .live_delay
+                .expect("old reader must delay live-entry cleanup");
+            assert_eq!(delay.table_id, table_id);
+            assert!(delay.effective_ts >= delay.min_active_sts);
+            let stats = outcome.stats;
+            assert_eq!(stats.indexes[0].scanned, 1);
+            assert_eq!(stats.indexes[0].removed, 1);
             assert_eq!(stats.indexes[0].retained, 0);
-            assert_eq!(stats.indexes[0].skipped_live, 0);
+            assert_eq!(stats.indexes[0].skipped_live, 1);
             assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
@@ -1059,6 +1311,7 @@ mod tests {
                     .unwrap(),
                 None
             );
+            reader.commit().await.unwrap();
         });
     }
 
@@ -1091,14 +1344,14 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1107,10 +1360,12 @@ mod tests {
                 .put_committed(row_id, TrxID::new(1))
                 .unwrap();
 
-            let stats = session
+            let outcome = session
                 .cleanup_secondary_mem_indexes(table_id, false)
                 .await
                 .unwrap();
+            assert_eq!(outcome.live_delay, None);
+            let stats = outcome.stats;
             assert_eq!(stats.indexes[0].scanned, 1);
             assert_eq!(stats.indexes[0].removed, 1);
             assert_eq!(stats.indexes[0].retained, 0);
@@ -1159,9 +1414,13 @@ mod tests {
                 &pool_guards,
                 0,
             );
+            let _ = index
+                .inject_mem_entry_if_absent(&current_key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1169,7 +1428,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[0].scanned, 1);
             assert_eq!(stats.indexes[0].removed, 0);
             assert_eq!(stats.indexes[0].retained, 1);
@@ -1190,7 +1450,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[0].scanned, 1);
             assert_eq!(stats.indexes[0].removed, 1);
             assert_eq!(stats.indexes[0].retained, 0);
@@ -1248,14 +1509,14 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1277,7 +1538,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[0].scanned, 2);
             assert_eq!(stats.indexes[0].removed, 2);
             assert_eq!(stats.indexes[0].retained, 0);
@@ -1336,14 +1598,14 @@ mod tests {
             let index = bound_unique_index(&table, &pool_guards, 0);
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1405,22 +1667,24 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
-            assert!(
+            assert_eq!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                IndexMask::Masked
             );
 
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[1].scanned, 0);
             assert_eq!(stats.indexes[1].removed, 0);
             assert_eq!(stats.indexes[1].retained, 0);
@@ -1466,16 +1730,17 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
-            assert!(
+            assert_eq!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                IndexMask::Masked
             );
             table_for_internal_assertion(&engine, table_id)
                 .deletion_buffer()
@@ -1485,7 +1750,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[1].scanned, 2);
             assert_eq!(stats.indexes[1].removed, 2);
             assert_eq!(stats.indexes[1].retained, 0);
@@ -1529,17 +1795,23 @@ mod tests {
                 &pool_guards,
                 current_key.index_no,
             );
-            assert!(
+            let _ = index
+                .inject_mem_entry_if_absent(&current_key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
+            assert_eq!(
                 index
-                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                IndexMask::Masked
             );
 
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[1].scanned, 1);
             assert_eq!(stats.indexes[1].removed, 0);
             assert_eq!(stats.indexes[1].retained, 1);
@@ -1560,7 +1832,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[1].scanned, 1);
             assert_eq!(stats.indexes[1].removed, 1);
             assert_eq!(stats.indexes[1].retained, 0);
@@ -1629,16 +1902,17 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
                     .is_ok()
             );
-            assert!(
+            assert_eq!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                IndexMask::Masked
             );
             assert_eq!(
                 index
@@ -1658,7 +1932,8 @@ mod tests {
             let stats = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert_eq!(stats.indexes[1].scanned, 2);
             assert_eq!(stats.indexes[1].removed, 2);
             assert_eq!(stats.indexes[1].retained, 0);
@@ -1710,9 +1985,13 @@ mod tests {
                 &pool_guards,
                 key.index_no,
             );
+            let _ = index
+                .inject_mem_entry_if_absent(&key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(&key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1736,14 +2015,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(deleted);
-            // A reinsertion attempt must not merge a stale MemIndex delete overlay;
-            // after purge it falls through to the immutable cold root instead.
             assert_eq!(
-                index
-                    .insert_if_not_exists(&key.vals, row_id, true, TrxID::new(11),)
-                    .await
-                    .unwrap(),
-                IndexInsert::DuplicateKey(row_id, false)
+                index.lookup(&key.vals, MAX_SNAPSHOT_TS).await.unwrap(),
+                Some((row_id, false))
             );
         });
     }
@@ -1779,12 +2053,12 @@ mod tests {
                 current_key.index_no,
             );
             let _ = index
-                .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1810,9 +2084,13 @@ mod tests {
                     .is_none()
             );
 
+            let _ = index
+                .inject_mem_entry_if_absent(&current_key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -1879,14 +2157,15 @@ mod tests {
                 current_key.index_no,
             );
             let _ = index
-                .insert_if_not_exists(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                .inject_mem_entry_if_absent(&stale_key.vals, row_id, false, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
-            assert!(
+            assert_eq!(
                 index
-                    .mask_as_deleted(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                IndexMask::Masked
             );
             let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
             let deleted = table_for_internal_assertion(&engine, table_id)
@@ -1910,11 +2189,16 @@ mod tests {
                     .is_none()
             );
 
-            assert!(
+            let _ = index
+                .inject_mem_entry_if_absent(&current_key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap();
+            assert_eq!(
                 index
-                    .mask_as_deleted(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&current_key.vals, row_id, MAX_SNAPSHOT_TS,)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                IndexMask::Masked
             );
             table_for_internal_assertion(&engine, table_id)
                 .deletion_buffer()
@@ -1961,12 +2245,12 @@ mod tests {
                 key.index_no,
             );
             let _ = index
-                .insert_if_not_exists(&key.vals, RowID::new(row_id), false, MAX_SNAPSHOT_TS)
+                .inject_mem_entry_if_absent(&key.vals, RowID::new(row_id), false, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap();
             assert!(
                 index
-                    .mask_as_deleted(&key.vals, RowID::new(row_id), MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&key.vals, RowID::new(row_id), MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );

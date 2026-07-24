@@ -3,8 +3,8 @@ use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard,
 use crate::catalog::CatalogTable;
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
+use crate::index::IndexCompareExchange;
 use crate::index::util::Maskable;
-use crate::index::{IndexCompareExchange, NonUniqueIndex, UniqueIndex};
 use crate::row::ops::SelectKey;
 use crate::trx::undo::{IndexUndo, IndexUndoKind};
 
@@ -442,7 +442,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::error::{DiscloseError, OperationError, Result};
     use crate::id::RowID;
-    use crate::index::{RowLocation, UniqueIndex};
+    use crate::index::RowLocation;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::CheckpointOutcome;
@@ -588,7 +588,7 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(
+                    .inject_mem_entry_if_absent(
                         &key.vals,
                         RowID::new(stale_row_id),
                         false,
@@ -600,7 +600,7 @@ mod tests {
             );
             assert!(
                 index
-                    .mask_as_deleted(&key.vals, RowID::new(stale_row_id), MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&key.vals, RowID::new(stale_row_id), MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );
@@ -715,14 +715,19 @@ mod tests {
             );
             assert!(
                 index
-                    .insert_if_not_exists(&stale_key.vals, old_row_id, false, MAX_SNAPSHOT_TS,)
+                    .inject_mem_entry_if_absent(
+                        &stale_key.vals,
+                        old_row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 index
-                    .mask_as_deleted(&stale_key.vals, old_row_id, MAX_SNAPSHOT_TS,)
+                    .inject_mem_delete_mask(&stale_key.vals, old_row_id, MAX_SNAPSHOT_TS,)
                     .await
                     .unwrap()
             );

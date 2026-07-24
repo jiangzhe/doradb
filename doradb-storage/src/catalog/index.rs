@@ -16,8 +16,8 @@ use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::disk_tree::{NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut};
 use crate::index::{
-    ColumnBlockIndex, IndexInsert, NonUniqueIndex, NonUniqueMemIndex, SecondaryDiskTreeRuntime,
-    SecondaryIndex, UniqueIndex, UniqueMemIndex,
+    ColumnBlockIndex, IndexInsert, NonUniqueMemIndex, SecondaryDiskTreeRuntime, SecondaryIndex,
+    UniqueMemIndex,
 };
 use crate::log::redo::DDLRedo;
 use crate::obs;
@@ -1611,6 +1611,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
+    use crate::index::IndexBatchStream;
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::session::Session;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
@@ -2468,13 +2469,16 @@ mod tests {
         index_no: usize,
         key: &[Val],
     ) -> Vec<RowID> {
-        let index = layout
-            .secondary_index(index_no)
-            .unwrap()
-            .bind_non_unique(guards, root)
+        let index = layout.secondary_index(index_no).unwrap();
+        let range = index.key_encoder().encode_non_unique_equal_range(key);
+        let bound = index.bind_non_unique(guards, root).unwrap();
+        let mut stream = bound
+            .equal_scan_candidates(&range, MAX_SNAPSHOT_TS)
             .unwrap();
         let mut rows = Vec::new();
-        index.lookup(key, &mut rows, MAX_SNAPSHOT_TS).await.unwrap();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
         rows
     }
 
@@ -2485,18 +2489,18 @@ mod tests {
     ) -> Vec<RowID> {
         let root = active_secondary_root(table, key.index_no);
         let layout = table.layout_snapshot();
-        let tree = layout
-            .secondary_index(key.index_no)
-            .unwrap()
+        let index = layout.secondary_index(key.index_no).unwrap();
+        let range = index.key_encoder().encode_non_unique_equal_range(&key.vals);
+        let tree = index
             .disk_runtime()
             .open_non_unique_at(root, guards.disk_guard())
             .unwrap();
-        tree.prefix_scan_entries(&key.vals)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(_, row_id)| row_id)
-            .collect()
+        let mut stream = tree.scan_candidate_stream(&range);
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
+        rows
     }
 
     fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {

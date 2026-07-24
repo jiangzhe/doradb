@@ -18,11 +18,12 @@ pub use checkpoint_workflow::{FreezeOutcome, FrozenPageBatchInfo};
 use checkpoint_workflow::{FrozenPage, FrozenPageBatch, TableCheckpointWorkflow};
 pub(crate) use deletion_buffer::*;
 pub(crate) use dml_validator::*;
-pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
+pub use gc::{
+    MemIndexCleanupDelay, MemIndexCleanupOutcome, MemIndexCleanupStats,
+    SecondaryMemIndexCleanupIndexStats,
+};
 pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
-#[cfg(test)]
-pub(crate) use lifecycle::CheckpointPublishLease;
 #[cfg(test)]
 pub(crate) use lifecycle::TableTerminal;
 pub(crate) use lifecycle::{
@@ -1152,6 +1153,7 @@ fn missing_secondary_index(index_no: usize, index_count: usize) -> Report<Intern
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::lifecycle::CheckpointPublishLease;
     use crate::buffer::page::PAGE_SIZE;
     use crate::buffer::{PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
     use crate::catalog::tests::table2;
@@ -1172,8 +1174,7 @@ pub(crate) mod tests {
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex,
-        IndexBatchStream, IndexCompareExchange, IndexInsert, IndexLookupCandidate, KeyRange,
-        NonUniqueIndex, RowLocation, UniqueIndex,
+        IndexBatchStream, IndexInsert, IndexMask, RowLocation,
     };
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
@@ -1184,8 +1185,8 @@ pub(crate) mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::{
-        CheckpointPublishLease, DeleteMarker, DmlValidationError, FreezeOutcome,
-        FrozenPageBatchInfo, Table, TableCheckpointRootMutationLease, TableRuntimeLayout,
+        DeleteMarker, DmlValidationError, FreezeOutcome, FrozenPageBatchInfo, Table,
+        TableCheckpointRootMutationLease, TableRuntimeLayout,
     };
     use crate::trx::Transaction;
     use crate::trx::stmt::Statement;
@@ -2302,62 +2303,6 @@ pub(crate) mod tests {
         table.file().active_root_unchecked().secondary_index_roots[index_no]
     }
 
-    pub(crate) struct BoundUniqueIndexCandidateStream<'a> {
-        layout: Arc<TableRuntimeLayout>,
-        guards: &'a PoolGuards,
-        index_no: usize,
-        root: BlockID,
-        range: &'a KeyRange,
-        ts: TrxID,
-        done: bool,
-    }
-
-    impl IndexBatchStream<IndexLookupCandidate> for BoundUniqueIndexCandidateStream<'_> {
-        #[inline]
-        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
-            if self.done {
-                return Ok(None);
-            }
-            self.done = true;
-            let index = self.layout.secondary_index(self.index_no)?;
-            let bound = index.bind_unique(self.guards, self.root)?;
-            let mut stream = bound.index_scan_candidates(self.range, self.ts)?;
-            let mut candidates = Vec::new();
-            while let Some(batch) = stream.next_batch().await? {
-                candidates.extend(batch);
-            }
-            Ok((!candidates.is_empty()).then_some(candidates))
-        }
-    }
-
-    pub(crate) struct BoundNonUniqueIndexCandidateStream<'a> {
-        layout: Arc<TableRuntimeLayout>,
-        guards: &'a PoolGuards,
-        index_no: usize,
-        root: BlockID,
-        range: &'a KeyRange,
-        ts: TrxID,
-        done: bool,
-    }
-
-    impl IndexBatchStream<IndexLookupCandidate> for BoundNonUniqueIndexCandidateStream<'_> {
-        #[inline]
-        async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {
-            if self.done {
-                return Ok(None);
-            }
-            self.done = true;
-            let index = self.layout.secondary_index(self.index_no)?;
-            let bound = index.bind_non_unique(self.guards, self.root)?;
-            let mut stream = bound.index_scan_candidates(self.range, self.ts)?;
-            let mut candidates = Vec::new();
-            while let Some(batch) = stream.next_batch().await? {
-                candidates.extend(batch);
-            }
-            Ok((!candidates.is_empty()).then_some(candidates))
-        }
-    }
-
     pub(crate) struct BoundUniqueIndex<'a> {
         layout: Arc<TableRuntimeLayout>,
         guards: &'a PoolGuards,
@@ -2365,14 +2310,13 @@ pub(crate) mod tests {
         root: BlockID,
     }
 
-    impl UniqueIndex for BoundUniqueIndex<'_> {
-        type LookupCandidateStream<'a>
-            = BoundUniqueIndexCandidateStream<'a>
-        where
-            Self: 'a;
-
+    impl BoundUniqueIndex<'_> {
         #[inline]
-        async fn lookup(&self, key: &[Val], ts: TrxID) -> RuntimeResult<Option<(RowID, bool)>> {
+        pub(crate) async fn lookup(
+            &self,
+            key: &[Val],
+            ts: TrxID,
+        ) -> RuntimeResult<Option<(RowID, bool)>> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_unique(self.guards, self.root)?
@@ -2380,8 +2324,10 @@ pub(crate) mod tests {
                 .await
         }
 
+        /// Inject an active MemIndex entry for a state that normal table
+        /// operations cannot construct.
         #[inline]
-        async fn insert_if_not_exists(
+        pub(crate) async fn inject_mem_entry_if_absent(
             &self,
             key: &[Val],
             row_id: RowID,
@@ -2390,64 +2336,26 @@ pub(crate) mod tests {
         ) -> RuntimeResult<IndexInsert> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.guards, self.root)?
+                .unique_mem()?
+                .bind(self.guards.index_guard())
                 .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
                 .await
         }
 
+        /// Inject a delete mark into an existing MemIndex entry for stale-state
+        /// cleanup and rollback tests.
         #[inline]
-        async fn compare_delete(
+        pub(crate) async fn inject_mem_delete_mask(
             &self,
             key: &[Val],
-            old_row_id: RowID,
-            ignore_del_mask: bool,
+            row_id: RowID,
             ts: TrxID,
         ) -> RuntimeResult<bool> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.guards, self.root)?
-                .compare_delete(key, old_row_id, ignore_del_mask, ts)
-                .await
-        }
-
-        #[inline]
-        async fn compare_exchange(
-            &self,
-            key: &[Val],
-            old_row_id: RowID,
-            new_row_id: RowID,
-            ts: TrxID,
-        ) -> RuntimeResult<IndexCompareExchange> {
-            let index = self.layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .compare_exchange(key, old_row_id, new_row_id, ts)
-                .await
-        }
-
-        #[inline]
-        fn index_scan_candidates<'a>(
-            &'a self,
-            range: &'a KeyRange,
-            ts: TrxID,
-        ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
-            Ok(BoundUniqueIndexCandidateStream {
-                layout: Arc::clone(&self.layout),
-                guards: self.guards,
-                index_no: self.index_no,
-                root: self.root,
-                range,
-                ts,
-                done: false,
-            })
-        }
-
-        #[inline]
-        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> RuntimeResult<()> {
-            let index = self.layout.secondary_index(self.index_no)?;
-            index
-                .bind_unique(self.guards, self.root)?
-                .scan_values(values, ts)
+                .unique_mem()?
+                .bind(self.guards.index_guard())
+                .mask_as_deleted(key, row_id, ts)
                 .await
         }
     }
@@ -2459,23 +2367,26 @@ pub(crate) mod tests {
         root: BlockID,
     }
 
-    impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
-        type LookupCandidateStream<'a>
-            = BoundNonUniqueIndexCandidateStream<'a>
-        where
-            Self: 'a;
-
+    impl BoundNonUniqueIndexNo<'_> {
         #[inline]
-        async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, ts: TrxID) -> RuntimeResult<()> {
+        pub(crate) async fn lookup(
+            &self,
+            key: &[Val],
+            res: &mut Vec<RowID>,
+            ts: TrxID,
+        ) -> RuntimeResult<()> {
             let index = self.layout.secondary_index(self.index_no)?;
-            index
-                .bind_non_unique(self.guards, self.root)?
-                .lookup(key, res, ts)
-                .await
+            let range = index.key_encoder().encode_non_unique_equal_range(key);
+            let bound = index.bind_non_unique(self.guards, self.root)?;
+            let mut stream = bound.equal_scan_candidates(&range, ts)?;
+            while let Some(batch) = stream.next_batch().await? {
+                res.extend(batch.into_iter().map(|candidate| candidate.row_id));
+            }
+            Ok(())
         }
 
         #[inline]
-        async fn lookup_unique(
+        pub(crate) async fn lookup_unique(
             &self,
             key: &[Val],
             row_id: RowID,
@@ -2488,8 +2399,10 @@ pub(crate) mod tests {
                 .await
         }
 
+        /// Inject an active MemIndex exact entry for a state that normal table
+        /// operations cannot construct.
         #[inline]
-        async fn insert_if_not_exists(
+        pub(crate) async fn inject_mem_entry_if_absent(
             &self,
             key: &[Val],
             row_id: RowID,
@@ -2499,93 +2412,23 @@ pub(crate) mod tests {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
-                .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
+                .insert_mem_if_not_exists(key, row_id, merge_if_match_deleted, ts)
                 .await
         }
 
+        /// Inject a delete mark into an existing MemIndex exact entry for
+        /// stale-state cleanup tests.
         #[inline]
-        async fn mask_as_deleted(
+        pub(crate) async fn inject_mem_delete_mask(
             &self,
             key: &[Val],
             row_id: RowID,
             ts: TrxID,
-        ) -> RuntimeResult<bool> {
+        ) -> RuntimeResult<IndexMask> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
                 .bind_non_unique(self.guards, self.root)?
-                .mask_as_deleted(key, row_id, ts)
-                .await
-        }
-
-        #[inline]
-        async fn mask_as_active(
-            &self,
-            key: &[Val],
-            row_id: RowID,
-            ts: TrxID,
-        ) -> RuntimeResult<bool> {
-            let index = self.layout.secondary_index(self.index_no)?;
-            index
-                .bind_non_unique(self.guards, self.root)?
-                .mask_as_active(key, row_id, ts)
-                .await
-        }
-
-        #[inline]
-        async fn compare_delete(
-            &self,
-            key: &[Val],
-            row_id: RowID,
-            ignore_del_mask: bool,
-            ts: TrxID,
-        ) -> RuntimeResult<bool> {
-            let index = self.layout.secondary_index(self.index_no)?;
-            index
-                .bind_non_unique(self.guards, self.root)?
-                .compare_delete(key, row_id, ignore_del_mask, ts)
-                .await
-        }
-
-        #[inline]
-        fn index_scan_candidates<'a>(
-            &'a self,
-            range: &'a KeyRange,
-            ts: TrxID,
-        ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
-            Ok(BoundNonUniqueIndexCandidateStream {
-                layout: Arc::clone(&self.layout),
-                guards: self.guards,
-                index_no: self.index_no,
-                root: self.root,
-                range,
-                ts,
-                done: false,
-            })
-        }
-
-        #[inline]
-        fn equal_scan_candidates<'a>(
-            &'a self,
-            range: &'a KeyRange,
-            ts: TrxID,
-        ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
-            Ok(BoundNonUniqueIndexCandidateStream {
-                layout: Arc::clone(&self.layout),
-                guards: self.guards,
-                index_no: self.index_no,
-                root: self.root,
-                range,
-                ts,
-                done: false,
-            })
-        }
-
-        #[inline]
-        async fn scan_values(&self, values: &mut Vec<RowID>, ts: TrxID) -> RuntimeResult<()> {
-            let index = self.layout.secondary_index(self.index_no)?;
-            index
-                .bind_non_unique(self.guards, self.root)?
-                .scan_values(values, ts)
+                .mask_mem_if_present(key, row_id, ts)
                 .await
         }
     }
@@ -2662,18 +2505,18 @@ pub(crate) mod tests {
     ) -> Vec<RowID> {
         let root = active_secondary_root(table, key.index_no);
         let layout = table.layout_snapshot();
-        let tree = layout
-            .secondary_index(key.index_no)
-            .unwrap()
+        let index = layout.secondary_index(key.index_no).unwrap();
+        let range = index.key_encoder().encode_non_unique_equal_range(&key.vals);
+        let tree = index
             .disk_runtime()
             .open_non_unique_at(root, guards.disk_guard())
             .unwrap();
-        tree.prefix_scan_entries(&key.vals)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(_, row_id)| row_id)
-            .collect()
+        let mut stream = tree.scan_candidate_stream(&range);
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await.unwrap() {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
+        rows
     }
 
     pub(crate) async fn assert_unique_index_entry(

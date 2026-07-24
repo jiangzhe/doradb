@@ -12,9 +12,8 @@ use super::index_stream::{
     NonUniqueDiskTreeCandidateStream, NonUniqueMemIndexCandidateStream,
     UniqueDiskTreeCandidateStream, UniqueMemIndexCandidateStream,
 };
-use super::mem_index::MemIndexEntry;
-use super::non_unique_index::{GuardedNonUniqueMemIndex, NonUniqueIndex, NonUniqueMemIndex};
-use super::unique_index::{GuardedUniqueMemIndex, UniqueIndex, UniqueMemIndex};
+use super::non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemIndex};
+use super::unique_index::{GuardedUniqueMemIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{InternalError, RuntimeError, RuntimeResult, SecondaryIndexBinding};
@@ -438,13 +437,21 @@ impl<P: BufferPool> SecondaryIndex<P> {
 }
 
 /// Root-bound unique secondary index view over one MemIndex plus DiskTree root.
-#[derive(Clone, Copy)]
 pub(crate) struct UniqueSecondaryIndex<'a, 'g, P: 'static> {
     mem: GuardedUniqueMemIndex<'a, 'g, P>,
     disk: &'a SecondaryDiskTreeRuntime,
     root: BlockID,
     disk_pool_guard: &'g PoolGuard,
 }
+
+impl<P: 'static> Clone for UniqueSecondaryIndex<'_, '_, P> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: 'static> Copy for UniqueSecondaryIndex<'_, '_, P> {}
 
 impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
     #[inline]
@@ -467,19 +474,117 @@ impl<'a, 'g, P: BufferPool> UniqueSecondaryIndex<'a, 'g, P> {
     fn open(&self) -> RuntimeResult<UniqueDiskTree<'_>> {
         self.disk.open_unique_at(self.root, self.disk_pool_guard)
     }
+
+    /// Atomically update only MemIndex, without lookup or DiskTree fallback.
+    #[inline]
+    pub(crate) async fn compare_exchange_mem(
+        &self,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexCompareExchange> {
+        self.mem
+            .compare_exchange(key, old_row_id, new_row_id, ts)
+            .await
+    }
+
+    /// Replace an exact MemIndex owner or insert on true MemIndex absence.
+    #[inline]
+    pub(crate) async fn replace_or_insert_mem(
+        &self,
+        key: &[Val],
+        expected_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexCompareExchange> {
+        self.mem
+            .replace_or_insert(key, expected_row_id, new_row_id, ts)
+            .await
+    }
+
+    /// Attempt insertion while retaining the exact selected owner on conflict.
+    ///
+    /// MemIndex is checked first because it may shadow the captured DiskTree
+    /// owner. If both layers are absent, the final MemIndex insertion closes the
+    /// race with a concurrent claim. Every occupied result records the layer and
+    /// exact owner representation that must still match when the caller later
+    /// consumes the observation.
+    #[inline]
+    pub(crate) async fn insert_if_not_exists_observed<'k>(
+        &self,
+        key: &'k [Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> RuntimeResult<UniqueInsertAttempt<'a, 'g, 'k, P>> {
+        debug_assert!(!row_id.is_deleted());
+        if let Some((owner_row_id, deleted)) = self.mem.lookup(key, ts).await? {
+            if merge_if_match_deleted && deleted && owner_row_id == row_id {
+                return Ok(
+                    match self.mem.insert_if_not_exists(key, row_id, true, ts).await? {
+                        IndexInsert::Ok(merged) => UniqueInsertAttempt::Inserted { merged },
+                        IndexInsert::DuplicateKey(owner_row_id, deleted) => {
+                            UniqueInsertAttempt::Occupied(UniqueOwnerObservation {
+                                index: *self,
+                                key,
+                                owner_row_id,
+                                deleted,
+                                source: UniqueOwnerSource::Mem,
+                            })
+                        }
+                    },
+                );
+            }
+            return Ok(UniqueInsertAttempt::Occupied(UniqueOwnerObservation {
+                index: *self,
+                key,
+                owner_row_id,
+                deleted,
+                source: UniqueOwnerSource::Mem,
+            }));
+        }
+
+        let disk = self.open()?;
+        if let Some(owner_row_id) = disk.lookup(key).await? {
+            return Ok(UniqueInsertAttempt::Occupied(UniqueOwnerObservation {
+                index: *self,
+                key,
+                owner_row_id,
+                deleted: false,
+                source: UniqueOwnerSource::Disk,
+            }));
+        }
+
+        Ok(
+            match self
+                .mem
+                .insert_if_not_exists(key, row_id, false, ts)
+                .await?
+            {
+                IndexInsert::Ok(merged) => UniqueInsertAttempt::Inserted { merged },
+                IndexInsert::DuplicateKey(owner_row_id, deleted) => {
+                    UniqueInsertAttempt::Occupied(UniqueOwnerObservation {
+                        index: *self,
+                        key,
+                        owner_row_id,
+                        deleted,
+                        source: UniqueOwnerSource::Mem,
+                    })
+                }
+            },
+        )
+    }
 }
 
-impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
-    type LookupCandidateStream<'a>
-        = SecondaryIndexCandidateStream<
-        UniqueMemIndexCandidateStream<'a, P>,
-        UniqueDiskTreeCandidateStream<'a, 'a>,
-    >
-    where
-        Self: 'a;
-
+impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
+    /// Lookup one unique owner across MemIndex and the captured DiskTree root.
     #[inline]
-    async fn lookup(&self, key: &[Val], ts: TrxID) -> RuntimeResult<Option<(RowID, bool)>> {
+    pub(crate) async fn lookup(
+        &self,
+        key: &[Val],
+        ts: TrxID,
+    ) -> RuntimeResult<Option<(RowID, bool)>> {
         if let Some(hit) = self.mem.lookup(key, ts).await? {
             return Ok(Some(hit));
         }
@@ -487,30 +592,9 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
         Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
     }
 
+    /// Physically delete only a matching MemIndex owner.
     #[inline]
-    async fn insert_if_not_exists(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
-        debug_assert!(!row_id.is_deleted());
-        if let Some((old_row_id, deleted)) = self.mem.lookup(key, ts).await? {
-            if merge_if_match_deleted && deleted && old_row_id == row_id {
-                return self.mem.insert_if_not_exists(key, row_id, true, ts).await;
-            }
-            return Ok(IndexInsert::DuplicateKey(old_row_id, deleted));
-        }
-        let disk = self.open()?;
-        if let Some(cold_row_id) = disk.lookup(key).await? {
-            return Ok(IndexInsert::DuplicateKey(cold_row_id, false));
-        }
-        self.mem.insert_if_not_exists(key, row_id, false, ts).await
-    }
-
-    #[inline]
-    async fn compare_delete(
+    pub(crate) async fn compare_delete_mem(
         &self,
         key: &[Val],
         old_row_id: RowID,
@@ -523,60 +607,116 @@ impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, '_, P> {
             .await
     }
 
+    /// Scan lookup candidates across MemIndex and the captured DiskTree root.
     #[inline]
-    async fn compare_exchange(
-        &self,
-        key: &[Val],
-        old_row_id: RowID,
-        new_row_id: RowID,
-        ts: TrxID,
-    ) -> RuntimeResult<IndexCompareExchange> {
-        if self.mem.lookup(key, ts).await?.is_some() {
-            return self
-                .mem
-                .compare_exchange(key, old_row_id, new_row_id, ts)
-                .await;
-        }
-        if old_row_id.is_deleted() {
-            return Ok(IndexCompareExchange::NotExists);
-        }
-        let disk = self.open()?;
-        match disk.lookup(key).await? {
-            Some(cold_row_id) if cold_row_id == old_row_id => {
-                if self
-                    .mem
-                    .insert_overlay_if_absent(key, new_row_id, ts)
-                    .await?
-                {
-                    Ok(IndexCompareExchange::Ok)
-                } else {
-                    Ok(IndexCompareExchange::Mismatch)
-                }
-            }
-            Some(_) => Ok(IndexCompareExchange::Mismatch),
-            None => Ok(IndexCompareExchange::NotExists),
-        }
-    }
-
-    #[inline]
-    fn index_scan_candidates<'a>(
+    pub(crate) fn index_scan_candidates<'a>(
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<
+        SecondaryIndexCandidateStream<
+            UniqueMemIndexCandidateStream<'a, P>,
+            UniqueDiskTreeCandidateStream<'a, 'a>,
+        >,
+    > {
         let mem = self.mem.index_scan_candidates(range, ts)?;
         let disk = self.open()?.scan_candidate_stream(range);
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
+}
 
+/// Layer that supplied one exact unique-owner observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum UniqueOwnerSource {
+    /// Mutable owner selected from MemIndex, possibly in deleted form.
+    Mem,
+    /// Active owner selected from the immutable captured DiskTree root.
+    Disk,
+}
+
+/// Exact owner selected while attempting to claim one unique logical key.
+///
+/// This is root-and-key-bound selection evidence, not permission to replace the
+/// owner. The caller must still validate row visibility, the current key,
+/// deletion state, and any required unique-version link. The private fields
+/// bind that validation to the exact composite index, borrowed key, owner, and
+/// source that were observed.
+///
+/// The token is deliberately non-`Clone` and consumed by [`Self::replace`].
+/// A Mem-sourced token expects the same active or delete-marked MemIndex value.
+/// A Disk-sourced token expects an immutable active owner and remembers that an
+/// equivalent MemIndex entry was absent when the DiskTree was consulted.
+pub(crate) struct UniqueOwnerObservation<'a, 'g, 'k, P: 'static> {
+    index: UniqueSecondaryIndex<'a, 'g, P>,
+    key: &'k [Val],
+    owner_row_id: RowID,
+    deleted: bool,
+    source: UniqueOwnerSource,
+}
+
+impl<'a, 'g, 'k, P: BufferPool> UniqueOwnerObservation<'a, 'g, 'k, P> {
+    /// Return the logical owner RowID without its MemIndex delete encoding.
     #[inline]
-    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
-        let mem_entries = self.mem.scan_encoded_entries().await?;
-        let disk = self.open()?;
-        let disk_entries = disk.scan_entries().await?;
-        merge_unique_entries(&mem_entries, &disk_entries, values);
-        Ok(())
+    pub(crate) fn owner_row_id(&self) -> RowID {
+        self.owner_row_id
     }
+
+    /// Return whether the observed MemIndex owner was delete-marked.
+    ///
+    /// DiskTree observations are always active, so this is always `false` for
+    /// [`UniqueOwnerSource::Disk`].
+    #[inline]
+    pub(crate) fn deleted(&self) -> bool {
+        self.deleted
+    }
+
+    /// Consume this exact observation to claim the key for `new_row_id`.
+    ///
+    /// Mem observations compare-exchange the representation that was actually
+    /// selected. DiskTree is immutable, so a Disk observation instead performs
+    /// one atomic MemIndex replace-or-insert traversal: it replaces a matching
+    /// copy installed after observation, inserts when MemIndex is still absent,
+    /// and reports a mismatch if another owner won the race.
+    #[inline]
+    pub(crate) async fn replace(
+        self,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexCompareExchange> {
+        debug_assert!(!new_row_id.is_deleted());
+        let expected_row_id = if self.deleted {
+            self.owner_row_id.deleted()
+        } else {
+            self.owner_row_id
+        };
+        match self.source {
+            UniqueOwnerSource::Mem => {
+                // The observed MemIndex entry itself remains the mutation
+                // target, including its delete bit.
+                self.index
+                    .compare_exchange_mem(self.key, expected_row_id, new_row_id, ts)
+                    .await
+            }
+            UniqueOwnerSource::Disk => {
+                debug_assert!(!self.deleted);
+                // The immutable DiskTree owner cannot be updated. Install the
+                // latest owner in MemIndex while accepting an equivalent Mem
+                // copy that may have appeared since the observation.
+                self.index
+                    .replace_or_insert_mem(self.key, expected_row_id, new_row_id, ts)
+                    .await
+            }
+        }
+    }
+}
+
+/// Result of an observation-preserving unique-key insertion attempt.
+pub(crate) enum UniqueInsertAttempt<'a, 'g, 'k, P: 'static> {
+    /// The new owner was inserted. `merged` preserves insert-undo semantics.
+    Inserted { merged: bool },
+    /// Another owner was selected from MemIndex or the captured DiskTree.
+    Occupied(UniqueOwnerObservation<'a, 'g, 'k, P>),
 }
 
 /// Root-bound non-unique secondary index view over one MemIndex plus DiskTree root.
@@ -610,28 +750,37 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
         self.disk
             .open_non_unique_at(self.root, self.disk_pool_guard)
     }
-}
 
-impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
-    type LookupCandidateStream<'a>
-        = SecondaryIndexCandidateStream<
-        NonUniqueMemIndexCandidateStream<'a, P>,
-        NonUniqueDiskTreeCandidateStream<'a, 'a>,
-    >
-    where
-        Self: 'a;
-
+    /// Atomically mask one exact MemIndex entry without lookup or DiskTree.
     #[inline]
-    async fn lookup(&self, key: &[Val], res: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
-        let mem_entries = self.mem.lookup_encoded_entries(key).await?;
-        let disk = self.open()?;
-        let disk_entries = disk.prefix_scan_entries(key).await?;
-        merge_non_unique_entries(&mem_entries, &disk_entries, res);
-        Ok(())
+    pub(crate) async fn mask_mem_if_present(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexMask> {
+        self.mem.mask_if_present(key, row_id, ts).await
     }
 
+    /// Insert one exact entry into MemIndex without consulting DiskTree.
     #[inline]
-    async fn lookup_unique(
+    pub(crate) async fn insert_mem_if_not_exists(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexInsert> {
+        self.mem
+            .insert_if_not_exists(key, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+}
+
+impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
+    /// Lookup one exact entry across MemIndex and the captured DiskTree root.
+    #[inline]
+    pub(crate) async fn lookup_unique(
         &self,
         key: &[Val],
         row_id: RowID,
@@ -648,54 +797,9 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
         }
     }
 
+    /// Physically delete only a matching MemIndex exact entry.
     #[inline]
-    async fn insert_if_not_exists(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
-        debug_assert!(!row_id.is_deleted());
-        if let Some(active) = self.mem.lookup_unique(key, row_id, ts).await? {
-            if merge_if_match_deleted && !active {
-                return self.mem.insert_if_not_exists(key, row_id, true, ts).await;
-            }
-            return Ok(IndexInsert::DuplicateKey(row_id, !active));
-        }
-        let disk = self.open()?;
-        if disk.contains_exact(key, row_id).await? {
-            return Ok(IndexInsert::DuplicateKey(row_id, false));
-        }
-        self.mem.insert_if_not_exists(key, row_id, false, ts).await
-    }
-
-    #[inline]
-    async fn mask_as_deleted(&self, key: &[Val], row_id: RowID, ts: TrxID) -> RuntimeResult<bool> {
-        debug_assert!(!row_id.is_deleted());
-        match self.mem.lookup_unique(key, row_id, ts).await? {
-            Some(true) => self.mem.mask_as_deleted(key, row_id, ts).await,
-            Some(false) => Ok(false),
-            None => {
-                let disk = self.open()?;
-                if disk.contains_exact(key, row_id).await? {
-                    self.mem
-                        .insert_delete_overlay_if_absent(key, row_id, ts)
-                        .await
-                } else {
-                    Ok(false)
-                }
-            }
-        }
-    }
-
-    #[inline]
-    async fn mask_as_active(&self, key: &[Val], row_id: RowID, ts: TrxID) -> RuntimeResult<bool> {
-        self.mem.mask_as_active(key, row_id, ts).await
-    }
-
-    #[inline]
-    async fn compare_delete(
+    pub(crate) async fn compare_delete_mem(
         &self,
         key: &[Val],
         row_id: RowID,
@@ -708,35 +812,38 @@ impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, '_, P> {
             .await
     }
 
+    /// Scan lookup candidates across MemIndex and the captured DiskTree root.
     #[inline]
-    fn index_scan_candidates<'a>(
+    pub(crate) fn index_scan_candidates<'a>(
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<
+        SecondaryIndexCandidateStream<
+            NonUniqueMemIndexCandidateStream<'a, P>,
+            NonUniqueDiskTreeCandidateStream<'a, 'a>,
+        >,
+    > {
         let mem = self.mem.index_scan_candidates(range, ts)?;
         let disk = self.open()?.scan_candidate_stream(range);
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
     }
 
+    /// Scan candidates equal to one encoded logical-key range.
     #[inline]
-    fn equal_scan_candidates<'a>(
+    pub(crate) fn equal_scan_candidates<'a>(
         &'a self,
         range: &'a KeyRange,
         ts: TrxID,
-    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<
+        SecondaryIndexCandidateStream<
+            NonUniqueMemIndexCandidateStream<'a, P>,
+            NonUniqueDiskTreeCandidateStream<'a, 'a>,
+        >,
+    > {
         let mem = self.mem.equal_scan_candidates(range, ts)?;
         let disk = self.open()?.scan_candidate_stream(range);
         Ok(SecondaryIndexCandidateStream::new(mem, disk))
-    }
-
-    #[inline]
-    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
-        let mem_entries = self.mem.scan_encoded_entries().await?;
-        let disk = self.open()?;
-        let disk_entries = disk.scan_entries().await?;
-        merge_non_unique_entries(&mem_entries, &disk_entries, values);
-        Ok(())
     }
 }
 
@@ -884,96 +991,6 @@ where
     }
 }
 
-#[inline]
-fn merge_unique_entries(
-    mem_entries: &[MemIndexEntry],
-    disk_entries: &[(Vec<u8>, RowID)],
-    values: &mut Vec<RowID>,
-) {
-    let mut mem_idx = 0;
-    let mut disk_idx = 0;
-    while mem_idx < mem_entries.len() && disk_idx < disk_entries.len() {
-        let mem = &mem_entries[mem_idx];
-        let (disk_key, disk_row_id) = &disk_entries[disk_idx];
-        match mem.encoded_key.as_bytes().cmp(disk_key.as_slice()) {
-            Ordering::Less => {
-                values.push(if mem.deleted {
-                    mem.row_id.deleted()
-                } else {
-                    mem.row_id
-                });
-                mem_idx += 1;
-            }
-            Ordering::Equal => {
-                values.push(if mem.deleted {
-                    mem.row_id.deleted()
-                } else {
-                    mem.row_id
-                });
-                mem_idx += 1;
-                disk_idx += 1;
-            }
-            Ordering::Greater => {
-                values.push(*disk_row_id);
-                disk_idx += 1;
-            }
-        }
-    }
-    for mem in &mem_entries[mem_idx..] {
-        values.push(if mem.deleted {
-            mem.row_id.deleted()
-        } else {
-            mem.row_id
-        });
-    }
-    for (_, row_id) in &disk_entries[disk_idx..] {
-        values.push(*row_id);
-    }
-}
-
-#[inline]
-fn merge_non_unique_entries(
-    mem_entries: &[MemIndexEntry],
-    disk_entries: &[(Vec<u8>, RowID)],
-    values: &mut Vec<RowID>,
-) {
-    let mut mem_idx = 0;
-    let mut disk_idx = 0;
-    // Both inputs are sorted and exact-key unique, so a hot/cold duplicate can
-    // only appear when the two current heads compare equal.
-    while mem_idx < mem_entries.len() && disk_idx < disk_entries.len() {
-        let mem = &mem_entries[mem_idx];
-        let (disk_key, disk_row_id) = &disk_entries[disk_idx];
-        match mem.encoded_key.as_bytes().cmp(disk_key.as_slice()) {
-            Ordering::Less => {
-                if !mem.deleted {
-                    values.push(mem.row_id);
-                }
-                mem_idx += 1;
-            }
-            Ordering::Equal => {
-                if !mem.deleted {
-                    values.push(mem.row_id);
-                }
-                mem_idx += 1;
-                disk_idx += 1;
-            }
-            Ordering::Greater => {
-                values.push(*disk_row_id);
-                disk_idx += 1;
-            }
-        }
-    }
-    for mem in &mem_entries[mem_idx..] {
-        if !mem.deleted {
-            values.push(mem.row_id);
-        }
-    }
-    for (_, row_id) in &disk_entries[disk_idx..] {
-        values.push(*row_id);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -985,7 +1002,6 @@ mod tests {
     use crate::file::build_test_fs;
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::index::btree::BTree;
     use crate::index::btree::BTreeKeyEncoder;
     use crate::index::disk_tree::{
         NonUniqueDiskTree, NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut,
@@ -994,6 +1010,7 @@ mod tests {
     use crate::quiescent::QuiescentBox;
     use crate::table::test_user_table_id;
     use crate::value::{ValKind, ValType};
+    use std::ops::Bound::Unbounded;
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()
@@ -1020,29 +1037,32 @@ mod tests {
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> UniqueMemIndex<FixedBufferPool> {
-        let tree = BTree::new(pool.guard(), pool_guard, true, TrxID::new(100))
-            .await
-            .expect("unique MemIndex should be created");
-        UniqueMemIndex::with_encoder(
-            tree,
-            BTreeKeyEncoder::new(vec![ValType::new(ValKind::U32, false)]),
+        let index_spec = IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK);
+        UniqueMemIndex::new(
+            pool.guard(),
+            pool_guard,
+            &index_spec,
+            |_| ValType::new(ValKind::U32, false),
+            TrxID::new(100),
         )
+        .await
+        .expect("unique MemIndex should be created")
     }
 
     async fn non_unique_mem_index(
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> NonUniqueMemIndex<FixedBufferPool> {
-        let tree = BTree::new(pool.guard(), pool_guard, true, TrxID::new(100))
-            .await
-            .expect("non-unique MemIndex should be created");
-        NonUniqueMemIndex::with_encoder(
-            tree,
-            BTreeKeyEncoder::new(vec![
-                ValType::new(ValKind::U32, false),
-                ValType::new(ValKind::U64, false),
-            ]),
+        let index_spec = IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty());
+        NonUniqueMemIndex::new(
+            pool.guard(),
+            pool_guard,
+            &index_spec,
+            |_| ValType::new(ValKind::U32, false),
+            TrxID::new(100),
         )
+        .await
+        .expect("non-unique MemIndex should be created")
     }
 
     struct UniqueDiskTreePut<'a> {
@@ -1055,16 +1075,16 @@ mod tests {
         row_id: RowID,
     }
 
-    async fn non_unique_disk_tree_prefix_scan_rows(
+    async fn non_unique_disk_tree_scan_rows(
         tree: &NonUniqueDiskTree<'_>,
-        key: &[Val],
+        range: &KeyRange,
     ) -> RuntimeResult<Vec<RowID>> {
-        Ok(tree
-            .prefix_scan_entries(key)
-            .await?
-            .into_iter()
-            .map(|(_, row_id)| row_id)
-            .collect())
+        let mut stream = tree.scan_candidate_stream(range);
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+        }
+        Ok(rows)
     }
 
     fn encode_unique_puts(entries: &[UniqueDiskTreePut<'_>]) -> Vec<(Vec<u8>, RowID)> {
@@ -1174,7 +1194,6 @@ mod tests {
             let key3 = [Val::from(3u32)];
             let key4 = [Val::from(4u32)];
             let key5 = [Val::from(5u32)];
-            let key6 = [Val::from(6u32)];
             let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));
             let puts = [
                 UniqueDiskTreePut {
@@ -1246,8 +1265,16 @@ mod tests {
                 Some((RowID::new(20), false))
             );
 
+            let mem_bound = index.unique_mem().unwrap().bind(&index_guard);
             assert!(
-                bound
+                mem_bound
+                    .insert_if_not_exists(&key3, RowID::new(30), false, TrxID::new(4))
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                mem_bound
                     .mask_as_deleted(&key3, RowID::new(30), TrxID::new(4))
                     .await
                     .unwrap()
@@ -1256,77 +1283,198 @@ mod tests {
                 bound.lookup(&key3, TrxID::new(4)).await.unwrap(),
                 Some((RowID::new(30), true))
             );
-            assert_eq!(
+            assert!(matches!(
                 bound
-                    .insert_if_not_exists(&key4, RowID::new(400), false, TrxID::new(5))
+                    .insert_if_not_exists_observed(&key4, RowID::new(400), false, TrxID::new(5))
                     .await
                     .unwrap(),
-                IndexInsert::DuplicateKey(RowID::new(40), false)
-            );
-            assert!(
+                UniqueInsertAttempt::Occupied(_)
+            ));
+            assert!(matches!(
                 bound
-                    .insert_if_not_exists(&key5, RowID::new(50), false, TrxID::new(5))
+                    .insert_if_not_exists_observed(&key5, RowID::new(50), false, TrxID::new(5))
                     .await
-                    .unwrap()
-                    .is_ok()
-            );
+                    .unwrap(),
+                UniqueInsertAttempt::Inserted { merged: false }
+            ));
+            let observation = match bound
+                .insert_if_not_exists_observed(&key2, RowID::new(200), false, TrxID::new(6))
+                .await
+                .unwrap()
+            {
+                UniqueInsertAttempt::Inserted { .. } => {
+                    panic!("captured DiskTree owner must prevent direct insertion")
+                }
+                UniqueInsertAttempt::Occupied(observation) => observation,
+            };
+            assert_eq!(observation.owner_row_id(), RowID::new(20));
+            assert!(!observation.deleted());
+            let mem_claim_start = (*index_pool).stats();
+            let disk_claim_start = disk_pool.global_stats();
             assert_eq!(
-                bound
-                    .compare_exchange(&key2, RowID::new(20), RowID::new(200), TrxID::new(6))
+                observation
+                    .replace(RowID::new(200), TrxID::new(6))
                     .await
                     .unwrap(),
                 IndexCompareExchange::Ok
             );
+            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            assert_eq!(mem_claim_delta.cache_hits, 1);
+            assert_eq!(mem_claim_delta.cache_misses, 0);
+            let disk_claim_delta = disk_pool.global_stats().delta_since(disk_claim_start);
+            assert_eq!(disk_claim_delta.cache_hits, 0);
+            assert_eq!(disk_claim_delta.cache_misses, 0);
+
+            assert!(
+                mem_bound
+                    .compare_delete(&key2, RowID::new(200), true, TrxID::new(7))
+                    .await
+                    .unwrap()
+            );
+            let observation = match bound
+                .insert_if_not_exists_observed(&key2, RowID::new(201), false, TrxID::new(7))
+                .await
+                .unwrap()
+            {
+                UniqueInsertAttempt::Inserted { .. } => {
+                    panic!("captured DiskTree owner must prevent direct insertion")
+                }
+                UniqueInsertAttempt::Occupied(observation) => observation,
+            };
+            assert!(
+                mem_bound
+                    .insert_if_not_exists(&key2, RowID::new(20), false, TrxID::new(7))
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            let mem_claim_start = (*index_pool).stats();
             assert_eq!(
-                bound
-                    .compare_exchange(&key4, RowID::new(999), RowID::new(9999), TrxID::new(6))
+                observation
+                    .replace(RowID::new(201), TrxID::new(7))
+                    .await
+                    .unwrap(),
+                IndexCompareExchange::Ok
+            );
+            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            assert_eq!(mem_claim_delta.cache_hits, 1);
+            assert_eq!(mem_claim_delta.cache_misses, 0);
+
+            assert!(
+                mem_bound
+                    .compare_delete(&key2, RowID::new(201), true, TrxID::new(8))
+                    .await
+                    .unwrap()
+            );
+            let observation = match bound
+                .insert_if_not_exists_observed(&key2, RowID::new(202), false, TrxID::new(8))
+                .await
+                .unwrap()
+            {
+                UniqueInsertAttempt::Inserted { .. } => {
+                    panic!("captured DiskTree owner must prevent direct insertion")
+                }
+                UniqueInsertAttempt::Occupied(observation) => observation,
+            };
+            assert!(
+                mem_bound
+                    .insert_if_not_exists(&key2, RowID::new(999), false, TrxID::new(8))
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            let mem_claim_start = (*index_pool).stats();
+            assert_eq!(
+                observation
+                    .replace(RowID::new(202), TrxID::new(8))
                     .await
                     .unwrap(),
                 IndexCompareExchange::Mismatch
             );
+            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            assert_eq!(mem_claim_delta.cache_hits, 1);
+            assert_eq!(mem_claim_delta.cache_misses, 0);
             assert_eq!(
-                bound
+                mem_bound.lookup(&key2, TrxID::new(8)).await.unwrap(),
+                Some((RowID::new(999), false))
+            );
+
+            assert!(
+                mem_bound
+                    .compare_delete(&key2, RowID::new(999), true, TrxID::new(9))
+                    .await
+                    .unwrap()
+            );
+            let observation = match bound
+                .insert_if_not_exists_observed(&key2, RowID::new(203), false, TrxID::new(9))
+                .await
+                .unwrap()
+            {
+                UniqueInsertAttempt::Inserted { .. } => {
+                    panic!("captured DiskTree owner must prevent direct insertion")
+                }
+                UniqueInsertAttempt::Occupied(observation) => observation,
+            };
+            assert!(
+                mem_bound
+                    .insert_if_not_exists(&key2, RowID::new(20), false, TrxID::new(9))
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                mem_bound
+                    .mask_as_deleted(&key2, RowID::new(20), TrxID::new(9))
+                    .await
+                    .unwrap()
+            );
+            let mem_claim_start = (*index_pool).stats();
+            assert_eq!(
+                observation
+                    .replace(RowID::new(203), TrxID::new(9))
+                    .await
+                    .unwrap(),
+                IndexCompareExchange::Mismatch
+            );
+            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            assert_eq!(mem_claim_delta.cache_hits, 1);
+            assert_eq!(mem_claim_delta.cache_misses, 0);
+            assert_eq!(
+                mem_bound.lookup(&key2, TrxID::new(9)).await.unwrap(),
+                Some((RowID::new(20), true))
+            );
+            assert_eq!(
+                mem_bound
                     .compare_exchange(
-                        &key4,
-                        RowID::new(40).deleted(),
-                        RowID::new(400),
-                        TrxID::new(6)
+                        &key2,
+                        RowID::new(20).deleted(),
+                        RowID::new(200),
+                        TrxID::new(10),
                     )
                     .await
                     .unwrap(),
-                IndexCompareExchange::NotExists
-            );
-            assert_eq!(
-                bound
-                    .compare_exchange(&key6, RowID::new(60), RowID::new(600), TrxID::new(6))
-                    .await
-                    .unwrap(),
-                IndexCompareExchange::NotExists
+                IndexCompareExchange::Ok
             );
             assert!(
                 bound
-                    .compare_delete(&key4, RowID::new(40), false, TrxID::new(7))
+                    .compare_delete_mem(&key4, RowID::new(40), false, TrxID::new(7))
                     .await
                     .unwrap()
             );
             assert!(
                 bound
-                    .compare_delete(&key4, RowID::new(41), false, TrxID::new(7))
+                    .compare_delete_mem(&key4, RowID::new(41), false, TrxID::new(7))
                     .await
                     .unwrap()
             );
 
-            let mut values = Vec::new();
-            bound.scan_values(&mut values, TrxID::new(8)).await.unwrap();
+            let full_range = KeyRange::new(Unbounded, Unbounded);
+            let mut full_stream = bound
+                .index_scan_candidates(&full_range, TrxID::new(8))
+                .unwrap();
             assert_eq!(
-                values,
-                vec![
-                    RowID::new(100),
-                    RowID::new(200),
-                    RowID::new(30).deleted(),
-                    RowID::new(40),
-                    RowID::new(50)
-                ]
+                drain_row_ids(&mut full_stream).await,
+                test_row_ids([100, 200, 30, 40, 50])
             );
             let range = index.key_encoder().encode_range(&key2[..]..=&key5[..]);
             let mut stream = bound.index_scan_candidates(&range, TrxID::new(8)).unwrap();
@@ -1517,15 +1665,45 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
+            let hot_insert_start = disk_pool.global_stats();
+            assert_eq!(
+                bound
+                    .insert_mem_if_not_exists(&key1, RowID::new(100), false, TrxID::new(4))
+                    .await
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            );
+            let hot_insert_delta = disk_pool.global_stats().delta_since(hot_insert_start);
+            assert_eq!(hot_insert_delta.cache_hits, 0);
+            assert_eq!(hot_insert_delta.cache_misses, 0);
             assert!(
                 bound
-                    .mask_as_deleted(&key1, RowID::new(10), TrxID::new(4))
+                    .compare_delete_mem(&key1, RowID::new(100), true, TrxID::new(4))
                     .await
                     .unwrap()
             );
-            let mut rows = Vec::new();
-            bound.lookup(&key1, &mut rows, TrxID::new(4)).await.unwrap();
-            assert_eq!(rows, test_row_ids([11, 12]));
+            assert_eq!(
+                bound
+                    .insert_mem_if_not_exists(&key1, RowID::new(10), false, TrxID::new(4))
+                    .await
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            );
+            assert_eq!(
+                bound
+                    .mask_mem_if_present(&key1, RowID::new(10), TrxID::new(4))
+                    .await
+                    .unwrap(),
+                IndexMask::Masked
+            );
+            let key1_range = index.key_encoder().encode_non_unique_equal_range(&key1);
+            let mut key1_stream = bound
+                .equal_scan_candidates(&key1_range, TrxID::new(4))
+                .unwrap();
+            assert_eq!(
+                drain_row_ids(&mut key1_stream).await,
+                test_row_ids([10, 11, 12])
+            );
             assert_eq!(
                 bound
                     .lookup_unique(&key1, RowID::new(10), TrxID::new(4))
@@ -1547,45 +1725,49 @@ mod tests {
                     .unwrap(),
                 None
             );
-            assert_eq!(
-                bound
-                    .insert_if_not_exists(&key1, RowID::new(11), false, TrxID::new(5))
-                    .await
-                    .unwrap(),
-                IndexInsert::DuplicateKey(RowID::new(11), false)
-            );
+            let non_unique_mem_bound = index.non_unique_mem().unwrap().bind(&index_guard);
             assert!(
-                bound
+                non_unique_mem_bound
                     .mask_as_active(&key1, RowID::new(10), TrxID::new(5))
                     .await
                     .unwrap()
             );
-            rows.clear();
-            bound.lookup(&key1, &mut rows, TrxID::new(5)).await.unwrap();
-            assert_eq!(rows, test_row_ids([10, 11, 12]));
+            let key1_range = index.key_encoder().encode_non_unique_equal_range(&key1);
+            let mut key1_stream = bound
+                .equal_scan_candidates(&key1_range, TrxID::new(5))
+                .unwrap();
+            assert_eq!(
+                drain_row_ids(&mut key1_stream).await,
+                test_row_ids([10, 11, 12])
+            );
             assert!(
                 bound
-                    .insert_if_not_exists(&key1, RowID::new(13), false, TrxID::new(6))
+                    .insert_mem_if_not_exists(&key1, RowID::new(13), false, TrxID::new(6))
                     .await
                     .unwrap()
                     .is_ok()
             );
-            assert!(
+            assert_eq!(
                 bound
-                    .mask_as_deleted(&key2, RowID::new(20), TrxID::new(7))
+                    .insert_mem_if_not_exists(&key2, RowID::new(20), false, TrxID::new(7))
                     .await
-                    .unwrap()
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            );
+            assert_eq!(
+                bound
+                    .mask_mem_if_present(&key2, RowID::new(20), TrxID::new(7))
+                    .await
+                    .unwrap(),
+                IndexMask::Masked
             );
             assert!(
                 bound
-                    .compare_delete(&key3, RowID::new(30), false, TrxID::new(7))
+                    .compare_delete_mem(&key3, RowID::new(30), false, TrxID::new(7))
                     .await
                     .unwrap()
             );
 
-            let mut values = Vec::new();
-            bound.scan_values(&mut values, TrxID::new(8)).await.unwrap();
-            assert_eq!(values, test_row_ids([10, 11, 12, 13, 30]));
             let key1_range = index.key_encoder().encode_non_unique_equal_range(&key1);
             let mut key1_stream = bound
                 .equal_scan_candidates(&key1_range, TrxID::new(8))
@@ -1610,13 +1792,13 @@ mod tests {
 
             let unchanged_disk = disk_runtime.open(root, &disk_guard);
             assert_eq!(
-                non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key1)
+                non_unique_disk_tree_scan_rows(&unchanged_disk, &key1_range)
                     .await
                     .unwrap(),
                 test_row_ids([10, 11])
             );
             assert_eq!(
-                non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key2)
+                non_unique_disk_tree_scan_rows(&unchanged_disk, &key2_range)
                     .await
                     .unwrap(),
                 test_row_ids([20])
@@ -1717,13 +1899,13 @@ mod tests {
                     bound.lookup(&key2, TrxID::new(5)).await.unwrap(),
                     Some((RowID::new(20), false))
                 );
-                assert!(
+                assert!(matches!(
                     bound
-                        .insert_if_not_exists(&key5, RowID::new(50), false, TrxID::new(6))
+                        .insert_if_not_exists_observed(&key5, RowID::new(50), false, TrxID::new(6))
                         .await
-                        .unwrap()
-                        .is_ok()
-                );
+                        .unwrap(),
+                    UniqueInsertAttempt::Inserted { merged: false }
+                ));
                 let fresh_range = index.key_encoder().encode_range(&key1[..]..=&key5[..]);
                 let mut fresh = bound
                     .index_scan_candidates(&fresh_range, TrxID::new(7))
@@ -1817,14 +1999,11 @@ mod tests {
 
                 assert!(
                     bound
-                        .insert_if_not_exists(&key1, RowID::new(13), false, TrxID::new(5))
+                        .insert_mem_if_not_exists(&key1, RowID::new(13), false, TrxID::new(5))
                         .await
                         .unwrap()
                         .is_ok()
                 );
-                let mut rows = Vec::new();
-                bound.lookup(&key1, &mut rows, TrxID::new(6)).await.unwrap();
-                assert_eq!(rows, test_row_ids([10, 11, 12, 13]));
                 let fresh_range = index.key_encoder().encode_non_unique_equal_range(&key1);
                 let mut fresh = bound
                     .equal_scan_candidates(&fresh_range, TrxID::new(7))
@@ -1855,15 +2034,19 @@ mod tests {
             let index_guard = (*index_pool).pool_guard();
             let mem = unique_mem_index(&index_pool, &index_guard).await;
             let shadow_key = [Val::from(9u32)];
+            let guarded = mem.bind(&index_guard);
             assert!(
-                mem.insert_overlay_if_absent(
-                    &index_guard,
-                    &shadow_key,
-                    RowID::new(90).deleted(),
-                    TrxID::new(2)
-                )
-                .await
-                .unwrap()
+                guarded
+                    .insert_if_not_exists(&shadow_key, RowID::new(90), false, TrxID::new(2))
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                guarded
+                    .mask_as_deleted(&shadow_key, RowID::new(90), TrxID::new(2))
+                    .await
+                    .unwrap()
             );
             let runtime = SecondaryDiskTreeRuntime::new(
                 0,

@@ -1253,7 +1253,7 @@ mod tests {
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
-    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex};
+    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
     use crate::log::LogSync;
     use crate::log::block_group::TrxLog;
     use crate::log::format::{
@@ -3398,6 +3398,9 @@ mod tests {
             let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
             let layout = table.layout_snapshot();
             let non_unique = layout.secondary_index(name_key.index_no).unwrap();
+            let range = non_unique
+                .key_encoder()
+                .encode_non_unique_equal_range(&name_key.vals);
             let root =
                 table.file().active_root_unchecked().secondary_index_roots[name_key.index_no];
             let disk_rows = {
@@ -3406,12 +3409,12 @@ mod tests {
                     .disk_runtime()
                     .open_non_unique_at(root, pool_guards.disk_guard())
                     .unwrap();
-                disk.prefix_scan_entries(&name_key.vals)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .map(|(_, row_id)| row_id)
-                    .collect::<Vec<_>>()
+                let mut stream = disk.scan_candidate_stream(&range);
+                let mut rows = Vec::new();
+                while let Some(batch) = stream.next_batch().await.unwrap() {
+                    rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
+                }
+                rows
             };
             assert_eq!(disk_rows, same_row_ids);
             drop(layout);

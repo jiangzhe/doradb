@@ -148,10 +148,13 @@ that runtime byte into a persisted `DiskTree` API or format contract.
 Delete representation is split across runtime overlay state and cold delete
 state:
 
-- `MemIndex` carries delete-shadows or delete-marked exact entries so hot lookup
-  does not fall through to stale cold `DiskTree` state
+- `MemIndex` carries delete-shadows or delete-marked exact entries when a
+  matching mutable entry must be masked
 - the deletion buffer and published delete bitmap remain the cold-row delete
   authority
+- a current persisted row whose exact old entry is absent from `MemIndex` does
+  not need a synthetic delete overlay; the deletion buffer already filters its
+  immutable `DiskTree` candidate
 - deletion-checkpoint companion work then removes or conditionally updates the
   corresponding durable `DiskTree` entry
 
@@ -221,6 +224,24 @@ entry against the corresponding `DiskTree` root from that same snapshot before
 issuing an encoded compare-delete. Cleanup never mutates `DiskTree` and never
 rebuilds checkpointed cold entries into `MemIndex`.
 
+One maintenance transaction and one proof-bound root snapshot cover the whole
+table pass, including every active secondary index. A root published after the
+cleanup transaction started is retried immediately with a new transaction.
+There is no event wait for this capture race.
+
+Because one mutable `MemIndex` is shared by operations bound to different
+immutable roots, requested live-entry removal additionally requires:
+
+```text
+captured_root.effective_ts() < Global_Min_Active_STS
+```
+
+Equality is unsafe. When the condition is false, cleanup retains and counts
+live entries but continues processing delete overlays. The returned
+`MemIndexCleanupOutcome` contains the completed `MemIndexCleanupStats` and a
+`live_delay` with the captured effective timestamp and active horizon. A caller
+that disabled live cleanup receives no delay.
+
 Valid cleanup decisions:
 
 - live unique entries can be removed only when the row id is below the captured
@@ -288,8 +309,9 @@ Each secondary index has its own `DiskTree` root.
 - it does not need to represent a standalone committed CTS prefix
 - it may be stale relative to hot `MemIndex`, and runtime lookup rules must
   account for that
-- cold-row deletes are represented by deletion overlay state until companion
-  checkpoint work removes or conditionally updates the durable entry
+- cold-row deletes are represented by the deletion buffer plus any matching
+  MemIndex entry that had to be masked until companion checkpoint work removes
+  or conditionally updates the durable entry
 
 Runtime opens of a user-table `DiskTree` root must come from one proof-gated
 table-root observation. A lookup, scan, insert/update/delete attempt, or GC
@@ -412,35 +434,102 @@ older cold owner/version. This link lifecycle is what makes the unique
 latest-mapping `DiskTree` model compatible with snapshot visibility across
 ownership transfer.
 
-### 7.5 Composite Trait Method Parity
+### 7.5 Production Access-Path APIs
 
-The composite user-table implementation keeps method parity with the current
-runtime traits, but routes each method through `MemIndex` and `DiskTree` under
-the contracts above. Foreground and rollback methods mutate only `MemIndex`;
-`DiskTree` changes are checkpoint companion work.
+There is no generic runtime index trait. Production always knows whether it
+holds a guarded MemIndex or a root-bound MemIndex/DiskTree view, and the
+concrete API exposes that authority.
 
-Unique index method parity:
+Root-bound reads combine both layers:
 
-| Current method | Composite semantics | Rollback expectation |
-| --- | --- | --- |
-| `lookup` | Probe `MemIndex` first. A live hit or delete-shadow hit is terminal for tree selection and returns the retained row id plus delete flag to the normal MVCC/key-recheck path. On `MemIndex` miss, probe `DiskTree` and return the cold owner as a live candidate. | Read-only. Rollback state is visible only through `MemIndex` overlays and runtime unique-key links. |
-| `insert_if_not_exists` | Insert into `MemIndex` only after duplicate checks. A `MemIndex` duplicate is terminal; `merge_if_match_deleted` may unmask a matching `MemIndex` delete-shadow. On `MemIndex` miss, a `DiskTree` owner is reported as a duplicate candidate but is not modified. | Insert rollback removes the new `MemIndex` claim, or remasks a delete-shadow that was merged by `merge_if_match_deleted`. |
-| `compare_exchange` | Update a matching `MemIndex` entry when present. If `MemIndex` misses and `DiskTree` still maps the key to `old_row_id`, claim the cold owner by installing the `new_row_id` mapping in `MemIndex`; `DiskTree` is not updated. | Update rollback uses the same operation to restore the old owner as a `MemIndex` overlay when the durable cold owner cannot be changed directly. |
-| `mask_as_deleted` | Mark a matching `MemIndex` live entry as a delete-shadow, or install a row-id-carrying `MemIndex` delete-shadow when the matching owner exists only in `DiskTree`. | Delete rollback unmasks or removes the `MemIndex` delete-shadow; no rollback path writes `DiskTree`. |
-| `compare_delete` | Remove or adjust matching `MemIndex` overlay state according to `ignore_del_mask`. If only `DiskTree` has the matching owner, the operation is an idempotent runtime no-op; durable removal is deletion-checkpoint work. | Purge/recovery rollback cleanup removes only `MemIndex` state. Durable cold cleanup waits for companion checkpoint publication. |
-| `scan_values` | Scan both layers, with `MemIndex` state terminal per logical key. `MemIndex` overlays suppress same-key `DiskTree` candidates before MVCC/key recheck. | Read-only. Rollback-visible candidates come from `MemIndex` overlays and runtime unique-key links. |
+- unique `lookup` and bounded candidate scans probe or merge MemIndex and the
+  captured unique DiskTree root;
+- non-unique exact lookup and bounded/equality candidate scans probe or merge
+  MemIndex and the captured non-unique DiskTree root.
 
-Non-unique index method parity:
+Root-bound writes are deliberately narrower:
 
-| Current method | Composite semantics | Rollback expectation |
-| --- | --- | --- |
-| `lookup` | Prefix-scan exact entries from both layers. Active `MemIndex` exact entries are returned; delete-marked `MemIndex` exact entries suppress only matching `DiskTree` exact entries. Remaining candidates are deduplicated and ordered by `(logical_key, row_id)`. | Read-only. Rollback state is represented by exact `MemIndex` overlays. |
-| `lookup_unique` | Check the exact `(logical_key, row_id)` pair in `MemIndex` first. A live or delete-marked exact hit is terminal and returns that state. On `MemIndex` miss, `DiskTree` exact-key presence returns active. | Read-only. Rollback observes only `MemIndex` exact overlay state. |
-| `insert_if_not_exists` | Insert the exact entry into `MemIndex` only. An active `MemIndex` exact duplicate is terminal; `merge_if_match_deleted` may unmask a matching delete-marked `MemIndex` exact entry. On `MemIndex` miss, matching `DiskTree` key presence is a duplicate candidate but is not modified. | Insert rollback removes the new `MemIndex` exact entry, or remasks the exact entry if it was merged from delete-marked state. |
-| `mask_as_deleted` | Mark a matching `MemIndex` exact entry deleted, or install a delete-marked `MemIndex` exact entry when the exact key exists only in `DiskTree`. `DiskTree` has no delete-mask API. | Delete rollback must be able to unmask this `MemIndex` exact entry until rollback/index-undo obligations are gone. |
-| `mask_as_active` | Rollback-only unmask of a delete-marked `MemIndex` exact entry. It never updates `DiskTree`, because `DiskTree` exact-key presence has no delete flag. | Required for delete/update rollback and must not fail because cleanup removed a hot-origin overlay too early. |
-| `compare_delete` | Remove the matching `MemIndex` exact overlay according to `ignore_del_mask`. If only `DiskTree` has the exact key, the operation is an idempotent runtime no-op; durable exact removal is deletion-checkpoint work. | Purge/recovery rollback cleanup removes only `MemIndex` overlays. Durable cold cleanup waits for companion checkpoint publication. |
-| `scan_values` | Scan both exact-entry sets and merge deterministically by `(logical_key, row_id)`. `MemIndex` exact entries deduplicate or suppress matching `DiskTree` exact keys. | Read-only. Rollback-visible state comes from exact `MemIndex` overlays. |
+- unique insertion returns `UniqueInsertAttempt`, retaining an opaque
+  `UniqueOwnerObservation` on conflict;
+- consuming a Mem observation uses `compare_exchange_mem`;
+- consuming a Disk observation uses `replace_or_insert_mem`, which atomically
+  revalidates a competing Mem owner or inserts on true Mem absence;
+- proof-bound non-unique insertion uses `insert_mem_if_not_exists`;
+- proof-bound non-unique masking uses `mask_mem_if_present` and retains
+  `Masked`, `AlreadyMasked`, or `NotFound`;
+- physical purge uses `compare_delete_mem`.
+
+Rollback, recovery, catalog build, and catalog-table access bind guarded
+MemIndex views directly. Their inherent mutation methods cannot probe
+DiskTree. No root-bound mutation API performs a generic Disk fallback or
+creates an absent-entry delete overlay.
+
+### 7.6 Proof-Bound Current-Row Mutation
+
+For one compatible captured table root with pivot `P` and one pinned runtime
+layout, every current row has one metadata-derived entry in every active index:
+
+- `row_id >= P`: the captured secondary DiskTrees cannot contain the row, so
+  its active current entries are required in MemIndex
+- `row_id < P`: a current, unconsumed LWC row and every active secondary entry
+  were published together; matching MemIndex copies may exist but are optional
+
+Checkpoint enforces the persisted half by sending every accepted current row to
+every active secondary sidecar and publishing the column root and all secondary
+roots atomically. Foreground insert/recovery establishes the Mem-required half
+before another transaction can independently own the row.
+
+This is current-row completeness, not historical candidate completeness.
+`CREATE INDEX` history construction is separately tracked by
+[`000163-create-index-full-mvcc-history.md`](./backlogs/000163-create-index-full-mvcc-history.md).
+
+After definitive RowPage write ownership or current-LWC validation plus CDB
+ownership, operations that consume every old index entry create one opaque,
+single-use `OwnedRowIndexSetProof`. A RowID-stable in-place update instead
+binds only the affected old entries after RowPage ownership, so unchanged
+indexes require no key reconstruction. Both forms derive storage relative to
+the captured root:
+
+```text
+row_id >= captured_pivot  => MemRequired
+row_id <  captured_pivot  => Persisted
+```
+
+Current routing does not change this classification. A row at or above the
+captured pivot can move to LWC after root capture, but the captured DiskTrees
+still do not contain it. The live-cleanup effective-time fence keeps its shared
+MemIndex entries resident for the proof-owning transaction.
+
+Both modes mutate only MemIndex because DiskTree is immutable:
+
+- `MemRequired`: unique compare-exchange must return `Ok`; non-unique exact
+  masking must return `IndexMask::Masked`. Absence or incompatible state is a
+  release invariant failure, with no DiskTree fallback.
+- `Persisted`: a matching active Mem entry is masked and receives the existing
+  undo. `NotExists` / `IndexMask::NotFound` is successful without a write,
+  undo, purge payload, or delete overlay. Unique mismatch or an already-masked
+  non-unique entry after row ownership is an invariant failure.
+
+The CDB is the visibility authority for a persisted row until deletion
+checkpoint removes the durable row and its DiskTree entries. Rollback removes
+the CDB marker and restores only Mem entries actually changed.
+
+New-side insertion is separate from old-side proof consumption:
+
+- a new non-unique exact entry with `new_row_id >= captured_pivot` uses atomic
+  MemIndex insertion without a DiskTree probe
+- a new unique logical key still performs normal owner selection, row/MVCC/key
+  validation, and runtime-link handling
+
+Unique owner selection returns a single-use `UniqueOwnerObservation` bound to
+the exact root, key, owner state, and source. A Mem observation is consumed by
+atomic Mem compare-exchange. A Disk observation is consumed by one atomic Mem
+replace-or-insert: absence inserts the new live owner, an exact active
+expected-owner copy is replaced, and any different owner or delete state
+conflicts without overwrite. This consumes the captured immutable owner
+without rereading DiskTree. The source-selection Mem lookup precedes owner
+validation and is separate from this one-traversal claim. This token is for new
+claims only; it does not authorize old-row index-set masking.
 
 ## 8. Write Path
 
@@ -488,9 +577,14 @@ If the target row remains in RowStore:
 - every write first owns the row undo head with a `Lock` entry
 - in-place update reuses the RowID and records before-image columns in the hot
   undo chain
+- an in-place update reconstructs old/new keys only for indexes containing a
+  changed column, and binds each affected old entry individually
 - move update marks the old hot RowID deleted, inserts the replacement as a new
   hot RowID, and links unique-key owners when older snapshots may need the old
   owner
+- a move update captures the complete old key set from the already-materialized
+  old row; unchanged logical keys are reused from that proof rather than read
+  back from the replacement row
 - secondary index updates only touch `MemIndex`; `DiskTree` is updated later by
   table checkpoint companion work
 
@@ -502,7 +596,7 @@ Cases:
     from old RowID to new RowID and record index undo for rollback
 - unique, key changed:
   - first apply the unique-key enforcement rule for the new key
-  - install a row-id-carrying delete-shadow for the old key in `MemIndex`
+  - atomically mask the required active old MemIndex owner
   - insert new key -> row id in `MemIndex`
   - same-RowID key changes may merge with this transaction's own delete-shadow
     by flipping the delete flag back to active
@@ -516,7 +610,7 @@ Cases:
   - if RowID changes due to move update, insert the new exact `(key, row_id)`
     entry and mask the old exact entry
 - non-unique, key changed:
-  - mask exact old `(key, row_id)` entry in `MemIndex`
+  - atomically mask the required active old `(key, row_id)` MemIndex entry
   - insert exact new `(key, row_id)` entry in `MemIndex`
   - rollback unmasks the old exact entry and removes or remasks the new exact
     entry according to its index undo kind
@@ -531,9 +625,11 @@ cleanup proof for them.
 If the target row is already persistent:
 
 1. Read the old cold row.
-2. Create a cold-row deletion marker for the old row id.
+2. Validate it against the captured column root and own a CDB marker for the
+   old row id.
 3. Insert the modified row into RowStore with a new row id.
-4. Update `MemIndex`.
+4. Conditionally mask matching old MemIndex copies and install new MemIndex
+   entries.
 
 Cases:
 
@@ -544,18 +640,18 @@ Cases:
     key, runtime must install a unique-key link from the new hot row version to
     the old cold owner/version; ordinary undo from the new hot row id is not
     sufficient by itself for that case
-  - if the logical key changes, `MemIndex` installs a row-id-carrying
-    delete-shadow for the old key and, after applying the unique-key
-    enforcement rule, maps the new key to the new hot row id
+  - if the logical key changes, a matching active old Mem owner is masked when
+    present; absence creates no overlay. After applying the unique-key
+    enforcement rule, `MemIndex` maps the new key to the new hot row id
   - if an older snapshot may still need the previous owner/version of the old
     or new key and that owner is not reachable by ordinary undo from the latest
     row id, runtime must install the required unique-key link, including when
     that previous owner/version is cold
 - non-unique:
   - insert the new exact `(new_key, new_row_id)` entry in `MemIndex`
-  - install a delete-marked exact entry for `(old_key, old_row_id)` in
-    `MemIndex` so the stale `DiskTree` entry is shadowed until deletion
-    checkpoint
+  - mask `(old_key, old_row_id)` only when that exact MemIndex copy exists;
+    absence creates no overlay because CDB visibility filters the immutable
+    candidate until deletion checkpoint
 
 ### 8.5 Delete
 
@@ -572,12 +668,11 @@ Hot-row delete:
 Cold-row delete:
 
 - create a deletion-buffer entry for the old row id
-- update `MemIndex` so runtime lookup does not surface the stale `DiskTree`
-  mapping
-- unique delete-shadows retain the old row id for read-time visibility
-  resolution and later cleanup
-- non-unique delete-shadows already keep the old row id as part of the exact
-  entry identity
+- conditionally mask every matching active old MemIndex entry
+- if an old unique owner or non-unique exact entry is absent from MemIndex, do
+  not install a delete overlay or index undo
+- let normal CDB/persisted-delete visibility filter immutable DiskTree
+  candidates until deletion checkpoint removes them
 
 ## 9. Checkpoint
 

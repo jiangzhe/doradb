@@ -5,8 +5,7 @@ use crate::buffer::{BufferPool, PoolGuard};
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
 use crate::index::btree::{
-    BTreeByte, BTreeKey, BTreeKeyEncoder, BTreeNode, BTreeNodeCursor, BTreeSlot, BTreeU64,
-    GenericBTree,
+    BTreeByte, BTreeKey, BTreeKeyEncoder, BTreeNode, BTreeNodeCursor, BTreeU64, GenericBTree,
 };
 use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
@@ -36,7 +35,7 @@ impl<P: BufferPool> MemIndex<P> {
 
     /// Wrap an already-created BTree with a key encoder.
     #[inline]
-    pub(crate) fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
+    fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         Self { tree, encoder }
     }
 
@@ -56,27 +55,6 @@ impl<P: BufferPool> MemIndex<P> {
     #[inline]
     pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> RuntimeResult<()> {
         self.tree.destory(pool_guard).await
-    }
-
-    /// Scan MemIndex entries with encoded keys and delete state.
-    #[inline]
-    pub(crate) async fn scan_encoded_entries<S>(
-        &self,
-        pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Vec<MemIndexEntry>>
-    where
-        S: MemIndexEntryScanSpec,
-    {
-        let mut entries = Vec::new();
-        let mut cursor = self.tree.cursor(pool_guard, 0);
-        cursor.seek(&[]).await?;
-        while let Some(guard) = cursor.next().await? {
-            let node = guard.page();
-            for idx in 0..node.count() {
-                S::push_entry(node, idx, &mut entries);
-            }
-        }
-        Ok(entries)
     }
 
     /// Create a leaf-bounded scanner for cleanup candidates.
@@ -103,42 +81,6 @@ pub(crate) struct MemIndexEntry {
     pub(crate) row_id: RowID,
     /// Whether the MemIndex entry is delete-marked.
     pub(crate) deleted: bool,
-}
-
-/// MemIndex-specific encoded-entry decoder used by full scans.
-pub(crate) trait MemIndexEntryScanSpec {
-    /// Push one decoded MemIndex entry into `entries`.
-    fn push_entry(node: &BTreeNode, slot_idx: usize, entries: &mut Vec<MemIndexEntry>);
-}
-
-/// Encoded-entry decoder for unique MemIndex leaves.
-pub(crate) struct UniqueMemIndexEntryScanSpec;
-
-impl MemIndexEntryScanSpec for UniqueMemIndexEntryScanSpec {
-    #[inline]
-    fn push_entry(node: &BTreeNode, slot_idx: usize, entries: &mut Vec<MemIndexEntry>) {
-        // Occupied B-tree slots are created with an encoded key and cannot
-        // subsequently lose it while the leaf latch is held.
-        let encoded_key = node.btree_key_checked(slot_idx).unwrap_or_else(|| {
-            panic!("MemIndex key missing from occupied slot: slot_idx={slot_idx}")
-        });
-        let value = node.value::<BTreeU64>(slot_idx);
-        entries.push(MemIndexEntry {
-            encoded_key,
-            row_id: value.value().to_row_id(),
-            deleted: value.is_deleted(),
-        });
-    }
-}
-
-/// Encoded-entry decoder for non-unique MemIndex leaves.
-pub(crate) struct NonUniqueMemIndexEntryScanSpec;
-
-impl MemIndexEntryScanSpec for NonUniqueMemIndexEntryScanSpec {
-    #[inline]
-    fn push_entry(node: &BTreeNode, slot_idx: usize, entries: &mut Vec<MemIndexEntry>) {
-        push_non_unique_encoded_entry(node, node.slot(slot_idx), entries)
-    }
 }
 
 /// Bounded batch of MemIndex entries selected for cleanup processing.
@@ -271,31 +213,4 @@ where
         }
         Ok(Some(batch))
     }
-}
-
-/// Push one encoded non-unique exact MemIndex entry.
-#[inline]
-pub(crate) fn push_non_unique_encoded_entry(
-    node: &BTreeNode,
-    slot: &BTreeSlot,
-    entries: &mut Vec<MemIndexEntry>,
-) {
-    let key_len = node.slot_key_len(slot);
-    // Non-unique MemIndex insertion always appends a row id before publishing
-    // the slot, so an encoded entry can never be shorter than that suffix.
-    assert!(
-        key_len >= mem::size_of::<RowID>(),
-        "non-unique MemIndex key is missing its row-id suffix: key_len={key_len}"
-    );
-    let mut encoded_key = BTreeKey::arbitrary(key_len);
-    let mut buf = encoded_key.modify_inplace();
-    node.copy_slot_key(slot, &mut buf);
-    drop(buf);
-    let row_id = node.unpack_value::<BTreeU64>(slot).to_row_id();
-    let value = node.value_for_slot::<BTreeByte>(slot);
-    entries.push(MemIndexEntry {
-        encoded_key,
-        row_id,
-        deleted: value.is_deleted(),
-    });
 }

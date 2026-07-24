@@ -723,44 +723,6 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         }
     }
 
-    /// Collect all logical entries in durable key order.
-    ///
-    /// This is intentionally simple for Phase 1 and powers scan APIs and rewrite
-    /// tests. Validation checks that the traversal observes strictly increasing
-    /// leaf keys.
-    async fn collect_entries(&self) -> RuntimeResult<Vec<LogicalEntry>> {
-        if self.root_block_id == SUPER_BLOCK_ID {
-            return Ok(Vec::new());
-        }
-        let mut stack = vec![self.root_block_id];
-        let mut entries: Vec<LogicalEntry> = Vec::new();
-        while let Some(block_id) = stack.pop() {
-            let guard = self.read_node(block_id).await?;
-            let node = guard.node();
-            if node.is_leaf() {
-                for idx in 0..node.count() {
-                    let entry = self.node_result(block_id, F::leaf_entry(node, idx))?;
-                    if entries.last().is_some_and(|prev| prev.key >= entry.key) {
-                        return Err(Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, leaf entries are not strictly sorted",
-                                self.file_kind()
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_secondary_disk_tree_entries"));
-                    }
-                    entries.push(entry);
-                }
-            } else {
-                let branch_entries = self.node_result(block_id, branch_entries_from_node(node))?;
-                for entry in branch_entries.into_iter().rev() {
-                    stack.push(entry.block_id);
-                }
-            }
-        }
-        Ok(entries)
-    }
-
     /// Collect every node block reachable from this root snapshot.
     pub(crate) async fn collect_reachable_blocks(
         &self,
@@ -828,71 +790,6 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                         .attach("operation=collect_secondary_disk_tree_reachable_blocks"));
                 }
                 stack.push(child_block_id);
-            }
-        }
-        Ok(())
-    }
-
-    /// Visit logical entries from the first key greater than or equal to
-    /// `start_key`, stopping when the visitor returns `false`.
-    async fn scan_entries_from<V>(&self, start_key: &[u8], mut visitor: V) -> RuntimeResult<()>
-    where
-        V: FnMut(LogicalEntry) -> RuntimeResult<bool>,
-    {
-        if self.root_block_id == SUPER_BLOCK_ID {
-            return Ok(());
-        }
-        let mut stack = vec![self.root_block_id];
-        let mut last_key: Option<Vec<u8>> = None;
-        while let Some(block_id) = stack.pop() {
-            let guard = self.read_node(block_id).await?;
-            let node = guard.node();
-            if node.is_leaf() {
-                for idx in node.lower_bound_slot_idx(start_key)..node.count() {
-                    let entry = self.node_result(block_id, F::leaf_entry(node, idx))?;
-                    if last_key
-                        .as_ref()
-                        .is_some_and(|prev| prev.as_slice() >= entry.key.as_slice())
-                    {
-                        return Err(Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, leaf entries are not strictly sorted",
-                                self.file_kind()
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=scan_secondary_disk_tree_entries"));
-                    }
-                    last_key = Some(entry.key.clone());
-                    if !visitor(entry)? {
-                        return Ok(());
-                    }
-                }
-            } else {
-                let start_idx = node
-                    .lower_bound_child_entry_idx(start_key)
-                    .ok_or_else(|| {
-                        Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, lower-bound child is missing",
-                                self.file_kind()
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=scan_secondary_disk_tree_entries")
-                    })?;
-                let branch_entries = self.node_result(block_id, branch_entries_from_node(node))?;
-                if start_idx >= branch_entries.len() {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
-                            "file={}, block=secondary_disk_tree, block_id={block_id}, child index {start_idx} is out of bounds for {} branch entries",
-                            self.file_kind(),
-                            branch_entries.len()
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=scan_secondary_disk_tree_entries"));
-                }
-                for entry in branch_entries.into_iter().skip(start_idx).rev() {
-                    stack.push(entry.block_id);
-                }
             }
         }
         Ok(())
@@ -1874,22 +1771,6 @@ impl<'a> UniqueDiskTree<'a> {
         }
     }
 
-    /// Scan encoded logical keys and row ids in durable key order.
-    #[inline]
-    pub(crate) async fn scan_entries(&self) -> RuntimeResult<Vec<(Vec<u8>, RowID)>> {
-        Ok(self
-            .collect_entries()
-            .await?
-            .into_iter()
-            .map(|entry| {
-                let row_id = entry.row_id.unwrap_or_else(|| {
-                    panic!("DiskTree rewrite invariant violated: unique scan entry has no row id")
-                });
-                (entry.key, row_id)
-            })
-            .collect())
-    }
-
     /// Open a bounded lookup-candidate stream over this root snapshot.
     #[inline]
     pub(crate) fn scan_candidate_stream<'r>(
@@ -1937,48 +1818,6 @@ impl<'a> NonUniqueDiskTree<'a> {
     #[inline]
     pub(crate) async fn contains_exact_encoded(&self, key: &[u8]) -> RuntimeResult<bool> {
         Ok(self.lookup_encoded_entry(key).await?.is_some())
-    }
-
-    /// Prefix-scan one logical key and return encoded exact keys with row ids.
-    ///
-    /// Composite secondary-index reads use the encoded exact key to merge
-    /// MemIndex and DiskTree entries without duplicating key encoders outside the
-    /// concrete DiskTree reader.
-    #[inline]
-    pub(crate) async fn prefix_scan_entries(
-        &self,
-        key: &[Val],
-    ) -> RuntimeResult<Vec<(Vec<u8>, RowID)>> {
-        let prefix = self.encoder().encode_prefix(key, Some(ROW_ID_SIZE));
-        let prefix_bytes = prefix.as_bytes();
-        let mut entries = Vec::new();
-        self.scan_entries_from(prefix_bytes, |entry| {
-            if !entry.key.starts_with(prefix_bytes) {
-                return Ok(false);
-            }
-            let row_id = unpack_row_id_from_exact_key(&entry.key)
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=prefix_scan_secondary_disk_tree")?;
-            entries.push((entry.key, row_id));
-            Ok(true)
-        })
-        .await?;
-        Ok(entries)
-    }
-
-    /// Scan encoded exact keys and row ids in durable exact-key order.
-    #[inline]
-    pub(crate) async fn scan_entries(&self) -> RuntimeResult<Vec<(Vec<u8>, RowID)>> {
-        self.collect_entries()
-            .await?
-            .into_iter()
-            .map(|entry| {
-                let row_id = unpack_row_id_from_exact_key(&entry.key)
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=scan_secondary_disk_tree")?;
-                Ok((entry.key, row_id))
-            })
-            .collect()
     }
 
     /// Open a bounded lookup-candidate stream over this root snapshot.
@@ -2439,7 +2278,7 @@ mod tests {
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
     use crate::index::btree::{BTreeKey, KeyRange};
-    use crate::index::util::tests::drain_row_ids;
+    use crate::index::util::tests::{drain_candidates, drain_row_ids};
     use crate::layout::LayoutError;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
@@ -2448,7 +2287,6 @@ mod tests {
     use std::io::Error as StdIoError;
     use std::ops::Bound;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2483,6 +2321,36 @@ mod tests {
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()
+    }
+
+    fn full_key_range() -> KeyRange {
+        KeyRange::new(Bound::Unbounded, Bound::Unbounded)
+    }
+
+    async fn unique_scan_entries(tree: &UniqueDiskTree<'_>) -> Vec<(Vec<u8>, RowID)> {
+        let range = full_key_range();
+        let mut stream = tree.scan_candidate_stream(&range);
+        drain_candidates(&mut stream)
+            .await
+            .into_iter()
+            .map(|candidate| (candidate.encoded_key.as_bytes().to_vec(), candidate.row_id))
+            .collect()
+    }
+
+    async fn non_unique_scan_entries(tree: &NonUniqueDiskTree<'_>) -> Vec<(Vec<u8>, RowID)> {
+        let range = full_key_range();
+        let mut stream = tree.scan_candidate_stream(&range);
+        drain_candidates(&mut stream)
+            .await
+            .into_iter()
+            .map(|candidate| (candidate.encoded_key.as_bytes().to_vec(), candidate.row_id))
+            .collect()
+    }
+
+    async fn non_unique_prefix_scan_rows(tree: &NonUniqueDiskTree<'_>, key: &[Val]) -> Vec<RowID> {
+        let range = tree.encoder().encode_non_unique_equal_range(key);
+        let mut stream = tree.scan_candidate_stream(&range);
+        drain_row_ids(&mut stream).await
     }
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
@@ -2651,29 +2519,6 @@ mod tests {
                 .map(|key| NonUniqueDiskTreeEncodedExact { key })
                 .collect::<Vec<_>>();
             self.batch_exact_delete_encoded(&encoded_entries)
-        }
-    }
-
-    trait NonUniqueDiskTreeTestExt {
-        fn prefix_scan<'b>(
-            &'b self,
-            key: &'b [Val],
-        ) -> Pin<Box<dyn Future<Output = RuntimeResult<Vec<RowID>>> + 'b>>;
-    }
-
-    impl NonUniqueDiskTreeTestExt for NonUniqueDiskTree<'_> {
-        fn prefix_scan<'b>(
-            &'b self,
-            key: &'b [Val],
-        ) -> Pin<Box<dyn Future<Output = RuntimeResult<Vec<RowID>>> + 'b>> {
-            Box::pin(async move {
-                Ok(self
-                    .prefix_scan_entries(key)
-                    .await?
-                    .into_iter()
-                    .map(|(_, row_id)| row_id)
-                    .collect())
-            })
         }
     }
 
@@ -2880,7 +2725,7 @@ mod tests {
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             assert_eq!(tree.lookup(&[Val::from(1u32)]).await.unwrap(), None);
-            assert!(tree.scan_entries().await.unwrap().is_empty());
+            assert!(unique_scan_entries(&tree).await.is_empty());
             drop(table);
             drop(fs);
         });
@@ -2908,12 +2753,11 @@ mod tests {
                     .unwrap()
             );
             assert!(
-                tree.prefix_scan(&[Val::from(1u32)])
+                non_unique_prefix_scan_rows(&tree, &[Val::from(1u32)])
                     .await
-                    .unwrap()
                     .is_empty()
             );
-            assert!(tree.scan_entries().await.unwrap().is_empty());
+            assert!(non_unique_scan_entries(&tree).await.is_empty());
             drop(table);
             drop(fs);
         });
@@ -2964,10 +2808,8 @@ mod tests {
 
             let tree = runtime.open(root, &guard);
             assert_eq!(tree.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
-            let rows = tree
-                .scan_entries()
+            let rows = unique_scan_entries(&tree)
                 .await
-                .unwrap()
                 .into_iter()
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
@@ -3046,7 +2888,7 @@ mod tests {
                 Some(RowID::from(ENTRY_COUNT) + 99)
             );
 
-            let scanned = tree.scan_entries().await.unwrap();
+            let scanned = unique_scan_entries(&tree).await;
             assert_eq!(scanned.len(), ENTRY_COUNT as usize);
             assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
@@ -3116,7 +2958,7 @@ mod tests {
             assert!(summaries.iter().any(|summary| {
                 summary.is_leaf && summary.has_upper_fence && summary.common_prefix_len > 0
             }));
-            let rows = tree.prefix_scan(&key).await.unwrap();
+            let rows = non_unique_prefix_scan_rows(&tree, &key).await;
             assert_eq!(rows.len(), ENTRY_COUNT);
             assert_eq!(rows.first().copied(), Some(RowID::new(1_000)));
             assert_eq!(rows.last().copied(), Some(RowID::from(ENTRY_COUNT) + 999));
@@ -3171,7 +3013,7 @@ mod tests {
                     Some(RowID::from(idx) + 5_000)
                 );
             }
-            let scanned = tree.scan_entries().await.unwrap();
+            let scanned = unique_scan_entries(&tree).await;
             assert_eq!(scanned.len(), ENTRY_COUNT);
             assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
@@ -3233,7 +3075,7 @@ mod tests {
             let tree = runtime.open(root, &guard);
             assert!(tree.contains_exact(&key1, RowID::new(10)).await.unwrap());
             assert_eq!(
-                tree.prefix_scan(&key1).await.unwrap(),
+                non_unique_prefix_scan_rows(&tree, &key1).await,
                 test_row_ids([10, 11])
             );
 
@@ -3259,7 +3101,7 @@ mod tests {
             let new_root = writer.finish().await.unwrap();
             let new_tree = runtime.open(new_root, &guard);
             assert_eq!(
-                new_tree.prefix_scan(&key1).await.unwrap(),
+                non_unique_prefix_scan_rows(&new_tree, &key1).await,
                 test_row_ids([11, 12])
             );
             assert!(
@@ -3269,7 +3111,7 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(
-                tree.prefix_scan(&key1).await.unwrap(),
+                non_unique_prefix_scan_rows(&tree, &key1).await,
                 test_row_ids([10, 11])
             );
         });
@@ -3319,7 +3161,10 @@ mod tests {
             let tree = runtime.open(root, &guard);
             let key = [Val::from(7u32)];
             let stats_before = disk_pool.global_stats();
-            assert_eq!(tree.prefix_scan(&key).await.unwrap(), test_row_ids([1007]));
+            assert_eq!(
+                non_unique_prefix_scan_rows(&tree, &key).await,
+                test_row_ids([1007])
+            );
             let delta = disk_pool.global_stats().delta_since(stats_before);
             assert!(
                 delta.cache_misses < tree_blocks / 2,
@@ -3580,7 +3425,7 @@ mod tests {
             let non_unique_root = writer.finish().await.unwrap();
             let non_unique_tree = non_unique_runtime.open(non_unique_root, &guard);
             assert_eq!(
-                non_unique_tree.prefix_scan(&key1).await.unwrap(),
+                non_unique_prefix_scan_rows(&non_unique_tree, &key1).await,
                 test_row_ids([11])
             );
         });
@@ -3630,10 +3475,8 @@ mod tests {
             assert_ne!(root, SUPER_BLOCK_ID);
 
             let tree = runtime.open(root, &guard);
-            let rows = tree
-                .scan_entries()
+            let rows = unique_scan_entries(&tree)
                 .await
-                .unwrap()
                 .into_iter()
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
@@ -3663,12 +3506,10 @@ mod tests {
             assert_eq!(empty_tree.lookup(&key1).await.unwrap(), None);
             assert_eq!(empty_tree.lookup(&key2).await.unwrap(), None);
             assert_eq!(empty_tree.lookup(&key3).await.unwrap(), None);
-            assert!(empty_tree.scan_entries().await.unwrap().is_empty());
+            assert!(unique_scan_entries(&empty_tree).await.is_empty());
 
-            let rows = tree
-                .scan_entries()
+            let rows = unique_scan_entries(&tree)
                 .await
-                .unwrap()
                 .into_iter()
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
@@ -3720,10 +3561,13 @@ mod tests {
 
             let tree = runtime.open(root, &guard);
             assert_eq!(
-                tree.prefix_scan(&key1).await.unwrap(),
+                non_unique_prefix_scan_rows(&tree, &key1).await,
                 test_row_ids([10, 11])
             );
-            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), test_row_ids([20]));
+            assert_eq!(
+                non_unique_prefix_scan_rows(&tree, &key2).await,
+                test_row_ids([20])
+            );
 
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer
@@ -3764,15 +3608,26 @@ mod tests {
                     .await
                     .unwrap()
             );
-            assert!(empty_tree.prefix_scan(&key1).await.unwrap().is_empty());
-            assert!(empty_tree.prefix_scan(&key2).await.unwrap().is_empty());
-            assert!(empty_tree.scan_entries().await.unwrap().is_empty());
+            assert!(
+                non_unique_prefix_scan_rows(&empty_tree, &key1)
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                non_unique_prefix_scan_rows(&empty_tree, &key2)
+                    .await
+                    .is_empty()
+            );
+            assert!(non_unique_scan_entries(&empty_tree).await.is_empty());
 
             assert_eq!(
-                tree.prefix_scan(&key1).await.unwrap(),
+                non_unique_prefix_scan_rows(&tree, &key1).await,
                 test_row_ids([10, 11])
             );
-            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), test_row_ids([20]));
+            assert_eq!(
+                non_unique_prefix_scan_rows(&tree, &key2).await,
+                test_row_ids([20])
+            );
         });
     }
 
@@ -3851,19 +3706,14 @@ mod tests {
             assert_eq!(compacted_guard.node().count(), expected_rows.len());
             drop(compacted_guard);
 
-            let rows = compacted_tree
-                .scan_entries()
+            let rows = unique_scan_entries(&compacted_tree)
                 .await
-                .unwrap()
                 .into_iter()
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
             assert_eq!(rows, expected_rows);
             assert_eq!(compacted_tree.lookup(&keys[1]).await.unwrap(), None);
-            assert_eq!(
-                tree.scan_entries().await.unwrap().len(),
-                ENTRY_COUNT as usize
-            );
+            assert_eq!(unique_scan_entries(&tree).await.len(), ENTRY_COUNT as usize);
         });
     }
 
