@@ -751,8 +751,6 @@ impl SecondaryCheckpointSidecar {
     ) {
         // The page and column layout were validated together before the LWC
         // callback runs, and active key columns come from that same metadata.
-        let expected = self.indexes.len();
-        let mut added = 0;
         for active in &mut self.indexes {
             let key = active
                 .key_cols
@@ -760,12 +758,7 @@ impl SecondaryCheckpointSidecar {
                 .map(|col_idx| page.val(col_layout, row_idx, *col_idx))
                 .collect();
             active.sidecar.add_data(key, row_id);
-            added += 1;
         }
-        assert_eq!(
-            added, expected,
-            "secondary checkpoint sidecar invariant violated: current row was not sent to every active index, row_id={row_id}, added={added}, expected={expected}"
-        );
     }
 
     fn add_deleted_key_at(

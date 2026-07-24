@@ -1,7 +1,7 @@
 ---
 id: 000235
 title: Optimize proof-bound dual-tree index mutations
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-23
 github_issue: 881
 ---
@@ -91,7 +91,7 @@ Issue Labels:
 
 Source Backlogs:
 
-- docs/backlogs/000086-secondary-index-dual-tree-access-path.md
+- docs/backlogs/closed/000086-secondary-index-dual-tree-access-path.md
 
 Related Design:
 
@@ -209,9 +209,10 @@ layout. It does not claim historical candidate completeness.
    in a table pass. Retry a root published after transaction start immediately.
 4. Return completed cleanup accounting as
    `MemIndexCleanupOutcome { stats: MemIndexCleanupStats, live_delay }`.
-5. Document and assert the pinned current-row index completeness invariant at
+5. Document and guard the pinned current-row index completeness invariant at
    root/layout capture, checkpoint sidecar production, proof construction, and
-   proof consumption.
+   proof consumption, using structural full-vector iteration for per-row
+   checkpoint fanout.
 6. Add one non-`Clone`, single-use `OwnedRowIndexSetProof` with private fields
    and root-relative `MemRequired` / `Persisted` storage mode.
 7. Construct the proof only after definitive RowPage write ownership or
@@ -629,8 +630,9 @@ about one old current row never authorizes a different unique owner claim.
   metadata index exactly once.
 - At secondary checkpoint sidecar creation/application, assert active sidecar
   identities equal active metadata identities.
-- Assert each accepted current row is fanned out to every active sidecar before
-  root publication.
+- Fan out each accepted current row by directly iterating the complete active
+  sidecar vector. Do not maintain a per-row completion counter whose equality
+  only restates iterator completion.
 - Keep column and secondary root publication atomic; document the existing
   mutable-root publication boundary.
 
@@ -772,7 +774,8 @@ about one old current row never authorizes a different unique owner claim.
   - conditional persisted masking and undo integration
   - unique claim observation integration
 - `doradb-storage/src/table/persistence.rs`
-  - checkpoint sidecar identity/fanout assertions and invariant comments
+  - checkpoint sidecar identity assertions, structural fanout, and invariant
+    comments
 - `doradb-storage/src/table/mod.rs`
   - narrow snapshot accessors only if needed for proof diagnostics
 - `docs/secondary-index.md`
@@ -879,8 +882,9 @@ about one old current row never authorizes a different unique owner claim.
 6. Verify source Disk row at or above captured pivot is impossible.
 7. Verify persisted construction rejects a row/key/LWC shape inconsistent with
    the captured column root.
-8. Verify checkpoint sidecar identities and per-row fanout cover every active
-   index before atomic root publication.
+8. Verify checkpoint sidecar identities match active metadata and checkpointed
+   rows appear in every active secondary DiskTree before atomic root
+   publication.
 
 ### End-to-end behavior
 
@@ -914,9 +918,10 @@ about one old current row never authorizes a different unique owner claim.
 3. Cleanup uses one transaction/root snapshot for all indexes, retries capture
    races immediately, and returns
    `MemIndexCleanupOutcome { stats, live_delay }`.
-4. The pinned current-row completeness invariant is documented and guarded by
-   release assertions at root/layout, checkpoint, proof construction, and
-   proof consumption boundaries.
+4. The pinned current-row completeness invariant is documented; release
+   assertions guard root/layout compatibility, checkpoint sidecar identity,
+   proof construction, and proof consumption, while direct active-sidecar
+   iteration structurally provides per-row checkpoint fanout.
 5. One non-`Clone` `OwnedRowIndexSetProof` replaces separate hot/cold proof
    concepts.
 6. RowID-stable hot updates bind and reconstruct only affected old index
@@ -957,14 +962,41 @@ about one old current row never authorizes a different unique owner claim.
 
 ## Implementation Notes
 
-- The cleanup prerequisite and its public outcome rename are already
-  implemented in the task worktree and must be preserved while the foreground
-  proof work proceeds.
-- No unsafe-code change is expected. If implementation reaches unsafe
-  BTree/page internals, stop and apply
-  `docs/process/unsafe-review-checklist.md`.
-- Cleanup maintenance intentionally tolerates root/layout skew and must not
-  reuse foreground compatibility assertions without preserving that behavior.
+- Implemented the strict live-cleanup effective-time gate, one maintenance
+  transaction and root snapshot per table pass, immediate root-capture-race
+  retry, per-entry durable equivalence checks, and
+  `MemIndexCleanupOutcome { stats, live_delay }`. Cleanup still tolerates
+  metadata/layout skew and continues independently proven delete-overlay
+  removal when live cleanup is delayed or disabled.
+- Replaced the generic `UniqueIndex` and `NonUniqueIndex` traits and lossy
+  composite mutation adapters with concrete guarded and root-bound APIs.
+  Added exact `IndexMask` outcomes, atomic unique replace-or-insert, retained
+  `UniqueOwnerObservation` claims, and captured-pivot Mem-only non-unique
+  insertion. BTree scan traversal was consolidated into the resumable cursor
+  implementation so production cleanup scans and tests share the same path.
+- Added the single-use root-relative `OwnedRowIndexSetProof` and the
+  `MemRequired` / `Persisted` consumption matrix. Mem-required absence or
+  incompatible state fails closed; persisted absence is a successful no-op
+  with no overlay, undo, purge payload, or cleanup obligation. Existing
+  duplicate, conflict, runtime-link, rollback, checkpoint, deletion-checkpoint,
+  restart, and recovery behavior remains on the production paths.
+- Added O(1) foreground root/layout compatibility assertions, structural
+  layout/root validation, checkpoint sidecar identity checks, and complete
+  proof-key validation. Review removed the planned per-row checkpoint
+  completion counter and assertion because the counter advanced exactly once
+  per direct sidecar iteration and therefore could not fail; direct iteration
+  remains the structural fanout guarantee.
+- Updated secondary-index and garbage-collection design documentation. The
+  discovered CREATE INDEX historical-candidate gap is intentionally deferred
+  with full recovery context in backlog 000163. Resolution closes source
+  backlog 000086; cleanup batching backlog 000095 remains open.
+- Verification completed with 1,512 passing workspace nextest cases, focused
+  unique and multi-index/non-unique checkpoint tests after the review
+  correction, formatting and workspace Clippy through the mandatory style
+  gate, and a passing style audit across 23 branch-diff Rust files. The
+  alternate `libaio` pass was not required because no backend-neutral I/O code
+  changed. No unsafe code or unsafe contract changed; the inventory date was
+  refreshed.
 
 ## Open Questions
 

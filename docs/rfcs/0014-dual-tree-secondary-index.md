@@ -633,6 +633,13 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
   persisting finite upper fences for non-rightmost DiskTree leaf and branch
   nodes. [Task Resolve Sync: docs/tasks/000122-disk-tree-prefix-compression.md
   @ 2026-04-18]
+- Follow-up task 000235 resolved the dual-tree access-path backlog with
+  proof-bound MemIndex mutations, conditional persisted masking, exact cleanup
+  gating, and concrete root-bound index APIs. It also retained CREATE INDEX
+  historical completeness as a separate deferred correctness program. [Task
+  Resolve Sync:
+  docs/tasks/000235-optimize-proof-bound-dual-tree-index-mutations.md @
+  2026-07-24]
 
 ## Open Questions
 
@@ -640,13 +647,13 @@ None.
 
 ## Deferred Follow-up Backlogs
 
-The implementation intentionally deferred the following non-blocking work. These
-items remain open for future task/RFC planning and are not required to close RFC
-0014:
+The implementation intentionally deferred the following non-blocking work.
+Closed paths record completed follow-ups; the remaining open items are not
+required to close RFC 0014:
 
 - `docs/backlogs/000083-full-disk-tree-compaction-policy.md`
 - `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
-- `docs/backlogs/000086-secondary-index-dual-tree-access-path.md`
+- `docs/backlogs/closed/000086-secondary-index-dual-tree-access-path.md`
 - `docs/backlogs/000087-refactor-recovery-process-parallel-log-replay.md`
 - `docs/backlogs/000088-remove-recovery-skip-option.md`
 - `docs/backlogs/000090-protect-disk-tree-root-lifetime.md`
