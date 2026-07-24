@@ -1,13 +1,13 @@
 pub(crate) mod algo;
+mod cursor;
 mod hint;
 mod key;
 mod node;
-mod scan;
 mod value;
 
 use crate::buffer::guard::{
     ExclusiveLockStrategy, FacadePageGuard, LockStrategy, OptimisticLockStrategy,
-    PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard, SharedLockStrategy,
+    PageExclusiveGuard, PageGuard, PageOptimisticGuard, SharedLockStrategy,
 };
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
@@ -21,15 +21,16 @@ use crate::index::btree::algo::{
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
+use cursor::{build_exhausted_parent_seek_key, make_strict_successor};
 use either::Either;
 use error_stack::Report;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub(crate) use cursor::{BTreeNodeCursor, BTreeNodeCursorState};
 pub(crate) use hint::*;
 pub(crate) use key::*;
 pub(crate) use node::*;
-pub(crate) use scan::*;
 pub(crate) use value::*;
 
 /// Shared latch strategy used by B-tree traversal helpers.
@@ -64,6 +65,17 @@ impl<V: BTreeValue> BTreeInsert<V> {
     }
 }
 
+/// Result of atomically replacing an expected value or inserting on absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BTreeReplaceOrInsert<V: BTreeValue> {
+    /// The key was absent and the new value was inserted.
+    Inserted,
+    /// The key held the expected value and was replaced.
+    Replaced,
+    /// The key held another value and was left unchanged.
+    ValueMismatch(V),
+}
+
 /// Result of deleting a key/value pair from a B-tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BTreeDelete {
@@ -94,6 +106,12 @@ impl<V: BTreeValue> BTreeUpdate<V> {
     pub(crate) fn is_ok(&self) -> bool {
         matches!(self, BTreeUpdate::Ok(_))
     }
+}
+
+enum BTreeInsertMutation<V: BTreeValue> {
+    Inserted,
+    Replaced,
+    Existing(V),
 }
 
 /// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
@@ -243,6 +261,62 @@ impl<P: BufferPool> GenericBTree<P> {
         merge_if_match_deleted: bool,
         ts: TrxID,
     ) -> RuntimeResult<BTreeInsert<V>> {
+        Ok(
+            match self
+                .insert_or_replace_if(pool_guard, key, value, ts, |old_value| {
+                    merge_if_match_deleted && old_value.value() == value && old_value.is_deleted()
+                })
+                .await?
+            {
+                BTreeInsertMutation::Inserted => BTreeInsert::Ok(false),
+                BTreeInsertMutation::Replaced => BTreeInsert::Ok(true),
+                BTreeInsertMutation::Existing(old_value) => BTreeInsert::DuplicateKey(old_value),
+            },
+        )
+    }
+
+    /// Atomically replace `expected_value` or insert `new_value` when absent.
+    ///
+    /// Matching compares the complete value, including its delete-bit state.
+    /// A different current value is returned without mutation.
+    #[inline]
+    pub(crate) async fn replace_or_insert<V: BTreeValue>(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+        expected_value: V,
+        new_value: V,
+        ts: TrxID,
+    ) -> RuntimeResult<BTreeReplaceOrInsert<V>> {
+        Ok(
+            match self
+                .insert_or_replace_if(pool_guard, key, new_value, ts, |old_value| {
+                    old_value == expected_value
+                })
+                .await?
+            {
+                BTreeInsertMutation::Inserted => BTreeReplaceOrInsert::Inserted,
+                BTreeInsertMutation::Replaced => BTreeReplaceOrInsert::Replaced,
+                BTreeInsertMutation::Existing(old_value) => {
+                    BTreeReplaceOrInsert::ValueMismatch(old_value)
+                }
+            },
+        )
+    }
+
+    #[inline]
+    async fn insert_or_replace_if<V, F>(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+        value: V,
+        ts: TrxID,
+        replace_if: F,
+    ) -> RuntimeResult<BTreeInsertMutation<V>>
+    where
+        V: BTreeValue,
+        F: Fn(V) -> bool,
+    {
         // Stack holds the path from root to leaf.
         loop {
             let res = self
@@ -254,18 +328,13 @@ impl<P: BufferPool> GenericBTree<P> {
             let idx = match node.search_key(key) {
                 Err(idx) => idx,
                 Ok(idx) => {
-                    // Here we special handle the case that old value is same as input value
-                    // but already masked as deleted.
-                    // If merge_if_match_deleted set to true, we unset the delete flag
-                    // and make the insert success.
-                    let old_v = node.value::<V>(idx);
-                    if merge_if_match_deleted && old_v.value() == value && old_v.is_deleted() {
-                        // This check can be applied to both unique index and non-unique index.
+                    let old_value = node.value::<V>(idx);
+                    if replace_if(old_value) {
                         node.update_value(idx, value);
                         node.update_ts(ts);
-                        return Ok(BTreeInsert::Ok(true));
+                        return Ok(BTreeInsertMutation::Replaced);
                     }
-                    return Ok(BTreeInsert::DuplicateKey(old_v));
+                    return Ok(BTreeInsertMutation::Existing(old_value));
                 }
             };
             if !node.can_insert::<V>(key) {
@@ -306,7 +375,7 @@ impl<P: BufferPool> GenericBTree<P> {
             node.insert_at(idx, key, value);
             node.update_hints();
             node.update_ts(ts);
-            return Ok(BTreeInsert::Ok(false));
+            return Ok(BTreeInsertMutation::Inserted);
         }
     }
 
@@ -393,16 +462,6 @@ impl<P: BufferPool> GenericBTree<P> {
         height: usize,
     ) -> BTreeNodeCursor<'a, P> {
         BTreeNodeCursor::new(self, pool_guard, height)
-    }
-
-    /// Create a prefix scanner to scan keys.
-    #[inline]
-    pub(crate) fn prefix_scanner<'a, C: BTreeSlotCallback>(
-        &'a self,
-        pool_guard: &'a PoolGuard,
-        callback: C,
-    ) -> BTreePrefixScan<'a, C, P> {
-        BTreePrefixScan::new(self, pool_guard, callback)
     }
 
     /// Collect space statistics at given height.
@@ -1398,136 +1457,6 @@ impl SplitNode {
     }
 }
 
-/// Shared cursor of nodes at given height.
-/// At most two locks are held at the same time.
-///
-/// This cursor does not guarantee consistent snapshot during iterating
-/// the tree nodes.
-/// But it guarantees if a value(node) does not change during the traverse,
-/// it will be always visited.
-pub(crate) struct BTreeNodeCursorState {
-    height: usize,
-    coupling: BTreeCoupling<SharedStrategy>,
-    resume_key_buffer: Vec<u8>,
-}
-
-impl BTreeNodeCursorState {
-    #[inline]
-    fn resumed_same_parent(&self, exhausted_parent_page_id: PageID) -> bool {
-        self.coupling
-            .parent
-            .as_ref()
-            .map(|parent| parent.g.page_id())
-            == Some(exhausted_parent_page_id)
-    }
-
-    /// Create a new cursor.
-    #[inline]
-    pub(crate) fn new(height: usize) -> Self {
-        Self {
-            height,
-            coupling: BTreeCoupling::<SharedStrategy>::new(),
-            resume_key_buffer: Vec::new(),
-        }
-    }
-
-    /// Seek to the first node at this cursor height that may contain `key`.
-    #[inline]
-    pub(crate) async fn seek<P: BufferPool>(
-        &mut self,
-        tree: &GenericBTree<P>,
-        pool_guard: &PoolGuard,
-        key: &[u8],
-    ) -> RuntimeResult<()> {
-        self.coupling
-            .seek_and_lock(tree, pool_guard, self.height, key)
-            .await
-    }
-
-    /// Fetch next node.
-    #[inline]
-    pub(crate) async fn next<P: BufferPool>(
-        &mut self,
-        tree: &GenericBTree<P>,
-        pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Option<PageSharedGuard<BTreeNode>>> {
-        if let Some(g) = self.coupling.node.take() {
-            return Ok(Some(g));
-        }
-        if let Some(parent) = self.coupling.parent.as_ref() {
-            let exhausted_parent_page_id = {
-                let p_node = parent.g.page();
-                let next_idx = (parent.idx + 1) as usize;
-                if next_idx == p_node.count() {
-                    // current parent exhausted.
-                    if p_node.has_no_upper_fence() {
-                        // The tree exhausted.
-                        self.coupling.reset();
-                        return Ok(None);
-                    }
-                    build_exhausted_parent_seek_key(p_node, &mut self.resume_key_buffer);
-                    Some(parent.g.page_id())
-                } else {
-                    let c_page_id = p_node.value_as_page_id(next_idx);
-                    self.coupling.parent.as_mut().unwrap().idx = next_idx as isize;
-                    let c_guard = tree
-                        .pool
-                        .get_page::<BTreeNode>(pool_guard, c_page_id, LatchFallbackMode::Shared)
-                        .await?
-                        .lock_shared_async()
-                        .await
-                        .unwrap();
-                    return Ok(Some(c_guard));
-                }
-            };
-            self.coupling
-                .seek_and_lock(tree, pool_guard, self.height, &self.resume_key_buffer)
-                .await?;
-            if let Some(exhausted_parent_page_id) = exhausted_parent_page_id
-                && self.resumed_same_parent(exhausted_parent_page_id)
-            {
-                make_strict_successor(&mut self.resume_key_buffer);
-                self.coupling
-                    .seek_and_lock(tree, pool_guard, self.height, &self.resume_key_buffer)
-                    .await?;
-            }
-            return Ok(self.coupling.node.take());
-        }
-        Ok(None)
-    }
-}
-
-/// Resumable cursor over B-tree nodes at one height.
-pub(crate) struct BTreeNodeCursor<'a, P: 'static> {
-    tree: &'a GenericBTree<P>,
-    pool_guard: &'a PoolGuard,
-    state: BTreeNodeCursorState,
-}
-
-impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
-    /// Create a new cursor.
-    #[inline]
-    pub(crate) fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, height: usize) -> Self {
-        BTreeNodeCursor {
-            tree,
-            pool_guard,
-            state: BTreeNodeCursorState::new(height),
-        }
-    }
-
-    /// Seek to the first node at this cursor height that may contain `key`.
-    #[inline]
-    pub(crate) async fn seek(&mut self, key: &[u8]) -> RuntimeResult<()> {
-        self.state.seek(self.tree, self.pool_guard, key).await
-    }
-
-    /// Fetch next node.
-    #[inline]
-    pub(crate) async fn next(&mut self) -> RuntimeResult<Option<PageSharedGuard<BTreeNode>>> {
-        self.state.next(self.tree, self.pool_guard).await
-    }
-}
-
 /// Very simple configuration on B-tree Compaction.
 /// Compaction will be triggered if node effective space
 /// is lower than low ratio, and will try best to fit
@@ -1922,20 +1851,6 @@ async fn revalidate_child_separator_for_split(
     Some(c_guard)
 }
 
-#[inline]
-fn build_exhausted_parent_seek_key(node: &BTreeNode, key_buffer: &mut Vec<u8>) {
-    key_buffer.clear();
-    if node.has_no_upper_fence() {
-        return;
-    }
-    node.extend_upper_fence_key(key_buffer);
-}
-
-#[inline]
-fn make_strict_successor(key_buffer: &mut Vec<u8>) {
-    key_buffer.push(0);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1944,7 +1859,7 @@ mod tests {
     use crate::buffer::page::Page;
     use crate::error::ResourceError;
     use crate::map::FastHashMap;
-    use crate::quiescent::{QuiescentBox, QuiescentGuard};
+    use crate::quiescent::QuiescentBox;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
     use rand_distr::{Distribution, Uniform};
@@ -1967,15 +1882,6 @@ mod tests {
         keys: usize,
         first_key_len: usize,
         prefix_len: usize,
-    }
-
-    struct ExactBoundaryResumeFixture {
-        tree: BTree,
-        left_branch_page_id: PageID,
-        right_branch_page_id: PageID,
-        left_leaf_page_id: PageID,
-        first_right_leaf_page_id: PageID,
-        second_right_leaf_page_id: PageID,
     }
 
     fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
@@ -2101,130 +2007,6 @@ mod tests {
                 .unwrap();
             let res2 = map.get(&k).copied().map(BTreeU64::from);
             assert_eq!(res1, res2);
-        }
-    }
-
-    async fn build_exact_boundary_resume_fixture(
-        pool: QuiescentGuard<FixedBufferPool>,
-        pool_guard: &PoolGuard,
-    ) -> ExactBoundaryResumeFixture {
-        let tree = BTree::new(pool, pool_guard, false, TrxID::new(200))
-            .await
-            .expect("test btree construction should succeed");
-
-        let mut left_leaf_guard = tree
-            .allocate_node(pool_guard)
-            .await
-            .expect("test node allocation should succeed");
-        let left_leaf_page_id = left_leaf_guard.page_id();
-        let left_leaf = left_leaf_guard.page_mut();
-        left_leaf.init(
-            0,
-            TrxID::new(200),
-            &[],
-            BTreeU64::INVALID_VALUE,
-            b"ab",
-            false,
-        );
-        left_leaf.insert(b"aa", BTreeU64::from(1));
-        drop(left_leaf_guard);
-
-        let mut first_right_leaf_guard = tree
-            .allocate_node(pool_guard)
-            .await
-            .expect("test node allocation should succeed");
-        let first_right_leaf_page_id = first_right_leaf_guard.page_id();
-        let first_right_leaf = first_right_leaf_guard.page_mut();
-        first_right_leaf.init(
-            0,
-            TrxID::new(200),
-            b"ab",
-            BTreeU64::INVALID_VALUE,
-            b"ab\0",
-            false,
-        );
-        first_right_leaf.insert(b"ab", BTreeU64::from(2));
-        drop(first_right_leaf_guard);
-
-        let mut second_right_leaf_guard = tree
-            .allocate_node(pool_guard)
-            .await
-            .expect("test node allocation should succeed");
-        let second_right_leaf_page_id = second_right_leaf_guard.page_id();
-        let second_right_leaf = second_right_leaf_guard.page_mut();
-        second_right_leaf.init(
-            0,
-            TrxID::new(200),
-            b"ab\0",
-            BTreeU64::INVALID_VALUE,
-            &[],
-            false,
-        );
-        second_right_leaf.insert(b"ab\0", BTreeU64::from(3));
-        drop(second_right_leaf_guard);
-
-        let mut left_branch_guard = tree
-            .allocate_node(pool_guard)
-            .await
-            .expect("test node allocation should succeed");
-        let left_branch_page_id = left_branch_guard.page_id();
-        let left_branch = left_branch_guard.page_mut();
-        left_branch.init(
-            1,
-            TrxID::new(200),
-            &[],
-            BTreeU64::from(left_leaf_page_id),
-            b"ab",
-            false,
-        );
-        drop(left_branch_guard);
-
-        let mut right_branch_guard = tree
-            .allocate_node(pool_guard)
-            .await
-            .expect("test node allocation should succeed");
-        let right_branch_page_id = right_branch_guard.page_id();
-        let right_branch = right_branch_guard.page_mut();
-        right_branch.init(
-            1,
-            TrxID::new(200),
-            b"ab",
-            BTreeU64::INVALID_VALUE,
-            &[],
-            false,
-        );
-        right_branch.insert(b"ab", BTreeU64::from(first_right_leaf_page_id));
-        right_branch.insert(b"ab\0", BTreeU64::from(second_right_leaf_page_id));
-        drop(right_branch_guard);
-
-        let mut root_guard = tree
-            .get_node(pool_guard, tree.root, LatchFallbackMode::Exclusive)
-            .await
-            .unwrap()
-            .lock_exclusive_async()
-            .await
-            .unwrap();
-        let root = root_guard.page_mut();
-        root.init(
-            2,
-            TrxID::new(200),
-            &[],
-            BTreeU64::from(left_branch_page_id),
-            &[],
-            false,
-        );
-        root.insert(b"ab", BTreeU64::from(right_branch_page_id));
-        drop(root_guard);
-
-        tree.height.store(2, Ordering::Release);
-
-        ExactBoundaryResumeFixture {
-            tree,
-            left_branch_page_id,
-            right_branch_page_id,
-            left_leaf_page_id,
-            first_right_leaf_page_id,
-            second_right_leaf_page_id,
         }
     }
 
@@ -2490,101 +2272,116 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_cursor_resumes_with_raw_upper_fence_before_strict_successor() {
+    fn test_btree_replace_or_insert_semantics() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            {
-                let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
+            let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
+                .await
+                .expect("test btree construction should succeed");
+            let key = b"replace-or-insert";
+            let first = BTreeU64::from(10);
+            let second = BTreeU64::from(20);
 
-                let root_guard = fixture
-                    .tree
-                    .get_node(&pool_guard, fixture.tree.root, LatchFallbackMode::Shared)
+            assert_eq!(
+                tree.replace_or_insert(
+                    &pool_guard,
+                    key,
+                    BTreeU64::from(999),
+                    first,
+                    TrxID::new(201),
+                )
+                .await
+                .unwrap(),
+                BTreeReplaceOrInsert::Inserted
+            );
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&pool_guard, key)
                     .await
-                    .unwrap()
-                    .lock_shared_async()
+                    .unwrap(),
+                Some(first)
+            );
+
+            assert_eq!(
+                tree.replace_or_insert(
+                    &pool_guard,
+                    key,
+                    BTreeU64::from(999),
+                    second,
+                    TrxID::new(202),
+                )
+                .await
+                .unwrap(),
+                BTreeReplaceOrInsert::ValueMismatch(first)
+            );
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&pool_guard, key)
                     .await
-                    .unwrap();
-                let root = root_guard.page();
-                assert_eq!(
-                    root.lookup_child(b"ab"),
-                    LookupChild::Slot(0, fixture.right_branch_page_id)
-                );
-                assert_eq!(
-                    root.lookup_child(b"ab\0"),
-                    LookupChild::Slot(0, fixture.right_branch_page_id)
-                );
-                drop(root_guard);
+                    .unwrap(),
+                Some(first)
+            );
 
-                let right_branch_guard = fixture
-                    .tree
-                    .get_node(
-                        &pool_guard,
-                        fixture.right_branch_page_id,
-                        LatchFallbackMode::Shared,
-                    )
+            assert_eq!(
+                tree.replace_or_insert(&pool_guard, key, first, second, TrxID::new(203))
                     .await
-                    .unwrap()
-                    .lock_shared_async()
+                    .unwrap(),
+                BTreeReplaceOrInsert::Replaced
+            );
+            assert_eq!(
+                tree.replace_or_insert(
+                    &pool_guard,
+                    key,
+                    second.deleted(),
+                    BTreeU64::from(30),
+                    TrxID::new(204),
+                )
+                .await
+                .unwrap(),
+                BTreeReplaceOrInsert::ValueMismatch(second)
+            );
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&pool_guard, key)
                     .await
-                    .unwrap();
-                let right_branch = right_branch_guard.page();
-                assert_eq!(
-                    right_branch.lookup_child(b"ab"),
-                    LookupChild::Slot(0, fixture.first_right_leaf_page_id)
-                );
-                assert_eq!(
-                    right_branch.lookup_child(b"ab\0"),
-                    LookupChild::Slot(1, fixture.second_right_leaf_page_id)
-                );
-                drop(right_branch_guard);
-
-                let mut cursor = fixture.tree.cursor(&pool_guard, 0);
-                cursor.seek(&[]).await.unwrap();
-
-                let first = cursor.next().await.unwrap().unwrap();
-                assert_eq!(first.page_id(), fixture.left_leaf_page_id);
-                drop(first);
-
-                let second = cursor.next().await.unwrap().unwrap();
-                assert_eq!(second.page_id(), fixture.first_right_leaf_page_id);
-                assert_ne!(second.page_id(), fixture.left_leaf_page_id);
-            }
+                    .unwrap(),
+                Some(second)
+            );
         })
     }
 
     #[test]
-    fn test_btree_compactor_parent_done_buffers_raw_upper_fence() {
+    fn test_btree_replace_or_insert_splits_for_absent_keys() {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            {
-                let fixture = build_exact_boundary_resume_fixture(pool.guard(), &pool_guard).await;
-                let mut compactor =
-                    fixture
-                        .tree
-                        .compact::<BTreeU64>(&pool_guard, 0, BTreeCompactConfig::default());
-                let mut lower_fence_key_buffer = Vec::new();
-                let mut upper_fence_key_buffer = Vec::new();
-                let mut purge_list = Vec::new();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
+                .await
+                .expect("test btree construction should succeed");
 
-                compactor.seek(&[]).await.unwrap();
-                let res = compactor
-                    .step(
-                        &mut lower_fence_key_buffer,
-                        &mut upper_fence_key_buffer,
-                        &mut purge_list,
+            for i in 0u64..128 {
+                let key = [u8::try_from(i).unwrap(); WIDE_KEY_LEN];
+                assert_eq!(
+                    tree.replace_or_insert(
+                        &pool_guard,
+                        &key,
+                        BTreeU64::INVALID_VALUE,
+                        BTreeU64::from(i),
+                        TrxID::new(201),
                     )
                     .await
-                    .unwrap();
-                assert!(
-                    matches!(res, BTreeCompact::ParentDone(page_id) if page_id == fixture.left_branch_page_id)
+                    .unwrap(),
+                    BTreeReplaceOrInsert::Inserted
                 );
-                assert_eq!(upper_fence_key_buffer, b"ab");
+            }
 
-                compactor.seek(&upper_fence_key_buffer).await.unwrap();
-                let node = compactor.coupling.node.as_ref().unwrap();
-                assert_eq!(node.page_id(), fixture.first_right_leaf_page_id);
+            assert!(tree.height() > 0);
+            for i in [0u64, 63, 127] {
+                let key = [u8::try_from(i).unwrap(); WIDE_KEY_LEN];
+                assert_eq!(
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &key)
+                        .await
+                        .unwrap(),
+                    Some(BTreeU64::from(i))
+                );
             }
         })
     }

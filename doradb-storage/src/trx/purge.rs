@@ -1432,7 +1432,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::error::{FatalError, Result, RuntimeError};
     use crate::id::{PageID, RowID, TableID};
-    use crate::index::{RowLocation, UniqueIndex};
+    use crate::index::RowLocation;
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
     use crate::row::ops::{DeleteMvcc, SelectKey};

@@ -744,6 +744,7 @@ impl BTreeNode {
     }
 
     /// Returns prefix length of this node.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn prefix_len(&self) -> usize {
         self.header.prefix_len() as usize
@@ -1375,12 +1376,6 @@ impl BTreeNode {
         res
     }
 
-    /// Return the raw upper fence slot stored in the header.
-    #[inline]
-    pub(crate) fn upper_fence_slot(&self) -> &BTreeSlot {
-        &self.header.upper_fence
-    }
-
     /// Append the exclusive upper fence key to `res`.
     #[inline]
     pub(crate) fn extend_upper_fence_key<T: BytesExtendable>(&self, res: &mut T) {
@@ -1488,16 +1483,6 @@ impl BTreeNode {
     #[inline]
     pub(crate) fn value_for_slot<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
         self.slot_value(slot)
-    }
-
-    /// Returns all values in this node.
-    #[inline]
-    pub(crate) fn values<V: BTreeValue, T, F: Fn(V) -> T>(&self, res: &mut Vec<T>, f: F) {
-        res.extend(
-            self.slots()
-                .iter()
-                .map(|slot| f(self.slot_value::<V>(slot))),
-        );
     }
 
     /// Replace the value at `idx` and return the previous value.
@@ -1816,19 +1801,6 @@ impl BTreeNode {
                 }
             }
         }
-    }
-
-    /// This method is used to check whether the slot key matches partial key prefix,
-    /// the common prefix of node is excluded in this check.
-    #[inline]
-    pub(in crate::index) fn slot_matches_k(&self, slot: &BTreeSlot, k: &[u8]) -> bool {
-        if (slot.len() as usize) < k.len() {
-            return false;
-        }
-        if slot.len() as usize <= KEY_HEAD_LEN {
-            return &slot.head_bytes()[..k.len()] == k;
-        }
-        &self.long_key_suffix(slot)[..k.len()] == k
     }
 
     #[inline]

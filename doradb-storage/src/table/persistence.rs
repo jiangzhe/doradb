@@ -714,7 +714,27 @@ impl SecondaryCheckpointSidecar {
                 sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
             })
             .collect();
-        Self { indexes }
+        let sidecar = Self { indexes };
+        sidecar.assert_matches_metadata(metadata);
+        sidecar
+    }
+
+    #[inline]
+    fn assert_matches_metadata(&self, metadata: &TableMetadata) {
+        let expected = metadata
+            .idx
+            .active_indexes()
+            .map(|(index_no, _)| index_no)
+            .collect::<Vec<_>>();
+        let actual = self
+            .indexes
+            .iter()
+            .map(|active| active.index_no)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "secondary checkpoint sidecar invariant violated: active identities differ from pinned metadata"
+        );
     }
 
     #[inline]
@@ -1185,6 +1205,8 @@ impl Table {
         sidecar: &mut SecondaryCheckpointSidecar,
         checkpoint_ts: TrxID,
     ) -> RuntimeOrFatalResult<()> {
+        let metadata = layout.metadata();
+        sidecar.assert_matches_metadata(metadata);
         if sidecar.is_empty() {
             return Ok(());
         }
@@ -1194,7 +1216,6 @@ impl Table {
         #[cfg(test)]
         test_hooks::maybe_force_secondary_sidecar_error()?;
 
-        let metadata = layout.metadata();
         if mutable_file.secondary_index_roots().len() != metadata.idx.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
@@ -2130,7 +2151,7 @@ mod tests {
         Error, FatalError, LifecycleError, OperationError, RuntimeError, RuntimeOrFatalError,
     };
     use crate::file::cow_file::tests::old_root_drop_count;
-    use crate::index::{RowLocation, UniqueIndex};
+    use crate::index::RowLocation;
     use crate::io::install_storage_backend_test_hook;
     use crate::row::ops::{SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{

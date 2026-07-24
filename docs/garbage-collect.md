@@ -112,8 +112,17 @@ encoded-key allocation. Hot delete overlays remain transaction index GC's
 responsibility because their proof requires row-page undo-chain context.
 
 Live-entry cleanup is policy-controlled. When enabled, live entries can be
-removed when the captured row id is below the captured pivot and the captured
-`DiskTree` already has the same durable entry:
+removed only after the captured root is older than every active snapshot:
+
+```text
+captured_root.effective_ts() < Global_Min_Active_STS
+```
+
+This root-level fence protects operations still bound to a displaced root whose
+`DiskTree` does not contain a row newly persisted by the captured root.
+Equality remains unsafe. After the fence succeeds, the captured row id must be
+below the captured pivot and the captured `DiskTree` must already have the same
+durable entry:
 
 - unique: same encoded logical key maps to the same row id
 - non-unique: same encoded exact `(logical_key, row_id)` key exists
@@ -121,7 +130,17 @@ removed when the captured row id is below the captured pivot and the captured
 When live-entry cleanup is disabled, all live entries are skipped before
 encoded-key allocation so the MemIndex can retain a warmer cache over DiskTree.
 Cleanup stats keep live skips and hot delete-overlay skips separate from
-processed cleanup candidate counts.
+processed cleanup candidate counts. If the caller requested live cleanup but
+the root fence failed, delete-overlay cleanup still runs and
+`MemIndexCleanupOutcome.live_delay` reports the captured effective timestamp
+and active horizon alongside the completed `MemIndexCleanupStats`. A
+caller-disabled live pass has no delay.
+
+The complete table pass uses one maintenance transaction and one
+`TableRootSnapshot` for all secondary indexes. If publication races with root
+capture and the root is not visible to the cleanup transaction, cleanup rolls
+back and retries immediately; this transient capture race does not wait for or
+report a horizon event.
 
 Delete overlays require overlay-obsolescence proof, not `DiskTree` absence. A
 unique delete-shadow or non-unique delete-marked exact entry below the captured
@@ -157,6 +176,21 @@ Invalid cleanup proofs:
 Cleanup removes scanned entries with encoded compare-delete operations that
 also check the expected row id or delete-bit state. If an entry changed after
 the scan, cleanup retains it.
+
+Foreground deletion of a current persisted row is deliberately not the inverse
+of live-entry cleanup. After current-LWC validation and successful CDB
+ownership, table DML conditionally masks each matching MemIndex copy:
+
+- matching active unique owner or non-unique exact entry: mask and record undo
+- absent entry: succeed without allocating a delete overlay, index undo, purge
+  payload, or later full-scan cleanup obligation
+
+The CDB filters the immutable DiskTree candidate until deletion checkpoint
+removes the durable row and companion secondary entries. Rollback removes the
+CDB marker and restores only MemIndex entries actually changed. A matching Mem
+copy can still exist because full-scan cleanup is per index and rollback can
+recreate an old unique owner, so persisted DML must check every active index
+rather than assuming uniform absence.
 
 ## DiskTree And CoW Roots
 

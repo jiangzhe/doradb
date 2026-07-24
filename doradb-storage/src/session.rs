@@ -19,7 +19,7 @@ use crate::stats::{
     storage_io_stats_snapshot, transaction_system_stats_snapshot,
 };
 use crate::table::{
-    CheckpointDelayReason, CheckpointOutcome, FreezeOutcome, SecondaryMemIndexCleanupStats, Table,
+    CheckpointDelayReason, CheckpointOutcome, FreezeOutcome, MemIndexCleanupOutcome, Table,
 };
 use crate::trx::{StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState};
 use error_stack::{Report, ResultExt};
@@ -673,12 +673,16 @@ impl Session {
     }
 
     /// Full-scan cleanup for an existing user table's secondary MemIndex entries.
+    ///
+    /// The outcome always includes completed cleanup accounting. When requested
+    /// live-entry removal is unsafe against the active snapshot horizon, delete
+    /// overlays are still processed and `live_delay` describes when to retry.
     #[inline]
     pub async fn cleanup_secondary_mem_indexes(
         &mut self,
         table_id: TableID,
         clean_live_entries: bool,
-    ) -> Result<SecondaryMemIndexCleanupStats> {
+    ) -> Result<MemIndexCleanupOutcome> {
         let session = self
             .pin()
             .attach("operation=cleanup_secondary_mem_indexes")

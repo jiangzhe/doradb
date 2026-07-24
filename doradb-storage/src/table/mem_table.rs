@@ -20,7 +20,7 @@ use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BlockIndex, GuardedNonUniqueMemIndex, GuardedUniqueMemIndex, InMemorySecondaryIndex,
-    IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation, UniqueIndex,
+    IndexCompareExchange, IndexInsert, RowLocation,
 };
 use crate::latch::LatchFallbackMode;
 use crate::map::FastHashMap;
@@ -3312,7 +3312,7 @@ mod tests {
     };
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::{RowID, TableID, TrxID};
-    use crate::index::{BlockIndex, NonUniqueIndex, RowLocation, UniqueIndex};
+    use crate::index::{BlockIndex, RowLocation};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, UpdateCol, UpdateMvcc, UpsertMvcc};
     use crate::session::{

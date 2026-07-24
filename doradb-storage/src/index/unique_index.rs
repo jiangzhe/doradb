@@ -1,123 +1,16 @@
-use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
-#[cfg(test)]
-use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::BTreeU64;
-#[cfg(test)]
-use crate::index::btree::GenericBTree;
-use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate};
+use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeReplaceOrInsert, BTreeUpdate};
 use crate::index::index_stream::UniqueMemIndexCandidateStream;
-use crate::index::mem_index::{
-    MemIndex, MemIndexCleanupScan, MemIndexEntry, UniqueMemIndexCleanupSpec,
-    UniqueMemIndexEntryScanSpec,
-};
+use crate::index::mem_index::{MemIndex, MemIndexCleanupScan, UniqueMemIndexCleanupSpec};
 use crate::index::util::Maskable;
-use crate::index::{
-    IndexBatchStream, IndexCompareExchange, IndexInsert, IndexLookupCandidate, KeyRange,
-};
+use crate::index::{IndexCompareExchange, IndexInsert, KeyRange};
 use crate::quiescent::QuiescentGuard;
 use crate::value::{Val, ValType};
-use futures::FutureExt;
-use std::future::Future;
 use std::ops::Deref;
-
-/// Abstraction of unique index.
-pub(crate) trait UniqueIndex: Send + Sync {
-    /// Candidate stream returned by bounded unique-index scans.
-    type LookupCandidateStream<'a>: IndexBatchStream<IndexLookupCandidate> + 'a
-    where
-        Self: 'a;
-
-    /// Lookup unique key in this index.
-    /// Return associated value and delete flag.
-    fn lookup(
-        &self,
-        key: &[Val],
-        ts: TrxID,
-    ) -> impl Future<Output = RuntimeResult<Option<(RowID, bool)>>>;
-
-    /// Scan lookup candidates over a bounded encoded-key range.
-    ///
-    /// Returned entries are index-derived candidates for MVCC lookup, not
-    /// visibility-confirmed rows. Unique candidates carry encoded logical keys.
-    /// The stream must return unmasked row ids even when an in-memory
-    /// delete-shadow entry is encountered; row-version and
-    /// column-deletion-buffer checks decide whether a candidate is visible. Hot
-    /// in-memory entries shadow equal cold DiskTree entries.
-    fn index_scan_candidates<'a>(
-        &'a self,
-        range: &'a KeyRange,
-        ts: TrxID,
-    ) -> RuntimeResult<Self::LookupCandidateStream<'a>>;
-
-    /// Insert new key value pair into this index.
-    /// If same key exists, return old key and its delete flag.
-    /// merge_if_match_deleted flag is an optimization for key change on same row.
-    /// In this case, we can directly unset the delete flag to finish the insert.
-    fn insert_if_not_exists(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> impl Future<Output = RuntimeResult<IndexInsert>>;
-
-    /// Delete a given key if value matches input value.
-    /// For normal delete index operation, we always mark the entry as deleted
-    /// before actually delete it.
-    /// But in some scenarios, e.g. recovery or rollback, we would not mask the entry
-    /// as deleted, so we set ignore_del_mask to true to force the deletion.
-    ///
-    /// todo: return more information about ts comparison with page sts,
-    /// to support minimal cost of index GC.
-    fn compare_delete(
-        &self,
-        key: &[Val],
-        old_row_id: RowID,
-        ignore_del_mask: bool,
-        ts: TrxID,
-    ) -> impl Future<Output = RuntimeResult<bool>>;
-
-    /// Mask a given key value as deleted.
-    #[inline]
-    fn mask_as_deleted(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        ts: TrxID,
-    ) -> impl Future<Output = RuntimeResult<bool>> {
-        debug_assert!(!row_id.is_deleted());
-        let new_row_id = row_id.deleted();
-        self.compare_exchange(key, row_id, new_row_id, ts)
-            .map(|res| {
-                res.map(|res| match res {
-                    IndexCompareExchange::Ok => true,
-                    IndexCompareExchange::Mismatch | IndexCompareExchange::NotExists => false,
-                })
-            })
-    }
-
-    /// atomically update an existing value associated to given key to another value.
-    /// if not exists, returns specified bool value.
-    fn compare_exchange(
-        &self,
-        key: &[Val],
-        old_row_id: RowID,
-        new_row_id: RowID,
-        ts: TrxID,
-    ) -> impl Future<Output = RuntimeResult<IndexCompareExchange>>;
-
-    /// Scan values into given collection.
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
-    fn scan_values(
-        &self,
-        values: &mut Vec<RowID>,
-        ts: TrxID,
-    ) -> impl Future<Output = RuntimeResult<()>>;
-}
 
 /// Generic unique-index implementation backed by a generic B-Tree.
 pub(crate) struct UniqueMemIndex<P: 'static>(MemIndex<P>);
@@ -153,14 +46,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         ))
     }
 
-    /// Wrap an already-created BTree with a key encoder.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
-        Self(MemIndex::with_encoder(tree, encoder))
-    }
-
-    /// Bind this index to one pool guard for trait-based operations.
+    /// Bind this index to one pool guard for MemIndex operations.
     #[inline]
     pub(crate) fn bind<'g>(&self, pool_guard: &'g PoolGuard) -> GuardedUniqueMemIndex<'_, 'g, P> {
         GuardedUniqueMemIndex {
@@ -175,50 +61,39 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         self.0.destroy(pool_guard).await
     }
 
-    /// Insert a live or delete-shadow overlay when the logical key is absent.
+    /// Replace an exact current owner or insert the new owner on true absence.
     ///
-    /// This helper is intentionally concrete to the BTree-backed MemIndex so the
-    /// dual-tree composite can claim or shadow cold DiskTree owners without
-    /// widening the public `UniqueIndex` trait.
+    /// This performs one BTree traversal and compares the complete expected
+    /// RowID value, including its delete bit.
     #[inline]
-    pub(crate) async fn insert_overlay_if_absent(
+    pub(crate) async fn replace_or_insert(
         &self,
         pool_guard: &PoolGuard,
         key: &[Val],
-        row_id: RowID,
+        expected_row_id: RowID,
+        new_row_id: RowID,
         ts: TrxID,
-    ) -> RuntimeResult<bool> {
+    ) -> RuntimeResult<IndexCompareExchange> {
+        debug_assert!(!new_row_id.is_deleted());
         let key = self.encoder().encode(key);
         Ok(
             match self
                 .tree()
-                .insert::<BTreeU64>(
+                .replace_or_insert(
                     pool_guard,
                     key.as_bytes(),
-                    BTreeU64::from(row_id),
-                    false,
+                    BTreeU64::from(expected_row_id),
+                    BTreeU64::from(new_row_id),
                     ts,
                 )
                 .await?
             {
-                BTreeInsert::Ok(_) => true,
-                BTreeInsert::DuplicateKey(_) => false,
+                BTreeReplaceOrInsert::Inserted | BTreeReplaceOrInsert::Replaced => {
+                    IndexCompareExchange::Ok
+                }
+                BTreeReplaceOrInsert::ValueMismatch(_) => IndexCompareExchange::Mismatch,
             },
         )
-    }
-
-    /// Scan MemIndex entries with encoded logical keys and delete state.
-    ///
-    /// The returned entries are ordered by encoded key because they are produced
-    /// by the underlying BTree leaf cursor.
-    #[inline]
-    pub(crate) async fn scan_encoded_entries(
-        &self,
-        pool_guard: &PoolGuard,
-    ) -> RuntimeResult<Vec<MemIndexEntry>> {
-        self.0
-            .scan_encoded_entries::<UniqueMemIndexEntryScanSpec>(pool_guard)
-            .await
     }
 
     /// Create a leaf-bounded scanner for cleanup candidates.
@@ -269,41 +144,42 @@ impl<P: BufferPool> UniqueMemIndex<P> {
 }
 
 /// Unique MemIndex view bound to one index-pool guard.
-#[derive(Clone, Copy)]
 pub(crate) struct GuardedUniqueMemIndex<'a, 'g, P: 'static> {
     index: &'a UniqueMemIndex<P>,
     pool_guard: &'g PoolGuard,
 }
 
-impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
-    /// Insert a live or delete-shadow overlay when the logical key is absent.
+impl<P: 'static> Clone for GuardedUniqueMemIndex<'_, '_, P> {
     #[inline]
-    pub(crate) async fn insert_overlay_if_absent(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        ts: TrxID,
-    ) -> RuntimeResult<bool> {
-        self.index
-            .insert_overlay_if_absent(self.pool_guard, key, row_id, ts)
-            .await
-    }
-
-    /// Scan MemIndex entries with encoded logical keys and delete state.
-    #[inline]
-    pub(crate) async fn scan_encoded_entries(&self) -> RuntimeResult<Vec<MemIndexEntry>> {
-        self.index.scan_encoded_entries(self.pool_guard).await
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
-impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
-    type LookupCandidateStream<'a>
-        = UniqueMemIndexCandidateStream<'a, P>
-    where
-        Self: 'a;
+impl<P: 'static> Copy for GuardedUniqueMemIndex<'_, '_, P> {}
 
+impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
+    /// Replace an exact current owner or insert the new owner on true absence.
     #[inline]
-    async fn lookup(&self, key: &[Val], _ts: TrxID) -> RuntimeResult<Option<(RowID, bool)>> {
+    pub(crate) async fn replace_or_insert(
+        &self,
+        key: &[Val],
+        expected_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexCompareExchange> {
+        self.index
+            .replace_or_insert(self.pool_guard, key, expected_row_id, new_row_id, ts)
+            .await
+    }
+
+    /// Lookup a unique key and return its owner and delete state.
+    #[inline]
+    pub(crate) async fn lookup(
+        &self,
+        key: &[Val],
+        _ts: TrxID,
+    ) -> RuntimeResult<Option<(RowID, bool)>> {
         let k = self.index.encoder().encode(key);
         Ok(self
             .index
@@ -313,8 +189,9 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
             .map(|res| (res.value().to_row_id(), res.is_deleted())))
     }
 
+    /// Insert a unique key unless another owner already exists.
     #[inline]
-    async fn insert_if_not_exists(
+    pub(crate) async fn insert_if_not_exists(
         &self,
         key: &[Val],
         row_id: RowID,
@@ -344,8 +221,9 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
         )
     }
 
+    /// Delete a unique key when its owner matches `row_id`.
     #[inline]
-    async fn compare_delete(
+    pub(crate) async fn compare_delete(
         &self,
         key: &[Val],
         row_id: RowID,
@@ -374,8 +252,25 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
         )
     }
 
+    /// Mask a matching unique owner as deleted.
     #[inline]
-    async fn compare_exchange(
+    pub(crate) async fn mask_as_deleted(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> RuntimeResult<bool> {
+        debug_assert!(!row_id.is_deleted());
+        Ok(matches!(
+            self.compare_exchange(key, row_id, row_id.deleted(), ts)
+                .await?,
+            IndexCompareExchange::Ok
+        ))
+    }
+
+    /// Atomically replace a matching unique owner.
+    #[inline]
+    pub(crate) async fn compare_exchange(
         &self,
         key: &[Val],
         old_row_id: RowID,
@@ -406,26 +301,17 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
         )
     }
 
+    /// Scan lookup candidates over a bounded encoded-key range.
     #[inline]
-    fn index_scan_candidates<'a>(
+    pub(crate) fn index_scan_candidates<'a>(
         &'a self,
         range: &'a KeyRange,
         _ts: TrxID,
-    ) -> RuntimeResult<Self::LookupCandidateStream<'a>> {
+    ) -> RuntimeResult<UniqueMemIndexCandidateStream<'a, P>> {
         Ok(UniqueMemIndexCandidateStream::new(
             self.index.tree().cursor(self.pool_guard, 0),
             range,
         ))
-    }
-
-    #[inline]
-    async fn scan_values(&self, values: &mut Vec<RowID>, _ts: TrxID) -> RuntimeResult<()> {
-        let mut cursor = self.index.tree().cursor(self.pool_guard, 0);
-        cursor.seek(&[]).await?;
-        while let Some(g) = cursor.next().await? {
-            g.page().values(values, BTreeU64::to_row_id);
-        }
-        Ok(())
     }
 }
 
@@ -433,10 +319,48 @@ impl<P: BufferPool> UniqueIndex for GuardedUniqueMemIndex<'_, '_, P> {
 mod tests {
     use super::*;
     use crate::buffer::{FixedBufferPool, PoolRole};
-    use crate::index::btree::BTree;
+    use crate::catalog::{IndexAttributes, IndexKey};
+    use crate::index::mem_index::MemIndexEntry;
     use crate::index::util::tests::drain_row_ids;
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
+    use std::ops::Bound::Unbounded;
+
+    async fn test_unique_mem_index(
+        pool: &QuiescentBox<FixedBufferPool>,
+        pool_guard: &PoolGuard,
+        types: Vec<ValType>,
+    ) -> UniqueMemIndex<FixedBufferPool> {
+        let index_spec = IndexSpec::new(
+            (0..types.len())
+                .map(|col_no| IndexKey::new(col_no as u16))
+                .collect(),
+            IndexAttributes::UK,
+        );
+        UniqueMemIndex::new(
+            pool.guard(),
+            pool_guard,
+            &index_spec,
+            |col_no| types[col_no],
+            TrxID::new(100),
+        )
+        .await
+        .expect("test unique MemIndex construction should succeed")
+    }
+
+    async fn cleanup_entry<P: BufferPool>(
+        index: &UniqueMemIndex<P>,
+        pool_guard: &PoolGuard,
+        pivot_row_id: RowID,
+    ) -> MemIndexEntry {
+        let mut scan = index.cleanup_scan(pool_guard, pivot_row_id, true);
+        let mut entries = Vec::new();
+        while let Some(batch) = scan.next_batch().await.unwrap() {
+            entries.extend(batch.entries);
+        }
+        assert_eq!(entries.len(), 1);
+        entries.pop().unwrap()
+    }
 
     #[test]
     fn test_single_key_btree_unique_index() {
@@ -446,15 +370,15 @@ mod tests {
             );
             {
                 let pool_guard = (*pool).pool_guard();
-                let index = UniqueMemIndex::with_encoder(
-                    BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
-                        .await
-                        .expect("test btree construction should succeed"),
-                    BTreeKeyEncoder::new(vec![ValType {
+                let index = test_unique_mem_index(
+                    &pool,
+                    &pool_guard,
+                    vec![ValType {
                         kind: ValKind::I32,
                         nullable: false,
-                    }]),
-                );
+                    }],
+                )
+                .await;
                 run_test_suit_for_single_key_unique_index(index.bind(&pool_guard)).await;
             }
         });
@@ -468,11 +392,10 @@ mod tests {
             );
             {
                 let pool_guard = (*pool).pool_guard();
-                let index = UniqueMemIndex::with_encoder(
-                    BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
-                        .await
-                        .expect("test btree construction should succeed"),
-                    BTreeKeyEncoder::new(vec![
+                let index = test_unique_mem_index(
+                    &pool,
+                    &pool_guard,
+                    vec![
                         ValType {
                             kind: ValKind::VarByte,
                             nullable: false,
@@ -481,8 +404,9 @@ mod tests {
                             kind: ValKind::I32,
                             nullable: false,
                         },
-                    ]),
-                );
+                    ],
+                )
+                .await;
                 run_test_suit_for_multi_key_unique_index(index.bind(&pool_guard)).await;
             }
         });
@@ -495,15 +419,15 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let index = UniqueMemIndex::with_encoder(
-                BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
-                    .await
-                    .expect("test btree construction should succeed"),
-                BTreeKeyEncoder::new(vec![ValType {
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![ValType {
                     kind: ValKind::I32,
                     nullable: false,
-                }]),
-            );
+                }],
+            )
+            .await;
             let guarded = index.bind(&pool_guard);
             for key in 1..=5 {
                 assert!(
@@ -554,15 +478,15 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let index = UniqueMemIndex::with_encoder(
-                BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
-                    .await
-                    .expect("test btree construction should succeed"),
-                BTreeKeyEncoder::new(vec![ValType {
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![ValType {
                     kind: ValKind::I32,
                     nullable: false,
-                }]),
-            );
+                }],
+            )
+            .await;
             let key = vec![Val::from(42i32)];
             let row_id = 100u64;
             let guarded = index.bind(&pool_guard);
@@ -574,12 +498,7 @@ mod tests {
                     .is_ok()
             );
 
-            let active_entry = index
-                .scan_encoded_entries(&pool_guard)
-                .await
-                .unwrap()
-                .pop()
-                .unwrap();
+            let active_entry = cleanup_entry(&index, &pool_guard, RowID::new(row_id + 1)).await;
             assert!(!active_entry.deleted);
             assert!(
                 !index
@@ -604,12 +523,7 @@ mod tests {
                     .await
                     .unwrap()
             );
-            let deleted_entry = index
-                .scan_encoded_entries(&pool_guard)
-                .await
-                .unwrap()
-                .pop()
-                .unwrap();
+            let deleted_entry = cleanup_entry(&index, &pool_guard, RowID::new(row_id + 1)).await;
             assert!(deleted_entry.deleted);
             assert!(
                 !index
@@ -650,15 +564,15 @@ mod tests {
                 FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let index = UniqueMemIndex::with_encoder(
-                BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
-                    .await
-                    .expect("test btree construction should succeed"),
-                BTreeKeyEncoder::new(vec![ValType {
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![ValType {
                     kind: ValKind::I32,
                     nullable: false,
-                }]),
-            );
+                }],
+            )
+            .await;
             let guarded = index.bind(&pool_guard);
 
             let cold_live_key = vec![Val::from(1i32)];
@@ -713,7 +627,9 @@ mod tests {
         });
     }
 
-    async fn run_test_suit_for_single_key_unique_index<T: UniqueIndex>(index: T) {
+    async fn run_test_suit_for_single_key_unique_index<P: BufferPool>(
+        index: GuardedUniqueMemIndex<'_, '_, P>,
+    ) {
         // 测试用例1：基本插入和查找操作
         let key = vec![Val::from(42i32)];
         let row_id = 100u64;
@@ -822,11 +738,7 @@ mod tests {
         );
 
         // 测试用例5：scan_values 操作
-        let mut values = Vec::new();
-        index
-            .scan_values(&mut values, TrxID::new(100))
-            .await
-            .unwrap();
+        let values = scan_rows(&index).await;
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], RowID::new(row_id2));
 
@@ -877,15 +789,13 @@ mod tests {
         );
 
         // 验证 scan_values 包含所有值
-        let mut values = Vec::new();
-        index
-            .scan_values(&mut values, TrxID::new(100))
-            .await
-            .unwrap();
+        let values = scan_rows(&index).await;
         assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
     }
 
-    async fn run_test_suit_for_multi_key_unique_index<T: UniqueIndex>(index: T) {
+    async fn run_test_suit_for_multi_key_unique_index<P: BufferPool>(
+        index: GuardedUniqueMemIndex<'_, '_, P>,
+    ) {
         // 测试用例1：基本插入和查找操作
         let key = vec![Val::from("hello"), Val::from(42i32)];
         let row_id = 100u64;
@@ -994,11 +904,7 @@ mod tests {
         );
 
         // 测试用例5：scan_values 操作
-        let mut values = Vec::new();
-        index
-            .scan_values(&mut values, TrxID::new(100))
-            .await
-            .unwrap();
+        let values = scan_rows(&index).await;
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], RowID::new(row_id2));
 
@@ -1049,11 +955,7 @@ mod tests {
         );
 
         // 验证 scan_values 包含所有值
-        let mut values = Vec::new();
-        index
-            .scan_values(&mut values, TrxID::new(100))
-            .await
-            .unwrap();
+        let values = scan_rows(&index).await;
         assert_eq!(values.len(), 4); // 包含之前插入的 row_id2
 
         // 验证insert覆盖
@@ -1079,5 +981,13 @@ mod tests {
             index.lookup(&key4, TrxID::new(100)).await.unwrap(),
             Some((RowID::new(row_id4), false))
         );
+    }
+
+    async fn scan_rows<P: BufferPool>(index: &GuardedUniqueMemIndex<'_, '_, P>) -> Vec<RowID> {
+        let range = KeyRange::new(Unbounded, Unbounded);
+        let mut stream = index
+            .index_scan_candidates(&range, TrxID::new(100))
+            .unwrap();
+        drain_row_ids(&mut stream).await
     }
 }

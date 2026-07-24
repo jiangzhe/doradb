@@ -4,7 +4,6 @@ use crate::error::{
 };
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::IndexInsert;
-use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
 use crate::table::{DeletionError, DmlValidator, Table};
