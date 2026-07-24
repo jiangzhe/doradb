@@ -1,7 +1,7 @@
 ---
 id: 000236
 title: Make Non-Unique CREATE INDEX MVCC-Candidate-Complete
-status: proposal
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-24
 github_issue: 883
 ---
@@ -63,10 +63,11 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000163-create-index-full-mvcc-history.md
+- docs/backlogs/closed/000163-create-index-full-mvcc-history.md
 
 Related Backlogs:
 - docs/backlogs/000164-create-unique-index-full-mvcc-history.md
+- docs/backlogs/000165-reclaim-non-unique-create-index-history.md
 - docs/backlogs/000104-stream-parallel-create-index-cold-build.md
 - docs/backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md
 
@@ -407,6 +408,38 @@ runtime-only restart property.
 
 ## Implementation Notes
 
+- Captured one purge-published history cutoff after the implicit DDL
+  transaction starts and validated it against the active root's deletion
+  cutoff. A `CreateIndexCollector` now binds one atomic column-route snapshot
+  so cold and hot collection share the same root and pivot boundary; the
+  unique-index collector remains current-state-only.
+- Split non-unique cold input into durable current rows and retained
+  CDB-deleted history, and added read-latched main-undo traversal for hot rows.
+  History is retained with the strict cutoff comparison, normalized per RowID
+  by encoded exact key, and emitted as delete-masked candidates while current
+  hot state remains active.
+- Added a build-only encoded non-unique MemIndex insertion path and
+  variant-specific runtime builder. Population failure destroys the
+  unpublished tree, staged failure remains owned by `CreateIndexProgress`, and
+  the existing catalog commit, root publication, layout installation, and
+  current-state-only recovery order is unchanged.
+- Added cutoff/invariant, normalization, fail-closed transition, hot and cold
+  multi-snapshot history, distinct-RowID move, cleanup-safety, staged failure,
+  and historical-key-reuse commit/rollback coverage. Review found no
+  in-scope cleanup proof change was needed: current full cleanup preserves
+  candidates needed by an old snapshot, while deterministic reclamation is a
+  separate lifecycle.
+- Updated the secondary-index design contract and preserved the deferred work:
+  unique historical ownership remains in backlog 000164, deterministic
+  reclamation of non-unique build history is now tracked by backlog 000165,
+  and bounded/parallel cold build plus unique validation remains in backlog
+  000104. The broad source backlog 000163 was closed after this decomposition.
+- Verification completed with 1,532 passing workspace nextest cases. The
+  mandatory style gate passed formatting, workspace Clippy, and repository
+  style checks across 6 branch-diff Rust files. The alternate `libaio` pass was
+  not required because the change is limited to row/index semantics and does
+  not alter backend-neutral asynchronous storage paths.
+
 ## Impacts
 
 Primary implementation files:
@@ -553,10 +586,8 @@ semantics.
 ## Open Questions
 
 1. Deterministic reclamation of historical non-unique MemIndex candidates
-   remains deferred. During task resolution, preserve that remainder from
-   backlog 000163 or create a narrower cleanup backlog before closing 000163;
-   do not mark the broad source backlog fully implemented while cleanup remains
-   untracked.
+   remains deferred to
+   `docs/backlogs/000165-reclaim-non-unique-create-index-history.md`.
 2. Backlog 000164 owns unique-index history. This task must not weaken or
    silently choose its owner-overlap policy.
 3. A captured `history_cutoff` is intentionally conservative if active
