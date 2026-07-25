@@ -1594,19 +1594,6 @@ impl TrxInner {
         stmt_no
     }
 
-    /// Upgrade a cached user-table runtime if this transaction weak cache can still reach it.
-    #[inline]
-    pub(crate) fn cached_user_table(&mut self, table_id: TableID) -> Option<Arc<Table>> {
-        let weak = self.table_cache.get(&table_id)?;
-        match weak.upgrade() {
-            Some(table) => Some(table),
-            None => {
-                self.table_cache.remove(&table_id);
-                None
-            }
-        }
-    }
-
     /// Remember a successfully resolved user-table runtime without extending its lifetime.
     #[inline]
     pub(crate) fn cache_user_table(&mut self, table: &Arc<Table>) {
@@ -1654,12 +1641,6 @@ impl TrxInner {
     ) -> OperationResult<()> {
         let operation = "lock_explicit_table";
         let engine = self.checked_engine(attachment);
-        engine
-            .catalog()
-            .validate_user_table_live(table_id)
-            .await
-            .attach_with(|| format!("operation={operation}"))?;
-
         let lock_manager = engine.lock_manager();
         let resources = Self::table_lock_resources(table_id);
         let lock_state = self.checked_lock_state();

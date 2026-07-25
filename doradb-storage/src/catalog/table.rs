@@ -196,19 +196,19 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn commit_catalog(&mut self) -> RuntimeOrFatalResult<()> {
+    async fn commit_catalog(&mut self) -> RuntimeOrFatalResult<TrxID> {
         debug_assert_eq!(self.phase, CreateTablePhase::RuntimeBuilt);
         let trx = self
             .trx
             .take()
             .expect("catalog transaction is present before commit");
-        trx.commit_catalog_ddl().await?;
+        let create_cts = trx.commit_catalog_ddl().await?;
         self.phase = CreateTablePhase::CatalogCommitted;
-        Ok(())
+        Ok(create_cts)
     }
 
     #[inline]
-    fn install_runtime(&mut self, engine: &EngineRef) {
+    fn install_runtime(&mut self, engine: &EngineRef, create_cts: TrxID) -> bool {
         debug_assert_eq!(self.phase, CreateTablePhase::CatalogCommitted);
         let table = Arc::clone(
             self.staged_table
@@ -217,9 +217,13 @@ impl CreateTableProgress {
         );
         // The table id was atomically allocated and this DDL owns the metadata
         // gate through commit, so no cache entry can exist for this runtime.
-        engine.catalog().insert_user_table(table);
+        if !engine.catalog().insert_user_table(create_cts, table) {
+            self.phase = CreateTablePhase::Aborted;
+            return false;
+        }
         let _ = self.staged_table.take();
         self.phase = CreateTablePhase::Installed;
+        true
     }
 
     #[inline]
@@ -1139,11 +1143,16 @@ pub(crate) async fn create_table_for_session(
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     reject_user_table_primary_key_indexes(&index_specs, "create_table").disclose()?;
-
-    let table_id = engine.catalog().next_table_id();
     let metadata = Arc::new(
         TableMetadata::try_new(table_spec.columns.clone(), index_specs.clone()).disclose()?,
     );
+    let table_id = engine.catalog().next_table_id();
+    let _metadata_lock = engine
+        .lock_manager()
+        .acquire_create_table_metadata_lock(table_id, ctx.owner, ctx.owner_group)
+        .await
+        .attach_with(|| format!("operation=create_table, table_id={table_id}"))
+        .disclose()?;
     let uninit_table_file = engine
         .table_fs
         .create_table_file(table_id, Arc::clone(&metadata), false)
@@ -1260,14 +1269,21 @@ pub(crate) async fn create_table_for_session(
     #[cfg(test)]
     maybe_poison_before_create_table_catalog_commit(&engine);
 
-    if let Err(err) = progress.commit_catalog().await {
-        return Err(progress
-            .abort_after_root_publish_commit_error(&engine, &guards, "catalog_commit", err)
-            .await
-            .disclose());
-    }
+    let create_cts = match progress.commit_catalog().await {
+        Ok(create_cts) => create_cts,
+        Err(err) => {
+            return Err(progress
+                .abort_after_root_publish_commit_error(&engine, &guards, "catalog_commit", err)
+                .await
+                .disclose());
+        }
+    };
 
-    progress.install_runtime(&engine);
+    if !progress.install_runtime(&engine, create_cts) {
+        return Err(
+            poison_create_table_after_commit(&engine, table_id, "runtime_install").disclose(),
+        );
+    }
 
     Ok(table_id)
 }
@@ -1279,14 +1295,12 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         .disclose()?;
     let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
-    validated_drop_table_target(&ctx.pool_guards, &engine, table_id)
-        .await
-        .disclose()?;
+    reject_non_user_table_id(table_id, "drop_table").disclose()?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
         .attach("operation=drop_table")
         .disclose()?;
-    let mut table_locks = lock_manager
+    let _table_locks = lock_manager
         .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
         .await
         .attach_with(|| format!("operation=drop_table, table_id={table_id}"))
@@ -1312,7 +1326,6 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     };
     let mut drop_progress = DropTableProgressGuard::new(engine.clone(), table_id);
     drain.wait().await;
-    table_locks.fail_waiters_on_release(OperationError::TableDropping);
 
     let metadata = table.metadata().clone();
     let exec_res = execute_drop_table_catalog_cascade(&engine, &mut trx, table_id, &metadata).await;
@@ -1362,11 +1375,11 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     finish_drop_table_runtime_retention(&engine, table_id, table, drop_cts, replay_floor)
         .disclose()?;
     drop_progress.disarm();
-    table_locks.fail_waiters_on_release(OperationError::TableNotFound);
     // Foreground DROP TABLE stops at logical removal. The catalog map retains
     // the dropped runtime and replay floor until purge and catalog checkpoint
     // finish the physical cleanup obligations.
     engine.trx_sys.request_dropped_table_purge();
+    engine.trx_sys.request_metadata_history_purge();
     Ok(())
 }
 
@@ -1405,17 +1418,6 @@ pub(crate) async fn ensure_user_table_catalog_row(
     Err(Report::new(OperationError::TableNotFound)
         .attach(format!("{operation} catalog lookup: table_id={table_id}"))
         .into())
-}
-
-/// Precheck that a user table is a valid index-DDL target.
-pub(crate) async fn precheck_index_ddl_target(
-    guards: &PoolGuards,
-    engine: &EngineRef,
-    table_id: TableID,
-    operation: &'static str,
-) -> OperationOrRuntimeResult<()> {
-    let _ = validated_index_ddl_target(guards, engine, table_id, operation).await?;
-    Ok(())
 }
 
 /// Return the validated runtime table for an index-DDL target.
@@ -1662,6 +1664,22 @@ fn poison_drop_table_after_gate(
     // engine shutdown remains responsible for stopping background workers.
     let report = Report::new(FatalError::Poisoned).attach(format!(
         "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
+    ));
+    obs::error!(
+        "event=engine_poison component=catalog_table action=poison result=error error={:?}",
+        report
+    );
+    engine.poisoner.poison(report).into_report()
+}
+
+#[inline]
+fn poison_create_table_after_commit(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+) -> Report<FatalError> {
+    let report = Report::new(FatalError::Poisoned).attach(format!(
+        "create table failed after catalog commit: table_id={table_id}, operation={operation}"
     ));
     obs::error!(
         "event=engine_poison component=catalog_table action=poison result=error error={:?}",
@@ -2421,6 +2439,7 @@ mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
+            let owner = LockOwner::Session(session.id());
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
@@ -2441,6 +2460,16 @@ mod tests {
                 Some(OperationError::InvalidMetadata)
             );
             assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!has_lock_resource(
+                &engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                owner,
+                LockResource::TableData(table_id),
+            ));
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
         });
@@ -2492,6 +2521,7 @@ mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
+            let owner = LockOwner::Session(session.id());
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
@@ -2506,6 +2536,16 @@ mod tests {
                 Some(RuntimeError::CatalogAccess)
             );
             assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!has_lock_resource(
+                &engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                owner,
+                LockResource::TableData(table_id),
+            ));
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
         });
@@ -3360,7 +3400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_table_fails_waiting_session_table_lock() {
+    fn test_drop_table_normally_grants_waiting_session_table_lock() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
@@ -3384,22 +3424,26 @@ mod tests {
 
             let lock_session = engine.new_session().unwrap();
             let lock_owner = LockOwner::Session(lock_session.id());
-            let err = lock_session
-                .lock_table(table_id, TableLockMode::Shared)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableDropping)
-            );
-            assert!(!has_lock_resource(
+            let mut lock_fut = Box::pin(lock_session.lock_table(table_id, TableLockMode::Shared));
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
                 &engine,
                 lock_owner,
                 LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
             ));
 
             drop(publish_lease);
             drop_fut.await.unwrap();
+            let err = lock_fut.await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             drop(root_lease);
             assert!(!has_lock_resource(
                 &engine,
@@ -3449,7 +3493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_table_fails_waiting_transaction_table_lock() {
+    fn test_drop_table_normally_grants_waiting_transaction_table_lock() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
@@ -3474,22 +3518,26 @@ mod tests {
             let mut lock_session = engine.new_session().unwrap();
             let mut trx = lock_session.begin_trx().unwrap();
             let lock_owner = trx_tests::lock_owner(&trx).unwrap();
-            let err = trx
-                .lock_table(table_id, TableLockMode::Exclusive)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableDropping)
-            );
-            assert!(!has_lock_resource(
+            let mut lock_fut = Box::pin(trx.lock_table(table_id, TableLockMode::Exclusive));
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
                 &engine,
                 lock_owner,
                 LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
             ));
 
             drop(publish_lease);
             drop_fut.await.unwrap();
+            let err = lock_fut.await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>().copied(),
+                Some(OperationError::TableNotFound)
+            );
             drop(root_lease);
             assert!(!has_lock_resource(
                 &engine,

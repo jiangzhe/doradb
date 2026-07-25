@@ -1,5 +1,5 @@
 use super::table::{
-    precheck_index_ddl_target, reject_user_table_primary_key_index, validated_index_ddl_target,
+    reject_non_user_table_id, reject_user_table_primary_key_index, validated_index_ddl_target,
 };
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::{
@@ -797,9 +797,7 @@ pub(crate) async fn create_index_for_session(
 
     // 1. Validate the target and acquire table-local DDL exclusion before
     // deriving any new metadata or touching mutable table roots.
-    precheck_index_ddl_target(&guards, &engine, table_id, "create_index")
-        .await
-        .disclose()?;
+    reject_non_user_table_id(table_id, "create_index").disclose()?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
         .attach("operation=create_index")
@@ -1053,8 +1051,25 @@ pub(crate) async fn create_index_for_session(
     // 9. Install the new runtime layout last. Existing snapshots keep their old
     // layout Arcs, while later foreground work observes the new index.
     let new_layout = progress.take_layout_for_install();
-    table.install_runtime_layout(old_layout.generation(), new_layout);
+    let installed_layout = table.install_runtime_layout(old_layout.generation(), new_layout);
+    let history_published = engine.catalog().publish_user_table_metadata(
+        table_id,
+        create_cts,
+        &table,
+        old_layout.metadata_arc(),
+        Arc::clone(installed_layout.metadata_arc()),
+    );
     progress.mark_installed();
+    if !history_published {
+        return Err(poison_index_publication_invariant(
+            &engine,
+            IndexDdlKind::Create,
+            table_id,
+            index_no,
+        )
+        .disclose());
+    }
+    engine.trx_sys.request_metadata_history_purge();
 
     Ok(index_no)
 }
@@ -1072,9 +1087,7 @@ pub(crate) async fn drop_index_for_session(
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
 
-    precheck_index_ddl_target(&guards, &engine, table_id, "drop_index")
-        .await
-        .disclose()?;
+    reject_non_user_table_id(table_id, "drop_index").disclose()?;
     lock_manager
         .reject_table_ddl_explicit_session_lock(table_id, ctx.owner)
         .attach("operation=drop_index")
@@ -1159,8 +1172,25 @@ pub(crate) async fn drop_index_for_session(
     }
 
     let new_layout = progress.take_layout_for_install();
-    table.install_runtime_layout(old_generation, new_layout);
+    let installed_layout = table.install_runtime_layout(old_generation, new_layout);
+    let history_published = engine.catalog().publish_user_table_metadata(
+        table_id,
+        drop_cts,
+        &table,
+        old_layout.metadata_arc(),
+        Arc::clone(installed_layout.metadata_arc()),
+    );
     progress.mark_installed();
+    if !history_published {
+        return Err(poison_index_publication_invariant(
+            &engine,
+            IndexDdlKind::Drop,
+            table_id,
+            index_no,
+        )
+        .disclose());
+    }
+    engine.trx_sys.request_metadata_history_purge();
     drop(old_layout);
 
     if let Err(err) = table.cleanup_retired_secondary_indexes(&guards).await {
@@ -1869,6 +1899,27 @@ fn poison_index_after_catalog_commit_with_source(
     };
     let report = source.into_fatal_report(FatalError::Poisoned).attach(format!(
         "{operation_name} failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
+    ));
+    obs::error!(
+        "event=engine_poison component=catalog_index action=poison result=error error={:?}",
+        report
+    );
+    RuntimeOrFatalError::from(engine.poisoner.poison(report).into_report())
+}
+
+#[inline]
+fn poison_index_publication_invariant(
+    engine: &EngineRef,
+    kind: IndexDdlKind,
+    table_id: TableID,
+    index_no: IndexNo,
+) -> RuntimeOrFatalError {
+    let operation = match kind {
+        IndexDdlKind::Create => "create_index",
+        IndexDdlKind::Drop => "drop_index",
+    };
+    let report = Report::new(FatalError::Poisoned).attach(format!(
+        "{operation} metadata history publication disagreed after catalog/root/layout commit: table_id={table_id}, index_no={index_no}"
     ));
     obs::error!(
         "event=engine_poison component=catalog_index action=poison result=error error={:?}",

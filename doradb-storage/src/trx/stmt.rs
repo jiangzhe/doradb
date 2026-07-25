@@ -389,13 +389,6 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     fn resolve_user_table(&mut self, table_id: TableID) -> OperationResult<Arc<Table>> {
         if !is_catalog_table(table_id) {
-            if let Some(table) = self.inner.cached_user_table(table_id) {
-                return Ok(table);
-            }
-            if let Some(table) = self.attachment.cached_user_table(table_id) {
-                self.inner.cache_user_table(&table);
-                return Ok(table);
-            }
             let engine = self.attachment.engine();
             if let Some(table) = engine.catalog().get_table_now(table_id) {
                 self.attachment.cache_user_table(&table);
@@ -422,13 +415,13 @@ impl<'stmt> Statement<'stmt> {
         F: FnMut(Vec<Val>) -> bool,
     {
         const OPERATION: &str = "table_scan_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -467,13 +460,13 @@ impl<'stmt> Statement<'stmt> {
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
         const OPERATION: &str = "table_mutate_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -508,13 +501,13 @@ impl<'stmt> Statement<'stmt> {
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         const OPERATION: &str = "table_lookup_unique_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -544,13 +537,13 @@ impl<'stmt> Statement<'stmt> {
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
         const OPERATION: &str = "table_index_lookup_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -583,13 +576,13 @@ impl<'stmt> Statement<'stmt> {
         R: RangeBounds<&'r [Val]>,
     {
         const OPERATION: &str = "table_index_scan_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_read_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -620,13 +613,13 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub async fn table_insert_mvcc(&mut self, table_id: TableID, cols: Vec<Val>) -> Result<RowID> {
         const OPERATION: &str = "table_insert_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -662,13 +655,13 @@ impl<'stmt> Statement<'stmt> {
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
         const OPERATION: &str = "table_upsert_unique_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -711,13 +704,13 @@ impl<'stmt> Statement<'stmt> {
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         const OPERATION: &str = "table_update_unique_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()
@@ -759,13 +752,13 @@ impl<'stmt> Statement<'stmt> {
         key_vals: &[Val],
     ) -> Result<DeleteMvcc> {
         const OPERATION: &str = "table_delete_unique_mvcc";
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
         self.acquire_table_write_metadata_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = self
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()

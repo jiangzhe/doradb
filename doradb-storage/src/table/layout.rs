@@ -166,6 +166,7 @@ mod tests {
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
     };
+    use crate::id::TrxID;
     use crate::table::tests::*;
     use crate::value::ValKind;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -291,7 +292,8 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
-            let old_layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let old_layout = table.layout_snapshot();
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
 
             let metadata_without_indexes = Arc::new(
@@ -314,8 +316,19 @@ mod tests {
                 inactive_slots.into_boxed_slice(),
             );
 
-            let installed = table_for_internal_assertion(&engine, table_id)
-                .install_runtime_layout(old_layout.generation(), new_layout);
+            let installed = table.install_runtime_layout(old_layout.generation(), new_layout);
+            let current_cts = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap()
+                .effective_cts();
+            assert!(engine.catalog().publish_user_table_metadata(
+                table_id,
+                TrxID::new(current_cts.as_u64() + 1),
+                &table,
+                old_layout.metadata_arc(),
+                Arc::clone(installed.metadata_arc()),
+            ));
             assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
             assert_eq!(installed.metadata().idx.active_index_count(), 0);
             assert_eq!(

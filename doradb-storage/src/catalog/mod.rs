@@ -1,4 +1,5 @@
 mod checkpoint;
+mod history;
 mod index;
 pub(crate) mod spec;
 pub(crate) mod storage;
@@ -6,6 +7,7 @@ pub(crate) mod table;
 
 pub use checkpoint::CatalogCheckpointOutcome;
 pub(crate) use checkpoint::*;
+pub(crate) use history::*;
 pub(crate) use index::*;
 pub(crate) use spec::ActiveIndexSpec;
 pub use spec::{
@@ -320,9 +322,11 @@ impl Catalog {
                 )
             })?,
         );
-        let old = self
-            .user_tables
-            .insert(table_id, UserTableEntry::Live { table });
+        let metadata = table.metadata();
+        let old = self.user_tables.insert(
+            table_id,
+            UserTableEntry::new_live(TrxID::new(0), metadata, table),
+        );
         assert!(
             old.is_none(),
             "catalog reload invariant violated: table runtime inserted concurrently, table_id={table_id}"
@@ -459,12 +463,50 @@ impl Catalog {
     /// Get a user-table runtime handle synchronously by table id.
     #[inline]
     pub(crate) fn get_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
+        self.current_live_user_table(table_id)
+    }
+
+    /// Resolve user-table metadata visible to one transaction snapshot.
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 2 consumes transaction-visible metadata resolution"
+        )
+    )]
+    pub(crate) fn resolve_user_table_visible(
+        &self,
+        table_id: TableID,
+        sts: TrxID,
+    ) -> Option<ResolvedVisibleTableMetadata> {
         if is_catalog_table(table_id) {
             return None;
         }
         self.user_tables
             .get(&table_id)
-            .and_then(|entry| entry.value().live_table().map(Arc::clone))
+            .and_then(|entry| entry.value().resolve_visible(sts))
+    }
+
+    /// Resolve the direct current logical state without consulting history.
+    #[inline]
+    pub(crate) fn resolve_user_table_current(
+        &self,
+        table_id: TableID,
+    ) -> Option<CurrentTableState> {
+        if is_catalog_table(table_id) {
+            return None;
+        }
+        self.user_tables
+            .get(&table_id)
+            .and_then(|entry| entry.value().resolve_current())
+    }
+
+    /// Return the direct current live runtime without consulting history.
+    #[inline]
+    pub(crate) fn current_live_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
+        self.resolve_user_table_current(table_id)
+            .and_then(|current| current.live_table().map(Arc::clone))
     }
 
     /// Pins a user-table runtime for checkpoint-retirement purge.
@@ -479,12 +521,7 @@ impl Catalog {
         }
         self.user_tables
             .get(&table_id)
-            .and_then(|entry| match entry.value() {
-                UserTableEntry::Live { table } | UserTableEntry::DroppedRuntime { table, .. } => {
-                    Some(Arc::clone(table))
-                }
-                UserTableEntry::DroppedFloor { .. } => None,
-            })
+            .and_then(|entry| entry.value().runtime_for_purge())
     }
 
     /// Return sorted ids for currently loaded user-table runtimes.
@@ -495,7 +532,11 @@ impl Catalog {
             .iter()
             .filter_map(|entry| {
                 let table_id = *entry.key();
-                entry.value().live_table().is_some().then_some(table_id)
+                entry
+                    .value()
+                    .current_live_table()
+                    .is_some()
+                    .then_some(table_id)
             })
             .collect::<Vec<_>>();
         table_ids.sort_by_key(|table_id| table_id.as_u64());
@@ -532,26 +573,20 @@ impl Catalog {
         let mut dropped = Vec::new();
         for entry in &self.user_tables {
             let table_id = *entry.key();
-            match entry.value() {
-                UserTableEntry::Live { table } => live.push(LiveTableRedoReplayFloor {
+            if let Some((_table, floor)) = entry
+                .value()
+                .live_replay_floor(checkpointed_silent_watermarks.get(&table_id).copied())
+            {
+                live.push(LiveTableRedoReplayFloor { table_id, floor });
+            }
+            if let Some((drop_cts, replay_floor)) = entry.value().dropped_replay_floor()
+                && catalog_replay_start_ts <= drop_cts
+            {
+                dropped.push(PendingDroppedTableRedoFloor::new(
                     table_id,
-                    floor: effective_table_redo_replay_floor(
-                        table.redo_replay_floor_snapshot(),
-                        checkpointed_silent_watermarks.get(&table_id).copied(),
-                    ),
-                }),
-                UserTableEntry::DroppedRuntime {
                     drop_cts,
                     replay_floor,
-                    ..
-                }
-                | UserTableEntry::DroppedFloor {
-                    drop_cts,
-                    replay_floor,
-                } if catalog_replay_start_ts <= *drop_cts => dropped.push(
-                    PendingDroppedTableRedoFloor::new(table_id, *drop_cts, *replay_floor),
-                ),
-                UserTableEntry::DroppedRuntime { .. } | UserTableEntry::DroppedFloor { .. } => {}
+                ));
             }
         }
         live.sort_by_key(|floor| floor.table_id.as_u64());
@@ -606,33 +641,51 @@ impl Catalog {
 
     /// Insert a user table runtime into the in-memory cache.
     #[inline]
-    pub(crate) fn insert_user_table(&self, table: Arc<Table>) {
+    pub(crate) fn insert_user_table(&self, effective_cts: TrxID, table: Arc<Table>) -> bool {
         let table_id = table.table_id();
+        let metadata = table.metadata();
         match self.user_tables.entry(table_id) {
             Vacant(entry) => {
-                entry.insert(UserTableEntry::Live { table });
+                entry.insert(UserTableEntry::new_live(effective_cts, metadata, table));
+                true
             }
-            Occupied(_) => panic!(
-                "create-table runtime install invariant violated: atomically allocated table_id is already installed, table_id={table_id}"
-            ),
+            Occupied(_) => false,
         }
     }
 
-    /// Remove a live user table runtime from the in-memory cache.
+    /// Remove one recovery-only live current entry from the in-memory cache.
     #[inline]
     pub(crate) fn remove_live_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         match self.user_tables.entry(table_id) {
-            Occupied(entry) if entry.get().live_table().is_some() => {
-                let UserTableEntry::Live { table } = entry.remove() else {
-                    unreachable!("entry checked as live")
-                };
-                Some(table)
+            Occupied(entry) if entry.get().current_live_table().is_some() => {
+                Some(entry.remove().into_recovery_live_table())
             }
-            Occupied(_) | Vacant(_) => None,
+            Occupied(_) => None,
+            Vacant(_) => None,
         }
     }
 
-    /// Transition one live user-table entry into retained dropped-runtime state.
+    /// Publish one live metadata transition after runtime-layout installation.
+    #[inline]
+    pub(crate) fn publish_user_table_metadata(
+        &self,
+        table_id: TableID,
+        effective_cts: TrxID,
+        table: &Arc<Table>,
+        expected_metadata: &Arc<TableMetadata>,
+        new_metadata: Arc<TableMetadata>,
+    ) -> bool {
+        match self.user_tables.entry(table_id) {
+            Occupied(mut entry) => {
+                entry
+                    .get_mut()
+                    .publish_live(effective_cts, table, expected_metadata, new_metadata)
+            }
+            Vacant(_) => false,
+        }
+    }
+
+    /// Publish a tombstone and retain the dropped runtime operationally.
     #[inline]
     pub(crate) fn mark_user_table_dropped_runtime(
         &self,
@@ -642,19 +695,7 @@ impl Catalog {
         replay_floor: TableRedoReplayFloor,
     ) -> bool {
         match self.user_tables.entry(table_id) {
-            Occupied(mut entry) => match entry.get() {
-                UserTableEntry::Live { table: current } if Arc::ptr_eq(current, &table) => {
-                    entry.insert(UserTableEntry::DroppedRuntime {
-                        table,
-                        drop_cts,
-                        replay_floor,
-                    });
-                    true
-                }
-                UserTableEntry::Live { .. }
-                | UserTableEntry::DroppedRuntime { .. }
-                | UserTableEntry::DroppedFloor { .. } => false,
-            },
+            Occupied(mut entry) => entry.get_mut().publish_drop(drop_cts, table, replay_floor),
             Vacant(_) => false,
         }
     }
@@ -669,10 +710,7 @@ impl Catalog {
     ) {
         match self.user_tables.entry(table_id) {
             Vacant(entry) => {
-                entry.insert(UserTableEntry::DroppedFloor {
-                    drop_cts,
-                    replay_floor,
-                });
+                entry.insert(UserTableEntry::new_dropped_floor(drop_cts, replay_floor));
             }
             Occupied(_) => panic!(
                 "recovery dropped-floor invariant violated: table entry still exists after runtime removal, table_id={table_id}, drop_cts={drop_cts}"
@@ -689,13 +727,12 @@ impl Catalog {
         let mut table_ids = self
             .user_tables
             .iter()
-            .filter_map(|entry| match entry.value() {
-                UserTableEntry::DroppedRuntime { drop_cts, .. } if *drop_cts < min_active_sts => {
-                    Some(*entry.key())
-                }
-                UserTableEntry::Live { .. }
-                | UserTableEntry::DroppedRuntime { .. }
-                | UserTableEntry::DroppedFloor { .. } => None,
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .dropped_replay_floor()
+                    .is_some_and(|(drop_cts, _)| drop_cts < min_active_sts)
+                    .then_some(*entry.key())
             })
             .collect::<Vec<_>>();
         table_ids.sort_by_key(|table_id| table_id.as_u64());
@@ -703,24 +740,11 @@ impl Catalog {
         let mut candidates = Vec::with_capacity(table_ids.len());
         for table_id in table_ids {
             if let Occupied(mut entry) = self.user_tables.entry(table_id) {
-                let UserTableEntry::DroppedRuntime {
-                    table,
-                    drop_cts,
-                    replay_floor,
-                } = entry.get()
+                let Some((table, drop_cts, replay_floor)) =
+                    entry.get_mut().take_dropped_runtime(min_active_sts)
                 else {
                     continue;
                 };
-                if *drop_cts >= min_active_sts {
-                    continue;
-                }
-                let table = Arc::clone(table);
-                let drop_cts = *drop_cts;
-                let replay_floor = *replay_floor;
-                entry.insert(UserTableEntry::DroppedFloor {
-                    drop_cts,
-                    replay_floor,
-                });
                 candidates.push(DroppedTableRuntime {
                     table_id,
                     drop_cts,
@@ -739,30 +763,14 @@ impl Catalog {
         let drop_cts = item.drop_cts;
         let replay_floor = item.replay_floor;
         match self.user_tables.entry(table_id) {
-            Occupied(mut entry) => match entry.get() {
-                UserTableEntry::DroppedFloor {
-                    drop_cts: observed_drop_cts,
-                    replay_floor: observed_replay_floor,
-                } if *observed_drop_cts == drop_cts && *observed_replay_floor == replay_floor => {
-                    entry.insert(UserTableEntry::DroppedRuntime {
-                        table: item.table,
-                        drop_cts,
-                        replay_floor,
-                    });
-                }
-                UserTableEntry::Live { .. } => panic!(
-                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=live"
-                ),
-                UserTableEntry::DroppedRuntime { .. } => panic!(
-                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=dropped_runtime"
-                ),
-                UserTableEntry::DroppedFloor {
-                    drop_cts: observed_drop_cts,
-                    replay_floor: observed_replay_floor,
-                } => panic!(
-                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=dropped_floor(observed_drop_cts={observed_drop_cts}, observed_replay_floor={observed_replay_floor:?})"
-                ),
-            },
+            Occupied(mut entry) => {
+                assert!(
+                    entry
+                        .get_mut()
+                        .restore_dropped_runtime(item.table, drop_cts, replay_floor),
+                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=mismatch"
+                );
+            }
             Vacant(_) => panic!(
                 "purge must retain a dropped floor while a detached runtime is checked for stale handles: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=vacant"
             ),
@@ -779,16 +787,13 @@ impl Catalog {
         let mut candidates = self
             .user_tables
             .iter()
-            .filter_map(|entry| match entry.value() {
-                UserTableEntry::DroppedFloor {
-                    drop_cts,
-                    replay_floor,
-                } => Some(DroppedTableFileCleanup::new(
-                    *entry.key(),
-                    *drop_cts,
-                    *replay_floor,
-                )),
-                UserTableEntry::Live { .. } | UserTableEntry::DroppedRuntime { .. } => None,
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .dropped_floor()
+                    .map(|(drop_cts, replay_floor)| {
+                        DroppedTableFileCleanup::new(*entry.key(), drop_cts, replay_floor)
+                    })
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|item| (item.drop_cts.as_u64(), item.table_id.as_u64()));
@@ -799,20 +804,48 @@ impl Catalog {
     #[inline]
     pub(crate) fn remove_dropped_floor(&self, item: DroppedTableFileCleanup) -> bool {
         match self.user_tables.entry(item.table_id) {
-            Occupied(entry) => match entry.get() {
-                UserTableEntry::DroppedFloor {
-                    drop_cts,
-                    replay_floor,
-                } if *drop_cts == item.drop_cts && *replay_floor == item.replay_floor => {
-                    let _ = entry.remove();
-                    true
+            Occupied(mut entry) => {
+                if !entry
+                    .get_mut()
+                    .remove_dropped_floor(item.drop_cts, item.replay_floor)
+                {
+                    return false;
                 }
-                UserTableEntry::Live { .. }
-                | UserTableEntry::DroppedRuntime { .. }
-                | UserTableEntry::DroppedFloor { .. } => false,
-            },
+                if entry.get().is_empty() {
+                    let _ = entry.remove();
+                }
+                true
+            }
             Vacant(_) => false,
         }
+    }
+
+    /// Purge metadata history against the authoritative transaction horizon.
+    #[inline]
+    pub(crate) fn purge_user_table_history(&self, min_active_sts: TrxID) {
+        let mut table_ids = self
+            .user_tables
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        table_ids.sort_by_key(|table_id| table_id.as_u64());
+        for table_id in table_ids {
+            if let Occupied(mut entry) = self.user_tables.entry(table_id) {
+                entry.get_mut().purge_history(min_active_sts);
+                if entry.get().is_empty() {
+                    let _ = entry.remove();
+                }
+            }
+        }
+    }
+
+    /// Return the retained logical metadata-version count for test assertions.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn user_table_history_version_count(&self, table_id: TableID) -> Option<usize> {
+        self.user_tables
+            .get(&table_id)
+            .and_then(|entry| entry.value().history_version_count())
     }
 
     /// Return retained dropped table ids that should protect files from startup cleanup.
@@ -821,11 +854,11 @@ impl Catalog {
         let mut table_ids = self
             .user_tables
             .iter()
-            .filter_map(|entry| match entry.value() {
-                UserTableEntry::DroppedRuntime { .. } | UserTableEntry::DroppedFloor { .. } => {
-                    Some(*entry.key())
-                }
-                UserTableEntry::Live { .. } => None,
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .has_dropped_operational_state()
+                    .then_some(*entry.key())
             })
             .collect::<Vec<_>>();
         table_ids.sort_by_key(|table_id| table_id.as_u64());
@@ -868,31 +901,6 @@ impl Component for Catalog {
 
     #[inline]
     fn shutdown(_component: &Self::Owned) {}
-}
-
-enum UserTableEntry {
-    Live {
-        table: Arc<Table>,
-    },
-    DroppedRuntime {
-        table: Arc<Table>,
-        drop_cts: TrxID,
-        replay_floor: TableRedoReplayFloor,
-    },
-    DroppedFloor {
-        drop_cts: TrxID,
-        replay_floor: TableRedoReplayFloor,
-    },
-}
-
-impl UserTableEntry {
-    #[inline]
-    fn live_table(&self) -> Option<&Arc<Table>> {
-        match self {
-            UserTableEntry::Live { table } => Some(table),
-            UserTableEntry::DroppedRuntime { .. } | UserTableEntry::DroppedFloor { .. } => None,
-        }
-    }
 }
 
 /// Dropped table runtime detached from the catalog map for purge destruction.
