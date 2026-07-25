@@ -1,8 +1,9 @@
 ---
 id: 000237
 title: Add Metadata-Only Table History and Publication
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-25
+github_issue: 887
 ---
 
 # Task: Add Metadata-Only Table History and Publication
@@ -539,6 +540,50 @@ outcome; keep its Task Doc linked to this document.
 
 ## Implementation Notes
 
+Implemented Phase 1 with one volatile metadata-history entry per user table.
+The catalog now resolves strict STS-visible metadata separately from direct
+current state, publishes matching CTS-effective transitions for table and index
+DDL, and keeps logical history independent from dropped-runtime and replay/file
+cleanup ownership. CREATE TABLE holds metadata X across catalog commit and
+complete runtime/history installation; queued DDL waiters resume through the
+normal grant path.
+
+Metadata-history GC reuses the authoritative transaction purge horizon. Live
+history retains the newest predecessor visible to the oldest active STS and
+stops prefix removal at an externally pinned version. Dropped history is
+removed only after its strict post-DROP horizon and pins clear, independently
+of operational cleanup. Recovery installs one CTS-zero current baseline and
+does not reconstruct pre-crash history or tombstones.
+
+Implementation review produced three material refinements:
+
+- `UserTableEntry` stores history directly under the existing `FastDashMap`
+  guard; an intermediate nested history mutex was removed.
+- The lock manager now has only production waiter outcomes
+  (`Waiting`, `Granted`, and `Released`); the test-only semantic failure outcome
+  and broadcast helpers were removed, and coverage uses owner release through
+  `LockWaiterReleased`.
+- Purge's exclusive prefix length deliberately retains the newest version below
+  `min_active_sts` when current metadata is too new. A regression test holds an
+  active reader across index DDL, verifies that predecessor remains resolvable,
+  and verifies reclamation after the horizon advances beyond current metadata.
+
+The forecast direct changes in `recovery/mod.rs`, `catalog/checkpoint.rs`, and
+`table/mod.rs` were unnecessary: their existing paths consume the refactored
+catalog helpers and recovery installation boundary. No public API, persistent
+format, redo shape, unsafe code, or Phase 2 admission behavior changed.
+
+Verification completed with:
+
+- branch-diff style audit passing for 12 Rust files, including formatting and
+  workspace Clippy with warnings denied;
+- `rtk cargo nextest run --workspace`: 1,535 tests passed;
+- `rtk cargo nextest run -p doradb-storage --no-default-features --features
+  libaio`: 1,460 tests passed; and
+- focused changed-path coverage above the repository 80% review bar (95.84%
+  across the original implementation paths, with the reviewed history/catalog
+  subset at 96.33%).
+
 ## Impacts
 
 - `doradb-storage/src/catalog/history.rs`
@@ -553,23 +598,22 @@ outcome; keep its Task Doc linked to this document.
   - post-root/layout CREATE/DROP INDEX metadata publication.
 - `doradb-storage/src/table/layout.rs`
   - current metadata identity assertions; no historical runtime ownership.
-- `doradb-storage/src/table/mod.rs`
-  - current layout metadata access used to validate publication consistency.
 - `doradb-storage/src/lock/mod.rs`
   - scoped metadata-X-only CREATE TABLE helper, normal DROP waiter release, and
     removal of semantic waiter-failure broadcasting.
 - `doradb-storage/src/session.rs`
   - explicit-lock and maintenance current-only lookup ordering.
+- `doradb-storage/src/trx/mod.rs`
+  - lock-before-current-resolution ordering and removal of stale weak-cache
+    admission.
 - `doradb-storage/src/trx/stmt.rs`
   - current-live compatibility lookup only; Phase 2 admission remains deferred.
 - `doradb-storage/src/trx/stream_stmt.rs`
   - same temporary current-live compatibility boundary for lazy streams.
+- `doradb-storage/src/table/access.rs`
+  - production owner-release coverage for queued lock cancellation context.
 - `doradb-storage/src/trx/purge.rs`
   - metadata-history work scheduling and strict-horizon cleanup.
-- `doradb-storage/src/recovery/mod.rs`
-  - recovery-only current baseline and operational drop cleanup.
-- `doradb-storage/src/catalog/checkpoint.rs`
-  - explicit current-only index-DDL root proof lookup.
 - `docs/rfcs/0024-versioned-metadata-immediate-retirement.md`
   - task-planning representation sync and resolve-time Phase 1 tracking.
 

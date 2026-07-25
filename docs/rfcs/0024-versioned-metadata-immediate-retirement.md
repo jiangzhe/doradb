@@ -1305,9 +1305,9 @@ Required coverage includes:
     current-only non-MVCC resolver, tombstone authority, and strict
     horizon/historical-pin eviction boundary are fixed.
   - Task Doc: `docs/tasks/000237-metadata-only-table-history-publication.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#887`
+  - Phase Status: done
+  - Implementation Summary: Implemented metadata-only table history, current and visible resolution, DDL publication exclusion, production-only waiter release, and strict horizon/pin-aware GC; validated across default and libaio backends. [Task Resolve Sync: docs/tasks/000237-metadata-only-table-history-publication.md @ 2026-07-25]
 
 - **Phase 2: First-Touch Transaction Binding And Admission**
   - Scope: Replace the weak transaction table cache with positive

@@ -342,18 +342,20 @@ impl TableHistoryEntry {
                     && self.versions.iter().all(TableMetadataVersion::is_unpinned)
             }
             CurrentTableState::Live { effective_cts, .. } => {
-                let candidate_prefix_len = if *effective_cts < min_active_sts {
+                let obsolete_prefix_len = if *effective_cts < min_active_sts {
                     self.versions.len()
                 } else {
+                    // The newest version below the horizon is the predecessor
+                    // visible to the oldest active snapshot, so retain it.
                     self.versions
                         .iter()
                         .rposition(|version| version.effective_cts < min_active_sts)
                         .unwrap_or(0)
                 };
-                let drain_len = self.versions[..candidate_prefix_len]
+                let drain_len = self.versions[..obsolete_prefix_len]
                     .iter()
                     .position(|version| !TableMetadataVersion::is_unpinned(version))
-                    .unwrap_or(candidate_prefix_len);
+                    .unwrap_or(obsolete_prefix_len);
                 self.versions.drain(..drain_len);
                 self.assert_valid();
                 false
@@ -388,6 +390,7 @@ impl TableHistoryEntry {
         }
     }
 
+    /// Returns the number of superseded metadata versions for tests.
     #[cfg(test)]
     #[inline]
     pub(crate) fn version_count(&self) -> usize {
@@ -700,6 +703,7 @@ impl UserTableEntry {
         }
     }
 
+    /// Returns the logical history's superseded-version count for tests.
     #[cfg(test)]
     #[inline]
     pub(crate) fn history_version_count(&self) -> Option<usize> {
@@ -902,6 +906,55 @@ mod tests {
                     .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
                     .is_none()
             );
+        });
+    }
+
+    #[test]
+    fn metadata_history_purge_retains_active_horizon_predecessor() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "metadata_history_purge").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let catalog = engine.catalog();
+
+            let mut ddl_session = engine.new_session().unwrap();
+            let index_no = ddl_session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+            let create_index_cts = catalog
+                .resolve_user_table_current(table_id)
+                .unwrap()
+                .effective_cts();
+
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            let reader_sts = reader.sts();
+            assert!(create_index_cts < reader_sts);
+
+            ddl_session.drop_index(table_id, index_no).await.unwrap();
+            let drop_index_cts = catalog
+                .resolve_user_table_current(table_id)
+                .unwrap()
+                .effective_cts();
+            assert!(reader_sts < drop_index_cts);
+
+            catalog.purge_user_table_history(reader_sts);
+            assert_eq!(catalog.user_table_history_version_count(table_id), Some(1));
+            let visible = catalog
+                .resolve_user_table_visible(table_id, reader_sts)
+                .unwrap();
+            let predecessor = visible.live().unwrap();
+            assert_eq!(predecessor.effective_cts(), create_index_cts);
+            assert_eq!(predecessor.metadata().idx.active_index_count(), 2);
+
+            reader.rollback().await.unwrap();
+            drop(visible);
+            catalog.purge_user_table_history(after(drop_index_cts));
+            assert_eq!(catalog.user_table_history_version_count(table_id), Some(0));
         });
     }
 
