@@ -383,9 +383,9 @@ impl<P: BufferPool> SecondaryIndex<P> {
         }
     }
 
-    /// Bind a unique user-table secondary index to one captured DiskTree root.
+    /// Bind a unique index at a raw root for classified internal operations.
     #[inline]
-    pub(crate) fn bind_unique<'a, 'g>(
+    pub(crate) fn bind_unique_unchecked<'a, 'g>(
         &'a self,
         guards: &'g PoolGuards,
         root: BlockID,
@@ -410,9 +410,9 @@ impl<P: BufferPool> SecondaryIndex<P> {
         }
     }
 
-    /// Bind a non-unique user-table secondary index to one captured DiskTree root.
+    /// Bind a non-unique index at a raw root for classified internal operations.
     #[inline]
-    pub(crate) fn bind_non_unique<'a, 'g>(
+    pub(crate) fn bind_non_unique_unchecked<'a, 'g>(
         &'a self,
         guards: &'g PoolGuards,
         root: BlockID,
@@ -1134,9 +1134,7 @@ mod tests {
         root: BlockID,
         ts: TrxID,
     ) -> Arc<TableFile> {
-        mutable
-            .set_secondary_index_root(index_no, root)
-            .expect("test secondary root publication should accept index number");
+        mutable.set_secondary_index_root(index_no, root);
         let (table, old_root) = mutable
             .commit(ts, false)
             .await
@@ -1242,7 +1240,7 @@ mod tests {
                 .push(PoolRole::Index, (*index_pool).pool_guard())
                 .push(PoolRole::Disk, disk_pool.pool_guard())
                 .build();
-            let bound = index.bind_unique(&pool_guards, root).unwrap();
+            let bound = index.bind_unique_unchecked(&pool_guards, root).unwrap();
 
             assert_eq!(table.active_root_unchecked().secondary_index_roots[0], root);
             assert_eq!(index.disk_runtime().index_no(), 0);
@@ -1651,7 +1649,7 @@ mod tests {
                 .push(PoolRole::Index, (*index_pool).pool_guard())
                 .push(PoolRole::Disk, disk_pool.pool_guard())
                 .build();
-            let bound = index.bind_non_unique(&pool_guards, root).unwrap();
+            let bound = index.bind_non_unique_unchecked(&pool_guards, root).unwrap();
 
             assert_eq!(table.active_root_unchecked().secondary_index_roots[1], root);
             assert_eq!(index.disk_runtime().index_no(), 1);
@@ -1880,7 +1878,7 @@ mod tests {
                     .push(PoolRole::Index, (*index_pool).pool_guard())
                     .push(PoolRole::Disk, disk_pool.pool_guard())
                     .build();
-                let bound = index.bind_unique(&pool_guards, root).unwrap();
+                let bound = index.bind_unique_unchecked(&pool_guards, root).unwrap();
 
                 let range = index.key_encoder().encode_range(&key1[..]..=&key4[..]);
                 let mut stream = bound.index_scan_candidates(&range, TrxID::new(4)).unwrap();
@@ -1982,7 +1980,7 @@ mod tests {
                     .push(PoolRole::Index, (*index_pool).pool_guard())
                     .push(PoolRole::Disk, disk_pool.pool_guard())
                     .build();
-                let bound = index.bind_non_unique(&pool_guards, root).unwrap();
+                let bound = index.bind_non_unique_unchecked(&pool_guards, root).unwrap();
 
                 let range = index.key_encoder().encode_non_unique_equal_range(&key1);
                 let mut stream = bound.equal_scan_candidates(&range, TrxID::new(4)).unwrap();

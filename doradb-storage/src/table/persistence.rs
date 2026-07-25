@@ -1247,15 +1247,7 @@ impl Table {
             if !index_sidecar.has_work() {
                 continue;
             }
-            let old_root = mutable_file
-                .secondary_index_root(index_no)
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach_with(|| {
-                    format!(
-                        "operation=apply_secondary_checkpoint_sidecar, phase=load_index_root, table_id={}, index_no={index_no}",
-                        self.table_id()
-                    )
-                })?;
+            let old_root = mutable_file.secondary_index_root(index_no);
             let runtime = layout.secondary_index(index_no)?.disk_runtime();
             let new_root = match index_sidecar {
                 SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
@@ -1307,15 +1299,7 @@ impl Table {
             if new_root != old_root {
                 // The root update stays private to mutable_file until the
                 // final table-file commit publishes every checkpoint change.
-                mutable_file
-                    .set_secondary_index_root(index_no, new_root)
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach_with(|| {
-                        format!(
-                            "operation=apply_secondary_checkpoint_sidecar, phase=set_index_root, table_id={}, index_no={index_no}",
-                            self.table_id()
-                        )
-                    })?;
+                mutable_file.set_secondary_index_root(index_no, new_root);
             }
         }
         Ok(())
@@ -2623,7 +2607,7 @@ mod tests {
                             active_root.deletion_cutoff_ts
                         );
                         assert_eq!(
-                            snapshot.secondary_index_root(0).unwrap(),
+                            snapshot.secondary_index_root(0),
                             active_root.secondary_index_roots[0]
                         );
                         assert_eq!(

@@ -1428,6 +1428,7 @@ impl TransactionSystem {
             return Err(error.into_report());
         }
         inner.effects_mut().clear_for_rollback();
+        inner.clear_table_bindings();
         self.record_rollback_for_purge(gc_no, sts);
         inner.release_transaction_locks(attachment);
         inner.finish_session_rollback(attachment);

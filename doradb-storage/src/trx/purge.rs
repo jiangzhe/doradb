@@ -197,9 +197,6 @@ impl TransactionSystem {
     }
 
     /// Wake the purge coordinator for metadata-history cleanup only.
-    ///
-    /// This targeted observation also retries an unchanged horizon after an
-    /// externally pinned historical version has been released.
     #[inline]
     pub(crate) fn request_metadata_history_purge(&self) {
         let _ = self.purge_tx.send(Purge::MetadataHistory);

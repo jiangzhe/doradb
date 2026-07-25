@@ -269,6 +269,8 @@ pub(crate) enum OperationError {
     TableNotFound,
     #[error("table is dropping")]
     TableDropping,
+    #[error("schema changed")]
+    SchemaChanged,
     #[error("index not found")]
     IndexNotFound,
     #[error("not supported")]
@@ -876,6 +878,93 @@ impl DiscloseError for OperationOrRuntimeError {
 pub(crate) type OperationOrRuntimeResult<T> = result::Result<T, OperationOrRuntimeError>;
 
 impl<T> MultiDomainResultExt for OperationOrRuntimeResult<T> {
+    #[inline]
+    fn attach(self, attachment: &'static str) -> Self {
+        self.map_err(|error| error.attach(attachment))
+    }
+
+    #[inline]
+    fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|error| error.attach_with(attachment))
+    }
+}
+
+/// Constrained carrier for foreground operations with Operation and Fatal exits.
+///
+/// The reports remain in their native domains until an outward public boundary.
+/// This carrier is deliberately not an `error-stack` context and never accepts
+/// a public [`Error`].
+pub(crate) enum OperationOrFatalError {
+    /// A terminal semantic operation failure.
+    Operation(Report<OperationError>),
+    /// A failure that already crossed a Fatal policy boundary.
+    Fatal(Report<FatalError>),
+}
+
+impl Debug for OperationOrFatalError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operation(report) => Debug::fmt(report, f),
+            Self::Fatal(report) => Debug::fmt(report, f),
+        }
+    }
+}
+
+impl OperationOrFatalError {
+    /// Adds static caller-owned diagnostic context without changing either domain.
+    #[inline]
+    pub(crate) fn attach(self, attachment: &'static str) -> Self {
+        match self {
+            Self::Operation(report) => Self::Operation(report.attach(attachment)),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment)),
+        }
+    }
+
+    /// Adds caller-owned diagnostic context without changing either domain.
+    #[inline]
+    pub(crate) fn attach_with<F>(self, attachment: F) -> Self
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Operation(report) => Self::Operation(report.attach(attachment())),
+            Self::Fatal(report) => Self::Fatal(report.attach(attachment())),
+        }
+    }
+}
+
+impl From<Report<OperationError>> for OperationOrFatalError {
+    #[inline]
+    fn from(report: Report<OperationError>) -> Self {
+        Self::Operation(report)
+    }
+}
+
+impl From<Report<FatalError>> for OperationOrFatalError {
+    #[inline]
+    fn from(report: Report<FatalError>) -> Self {
+        Self::Fatal(report)
+    }
+}
+
+impl DiscloseError for OperationOrFatalError {
+    #[inline]
+    fn disclose(self) -> Error {
+        match self {
+            OperationOrFatalError::Operation(report) => report.disclose(),
+            OperationOrFatalError::Fatal(report) => report.disclose(),
+        }
+    }
+}
+
+/// Result carrying either a terminal Operation report or a Fatal report.
+pub(crate) type OperationOrFatalResult<T> = result::Result<T, OperationOrFatalError>;
+
+impl<T> MultiDomainResultExt for OperationOrFatalResult<T> {
     #[inline]
     fn attach(self, attachment: &'static str) -> Self {
         self.map_err(|error| error.attach(attachment))
@@ -1663,6 +1752,49 @@ mod tests {
             Some(OperationError::DuplicateKey)
         );
         assert!(format!("{report:?}").contains("operation=insert_unique_index"));
+    }
+
+    #[test]
+    fn test_operation_or_fatal_operation_arm_stays_operation() {
+        let carrier = OperationOrFatalError::from(
+            Report::new(OperationError::SchemaChanged).attach("table_id=42"),
+        )
+        .attach("operation=table_insert_mvcc");
+
+        let err = carrier.disclose();
+
+        assert_eq!(err.kind(), ErrorKind::Operation);
+        assert_eq!(
+            err.report().downcast_ref::<OperationError>().copied(),
+            Some(OperationError::SchemaChanged)
+        );
+        let output = format!("{err:?}");
+        assert!(output.contains("table_id=42"));
+        assert!(output.contains("operation=table_insert_mvcc"));
+    }
+
+    #[test]
+    fn test_operation_or_fatal_result_attachment_preserves_fatal_arm() {
+        let result: OperationOrFatalResult<()> = Err(OperationOrFatalError::from(Report::new(
+            FatalError::Poisoned,
+        )));
+
+        let carrier = result
+            .attach("operation=admit_user_table")
+            .expect_err("fatal failure must remain terminal");
+        let OperationOrFatalError::Fatal(report) = carrier else {
+            panic!("fatal attachment must preserve the Fatal arm")
+        };
+
+        assert_eq!(
+            report.downcast_ref::<FatalError>().copied(),
+            Some(FatalError::Poisoned)
+        );
+        assert!(format!("{report:?}").contains("operation=admit_user_table"));
+        assert_eq!(
+            OperationOrFatalError::Fatal(report).disclose().kind(),
+            ErrorKind::Fatal
+        );
     }
 
     #[test]

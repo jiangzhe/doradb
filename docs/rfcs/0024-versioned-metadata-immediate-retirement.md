@@ -41,8 +41,7 @@ Secondary-index roots remain operation resources: an opaque lifetime-bound
 proof prevents an eager read or lazy stream from reusing a root address after
 its operation lease ends. Non-MVCC operations resolve current state only. A
 DROP TABLE history tombstone remains authoritative over weak/runtime hints
-until the strict active-STS horizon and historical-version pins permit
-history-slot GC.
+until the strict active-STS horizon permits history-slot GC.
 
 Writes additionally require the transaction-visible metadata identity
 `(TableID, effective_cts)` to equal the current identity captured by the
@@ -291,6 +290,14 @@ Issue Labels:
   without a nested history lock, storing current live metadata and CTS directly,
   identifying versions by `(TableID, effective_cts)`, and resolving current
   before a reverse-linear scan of superseded versions.
+- [U13] Phase 2 implementation review on 2026-07-25 made the authoritative
+  active-STS horizon the sole metadata-history reclamation boundary. A resolved
+  result owns its selected `Arc<TableMetadata>` but does not pin catalog
+  history; transaction cleanup drops bindings before removing its STS from
+  horizon tracking.
+- [U14] Phase 2 ownership review on 2026-07-25 selected a borrowed eager index
+  runtime from the pinned `TableRuntimeLayout`; only caller-driven streams own
+  an index Arc independently of their temporary accessor.
 
 ### Source Backlogs
 
@@ -314,7 +321,7 @@ struct TableMetadataVersion {
 
 struct TableHistoryEntry {
     // Superseded live versions, oldest to newest.
-    versions: Vec<Arc<TableMetadataVersion>>,
+    versions: Vec<TableMetadataVersion>,
     current: CurrentTableState,
 }
 
@@ -358,10 +365,11 @@ GC, and operational-slot changes hold an occupied write entry only for final
 in-memory validation, appends, state switches, or prefix drains. No map guard
 is held across `.await`, logical lock acquisition, catalog commit/rollback,
 root publication, layout installation, runtime destruction, or file deletion.
-A historical result clones its wrapper before releasing the shared guard, and
-that Arc remains its external GC pin. `TableMetadata(S/X)` remains the
-asynchronous operation/publication boundary. [D7], [D14], [C4], [C5], [C11],
-[C13], [U4], [U12]
+A historical result clones its selected metadata Arc and copies its effective
+CTS before releasing the shared guard. History membership remains governed
+only by the active-STS horizon. `TableMetadata(S/X)` remains the asynchronous
+operation/publication boundary. [D7], [D14], [C4], [C5], [C11], [C13], [U4],
+[U12], [U13]
 
 Each successfully admitted transaction stores a positive table binding:
 
@@ -369,7 +377,6 @@ Each successfully admitted transaction stores a positive table binding:
 struct ResolvedLiveMetadata {
     effective_cts: TrxID,
     metadata: Arc<TableMetadata>,
-    _history_pin: Option<Arc<TableMetadataVersion>>,
 }
 
 struct TransactionTableBinding {
@@ -381,13 +388,13 @@ struct TransactionTableBinding {
 ```
 
 The binding map key supplies `TableID`, so the visible and bound-current
-version identities are `(table_id, effective_cts)`. Pointer identity of a
-version wrapper is not semantic identity. A historical visible result carries
-its wrapper in `_history_pin`; a direct-current result carries no wrapper.
-Transaction metadata S prevents that direct current state from becoming
-superseded while the binding exists. Online publication enforces strictly
-increasing effective CTS values per table; recovery alone may install the
-synthetic CTS-zero baseline. [D2], [D7], [D14], [C10], [C13], [U10], [U12]
+version identities are `(table_id, effective_cts)`. A resolved result is
+self-contained through its metadata Arc; whether the selected catalog version
+remains in history is not part of its identity or lifetime. Transaction
+metadata S prevents direct current state from becoming superseded while the
+binding exists. Online publication enforces strictly increasing effective CTS
+values per table; recovery alone may install the synthetic CTS-zero baseline.
+[D2], [D7], [D14], [C10], [C13], [U10], [U12], [U13]
 
 The binding contains no table-root snapshot. Its runtime/layout were current
 when admitted and cannot become non-current while the transaction owns
@@ -399,7 +406,7 @@ not an STS-resolvable historical runtime. [D7], [D14], [C1], [C10], [C13],
 
 A DDL commit advances direct current state to its commit timestamp. When an
 existing live current state is superseded, publication wraps that old metadata
-and CTS in one historical `Arc<TableMetadataVersion>` before installing the new
+and CTS in one historical `TableMetadataVersion` before installing the new
 current state. Visible resolution holds the shared catalog-map guard and uses:
 
 ```text
@@ -409,7 +416,7 @@ resolve_visible(sts):
 
     for version in versions.iter().rev():
         if version.effective_cts < sts:
-            return historical live metadata with its version Arc pin
+            return effective_cts plus a clone of the historical metadata Arc
 
     return absent
 ```
@@ -643,42 +650,45 @@ logical index incarnation; historical metadata does not need a
 secondary-runtime Arc, and the foreground path does not compare
 historical/current runtime pointers. Publication and recovery may assert that
 a shared stable slot has an unchanged specification as an internal invariant.
-[D9], [D14], [C1], [C4], [C12], [U9], [U10], [U12]
+[D9], [D14], [C1], [C4], [C12], [U9], [U10], [U12], [U14]
 
 The executable index is taken only from the transaction's pinned current
 `TableRuntimeLayout`. Root capture is represented by an opaque,
-lifetime-bearing operation proof rather than a root address:
+lifetime-bearing current-index read handle rather than a root address:
 
 ```rust
-struct CurrentIndexReadProof<'op> {
-    index: Arc<SecondaryIndex<EvictableBufferPool>>,
+struct CurrentIndexReadHandle<'op, 'idx> {
+    index: &'idx SecondaryIndex<EvictableBufferPool>,
+    guards: &'op PoolGuards,
     root: ProvenIndexRoot<'op>,
 }
 
 struct ProvenIndexRoot<'op> {
     block_id: BlockID,
-    _lease: PhantomData<&'op OperationRootLease>,
+    _proof: PhantomData<&'op TrxReadProof<'op>>,
 }
 ```
 
 The names and private representation are conceptual, but the Rust lifetime is
-required. A constructor may mint the proof only from a proof-gated active-root
-observation after table/index admission. Downstream index bind and execution
-APIs accept the proof, not a standalone `BlockID`, and expose no extraction
-path that authorizes delayed reuse of the address. The proof cannot be stored
-in `TransactionTableBinding`, transaction/session caches, or metadata history.
-Existing CoW publication retention protects a root displaced by checkpoint
-until the operation lease ends. No historical root handle, index incarnation
-wrapper, mutex, or retained-root lookup is introduced. [D3], [D4], [C7], [C9],
-[C12], [U6], [U9], [U10], [U11]
+required. The eager handle borrows its index runtime from the pinned layout
+instead of cloning the layout-owned Arc. A constructor may mint the handle
+only from a proof-gated active-root observation after table/index admission.
+Downstream index bind and execution APIs accept the handle, not a standalone
+`BlockID`, and expose no extraction path that authorizes delayed reuse of the
+address. The handle cannot be stored in `TransactionTableBinding`,
+transaction/session caches, or metadata history. Existing CoW publication
+retention protects a root displaced by checkpoint until the operation handle
+ends. No historical root handle, index incarnation wrapper, mutex, or
+retained-root lookup is introduced. [D3], [D4], [C1], [C7], [C9], [C12], [U6],
+[U9], [U10], [U11], [U14]
 
-An eager read retains its proof through the final DiskTree access. A lazy
-stream owns or borrows an equivalent operation lease and retains the proof
-until exhaustion or drop; the type system must prevent the stream's root state
-from outliving that lease and its transaction checkout. The transaction
-metadata-S binding prevents DDL publication, while the operation proof
-separately protects a root that checkpoint may displace. [D4], [D7], [C17],
-[U10], [U11]
+An eager read retains its borrowed handle through the final DiskTree access. A
+lazy stream owns an equivalent handle, including its index Arc, and retains
+the root/cursor state until exhaustion or drop; the type system must prevent
+that state from outliving the owning handle and its transaction checkout. The
+transaction metadata-S binding prevents DDL publication, while the operation
+handle separately protects a root that checkpoint may displace. [D4], [D7],
+[C17], [U10], [U11], [U14]
 
 `SchemaChanged` does not trigger automatic fallback in the storage layer. An
 upper execution layer may discard the plan and, under the same STS, choose
@@ -874,34 +884,32 @@ metadata X only. [D7], [C3], [C11], [C13], [C14], [U4], [U11]
 
 ### Metadata And Resource Reclamation
 
-Superseded metadata versions are retained while an active transaction STS may
-resolve them or a visible result pins their wrapper Arc. Direct current state
+Superseded metadata versions are retained only while an active transaction STS
+may newly resolve them. A resolved result owns its selected metadata Arc and
+effective CTS independently of catalog history membership. Direct current state
 needs no version wrapper: transaction metadata S prevents publication while a
 current binding exists. This history hides later creations and distinguishes
 old-object retirement from ordinary absence. Catalog-row history remains
 ordinary catalog-table MVCC GC. [D1], [D2], [D6], [D14], [C5], [C6], [U8],
-[U9], [U12]
+[U9], [U12], [U13]
 
 Metadata GC joins the existing transaction purge coordinator and uses its
 authoritative `min_active_sts`; it adds no horizon or worker. For a live entry,
 if current CTS is strictly below the horizon, direct current state is already
-the required predecessor and every unpinned historical version may be removed.
+the required predecessor and every historical version may be removed.
 Otherwise GC retains the newest historical version strictly below the horizon
-and every later version. It calculates that position linearly, drains only an
-unpinned prefix, and stops at the first externally pinned historical wrapper.
-An unchanged horizon may retry after such a pin drains. [D2], [D6], [D14],
-[C9], [U12]
+and every later version. It calculates that position linearly and drains the
+complete obsolete prefix. [D2], [D6], [D14], [C9], [U12], [U13]
 
 For a dropped table, history GC must retain the current tombstone and enough
-predecessor history to resolve every active STS until both:
+predecessor history to resolve every active STS until:
 
 ```text
 min_active_sts > drop_cts
-AND no historical TableMetadataVersion Arc is externally pinned
 ```
 
 At `sts == drop_cts`, strict visibility still selects the predecessor, so the
-strict horizon condition is required. Once both conditions hold, no surviving
+strict horizon condition is required. Once that condition holds, no surviving
 or future transaction can distinguish the tombstone from registry absence;
 the `UserTableEntry.history` slot may be removed. Its dropped operational slot
 remains untouched, and the outer map key survives until that slot also clears.
@@ -909,7 +917,7 @@ A later lookup returns `TableNotFound` and still may not fall back to a weak or
 dropped-runtime hint. Stable table-id non-reuse makes this horizon-scoped
 negative-state eviction unambiguous. The tombstone is not retained for the
 engine lifetime and is not made durable. [D2], [D6], [D8], [D14], [C5], [C9],
-[C10], [C14], [U11], [U12]
+[C10], [C14], [U11], [U12], [U13]
 
 Metadata retention cannot retain executable resources because version objects
 contain no runtime handles. A transaction binding may strongly own a
@@ -1098,9 +1106,8 @@ metadata. [D5], [C8], [C10], [U3]
   Removing the entry also invites weak or dropped-runtime fallback during
   operational cleanup.
 - Why Not Chosen: The tombstone remains authoritative until the strict
-  post-DROP STS horizon and historical-version pins prove that all predecessor
-  resolutions are gone. [D2], [D6], [D8], [D14], [C5], [C14], [U8], [U11],
-  [U12]
+  post-DROP STS horizon proves that all predecessor resolutions are gone.
+  [D2], [D6], [D8], [D14], [C5], [C14], [U8], [U11], [U12], [U13]
 
 ### Engine-Lifetime Or Durable Tombstones
 
@@ -1241,9 +1248,9 @@ Required coverage includes:
 25. Catalog/runtime detachment after DROP leaving the retained direct tombstone
     authoritative despite live weak hints or operational `DroppedRuntime`, with
     old/new STS errors still derived from the history slot.
-26. A tombstone remaining while `min_active_sts <= drop_cts` or a historical
-    version Arc is pinned, then the history slot becoming removable only after
-    `min_active_sts > drop_cts` and all pins release; the independent
+26. A tombstone remaining while `min_active_sts <= drop_cts`, then the history
+    slot becoming removable as soon as `min_active_sts > drop_cts` even while
+    an already resolved metadata result remains alive; the independent
     operational slot and outer-key lifetime remain correct.
 27. A stale writer on a binding miss receiving `SchemaChanged` with no
     row/index/undo/redo effects and no transaction metadata/data lock.
@@ -1261,10 +1268,10 @@ Required coverage includes:
 33. Dropped-index DiskTree pages obeying the existing active-root publication
     fence, then being reclaimed without any metadata-version or incarnation
     root lease.
-34. Historical metadata-version Arcs and session weak hints retaining no
-    secondary runtime; direct current live state remains layout-consistent, and
-    runtime cleanup waits only for DDL-local, rollback/purge, and lifecycle
-    ownership.
+34. Resolved historical metadata Arcs and session weak hints retaining no
+    secondary runtime or catalog-history membership; direct current live state
+    remains layout-consistent, and runtime cleanup waits only for DDL-local,
+    rollback/purge, and lifecycle ownership.
 35. Dropped-table runtime/file cleanup obeying existing purge, checkpoint, and
     recovery fences independently of horizon-scoped metadata-tombstone
     authority and without historical foreground access.
@@ -1303,11 +1310,11 @@ Required coverage includes:
     identity, the single `FastDashMap` guard boundary, current-first reverse-linear vector
     resolution, metadata/runtime ownership boundary, publication lock,
     current-only non-MVCC resolver, tombstone authority, and strict
-    horizon/historical-pin eviction boundary are fixed.
+    horizon eviction boundary are fixed.
   - Task Doc: `docs/tasks/000237-metadata-only-table-history-publication.md`
   - Task Issue: `#887`
   - Phase Status: done
-  - Implementation Summary: Implemented metadata-only table history, current and visible resolution, DDL publication exclusion, production-only waiter release, and strict horizon/pin-aware GC; validated across default and libaio backends. [Task Resolve Sync: docs/tasks/000237-metadata-only-table-history-publication.md @ 2026-07-25]
+  - Implementation Summary: Implemented metadata-only table history, current and visible resolution, DDL publication exclusion, production-only waiter release, and strict horizon-aware GC. Phase 2 later removed the original defensive wrapper-pin gate so the active-STS horizon is the sole reclamation authority; Phase 1 validation passed across default and libaio backends. [Task Resolve Sync: docs/tasks/000237-metadata-only-table-history-publication.md @ 2026-07-25] [U13]
 
 - **Phase 2: First-Touch Transaction Binding And Admission**
   - Scope: Replace the weak transaction table cache with positive
@@ -1315,7 +1322,9 @@ Required coverage includes:
     acquisition, implement locked cache misses and failure-atomic
     statement-to-transaction S handoff, retain session weak hints without
     version caching, add lifetime-bound current-index read proofs, and add
-    `OperationError::SchemaChanged` plus table/index/write admission.
+    `OperationError::SchemaChanged` plus table/index/write admission. Simplify
+    historical results to self-contained metadata observations and make the
+    active-STS horizon the sole metadata-history GC boundary.
   - Goals: Give bound tables a constant-time transaction cache path, make
     same-table DDL drain table-touching transactions, preserve effect- and
     lock-free schema rejection on first-touch failures, and prevent root
@@ -1326,12 +1335,12 @@ Required coverage includes:
     resolution, `(TableID, effective_cts)` identity, current-runtime lookup, and
     create publication exclusion.
   - Phase-local Choices: Choose helper placement, cache-map mechanics, and a
-    safe borrowed or owning representation for the operation root lease.
+    safe borrowed or owning representation for the current-index read handle.
     Cache-before-lock ordering, fresh-grant-aware failure rollback,
     admission-lock/binding invariant, table-granular DDL drain, error mapping,
     stable-index membership, and compiler-enforced proof lifetime are fixed.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000238-first-touch-transaction-binding-admission.md`
+  - Task Issue: `#889`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
@@ -1420,8 +1429,7 @@ Required coverage includes:
 - Transaction bindings strongly pin the current table/runtime layout until
   transaction end.
 - A dropped table's metadata history may outlive foreground runtime detachment
-  until the strict active-STS horizon and historical-version pins permit
-  eviction.
+  until the strict active-STS horizon permits eviction.
 - Metadata history, direct current foreground state, independent operational
   cleanup state, and transaction binding add coordination complexity even
   though historical versions are non-executable.

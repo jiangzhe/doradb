@@ -744,13 +744,11 @@ fn drop_not_live_err(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::TrxID;
     use crate::session::tests::{
         SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_root_ready,
     };
     use crate::table::CheckpointOutcome;
     use crate::table::tests::*;
-    use crate::value::Val;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -936,76 +934,6 @@ mod tests {
             drop(metadata_fut);
             drop(root_lease);
             let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
-        });
-    }
-
-    #[test]
-    fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_one_row(
-                table_id,
-                &mut session,
-                vec![Val::from(1), Val::from("lifecycle")],
-            )
-            .await;
-
-            let table = table_for_internal_assertion(&engine, table_id);
-            table.start_drop_lifecycle().unwrap().wait().await;
-
-            let mut read_trx = session.begin_trx().unwrap();
-            let err = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &single_key(1), &[0, 1])
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableDropping)
-            );
-            assert_eq!(read_trx.commit().await.unwrap(), TrxID::new(0));
-
-            let mut write_trx = session.begin_trx().unwrap();
-            let err = trx_insert_row_by_id(
-                &mut write_trx,
-                table_id,
-                vec![Val::from(2), Val::from("blocked")],
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableDropping)
-            );
-            assert_eq!(write_trx.commit().await.unwrap(), TrxID::new(0));
-
-            table.mark_dropped_lifecycle();
-
-            let mut dropped_read = session.begin_trx().unwrap();
-            let err =
-                trx_select_row_mvcc_by_id(&mut dropped_read, table_id, &single_key(1), &[0, 1])
-                    .await
-                    .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
-            );
-            assert_eq!(dropped_read.commit().await.unwrap(), TrxID::new(0));
-
-            let mut dropped_write = session.begin_trx().unwrap();
-            let err = trx_insert_row_by_id(
-                &mut dropped_write,
-                table_id,
-                vec![Val::from(3), Val::from("dropped")],
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
-            );
-            assert_eq!(dropped_write.commit().await.unwrap(), TrxID::new(0));
         });
     }
 

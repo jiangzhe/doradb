@@ -15,6 +15,7 @@
 //!    c) If exists, check the timestamp in entry head. If it's larger than current STS, means
 //!    it's invisible, undo change and go to next version in the chain...
 //!    d) If less than current STS, return current version.
+mod admission;
 pub(crate) mod group;
 pub(crate) mod purge;
 pub(crate) mod retention;
@@ -50,7 +51,6 @@ use crate::notify::EventNotifyOnDrop;
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::session::TrxAttachment;
-use crate::table::Table;
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener};
@@ -59,9 +59,10 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::AsyncFnOnce;
 use std::ptr::addr_eq;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 
+pub(crate) use admission::TableAdmissionRequest;
 pub use stmt::Statement;
 pub use stream_stmt::{IndexScanMvccStream, StreamStmt};
 /// Minimum snapshot timestamp assigned by the transaction system.
@@ -695,8 +696,8 @@ impl<'r> TrxRuntime<'r> {
 
     /// Mint a proof for runtime reads tied to this transaction context.
     #[inline]
-    pub(crate) fn read_proof(&self) -> TrxReadProof<'_> {
-        self.ctx.read_proof()
+    pub(crate) fn read_proof(&self) -> TrxReadProof<'r> {
+        TrxReadProof { _ctx: PhantomData }
     }
 
     /// Debug-asserts that this transaction owns table-write intent.
@@ -1481,7 +1482,7 @@ impl TrxTableLockGuards<'_> {
 pub(crate) struct TrxInner {
     ctx: TrxContext,
     effects: TrxEffects,
-    table_cache: FastHashMap<TableID, Weak<Table>>,
+    table_bindings: FastHashMap<TableID, admission::TransactionTableBinding>,
     lock_state: Option<OwnerLockState>,
     next_stmt_no: StmtNo,
     active: bool,
@@ -1495,7 +1496,7 @@ impl TrxInner {
         TrxInner {
             ctx: TrxContext::new(trx_id, sts, gc_no),
             effects: TrxEffects::empty(),
-            table_cache: FastHashMap::default(),
+            table_bindings: FastHashMap::default(),
             lock_state: Some(OwnerLockState::new_grouped(
                 LockOwner::Transaction(trx_id),
                 owner_group,
@@ -1594,13 +1595,6 @@ impl TrxInner {
         stmt_no
     }
 
-    /// Remember a successfully resolved user-table runtime without extending its lifetime.
-    #[inline]
-    pub(crate) fn cache_user_table(&mut self, table: &Arc<Table>) {
-        self.table_cache
-            .insert(table.table_id(), Arc::downgrade(table));
-    }
-
     /// Returns this transaction's current status timestamp.
     #[inline]
     pub(crate) fn trx_id(&self) -> TrxID {
@@ -1684,9 +1678,16 @@ impl TrxInner {
         if !self.active {
             return 0;
         }
+        self.clear_table_bindings();
         self.lock_state.as_mut().map_or(0, |lock_state| {
             lock_state.release_all(attachment.engine().lock_manager())
         })
+    }
+
+    /// Drops every transaction table binding before the active STS can advance.
+    #[inline]
+    pub(crate) fn clear_table_bindings(&mut self) {
+        self.table_bindings.clear();
     }
 
     /// Returns whether the transaction needs a recovery-visible log record.
@@ -1728,6 +1729,7 @@ impl TrxInner {
             "terminal transaction claim must retain its active core through prepare: trx_id={}",
             self.trx_id()
         );
+        self.clear_table_bindings();
         // fast path for readonly transactions
         if !self.require_ordered_commit() {
             let lock_manager = self.clone_lock_manager_guard(&attachment);
@@ -1779,6 +1781,10 @@ impl Drop for TrxInner {
     #[inline]
     fn drop(&mut self) {
         self.effects.assert_cleared();
+        assert!(
+            self.table_bindings.is_empty(),
+            "transaction table bindings should be cleared before core drop"
+        );
         if let Some(lock_state) = self.lock_state.as_ref() {
             lock_state.assert_cleared();
         }

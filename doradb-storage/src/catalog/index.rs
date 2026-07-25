@@ -2354,15 +2354,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
-                vec![vec![Val::from(1), Val::from("alpha")]]
-            );
-            assert!(
-                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "bravo")
-                    .await
-                    .is_empty()
-            );
+            assert_index_not_found(&mut old_reader, table_id, 1, "alpha").await;
             old_reader.commit().await.unwrap();
 
             let mut fresh_reader = writer_session.begin_trx().unwrap();
@@ -2425,14 +2417,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                non_unique_mvcc_lookup(&mut first_reader, table_id, 1, "alpha").await,
-                vec![vec![Val::from(1), Val::from("alpha")]]
-            );
-            assert_eq!(
-                non_unique_mvcc_lookup(&mut second_reader, table_id, 1, "bravo").await,
-                vec![vec![Val::from(1), Val::from("bravo")]]
-            );
+            assert_index_not_found(&mut first_reader, table_id, 1, "alpha").await;
+            assert_index_not_found(&mut second_reader, table_id, 1, "bravo").await;
             first_reader.commit().await.unwrap();
             second_reader.commit().await.unwrap();
 
@@ -2481,10 +2467,7 @@ mod tests {
                 1
             );
 
-            assert_eq!(
-                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "cold").await,
-                vec![vec![Val::from(1), Val::from("cold")]]
-            );
+            assert_index_not_found(&mut old_reader, table_id, 1, "cold").await;
             old_reader.commit().await.unwrap();
 
             let mut fresh_reader = writer_session.begin_trx().unwrap();
@@ -2540,15 +2523,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
-                vec![vec![Val::from(1), Val::from("alpha")]]
-            );
-            assert!(
-                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "bravo")
-                    .await
-                    .is_empty()
-            );
+            assert_index_not_found(&mut old_reader, table_id, 1, "alpha").await;
             old_reader.commit().await.unwrap();
 
             let mut fresh_reader = writer_session.begin_trx().unwrap();
@@ -2638,15 +2613,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
-                vec![vec![Val::from(0), Val::from("alpha")]]
-            );
-            assert!(
-                non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "bravo")
-                    .await
-                    .is_empty()
-            );
+            assert_index_not_found(&mut old_reader, table_id, 1, "alpha").await;
             old_reader.commit().await.unwrap();
 
             let mut fresh_reader = writer_session.begin_trx().unwrap();
@@ -3348,23 +3315,48 @@ mod tests {
         row_id
     }
 
-    async fn non_unique_mvcc_lookup(
+    async fn non_unique_mvcc_lookup_result(
         trx: &mut Transaction,
         table_id: TableID,
         index_no: usize,
         key: &str,
-    ) -> Vec<Vec<Val>> {
+    ) -> Result<Vec<Vec<Val>>> {
         let key = [Val::from(key)];
         let result = trx
             .exec(async |stmt| {
                 stmt.table_index_lookup_mvcc(table_id, index_no, &key, &[0, 1])
                     .await
             })
-            .await
-            .unwrap();
-        match result {
+            .await?;
+        Ok(match result {
             ScanMvcc::Rows(rows) => rows,
-        }
+        })
+    }
+
+    async fn non_unique_mvcc_lookup(
+        trx: &mut Transaction,
+        table_id: TableID,
+        index_no: usize,
+        key: &str,
+    ) -> Vec<Vec<Val>> {
+        non_unique_mvcc_lookup_result(trx, table_id, index_no, key)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_index_not_found(
+        trx: &mut Transaction,
+        table_id: TableID,
+        index_no: usize,
+        key: &str,
+    ) {
+        let err = non_unique_mvcc_lookup_result(trx, table_id, index_no, key)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<OperationError>().copied(),
+            Some(OperationError::IndexNotFound)
+        );
     }
 
     async fn assert_create_index_historical_key_reuse(rollback: bool) {
@@ -3447,10 +3439,7 @@ mod tests {
             non_unique_mem_state(&table, &writer_session.pool_guards(), 1, "bravo", row_id).await,
             Some(rollback)
         );
-        assert_eq!(
-            non_unique_mvcc_lookup(&mut old_reader, table_id, 1, "alpha").await,
-            vec![vec![Val::from(1), Val::from("alpha")]]
-        );
+        assert_index_not_found(&mut old_reader, table_id, 1, "alpha").await;
         old_reader.commit().await.unwrap();
 
         let mut fresh_reader = writer_session.begin_trx().unwrap();
@@ -3546,7 +3535,7 @@ mod tests {
         let index = layout
             .secondary_index(index_no)
             .unwrap()
-            .bind_unique(guards, root)
+            .bind_unique_unchecked(guards, root)
             .unwrap();
         index.lookup(key, MAX_SNAPSHOT_TS).await.unwrap()
     }
@@ -3560,7 +3549,7 @@ mod tests {
     ) -> Vec<RowID> {
         let index = layout.secondary_index(index_no).unwrap();
         let range = index.key_encoder().encode_non_unique_equal_range(key);
-        let bound = index.bind_non_unique(guards, root).unwrap();
+        let bound = index.bind_non_unique_unchecked(guards, root).unwrap();
         let mut stream = bound
             .equal_scan_candidates(&range, MAX_SNAPSHOT_TS)
             .unwrap();

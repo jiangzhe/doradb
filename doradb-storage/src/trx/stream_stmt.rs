@@ -1,20 +1,23 @@
 use crate::buffer::EvictableBufferPool;
-use crate::catalog::is_catalog_table;
-use crate::error::{DiscloseResultExt, OperationError, OperationResult, Result, RuntimeResult};
+use crate::error::{
+    DiscloseResultExt, OperationError, OperationOrFatalResult, Result, RuntimeResult,
+};
 use crate::id::TableID;
 use crate::index::{
     BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, OwnedSecondaryIndexCandidateStream,
 };
-use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
+use crate::lock::{LockOwner, OwnerLockState};
 use crate::row::ops::SelectMvcc;
 use crate::table::{DmlValidator, Table, TableRuntimeLayout};
-use crate::trx::{Transaction, TrxCheckout, TrxRuntime};
+use crate::trx::{TableAdmissionRequest, Transaction, TrxCheckout, TrxRuntime};
 use crate::value::Val;
-use error_stack::{Report, ResultExt};
+use error_stack::ResultExt;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::Arc;
+
+use super::admission::admit_user_table;
 
 const INDEX_SCAN_STREAM_OPERATION: &str = "table_index_scan_mvcc";
 
@@ -38,28 +41,25 @@ impl StreamStmtState {
     }
 
     #[inline]
-    async fn acquire_table_read_lock(&mut self, table_id: TableID) -> OperationResult<()> {
-        self.stmt_locks
-            .acquire(
-                self.checkout.attachment().engine().lock_manager(),
-                LockResource::TableMetadata(table_id),
-                LockMode::Shared,
-            )
-            .await
-    }
-
-    #[inline]
-    fn resolve_user_table(&mut self, table_id: TableID) -> OperationResult<Arc<Table>> {
-        if !is_catalog_table(table_id) {
-            let (inner, attachment) = self.checkout.inner_and_attachment_mut();
-            let engine = attachment.engine();
-            if let Some(table) = engine.catalog().get_table_now(table_id) {
-                attachment.cache_user_table(&table);
-                inner.cache_user_table(&table);
-                return Ok(table);
-            }
-        }
-        Err(Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}")))
+    async fn admit_user_table(
+        &mut self,
+        table_id: TableID,
+        request: TableAdmissionRequest,
+    ) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
+        let Self {
+            checkout,
+            stmt_locks,
+        } = self;
+        let (inner, attachment) = checkout.inner_and_attachment_mut();
+        admit_user_table(
+            inner,
+            attachment,
+            stmt_locks,
+            table_id,
+            request,
+            INDEX_SCAN_STREAM_OPERATION,
+        )
+        .await
     }
 }
 
@@ -71,20 +71,21 @@ impl Drop for StreamStmtState {
     }
 }
 
-struct IndexScanMvccStreamState {
-    stmt_state: StreamStmtState,
+struct IndexScanMvccStreamState<'trx> {
+    candidate_stream: OwnedSecondaryIndexCandidateStream<'trx, EvictableBufferPool>,
     table: Arc<Table>,
     layout: Arc<TableRuntimeLayout>,
     index_no: usize,
     unique: bool,
     encoder: Arc<BTreeKeyEncoder>,
-    candidate_stream: OwnedSecondaryIndexCandidateStream<EvictableBufferPool>,
     read_set: Vec<usize>,
+    // Keep checkout last so cursor/root state is destroyed before transaction check-in.
+    stmt_state: StreamStmtState,
 }
 
 /// Public caller-driven MVCC secondary-index scan stream.
 pub struct IndexScanMvccStream<'trx> {
-    state: Option<IndexScanMvccStreamState>,
+    state: Option<IndexScanMvccStreamState<'trx>>,
     candidates: VecDeque<IndexLookupCandidate>,
     exhausted: bool,
     _trx: PhantomData<&'trx mut Transaction>,
@@ -92,7 +93,7 @@ pub struct IndexScanMvccStream<'trx> {
 
 impl<'trx> IndexScanMvccStream<'trx> {
     #[inline]
-    fn new(state: IndexScanMvccStreamState) -> Self {
+    fn new(state: IndexScanMvccStreamState<'trx>) -> Self {
         Self {
             state: Some(state),
             candidates: VecDeque::new(),
@@ -268,20 +269,10 @@ impl<'trx> StreamStmt<'trx> {
             None => OwnerLockState::new(stmt_owner),
         };
         let mut stmt_state = StreamStmtState::new(checkout, stmt_locks);
-        stmt_state
-            .acquire_table_read_lock(table_id)
+        let (table, layout) = stmt_state
+            .admit_user_table(table_id, TableAdmissionRequest::IndexRead { index_no })
             .await
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = stmt_state
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         if !self.disable_validation {
             DmlValidator::new(layout.metadata())
                 .validate_index_scan(index_no, &range, read_set)
@@ -302,17 +293,17 @@ impl<'trx> StreamStmt<'trx> {
         let rt = stmt_state.runtime();
         let accessor = table.accessor_with_layout(&layout);
         let candidate_stream = accessor
-            .index_scan_candidates(rt, index_no, range)
+            .index_scan_candidates(rt, index_no, range, PhantomData)
             .disclose()?;
         let state = IndexScanMvccStreamState {
-            stmt_state,
+            candidate_stream,
             table,
             layout,
             index_no,
             unique,
             encoder,
-            candidate_stream,
             read_set: read_set.to_vec(),
+            stmt_state,
         };
         Ok(IndexScanMvccStream::new(state))
     }
