@@ -8,7 +8,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const MODULES: [&str; 10] = [
     "buffer", "latch", "row", "index", "io", "trx", "lwc", "file", "log", "recovery",
@@ -199,24 +198,9 @@ fn count_word(input: &str, needle: &str) -> usize {
     count
 }
 
-fn generated_at() -> String {
-    // Use current UTC day to reflect when inventory is generated.
-    let output = Command::new("date").args(["-u", "+%F"]).output();
-    if let Ok(out) = output {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return s;
-            }
-        }
-    }
-    "unknown".to_string()
-}
-
 fn render_markdown(module_rows: &[ModuleMetrics], file_rows: &[FileMetrics], top: usize) -> String {
     let mut out = String::new();
     out.push_str("# Unsafe Usage Baseline\n\n");
-    out.push_str(&format!("- Generated on: `{}`\n", generated_at()));
     out.push_str("- Command: `tools/unsafe_inventory.rs`\n");
     out.push_str(&format!("- Scope: `{MODULE_SCOPE}`\n\n"));
 
