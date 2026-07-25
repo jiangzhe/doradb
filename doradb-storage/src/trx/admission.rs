@@ -378,7 +378,7 @@ mod tests {
     use crate::catalog::{IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::OperationError;
+    use crate::error::{Error, OperationError};
     use crate::lock::LockOwner;
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
     use crate::value::Val;
@@ -423,7 +423,7 @@ mod tests {
             })
     }
 
-    fn operation_error(err: &crate::error::Error) -> Option<OperationError> {
+    fn operation_error(err: &Error) -> Option<OperationError> {
         err.report().downcast_ref::<OperationError>().copied()
     }
 

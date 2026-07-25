@@ -1,7 +1,7 @@
 ---
 id: 000238
 title: First-Touch Transaction Binding and Admission
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-25
 github_issue: 889
 ---
@@ -764,10 +764,24 @@ table/layout state. Secondary-index execution uses borrowed or owning
 current-index read handles, while explicitly classified catalog, recovery, and
 purge paths retain narrow unchecked current-root adapters.
 
+Final review removed the planned `UserTableOperationView`; admission returns
+the operation-local table/layout Arc pair directly. It also removed
+admission-specific map pre-reservation and the unused owner-cache reserve
+helper because comparable guarded transaction lock handoffs use ordinary map
+insertion. Admission now preserves its exact typed producer set:
+operation-only helpers return `OperationResult`, the orchestrator returns the
+new `OperationOrFatalResult`, and only public statement/stream boundaries
+disclose the result.
+
 The eager `CurrentIndexReadHandle` borrows its `SecondaryIndex` from the pinned
 operation layout, avoiding a redundant Arc clone while making layout ownership
 explicit in the type. `OwnedCurrentIndexReadHandle` retains its index Arc
 because a caller-driven stream outlives the temporary accessor that creates it.
+
+Foreground writes construct metadata-proven `WriteIndexKeySet` values and keep
+`UserTableAccessor` as the sole index-mutation owner. This proves generated
+index keys against the accessor's pinned metadata once, without repeating
+expensive hot-path assertions during consumption.
 
 Implementation review simplified metadata-history ownership. Superseded
 versions are stored directly, `ResolvedLiveMetadata` owns only effective CTS
@@ -778,18 +792,18 @@ even if an already resolved result remains alive. Direct rollback clears table
 bindings before recording active-STS removal and releases logical locks
 afterward.
 
-The parent RFC now records the horizon-only decision and links Phase 2 to this
-task and issue. Completed Task 000237 retains its historical plan with an
-explicit supersession amendment. Task/RFC statuses remain unchanged pending
-the separate `$task-resolve` workflow.
+The parent RFC records the horizon-only decision, links Phase 2 to this task
+and issue, and is synchronized to the implemented Phase 2 outcome during this
+resolve workflow. Completed Task 000237 retains its historical plan with an
+explicit supersession amendment.
 
 Validation completed with:
 
-- RFC formal validation, formatting, diff checks, and workspace Clippy with
-  warnings denied;
-- `rtk cargo nextest run --workspace`: 1,537 tests passed;
+- formatting, debug/release checks, diff checks, workspace Clippy with warnings
+  denied, and the deterministic style audit across 22 branch-diff Rust files;
+- `rtk cargo nextest run --workspace`: 1,539 tests passed;
 - `rtk cargo nextest run -p doradb-storage --no-default-features --features
-  libaio`: 1,462 tests passed; and
+  libaio`: 1,464 tests passed; and
 - 96.13% focused line coverage across catalog history, purge scheduling,
   transaction lifecycle, and admission.
 
@@ -798,10 +812,11 @@ Validation completed with:
 Primary code impacts:
 
 - `doradb-storage/src/error.rs`
-  - add `OperationError::SchemaChanged`.
+  - add `OperationError::SchemaChanged` and the constrained
+    `OperationOrFatalResult` admission carrier.
 - `doradb-storage/src/trx/admission.rs`
-  - add request validation, transaction binding, operation views, and locked
-    miss/handoff orchestration.
+  - add request validation, transaction binding, direct operation-local
+    table/layout results, and locked miss/handoff orchestration.
 - `doradb-storage/src/trx/mod.rs`
   - replace the weak transaction table cache, expose narrow binding/lock
     helpers, and order terminal cleanup.
@@ -810,7 +825,8 @@ Primary code impacts:
 - `doradb-storage/src/trx/stream_stmt.rs`
   - route lazy index scans through admission and own the stream index handle.
 - `doradb-storage/src/lock/state.rs`
-  - add exact cache reserve/commit/rollback/release operations.
+  - add uncached grant acquisition and exact cache
+    commit/rollback/release operations.
 - `doradb-storage/src/lock/mod.rs`
   - reuse fresh-grant guards and add only narrow tests or helper visibility;
     lock compatibility and waiter semantics remain unchanged.
@@ -874,7 +890,8 @@ Expected runtime costs:
 Risks and mitigations:
 
 - Lock/binding divergence during cancellation or unwinding is controlled by
-  pre-reservation, `LockGrant` distinction, and one admission commit guard.
+  completing fallible validation before the transaction grant,
+  `LockGrant` distinction, and one admission commit guard.
 - Error-precedence drift is controlled by one request validator and explicit
   matrix tests shared by hits and misses.
 - A lazy proof could otherwise become self-referential; the owning handle

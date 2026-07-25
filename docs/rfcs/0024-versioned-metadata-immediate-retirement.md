@@ -1341,8 +1341,8 @@ Required coverage includes:
     stable-index membership, and compiler-enforced proof lifetime are fixed.
   - Task Doc: `docs/tasks/000238-first-touch-transaction-binding-admission.md`
   - Task Issue: `#889`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented positive first-touch transaction bindings, request-aware visible/current admission with stale-writer fencing, transaction-lifetime metadata-S handoff, lifetime-bound current-index read handles, and horizon-only metadata history reclamation; validated across default and libaio backends. [Task Resolve Sync: docs/tasks/000238-first-touch-transaction-binding-admission.md @ 2026-07-26]
 
 - **Phase 3: Current-State CREATE INDEX And Workaround Removal**
   - Scope: Switch unique and non-unique CREATE INDEX to current committed state,
