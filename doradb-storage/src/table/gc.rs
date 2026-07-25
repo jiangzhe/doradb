@@ -2,8 +2,7 @@ use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
 use crate::error::{
-    DataIntegrityError, InternalResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
-    RuntimeResult,
+    DataIntegrityError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::id::{BlockID, RowID, TableID, TrxID};
@@ -143,7 +142,7 @@ impl MemIndexCleanupSnapshot<'_> {
     }
 
     #[inline]
-    fn secondary_index_root(&self, index_no: usize) -> InternalResult<BlockID> {
+    fn secondary_index_root(&self, index_no: usize) -> BlockID {
         self.root.secondary_index_root(index_no)
     }
 
@@ -309,15 +308,7 @@ impl Table {
             if !snapshot.root_index_is_active(index_no) {
                 continue;
             }
-            let secondary_root = snapshot
-                .secondary_index_root(index_no)
-                .change_context(RuntimeError::TableAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=cleanup_secondary_mem_indexes, table_id={}, index_no={index_no}, phase=resolve_secondary_root",
-                        self.table_id()
-                    )
-                })?;
+            let secondary_root = snapshot.secondary_index_root(index_no);
             let mut index_stats =
                 SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());
             match index {

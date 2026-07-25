@@ -2,9 +2,9 @@ use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::table::TableMetadata;
 use crate::error::{
-    CompletionErrorBridge, CompletionResult, DataIntegrityResult, InternalError, InternalResult,
-    IoResult, MultiDomainResultExt, ResourceError, ResourceResult, RuntimeError,
-    RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+    CompletionErrorBridge, CompletionResult, DataIntegrityResult, IoResult, MultiDomainResultExt,
+    ResourceError, ResourceResult, RuntimeError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
+    RuntimeResult,
 };
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -298,30 +298,14 @@ impl MutableTableFile {
 
     /// Returns one mutable-root secondary DiskTree root by index number.
     #[inline]
-    pub(crate) fn secondary_index_root(&self, index_no: usize) -> InternalResult<BlockID> {
-        self.root()
-            .secondary_index_roots
-            .get(index_no)
-            .copied()
-            .ok_or_else(|| {
-                missing_secondary_index(index_no, self.root().secondary_index_roots.len())
-            })
+    pub(crate) fn secondary_index_root(&self, index_no: usize) -> BlockID {
+        self.root().secondary_index_roots[index_no]
     }
 
     /// Updates one mutable-root secondary DiskTree root by index number.
     #[inline]
-    pub(crate) fn set_secondary_index_root(
-        &mut self,
-        index_no: usize,
-        root_block_id: BlockID,
-    ) -> InternalResult<()> {
-        let roots = &mut self.new_root.root.secondary_index_roots;
-        let index_count = roots.len();
-        let root = roots
-            .get_mut(index_no)
-            .ok_or_else(|| missing_secondary_index(index_no, index_count))?;
-        *root = root_block_id;
-        Ok(())
+    pub(crate) fn set_secondary_index_root(&mut self, index_no: usize, root_block_id: BlockID) {
+        self.new_root.root.secondary_index_roots[index_no] = root_block_id;
     }
 
     /// Replaces table metadata and the matching sparse secondary-root slots.
@@ -605,12 +589,6 @@ pub(crate) struct LwcBlockPersist {
 pub(crate) type OldRoot = OldCowRoot<TableMeta>;
 
 #[inline]
-fn missing_secondary_index(index_no: usize, index_count: usize) -> Report<InternalError> {
-    Report::new(InternalError::SecondaryIndexOutOfBounds)
-        .attach(format!("index_no={index_no}, index_count={index_count}"))
-}
-
-#[inline]
 fn parse_table_super_block(buf: &[u8]) -> DataIntegrityResult<SuperBlock> {
     parse_super_block(buf, TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
 }
@@ -840,8 +818,8 @@ mod tests {
             let mut mutable =
                 MutableTableFile::fork(&table_file2, background_writes, disk_pool.clone());
             let secondary_root = mutable.allocate_block().unwrap();
-            mutable.set_secondary_index_root(0, secondary_root).unwrap();
-            assert_eq!(mutable.secondary_index_root(0).unwrap(), secondary_root);
+            mutable.set_secondary_index_root(0, secondary_root);
+            assert_eq!(mutable.secondary_index_root(0), secondary_root);
             let metadata = Arc::clone(&mutable.root().metadata);
             let panic = catch_unwind(AssertUnwindSafe(|| {
                 mutable.replace_metadata_and_secondary_index_roots(
@@ -885,7 +863,7 @@ mod tests {
                 disk_pool.global_pool().clone(),
             );
             let inherited_root = mutable.allocate_block().unwrap();
-            mutable.set_secondary_index_root(0, inherited_root).unwrap();
+            mutable.set_secondary_index_root(0, inherited_root);
             let (table_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
 

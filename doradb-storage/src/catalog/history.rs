@@ -1,5 +1,5 @@
 use super::TableMetadata;
-use crate::id::{TableID, TrxID};
+use crate::id::TrxID;
 use crate::table::{Table, TableRedoReplayFloor};
 use std::sync::Arc;
 
@@ -9,10 +9,6 @@ pub(crate) struct TableMetadataVersion {
     metadata: Arc<TableMetadata>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Phase 2 consumes historical-version observations")
-)]
 impl TableMetadataVersion {
     #[inline]
     fn new(effective_cts: TrxID, metadata: Arc<TableMetadata>) -> Self {
@@ -20,23 +16,6 @@ impl TableMetadataVersion {
             effective_cts,
             metadata,
         }
-    }
-
-    /// Returns the commit timestamp at which this metadata became effective.
-    #[inline]
-    pub(crate) fn effective_cts(&self) -> TrxID {
-        self.effective_cts
-    }
-
-    /// Returns the logical table metadata owned by this version.
-    #[inline]
-    pub(crate) fn metadata(&self) -> &Arc<TableMetadata> {
-        &self.metadata
-    }
-
-    #[inline]
-    fn is_unpinned(version: &Arc<Self>) -> bool {
-        Arc::strong_count(version) == 1
     }
 }
 
@@ -69,19 +48,6 @@ impl CurrentTableState {
         }
     }
 
-    /// Returns current live metadata when the table has not been dropped.
-    #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Phase 2 consumes current metadata resolution")
-    )]
-    pub(crate) fn live_metadata(&self) -> Option<&Arc<TableMetadata>> {
-        match self {
-            CurrentTableState::Live { metadata, .. } => Some(metadata),
-            CurrentTableState::Dropped { .. } => None,
-        }
-    }
-
     /// Returns the current foreground table runtime when live.
     #[inline]
     pub(crate) fn live_table(&self) -> Option<&Arc<Table>> {
@@ -90,39 +56,14 @@ impl CurrentTableState {
             CurrentTableState::Dropped { .. } => None,
         }
     }
-
-    /// Returns whether this current state is a terminal tombstone.
-    #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Phase 2 consumes current tombstone resolution")
-    )]
-    pub(crate) fn is_dropped(&self) -> bool {
-        matches!(self, CurrentTableState::Dropped { .. })
-    }
 }
 
 /// A live logical metadata result selected for one transaction snapshot.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 2 consumes visible metadata resolution and version identity"
-    )
-)]
 pub(crate) struct ResolvedLiveMetadata {
     effective_cts: TrxID,
     metadata: Arc<TableMetadata>,
-    _history_pin: Option<Arc<TableMetadataVersion>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 2 consumes visible metadata resolution and version identity"
-    )
-)]
 impl ResolvedLiveMetadata {
     /// Returns the commit timestamp at which the selected metadata became effective.
     #[inline]
@@ -135,34 +76,9 @@ impl ResolvedLiveMetadata {
     pub(crate) fn metadata(&self) -> &Arc<TableMetadata> {
         &self.metadata
     }
-
-    /// Returns whether this result selected the direct current state.
-    #[inline]
-    pub(crate) fn is_current(&self) -> bool {
-        self._history_pin.is_none()
-    }
-
-    /// Returns the stable table-local metadata version identity.
-    #[inline]
-    pub(crate) fn identity(&self, table_id: TableID) -> (TableID, TrxID) {
-        (table_id, self.effective_cts)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn historical_version(&self) -> Option<&Arc<TableMetadataVersion>> {
-        self._history_pin.as_ref()
-    }
 }
 
 /// Transaction-snapshot-visible logical state for one user table.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 2 consumes visible metadata resolution and tombstones"
-    )
-)]
 pub(crate) enum ResolvedVisibleTableMetadata {
     /// The selected state is live logical metadata.
     Live(ResolvedLiveMetadata),
@@ -173,43 +89,10 @@ pub(crate) enum ResolvedVisibleTableMetadata {
     },
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 2 consumes visible metadata resolution and tombstones"
-    )
-)]
-impl ResolvedVisibleTableMetadata {
-    /// Returns the selected state's effective commit timestamp.
-    #[inline]
-    pub(crate) fn effective_cts(&self) -> TrxID {
-        match self {
-            ResolvedVisibleTableMetadata::Live(live) => live.effective_cts(),
-            ResolvedVisibleTableMetadata::Tombstone { effective_cts } => *effective_cts,
-        }
-    }
-
-    /// Returns live metadata when the selected state is not a tombstone.
-    #[inline]
-    pub(crate) fn live(&self) -> Option<&ResolvedLiveMetadata> {
-        match self {
-            ResolvedVisibleTableMetadata::Live(live) => Some(live),
-            ResolvedVisibleTableMetadata::Tombstone { .. } => None,
-        }
-    }
-
-    /// Returns whether the selected state is a terminal tombstone.
-    #[inline]
-    pub(crate) fn is_tombstone(&self) -> bool {
-        matches!(self, ResolvedVisibleTableMetadata::Tombstone { .. })
-    }
-}
-
 /// Short volatile metadata history for one user table.
 pub(crate) struct TableHistoryEntry {
     /// Superseded live versions, oldest to newest.
-    versions: Vec<Arc<TableMetadataVersion>>,
+    versions: Vec<TableMetadataVersion>,
     current: CurrentTableState,
 }
 
@@ -238,7 +121,6 @@ impl TableHistoryEntry {
                 } => ResolvedVisibleTableMetadata::Live(ResolvedLiveMetadata {
                     effective_cts: *effective_cts,
                     metadata: Arc::clone(metadata),
-                    _history_pin: None,
                 }),
                 CurrentTableState::Dropped { effective_cts } => {
                     ResolvedVisibleTableMetadata::Tombstone {
@@ -256,7 +138,6 @@ impl TableHistoryEntry {
                 ResolvedVisibleTableMetadata::Live(ResolvedLiveMetadata {
                     effective_cts: version.effective_cts,
                     metadata: Arc::clone(&version.metadata),
-                    _history_pin: Some(Arc::clone(version)),
                 })
             })
     }
@@ -296,7 +177,7 @@ impl TableHistoryEntry {
         let old_cts = *current_cts;
         let old_metadata = Arc::clone(current_metadata);
         self.versions
-            .push(Arc::new(TableMetadataVersion::new(old_cts, old_metadata)));
+            .push(TableMetadataVersion::new(old_cts, old_metadata));
         self.current = CurrentTableState::Live {
             effective_cts,
             metadata: new_metadata,
@@ -324,10 +205,10 @@ impl TableHistoryEntry {
             return false;
         }
 
-        self.versions.push(Arc::new(TableMetadataVersion::new(
+        self.versions.push(TableMetadataVersion::new(
             *current_cts,
             Arc::clone(metadata),
-        )));
+        ));
         self.current = CurrentTableState::Dropped { effective_cts };
         self.assert_valid();
         true
@@ -337,10 +218,7 @@ impl TableHistoryEntry {
     #[inline]
     fn purge(&mut self, min_active_sts: TrxID) -> bool {
         match &self.current {
-            CurrentTableState::Dropped { effective_cts } => {
-                *effective_cts < min_active_sts
-                    && self.versions.iter().all(TableMetadataVersion::is_unpinned)
-            }
+            CurrentTableState::Dropped { effective_cts } => *effective_cts < min_active_sts,
             CurrentTableState::Live { effective_cts, .. } => {
                 let obsolete_prefix_len = if *effective_cts < min_active_sts {
                     self.versions.len()
@@ -352,11 +230,7 @@ impl TableHistoryEntry {
                         .rposition(|version| version.effective_cts < min_active_sts)
                         .unwrap_or(0)
                 };
-                let drain_len = self.versions[..obsolete_prefix_len]
-                    .iter()
-                    .position(|version| !TableMetadataVersion::is_unpinned(version))
-                    .unwrap_or(obsolete_prefix_len);
-                self.versions.drain(..drain_len);
+                self.versions.drain(..obsolete_prefix_len);
                 self.assert_valid();
                 false
             }
@@ -743,13 +617,62 @@ mod tests {
     use crate::trx::MAX_SNAPSHOT_TS;
     use tempfile::TempDir;
 
+    trait CurrentTableStateTestExt {
+        fn live_metadata(&self) -> Option<&Arc<TableMetadata>>;
+        fn is_dropped(&self) -> bool;
+    }
+
+    impl CurrentTableStateTestExt for CurrentTableState {
+        #[inline]
+        fn live_metadata(&self) -> Option<&Arc<TableMetadata>> {
+            match self {
+                CurrentTableState::Live { metadata, .. } => Some(metadata),
+                CurrentTableState::Dropped { .. } => None,
+            }
+        }
+
+        #[inline]
+        fn is_dropped(&self) -> bool {
+            matches!(self, CurrentTableState::Dropped { .. })
+        }
+    }
+
+    trait ResolvedVisibleTableMetadataTestExt {
+        fn effective_cts(&self) -> TrxID;
+        fn live(&self) -> Option<&ResolvedLiveMetadata>;
+        fn is_tombstone(&self) -> bool;
+    }
+
+    impl ResolvedVisibleTableMetadataTestExt for ResolvedVisibleTableMetadata {
+        #[inline]
+        fn effective_cts(&self) -> TrxID {
+            match self {
+                ResolvedVisibleTableMetadata::Live(live) => live.effective_cts(),
+                ResolvedVisibleTableMetadata::Tombstone { effective_cts } => *effective_cts,
+            }
+        }
+
+        #[inline]
+        fn live(&self) -> Option<&ResolvedLiveMetadata> {
+            match self {
+                ResolvedVisibleTableMetadata::Live(live) => Some(live),
+                ResolvedVisibleTableMetadata::Tombstone { .. } => None,
+            }
+        }
+
+        #[inline]
+        fn is_tombstone(&self) -> bool {
+            matches!(self, ResolvedVisibleTableMetadata::Tombstone { .. })
+        }
+    }
+
     #[inline]
     fn after(ts: TrxID) -> TrxID {
         TrxID::new(ts.as_u64() + 1)
     }
 
     #[test]
-    fn metadata_history_resolves_strict_boundaries_pins_and_tombstones() {
+    fn metadata_history_resolves_strict_boundaries_and_tombstones() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "metadata_history").await;
@@ -774,8 +697,7 @@ mod tests {
                 .resolve_user_table_visible(table_id, after(initial_cts))
                 .unwrap();
             let initial_live = initial_visible.live().unwrap();
-            assert!(initial_live.is_current());
-            assert_eq!(initial_live.identity(table_id), (table_id, initial_cts));
+            assert_eq!(initial_live.effective_cts(), initial_cts);
             assert!(Arc::ptr_eq(initial_live.metadata(), &initial_metadata));
 
             let mut reader_session = engine.new_session().unwrap();
@@ -831,8 +753,8 @@ mod tests {
             assert_eq!(drop_predecessor.effective_cts(), create_index_cts);
             assert_eq!(drop_predecessor.metadata().idx.active_index_count(), 2);
             assert_ne!(
-                create_predecessor.identity(table_id),
-                drop_predecessor.identity(table_id)
+                create_predecessor.effective_cts(),
+                drop_predecessor.effective_cts()
             );
 
             let layout = table.layout_snapshot();
@@ -840,17 +762,12 @@ mod tests {
             let table_owners = Arc::strong_count(&table);
             let layout_owners = Arc::strong_count(&layout);
             let index_owners = Arc::strong_count(&index);
-            let pinned_visible = catalog
+            let resolved_visible = catalog
                 .resolve_user_table_visible(table_id, reader_sts)
                 .unwrap();
-            let pinned_live = pinned_visible.live().unwrap();
-            assert!(!pinned_live.is_current());
-            let pinned_version = pinned_live.historical_version().unwrap();
-            assert_eq!(pinned_version.effective_cts(), initial_cts);
-            assert!(Arc::ptr_eq(
-                pinned_version.metadata(),
-                pinned_live.metadata()
-            ));
+            let resolved_live = resolved_visible.live().unwrap();
+            assert_eq!(resolved_live.effective_cts(), initial_cts);
+            assert!(Arc::ptr_eq(resolved_live.metadata(), &initial_metadata));
             assert_eq!(Arc::strong_count(&table), table_owners);
             assert_eq!(Arc::strong_count(&layout), layout_owners);
             assert_eq!(Arc::strong_count(&index), index_owners);
@@ -859,10 +776,15 @@ mod tests {
             drop(at_drop_equality);
             reader.rollback().await.unwrap();
             catalog.purge_user_table_history(MAX_SNAPSHOT_TS);
-            assert_eq!(catalog.user_table_history_version_count(table_id), Some(2));
-            drop(pinned_visible);
-            catalog.purge_user_table_history(MAX_SNAPSHOT_TS);
             assert_eq!(catalog.user_table_history_version_count(table_id), Some(0));
+            assert_eq!(
+                resolved_visible.live().unwrap().effective_cts(),
+                initial_cts
+            );
+            assert!(Arc::ptr_eq(
+                resolved_visible.live().unwrap().metadata(),
+                &initial_metadata
+            ));
 
             let mut drop_reader_session = engine.new_session().unwrap();
             let drop_reader = drop_reader_session.begin_trx().unwrap();
@@ -891,15 +813,24 @@ mod tests {
             let reader_visible = catalog
                 .resolve_user_table_visible(table_id, drop_reader_sts)
                 .unwrap();
-            assert!(!reader_visible.live().unwrap().is_current());
+            let reader_visible_cts = reader_visible.live().unwrap().effective_cts();
+            let reader_visible_metadata = Arc::clone(reader_visible.live().unwrap().metadata());
             drop_reader.rollback().await.unwrap();
             drop(after_table_drop);
-            drop(reader_visible);
-            catalog.purge_user_table_history(MAX_SNAPSHOT_TS);
-            assert!(catalog.resolve_user_table_current(table_id).is_some());
-            drop(at_table_drop_equality);
             catalog.purge_user_table_history(MAX_SNAPSHOT_TS);
             assert!(catalog.resolve_user_table_current(table_id).is_none());
+            assert_eq!(
+                at_table_drop_equality.live().unwrap().effective_cts(),
+                drop_index_cts
+            );
+            assert_eq!(
+                reader_visible.live().unwrap().effective_cts(),
+                reader_visible_cts
+            );
+            assert!(Arc::ptr_eq(
+                reader_visible.live().unwrap().metadata(),
+                &reader_visible_metadata
+            ));
             assert_eq!(catalog.retained_dropped_table_ids_now(), vec![table_id]);
             assert!(
                 catalog

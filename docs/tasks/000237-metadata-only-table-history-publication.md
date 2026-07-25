@@ -540,6 +540,14 @@ outcome; keep its Task Doc linked to this document.
 
 ## Implementation Notes
 
+Follow-up amendment: Task 000238 supersedes this task's defensive
+historical-wrapper pin contract. `min_active_sts` is now the sole
+metadata-history reclamation authority; a resolved result owns its selected
+`Arc<TableMetadata>` and effective CTS without retaining catalog history
+membership. The original plan and test descriptions below remain as the
+historical record of Phase 1's implementation, while RFC 0024 and Task 000238
+define the current contract.
+
 Implemented Phase 1 with one volatile metadata-history entry per user table.
 The catalog now resolves strict STS-visible metadata separately from direct
 current state, publishes matching CTS-effective transitions for table and index

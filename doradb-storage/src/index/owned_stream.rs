@@ -13,11 +13,12 @@ use super::index_stream::{
 };
 use super::secondary_index::{SecondaryIndex, SecondaryIndexCandidateStream};
 use crate::buffer::guard::PageSharedGuard;
-use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::index::btree::{BTreeNode, BTreeNodeCursorState};
-use crate::index::{IndexBatchStream, IndexLookupCandidate, KeyRange};
+use crate::index::{IndexBatchStream, IndexLookupCandidate, KeyRange, OwnedCurrentIndexReadHandle};
+use crate::trx::Transaction;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -254,19 +255,21 @@ enum OwnedSecondaryIndexCandidateStreamKind<P: BufferPool + 'static> {
 }
 
 /// Owned persistent lookup-candidate stream for user-table secondary scans.
-pub(crate) struct OwnedSecondaryIndexCandidateStream<P: BufferPool + 'static> {
+pub(crate) struct OwnedSecondaryIndexCandidateStream<'trx, P: BufferPool + 'static> {
     inner: OwnedSecondaryIndexCandidateStreamKind<P>,
+    _transaction: PhantomData<&'trx mut Transaction>,
 }
 
-impl<P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<P> {
+impl<'trx, P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<'trx, P> {
     /// Create a persistent candidate stream over one proof-gated root.
     #[inline]
-    pub(crate) fn new(
-        index: Arc<SecondaryIndex<P>>,
-        pool_guards: PoolGuards,
-        root: BlockID,
-        range: KeyRange,
-    ) -> Self {
+    pub(crate) fn new(handle: OwnedCurrentIndexReadHandle<'trx, P>, range: KeyRange) -> Self {
+        let OwnedCurrentIndexReadHandle {
+            index,
+            guards: pool_guards,
+            root,
+            _transaction,
+        } = handle;
         let range = Arc::new(range);
         let inner = match index.as_ref() {
             SecondaryIndex::Unique { .. } => {
@@ -306,12 +309,15 @@ impl<P: BufferPool + 'static> OwnedSecondaryIndexCandidateStream<P> {
                 )
             }
         };
-        Self { inner }
+        Self {
+            inner,
+            _transaction,
+        }
     }
 }
 
 impl<P: BufferPool + 'static> IndexBatchStream<IndexLookupCandidate>
-    for OwnedSecondaryIndexCandidateStream<P>
+    for OwnedSecondaryIndexCandidateStream<'_, P>
 {
     #[inline]
     async fn next_batch(&mut self) -> RuntimeResult<Option<Vec<IndexLookupCandidate>>> {

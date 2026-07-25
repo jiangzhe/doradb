@@ -1,11 +1,11 @@
 use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
-use crate::catalog::{CatalogTable, TableCache, is_catalog_table};
+use crate::catalog::{CatalogTable, TableCache};
 use crate::error::{
     DiscloseResultExt, FatalError, FatalResult, MultiDomainResultExt, OperationError,
-    OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult, Result, RuntimeError,
-    RuntimeResult,
+    OperationOrFatalResult, OperationOrRuntimeError, OperationOrRuntimeResult, OperationResult,
+    Result, RuntimeError, RuntimeResult,
 };
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
@@ -15,16 +15,18 @@ use crate::row::ops::{
     UpdateMvcc, UpsertMvcc,
 };
 use crate::session::TrxAttachment;
-use crate::table::{DmlValidator, LazyRow, Table};
+use crate::table::{DmlValidator, LazyRow, Table, TableRuntimeLayout};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
-use crate::trx::{FatalRollbackRetention, TrxEffects, TrxInner, TrxRuntime};
+use crate::trx::{FatalRollbackRetention, TableAdmissionRequest, TrxEffects, TrxInner, TrxRuntime};
 use crate::value::Val;
-use error_stack::{Report, ResultExt};
+use error_stack::ResultExt;
 use std::mem;
 use std::ops::RangeBounds;
 use std::sync::Arc;
+
+use super::admission::admit_user_table;
 
 /// Catalog statement adapters preserve semantic Operation errors while adding
 /// a catalog integration context only to Runtime failures.
@@ -313,28 +315,6 @@ impl<'stmt> Statement<'stmt> {
         )
     }
 
-    /// Acquires a statement-owned logical lock.
-    #[inline]
-    async fn acquire_statement_lock(
-        &mut self,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> OperationResult<()> {
-        self.stmt_locks
-            .acquire(self.attachment.engine().lock_manager(), resource, mode)
-            .await
-    }
-
-    /// Acquires statement-lifetime metadata protection for a table read.
-    #[inline]
-    pub(crate) async fn acquire_table_read_lock(
-        &mut self,
-        table_id: TableID,
-    ) -> OperationResult<()> {
-        self.acquire_statement_lock(LockResource::TableMetadata(table_id), LockMode::Shared)
-            .await
-    }
-
     /// Acquires transaction-lifetime metadata protection for a table write.
     #[inline]
     pub(crate) async fn acquire_table_write_metadata_lock(
@@ -387,16 +367,21 @@ impl<'stmt> Statement<'stmt> {
     }
 
     #[inline]
-    fn resolve_user_table(&mut self, table_id: TableID) -> OperationResult<Arc<Table>> {
-        if !is_catalog_table(table_id) {
-            let engine = self.attachment.engine();
-            if let Some(table) = engine.catalog().get_table_now(table_id) {
-                self.attachment.cache_user_table(&table);
-                self.inner.cache_user_table(&table);
-                return Ok(table);
-            }
-        }
-        Err(Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}")))
+    async fn admit_user_table(
+        &mut self,
+        table_id: TableID,
+        request: TableAdmissionRequest,
+        operation: &'static str,
+    ) -> OperationOrFatalResult<(Arc<Table>, Arc<TableRuntimeLayout>)> {
+        admit_user_table(
+            self.inner,
+            self.attachment,
+            &mut self.stmt_locks,
+            table_id,
+            request,
+            operation,
+        )
+        .await
     }
 
     /// Scans the catalog-owned user table's row store by table id.
@@ -415,19 +400,10 @@ impl<'stmt> Statement<'stmt> {
         F: FnMut(Vec<Val>) -> bool,
     {
         const OPERATION: &str = "table_scan_mvcc";
-        self.acquire_table_read_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(table_id, TableAdmissionRequest::TableRead, OPERATION)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         let rt = self.runtime();
         table
             .accessor_with_layout(&layout)
@@ -460,27 +436,14 @@ impl<'stmt> Statement<'stmt> {
         F: for<'row> FnMut(&mut LazyRow<'row>) -> Result<RowMutation>,
     {
         const OPERATION: &str = "table_mutate_mvcc";
-        self.acquire_table_write_metadata_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(table_id, TableAdmissionRequest::TableWrite, OPERATION)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
-            .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
             .disclose()?;
         self.acquire_table_exclusive_data_lock(table_id)
             .await
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         let validate_updates = !self.disable_dml_validation;
         let (rt, effects) = self.runtime_and_effects_mut();
         table
@@ -501,19 +464,14 @@ impl<'stmt> Statement<'stmt> {
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         const OPERATION: &str = "table_lookup_unique_mvcc";
-        self.acquire_table_read_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(
+                table_id,
+                TableAdmissionRequest::IndexRead { index_no },
+                OPERATION,
+            )
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         let rt = self.runtime();
         table
             .accessor_with_layout(&layout)
@@ -537,19 +495,14 @@ impl<'stmt> Statement<'stmt> {
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
         const OPERATION: &str = "table_index_lookup_mvcc";
-        self.acquire_table_read_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(
+                table_id,
+                TableAdmissionRequest::IndexRead { index_no },
+                OPERATION,
+            )
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         let rt = self.runtime();
         table
             .accessor_with_layout(&layout)
@@ -576,19 +529,14 @@ impl<'stmt> Statement<'stmt> {
         R: RangeBounds<&'r [Val]>,
     {
         const OPERATION: &str = "table_index_scan_mvcc";
-        self.acquire_table_read_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(
+                table_id,
+                TableAdmissionRequest::IndexRead { index_no },
+                OPERATION,
+            )
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_index_scan(index_no, &range, read_set)
@@ -613,19 +561,10 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub async fn table_insert_mvcc(&mut self, table_id: TableID, cols: Vec<Val>) -> Result<RowID> {
         const OPERATION: &str = "table_insert_mvcc";
-        self.acquire_table_write_metadata_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(table_id, TableAdmissionRequest::TableWrite, OPERATION)
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_full_row(&cols)
@@ -655,19 +594,16 @@ impl<'stmt> Statement<'stmt> {
         cols: Vec<Val>,
     ) -> Result<UpsertMvcc> {
         const OPERATION: &str = "table_upsert_unique_mvcc";
-        self.acquire_table_write_metadata_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(
+                table_id,
+                TableAdmissionRequest::IndexWrite {
+                    index_no: unique_index_no,
+                },
+                OPERATION,
+            )
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             let validator = DmlValidator::new(layout.metadata());
             validator
@@ -704,19 +640,14 @@ impl<'stmt> Statement<'stmt> {
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         const OPERATION: &str = "table_update_unique_mvcc";
-        self.acquire_table_write_metadata_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(
+                table_id,
+                TableAdmissionRequest::IndexWrite { index_no },
+                OPERATION,
+            )
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             let validator = DmlValidator::new(layout.metadata());
             validator
@@ -752,19 +683,14 @@ impl<'stmt> Statement<'stmt> {
         key_vals: &[Val],
     ) -> Result<DeleteMvcc> {
         const OPERATION: &str = "table_delete_unique_mvcc";
-        self.acquire_table_write_metadata_lock(table_id)
+        let (table, layout) = self
+            .admit_user_table(
+                table_id,
+                TableAdmissionRequest::IndexWrite { index_no },
+                OPERATION,
+            )
             .await
-            .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
             .disclose()?;
-        let table = self
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        table
-            .check_foreground_live()
-            .attach_with(|| format!("operation={OPERATION}"))
-            .disclose()?;
-        let layout = table.layout_snapshot();
         if !self.disable_dml_validation {
             DmlValidator::new(layout.metadata())
                 .validate_unique_key(index_no, key_vals)

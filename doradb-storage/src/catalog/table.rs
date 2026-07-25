@@ -2260,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    fn test_statement_read_takes_metadata_lock_only() {
+    fn test_first_read_hands_metadata_lock_to_transaction_owner() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -2271,6 +2271,7 @@ mod tests {
 
             let stmt_owner = Cell::new(None);
             let mut trx = session.begin_trx().unwrap();
+            let trx_owner = trx_tests::lock_owner(&trx).unwrap();
             trx.exec(async |stmt| {
                 let owner = stmt_tests::lock_owner(stmt);
                 stmt_owner.set(Some(owner));
@@ -2283,14 +2284,7 @@ mod tests {
                     .table_lookup_unique_mvcc(table_id, key.index_no, &key.vals, &[0, 1])
                     .await?;
                 assert!(repeated.is_found());
-                assert_eq!(lock_entry_count(&engine, owner), 1);
-                assert!(has_lock_entry(
-                    &engine,
-                    owner,
-                    LockResource::TableMetadata(table_id),
-                    LockMode::Shared,
-                    LockDebugEntryState::Granted,
-                ));
+                assert_eq!(lock_entry_count(&engine, owner), 0);
                 assert!(!has_lock_resource(
                     &engine,
                     owner,
@@ -2303,6 +2297,14 @@ mod tests {
 
             let owner = stmt_owner.get().unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 0);
+            assert_eq!(lock_entry_count(&engine, trx_owner), 1);
+            assert!(has_lock_entry(
+                &engine,
+                trx_owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
             trx.commit().await.unwrap();
         });
     }

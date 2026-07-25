@@ -153,10 +153,12 @@ use a public adapter only when asserting public classification.
 
 ## Constrained carriers
 
-Two carriers encode closed multi-domain contracts without adding a synthetic
+Three carriers encode closed multi-domain contracts without adding a synthetic
 error-stack frame:
 
 - `OperationOrRuntimeError` contains either an Operation report or a Runtime
+  report;
+- `OperationOrFatalError` contains either an Operation report or a Fatal
   report;
 - `RuntimeOrFatalError` contains either a Runtime report or a Fatal report.
 

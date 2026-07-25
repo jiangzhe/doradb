@@ -468,13 +468,6 @@ impl Catalog {
 
     /// Resolve user-table metadata visible to one transaction snapshot.
     #[inline]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 2 consumes transaction-visible metadata resolution"
-        )
-    )]
     pub(crate) fn resolve_user_table_visible(
         &self,
         table_id: TableID,

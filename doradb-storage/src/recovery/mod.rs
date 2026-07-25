@@ -3147,7 +3147,7 @@ mod tests {
                 let pool_guards = session.pool_guards();
                 assert_eq!(
                     index
-                        .bind_unique(&pool_guards, root)
+                        .bind_unique_unchecked(&pool_guards, root)
                         .unwrap()
                         .lookup(&key.vals, MIN_SNAPSHOT_TS)
                         .await
@@ -3287,7 +3287,7 @@ mod tests {
                 let pool_guards = session.pool_guards();
                 assert_eq!(
                     index
-                        .bind_unique(&pool_guards, root)
+                        .bind_unique_unchecked(&pool_guards, root)
                         .unwrap()
                         .lookup(&key.vals, MIN_SNAPSHOT_TS)
                         .await

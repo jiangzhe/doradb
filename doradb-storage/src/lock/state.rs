@@ -125,6 +125,33 @@ impl OwnerLockState {
         self.held.insert(resource, mode);
     }
 
+    /// Removes one exact owner-cache record without releasing its manager grant.
+    ///
+    /// Admission rollback uses this before its fresh-grant guard releases the
+    /// corresponding manager entry.
+    #[inline]
+    pub(crate) fn remove_cached_exact(&mut self, resource: LockResource, mode: LockMode) -> bool {
+        if self.held.get(&resource).copied() != Some(mode) {
+            return false;
+        }
+        self.held.remove(&resource);
+        true
+    }
+
+    /// Releases and removes one exact cached resource.
+    #[inline]
+    pub(crate) fn release_cached(
+        &mut self,
+        lock_manager: &LockManager,
+        resource: LockResource,
+    ) -> usize {
+        if self.held.remove(&resource).is_some() {
+            lock_manager.release(resource, self.owner)
+        } else {
+            0
+        }
+    }
+
     /// Releases every cached lock and clears the cache.
     #[inline]
     pub(crate) fn release_all(&mut self, lock_manager: &LockManager) -> usize {

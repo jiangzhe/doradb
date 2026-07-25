@@ -40,8 +40,7 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, InternalError, InternalResult, OperationResult,
-    RuntimeError, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, OperationResult, RuntimeError, RuntimeResult,
 };
 use crate::file::table_file::{ActiveRoot, TableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
@@ -860,11 +859,8 @@ impl<'ctx> TableRootSnapshot<'ctx> {
 
     /// Returns the captured DiskTree root for one secondary index.
     #[inline]
-    pub(crate) fn secondary_index_root(&self, index_no: usize) -> InternalResult<BlockID> {
-        self.secondary_index_roots
-            .get(index_no)
-            .copied()
-            .ok_or_else(|| missing_secondary_index(index_no, self.secondary_index_roots.len()))
+    pub(crate) fn secondary_index_root(&self, index_no: usize) -> BlockID {
+        self.secondary_index_roots[index_no]
     }
 
     /// Returns whether the captured root was observable before the supplied
@@ -1143,12 +1139,6 @@ fn unique_key_from_full_row(
         .map(|key| cols[key.col_no as usize].clone())
         .collect();
     SelectKey::new(unique_index_no, vals)
-}
-
-#[inline]
-fn missing_secondary_index(index_no: usize, index_count: usize) -> Report<InternalError> {
-    Report::new(InternalError::SecondaryIndexOutOfBounds)
-        .attach(format!("index_no={index_no}, index_count={index_count}"))
 }
 
 #[cfg(test)]
@@ -2319,7 +2309,7 @@ pub(crate) mod tests {
         ) -> RuntimeResult<Option<(RowID, bool)>> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_unique(self.guards, self.root)?
+                .bind_unique_unchecked(self.guards, self.root)?
                 .lookup(key, ts)
                 .await
         }
@@ -2377,7 +2367,7 @@ pub(crate) mod tests {
         ) -> RuntimeResult<()> {
             let index = self.layout.secondary_index(self.index_no)?;
             let range = index.key_encoder().encode_non_unique_equal_range(key);
-            let bound = index.bind_non_unique(self.guards, self.root)?;
+            let bound = index.bind_non_unique_unchecked(self.guards, self.root)?;
             let mut stream = bound.equal_scan_candidates(&range, ts)?;
             while let Some(batch) = stream.next_batch().await? {
                 res.extend(batch.into_iter().map(|candidate| candidate.row_id));
@@ -2394,7 +2384,7 @@ pub(crate) mod tests {
         ) -> RuntimeResult<Option<bool>> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.guards, self.root)?
+                .bind_non_unique_unchecked(self.guards, self.root)?
                 .lookup_unique(key, row_id, ts)
                 .await
         }
@@ -2411,7 +2401,7 @@ pub(crate) mod tests {
         ) -> RuntimeResult<IndexInsert> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.guards, self.root)?
+                .bind_non_unique_unchecked(self.guards, self.root)?
                 .insert_mem_if_not_exists(key, row_id, merge_if_match_deleted, ts)
                 .await
         }
@@ -2427,7 +2417,7 @@ pub(crate) mod tests {
         ) -> RuntimeResult<IndexMask> {
             let index = self.layout.secondary_index(self.index_no)?;
             index
-                .bind_non_unique(self.guards, self.root)?
+                .bind_non_unique_unchecked(self.guards, self.root)?
                 .mask_mem_if_present(key, row_id, ts)
                 .await
         }
