@@ -52,13 +52,6 @@ impl StreamStmtState {
     fn resolve_user_table(&mut self, table_id: TableID) -> OperationResult<Arc<Table>> {
         if !is_catalog_table(table_id) {
             let (inner, attachment) = self.checkout.inner_and_attachment_mut();
-            if let Some(table) = inner.cached_user_table(table_id) {
-                return Ok(table);
-            }
-            if let Some(table) = attachment.cached_user_table(table_id) {
-                inner.cache_user_table(&table);
-                return Ok(table);
-            }
             let engine = attachment.engine();
             if let Some(table) = engine.catalog().get_table_now(table_id) {
                 attachment.cache_user_table(&table);
@@ -275,14 +268,14 @@ impl<'trx> StreamStmt<'trx> {
             None => OwnerLockState::new(stmt_owner),
         };
         let mut stmt_state = StreamStmtState::new(checkout, stmt_locks);
-        let table = stmt_state
-            .resolve_user_table(table_id)
-            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
-            .disclose()?;
         stmt_state
             .acquire_table_read_lock(table_id)
             .await
             .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}, table_id={table_id}"))
+            .disclose()?;
+        let table = stmt_state
+            .resolve_user_table(table_id)
+            .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
             .disclose()?;
         table
             .check_foreground_live()

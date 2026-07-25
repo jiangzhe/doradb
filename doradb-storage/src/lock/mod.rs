@@ -238,37 +238,18 @@ pub(crate) struct ScopedTableDdlLocks<'a> {
     owner: LockOwner,
     metadata_fresh: bool,
     data_fresh: bool,
-    fail_waiters: Option<OperationError>,
-}
-
-impl ScopedTableDdlLocks<'_> {
-    /// Fail waiters with the provided error when releasing fresh locks.
-    #[inline]
-    pub(crate) fn fail_waiters_on_release(&mut self, error: OperationError) {
-        self.fail_waiters = Some(error);
-    }
 }
 
 impl Drop for ScopedTableDdlLocks<'_> {
     #[inline]
     fn drop(&mut self) {
         if self.data_fresh {
-            let resource = LockResource::TableData(self.table_id);
-            if let Some(error) = self.fail_waiters {
-                self.lock_manager
-                    .release_and_fail_waiters(resource, self.owner, error);
-            } else {
-                self.lock_manager.release(resource, self.owner);
-            }
+            self.lock_manager
+                .release(LockResource::TableData(self.table_id), self.owner);
         }
         if self.metadata_fresh {
-            let resource = LockResource::TableMetadata(self.table_id);
-            if let Some(error) = self.fail_waiters {
-                self.lock_manager
-                    .release_and_fail_waiters(resource, self.owner, error);
-            } else {
-                self.lock_manager.release(resource, self.owner);
-            }
+            self.lock_manager
+                .release(LockResource::TableMetadata(self.table_id), self.owner);
         }
     }
 }
@@ -366,6 +347,28 @@ impl LockManager {
         Ok((metadata_guard, data_guard))
     }
 
+    /// Acquires metadata-X for one freshly allocated CREATE TABLE id.
+    #[inline]
+    pub(crate) async fn acquire_create_table_metadata_lock<'a>(
+        &'a self,
+        table_id: TableID,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> OperationResult<FreshLockGuard<'a>> {
+        let resource = LockResource::TableMetadata(table_id);
+        let grant = self
+            .acquire_grouped_with_grant(resource, LockMode::Exclusive, owner, owner_group)
+            .await?;
+        FreshLockGuard::new(self, resource, owner, grant).map_or_else(
+            || {
+                panic!(
+                    "create-table metadata lock invariant violated: fresh table id reused an existing owner grant, table_id={table_id}, owner={owner:?}"
+                )
+            },
+            Ok,
+        )
+    }
+
     /// Acquires scoped exclusive table DDL locks.
     #[inline]
     pub(crate) async fn acquire_table_ddl_locks<'a>(
@@ -395,7 +398,6 @@ impl LockManager {
             owner,
             metadata_fresh: metadata_grant == LockGrant::Fresh,
             data_fresh: data_grant == LockGrant::Fresh,
-            fail_waiters: None,
         })
     }
 
@@ -523,42 +525,6 @@ impl LockManager {
         removed
     }
 
-    /// Releases `owner` on `resource` and fails every queued waiter.
-    ///
-    /// This is for resource invalidation, not ordinary unlock. A successful
-    /// `DROP TABLE` uses it so waiters queued behind the drop do not acquire
-    /// locks for a table that has just left the runtime catalog.
-    #[inline]
-    pub(crate) fn release_and_fail_waiters(
-        &self,
-        resource: LockResource,
-        owner: LockOwner,
-        error: OperationError,
-    ) -> usize {
-        let mut notify = Vec::new();
-        let mut removed = 0;
-        let remove_resource = {
-            if let Some(mut resource_state) = self.resources.get_mut(&resource) {
-                removed += resource_state.remove_granted(owner);
-                let failed_waiters = resource_state.drain_waiters();
-                removed += failed_waiters.len();
-                mark_waiters(&failed_waiters, WaitOutcome::Failed(error));
-                notify.extend(failed_waiters);
-                resource_state.is_empty()
-            } else {
-                false
-            }
-        };
-        if remove_resource {
-            self.resources
-                .remove_if(&resource, |_resource, resource_state| {
-                    resource_state.is_empty()
-                });
-        }
-        notify_waiters(notify);
-        removed
-    }
-
     /// Releases every granted lock and queued request owned by `owner`.
     ///
     /// This is the authoritative cleanup path for later statement, transaction,
@@ -622,9 +588,6 @@ impl LockManager {
                     return Err(waiter_released_err(resource, mode, owner));
                 }
                 WaitOutcome::Released => return Err(waiter_released_err(resource, mode, owner)),
-                WaitOutcome::Failed(error) => {
-                    return Err(waiter_failed_err(resource, mode, owner, error));
-                }
             }
         }
     }
@@ -858,11 +821,6 @@ impl ResourceState {
     }
 
     #[inline]
-    fn drain_waiters(&mut self) -> Vec<Arc<Waiter>> {
-        self.waiters.drain(..).collect()
-    }
-
-    #[inline]
     fn remove_waiter(&mut self, target: &Arc<Waiter>) -> Option<Arc<Waiter>> {
         let mut retained = VecDeque::with_capacity(self.waiters.len());
         let mut removed = None;
@@ -1071,7 +1029,6 @@ enum WaitOutcome {
     Waiting,
     Granted,
     Released,
-    Failed(OperationError),
 }
 
 enum AcquireImmediate {
@@ -1247,16 +1204,6 @@ fn waiter_released_err(
         .attach(format!("resource={resource}, owner={owner}, mode={mode}"))
 }
 
-#[inline]
-fn waiter_failed_err(
-    resource: LockResource,
-    mode: LockMode,
-    owner: LockOwner,
-    error: OperationError,
-) -> Report<OperationError> {
-    Report::new(error).attach(format!("resource={resource}, owner={owner}, mode={mode}"))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1412,6 +1359,35 @@ pub(crate) mod tests {
     fn assert_operation_err<T>(res: OperationResult<T>, expected: OperationError) {
         let err = res.err().unwrap();
         assert_eq!(*err.current_context(), expected);
+    }
+
+    #[test]
+    fn create_table_metadata_guard_holds_only_fresh_metadata_x() {
+        smol::block_on(async {
+            let manager = LockManager::new();
+            let table_id = TableID::new(42);
+            let owner = session(SessionID::new(7));
+            let owner_group = group(SessionID::new(7));
+            let guard = manager
+                .acquire_create_table_metadata_lock(table_id, owner, owner_group)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                debug_snapshot(&manager).entries,
+                vec![LockDebugEntry {
+                    resource: table_metadata(table_id),
+                    mode: LockMode::Exclusive,
+                    owner,
+                    owner_group: Some(owner_group),
+                    state: LockDebugEntryState::Granted,
+                    queue_order: None,
+                }]
+            );
+
+            drop(guard);
+            assert!(debug_snapshot(&manager).entries.is_empty());
+        });
     }
 
     fn count_entries(
@@ -1662,64 +1638,6 @@ pub(crate) mod tests {
             count_entries(&snapshot, second, LockDebugEntryState::Granted),
             1
         );
-    }
-
-    #[test]
-    fn release_and_fail_waiters_does_not_grant_queue() {
-        smol::block_on(async {
-            let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(TableID::new(41));
-            assert!(
-                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
-            );
-
-            let first_waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move {
-                    manager
-                        .acquire(resource, LockMode::Shared, trx(TrxID::new(2)))
-                        .await
-                })
-            };
-            let second_waiter = {
-                let manager = Arc::clone(&manager);
-                smol::spawn(async move {
-                    manager
-                        .acquire(resource, LockMode::Shared, trx(TrxID::new(3)))
-                        .await
-                })
-            };
-            wait_for_waiters(&manager, resource, 2).await;
-
-            assert_eq!(
-                manager.release_and_fail_waiters(
-                    resource,
-                    trx(TrxID::new(1)),
-                    OperationError::TableNotFound,
-                ),
-                3
-            );
-            for waiter in [first_waiter, second_waiter] {
-                let err = waiter.await.unwrap_err();
-                assert_eq!(*err.current_context(), OperationError::TableNotFound);
-            }
-            assert_eq!(
-                count_entries(
-                    &debug_snapshot(&manager),
-                    resource,
-                    LockDebugEntryState::Granted,
-                ),
-                0
-            );
-            assert_eq!(
-                count_entries(
-                    &debug_snapshot(&manager),
-                    resource,
-                    LockDebugEntryState::Waiting,
-                ),
-                0
-            );
-        });
     }
 
     #[test]

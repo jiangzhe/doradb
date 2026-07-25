@@ -4620,6 +4620,7 @@ mod tests {
     use crate::value::{Val, ValKind};
     use error_stack::Report;
     use smol::Timer;
+    use std::cell::Cell;
     use std::io::Error as StdIoError;
     use std::iter::repeat_n;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -8367,7 +8368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_scan_mvcc_read_lock_failure_preserves_lock_context() {
+    fn test_table_scan_mvcc_released_waiter_preserves_lock_context() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine =
@@ -8383,29 +8384,37 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            let mut scan_fut = Box::pin(
-                trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await),
-            );
+            let stmt_owner = Cell::new(None);
+            let mut scan_fut = Box::pin(trx.exec(async |stmt| {
+                stmt_owner.set(Some(stmt_tests::lock_owner(stmt)));
+                stmt.table_scan_mvcc(table_id, &[0], |_| true).await
+            }));
             assert!(matches!(
                 futures::poll!(scan_fut.as_mut()),
                 std::task::Poll::Pending
             ));
-            engine.lock_manager().release_and_fail_waiters(
+            let stmt_owner = stmt_owner.get().unwrap();
+            wait_for_lock_entry(
+                &engine,
+                stmt_owner,
                 resource,
-                blocker,
-                OperationError::TableDropping,
-            );
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
+            )
+            .await;
+            assert_eq!(engine.lock_manager().release_owner(stmt_owner), 1);
 
             let err = scan_fut.await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableDropping)
+                Some(OperationError::LockWaiterReleased)
             );
             let rendered = format!("{err:?}");
             assert_eq!(rendered.matches("operation=table_scan_mvcc").count(), 1);
             assert_eq!(rendered.matches(&format!("table_id={table_id}")).count(), 1);
             assert!(rendered.contains("resource=table_metadata"), "{rendered}");
             assert!(rendered.contains("mode=shared"), "{rendered}");
+            assert_eq!(engine.lock_manager().release(resource, blocker), 1);
             trx.rollback().await.unwrap();
         });
     }

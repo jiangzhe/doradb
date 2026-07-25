@@ -489,12 +489,6 @@ impl Session {
         ensure_idle_maintenance_session(&session)
             .attach("operation=freeze_table")
             .disclose()?;
-        let table = session
-            .resolve_user_table(table_id)
-            .await
-            .attach("operation=freeze_table")
-            .disclose()?;
-
         // Acquire maintenance admission before entering the freeze workflow. The
         // grouped helper orders TableMetadata(S) before TableData(IS), excluding
         // metadata-X DDL and data-X full-table mutations while remaining compatible
@@ -507,10 +501,9 @@ impl Session {
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
             .disclose()?;
-        // Lock acquisition can wait, so the table may have started dropping since
-        // resolution. Revalidate only after both maintenance locks are granted.
-        table
-            .check_foreground_live()
+        let table = session
+            .resolve_user_table(table_id)
+            .await
             .attach("operation=freeze_table")
             .disclose()?;
         table
@@ -527,12 +520,6 @@ impl Session {
         ensure_idle_maintenance_session(&session)
             .attach("operation=checkpoint_table")
             .disclose()?;
-        let table = session
-            .resolve_existing_user_table(table_id)
-            .await
-            .attach("operation=checkpoint_table")
-            .disclose()?;
-
         // Acquire maintenance admission before entering the checkpoint workflow.
         // The grouped helper orders TableMetadata(S) before TableData(IS), excluding
         // metadata-X DDL and data-X full-table mutations while remaining compatible
@@ -545,10 +532,9 @@ impl Session {
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
             .disclose()?;
-        // Lock acquisition can wait, so the table may have started dropping since
-        // resolution. Revalidate only after both maintenance locks are granted.
-        table
-            .check_foreground_live()
+        let table = session
+            .resolve_user_table(table_id)
+            .await
             .attach("operation=checkpoint_table")
             .disclose()?;
         table
@@ -574,16 +560,10 @@ impl Session {
             CheckpointDelayReason::ActiveRoot { table_id, .. }
             | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
         };
-        let table = match session.state.cached_user_table(table_id) {
-            Some(table) => table,
-            None => {
-                let Some(table) = session.engine.catalog().get_table(table_id).await else {
-                    return Ok(());
-                };
-                session.state.cache_user_table(&table);
-                table
-            }
+        let Some(table) = session.engine.catalog().get_table(table_id).await else {
+            return Ok(());
         };
+        session.state.cache_user_table(&table);
         table
             .wait_for_checkpoint_retry(&session, reason)
             .await
@@ -786,42 +766,17 @@ impl SessionPin {
         self.state.in_trx()
     }
 
-    /// Resolve a live user table, checking cached entries first.
+    /// Resolve a live user table from authoritative current catalog state.
     #[inline]
     pub(crate) async fn resolve_user_table(
         &self,
         table_id: TableID,
     ) -> OperationResult<Arc<Table>> {
-        if let Some(table) = self.state.cached_user_table(table_id) {
-            table.check_foreground_live()?;
-            return Ok(table);
-        }
         let table = self
             .engine
             .catalog()
             .validate_user_table_live(table_id)
             .await?;
-        self.state.cache_user_table(&table);
-        Ok(table)
-    }
-
-    /// Resolve an existing user table without requiring it to be foreground-live.
-    #[inline]
-    pub(crate) async fn resolve_existing_user_table(
-        &self,
-        table_id: TableID,
-    ) -> OperationResult<Arc<Table>> {
-        if let Some(table) = self.state.cached_user_table(table_id) {
-            return Ok(table);
-        }
-        let table = self
-            .engine
-            .catalog()
-            .get_table(table_id)
-            .await
-            .ok_or_else(|| {
-                Report::new(OperationError::TableNotFound).attach(format!("table_id={table_id}"))
-            })?;
         self.state.cache_user_table(&table);
         Ok(table)
     }
@@ -835,7 +790,6 @@ impl SessionPin {
     ) -> OperationResult<()> {
         let session_id = self.id();
         let engine = &self.engine;
-        engine.catalog().validate_user_table_live(table_id).await?;
         let lock_manager = engine.lock_manager();
         let owner = LockOwner::Session(session_id);
         let owner_group = LockOwnerGroup::Session(session_id);
@@ -1374,6 +1328,7 @@ impl SessionState {
 
     /// Upgrade a cached user-table runtime if the session weak cache still reaches it.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn cached_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         let mut cache = self.table_cache.lock();
         let entry = cache.get(&table_id)?;
@@ -1501,12 +1456,6 @@ impl TrxAttachment {
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
         &self.pool_guards
-    }
-
-    /// Upgrade a cached session-local user-table runtime if it is still alive.
-    #[inline]
-    pub(crate) fn cached_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
-        self.session.cached_user_table(table_id)
     }
 
     /// Store a weak session-local table cache entry after successful resolution.

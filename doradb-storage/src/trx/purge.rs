@@ -196,6 +196,15 @@ impl TransactionSystem {
         let _ = self.purge_tx.send(Purge::DroppedTable);
     }
 
+    /// Wake the purge coordinator for metadata-history cleanup only.
+    ///
+    /// This targeted observation also retries an unchanged horizon after an
+    /// externally pinned historical version has been released.
+    #[inline]
+    pub(crate) fn request_metadata_history_purge(&self) {
+        let _ = self.purge_tx.send(Purge::MetadataHistory);
+    }
+
     /// Start exactly the configured number of purge-bucket worker threads.
     ///
     /// The dispatcher is worker slot zero and the remaining configured slots
@@ -933,6 +942,8 @@ pub(crate) enum Purge {
     TableRootRetention,
     /// Run only dropped-table runtime/file cleanup.
     DroppedTable,
+    /// Run only user-table metadata-history cleanup.
+    MetadataHistory,
     /// Test-only system-CTS scheduling input without a retirement payload.
     #[cfg(test)]
     TestSystemCts(TrxID),
@@ -945,6 +956,7 @@ struct PurgeWork {
     full_observation: bool,
     table_root_retention: bool,
     dropped_table: bool,
+    metadata_history: bool,
     /// Terminal shutdown marker. When set, the purge loop returns without
     /// running cleanup work collected before the marker.
     stop_after: bool,
@@ -959,6 +971,7 @@ impl PurgeWork {
             full_observation: false,
             table_root_retention: false,
             dropped_table: false,
+            metadata_history: false,
             stop_after: false,
         }
     }
@@ -972,6 +985,7 @@ impl PurgeWork {
             full_observation: false,
             table_root_retention: true,
             dropped_table: false,
+            metadata_history: false,
             stop_after: false,
         }
     }
@@ -984,6 +998,7 @@ impl PurgeWork {
             full_observation: false,
             table_root_retention: false,
             dropped_table: false,
+            metadata_history: false,
             stop_after: true,
         }
     }
@@ -1008,6 +1023,7 @@ impl PurgeWork {
             || self.full_observation
             || self.table_root_retention
             || self.dropped_table
+            || self.metadata_history
     }
 
     #[inline]
@@ -1039,9 +1055,11 @@ impl PurgeWork {
                 self.full_observation = true;
                 self.table_root_retention = true;
                 self.dropped_table = true;
+                self.metadata_history = true;
             }
             Purge::TableRootRetention => self.table_root_retention = true,
             Purge::DroppedTable => self.dropped_table = true,
+            Purge::MetadataHistory => self.metadata_history = true,
             #[cfg(test)]
             Purge::TestSystemCts(cts) => self.merge_system_cts(cts),
         }
@@ -1054,6 +1072,7 @@ struct PurgeCyclePlan {
     transaction_gc: bool,
     table_root_retention: bool,
     dropped_table: bool,
+    metadata_history: bool,
     advance_completed_horizon: bool,
 }
 
@@ -1248,6 +1267,9 @@ impl PurgeDispatcher {
                 trx_sys.observe_purge_test_event(PurgeTestEvent::TableRootRetentionStarted);
                 trx_sys.process_retained_table_roots(curr_sts);
             }
+            if plan.metadata_history {
+                trx_sys.catalog.purge_user_table_history(curr_sts);
+            }
             if plan.dropped_table {
                 #[cfg(test)]
                 trx_sys.observe_purge_test_event(PurgeTestEvent::DroppedTableStarted);
@@ -1351,6 +1373,7 @@ fn plan_purge_cycle(
         transaction_gc: horizon_cycle || system_eligible,
         table_root_retention: work.table_root_retention || horizon_cycle,
         dropped_table: work.dropped_table || horizon_cycle,
+        metadata_history: work.metadata_history || horizon_cycle,
         advance_completed_horizon: horizon_cycle,
     }
 }
@@ -1707,6 +1730,7 @@ mod tests {
                 full_observation: true,
                 table_root_retention: true,
                 dropped_table: true,
+                metadata_history: true,
                 stop_after: false,
             }
         );
@@ -1716,12 +1740,14 @@ mod tests {
     fn test_coalesce_purge_work_keeps_targeted_housekeeping_independent() {
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::DroppedTable).unwrap();
+        tx.send(Purge::MetadataHistory).unwrap();
         assert_eq!(
             coalesce_purge_work(&rx, Purge::TableRootRetention, |_| {
                 panic!("no committed payload expected")
             }),
             PurgeWork {
                 dropped_table: true,
+                metadata_history: true,
                 ..PurgeWork::table_root_retention()
             }
         );
@@ -1735,12 +1761,14 @@ mod tests {
             transaction_gc: false,
             table_root_retention: false,
             dropped_table: false,
+            metadata_history: false,
             advance_completed_horizon: false,
         };
         let full_plan = PurgeCyclePlan {
             transaction_gc: true,
             table_root_retention: true,
             dropped_table: true,
+            metadata_history: true,
             advance_completed_horizon: true,
         };
 
@@ -1782,6 +1810,7 @@ mod tests {
             full_observation: true,
             table_root_retention: true,
             dropped_table: true,
+            metadata_history: true,
             ..PurgeWork::none()
         };
         assert_eq!(
@@ -1790,6 +1819,7 @@ mod tests {
                 transaction_gc: false,
                 table_root_retention: true,
                 dropped_table: true,
+                metadata_history: true,
                 advance_completed_horizon: false,
             }
         );
@@ -1808,6 +1838,7 @@ mod tests {
                 transaction_gc: true,
                 table_root_retention: false,
                 dropped_table: false,
+                metadata_history: false,
                 advance_completed_horizon: false,
             }
         );
@@ -1840,6 +1871,24 @@ mod tests {
                 transaction_gc: false,
                 table_root_retention: true,
                 dropped_table: false,
+                metadata_history: false,
+                advance_completed_horizon: false,
+            }
+        );
+        assert_eq!(
+            plan_purge_cycle(
+                PurgeWork {
+                    metadata_history: true,
+                    ..PurgeWork::none()
+                },
+                TrxID::new(20),
+                TrxID::new(20),
+            ),
+            PurgeCyclePlan {
+                transaction_gc: false,
+                table_root_retention: false,
+                dropped_table: false,
+                metadata_history: true,
                 advance_completed_horizon: false,
             }
         );
