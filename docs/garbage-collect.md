@@ -221,9 +221,12 @@ and reclaim only the displaced meta block. Catalog reclamation does not trace
 secondary `DiskTree` roots because catalog logical tables do not persist them
 in `catalog.mtb`.
 
-Recovery can apply a simpler reachability rule: after restart there are no
-active transactions, so blocks unreachable from the selected latest valid root
-are reclaimable once recovery has validated and installed that root.
+In principle, recovery could rebuild reachability after selecting and
+validating the latest root because no pre-crash transaction remains active.
+Current recovery does not perform that rebuild: it validates and trusts the
+allocation map persisted by checkpoint. Startup allocation-map rebuilding is a
+separate follow-up tracked by
+`docs/backlogs/000108-recovery-table-file-alloc-map-rebuild.md`.
 
 ## Deletion Buffer
 

@@ -2128,7 +2128,9 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPool;
     use crate::buffer::guard::PageSharedGuard;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableSpec};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableSpec,
+    };
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
     use crate::error::{
@@ -2162,6 +2164,7 @@ mod tests {
     use crate::table::tests::*;
     use crate::table::{DeleteMarker, TableTerminal};
     use crate::trx::Transaction;
+    use crate::trx::purge::PurgeTestEvent;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests::discard_transaction_after_fatal_rollback;
     use crate::trx::undo::{OwnedRowUndo, RowUndoHead, RowUndoKind};
@@ -6740,6 +6743,7 @@ mod tests {
     fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
@@ -6758,11 +6762,28 @@ mod tests {
                     .is_allocated(usize::from(dropped_disk_root))
             );
 
+            let mut old_session = engine.new_session().unwrap();
+            let old_trx = old_session.begin_trx().unwrap();
+            let retained_visible = engine
+                .catalog()
+                .resolve_user_table_visible(table_id, old_trx.sts())
+                .unwrap();
+            let ResolvedVisibleTableMetadata::Live(retained_live) = &retained_visible else {
+                panic!("pre-drop metadata should remain logically live");
+            };
+            assert!(retained_live.metadata().idx.index_spec(0).is_some());
+
             session.drop_index(table_id, 0).await.unwrap();
-            let after_drop_root = table_for_internal_assertion(&engine, table_id)
-                .file()
-                .active_root_unchecked()
-                .clone();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let after_drop_root = table.file().active_root_unchecked().clone();
+            let CurrentTableState::Live { metadata, .. } = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap()
+            else {
+                panic!("DROP INDEX must leave the table live");
+            };
+            assert!(metadata.idx.index_spec(0).is_none());
             assert_eq!(after_drop_root.secondary_index_roots[0], SUPER_BLOCK_ID);
             assert!(
                 after_drop_root
@@ -6770,21 +6791,63 @@ mod tests {
                     .is_allocated(usize::from(dropped_disk_root)),
                 "DROP INDEX detaches the root but leaves page reclamation to checkpoint reachability"
             );
+            assert_eq!(
+                engine.catalog().user_table_history_version_count(table_id),
+                Some(1)
+            );
+            assert!(retained_live.metadata().idx.index_spec(0).is_some());
+            assert!(
+                !table.has_retired_secondary_indexes(),
+                "logical metadata and an untouched old transaction must not retain removed runtime"
+            );
 
+            old_trx.rollback().await.unwrap();
             session
                 .wait_for_gc_horizon_after(after_drop_root.effective_ts())
                 .await
                 .unwrap();
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
+            engine.inner().trx_sys.request_metadata_history_purge();
+            loop {
+                if event_rx.recv_async().await.unwrap() == PurgeTestEvent::CycleCompleted {
+                    break;
+                }
+            }
+            assert_eq!(
+                engine.catalog().user_table_history_version_count(table_id),
+                Some(0)
+            );
+            assert!(retained_live.metadata().idx.index_spec(0).is_some());
             assert_checkpoint_published(&mut session, table_id).await;
-            let after_reclaim = table_for_internal_assertion(&engine, table_id)
-                .file()
-                .active_root_unchecked()
-                .clone();
+            let after_reclaim = table.file().active_root_unchecked().clone();
             assert!(
                 !after_reclaim
                     .alloc_map
                     .is_allocated(usize::from(dropped_disk_root)),
                 "checkpoint reachability should reclaim detached DiskTree pages"
+            );
+
+            drop(retained_visible);
+            drop(table);
+            drop(old_session);
+            drop(session);
+            engine.shutdown().unwrap();
+
+            let recovered = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "redo_testsys_lightweight",
+            ))
+            .await
+            .unwrap();
+            let recovered_table = table_for_internal_assertion(&recovered, table_id);
+            let recovered_root = recovered_table.file().active_root_unchecked();
+            assert_eq!(recovered_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+            assert!(
+                !recovered_root
+                    .alloc_map
+                    .is_allocated(usize::from(dropped_disk_root)),
+                "restart must trust the allocation map already cleared by checkpoint"
             );
         })
     }

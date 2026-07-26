@@ -258,6 +258,9 @@ mod tests {
     use super::ensure_recovery_index_insert;
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::PAGE_SIZE;
+    use crate::catalog::tests::{
+        assert_dropped_table_floor, assert_no_dropped_table_operational_state,
+    };
     use crate::catalog::{TableMetadata, USER_TABLE_ID_START};
     use crate::engine::Engine;
     use crate::error::{DataIntegrityError, RecoveryDuplicateKey, RuntimeError};
@@ -267,6 +270,7 @@ mod tests {
     use crate::row::ops::UpdateCol;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::{DmlValidationError, tests::*};
+    use crate::trx::MAX_SNAPSHOT_TS;
     use crate::value::Val;
     use error_stack::Report;
     use std::sync::Arc;
@@ -582,7 +586,21 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert!(engine.catalog().get_table(table_id).await.is_some());
+            let current = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap();
+            assert_eq!(current.effective_cts(), TrxID::new(0));
+            let table = current.live_table().unwrap();
+            assert!(Arc::ptr_eq(
+                table.layout_snapshot().metadata_arc(),
+                &table.metadata()
+            ));
+            assert_eq!(
+                engine.catalog().user_table_history_version_count(table_id),
+                Some(0)
+            );
+            assert_no_dropped_table_operational_state(engine.catalog(), table_id);
         });
     }
 
@@ -615,10 +633,28 @@ mod tests {
             .await
             .unwrap();
             assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(engine.catalog().get_table_now(table_id).is_none());
+            assert!(
+                engine
+                    .catalog()
+                    .resolve_user_table_current(table_id)
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
+                    .is_none()
+            );
+            assert_eq!(
+                engine.catalog().user_table_history_version_count(table_id),
+                None
+            );
             assert_eq!(
                 engine.catalog().retained_dropped_table_ids_now(),
                 vec![table_id]
             );
+            assert_dropped_table_floor(engine.catalog(), table_id);
             assert!(std::path::Path::new(&table_file_path).exists());
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
@@ -630,6 +666,11 @@ mod tests {
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;
             assert!(engine.catalog().retained_dropped_table_ids_now().is_empty());
+            assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+            assert_eq!(
+                engine.catalog().user_table_history_version_count(table_id),
+                None
+            );
         });
     }
 

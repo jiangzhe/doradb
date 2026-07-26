@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() {
+    fn test_runtime_layout_install_retires_removed_index_until_pinned_layout_drops() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;

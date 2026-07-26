@@ -1701,8 +1701,8 @@ mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolRole};
     use crate::catalog::{
-        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
-        TableMetadata, tests::table2,
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, CurrentTableState, IndexAttributes,
+        IndexKey, IndexSpec, ResolvedVisibleTableMetadata, TableMetadata, tests::table2,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1740,6 +1740,85 @@ mod tests {
 
     fn set_create_index_failure(failure: Option<CreateIndexTestFailure>) {
         CREATE_INDEX_FAILURE.with(|slot| slot.set(failure));
+    }
+
+    struct IndexDdlSnapshot {
+        current_effective_cts: TrxID,
+        current_metadata: Arc<TableMetadata>,
+        history_count: Option<usize>,
+        layout_generation: u64,
+        runtime_slots: Vec<bool>,
+        root: ActiveRoot,
+        has_retired_runtime: bool,
+    }
+
+    fn index_ddl_snapshot(engine: &Engine, table_id: TableID, table: &Table) -> IndexDdlSnapshot {
+        let CurrentTableState::Live {
+            effective_cts,
+            metadata,
+            ..
+        } = engine
+            .catalog()
+            .resolve_user_table_current(table_id)
+            .unwrap()
+        else {
+            panic!("index DDL snapshot requires a live current table");
+        };
+        let layout = table.layout_snapshot();
+        IndexDdlSnapshot {
+            current_effective_cts: effective_cts,
+            current_metadata: metadata,
+            history_count: engine.catalog().user_table_history_version_count(table_id),
+            layout_generation: layout.generation(),
+            runtime_slots: layout
+                .secondary_indexes()
+                .iter()
+                .map(Option::is_some)
+                .collect(),
+            root: table.file().active_root_unchecked().clone(),
+            has_retired_runtime: table.has_retired_secondary_indexes(),
+        }
+    }
+
+    fn assert_index_ddl_snapshot_unchanged(
+        before: &IndexDdlSnapshot,
+        engine: &Engine,
+        table_id: TableID,
+        table: &Table,
+    ) {
+        let CurrentTableState::Live {
+            effective_cts,
+            metadata,
+            ..
+        } = engine
+            .catalog()
+            .resolve_user_table_current(table_id)
+            .unwrap()
+        else {
+            panic!("failed index DDL must keep a live current table");
+        };
+        assert_eq!(effective_cts, before.current_effective_cts);
+        assert!(Arc::ptr_eq(&metadata, &before.current_metadata));
+        assert_eq!(
+            engine.catalog().user_table_history_version_count(table_id),
+            before.history_count
+        );
+        let layout = table.layout_snapshot();
+        assert_eq!(layout.generation(), before.layout_generation);
+        assert!(Arc::ptr_eq(layout.metadata_arc(), &before.current_metadata));
+        assert_eq!(
+            layout
+                .secondary_indexes()
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            before.runtime_slots
+        );
+        assert_root_metadata_unchanged(&before.root, table);
+        assert_eq!(
+            table.has_retired_secondary_indexes(),
+            before.has_retired_runtime
+        );
     }
 
     pub(super) fn maybe_fail_create_index(failure: CreateIndexTestFailure) -> RuntimeResult<()> {
@@ -2435,8 +2514,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("dup")]).await;
             insert_one_row(&table, &mut session, vec![Val::from(2), Val::from("dup")]).await;
-            let root_before = table.file().active_root_unchecked().clone();
-            let old_generation = table.layout_snapshot().generation();
+            let before = index_ddl_snapshot(&engine, table_id, &table);
 
             let err = session
                 .create_index(
@@ -2450,8 +2528,7 @@ mod tests {
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::DuplicateKey)
             );
-            assert_root_metadata_unchanged(&root_before, &table);
-            assert_eq!(table.layout_snapshot().generation(), old_generation);
+            assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             assert_eq!(table.metadata().idx.next_index_no(), 1);
             assert!(table.metadata().idx.index_spec(1).is_none());
         });
@@ -2482,8 +2559,7 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "create_index_pk_rejected").await;
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
-            let root_before = table.file().active_root_unchecked().clone();
-            let old_generation = table.layout_snapshot().generation();
+            let before = index_ddl_snapshot(&engine, table_id, &table);
             let mut session = engine.new_session().unwrap();
 
             let err = session
@@ -2503,8 +2579,7 @@ mod tests {
                 report.contains("create_index does not support user-table primary keys"),
                 "{report}"
             );
-            assert_root_metadata_unchanged(&root_before, &table);
-            assert_eq!(table.layout_snapshot().generation(), old_generation);
+            assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             assert_eq!(table.metadata().idx.next_index_no(), 1);
             assert!(table.metadata().idx.index_spec(1).is_none());
         });
@@ -2552,8 +2627,10 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
             let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
+            let before = index_ddl_snapshot(&engine, table_id, &table);
 
             let err = session
                 .create_index(
@@ -2567,6 +2644,7 @@ mod tests {
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::NotSupported)
             );
+            assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             trx.rollback().await.unwrap();
         });
     }
@@ -2755,40 +2833,41 @@ mod tests {
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
+            let mut horizon_session = engine.new_session().unwrap();
+            let horizon_trx = horizon_session.begin_trx().unwrap();
 
             let trx = session.begin_trx().unwrap();
+            let before = index_ddl_snapshot(&engine, table_id, &table);
             let err = session.drop_index(table_id, 0).await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::NotSupported)
             );
+            assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             trx.rollback().await.unwrap();
 
-            let root_before = table.file().active_root_unchecked().clone();
-            let old_generation = table.layout_snapshot().generation();
+            let before = index_ddl_snapshot(&engine, table_id, &table);
             let err = session.drop_index(table_id, 1).await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::IndexNotFound)
             );
-            assert_root_metadata_unchanged(&root_before, &table);
-            assert_eq!(table.layout_snapshot().generation(), old_generation);
+            assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
 
             session.drop_index(table_id, 0).await.unwrap();
-            let root_before = table.file().active_root_unchecked().clone();
-            let old_generation = table.layout_snapshot().generation();
+            let before = index_ddl_snapshot(&engine, table_id, &table);
             let err = session.drop_index(table_id, 0).await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::IndexNotFound)
             );
-            assert_root_metadata_unchanged(&root_before, &table);
-            assert_eq!(table.layout_snapshot().generation(), old_generation);
+            assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
+            horizon_trx.rollback().await.unwrap();
         });
     }
 
     #[test]
-    fn test_drop_index_runtime_install_retires_removed_runtime() {
+    fn test_drop_index_runtime_install_retires_removed_runtime_until_pinned_layout_drops() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
@@ -2808,8 +2887,19 @@ mod tests {
             let old_layout = table.layout_snapshot();
             let old_generation = old_layout.generation();
             let old_pk = Arc::clone(old_layout.secondary_indexes()[0].as_ref().unwrap());
+            let mut old_session = engine.new_session().unwrap();
+            let old_trx = old_session.begin_trx().unwrap();
+            let retained_visible = engine
+                .catalog()
+                .resolve_user_table_visible(table_id, old_trx.sts())
+                .unwrap();
+            let ResolvedVisibleTableMetadata::Live(retained_live) = &retained_visible else {
+                panic!("pre-drop metadata should remain logically live");
+            };
+            assert!(retained_live.metadata().idx.index_spec(1).is_some());
 
             session.drop_index(table_id, 1).await.unwrap();
+            old_trx.rollback().await.unwrap();
 
             let installed = table.layout_snapshot();
             assert_eq!(installed.generation(), old_generation + 1);
@@ -2827,6 +2917,7 @@ mod tests {
                 0
             );
             drop(old_layout);
+            assert!(retained_live.metadata().idx.index_spec(1).is_some());
             assert_eq!(
                 table
                     .cleanup_retired_secondary_indexes(&session.pool_guards())
@@ -2835,6 +2926,69 @@ mod tests {
                 1
             );
             assert!(!table.has_retired_secondary_indexes());
+        });
+    }
+
+    #[test]
+    fn test_maintenance_and_ddl_use_current_layout_with_retained_predecessor_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "current_layout_maintenance").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut old_session = engine.new_session().unwrap();
+            let old_trx = old_session.begin_trx().unwrap();
+            let retained_visible = engine
+                .catalog()
+                .resolve_user_table_visible(table_id, old_trx.sts())
+                .unwrap();
+            let ResolvedVisibleTableMetadata::Live(retained_live) = &retained_visible else {
+                panic!("pre-DDL metadata should remain logically live");
+            };
+            assert_eq!(retained_live.metadata().idx.active_index_count(), 1);
+
+            let mut session = engine.new_session().unwrap();
+            let index_no = session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(usize::from(index_no), 1);
+            let current_layout = table.layout_snapshot();
+            assert_eq!(current_layout.metadata().idx.active_index_count(), 2);
+            assert!(current_layout.secondary_indexes()[1].is_some());
+            assert!(Arc::ptr_eq(
+                current_layout.metadata_arc(),
+                &table.file().active_root_unchecked().metadata
+            ));
+
+            old_trx.rollback().await.unwrap();
+            insert_one_row(
+                &table,
+                &mut session,
+                vec![Val::from(1), Val::from("current")],
+            )
+            .await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            assert_ne!(
+                table.file().active_root_unchecked().secondary_index_roots[1],
+                SUPER_BLOCK_ID
+            );
+            assert_eq!(retained_live.metadata().idx.active_index_count(), 1);
+
+            session.drop_index(table_id, index_no).await.unwrap();
+            let installed = table.layout_snapshot();
+            assert_eq!(installed.generation(), current_layout.generation() + 1);
+            assert!(installed.metadata().idx.index_spec(1).is_none());
+            assert!(installed.secondary_indexes()[1].is_none());
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_roots[1],
+                SUPER_BLOCK_ID
+            );
+            assert_eq!(retained_live.metadata().idx.active_index_count(), 1);
         });
     }
 
@@ -2972,8 +3126,7 @@ mod tests {
             .await;
         }
         assert_checkpoint_published(&mut session, table_id).await;
-        let root_before = table.file().active_root_unchecked().clone();
-        let old_generation = table.layout_snapshot().generation();
+        let before = index_ddl_snapshot(&engine, table_id, &table);
 
         let err = session
             .create_index(
@@ -2987,8 +3140,7 @@ mod tests {
             err.report().downcast_ref::<OperationError>().copied(),
             Some(OperationError::DuplicateKey)
         );
-        assert_root_metadata_unchanged(&root_before, &table);
-        assert_eq!(table.layout_snapshot().generation(), old_generation);
+        assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
         assert_eq!(table.metadata().idx.next_index_no(), 1);
         assert!(table.metadata().idx.index_spec(1).is_none());
     }
@@ -3004,8 +3156,7 @@ mod tests {
         let table = table_for_internal_assertion(&engine, table_id);
         let mut session = engine.new_session().unwrap();
         insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("alpha")]).await;
-        let root_before = table.file().active_root_unchecked().clone();
-        let generation_before = table.layout_snapshot().generation();
+        let before = index_ddl_snapshot(&engine, table_id, &table);
         let allocated_before = engine.inner().index_pool.allocated();
 
         set_create_index_failure(Some(failure));
@@ -3023,8 +3174,7 @@ mod tests {
             Some(RuntimeError::IndexAccess)
         );
         assert_eq!(engine.inner().index_pool.allocated(), allocated_before);
-        assert_root_metadata_unchanged(&root_before, &table);
-        assert_eq!(table.layout_snapshot().generation(), generation_before);
+        assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
         assert_eq!(table.metadata().idx.next_index_no(), 1);
         assert!(table.metadata().idx.index_spec(1).is_none());
     }
@@ -3142,7 +3292,9 @@ mod tests {
 
     fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
         let after = table.file().active_root_unchecked();
+        assert_eq!(after.slot_no, before.slot_no);
         assert_eq!(after.root_ts, before.root_ts);
+        assert_eq!(after.effective_ts(), before.effective_ts());
         assert_eq!(after.meta_block_id, before.meta_block_id);
         assert_eq!(after.pivot_row_id, before.pivot_row_id);
         assert_eq!(after.heap_redo_start_ts, before.heap_redo_start_ts);
@@ -3150,6 +3302,14 @@ mod tests {
         assert_eq!(
             after.secondary_index_roots, before.secondary_index_roots,
             "secondary index roots changed"
+        );
+        assert_eq!(after.alloc_map.len(), before.alloc_map.len());
+        assert_eq!(after.alloc_map.allocated(), before.alloc_map.allocated());
+        assert!(
+            (0..before.alloc_map.len()).all(|block_id| {
+                after.alloc_map.is_allocated(block_id) == before.alloc_map.is_allocated(block_id)
+            }),
+            "table-file allocation map changed"
         );
         assert!(Arc::ptr_eq(&after.metadata, &before.metadata));
     }

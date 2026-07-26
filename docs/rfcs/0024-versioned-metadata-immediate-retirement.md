@@ -1380,10 +1380,14 @@ Required coverage includes:
     strict tombstone horizon and current-only resolver to validation hooks.
   - Phase-local Choices: Reuse existing purge/root observability and failpoints;
     add instrumentation only where deterministic reclamation tests require it.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000240-operational-reclamation-recovery-validation.md`
+  - Task Issue: `#895`
+  - Phase Status: done
+  - Implementation Summary: Validated metadata-only reclamation independence, transaction-binding DDL drainage, current-only operational access, checkpoint-persisted root reclamation, dropped-table runtime and floor cleanup, recovery baselines, and DDL failure windows across default and libaio backends; corrected live ownership documentation and deferred explicit runtime leases to backlog 000166. [Task Resolve Sync: docs/tasks/000240-operational-reclamation-recovery-validation.md @ 2026-07-26]
+  - Deferred Follow-ups:
+    - `docs/backlogs/000166-replace-arc-probed-dropped-table-runtime-purge.md`
+      remains open for explicit executable-runtime lease and owned cleanup-job
+      design beyond this validation phase.
 
 ## Consequences
 

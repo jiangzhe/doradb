@@ -1753,9 +1753,13 @@ fn validate_primary_key_contract(
 mod tests {
     use super::*;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
+    use crate::catalog::tests::{
+        assert_dropped_table_floor, assert_dropped_table_runtime,
+        assert_no_dropped_table_operational_state,
+    };
     use crate::catalog::{
-        CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
-        IndexSpec, TableSpec,
+        CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, CurrentTableState,
+        IndexAttributes, IndexKey, IndexSpec, TableMetadata, TableSpec,
     };
     use crate::engine::Engine;
     use crate::error::{
@@ -1770,6 +1774,8 @@ mod tests {
     use crate::session::tests::SessionTestExt;
     use crate::table::TableTerminal;
     use crate::table::tests::*;
+    use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::trx::purge::PurgeTestEvent;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::tests as trx_tests;
     use crate::value::{Val, ValKind};
@@ -1820,6 +1826,132 @@ mod tests {
         );
         let report = format!("{err:?}");
         assert!(report.contains(expected_message), "{report}");
+    }
+
+    async fn request_and_wait_for_purge_cycle(
+        engine: &Engine,
+        event_rx: &flume::Receiver<PurgeTestEvent>,
+    ) {
+        while event_rx.try_recv().is_ok() {}
+        engine.inner().trx_sys.request_dropped_table_purge();
+        let mut dropped_table_started = false;
+        loop {
+            match event_rx.recv_async().await.unwrap() {
+                PurgeTestEvent::DroppedTableStarted => dropped_table_started = true,
+                PurgeTestEvent::CycleCompleted if dropped_table_started => return,
+                _ => {}
+            }
+        }
+    }
+
+    fn assert_no_user_table_publication(engine: &Engine, table_id: TableID) {
+        assert!(engine.catalog().get_table_now(table_id).is_none());
+        assert!(
+            engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .is_none()
+        );
+        assert!(
+            engine
+                .catalog()
+                .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
+                .is_none()
+        );
+        assert_eq!(
+            engine.catalog().user_table_history_version_count(table_id),
+            None
+        );
+        assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+    }
+
+    struct TableDdlSnapshot {
+        effective_cts: TrxID,
+        metadata: Arc<TableMetadata>,
+        table: Arc<Table>,
+        history_count: Option<usize>,
+        retained_dropped_state: bool,
+        file_exists: bool,
+        lifecycle: TableTerminal,
+        poisoned: bool,
+    }
+
+    fn table_ddl_snapshot(engine: &Engine, table_id: TableID, table: &Table) -> TableDdlSnapshot {
+        let CurrentTableState::Live {
+            effective_cts,
+            metadata,
+            table: current_table,
+        } = engine
+            .catalog()
+            .resolve_user_table_current(table_id)
+            .unwrap()
+        else {
+            panic!("table DDL snapshot requires a live current table");
+        };
+        TableDdlSnapshot {
+            effective_cts,
+            metadata,
+            table: current_table,
+            history_count: engine.catalog().user_table_history_version_count(table_id),
+            retained_dropped_state: engine
+                .catalog()
+                .retained_dropped_table_ids_now()
+                .contains(&table_id),
+            file_exists: Path::new(&engine.inner().table_fs.user_table_file_path(table_id))
+                .exists(),
+            lifecycle: table.lifecycle.inspect_terminal(),
+            poisoned: engine.inner().poisoner.poison_error().is_some(),
+        }
+    }
+
+    fn assert_table_logical_snapshot_unchanged(
+        before: &TableDdlSnapshot,
+        engine: &Engine,
+        table_id: TableID,
+    ) {
+        let CurrentTableState::Live {
+            effective_cts,
+            metadata,
+            table: current_table,
+        } = engine
+            .catalog()
+            .resolve_user_table_current(table_id)
+            .unwrap()
+        else {
+            panic!("failed pre-gate DROP TABLE must keep the table live");
+        };
+        assert_eq!(effective_cts, before.effective_cts);
+        assert!(Arc::ptr_eq(&metadata, &before.metadata));
+        assert!(Arc::ptr_eq(&current_table, &before.table));
+        assert_eq!(
+            engine.catalog().user_table_history_version_count(table_id),
+            before.history_count
+        );
+        assert_eq!(
+            engine
+                .catalog()
+                .retained_dropped_table_ids_now()
+                .contains(&table_id),
+            before.retained_dropped_state
+        );
+        assert_eq!(
+            Path::new(&engine.inner().table_fs.user_table_file_path(table_id)).exists(),
+            before.file_exists
+        );
+    }
+
+    fn assert_table_ddl_snapshot_unchanged(
+        before: &TableDdlSnapshot,
+        engine: &Engine,
+        table_id: TableID,
+        table: &Table,
+    ) {
+        assert_table_logical_snapshot_unchanged(before, engine, table_id);
+        assert_eq!(table.lifecycle.inspect_terminal(), before.lifecycle);
+        assert_eq!(
+            engine.inner().poisoner.poison_error().is_some(),
+            before.poisoned
+        );
     }
 
     #[test]
@@ -2461,7 +2593,8 @@ mod tests {
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::InvalidMetadata)
             );
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_no_user_table_publication(&engine, table_id);
+            assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(!has_lock_resource(
                 &engine,
                 owner,
@@ -2505,7 +2638,8 @@ mod tests {
                 .unwrap_err();
 
             assert_invalid_metadata(err, "create_table does not support user-table primary keys");
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_no_user_table_publication(&engine, table_id);
+            assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
         });
@@ -2537,7 +2671,8 @@ mod tests {
                 err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::CatalogAccess)
             );
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_no_user_table_publication(&engine, table_id);
+            assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(!has_lock_resource(
                 &engine,
                 owner,
@@ -2589,7 +2724,8 @@ mod tests {
             assert!(report.contains("file_kind=table_file"), "{report}");
             assert!(report.contains("phase=write_meta_block"), "{report}");
             assert!(hook.call_count() > 0);
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_no_user_table_publication(&engine, table_id);
+            assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
         });
@@ -2620,7 +2756,8 @@ mod tests {
                 err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::CatalogAccess)
             );
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_no_user_table_publication(&engine, table_id);
+            assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
         });
@@ -2651,7 +2788,8 @@ mod tests {
                 err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::CatalogAccess)
             );
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_no_user_table_publication(&engine, table_id);
+            assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(!session.in_trx().unwrap());
             wait_path_exists(&table_file_path, false).await;
         });
@@ -2663,7 +2801,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
             let engine = Engine::bootstrap(lightweight_test_engine_config(
-                main_dir,
+                main_dir.clone(),
                 "create_fail_commit",
             ))
             .await
@@ -2690,9 +2828,21 @@ mod tests {
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
             );
-            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert_no_user_table_publication(&engine, table_id);
             assert!(!session.in_trx().unwrap());
             assert!(Path::new(&table_file_path).exists());
+
+            drop(session);
+            drop(engine);
+
+            let recovered = Engine::bootstrap(lightweight_test_engine_config(
+                main_dir,
+                "create_fail_commit",
+            ))
+            .await
+            .unwrap();
+            assert_no_user_table_publication(&recovered, table_id);
+            wait_path_exists(&table_file_path, false).await;
         });
     }
 
@@ -3162,18 +3312,15 @@ mod tests {
                 .unwrap()
                 .wait()
                 .await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let before = table_ddl_snapshot(&engine, table_id, &table);
 
             let err = session.drop_table(table_id).await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableDropping)
             );
-            assert_eq!(
-                table_for_internal_assertion(&engine, table_id)
-                    .lifecycle
-                    .inspect_terminal(),
-                TableTerminal::Dropping
-            );
+            assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             assert!(!session.in_trx().unwrap());
             assert!(engine.inner().poisoner.poison_error().is_none());
         });
@@ -3185,14 +3332,17 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
+            let before = table_ddl_snapshot(&engine, table_id, &table);
 
             let err = session.drop_table(table_id).await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::NotSupported)
             );
+            assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
 
             trx.rollback().await.unwrap();
         });
@@ -3205,12 +3355,15 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let before = table_ddl_snapshot(&engine, table_id, &table);
 
             let err = session.drop_table(TABLE_ID_TABLES).await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
             );
+            assert_no_user_table_publication(&engine, TABLE_ID_TABLES);
 
             let missing_user_table_id = table_id + 1000;
             let err = session.drop_table(missing_user_table_id).await.unwrap_err();
@@ -3218,6 +3371,8 @@ mod tests {
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
             );
+            assert_no_user_table_publication(&engine, missing_user_table_id);
+            assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
         });
     }
 
@@ -3251,18 +3406,15 @@ mod tests {
             corrupt_trx.commit().await.unwrap();
 
             let mut drop_session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let before = table_ddl_snapshot(&engine, table_id, &table);
             let err = drop_session.drop_table(table_id).await.unwrap_err();
 
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
             );
-            assert_eq!(
-                table_for_internal_assertion(&engine, table_id)
-                    .lifecycle
-                    .inspect_terminal(),
-                TableTerminal::Live
-            );
+            assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             assert!(!drop_session.in_trx().unwrap());
             assert!(engine.inner().poisoner.poison_error().is_none());
             assert!(engine.catalog().get_table(table_id).await.is_some());
@@ -3281,8 +3433,10 @@ mod tests {
                 let table_id = create_table2_for_test(&engine).await;
                 let mut session = engine.new_session().unwrap();
                 let owner = LockOwner::Session(session.id());
+                let table = table_for_internal_assertion(&engine, table_id);
 
                 session.lock_table(table_id, table_mode).await.unwrap();
+                let before = table_ddl_snapshot(&engine, table_id, &table);
                 let err = session.drop_table(table_id).await.unwrap_err();
                 assert_eq!(
                     err.report().downcast_ref::<OperationError>().copied(),
@@ -3292,12 +3446,7 @@ mod tests {
                 assert_eq!(rendered.matches("operation=drop_table").count(), 1);
                 assert!(rendered.contains(&format!("table_id={table_id}")));
 
-                assert_eq!(
-                    table_for_internal_assertion(&engine, table_id)
-                        .lifecycle
-                        .inspect_terminal(),
-                    TableTerminal::Live
-                );
+                assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
                 assert!(engine.catalog().get_table(table_id).await.is_some());
                 assert!(has_lock_entry(
                     &engine,
@@ -3469,6 +3618,7 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
             let mut drop_session = engine.new_session().unwrap();
+            let before = table_ddl_snapshot(&engine, table_id, &table);
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
 
             assert!(matches!(
@@ -3485,6 +3635,8 @@ mod tests {
                 .poison_error()
                 .expect("abandoned terminal drop should poison storage");
             assert_eq!(*poison.current_context(), FatalError::Poisoned);
+            assert_table_logical_snapshot_unchanged(&before, &engine, table_id);
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
             drop(publish_lease);
             drop(root_lease);
@@ -3562,10 +3714,12 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
             let mut drop_session = engine.new_session().unwrap();
             drop_session.drop_table(table_id).await.unwrap();
+            assert_dropped_table_runtime(engine.catalog(), table_id);
 
-            let lock_session = engine.new_session().unwrap();
+            let mut lock_session = engine.new_session().unwrap();
             let session_owner = LockOwner::Session(lock_session.id());
             let err = lock_session
                 .lock_table(table_id, TableLockMode::Shared)
@@ -3585,6 +3739,30 @@ mod tests {
                 session_owner,
                 LockResource::TableData(table_id),
             ));
+
+            for err in [
+                lock_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap_err(),
+                lock_session.checkpoint_table(table_id).await.unwrap_err(),
+            ] {
+                assert_eq!(
+                    err.report().downcast_ref::<OperationError>().copied(),
+                    Some(OperationError::TableNotFound)
+                );
+                assert!(!has_lock_resource(
+                    &engine,
+                    session_owner,
+                    LockResource::TableMetadata(table_id),
+                ));
+                assert!(!has_lock_resource(
+                    &engine,
+                    session_owner,
+                    LockResource::TableData(table_id),
+                ));
+            }
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
 
             let mut trx_session = engine.new_session().unwrap();
             let mut trx = trx_session.begin_trx().unwrap();
@@ -3751,7 +3929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_table_gc_deletes_file_after_catalog_checkpoint() {
+    fn test_drop_table_runtime_pin_delays_floor_but_not_logical_history_or_foreground_removal() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -3762,6 +3940,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            let table_pin = table_for_internal_assertion(&engine, table_id);
             insert_one_row(
                 table_id,
                 &mut session,
@@ -3769,13 +3948,36 @@ mod tests {
             )
             .await;
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let (event_tx, event_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(event_tx);
 
             session.drop_table(table_id).await.unwrap();
+            let drop_cts = session.last_cts();
             assert_eq!(
                 engine.catalog().retained_dropped_table_ids_now(),
                 vec![table_id]
             );
-            engine.inner().trx_sys.request_dropped_table_purge();
+            session.wait_for_gc_horizon_after(drop_cts).await.unwrap();
+            request_and_wait_for_purge_cycle(&engine, &event_rx).await;
+            assert!(
+                engine
+                    .catalog()
+                    .resolve_user_table_current(table_id)
+                    .is_none()
+            );
+            assert_eq!(
+                engine.catalog().user_table_history_version_count(table_id),
+                None
+            );
+            assert_dropped_table_runtime(engine.catalog(), table_id);
+            assert!(engine.catalog().get_table_now(table_id).is_none());
+            assert!(Path::new(&table_file_path).exists());
+
+            drop(table_pin);
+            request_and_wait_for_purge_cycle(&engine, &event_rx).await;
+            assert_dropped_table_floor(engine.catalog(), table_id);
+            assert!(Path::new(&table_file_path).exists());
+
             engine
                 .catalog()
                 .checkpoint_now(&engine.inner().trx_sys)
@@ -3783,6 +3985,13 @@ mod tests {
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;
             assert!(engine.catalog().retained_dropped_table_ids_now().is_empty());
+            assert_no_dropped_table_operational_state(engine.catalog(), table_id);
+            assert!(
+                engine
+                    .catalog()
+                    .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
+                    .is_none()
+            );
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
@@ -3807,6 +4016,8 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let before = table_ddl_snapshot(&engine, table_id, &table);
             let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.00000000");
             let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
             let _install = install_storage_backend_test_hook(hook.clone());
@@ -3844,6 +4055,8 @@ mod tests {
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
             );
+            assert_table_logical_snapshot_unchanged(&before, &engine, table_id);
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
             assert!(!session.in_trx().unwrap());
         });
     }
