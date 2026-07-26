@@ -381,7 +381,10 @@ mod tests {
     use crate::error::{Error, OperationError};
     use crate::lock::LockOwner;
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
+    use crate::table::TableTerminal;
     use crate::value::Val;
+    use std::future::Future;
+    use std::pin::Pin;
     use tempfile::TempDir;
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
@@ -425,6 +428,44 @@ mod tests {
 
     fn operation_error(err: &Error) -> Option<OperationError> {
         err.report().downcast_ref::<OperationError>().copied()
+    }
+
+    async fn observe_metadata_x_waiter<F>(
+        engine: &Engine,
+        resource: LockResource,
+        mut future: Pin<&mut F>,
+    ) where
+        F: Future,
+    {
+        for _ in 0..32 {
+            assert!(matches!(
+                futures::poll!(future.as_mut()),
+                std::task::Poll::Pending
+            ));
+            if debug_snapshot(engine.lock_manager())
+                .entries
+                .iter()
+                .any(|entry| {
+                    entry.resource == resource
+                        && entry.mode == LockMode::Exclusive
+                        && entry.state == LockDebugEntryState::Waiting
+                })
+            {
+                return;
+            }
+        }
+        panic!("table metadata X waiter was not observed after bounded polling");
+    }
+
+    fn assert_no_table_locks(engine: &Engine, table_id: TableID) {
+        let metadata = LockResource::TableMetadata(table_id);
+        let data = LockResource::TableData(table_id);
+        assert!(
+            debug_snapshot(engine.lock_manager())
+                .entries
+                .iter()
+                .all(|entry| entry.resource != metadata && entry.resource != data)
+        );
     }
 
     #[test]
@@ -691,39 +732,319 @@ mod tests {
                 .unwrap();
 
             let mut ddl_session = engine.new_session().unwrap();
+            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let before_layout = table.layout_snapshot();
+            let before_root = table.file().active_root_unchecked().clone();
+            let before_current_cts = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap()
+                .effective_cts();
             let mut create = Box::pin(ddl_session.create_index(
                 table_id,
                 IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             ));
-            let mut metadata_waiting = false;
-            for _ in 0..10 {
-                assert!(matches!(
-                    futures::poll!(create.as_mut()),
-                    std::task::Poll::Pending
-                ));
-                metadata_waiting =
-                    debug_snapshot(engine.lock_manager())
-                        .entries
-                        .iter()
-                        .any(|entry| {
-                            entry.resource == metadata
-                                && entry.mode == LockMode::Exclusive
-                                && entry.state == LockDebugEntryState::Waiting
-                        });
-                if metadata_waiting {
-                    break;
-                }
-            }
-            assert!(
-                metadata_waiting,
-                "create index metadata lock waiter was not observed after bounded polling"
+            observe_metadata_x_waiter(&engine, metadata, create.as_mut()).await;
+            assert_eq!(
+                engine
+                    .catalog()
+                    .resolve_user_table_current(table_id)
+                    .unwrap()
+                    .effective_cts(),
+                before_current_cts
+            );
+            assert_eq!(
+                table.layout_snapshot().generation(),
+                before_layout.generation()
+            );
+            assert_eq!(
+                table.file().active_root_unchecked().root_ts,
+                before_root.root_ts
             );
 
             bound_trx.commit().await.unwrap();
             assert_eq!(create.await.unwrap(), 1);
+            assert_no_table_locks(&engine, table_id);
 
             drop(ddl_session);
             drop(bound_session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn bound_transaction_makes_drop_index_metadata_lock_wait() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_drop_index_waits_for_binding").await;
+            let table_id = table2(&engine).await;
+            let metadata_resource = LockResource::TableMetadata(table_id);
+            let mut ddl_session = engine.new_session().unwrap();
+            let index_no = ddl_session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+            let table = engine.catalog().get_table_now(table_id).unwrap();
+
+            let mut bound_session = engine.new_session().unwrap();
+            let mut bound_trx = bound_session.begin_trx().unwrap();
+            let bound_owner = LockOwner::Transaction(bound_trx.trx_id());
+            bound_trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .await
+                .unwrap();
+            let before_current_cts = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap()
+                .effective_cts();
+            let before_layout = table.layout_snapshot();
+            let before_root = table.file().active_root_unchecked().clone();
+
+            let mut drop_index = Box::pin(ddl_session.drop_index(table_id, index_no));
+            observe_metadata_x_waiter(&engine, metadata_resource, drop_index.as_mut()).await;
+            assert!(owner_has_grant(
+                &engine,
+                bound_owner,
+                metadata_resource,
+                LockMode::Shared
+            ));
+            let waiting_current = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap();
+            assert_eq!(waiting_current.effective_cts(), before_current_cts);
+            assert!(
+                waiting_current
+                    .live_table()
+                    .is_some_and(|current| Arc::ptr_eq(current, &table))
+            );
+            assert!(before_layout.secondary_indexes()[usize::from(index_no)].is_some());
+            assert_eq!(
+                table.layout_snapshot().generation(),
+                before_layout.generation()
+            );
+            assert!(table.layout_snapshot().secondary_indexes()[usize::from(index_no)].is_some());
+            assert_eq!(
+                table.file().active_root_unchecked().root_ts,
+                before_root.root_ts
+            );
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
+
+            bound_trx.commit().await.unwrap();
+            drop_index.await.unwrap();
+            let current = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap();
+            let CurrentTableState::Live { metadata, .. } = current else {
+                panic!("DROP INDEX must keep the table live");
+            };
+            assert!(metadata.idx.index_spec(usize::from(index_no)).is_none());
+            assert!(table.layout_snapshot().secondary_indexes()[usize::from(index_no)].is_none());
+            assert_no_table_locks(&engine, table_id);
+
+            drop(ddl_session);
+            drop(bound_session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn bound_transaction_makes_drop_table_metadata_lock_wait() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_drop_table_waits_for_binding").await;
+            let table_id = table2(&engine).await;
+            let metadata_resource = LockResource::TableMetadata(table_id);
+            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let mut bound_session = engine.new_session().unwrap();
+            let mut bound_trx = bound_session.begin_trx().unwrap();
+            let bound_owner = LockOwner::Transaction(bound_trx.trx_id());
+            bound_trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .await
+                .unwrap();
+            let before_current_cts = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap()
+                .effective_cts();
+            let before_history_count = engine.catalog().user_table_history_version_count(table_id);
+            let before_generation = table.layout_snapshot().generation();
+            let before_root_ts = table.file().active_root_unchecked().root_ts;
+
+            let mut ddl_session = engine.new_session().unwrap();
+            let mut drop_table = Box::pin(ddl_session.drop_table(table_id));
+            observe_metadata_x_waiter(&engine, metadata_resource, drop_table.as_mut()).await;
+            assert!(owner_has_grant(
+                &engine,
+                bound_owner,
+                metadata_resource,
+                LockMode::Shared
+            ));
+            let waiting_current = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap();
+            assert_eq!(waiting_current.effective_cts(), before_current_cts);
+            assert!(
+                waiting_current
+                    .live_table()
+                    .is_some_and(|current| Arc::ptr_eq(current, &table))
+            );
+            assert_eq!(
+                engine.catalog().user_table_history_version_count(table_id),
+                before_history_count
+            );
+            assert_eq!(table.layout_snapshot().generation(), before_generation);
+            assert_eq!(table.file().active_root_unchecked().root_ts, before_root_ts);
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
+
+            bound_trx.rollback().await.unwrap();
+            drop_table.await.unwrap();
+            assert!(!matches!(
+                engine.catalog().resolve_user_table_current(table_id),
+                Some(CurrentTableState::Live { .. })
+            ));
+            assert!(engine.catalog().get_table_now(table_id).is_none());
+            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
+            assert_no_table_locks(&engine, table_id);
+
+            drop(ddl_session);
+            drop(bound_session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn untouched_old_transaction_cannot_bind_removed_index() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_untouched_drop_index").await;
+            let table_id = table2(&engine).await;
+            let mut old_session = engine.new_session().unwrap();
+            let mut old_trx = old_session.begin_trx().unwrap();
+            let old_sts = old_trx.sts();
+            let old_owner = LockOwner::Transaction(old_trx.trx_id());
+
+            let mut ddl_session = engine.new_session().unwrap();
+            ddl_session.drop_index(table_id, 0).await.unwrap();
+            let visible = engine
+                .catalog()
+                .resolve_user_table_visible(table_id, old_sts)
+                .unwrap();
+            let ResolvedVisibleTableMetadata::Live(visible) = visible else {
+                panic!("untouched transaction should retain logical predecessor metadata");
+            };
+            assert!(visible.metadata().idx.index_spec(0).is_some());
+            let CurrentTableState::Live { metadata, .. } = engine
+                .catalog()
+                .resolve_user_table_current(table_id)
+                .unwrap()
+            else {
+                panic!("DROP INDEX must keep the table live");
+            };
+            assert!(metadata.idx.index_spec(0).is_none());
+
+            let err = old_trx
+                .exec(async |stmt| {
+                    stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(1i32)], &[0])
+                        .await
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
+            {
+                let checkout = old_trx.checkout().unwrap();
+                assert!(!checkout.inner().table_bindings.contains_key(&table_id));
+                assert!(
+                    !checkout
+                        .inner()
+                        .checked_lock_state()
+                        .cached_covers(LockResource::TableMetadata(table_id), LockMode::Shared)
+                );
+                assert!(
+                    !checkout
+                        .inner()
+                        .checked_lock_state()
+                        .cached_covers(LockResource::TableData(table_id), LockMode::Shared)
+                );
+            }
+            assert!(
+                debug_snapshot(engine.lock_manager())
+                    .entries
+                    .iter()
+                    .all(|entry| entry.owner != old_owner
+                        && (entry.resource != LockResource::TableMetadata(table_id)
+                            || !matches!(entry.owner, LockOwner::Statement(..))))
+            );
+
+            old_trx.rollback().await.unwrap();
+            assert_no_table_locks(&engine, table_id);
+            drop(ddl_session);
+            drop(old_session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn untouched_old_transaction_cannot_bind_dropped_table() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_untouched_drop_table").await;
+            let table_id = table2(&engine).await;
+            let mut old_session = engine.new_session().unwrap();
+            let mut old_trx = old_session.begin_trx().unwrap();
+            let old_sts = old_trx.sts();
+            let old_owner = LockOwner::Transaction(old_trx.trx_id());
+
+            let mut ddl_session = engine.new_session().unwrap();
+            ddl_session.drop_table(table_id).await.unwrap();
+            assert!(matches!(
+                engine.catalog().resolve_user_table_current(table_id),
+                Some(CurrentTableState::Dropped { .. })
+            ));
+            assert!(matches!(
+                engine
+                    .catalog()
+                    .resolve_user_table_visible(table_id, old_sts),
+                Some(ResolvedVisibleTableMetadata::Live(_))
+            ));
+
+            let err = old_trx
+                .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                .await
+                .unwrap_err();
+            assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
+            {
+                let checkout = old_trx.checkout().unwrap();
+                assert!(!checkout.inner().table_bindings.contains_key(&table_id));
+                assert!(
+                    !checkout
+                        .inner()
+                        .checked_lock_state()
+                        .cached_covers(LockResource::TableMetadata(table_id), LockMode::Shared)
+                );
+                assert!(
+                    !checkout
+                        .inner()
+                        .checked_lock_state()
+                        .cached_covers(LockResource::TableData(table_id), LockMode::Shared)
+                );
+            }
+            assert!(
+                debug_snapshot(engine.lock_manager())
+                    .entries
+                    .iter()
+                    .all(|entry| entry.owner != old_owner
+                        && (entry.resource != LockResource::TableMetadata(table_id)
+                            || !matches!(entry.owner, LockOwner::Statement(..))))
+            );
+
+            old_trx.rollback().await.unwrap();
+            assert_no_table_locks(&engine, table_id);
+            drop(ddl_session);
+            drop(old_session);
             engine.shutdown().unwrap();
         });
     }

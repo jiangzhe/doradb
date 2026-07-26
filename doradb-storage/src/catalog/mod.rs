@@ -1240,6 +1240,33 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     #[inline]
+    pub(crate) fn assert_dropped_table_runtime(catalog: &Catalog, table_id: TableID) {
+        assert!(catalog.retained_dropped_table_ids_now().contains(&table_id));
+        assert!(
+            !catalog
+                .snapshot_dropped_table_file_cleanups()
+                .iter()
+                .any(|item| item.table_id == table_id)
+        );
+    }
+
+    #[inline]
+    pub(crate) fn assert_dropped_table_floor(catalog: &Catalog, table_id: TableID) {
+        assert!(catalog.retained_dropped_table_ids_now().contains(&table_id));
+        assert!(
+            catalog
+                .snapshot_dropped_table_file_cleanups()
+                .iter()
+                .any(|item| item.table_id == table_id)
+        );
+    }
+
+    #[inline]
+    pub(crate) fn assert_no_dropped_table_operational_state(catalog: &Catalog, table_id: TableID) {
+        assert!(!catalog.retained_dropped_table_ids_now().contains(&table_id));
+    }
+
+    #[inline]
     pub(crate) fn catalog_test_engine_config(
         main_dir: impl Into<PathBuf>,
         log_file_stem: Option<&str>,

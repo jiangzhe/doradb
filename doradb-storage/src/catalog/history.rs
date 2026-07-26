@@ -613,6 +613,9 @@ fn assert_current_layout_metadata(table: &Arc<Table>, metadata: &Arc<TableMetada
 mod tests {
     use super::*;
     use crate::catalog::{IndexAttributes, IndexKey, IndexSpec};
+    use crate::engine::Engine;
+    use crate::file::cow_file::SUPER_BLOCK_ID;
+    use crate::id::TableID;
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine};
     use crate::trx::MAX_SNAPSHOT_TS;
     use tempfile::TempDir;
@@ -785,6 +788,9 @@ mod tests {
                 resolved_visible.live().unwrap().metadata(),
                 &initial_metadata
             ));
+            assert_eq!(Arc::strong_count(&table), table_owners);
+            assert_eq!(Arc::strong_count(&layout), layout_owners);
+            assert_eq!(Arc::strong_count(&index), index_owners);
 
             let mut drop_reader_session = engine.new_session().unwrap();
             let drop_reader = drop_reader_session.begin_trx().unwrap();
@@ -837,6 +843,116 @@ mod tests {
                     .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
                     .is_none()
             );
+        });
+    }
+
+    fn assert_dropped_runtime(entry: &UserTableEntry) {
+        assert!(matches!(
+            entry.dropped.as_ref(),
+            Some(DroppedTableOperationalState::Runtime { .. })
+        ));
+    }
+
+    fn assert_dropped_floor(entry: &UserTableEntry) {
+        assert!(matches!(
+            entry.dropped.as_ref(),
+            Some(DroppedTableOperationalState::Floor { .. })
+        ));
+    }
+
+    fn dropped_entry_fixture(
+        engine: &Engine,
+        table_id: TableID,
+    ) -> (
+        UserTableEntry,
+        Arc<Table>,
+        TrxID,
+        TrxID,
+        TableRedoReplayFloor,
+    ) {
+        let current = engine
+            .catalog()
+            .resolve_user_table_current(table_id)
+            .unwrap();
+        let initial_cts = current.effective_cts();
+        let table = Arc::clone(current.live_table().unwrap());
+        let metadata = Arc::clone(current.live_metadata().unwrap());
+        let drop_cts = after(initial_cts);
+        let replay_floor = TableRedoReplayFloor {
+            heap_redo_start_ts: TrxID::new(7),
+            deletion_cutoff_ts: TrxID::new(9),
+        };
+        let mut entry = UserTableEntry::new_live(initial_cts, metadata, Arc::clone(&table));
+        assert!(entry.publish_drop(drop_cts, Arc::clone(&table), replay_floor));
+        (entry, table, initial_cts, drop_cts, replay_floor)
+    }
+
+    #[test]
+    fn dropped_runtime_can_become_floor_before_tombstone_history_purge() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "drop_runtime_before_history").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let (mut entry, _table, initial_cts, drop_cts, replay_floor) =
+                dropped_entry_fixture(&engine, table_id);
+
+            entry.purge_history(drop_cts);
+            assert!(entry.take_dropped_runtime(drop_cts).is_none());
+            assert_dropped_runtime(&entry);
+            let at_equality = entry.resolve_visible(drop_cts).unwrap();
+            assert_eq!(at_equality.live().unwrap().effective_cts(), initial_cts);
+
+            let (detached, observed_drop_cts, observed_floor) =
+                entry.take_dropped_runtime(after(drop_cts)).unwrap();
+            assert_eq!(observed_drop_cts, drop_cts);
+            assert_eq!(observed_floor, replay_floor);
+            assert_dropped_floor(&entry);
+            assert!(entry.resolve_current().unwrap().is_dropped());
+            assert!(
+                entry
+                    .resolve_visible(after(drop_cts))
+                    .unwrap()
+                    .is_tombstone()
+            );
+            assert!(!entry.is_empty());
+
+            entry.purge_history(after(drop_cts));
+            assert!(entry.resolve_current().is_none());
+            assert!(!entry.is_empty());
+            assert!(entry.remove_dropped_floor(drop_cts, replay_floor));
+            assert!(entry.is_empty());
+            drop(detached);
+        });
+    }
+
+    #[test]
+    fn tombstone_history_can_purge_before_dropped_runtime_becomes_floor() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "drop_history_before_runtime").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let (mut entry, _table, _initial_cts, drop_cts, replay_floor) =
+                dropped_entry_fixture(&engine, table_id);
+
+            entry.purge_history(drop_cts);
+            assert!(entry.resolve_current().unwrap().is_dropped());
+            assert!(entry.take_dropped_runtime(drop_cts).is_none());
+            assert_dropped_runtime(&entry);
+
+            entry.purge_history(after(drop_cts));
+            assert!(entry.resolve_current().is_none());
+            assert_eq!(entry.history_version_count(), None);
+            assert_dropped_runtime(&entry);
+            assert!(!entry.is_empty());
+
+            let (detached, observed_drop_cts, observed_floor) =
+                entry.take_dropped_runtime(after(drop_cts)).unwrap();
+            assert_eq!(observed_drop_cts, drop_cts);
+            assert_eq!(observed_floor, replay_floor);
+            assert_dropped_floor(&entry);
+            assert!(entry.remove_dropped_floor(drop_cts, replay_floor));
+            assert!(entry.is_empty());
+            drop(detached);
         });
     }
 
@@ -893,9 +1009,34 @@ mod tests {
     fn recovery_builds_one_zero_cts_current_baseline() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let table_id = {
+            let (table_id, retained_pre_crash_metadata) = {
                 let engine = lightweight_test_engine(&temp_dir, "metadata_history_recovery").await;
-                create_table2_for_test(&engine).await
+                let table_id = create_table2_for_test(&engine).await;
+                let mut session = engine.new_session().unwrap();
+                let index_no = session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(usize::from(index_no), 1);
+                let visible = engine
+                    .catalog()
+                    .resolve_user_table_visible(table_id, MAX_SNAPSHOT_TS)
+                    .unwrap();
+                let retained_metadata = Arc::clone(visible.live().unwrap().metadata());
+                assert!(retained_metadata.idx.index_spec(1).is_some());
+
+                session.drop_index(table_id, index_no).await.unwrap();
+                let table = engine.catalog().get_table_now(table_id).unwrap();
+                assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
+                assert!(!table.has_retired_secondary_indexes());
+                assert_eq!(
+                    table.file().active_root_unchecked().secondary_index_roots[1],
+                    SUPER_BLOCK_ID
+                );
+                (table_id, retained_metadata)
             };
 
             let recovered = lightweight_test_engine(&temp_dir, "metadata_history_recovery").await;
@@ -909,11 +1050,31 @@ mod tests {
                 current.live_metadata().unwrap(),
                 table.layout_snapshot().metadata_arc()
             ));
+            assert!(!Arc::ptr_eq(
+                current.live_metadata().unwrap(),
+                &retained_pre_crash_metadata
+            ));
+            assert!(retained_pre_crash_metadata.idx.index_spec(1).is_some());
+            assert!(current.live_metadata().unwrap().idx.index_spec(1).is_none());
+            assert_eq!(current.live_metadata().unwrap().idx.index_slot_count(), 2);
+            assert!(table.layout_snapshot().secondary_indexes()[1].is_none());
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_roots[1],
+                SUPER_BLOCK_ID
+            );
+            assert!(!table.has_retired_secondary_indexes());
             assert_eq!(
                 recovered
                     .catalog()
                     .user_table_history_version_count(table_id),
                 Some(0)
+            );
+            assert_eq!(
+                recovered
+                    .inner()
+                    .session_registry
+                    .active_transaction_count(),
+                0
             );
         });
     }

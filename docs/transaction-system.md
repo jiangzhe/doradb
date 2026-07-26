@@ -174,16 +174,19 @@ pairs the immutable `TrxContext` with runtime access to the engine, pool
 guards, and session-local user-table cache. `TrxContext` never stores the
 attachment.
 
-Each session user-table cache entry contains one weak `Table` runtime and an
-optional `VersionedPageID`. User-table insert selection takes the optional page
-token while retaining the weak runtime entry, reopens only the matching page
-generation, and otherwise falls back to the table insert free list before
-allocating a page. The row inserter remains responsible for checking active page
-state and capacity; cached RowID range state is not required. A successful user
-insert returns the version token to the same entry. When session state is
-destroyed, cached tokens whose weak runtime remains reachable are returned to
-the table insert free list; tokens attached to unreachable runtimes are
-discarded.
+Each session user-table cache entry contains one weak `Table` runtime hint and
+an optional `VersionedPageID`. The weak runtime is never authoritative for
+foreground admission: a cache miss or stale weak pointer is resolved through
+the catalog, and a cache hit is usable only after the transaction's metadata
+binding contract has admitted the operation. User-table insert selection takes
+the optional page token while retaining the weak runtime entry, reopens only
+the matching page generation, and otherwise falls back to the table insert free
+list before allocating a page. The row inserter remains responsible for checking
+active page state and capacity; cached RowID range state is not required. A
+successful user insert returns the version token to the same entry. When session
+state is destroyed, cached tokens whose weak runtime remains reachable are
+returned to the table insert free list; tokens attached to unreachable runtimes
+are discarded.
 
 Catalog-table MVCC inserts do not use session entries. They acquire and return
 versioned page tokens through the catalog table's shared insert free list, so
@@ -239,13 +242,28 @@ locks are released on commit, rollback, no-op discard, or fatal transaction
 discard. Session-owned logical locks are released when the session state is
 dropped.
 
-Foreground table access enters through lock-aware `Statement` APIs. Plain MVCC
-table scans, unique lookups, and index scans acquire statement-lifetime
-`TableMetadata(S)` and do not acquire `TableData`. Row inserts, updates, and
-deletes acquire transaction-lifetime `TableMetadata(S)` followed by
+Foreground table access enters through lock-aware `Statement` APIs and a
+positive transaction-lifetime `TransactionTableBinding`. A binding hit is
+checked before any new metadata-lock request and reuses the STS-visible
+metadata, current `Table`, current `TableRuntimeLayout`, and transaction-owned
+`TableMetadata(S)` already stored for that table. On first touch, the statement
+acquires `TableMetadata(S)`, resolves both STS-visible logical metadata and the
+authoritative current state, and validates the requested table/index shape.
+Admission then acquires transaction-owned `TableMetadata(S)` before releasing
+the statement grant and installing the binding. Failure at any point releases
+the statement grant and installs neither a binding nor a transaction grant.
+
+Successfully bound reads and writes retain `TableMetadata(S)` until transaction
+commit or rollback. Reads may use the intersection of visible and current
+schema: an index absent from visible metadata returns `IndexNotFound`, while an
+index visible to the transaction but removed from current state returns
+`SchemaChanged`. Writes additionally require visible metadata to be the current
+metadata version, rejecting stale writers before row or index mutation.
+Row inserts, updates, and deletes then acquire transaction-lifetime
 `TableData(IX)` before installing row undo, deletion-buffer ownership, or
-secondary-index write undo. Repeated writes to the same table reuse the
-transaction lock cache rather than re-entering the lock manager.
+secondary-index write undo. Repeated operations reuse the binding and
+transaction lock cache rather than re-entering the metadata resolver or lock
+manager.
 
 Sequential full-table MVCC mutation acquires transaction-lifetime
 `TableMetadata(S)` followed by `TableData(X)` before it captures the table root
@@ -267,18 +285,24 @@ serializing page freeze/transition against full-table mutation `X`. Grants alrea
 covered by an explicit session lock are preserved when the maintenance call
 returns; only fresh maintenance grants are released.
 
-`CREATE TABLE` does not acquire a logical lock. The atomic table-id allocator
-assigns a distinct id before the operation creates its deterministic table
-file, stages catalog rows, or builds the per-id runtime. The initial table-file
-root uses the create transaction STS as `root_ts`; catalog commit is held until
-file/runtime staging succeeds, and the runtime is inserted into the concurrent
-per-id catalog map only after the durable catalog commit.
+`CREATE TABLE` allocates a distinct id and then holds `TableMetadata(X)` for
+that id while it creates the deterministic table file, stages catalog rows,
+builds the per-id runtime, commits the catalog transaction, and publishes the
+current history/runtime entry. The initial table-file root uses the create
+transaction STS as `root_ts`. Keeping metadata X through current publication
+prevents first touch from observing a partially published table.
 
 `DROP TABLE` prechecks the id-only runtime and catalog row, acquires
 `TableMetadata(X)` followed by `TableData(X)`, and then revalidates the target
 under those table-local locks before crossing the terminal lifecycle gate. A
 drop that waits for an already-admitted checkpoint publisher therefore does
 not delay CREATE or DROP for unrelated table ids.
+CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant
+waits for every transaction that successfully bound the table, but an older
+transaction that never touched it holds no metadata grant and does not delay
+DDL. After publication, such a transaction must pass visible/current
+validation on first touch and cannot newly bind a removed index or dropped
+table.
 Recovery, purge, and no-transaction catalog replay remain outside logical lock
 acquisition because they run at internal lifecycle boundaries rather than
 through foreground sessions and waiters. User-table freeze and checkpoint are
