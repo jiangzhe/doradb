@@ -2,8 +2,8 @@ use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
 use crate::error::RuntimeResult;
 use crate::id::{RowID, TrxID};
-use crate::index::btree::BTreeU64;
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeReplaceOrInsert, BTreeUpdate};
+use crate::index::btree::{BTreeKey, BTreeU64};
 use crate::index::index_stream::UniqueMemIndexCandidateStream;
 use crate::index::mem_index::{MemIndex, MemIndexCleanupScan, UniqueMemIndexCleanupSpec};
 use crate::index::util::Maskable;
@@ -200,13 +200,27 @@ impl<P: BufferPool> GuardedUniqueMemIndex<'_, '_, P> {
     ) -> RuntimeResult<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode(key);
+        self.insert_encoded_if_not_exists(&k, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+
+    /// Insert an already-encoded unique key unless another owner exists.
+    #[inline]
+    pub(crate) async fn insert_encoded_if_not_exists(
+        &self,
+        key: &BTreeKey,
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexInsert> {
+        debug_assert!(!row_id.is_deleted());
         Ok(
             match self
                 .index
                 .tree()
                 .insert::<BTreeU64>(
                     self.pool_guard,
-                    k.as_bytes(),
+                    key.as_bytes(),
                     BTreeU64::from(row_id),
                     merge_if_match_deleted,
                     ts,
@@ -409,6 +423,48 @@ mod tests {
                 .await;
                 run_test_suit_for_multi_key_unique_index(index.bind(&pool_guard)).await;
             }
+        });
+    }
+
+    #[test]
+    fn test_unique_mem_index_encoded_insertion_matches_logical_key() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let index = test_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![
+                    ValType::new(ValKind::VarByte, false),
+                    ValType::new(ValKind::I32, true),
+                ],
+            )
+            .await;
+            let guarded = index.bind(&pool_guard);
+            let key = [Val::from("encoded"), Val::Null];
+            let encoded_key = index.encoder().encode(&key);
+            let row_id = RowID::new(10);
+
+            assert_eq!(
+                guarded
+                    .insert_encoded_if_not_exists(&encoded_key, row_id, false, TrxID::new(101),)
+                    .await
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            );
+            assert_eq!(
+                guarded.lookup(&key, TrxID::new(102)).await.unwrap(),
+                Some((row_id, false))
+            );
+            assert_eq!(
+                guarded
+                    .insert_if_not_exists(&key, RowID::new(20), false, TrxID::new(103))
+                    .await
+                    .unwrap(),
+                IndexInsert::DuplicateKey(row_id, false)
+            );
         });
     }
 

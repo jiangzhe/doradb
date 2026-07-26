@@ -478,152 +478,252 @@ mod tests {
     }
 
     #[test]
-    fn stale_write_first_rejects_before_transaction_locks_or_binding() {
+    fn stale_write_first_rejects_both_index_kinds_before_locks_or_binding() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("admission_stale_write_first").await;
-            let table_id = table2(&engine).await;
-            let mut old_session = engine.new_session().unwrap();
-            let mut old_trx = old_session.begin_trx().unwrap();
-            let trx_owner = LockOwner::Transaction(old_trx.trx_id());
-            let metadata = LockResource::TableMetadata(table_id);
+            for (attributes, log_file_stem) in [
+                (IndexAttributes::UK, "admission_stale_write_first_unique"),
+                (
+                    IndexAttributes::empty(),
+                    "admission_stale_write_first_non_unique",
+                ),
+            ] {
+                let (_temp_dir, engine) = test_engine(log_file_stem).await;
+                let table_id = table2(&engine).await;
+                let mut old_session = engine.new_session().unwrap();
+                let mut old_trx = old_session.begin_trx().unwrap();
+                let trx_owner = LockOwner::Transaction(old_trx.trx_id());
+                let metadata = LockResource::TableMetadata(table_id);
 
-            let mut ddl_session = engine.new_session().unwrap();
-            ddl_session
-                .create_index(
-                    table_id,
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
-                )
-                .await
-                .unwrap();
+                let mut ddl_session = engine.new_session().unwrap();
+                ddl_session
+                    .create_index(table_id, IndexSpec::new(vec![IndexKey::new(1)], attributes))
+                    .await
+                    .unwrap();
 
-            let err = old_trx
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from(&b"old"[..])])
+                let err = old_trx
+                    .exec(async |stmt| {
+                        stmt.table_insert_mvcc(
+                            table_id,
+                            vec![Val::from(1i32), Val::from(&b"old"[..])],
+                        )
                         .await
                         .map(|_| ())
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
 
-            {
-                let checkout = old_trx.checkout().unwrap();
-                assert!(!checkout.inner().table_bindings.contains_key(&table_id));
-                assert!(
-                    !checkout
-                        .inner()
-                        .checked_lock_state()
-                        .cached_covers(metadata, LockMode::Shared)
-                );
-                assert!(
-                    !checkout.inner().checked_lock_state().cached_covers(
+                {
+                    let checkout = old_trx.checkout().unwrap();
+                    assert!(!checkout.inner().table_bindings.contains_key(&table_id));
+                    assert!(
+                        !checkout
+                            .inner()
+                            .checked_lock_state()
+                            .cached_covers(metadata, LockMode::Shared)
+                    );
+                    assert!(!checkout.inner().checked_lock_state().cached_covers(
                         LockResource::TableData(table_id),
                         LockMode::IntentExclusive
-                    )
+                    ));
+                }
+                let snapshot = debug_snapshot(engine.lock_manager());
+                assert!(
+                    snapshot
+                        .entries
+                        .iter()
+                        .all(|entry| entry.owner != trx_owner)
                 );
-            }
-            let snapshot = debug_snapshot(engine.lock_manager());
-            assert!(
-                snapshot
-                    .entries
-                    .iter()
-                    .all(|entry| entry.owner != trx_owner)
-            );
-            assert!(snapshot.entries.iter().all(|entry| {
-                entry.resource != metadata || !matches!(entry.owner, LockOwner::Statement(..))
-            }));
+                assert!(snapshot.entries.iter().all(|entry| {
+                    entry.resource != metadata || !matches!(entry.owner, LockOwner::Statement(..))
+                }));
 
-            old_trx.rollback().await.unwrap();
-            drop(ddl_session);
-            drop(old_session);
-            engine.shutdown().unwrap();
+                old_trx.rollback().await.unwrap();
+                drop(ddl_session);
+                drop(old_session);
+                engine.shutdown().unwrap();
+            }
         });
     }
 
     #[test]
-    fn read_intersection_binds_but_rejects_new_index_and_later_write() {
+    fn read_intersection_rejects_both_new_index_kinds_and_later_write() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("admission_read_intersection").await;
+            for (attributes, log_file_stem) in [
+                (IndexAttributes::UK, "admission_read_intersection_unique"),
+                (
+                    IndexAttributes::empty(),
+                    "admission_read_intersection_non_unique",
+                ),
+            ] {
+                let (_temp_dir, engine) = test_engine(log_file_stem).await;
+                let table_id = table2(&engine).await;
+                let mut old_session = engine.new_session().unwrap();
+                let mut old_trx = old_session.begin_trx().unwrap();
+                let trx_owner = LockOwner::Transaction(old_trx.trx_id());
+
+                let mut ddl_session = engine.new_session().unwrap();
+                let new_index_no = ddl_session
+                    .create_index(table_id, IndexSpec::new(vec![IndexKey::new(1)], attributes))
+                    .await
+                    .unwrap();
+
+                old_trx
+                    .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
+                    .await
+                    .unwrap();
+                let surviving = old_trx
+                    .exec(async |stmt| {
+                        stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(7i32)], &[0])
+                            .await
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(surviving, crate::row::ops::SelectMvcc::NotFound));
+
+                let new_index_err = old_trx
+                    .exec(async |stmt| {
+                        stmt.table_index_lookup_mvcc(
+                            table_id,
+                            usize::from(new_index_no),
+                            &[Val::from(&b"new"[..])],
+                            &[0],
+                        )
+                        .await
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    operation_error(&new_index_err),
+                    Some(OperationError::IndexNotFound)
+                );
+
+                let write_err = old_trx
+                    .exec(async |stmt| {
+                        stmt.table_insert_mvcc(
+                            table_id,
+                            vec![Val::from(8i32), Val::from(&b"stale"[..])],
+                        )
+                        .await
+                        .map(|_| ())
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    operation_error(&write_err),
+                    Some(OperationError::SchemaChanged)
+                );
+
+                {
+                    let checkout = old_trx.checkout().unwrap();
+                    assert!(checkout.inner().table_bindings.contains_key(&table_id));
+                    assert!(!checkout.inner().checked_lock_state().cached_covers(
+                        LockResource::TableData(table_id),
+                        LockMode::IntentExclusive
+                    ));
+                }
+                assert!(owner_has_grant(
+                    &engine,
+                    trx_owner,
+                    LockResource::TableMetadata(table_id),
+                    LockMode::Shared
+                ));
+
+                let mut fresh_session = engine.new_session().unwrap();
+                let mut fresh_trx = fresh_session.begin_trx().unwrap();
+                if attributes.contains(IndexAttributes::UK) {
+                    let fresh_result = fresh_trx
+                        .exec(async |stmt| {
+                            stmt.table_lookup_unique_mvcc(
+                                table_id,
+                                usize::from(new_index_no),
+                                &[Val::from(&b"new"[..])],
+                                &[0],
+                            )
+                            .await
+                        })
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        fresh_result,
+                        crate::row::ops::SelectMvcc::NotFound
+                    ));
+                } else {
+                    let fresh_result = fresh_trx
+                        .exec(async |stmt| {
+                            stmt.table_index_lookup_mvcc(
+                                table_id,
+                                usize::from(new_index_no),
+                                &[Val::from(&b"new"[..])],
+                                &[0],
+                            )
+                            .await
+                        })
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        fresh_result,
+                        crate::row::ops::ScanMvcc::Rows(rows) if rows.is_empty()
+                    ));
+                }
+                fresh_trx.commit().await.unwrap();
+
+                old_trx.rollback().await.unwrap();
+                drop(fresh_session);
+                drop(ddl_session);
+                drop(old_session);
+                engine.shutdown().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn bound_transaction_makes_create_index_metadata_lock_wait() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("admission_create_index_waits_for_binding").await;
             let table_id = table2(&engine).await;
-            let mut old_session = engine.new_session().unwrap();
-            let mut old_trx = old_session.begin_trx().unwrap();
-            let trx_owner = LockOwner::Transaction(old_trx.trx_id());
-
-            let mut ddl_session = engine.new_session().unwrap();
-            let new_index_no = ddl_session
-                .create_index(
-                    table_id,
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
-                )
-                .await
-                .unwrap();
-
-            old_trx
+            let metadata = LockResource::TableMetadata(table_id);
+            let mut bound_session = engine.new_session().unwrap();
+            let mut bound_trx = bound_session.begin_trx().unwrap();
+            bound_trx
                 .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
                 .await
                 .unwrap();
-            let surviving = old_trx
-                .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(table_id, 0, &[Val::from(7i32)], &[0])
-                        .await
-                })
-                .await
-                .unwrap();
-            assert!(matches!(surviving, crate::row::ops::SelectMvcc::NotFound));
 
-            let new_index_err = old_trx
-                .exec(async |stmt| {
-                    stmt.table_lookup_unique_mvcc(
-                        table_id,
-                        usize::from(new_index_no),
-                        &[Val::from(&b"new"[..])],
-                        &[0],
-                    )
-                    .await
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(
-                operation_error(&new_index_err),
-                Some(OperationError::IndexNotFound)
-            );
-
-            let write_err = old_trx
-                .exec(async |stmt| {
-                    stmt.table_insert_mvcc(
-                        table_id,
-                        vec![Val::from(8i32), Val::from(&b"stale"[..])],
-                    )
-                    .await
-                    .map(|_| ())
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(
-                operation_error(&write_err),
-                Some(OperationError::SchemaChanged)
-            );
-
-            {
-                let checkout = old_trx.checkout().unwrap();
-                assert!(checkout.inner().table_bindings.contains_key(&table_id));
-                assert!(
-                    !checkout.inner().checked_lock_state().cached_covers(
-                        LockResource::TableData(table_id),
-                        LockMode::IntentExclusive
-                    )
-                );
-            }
-            assert!(owner_has_grant(
-                &engine,
-                trx_owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Shared
+            let mut ddl_session = engine.new_session().unwrap();
+            let mut create = Box::pin(ddl_session.create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             ));
+            let mut metadata_waiting = false;
+            for _ in 0..10 {
+                assert!(matches!(
+                    futures::poll!(create.as_mut()),
+                    std::task::Poll::Pending
+                ));
+                metadata_waiting =
+                    debug_snapshot(engine.lock_manager())
+                        .entries
+                        .iter()
+                        .any(|entry| {
+                            entry.resource == metadata
+                                && entry.mode == LockMode::Exclusive
+                                && entry.state == LockDebugEntryState::Waiting
+                        });
+                if metadata_waiting {
+                    break;
+                }
+            }
+            assert!(
+                metadata_waiting,
+                "create index metadata lock waiter was not observed after bounded polling"
+            );
 
-            old_trx.rollback().await.unwrap();
+            bound_trx.commit().await.unwrap();
+            assert_eq!(create.await.unwrap(), 1);
+
             drop(ddl_session);
-            drop(old_session);
+            drop(bound_session);
             engine.shutdown().unwrap();
         });
     }

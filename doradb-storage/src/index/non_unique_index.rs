@@ -25,15 +25,6 @@ pub(crate) enum IndexMask {
     NotFound,
 }
 
-/// Initial delete-mask state for an exact non-unique MemIndex build entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NonUniqueIndexBuildState {
-    /// The exact candidate represents the current live row version.
-    Active,
-    /// The exact candidate exists only for retained MVCC history.
-    DeleteMasked,
-}
-
 /// Generic non-unique-index implementation backed by a generic B-Tree.
 pub(crate) struct NonUniqueMemIndex<P: 'static>(MemIndex<P>);
 
@@ -148,37 +139,6 @@ pub(crate) struct GuardedNonUniqueMemIndex<'a, 'g, P: 'static> {
 }
 
 impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
-    /// Insert one exact CREATE INDEX candidate with its initial mask state.
-    ///
-    /// This build-only path neither consults DiskTree nor creates foreground
-    /// index undo. Callers must normalize exact `(key, row_id)` candidates
-    /// before insertion.
-    #[inline]
-    pub(crate) async fn insert_encoded_build_candidate(
-        &self,
-        encoded_key: &BTreeKey,
-        row_id: RowID,
-        state: NonUniqueIndexBuildState,
-        ts: TrxID,
-    ) -> RuntimeResult<IndexInsert> {
-        debug_assert!(!row_id.is_deleted());
-        let value = match state {
-            NonUniqueIndexBuildState::Active => BTREE_BYTE_ZERO,
-            NonUniqueIndexBuildState::DeleteMasked => BTREE_BYTE_ZERO.deleted(),
-        };
-        Ok(
-            match self
-                .index
-                .tree()
-                .insert::<BTreeByte>(self.pool_guard, encoded_key.as_bytes(), value, false, ts)
-                .await?
-            {
-                BTreeInsert::Ok(merged) => IndexInsert::Ok(merged),
-                BTreeInsert::DuplicateKey(v) => IndexInsert::DuplicateKey(row_id, v.is_deleted()),
-            },
-        )
-    }
-
     /// Atomically mask one exact entry without a preliminary lookup.
     #[inline]
     pub(crate) async fn mask_if_present(
@@ -237,13 +197,29 @@ impl<P: BufferPool> GuardedNonUniqueMemIndex<'_, '_, P> {
     ) -> RuntimeResult<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         let k = self.index.encoder().encode_pair(key, Val::from(row_id));
+        self.insert_encoded_if_not_exists(&k, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+
+    /// Insert an already-encoded exact key unless it already exists.
+    ///
+    /// The key must include the RowID suffix used by non-unique indexes.
+    #[inline]
+    pub(crate) async fn insert_encoded_if_not_exists(
+        &self,
+        key: &BTreeKey,
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> RuntimeResult<IndexInsert> {
+        debug_assert!(!row_id.is_deleted());
         Ok(
             match self
                 .index
                 .tree()
                 .insert::<BTreeByte>(
                     self.pool_guard,
-                    k.as_bytes(),
+                    key.as_bytes(),
                     BTREE_BYTE_ZERO,
                     merge_if_match_deleted,
                     ts,
@@ -406,46 +382,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_candidate_preserves_initial_delete_mask() {
-        smol::block_on(async {
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
-            );
-            let pool_guard = (*pool).pool_guard();
-            let index = test_non_unique_mem_index(
-                &pool,
-                &pool_guard,
-                vec![ValType::new(ValKind::I32, false)],
-            )
-            .await;
-            let bound = index.bind(&pool_guard);
-            let key = [Val::from(7i32)];
-            let row_id = RowID::new(42);
-            let encoded_key = index.encoder().encode_pair(&key, Val::from(row_id));
-
-            assert!(matches!(
-                bound
-                    .insert_encoded_build_candidate(
-                        &encoded_key,
-                        row_id,
-                        NonUniqueIndexBuildState::DeleteMasked,
-                        TrxID::new(101),
-                    )
-                    .await
-                    .unwrap(),
-                IndexInsert::Ok(false)
-            ));
-            assert_eq!(
-                bound
-                    .lookup_unique(&key, row_id, TrxID::new(102))
-                    .await
-                    .unwrap(),
-                Some(false)
-            );
-        });
-    }
-
-    #[test]
     fn test_non_unique_index() {
         smol::block_on(async {
             let pool = QuiescentBox::new(
@@ -461,6 +397,60 @@ mod tests {
                 .await;
                 run_test_suit_for_non_unique_index(index.bind(&pool_guard)).await;
             }
+        })
+    }
+
+    #[test]
+    fn test_non_unique_mem_index_encoded_insertion_uses_exact_key() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 1024usize * 1024 * 1024).unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let index = test_non_unique_mem_index(
+                &pool,
+                &pool_guard,
+                vec![
+                    ValType::new(ValKind::VarByte, false),
+                    ValType::new(ValKind::I32, true),
+                ],
+            )
+            .await;
+            let guarded = index.bind(&pool_guard);
+            let key = [Val::from("encoded"), Val::Null];
+            let row_id1 = RowID::new(10);
+            let row_id2 = RowID::new(20);
+            let encoded_key1 = index.encoder().encode_pair(&key, Val::from(row_id1));
+            let encoded_key2 = index.encoder().encode_pair(&key, Val::from(row_id2));
+
+            assert_eq!(
+                guarded
+                    .insert_encoded_if_not_exists(&encoded_key1, row_id1, false, TrxID::new(101),)
+                    .await
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            );
+            assert_eq!(
+                guarded
+                    .insert_encoded_if_not_exists(&encoded_key2, row_id2, false, TrxID::new(102),)
+                    .await
+                    .unwrap(),
+                IndexInsert::Ok(false)
+            );
+            assert_eq!(
+                guarded
+                    .insert_if_not_exists(&key, row_id1, false, TrxID::new(103))
+                    .await
+                    .unwrap(),
+                IndexInsert::DuplicateKey(row_id1, false)
+            );
+            assert_eq!(
+                guarded
+                    .lookup_unique(&key, row_id2, TrxID::new(104))
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
         })
     }
 

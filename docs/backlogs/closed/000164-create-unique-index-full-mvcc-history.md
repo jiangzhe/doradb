@@ -121,3 +121,12 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: replaced
+- Detail: Replaced by current-state CREATE INDEX admission. Old transactions cannot admit a newly created unique index, and the visible/current metadata identity fence rejects stale writers before mutation, so full MVCC ownership reconstruction is unnecessary.
+- Closed By: backlog close
+- Reference: docs/tasks/000239-current-state-create-index-workaround-removal.md; GitHub issue #892; docs/rfcs/0024-versioned-metadata-immediate-retirement.md Phase 3
+
+- Closed At: 2026-07-26
