@@ -1573,16 +1573,23 @@ pub(crate) mod tests {
         page_id: BlockID,
         payload: &[u8],
     ) {
+        let global = global_readonly_pool_scope(frame_page_bytes(2));
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        write_payload_with_pool(fs, table_file, disk_pool.global_pool(), page_id, payload).await;
+    }
+
+    async fn write_payload_with_pool(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        readonly_pool: &QuiescentGuard<ReadonlyBufferPool>,
+        page_id: BlockID,
+        payload: &[u8],
+    ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
         bytes[..payload.len()].copy_from_slice(payload);
-        let global = global_readonly_pool_scope(frame_page_bytes(2));
-        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
-        let mutable = MutableTableFile::fork(
-            table_file,
-            fs.background_writes(),
-            disk_pool.global_pool().clone(),
-        );
+        let mutable =
+            MutableTableFile::fork(table_file, fs.background_writes(), readonly_pool.clone());
         mutable.write_block(page_id, buf).await.unwrap();
         drop(mutable);
     }
@@ -3238,15 +3245,17 @@ pub(crate) mod tests {
             let table_file = commit_table_file(&engine.inner().table_fs, table_file).await;
 
             let capacity = engine.inner().disk_pool.capacity();
+            let pool = engine.inner().disk_pool.clone_inner();
             let base_page_id = 7u64;
 
             // Prepare one more block than cache capacity to force drop-only eviction.
             for i in 0..=capacity {
                 let block_id = BlockID::from(base_page_id + i as u64);
                 let payload = format!("page-{i}");
-                write_payload(
+                write_payload_with_pool(
                     &engine.inner().table_fs,
                     &table_file,
+                    &pool,
                     block_id,
                     payload.as_bytes(),
                 )
@@ -3263,7 +3272,6 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            let pool = engine.inner().disk_pool.clone_inner();
             let pool_guard = pool.pool_guard();
 
             for i in 0..=capacity {
