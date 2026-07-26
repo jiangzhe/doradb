@@ -1,7 +1,7 @@
 ---
 id: 000241
 title: Make Dropped-Table Runtime Cleanup Assertion-Only
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-26
 github_issue: 898
 ---
@@ -43,11 +43,11 @@ Issue Labels:
 
 Source Backlogs:
 
-- `docs/backlogs/000166-replace-arc-probed-dropped-table-runtime-purge.md`
+- `docs/backlogs/closed/000166-replace-arc-probed-dropped-table-runtime-purge.md`
 
 Related Backlogs:
 
-- `docs/backlogs/000098-dropped-table-purge-retry-stall.md`
+- `docs/backlogs/closed/000098-dropped-table-purge-retry-stall.md`
 
 Related Designs And Tasks:
 
@@ -422,6 +422,44 @@ Follow `docs/process/unit-test.md`. Do not use retry-based test masking or
 wall-clock sleeps.
 
 ## Implementation Notes
+
+- Added private scoped session runtime access that acquires grouped metadata
+  S/data IS admission, resolves the live runtime only after admission, and
+  explicitly releases the table Arc before fresh logical-lock guards. Freeze,
+  checkpoint, row-page counting, MemIndex cleanup, and checkpoint retry
+  rechecks now share this boundary.
+- Split checkpoint retry into bounded active-root/frozen-page observations and
+  listener-only detached waits. The waits retain no table/layout/index runtime,
+  checkpoint attempt, page guard, or logical table lock, so DROP and
+  strict-horizon destruction can finish while a retry future remains parked.
+- Replaced replay-floor and index-DDL root-proof table clones with catalog-entry
+  borrows and copied facts. The holder audit also found and fixed rollback-local
+  `TableCache` lifetime: rollback now releases cached table/layout/index owners
+  before bindings and transaction locks.
+- Removed dropped-runtime restoration and stale-handle retry state. Eligible
+  runtimes transition one-way from Runtime to Floor, pass a table-id/count
+  uniqueness assertion, and are destroyed by value before the existing
+  checkpoint-gated file-cleanup policy.
+- Review removed initially planned explicit full-purge observations from
+  active-root and stable frozen-page retry waits. Both delays have causal
+  transaction completion wakes: an active-root delay requires an active
+  snapshot, while a stable cutoff comes from an ordered committed-image
+  handoff. Listener registration plus the final predicate recheck closes the
+  notification race without scheduling redundant full purge work. The generic
+  maintenance-boundary wait retains its explicit observation because it accepts
+  arbitrary timestamps without that causal guarantee.
+- Added deterministic DROP-drain, detached-wait, notification-race,
+  replay-floor ownership, and uniqueness-assertion coverage. The final
+  validation passed the branch-diff style audit for 10 Rust files,
+  `rtk cargo nextest run --workspace` with 1,546 tests, and the alternate
+  `libaio` suite with 1,471 tests. Active-root and both stable-cutoff waits also
+  passed focused 100-iteration stress runs without retries or sleeps.
+- Resolution archived source backlog 000166 as implemented. It first narrowed
+  backlog 000098 to retryable physical file deletion, then archived it as
+  `wontfix`: normal transaction/checkpoint purge wakes and checkpoint-absence
+  startup cleanup are the accepted progress mechanisms, without a dedicated
+  idle retry scheduler. No new deferred work or parent-RFC phase
+  synchronization was required.
 
 ## Impacts
 
