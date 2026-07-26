@@ -1,7 +1,7 @@
 ---
 id: 000240
 title: Validate Operational Reclamation and Recovery
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-26
 github_issue: 895
 ---
@@ -562,6 +562,58 @@ contract, stop and plan it separately rather than expanding this task.
 
 ## Implementation Notes
 
+- Strengthened metadata-history tests to retain resolved
+  `Arc<TableMetadata>` values across strict-horizon purge while proving table,
+  layout, and index owner counts do not change. Direct `UserTableEntry` tests
+  cover both legal orderings between logical tombstone/history removal and
+  dropped Runtime-to-Floor teardown, including the equality boundary and final
+  outer-entry emptiness.
+- Made runtime ownership explicit in index cleanup tests: historical metadata
+  does not retain removed executable indexes, while a pinned old runtime
+  layout does. Maintenance and later DDL were also exercised against the
+  installed current layout while predecessor metadata remained retained.
+- Added deterministic transaction-binding drainage coverage for DROP INDEX and
+  DROP TABLE, covering commit and rollback release. Untouched older
+  transactions now prove post-DDL first touch returns `SchemaChanged` without
+  installing a binding or retaining metadata/data locks.
+- Extended dropped-index persistence coverage through populated `DiskTree`
+  detachment, strict-horizon metadata purge, eligible checkpoint allocation-map
+  reclamation, and restart. The reclaimed allocation bit remains clear after
+  recovery even while an externally retained metadata Arc still names the
+  removed index.
+- Strengthened DROP TABLE integration and recovery validation. An external
+  table Arc can delay runtime destruction without reopening foreground access;
+  after it drains, the retained Floor and file remain catalog-checkpoint-gated.
+  Recovery now proves either one current CTS-zero live baseline with empty
+  volatile history or a committed-drop Floor with no logical history.
+- Expanded CREATE/DROP TABLE and CREATE/DROP INDEX failure-window assertions
+  over current metadata identity, history, layout/root/allocation state,
+  retired runtime, lifecycle, files, poison, and restart reconciliation.
+  Existing failpoints and storage hooks were sufficient; no production failure
+  branch or central observability surface was added.
+- Corrected live transaction documentation for positive transaction-lifetime
+  bindings, first-touch lock handoff, same-table DDL drainage, and CREATE TABLE
+  metadata X. Recovery documentation now states that current startup trusts
+  the checkpoint-persisted allocation map and leaves rebuild work to backlog
+  000108.
+- Review removed the initially added
+  `DroppedTableOperationalStateKind` inspection type. Cross-module tests now
+  distinguish Runtime, Floor, and absence through test assertions over the
+  existing retained-id and dropped-floor cleanup snapshots; history-local
+  tests match the private operational enum directly. Purge tests also require
+  `DroppedTableStarted` before accepting `CycleCompleted`, avoiding
+  correlation with an earlier cycle without adding a new event.
+- Validation passed with formatting, strict workspace Clippy, strict libaio
+  Clippy, the style audit across eight branch-diff Rust files, 1,539 workspace
+  tests on the default backend, 1,464 storage tests on libaio, 100/100 focused
+  stress iterations, `cargo deny`, and 94.42% focused line coverage across all
+  changed Rust files. The final inspection-type removal additionally passed
+  six focused tests on each backend and the storage test compile check.
+- Production ownership, horizon, durable formats, public APIs, and recovery
+  behavior remain unchanged. Replacing Arc-probed dropped-runtime cleanup with
+  explicit executable leases is intentionally deferred to
+  `docs/backlogs/000166-replace-arc-probed-dropped-table-runtime-purge.md`.
+
 ## Impacts
 
 | Area | Files and interfaces |
@@ -649,7 +701,11 @@ most narrow `#[cfg(test)]` observations.
 
 ## Open Questions
 
-None. Recovery-time allocation-map validation or rebuilding remains explicitly
-owned by `docs/backlogs/000108-recovery-table-file-alloc-map-rebuild.md`. Any
-new architectural question discovered during implementation must be separated
-from this validation task rather than resolved implicitly.
+No unresolved questions remain within this task's validation scope. Future
+architectural work remains tracked separately:
+
+- Recovery-time allocation-map validation or rebuilding remains owned by
+  `docs/backlogs/000108-recovery-table-file-alloc-map-rebuild.md`.
+- Replacing Arc-probed dropped-table runtime reclamation with an explicit
+  executable-runtime lease and owned cleanup job remains owned by
+  `docs/backlogs/000166-replace-arc-probed-dropped-table-runtime-purge.md`.
