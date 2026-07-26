@@ -132,6 +132,7 @@ trx.rollback().await?;
 
 - [Storage Architecture](./docs/architecture.md)
 - [Transaction System](./docs/transaction-system.md)
+- [Lock System](./docs/lock-system.md)
 - [Index Design](./docs/index-design.md)
 - [Block Index](./docs/block-index.md)
 - [Secondary Index](./docs/secondary-index.md)

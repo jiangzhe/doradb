@@ -132,7 +132,8 @@ RowID-based routing layer is documented in [Block Index Design](./block-index.md
 
 This system employs a unique persistence and recovery model (No-Steal / No-Force) that fundamentally differs from traditional ARIES algorithms (Steal / No-Force).
 
-See [Transaction System](./transaction-system.md).
+See [Transaction System](./transaction-system.md). Table-level metadata and
+data coordination is described in [Lock System](./lock-system.md).
 
 ## Logging, Checkpoint and Recovery
 
