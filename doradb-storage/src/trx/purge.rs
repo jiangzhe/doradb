@@ -5,7 +5,7 @@ use crate::catalog::{
 };
 use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
 use crate::file::table_file::OldRoot;
-use crate::id::TrxID;
+use crate::id::{TableID, TrxID};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::obs;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
@@ -579,7 +579,6 @@ impl TransactionSystem {
         guards: &PoolGuards,
         min_active_sts: TrxID,
     ) -> RuntimeResult<()> {
-        let mut stale_handles = Vec::new();
         for DroppedTableRuntime {
             table_id,
             drop_cts,
@@ -587,52 +586,22 @@ impl TransactionSystem {
             table,
         } in self.catalog.take_dropped_runtime_candidates(min_active_sts)
         {
-            match Arc::try_unwrap(table) {
-                Ok(table) => {
-                    // At this point purge has exclusive ownership of the dropped
-                    // runtime. Any destroy error is fatal to the storage runtime
-                    // and is converted to poison by the caller.
-                    table.destroy_dropped_runtime(guards).await?;
-                    // Runtime destruction leaves only the catalog `DroppedFloor`.
-                    // The queued item schedules checkpoint-gated file unlink;
-                    // redo retention still reads the catalog floor as truth.
-                    self.dropped_table_files
-                        .lock()
-                        .push_ordered(DroppedTableFileCleanup::new(
-                            table_id,
-                            drop_cts,
-                            replay_floor,
-                        ));
-                }
-                Err(table) => {
-                    // Stale external table handles are not fatal. Keep retrying
-                    // on future purge wakes until the last handle is released.
-                    stale_handles.push(DroppedTableRuntime {
-                        table_id,
-                        drop_cts,
-                        replay_floor,
-                        table,
-                    })
-                }
-            }
-        }
-
-        let stale_handle_count = stale_handles.len();
-        for (idx, item) in stale_handles.into_iter().enumerate() {
-            let table_id = item.table_id;
-            let drop_cts = item.drop_cts;
-            let replay_floor = item.replay_floor;
-            let strong_count = Arc::strong_count(&item.table);
-            let remaining_stale_handles = stale_handle_count - idx - 1;
-            self.catalog.restore_dropped_runtime(item);
-            obs::info!(
-                "event=dropped_table_gc component=purge action=restore_stale_runtime result=ok table_id={} drop_cts={} replay_floor={:?} strong_count={} remaining_stale_handles={}",
-                table_id,
-                drop_cts,
-                replay_floor,
-                strong_count,
-                remaining_stale_handles
-            );
+            // Every production strong holder drains before the strict active-STS
+            // horizon can detach this catalog-owned runtime.
+            let table = assert_unique_dropped_table_runtime(table_id, table);
+            // Any consuming destroy error is fatal to the storage runtime and
+            // is converted to poison by the caller.
+            table.destroy_dropped_runtime(guards).await?;
+            // Runtime destruction leaves only the catalog `DroppedFloor`. The
+            // queued item schedules checkpoint-gated file unlink; redo retention
+            // still reads the catalog floor as truth.
+            self.dropped_table_files
+                .lock()
+                .push_ordered(DroppedTableFileCleanup::new(
+                    table_id,
+                    drop_cts,
+                    replay_floor,
+                ));
         }
 
         self.process_dropped_table_file_deletes();
@@ -1308,6 +1277,16 @@ impl PurgeDispatcher {
     }
 }
 
+#[inline]
+fn assert_unique_dropped_table_runtime(table_id: TableID, table: Arc<Table>) -> Table {
+    Arc::try_unwrap(table).unwrap_or_else(|table| {
+        panic!(
+            "dropped-table runtime ownership invariant violated: table_id={table_id}, strong_count={}",
+            Arc::strong_count(&table)
+        )
+    })
+}
+
 /// Executes dispatched purge tasks until the task channel closes.
 #[inline]
 async fn purge_executor(
@@ -1462,6 +1441,7 @@ mod tests {
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus, SysTrxPayload};
     use crate::value::Val;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -1657,6 +1637,34 @@ mod tests {
             queued_cleanup_pairs(&queue),
             vec![(10, 102), (10, 103), (10, 105), (15, 101), (20, 104)]
         );
+    }
+
+    #[test]
+    fn test_dropped_table_runtime_uniqueness_assertion_reports_identity_and_count() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                purge_test_engine("drop_runtime_unique_assertion", 1, 1).await;
+            let table_id = table1(&engine).await;
+            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let expected_strong_count = Arc::strong_count(&table) + 1;
+
+            let panic = match catch_unwind(AssertUnwindSafe(|| {
+                assert_unique_dropped_table_runtime(table_id, Arc::clone(&table))
+            })) {
+                Err(panic) => panic,
+                Ok(_) => panic!("cloned table runtime must fail the uniqueness assertion"),
+            };
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            assert!(message.contains(&format!("table_id={table_id}")));
+            assert!(message.contains(&format!("strong_count={expected_strong_count}")));
+
+            drop(table);
+            engine.shutdown().unwrap();
+        });
     }
 
     #[test]

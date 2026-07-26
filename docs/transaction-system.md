@@ -276,14 +276,24 @@ readers remain admitted. A transaction that already holds `TableData(IX)` can
 convert to `X` only when conversion is immediately compatible; otherwise the
 operation returns `LockUpgradeWouldBlock` before invoking the callback.
 
-Idle-session freeze and user-table checkpoint calls acquire scoped
-`TableMetadata(S)` followed by `TableData(IS)` before entering the table-owned
-workflow. The scoped locks remain held through frozen-state publication or the
-checkpoint's final root/state publication and system-transaction completion.
-They preserve ordinary `IX` DML and explicit `S` table-reader concurrency while
-serializing page freeze/transition against full-table mutation `X`. Grants already
-covered by an explicit session lock are preserved when the maintenance call
-returns; only fresh maintenance grants are released.
+Finite session maintenance uses one scoped runtime admission:
+`TableMetadata(S)` followed by `TableData(IS)`, then current live-runtime
+resolution. Freeze, checkpoint, hot-row-page counting, secondary `MemIndex`
+cleanup, and each bounded checkpoint-retry recheck keep this scope through
+their last table/layout/index use. The table runtime owner is explicitly
+released before fresh lock guards. These calls preserve ordinary `IX` DML and
+explicit `S` table-reader concurrency while excluding same-table DROP and
+serializing page freeze/transition against full-table mutation `X`. Grants
+already covered by an explicit session lock are preserved when maintenance
+returns; only fresh grants are released.
+
+Checkpoint retry never keeps that scope across its indefinite sleep. One
+recheck registers the relevant lifecycle, transaction-terminal, GC-horizon,
+poison, and shutdown listeners and then verifies the predicate again. It
+returns only detached listener state, releases checkpoint attempts, page
+guards, table/layout owners, and logical locks, and then sleeps. This lets
+same-table DROP acquire metadata X and publish terminal lifecycle state; the
+listener carries that change into the next bounded recheck.
 
 `CREATE TABLE` allocates a distinct id and then holds `TableMetadata(X)` for
 that id while it creates the deterministic table file, stages catalog rows,
@@ -296,7 +306,9 @@ prevents first touch from observing a partially published table.
 `TableMetadata(X)` followed by `TableData(X)`, and then revalidates the target
 under those table-local locks before crossing the terminal lifecycle gate. A
 drop that waits for an already-admitted checkpoint publisher therefore does
-not delay CREATE or DROP for unrelated table ids.
+not delay CREATE or DROP for unrelated table ids. Transaction and statement
+rollback drop their operation-local table caches and transaction bindings
+before releasing the logical locks that authorize those runtime owners.
 CREATE INDEX and DROP INDEX also take same-table `TableMetadata(X)`. That grant
 waits for every transaction that successfully bound the table, but an older
 transaction that never touched it holds no metadata grant and does not delay
@@ -568,6 +580,14 @@ progress. At a genuinely newer horizon it becomes a complete horizon cycle.
 An explicit full observation likewise starts a complete cycle only for a newer
 horizon, while still performing its explicitly requested housekeeping at an
 unchanged horizon.
+
+After bucket cleanup, retired-page processing, retained-root release, and
+metadata-history work have completed, dropped-table GC applies the strict
+`drop_cts < Global_Min_STS` boundary. It detaches the catalog-owned runtime in
+one direction, asserts that the `Table` Arc is unique, and destroys it by
+value. A failed uniqueness assertion is a holder-discipline bug; the runtime
+is never restored or requeued. Table-file unlink remains a separate,
+catalog-checkpoint-gated operation whose I/O failure is retryable.
 
 Purge publishes two monotonic coordination boundaries in order. First it
 publishes the freshly observed oldest-active-snapshot horizon, which is

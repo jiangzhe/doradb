@@ -274,7 +274,7 @@ impl TableHistoryEntry {
 
 /// Operational state retained independently from authoritative logical history.
 pub(crate) enum DroppedTableOperationalState {
-    /// Runtime retained until all stale runtime handles drain.
+    /// Runtime retained until the strict active-STS horizon permits one-way detach.
     Runtime {
         table: Arc<Table>,
         drop_cts: TrxID,
@@ -346,6 +346,15 @@ impl UserTableEntry {
             .and_then(|current| current.live_table().map(Arc::clone))
     }
 
+    /// Borrows the current foreground runtime while its catalog entry is guarded.
+    #[inline]
+    pub(crate) fn current_live_table_ref(&self) -> Option<&Table> {
+        self.history
+            .as_ref()
+            .and_then(|history| history.current.live_table())
+            .map(Arc::as_ref)
+    }
+
     /// Returns a live or retained dropped runtime for purge-owned physical work.
     #[inline]
     pub(crate) fn runtime_for_purge(&self) -> Option<Arc<Table>> {
@@ -415,11 +424,10 @@ impl UserTableEntry {
     pub(crate) fn live_replay_floor(
         &self,
         checkpointed_silent: Option<TableRedoReplayFloor>,
-    ) -> Option<(Arc<Table>, TableRedoReplayFloor)> {
-        self.current_live_table().map(|table| {
+    ) -> Option<TableRedoReplayFloor> {
+        self.current_live_table_ref().map(|table| {
             let root_floor = table.redo_replay_floor_snapshot();
-            let floor = super::effective_table_redo_replay_floor(root_floor, checkpointed_silent);
-            (table, floor)
+            super::effective_table_redo_replay_floor(root_floor, checkpointed_silent)
         })
     }
 
@@ -466,35 +474,6 @@ impl UserTableEntry {
         });
         self.assert_valid();
         Some(result)
-    }
-
-    /// Restores one exact detached runtime over its temporary floor.
-    #[inline]
-    pub(crate) fn restore_dropped_runtime(
-        &mut self,
-        table: Arc<Table>,
-        drop_cts: TrxID,
-        replay_floor: TableRedoReplayFloor,
-    ) -> bool {
-        match &self.dropped {
-            Some(DroppedTableOperationalState::Floor {
-                drop_cts: observed_drop_cts,
-                replay_floor: observed_replay_floor,
-            }) if *observed_drop_cts == drop_cts && *observed_replay_floor == replay_floor => {
-                self.dropped = Some(DroppedTableOperationalState::Runtime {
-                    table,
-                    drop_cts,
-                    replay_floor,
-                });
-                self.assert_valid();
-                true
-            }
-            Some(
-                DroppedTableOperationalState::Runtime { .. }
-                | DroppedTableOperationalState::Floor { .. },
-            )
-            | None => false,
-        }
     }
 
     /// Returns a retained floor eligible for file-cleanup queue seeding.
@@ -792,6 +771,10 @@ mod tests {
             assert_eq!(Arc::strong_count(&layout), layout_owners);
             assert_eq!(Arc::strong_count(&index), index_owners);
 
+            drop(initial);
+            drop(after_create);
+            drop(after_drop_index);
+            drop(table);
             let mut drop_reader_session = engine.new_session().unwrap();
             let drop_reader = drop_reader_session.begin_trx().unwrap();
             let drop_reader_sts = drop_reader.sts();

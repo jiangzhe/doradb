@@ -1395,6 +1395,7 @@ impl TransactionSystem {
             .await
         {
             entry.publish_state(TrxEntryState::Failed);
+            drop(table_cache);
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
@@ -1414,6 +1415,7 @@ impl TransactionSystem {
             .await
         {
             entry.publish_state(TrxEntryState::Failed);
+            drop(table_cache);
             let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
             self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
@@ -1427,6 +1429,9 @@ impl TransactionSystem {
             let error = self.poisoner.poison(report);
             return Err(error.into_report());
         }
+        // Rollback access can pin table/layout/index state in its operation
+        // cache. Release those owners before bindings and transaction locks.
+        drop(table_cache);
         inner.effects_mut().clear_for_rollback();
         inner.clear_table_bindings();
         self.record_rollback_for_purge(gc_no, sts);

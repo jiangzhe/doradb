@@ -128,9 +128,13 @@ Normal scheduling pressure is reported separately from storage failure:
 Neither delay applies checkpoint state or moves a page into `TRANSITION`.
 `wait_for_checkpoint_retry` observes the exact root, page blockers, GC horizon,
 table lifecycle, storage poison, and shutdown predicates before returning.
-Completion only means a retry may be useful. `checkpoint_table_with_wait`
-retries delayed outcomes and returns published, cancelled, or error outcomes
-unchanged.
+Each observation holds scoped table admission only while registering listeners
+and rechecking its predicate. A blocked observation restores any claimed
+checkpoint attempt and returns listener-only wait state, so the subsequent
+sleep owns no table runtime, layout, frozen page, page guard, checkpoint
+attempt, or logical table lock. Completion only means a retry may be useful.
+`checkpoint_table_with_wait` retries delayed outcomes and returns published,
+cancelled, or error outcomes unchanged.
 
 ### Root Liveness and Reclamation
 

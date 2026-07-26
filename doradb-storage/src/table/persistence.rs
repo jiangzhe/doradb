@@ -31,6 +31,7 @@ use crate::table::{
 use crate::trx::RetiredRowPageBatch;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
+use event_listener::EventListener;
 use futures::future::select_all;
 use std::collections::BTreeSet;
 use std::result::Result as StdResult;
@@ -94,6 +95,27 @@ pub enum CheckpointDelayReason {
         /// Whether an unresolved transaction status blocks the page.
         unresolved_status: bool,
     },
+}
+
+/// Result of one bounded checkpoint-retry predicate observation.
+pub(crate) enum CheckpointRetryObservation {
+    /// The original delay predicate is satisfied or obsolete.
+    Ready,
+    /// The predicate remains blocked and can wait without retaining table state.
+    Wait(DetachedCheckpointRetryWait),
+}
+
+/// Notification state detached from all table-owned runtime and proof objects.
+pub(crate) struct DetachedCheckpointRetryWait {
+    listeners: Vec<EventListener>,
+}
+
+impl DetachedCheckpointRetryWait {
+    /// Waits for any predicate, lifecycle, poison, or shutdown notification.
+    #[inline]
+    pub(crate) async fn wait(self) {
+        select_all(self.listeners).await;
+    }
 }
 
 /// Owns one table checkpoint attempt and its reversible-to-fatal boundary.
@@ -1466,12 +1488,12 @@ impl Table {
         })
     }
 
-    /// Wait until the predicate represented by a checkpoint delay may be retried.
-    pub(crate) async fn wait_for_checkpoint_retry(
+    /// Observes one checkpoint retry predicate and returns runtime-free wait state.
+    pub(crate) async fn checkpoint_retry_observation(
         &self,
         session: &SessionPin,
         reason: CheckpointDelayReason,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<CheckpointRetryObservation> {
         match reason {
             CheckpointDelayReason::ActiveRoot {
                 table_id,
@@ -1479,163 +1501,204 @@ impl Table {
                 ..
             } => {
                 debug_assert_eq!(table_id, self.table_id());
-                self.wait_for_active_root_retry(session, effective_ts).await
+                self.observe_active_root_retry(session, effective_ts).await
             }
             CheckpointDelayReason::FrozenPageCutoff {
                 table_id, page_id, ..
             } => {
                 debug_assert_eq!(table_id, self.table_id());
-                self.wait_for_frozen_page_retry(session, page_id).await
+                self.observe_frozen_page_retry(session, page_id).await
             }
         }
     }
 
-    async fn wait_for_active_root_retry(
+    async fn observe_active_root_retry(
         &self,
         session: &SessionPin,
         effective_ts: TrxID,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<CheckpointRetryObservation> {
         let trx_sys = &session.engine.trx_sys;
-        loop {
-            ensure_maintenance_wait_running(session, "wait for active-root checkpoint retry")?;
-            if self.lifecycle.inspect_terminal() != TableTerminal::Live
-                || self.file().active_root_unchecked().effective_ts() != effective_ts
-                || trx_sys.published_gc_horizon() > effective_ts
-            {
-                return Ok(());
-            }
-
-            trx_sys.request_purge_observation();
-            let horizon_listener = trx_sys.gc_horizon_listener();
-            let lifecycle_listener = self.lifecycle.listener();
-            let poison_listener = session.engine.poisoner.listener();
-            let shutdown_listener = session.engine.shutdown_listener();
-
-            ensure_maintenance_wait_running(session, "wait for active-root checkpoint retry")?;
-            if self.lifecycle.inspect_terminal() != TableTerminal::Live
-                || self.file().active_root_unchecked().effective_ts() != effective_ts
-                || trx_sys.published_gc_horizon() > effective_ts
-            {
-                return Ok(());
-            }
-            select_all(vec![
-                horizon_listener,
-                lifecycle_listener,
-                poison_listener,
-                shutdown_listener,
-            ])
-            .await;
+        ensure_maintenance_wait_running(session, "observe active-root checkpoint retry")?;
+        if self.active_root_retry_ready(effective_ts, trx_sys.published_gc_horizon()) {
+            return Ok(CheckpointRetryObservation::Ready);
         }
+
+        let listeners = vec![
+            trx_sys.gc_horizon_listener(),
+            self.lifecycle.listener(),
+            session.engine.poisoner.listener(),
+            session.engine.shutdown_listener(),
+        ];
+        #[cfg(test)]
+        test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
+
+        ensure_maintenance_wait_running(session, "observe active-root checkpoint retry")?;
+        if self.active_root_retry_ready(effective_ts, trx_sys.published_gc_horizon()) {
+            return Ok(CheckpointRetryObservation::Ready);
+        }
+        Ok(CheckpointRetryObservation::Wait(
+            DetachedCheckpointRetryWait { listeners },
+        ))
     }
 
-    async fn wait_for_frozen_page_retry(
+    #[inline]
+    fn active_root_retry_ready(&self, effective_ts: TrxID, gc_horizon: TrxID) -> bool {
+        self.lifecycle.inspect_terminal() != TableTerminal::Live
+            || self.file().active_root_unchecked().effective_ts() != effective_ts
+            || gc_horizon > effective_ts
+    }
+
+    async fn observe_frozen_page_retry(
         &self,
         session: &SessionPin,
         page_id: PageID,
-    ) -> RuntimeOrFatalResult<()> {
-        ensure_maintenance_wait_running(session, "wait for frozen-page checkpoint retry")?;
+    ) -> RuntimeOrFatalResult<CheckpointRetryObservation> {
+        ensure_maintenance_wait_running(session, "observe frozen-page checkpoint retry")?;
         let mut attempt = match self.checkpoint_workflow.begin_checkpoint(&self.lifecycle) {
             Ok(attempt) => attempt,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(CheckpointRetryObservation::Ready),
         };
-        let Some(batch) = attempt.batch_mut() else {
-            return Ok(());
+        let Some(batch) = attempt.batch() else {
+            return Ok(CheckpointRetryObservation::Ready);
         };
         if batch.table_id != self.table_id() {
-            return Ok(());
+            return Ok(CheckpointRetryObservation::Ready);
         }
         let Some(page_idx) = batch.pages.iter().position(|page| page.page_id == page_id) else {
-            return Ok(());
+            return Ok(CheckpointRetryObservation::Ready);
         };
-        let page_info = batch.pages[page_idx];
-        let guards = session.pool_guards();
-        let mut page_guards = self
-            .load_frozen_pages_for_transition(&guards, &[page_info])
-            .await?;
-        let page_guard = page_guards
-            .pop()
-            .expect("one-page frozen readiness load must return one page");
         let trx_sys = &session.engine.trx_sys;
-        let mut reanalyze = matches!(
-            batch.validation[page_idx],
-            FrozenPageValidationState::Unchecked
-        );
 
         loop {
-            ensure_maintenance_wait_running(session, "wait for frozen-page checkpoint retry")?;
+            ensure_maintenance_wait_running(session, "observe frozen-page checkpoint retry")?;
             if self.lifecycle.inspect_terminal() != TableTerminal::Live {
-                return Ok(());
-            }
-            if reanalyze {
-                let cutoff_ts = trx_sys.published_gc_horizon();
-                self.refresh_frozen_page_readiness(&page_guard, batch, page_idx, cutoff_ts);
-                reanalyze = false;
+                return Ok(CheckpointRetryObservation::Ready);
             }
 
-            match batch.validation[page_idx] {
+            match attempt
+                .batch()
+                .map(|batch| batch.validation[page_idx])
+                .unwrap_or(FrozenPageValidationState::Unchecked)
+            {
                 FrozenPageValidationState::Unchecked => {
-                    reanalyze = true;
+                    self.reanalyze_frozen_page_retry(session, &mut attempt, page_idx)
+                        .await?;
                 }
                 FrozenPageValidationState::Blocked { .. } => {
-                    let blockers = batch.blockers_for(page_id).expect(
-                        "blocked frozen page must retain its complete transaction blocker set",
-                    );
-                    let mut listeners = Vec::with_capacity(blockers.len() + 3);
-                    for blocker in blockers {
-                        if let Some(listener) = blocker.terminal_listener() {
-                            listeners.push(listener);
-                        }
-                    }
-                    if listeners.is_empty() {
-                        reanalyze = true;
+                    let batch = attempt.batch().unwrap_or_else(|| {
+                        panic!(
+                            "frozen-page retry invariant violated: admitted frozen attempt lost batch, table_id={}, page_id={page_id}",
+                            self.table_id()
+                        )
+                    });
+                    let blockers = batch.blockers_for(page_id).unwrap_or_else(|| {
+                        panic!(
+                            "frozen-page retry invariant violated: blocked page lost transaction blockers, table_id={}, page_id={page_id}",
+                            self.table_id()
+                        )
+                    });
+                    let mut listeners = blockers
+                        .iter()
+                        .filter_map(|blocker| blocker.terminal_listener())
+                        .collect::<Vec<_>>();
+                    if blockers.iter().all(|blocker| blocker.terminal()) || listeners.is_empty() {
+                        self.reanalyze_frozen_page_retry(session, &mut attempt, page_idx)
+                            .await?;
                         continue;
                     }
                     listeners.push(self.lifecycle.listener());
                     listeners.push(session.engine.poisoner.listener());
                     listeners.push(session.engine.shutdown_listener());
+                    #[cfg(test)]
+                    test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
 
                     ensure_maintenance_wait_running(
                         session,
-                        "wait for frozen-page checkpoint retry",
+                        "observe frozen-page checkpoint retry",
                     )?;
                     if self.lifecycle.inspect_terminal() != TableTerminal::Live {
-                        return Ok(());
+                        return Ok(CheckpointRetryObservation::Ready);
                     }
                     if blockers.iter().all(|blocker| blocker.terminal()) {
-                        reanalyze = true;
+                        self.reanalyze_frozen_page_retry(session, &mut attempt, page_idx)
+                            .await?;
                         continue;
                     }
-                    select_all(listeners).await;
+                    return Ok(CheckpointRetryObservation::Wait(
+                        DetachedCheckpointRetryWait { listeners },
+                    ));
                 }
                 FrozenPageValidationState::Stable { required_cutoff_ts } => {
                     let cutoff_ts = trx_sys.published_gc_horizon();
                     if required_cutoff_ts.is_none_or(|required| required <= cutoff_ts) {
-                        return Ok(());
+                        return Ok(CheckpointRetryObservation::Ready);
                     }
 
-                    trx_sys.request_purge_observation();
                     let listeners = vec![
                         trx_sys.gc_horizon_listener(),
                         self.lifecycle.listener(),
                         session.engine.poisoner.listener(),
                         session.engine.shutdown_listener(),
                     ];
+                    #[cfg(test)]
+                    test_hooks::run_test_checkpoint_retry_after_listener_registration_hook().await;
                     ensure_maintenance_wait_running(
                         session,
-                        "wait for frozen-page checkpoint retry",
+                        "observe frozen-page checkpoint retry",
                     )?;
                     if self.lifecycle.inspect_terminal() != TableTerminal::Live {
-                        return Ok(());
+                        return Ok(CheckpointRetryObservation::Ready);
                     }
                     if required_cutoff_ts
                         .is_some_and(|required| trx_sys.published_gc_horizon() >= required)
                     {
                         continue;
                     }
-                    select_all(listeners).await;
+                    return Ok(CheckpointRetryObservation::Wait(
+                        DetachedCheckpointRetryWait { listeners },
+                    ));
                 }
             }
         }
+    }
+
+    async fn reanalyze_frozen_page_retry(
+        &self,
+        session: &SessionPin,
+        attempt: &mut CheckpointAttempt<'_>,
+        page_idx: usize,
+    ) -> RuntimeOrFatalResult<()> {
+        let page_info = attempt
+            .batch()
+            .and_then(|batch| batch.pages.get(page_idx))
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "frozen-page retry invariant violated: page position disappeared from admitted batch, table_id={}, page_idx={page_idx}",
+                    self.table_id()
+                )
+            });
+        let guards = session.pool_guards();
+        let mut page_guards = self
+            .load_frozen_pages_for_transition(&guards, &[page_info])
+            .await?;
+        let page_guard = page_guards.pop().unwrap_or_else(|| {
+            panic!(
+                "frozen-page retry invariant violated: one-page load returned no guard, table_id={}, page_id={}",
+                self.table_id(),
+                page_info.page_id
+            )
+        });
+        let cutoff_ts = session.engine.trx_sys.published_gc_horizon();
+        let batch = attempt.batch_mut().unwrap_or_else(|| {
+            panic!(
+                "frozen-page retry invariant violated: admitted frozen attempt lost batch during analysis, table_id={}, page_id={}",
+                self.table_id(),
+                page_info.page_id
+            )
+        });
+        self.refresh_frozen_page_readiness(&page_guard, batch, page_idx, cutoff_ts);
+        Ok(())
     }
 
     /// Claim and freeze a contiguous hot-page prefix up to the requested row budget.
@@ -1967,6 +2030,8 @@ mod tests {
                 const { RefCell::new(None) };
             static TEST_CHECKPOINT_AFTER_PUBLISH_ADMISSION_HOOK: RefCell<Option<TableHook>> =
                 const { RefCell::new(None) };
+            static TEST_CHECKPOINT_RETRY_AFTER_LISTENER_REGISTRATION_HOOK:
+                RefCell<Option<TableHook>> = const { RefCell::new(None) };
             static TEST_SILENT_WATERMARK_MUTATION_HOOK: RefCell<Option<FallibleTableHook>> =
                 const { RefCell::new(None) };
         }
@@ -2078,6 +2143,22 @@ mod tests {
             });
         }
 
+        pub(crate) fn set_test_checkpoint_retry_after_listener_registration_hook<F, Fut>(hook: F)
+        where
+            F: FnOnce() -> Fut + 'static,
+            Fut: Future<Output = ()> + 'static,
+        {
+            TEST_CHECKPOINT_RETRY_AFTER_LISTENER_REGISTRATION_HOOK.with(|slot| {
+                let old = slot
+                    .borrow_mut()
+                    .replace(Box::new(move || Box::pin(hook())));
+                assert!(
+                    old.is_none(),
+                    "checkpoint retry listener-registration hook already installed"
+                );
+            });
+        }
+
         pub(crate) fn set_test_silent_watermark_mutation_hook<F, Fut>(hook: F)
         where
             F: FnOnce() -> Fut + 'static,
@@ -2109,6 +2190,14 @@ mod tests {
             }
         }
 
+        pub(crate) async fn run_test_checkpoint_retry_after_listener_registration_hook() {
+            let hook = TEST_CHECKPOINT_RETRY_AFTER_LISTENER_REGISTRATION_HOOK
+                .with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+
         pub(crate) async fn run_test_silent_watermark_mutation_hook() -> RuntimeResult<()> {
             let hook = TEST_SILENT_WATERMARK_MUTATION_HOOK.with(|slot| slot.borrow_mut().take());
             match hook {
@@ -2128,6 +2217,7 @@ mod tests {
     use super::*;
     use crate::buffer::BufferPool;
     use crate::buffer::guard::PageSharedGuard;
+    use crate::catalog::tests::wait_for_dropped_table_floor;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, CurrentTableState, ResolvedVisibleTableMetadata, TableSpec,
     };
@@ -2151,6 +2241,7 @@ mod tests {
     use crate::table::persistence::test_hooks::{
         ForceCheckpointCommitErrorGuard, ForcePostPublishCheckpointErrorGuard,
         set_test_checkpoint_after_publish_admission_hook, set_test_checkpoint_after_trx_start_hook,
+        set_test_checkpoint_retry_after_listener_registration_hook,
         set_test_force_secondary_sidecar_error, set_test_freeze_after_loading_hook,
         set_test_silent_watermark_mutation_hook,
     };
@@ -2389,11 +2480,12 @@ mod tests {
                 panic!("admitted checkpoint should publish: {outcome:?}");
             };
             assert_eq!(silent, expected_silent);
+            drop(table);
             drop_table.await.unwrap();
             redo_cts
         };
         assert!(checkpoint_redo_cts < drop_session.last_cts());
-        assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
+        assert!(engine.catalog().get_table_now(table_id).is_none());
     }
 
     #[test]
@@ -4446,6 +4538,88 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_retry_notification_between_registration_and_recheck_is_not_lost() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "retry_recheck_race").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut checkpoint_session, 0, 4, "retry-race").await;
+            assert_freeze_created(
+                checkpoint_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            assert_checkpoint_published(&mut checkpoint_session, table_id).await;
+            let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("second checkpoint should observe an active root: {outcome:?}");
+            };
+            let CheckpointDelayReason::ActiveRoot { effective_ts, .. } = reason else {
+                panic!("expected active-root delay: {reason:?}");
+            };
+
+            let hook_ran = Rc::new(Cell::new(false));
+            let hook_flag = Rc::clone(&hook_ran);
+            let trx_sys = engine.inner().trx_sys.clone();
+            set_test_checkpoint_retry_after_listener_registration_hook(move || async move {
+                hook_flag.set(true);
+                assert!(trx_sys.publish_gc_horizon(effective_ts.saturating_add(1)));
+            });
+            checkpoint_session
+                .wait_for_checkpoint_retry(reason)
+                .await
+                .unwrap();
+            assert!(hook_ran.get());
+
+            reader.rollback().await.unwrap();
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_detached_active_root_waiter_does_not_block_drop_or_runtime_gc() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "detached_root_wait").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut checkpoint_session, 0, 4, "detached-root").await;
+            assert_freeze_created(
+                checkpoint_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            assert_checkpoint_published(&mut checkpoint_session, table_id).await;
+            let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("second checkpoint should observe an active root: {outcome:?}");
+            };
+            assert!(matches!(reason, CheckpointDelayReason::ActiveRoot { .. }));
+
+            let mut wait = Box::pin(checkpoint_session.wait_for_checkpoint_retry(reason));
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            reader.rollback().await.unwrap();
+
+            let mut drop_session = engine.new_session().unwrap();
+            drop_session.drop_table(table_id).await.unwrap();
+            wait_for_dropped_table_floor(&engine, table_id).await;
+
+            wait.await.unwrap();
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
     fn test_checkpoint_reachability_reclaims_obsolete_column_index_root() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -4771,7 +4945,7 @@ mod tests {
             assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
             let mut wait = Box::pin(checkpoint_session.wait_for_checkpoint_retry(reason));
             assert!(futures::poll!(wait.as_mut()).is_pending());
-            assert_eq!(table.checkpoint_workflow.state_name(), "Checkpointing");
+            assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let mut drop_session = engine.new_session().unwrap();
@@ -4779,8 +4953,8 @@ mod tests {
             wait.await.unwrap();
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
             assert_checkpoint_workflow_closed(&table);
-            horizon.rollback().await.unwrap();
             drop(table);
+            horizon.rollback().await.unwrap();
 
             engine.inner().trx_sys.request_dropped_table_purge();
             engine
@@ -4789,6 +4963,70 @@ mod tests {
                 .await
                 .unwrap();
             wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn test_detached_frozen_page_waiter_does_not_block_drop_or_runtime_gc() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "detached-frozen-page-wait").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut setup = engine.new_session().unwrap();
+            insert_rows(table_id, &mut setup, 1, 1, "before").await;
+            let active_root_effective_ts = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .effective_ts();
+            setup
+                .wait_for_gc_horizon_after(active_root_effective_ts)
+                .await
+                .unwrap();
+
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer = writer_session.begin_trx().unwrap();
+            let update = trx_update_row_by_id(
+                &mut writer,
+                table_id,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("after"),
+                }],
+            )
+            .await
+            .unwrap();
+            assert!(matches!(update, UpdateMvcc::Updated(_)));
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            assert_freeze_created(
+                checkpoint_session
+                    .freeze_table(table_id, usize::MAX)
+                    .await
+                    .unwrap(),
+            );
+            let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("checkpoint should wait for the unresolved frozen image: {outcome:?}");
+            };
+            assert!(matches!(
+                reason,
+                CheckpointDelayReason::FrozenPageCutoff {
+                    unresolved_status: true,
+                    ..
+                }
+            ));
+
+            let mut wait = Box::pin(checkpoint_session.wait_for_checkpoint_retry(reason));
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            writer.rollback().await.unwrap();
+
+            let mut drop_session = engine.new_session().unwrap();
+            drop_session.drop_table(table_id).await.unwrap();
+            wait_for_dropped_table_floor(&engine, table_id).await;
+
+            wait.await.unwrap();
+            engine.shutdown().unwrap();
         });
     }
 
@@ -4881,11 +5119,12 @@ mod tests {
                 let CheckpointOutcome::Published { redo_cts, .. } = outcome else {
                     panic!("admitted checkpoint should publish: {outcome:?}");
                 };
+                drop(table);
                 drop_table.as_mut().await.unwrap();
                 redo_cts
             };
             assert!(checkpoint_redo_cts < drop_session.last_cts());
-            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
+            assert!(engine.catalog().get_table_now(table_id).is_none());
         });
     }
 
@@ -6288,7 +6527,7 @@ mod tests {
             let mut cancelled_wait = Box::pin(checkpoint_session.wait_for_checkpoint_retry(reason));
             assert!(futures::poll!(cancelled_wait.as_mut()).is_pending());
             assert_eq!(analysis_count.get(), 1);
-            assert_eq!(table.checkpoint_workflow.state_name(), "Checkpointing");
+            assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
             drop(cancelled_wait);
             assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
             assert_eq!(
