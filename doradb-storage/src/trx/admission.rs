@@ -695,19 +695,28 @@ mod tests {
                 table_id,
                 IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             ));
-            assert!(matches!(
-                futures::poll!(create.as_mut()),
-                std::task::Poll::Pending
-            ));
+            let mut metadata_waiting = false;
+            for _ in 0..10 {
+                assert!(matches!(
+                    futures::poll!(create.as_mut()),
+                    std::task::Poll::Pending
+                ));
+                metadata_waiting =
+                    debug_snapshot(engine.lock_manager())
+                        .entries
+                        .iter()
+                        .any(|entry| {
+                            entry.resource == metadata
+                                && entry.mode == LockMode::Exclusive
+                                && entry.state == LockDebugEntryState::Waiting
+                        });
+                if metadata_waiting {
+                    break;
+                }
+            }
             assert!(
-                debug_snapshot(engine.lock_manager())
-                    .entries
-                    .iter()
-                    .any(|entry| {
-                        entry.resource == metadata
-                            && entry.mode == LockMode::Exclusive
-                            && entry.state == LockDebugEntryState::Waiting
-                    })
+                metadata_waiting,
+                "create index metadata lock waiter was not observed after bounded polling"
             );
 
             bound_trx.commit().await.unwrap();

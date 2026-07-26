@@ -107,3 +107,12 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: replaced
+- Detail: Replaced because task 000239 removes the build-created historical non-unique candidates and their delete-masked build state. With no CREATE INDEX history candidates to own, the proposed deterministic reclamation lifecycle is no longer needed.
+- Closed By: backlog close
+- Reference: docs/tasks/000239-current-state-create-index-workaround-removal.md; GitHub issue #892; docs/rfcs/0024-versioned-metadata-immediate-retirement.md Phase 3
+
+- Closed At: 2026-07-26

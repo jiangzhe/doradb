@@ -1,7 +1,7 @@
 ---
 id: 000239
 title: Use Current State for CREATE INDEX and Remove History Workarounds
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-26
 github_issue: 892
 ---
@@ -604,6 +604,44 @@ No nextest configuration, timeout, retry, or hang-detection change belongs in
 this task.
 
 ## Implementation Notes
+
+- Unified unique and non-unique creation around one current-state collector.
+  Included cold and hot rows are encoded once into first-class `BTreeKey`
+  entries: unique keys contain the logical key, while non-unique keys contain
+  the exact logical-key/RowID pair. Cold entries are sorted for DiskTree
+  construction; only unique creation sorts hot entries and performs explicit
+  duplicate validation.
+- Added encoded guarded insertion paths for both MemIndex kinds and made the
+  existing logical-key paths encode and delegate to them. Non-unique creation
+  deliberately performs no separate exact-key duplicate scan: exact-key
+  uniqueness follows from non-overlapping cold RowID ranges, strictly ordered
+  row IDs, and RowID-bearing encoding, while ordinary insertion retains its
+  invariant checks.
+- Removed the non-unique history cutoff, cold historical dispositions, hot
+  undo-chain collection and normalization, delete-masked build insertion,
+  build-state/candidate types, table-access bridge, exports, and their
+  dedicated tests. General row-MVCC reconstruction, candidate recheck,
+  foreground index maintenance, checkpoint, purge, and cleanup paths were
+  unchanged.
+- Added direct current-state coverage for hot key replacement, cold-to-hot
+  replacement, unique owner replacement, canonical-key validation, encoded
+  insertion parity, and both unique/non-unique admission behavior. The
+  transaction-binding test deterministically proves CREATE INDEX metadata X
+  waits, using bounded polling of the observable exclusive waiter.
+- Updated `docs/secondary-index.md` to describe the current-state build and
+  metadata-admission proof. The removed-symbol audit found no remaining
+  production references to the CREATE-INDEX-only history candidate or
+  build-state APIs.
+- Validation passed with formatting and strict workspace Clippy, 1,532 tests
+  on the default backend, 1,457 `doradb-storage` tests with the `libaio`
+  backend, and the branch style audit across seven changed Rust files. Focused
+  coverage across the changed Rust paths was 92.27%, above the 80% review bar.
+  The final bounded-poll review adjustment additionally passed its focused
+  regression test.
+- No implementation scope deviation remains. The planned representation was
+  refined during review to retain canonical `BTreeKey` values throughout the
+  build and to treat non-unique exact-key duplication as a programmer
+  invariant rather than an expensive CREATE-specific runtime validation.
 
 ## Impacts
 

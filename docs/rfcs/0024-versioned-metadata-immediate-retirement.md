@@ -1356,13 +1356,13 @@ Required coverage includes:
     old writers cannot mutate through stale metadata.
   - Phase-local Choices: Preserve general row-MVCC candidate logic used by
     ordinary lookup; remove only create-index-specific history mechanisms.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000239-current-state-create-index-workaround-removal.md`
+  - Task Issue: `#892`
+  - Phase Status: done
+  - Implementation Summary: Unified unique and non-unique CREATE INDEX around current committed rows encoded once as canonical BTreeKey values, removed CREATE-INDEX-specific history collection and delete-masked build state, and validated metadata admission, failure cleanup, default and libaio suites, and focused coverage. [Task Resolve Sync: docs/tasks/000239-current-state-create-index-workaround-removal.md @ 2026-07-26]
   - Related Backlogs:
-    - `docs/backlogs/000164-create-unique-index-full-mvcc-history.md`
-    - `docs/backlogs/000165-reclaim-non-unique-create-index-history.md`
+    - `docs/backlogs/closed/000164-create-unique-index-full-mvcc-history.md`
+    - `docs/backlogs/closed/000165-reclaim-non-unique-create-index-history.md`
 
 - **Phase 4: Operational Reclamation And Recovery Validation**
   - Scope: Validate ordinary dropped-index root reachability, Arc-based runtime
@@ -1375,7 +1375,7 @@ Required coverage includes:
     bindings before DDL or operational cleanup fences after DDL.
   - Non-goals: New vacuum mechanisms, historical table/index access, or changes
     to durable table-file formats.
-  - Prerequisites: Phase 3 must remove historical candidate state, Phase 2 must
+  - Prerequisites: Phase 3 has removed historical candidate state, Phase 2 must
     prove no retired object can be newly admitted, and Phase 1 must expose the
     strict tombstone horizon and current-only resolver to validation hooks.
   - Phase-local Choices: Reuse existing purge/root observability and failpoints;
