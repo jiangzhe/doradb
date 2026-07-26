@@ -1755,7 +1755,7 @@ mod tests {
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_dropped_table_runtime,
-        assert_no_dropped_table_operational_state,
+        assert_no_dropped_table_operational_state, wait_for_dropped_table_floor,
     };
     use crate::catalog::{
         CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, CurrentTableState,
@@ -3474,6 +3474,8 @@ mod tests {
                     owner,
                     LockResource::TableData(table_id),
                 ));
+                drop(before);
+                drop(table);
                 session.drop_table(table_id).await.unwrap();
             }
         });
@@ -3502,9 +3504,10 @@ mod tests {
             assert!(engine.catalog().get_table(other_table_id).await.is_none());
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
-            drop(publish_lease);
-            waiting_drop.await.unwrap();
             drop(root_lease);
+            drop(publish_lease);
+            drop(table);
+            waiting_drop.await.unwrap();
         });
     }
 
@@ -3544,9 +3547,10 @@ mod tests {
             );
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropping);
 
-            drop(publish_lease);
-            waiting_drop.await.unwrap();
             drop(root_lease);
+            drop(publish_lease);
+            drop(table);
+            waiting_drop.await.unwrap();
         });
     }
 
@@ -3588,14 +3592,15 @@ mod tests {
                 LockDebugEntryState::Waiting,
             ));
 
+            drop(root_lease);
             drop(publish_lease);
+            drop(table);
             drop_fut.await.unwrap();
             let err = lock_fut.await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
             );
-            drop(root_lease);
             assert!(!has_lock_resource(
                 &engine,
                 lock_owner,
@@ -3685,14 +3690,15 @@ mod tests {
                 LockDebugEntryState::Waiting,
             ));
 
+            drop(root_lease);
             drop(publish_lease);
+            drop(table);
             drop_fut.await.unwrap();
             let err = lock_fut.await.unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
             );
-            drop(root_lease);
             assert!(!has_lock_resource(
                 &engine,
                 lock_owner,
@@ -3715,6 +3721,8 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
+            let mut horizon_session = engine.new_session().unwrap();
+            let horizon = horizon_session.begin_trx().unwrap();
             let mut drop_session = engine.new_session().unwrap();
             drop_session.drop_table(table_id).await.unwrap();
             assert_dropped_table_runtime(engine.catalog(), table_id);
@@ -3786,6 +3794,9 @@ mod tests {
                 LockResource::TableData(table_id),
             ));
             trx.rollback().await.unwrap();
+            drop(table);
+            horizon.rollback().await.unwrap();
+            wait_for_dropped_table_floor(&engine, table_id).await;
         });
     }
 
@@ -3929,7 +3940,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_table_runtime_pin_delays_floor_but_not_logical_history_or_foreground_removal() {
+    fn test_drop_table_first_eligible_purge_destroys_runtime_without_restore() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -3940,7 +3951,6 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let (table_spec, index_specs) = drop_table_test_spec();
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
-            let table_pin = table_for_internal_assertion(&engine, table_id);
             insert_one_row(
                 table_id,
                 &mut session,
@@ -3969,13 +3979,8 @@ mod tests {
                 engine.catalog().user_table_history_version_count(table_id),
                 None
             );
-            assert_dropped_table_runtime(engine.catalog(), table_id);
-            assert!(engine.catalog().get_table_now(table_id).is_none());
-            assert!(Path::new(&table_file_path).exists());
-
-            drop(table_pin);
-            request_and_wait_for_purge_cycle(&engine, &event_rx).await;
             assert_dropped_table_floor(engine.catalog(), table_id);
+            assert!(engine.catalog().get_table_now(table_id).is_none());
             assert!(Path::new(&table_file_path).exists());
 
             engine

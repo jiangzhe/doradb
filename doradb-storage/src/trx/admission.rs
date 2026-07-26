@@ -902,6 +902,8 @@ mod tests {
             assert_eq!(table.file().active_root_unchecked().root_ts, before_root_ts);
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Live);
 
+            drop(waiting_current);
+            drop(table);
             bound_trx.rollback().await.unwrap();
             drop_table.await.unwrap();
             assert!(!matches!(
@@ -909,7 +911,6 @@ mod tests {
                 Some(CurrentTableState::Live { .. })
             ));
             assert!(engine.catalog().get_table_now(table_id).is_none());
-            assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
             assert_no_table_locks(&engine, table_id);
 
             drop(ddl_session);

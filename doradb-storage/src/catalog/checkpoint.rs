@@ -620,9 +620,10 @@ impl Catalog {
         index_no: u16,
         cts: TrxID,
     ) -> DataIntegrityResult<CatalogCheckpointTxnAction> {
-        let table = self.get_table_now(table_id);
-        let active_root = table
+        let table_entry = self.user_tables.get(&table_id);
+        let active_root = table_entry
             .as_ref()
+            .and_then(|entry| entry.value().current_live_table_ref())
             .map(|table| table.file().active_root_unchecked());
         // Index DDL needs root proof because its catalog rows may be logged
         // before the table root is durably published. Proven index DDL is
@@ -630,6 +631,7 @@ impl Catalog {
         // point but leaves catalog row redo for recovery to skip/replay from
         // the still-authoritative root.
         let proof = classify_index_ddl_root(kind, table_id, index_no, cts, active_root)?;
+        drop(table_entry);
         match (kind, proof) {
             (
                 IndexDdlKind::Create,

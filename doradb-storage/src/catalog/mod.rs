@@ -527,7 +527,7 @@ impl Catalog {
                 let table_id = *entry.key();
                 entry
                     .value()
-                    .current_live_table()
+                    .current_live_table_ref()
                     .is_some()
                     .then_some(table_id)
             })
@@ -566,7 +566,7 @@ impl Catalog {
         let mut dropped = Vec::new();
         for entry in &self.user_tables {
             let table_id = *entry.key();
-            if let Some((_table, floor)) = entry
+            if let Some(floor) = entry
                 .value()
                 .live_replay_floor(checkpointed_silent_watermarks.get(&table_id).copied())
             {
@@ -650,7 +650,7 @@ impl Catalog {
     #[inline]
     pub(crate) fn remove_live_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         match self.user_tables.entry(table_id) {
-            Occupied(entry) if entry.get().current_live_table().is_some() => {
+            Occupied(entry) if entry.get().current_live_table_ref().is_some() => {
                 Some(entry.remove().into_recovery_live_table())
             }
             Occupied(_) => None,
@@ -747,27 +747,6 @@ impl Catalog {
             }
         }
         candidates
-    }
-
-    /// Restore a detached dropped runtime after purge observes stale handles.
-    #[inline]
-    pub(crate) fn restore_dropped_runtime(&self, item: DroppedTableRuntime) {
-        let table_id = item.table_id;
-        let drop_cts = item.drop_cts;
-        let replay_floor = item.replay_floor;
-        match self.user_tables.entry(table_id) {
-            Occupied(mut entry) => {
-                assert!(
-                    entry
-                        .get_mut()
-                        .restore_dropped_runtime(item.table, drop_cts, replay_floor),
-                    "purge must restore the exact authoritative dropped-runtime floor before another detach: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=mismatch"
-                );
-            }
-            Vacant(_) => panic!(
-                "purge must retain a dropped floor while a detached runtime is checked for stale handles: table_id={table_id}, drop_cts={drop_cts}, replay_floor={replay_floor:?}, observed_entry=vacant"
-            ),
-        }
     }
 
     /// Snapshot retained dropped floors for purge file-cleanup queue seeding.
@@ -1232,6 +1211,7 @@ pub(crate) mod tests {
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::table::tests::assert_freeze_created;
     use crate::trx::MIN_SNAPSHOT_TS;
+    use crate::trx::purge::PurgeTestEvent;
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
     use std::fs::OpenOptions;
@@ -1259,6 +1239,42 @@ pub(crate) mod tests {
                 .iter()
                 .any(|item| item.table_id == table_id)
         );
+    }
+
+    /// Waits for one targeted purge cycle to convert a dropped runtime to a floor.
+    pub(crate) async fn wait_for_dropped_table_floor(engine: &Engine, table_id: TableID) {
+        let (event_tx, event_rx) = flume::unbounded();
+        engine.inner().trx_sys.set_purge_test_observer(event_tx);
+        if engine
+            .catalog()
+            .snapshot_dropped_table_file_cleanups()
+            .iter()
+            .any(|item| item.table_id == table_id)
+        {
+            return;
+        }
+
+        engine.inner().trx_sys.request_dropped_table_purge();
+        let mut dropped_table_started = false;
+        loop {
+            match event_rx.recv_async().await.unwrap() {
+                PurgeTestEvent::DroppedTableStarted => dropped_table_started = true,
+                PurgeTestEvent::CycleCompleted if dropped_table_started => {
+                    if engine
+                        .catalog()
+                        .snapshot_dropped_table_file_cleanups()
+                        .iter()
+                        .any(|item| item.table_id == table_id)
+                    {
+                        break;
+                    }
+                    dropped_table_started = false;
+                    engine.inner().trx_sys.request_dropped_table_purge();
+                }
+                _ => {}
+            }
+        }
+        assert_dropped_table_floor(engine.catalog(), table_id);
     }
 
     #[inline]
@@ -1762,6 +1778,31 @@ pub(crate) mod tests {
             );
             drop(table);
             drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_redo_floor_snapshot_does_not_retain_live_table_runtime() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                open_catalog_test_engine(temp_dir.path().to_path_buf(), Some("redo-floor-borrow"))
+                    .await;
+            let table_id = table1(&engine).await;
+            let table = engine.catalog().get_table_now(table_id).unwrap();
+            let owners_before = Arc::strong_count(&table);
+
+            let (live, dropped) = engine
+                .catalog()
+                .snapshot_user_table_redo_floors(MIN_SNAPSHOT_TS);
+
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].table_id, table_id);
+            assert!(dropped.is_empty());
+            assert_eq!(Arc::strong_count(&table), owners_before);
+
+            drop(table);
+            engine.shutdown().unwrap();
         });
     }
 

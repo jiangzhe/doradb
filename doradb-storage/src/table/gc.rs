@@ -192,7 +192,7 @@ impl Table {
     /// are cleaned independently in either case.
     pub(crate) async fn cleanup_secondary_mem_indexes(
         &self,
-        session: SessionPin,
+        session: &SessionPin,
         clean_live_entries: bool,
     ) -> RuntimeOrFatalResult<MemIndexCleanupOutcome> {
         let trx_sys = session.engine.trx_sys.clone();
@@ -699,6 +699,7 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
 mod tests {
     use super::finish_secondary_mem_index_cleanup;
     use crate::catalog::IndexNo;
+    use crate::catalog::tests::wait_for_dropped_table_floor;
     use crate::error::{
         DataIntegrityError, LifecycleError, OperationError, RuntimeError, RuntimeOrFatalError,
     };
@@ -802,6 +803,39 @@ mod tests {
             assert_eq!(outcome.stats.indexes.len(), 1);
             assert_eq!(outcome.stats.indexes[0].removed, 1);
             assert_eq!(outcome.stats.indexes[0].skipped_live, 0);
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_scoped_access_blocks_drop() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "cleanup_drop_drain").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut cleanup_session = engine.new_session().unwrap();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            set_test_cleanup_after_trx_start_hook(move || async move {
+                entered_tx.send_async(()).await.unwrap();
+                release_rx.recv_async().await.unwrap();
+            });
+
+            let mut cleanup =
+                Box::pin(cleanup_session.cleanup_secondary_mem_indexes(table_id, true));
+            assert!(futures::poll!(cleanup.as_mut()).is_pending());
+            entered_rx.recv_async().await.unwrap();
+
+            let mut drop_session = engine.new_session().unwrap();
+            let mut drop_table = Box::pin(drop_session.drop_table(table_id));
+            assert!(futures::poll!(drop_table.as_mut()).is_pending());
+
+            release_tx.send_async(()).await.unwrap();
+            cleanup.await.unwrap();
+            drop_table.await.unwrap();
+            wait_for_dropped_table_floor(&engine, table_id).await;
+
+            engine.shutdown().unwrap();
         });
     }
 
@@ -998,7 +1032,7 @@ mod tests {
             let was_in_trx = session.in_trx().unwrap();
 
             let internal_err = table_for_internal_assertion(&engine, table_id)
-                .cleanup_secondary_mem_indexes(session.pin().unwrap(), true)
+                .cleanup_secondary_mem_indexes(&session.pin().unwrap(), true)
                 .await
                 .unwrap_err();
             let RuntimeOrFatalError::Runtime(internal_err) = internal_err else {

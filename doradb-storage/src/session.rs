@@ -10,7 +10,9 @@ use crate::error::{
     OperationError, OperationResult, Result,
 };
 use crate::id::{SessionID, TableID, TrxID};
-use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, TableLockMode};
+use crate::lock::{
+    FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, TableLockMode,
+};
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::ChangeNotifier;
 use crate::quiescent::QuiescentGuard;
@@ -19,7 +21,8 @@ use crate::stats::{
     storage_io_stats_snapshot, transaction_system_stats_snapshot,
 };
 use crate::table::{
-    CheckpointDelayReason, CheckpointOutcome, FreezeOutcome, MemIndexCleanupOutcome, Table,
+    CheckpointDelayReason, CheckpointOutcome, CheckpointRetryObservation, FreezeOutcome,
+    MemIndexCleanupOutcome, Table,
 };
 use crate::trx::{StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState};
 use error_stack::{Report, ResultExt};
@@ -158,6 +161,83 @@ impl MaintenanceBoundary {
                 session.engine.trx_sys.purge_completion_listener()
             }
         }
+    }
+}
+
+/// Scoped runtime access for one finite session maintenance operation.
+///
+/// The table owner is explicitly released before fresh logical-lock guards so
+/// same-table metadata X cannot detach the catalog-owned runtime while this
+/// scope can still use it.
+struct ScopedTableRuntimeAccess<'lock> {
+    table: Option<Arc<Table>>,
+    metadata_lock: Option<FreshLockGuard<'lock>>,
+    data_lock: Option<FreshLockGuard<'lock>>,
+}
+
+impl<'lock> ScopedTableRuntimeAccess<'lock> {
+    /// Acquires ordered metadata S/data IS admission and resolves a live table.
+    async fn acquire(session: &'lock SessionPin, table_id: TableID) -> OperationResult<Self> {
+        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id).await?;
+        let table = session.resolve_user_table(table_id).await?;
+        Ok(Self {
+            table: Some(table),
+            metadata_lock,
+            data_lock,
+        })
+    }
+
+    /// Acquires retry-recheck access, treating absent or terminal state as obsolete.
+    async fn acquire_for_retry(
+        session: &'lock SessionPin,
+        table_id: TableID,
+    ) -> OperationResult<Option<Self>> {
+        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id).await?;
+        let Some(table) = session.engine.catalog().current_live_user_table(table_id) else {
+            return Ok(None);
+        };
+        if table.check_foreground_live().is_err() {
+            return Ok(None);
+        }
+        session.state.cache_user_table(&table);
+        Ok(Some(Self {
+            table: Some(table),
+            metadata_lock,
+            data_lock,
+        }))
+    }
+
+    /// Acquires logical locks in the repository-wide table resource order.
+    async fn acquire_locks(
+        session: &'lock SessionPin,
+        table_id: TableID,
+    ) -> OperationResult<(Option<FreshLockGuard<'lock>>, Option<FreshLockGuard<'lock>>)> {
+        let owner = LockOwner::Session(session.id());
+        let owner_group = LockOwnerGroup::Session(session.id());
+        session
+            .engine
+            .lock_manager()
+            .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
+            .await
+    }
+
+    /// Borrows the admitted runtime without exposing another strong clone.
+    #[inline]
+    fn table(&self) -> &Table {
+        self.table.as_deref().unwrap_or_else(|| {
+            panic!("scoped table runtime access invariant violated: table already released")
+        })
+    }
+}
+
+impl Drop for ScopedTableRuntimeAccess<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // Logical DROP can acquire metadata X only after this strong runtime
+        // owner is gone.
+        drop(self.table.take());
+        drop(self.data_lock.take());
+        drop(self.metadata_lock.take());
     }
 }
 
@@ -489,24 +569,12 @@ impl Session {
         ensure_idle_maintenance_session(&session)
             .attach("operation=freeze_table")
             .disclose()?;
-        // Acquire maintenance admission before entering the freeze workflow. The
-        // grouped helper orders TableMetadata(S) before TableData(IS), excluding
-        // metadata-X DDL and data-X full-table mutations while remaining compatible
-        // with ordinary IX DML. Keep the scoped guards through batch publication.
-        let lock_manager = session.engine.lock_manager();
-        let owner = LockOwner::Session(session.id());
-        let owner_group = LockOwnerGroup::Session(session.id());
-        let (_metadata_lock, _data_lock) = lock_manager
-            .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
+        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
             .disclose()?;
-        let table = session
-            .resolve_user_table(table_id)
-            .await
-            .attach("operation=freeze_table")
-            .disclose()?;
-        table
+        access
+            .table()
             .freeze(&session, max_rows)
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
@@ -520,24 +588,12 @@ impl Session {
         ensure_idle_maintenance_session(&session)
             .attach("operation=checkpoint_table")
             .disclose()?;
-        // Acquire maintenance admission before entering the checkpoint workflow.
-        // The grouped helper orders TableMetadata(S) before TableData(IS), excluding
-        // metadata-X DDL and data-X full-table mutations while remaining compatible
-        // with ordinary IX DML. Keep the scoped guards through root publication.
-        let lock_manager = session.engine.lock_manager();
-        let owner = LockOwner::Session(session.id());
-        let owner_group = LockOwnerGroup::Session(session.id());
-        let (_metadata_lock, _data_lock) = lock_manager
-            .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
+        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
             .disclose()?;
-        let table = session
-            .resolve_user_table(table_id)
-            .await
-            .attach("operation=checkpoint_table")
-            .disclose()?;
-        table
+        access
+            .table()
             .checkpoint(&session)
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
@@ -560,15 +616,28 @@ impl Session {
             CheckpointDelayReason::ActiveRoot { table_id, .. }
             | CheckpointDelayReason::FrozenPageCutoff { table_id, .. } => table_id,
         };
-        let Some(table) = session.engine.catalog().get_table(table_id).await else {
-            return Ok(());
-        };
-        session.state.cache_user_table(&table);
-        table
-            .wait_for_checkpoint_retry(&session, reason)
-            .await
-            .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))
-            .disclose()
+        loop {
+            let Some(access) = ScopedTableRuntimeAccess::acquire_for_retry(&session, table_id)
+                .await
+                .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))
+                .disclose()?
+            else {
+                return Ok(());
+            };
+            let observation = access
+                .table()
+                .checkpoint_retry_observation(&session, reason)
+                .await
+                .attach_with(|| format!("operation=wait_for_checkpoint_retry, table_id={table_id}"))
+                .disclose()?;
+            // The detached waiter owns only event-listener state. Release the
+            // table and fresh logical locks before an unbounded await.
+            drop(access);
+            match observation {
+                CheckpointRetryObservation::Ready => return Ok(()),
+                CheckpointRetryObservation::Wait(waiter) => waiter.wait().await,
+            }
+        }
     }
 
     /// Retry delayed table checkpoints through their exact production wait predicate.
@@ -639,13 +708,15 @@ impl Session {
             .pin()
             .attach("operation=count_table_row_pages")
             .disclose()?;
-        let table = session
-            .resolve_user_table(table_id)
+        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach("operation=count_table_row_pages")
             .disclose()?;
+        #[cfg(test)]
+        tests::run_test_total_row_pages_after_access_hook().await;
         let guards = session.pool_guards();
-        table
+        access
+            .table()
             .total_row_pages(&guards)
             .await
             .attach_with(|| format!("operation=count_table_row_pages, table_id={table_id}"))
@@ -670,13 +741,13 @@ impl Session {
         ensure_idle_maintenance_session(&session)
             .attach("operation=cleanup_secondary_mem_indexes")
             .disclose()?;
-        let table = session
-            .resolve_user_table(table_id)
+        let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach("operation=cleanup_secondary_mem_indexes")
             .disclose()?;
-        table
-            .cleanup_secondary_mem_indexes(session, clean_live_entries)
+        access
+            .table()
+            .cleanup_secondary_mem_indexes(&session, clean_live_entries)
             .await
             .attach_with(|| format!("operation=cleanup_secondary_mem_indexes, table_id={table_id}"))
             .disclose()
@@ -1600,7 +1671,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::guard::PageGuard;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
-    use crate::catalog::tests::{table1, table2};
+    use crate::catalog::tests::{table1, table2, wait_for_dropped_table_floor};
     use crate::catalog::{
         CatalogTable, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, is_catalog_table,
     };
@@ -1614,16 +1685,20 @@ pub(crate) mod tests {
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
     use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
-    use crate::table::tests::{FailingFirstWriteHook, assert_freeze_created};
+    use crate::table::tests::{
+        FailingFirstWriteHook, assert_freeze_created, lightweight_test_engine_config,
+    };
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
     };
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use crate::value::{Val, ValKind};
     use futures::task::noop_waker;
+    use std::cell::RefCell;
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::sync::mpsc;
     use std::task::{Context, Poll};
     use std::thread;
@@ -1633,6 +1708,37 @@ pub(crate) mod tests {
     const TRUNCATE_TEST_LOG_BLOCK_SIZE: usize = 4096;
     const TRUNCATE_TEST_LOG_FILE_MAX_SIZE: usize =
         REDO_DEFAULT_DATA_START_OFFSET + 4 * TRUNCATE_TEST_LOG_BLOCK_SIZE;
+
+    type TotalRowPagesAfterAccessHook =
+        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+
+    thread_local! {
+        static TEST_TOTAL_ROW_PAGES_AFTER_ACCESS_HOOK:
+            RefCell<Option<TotalRowPagesAfterAccessHook>> = RefCell::new(None);
+    }
+
+    fn set_test_total_row_pages_after_access_hook<F, Fut>(hook: F)
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        TEST_TOTAL_ROW_PAGES_AFTER_ACCESS_HOOK.with(|slot| {
+            let old = slot
+                .borrow_mut()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "total-row-pages scoped-access hook already installed"
+            );
+        });
+    }
+
+    pub(super) async fn run_test_total_row_pages_after_access_hook() {
+        let hook = TEST_TOTAL_ROW_PAGES_AFTER_ACCESS_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
 
     #[inline]
     fn assert_runtime_unavailable_after_shutdown(err: Error) {
@@ -2160,6 +2266,42 @@ pub(crate) mod tests {
             );
 
             trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_total_row_pages_scoped_access_blocks_drop_until_runtime_release() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(lightweight_test_engine_config(
+                root.path().to_path_buf(),
+                "total-row-pages-drop-drain",
+            ))
+            .await
+            .unwrap();
+            let table_id = table2(&engine).await;
+            let count_session = engine.new_session().unwrap();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            set_test_total_row_pages_after_access_hook(move || async move {
+                entered_tx.send_async(()).await.unwrap();
+                release_rx.recv_async().await.unwrap();
+            });
+
+            let mut count = Box::pin(count_session.total_row_pages(table_id));
+            assert!(futures::poll!(count.as_mut()).is_pending());
+            entered_rx.recv_async().await.unwrap();
+
+            let mut drop_session = engine.new_session().unwrap();
+            let mut drop_table = Box::pin(drop_session.drop_table(table_id));
+            assert!(futures::poll!(drop_table.as_mut()).is_pending());
+
+            release_tx.send_async(()).await.unwrap();
+            assert_eq!(count.await.unwrap(), 0);
+            drop_table.await.unwrap();
+            wait_for_dropped_table_floor(&engine, table_id).await;
+
+            engine.shutdown().unwrap();
         });
     }
 

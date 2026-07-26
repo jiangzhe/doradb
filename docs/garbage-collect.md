@@ -88,6 +88,28 @@ below the captured pivot before deallocating any still-hot page. This makes a
 missed ordered checkpoint cleanup fatal instead of silently filtering stale
 entries and risking a leak or double deallocation.
 
+## Dropped-Table Runtime And File Cleanup
+
+Logical DROP first acquires `TableMetadata(X)` and `TableData(X)`. Finite
+foreground and maintenance runtime holders participate through compatible
+metadata/data locks, so DROP drains them before publishing terminal table
+state. Checkpoint-retry sleeps are not holders: each bounded recheck registers
+its listeners while scoped access is live, then releases the table, layout,
+checkpoint attempt, page guards, and fresh locks before awaiting detached
+listener state.
+
+Purge considers a dropped runtime only when `drop_cts < Global_Min_STS`, after
+bucket-local undo/index caches, retired row pages, and retained roots for the
+cycle have completed. Detachment changes the catalog operational state once
+from `Runtime` to `Floor`. The purge coordinator requires the detached
+`Arc<Table>` to be uniquely owned and destroys it by value; a remaining strong
+owner is an invariant failure and the runtime is never restored.
+
+The lightweight floor continues to protect redo retention and the table file.
+Physical unlink is independently gated by a catalog checkpoint that makes
+table absence durable. Unlink failure retains and requeues the floor cleanup
+for a later purge wake; this retry policy does not restore table runtime state.
+
 ## MemIndex Full-Scan Cleanup
 
 User-table secondary indexes use a hot `MemIndex` and a checkpointed cold
@@ -248,5 +270,7 @@ Use the narrowest proof owned by the component being collected:
   validation and unlink-before-deallocation
 - runtime unique-key links use the undo GC horizon
 - `MemIndex` cleanup uses captured checkpoint roots plus deletion proof
+- dropped-table runtime GC uses lock drainage plus strict-horizon unique
+  ownership, while its file unlink uses the durable catalog-absence boundary
 - user-table table-file, LWC replacement, `ColumnBlockIndex`, and `DiskTree`
   page GC use table-file CoW root reachability
