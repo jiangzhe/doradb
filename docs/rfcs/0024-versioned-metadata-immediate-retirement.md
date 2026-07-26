@@ -1,7 +1,7 @@
 ---
 id: 0024
 title: Versioned Metadata, Immediate Retirement
-status: proposal
+status: implemented
 tags: [catalog, ddl, mvcc, secondary-index]
 created: 2026-07-24
 github_issue: 885
