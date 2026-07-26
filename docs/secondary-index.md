@@ -481,10 +481,8 @@ roots atomically. Foreground insert/recovery establishes the Mem-required half
 before another transaction can independently own the row.
 
 This current-row completeness invariant applies to every active secondary
-index. Runtime non-unique `CREATE INDEX` additionally establishes the
-historical candidate invariant below. Full runtime-created unique-index
-history remains unresolved and is tracked by
-[`000164-create-unique-index-full-mvcc-history.md`](./backlogs/000164-create-unique-index-full-mvcc-history.md).
+index. Unique and non-unique `CREATE INDEX` both establish it from current
+committed rows only, using one captured root and pivot for the cold/hot split.
 
 After definitive RowPage write ownership or current-LWC validation plus CDB
 ownership, operations that consume every old index entry create one opaque,
@@ -534,42 +532,43 @@ without rereading DiskTree. The source-selection Mem lookup precedes owner
 validation and is separate from this one-traversal claim. This token is for new
 claims only; it does not authorize old-row index-set masking.
 
-### 7.7 Runtime Non-Unique CREATE INDEX History
+### 7.7 Current-State CREATE INDEX
 
-Non-unique `CREATE INDEX` captures one
-`TransactionSystem::published_gc_horizon()` after its implicit DDL transaction
-starts. The captured cutoff is conservative: every hot main-branch transition
-or cold CDB delete whose committed CTS is equal to or newer than the cutoff is
-still potentially visible to a transaction active across index publication.
-The build therefore retains equality and excludes history only with the strict
-comparison:
+Unique and non-unique `CREATE INDEX` build the same current committed table
+state. The operation first acquires table-metadata and table-data X. Metadata X
+waits for transactions that already bound the table and retain
+transaction-lifetime metadata S; data X drains foreground writers before the
+operation captures the active root, runtime layout, column-block root, and
+pivot.
 
-```text
-invalidation_or_delete_cts < history_cutoff => globally invisible
-```
+The captured boundary partitions the build input:
 
-Current live cold rows are written only to the new `DiskTree`. Current hot rows
-are inserted into the runtime `MemIndex` as active exact candidates. Retained
-hot versions and retained CDB-deleted cold rows are inserted into `MemIndex` as
-delete-masked exact `(logical_key, row_id)` candidates. If the same exact
-candidate appears both currently and historically within one hot RowID's undo
-chain, row-local encoded normalization keeps one entry and active state wins.
-The captured pivot makes cold and hot RowID ranges disjoint, so cold historical
-candidates and normalized hot candidates are combined without a global
-normalization pass.
+- current, non-deleted cold rows below the pivot populate the new `DiskTree`
+- latest, non-deleted hot row images at or above the pivot populate the new
+  `MemIndex`
+- persisted delete deltas and committed CDB markers exclude old cold rows
+- retained row undo and historical CDB-deleted rows do not create entries in
+  the new index
 
-The delete mask reproduces the state foreground maintenance would have left
-after an update or delete. Candidate scans may still emit the entry; the normal
-row/CDB MVCC recheck decides whether the transaction can see that version.
-Later same-RowID key reuse can reactivate the entry through the existing
-merge-and-undo path.
+Each included row is encoded once into its final memory-comparable `BTreeKey`
+and retained in that form for build preparation and population. Unique build
+entries encode the logical key and retain RowID as the owner value. Non-unique
+build entries encode the exact `(logical_key, row_id)` physical key.
 
-Historical build entries are runtime-only. Restart rebuilds current hot
-MemIndex state over current durable `DiskTree` roots and does not reconstruct
-pre-crash history because no pre-crash transaction snapshot survives recovery.
-This completeness contract is specific to non-unique indexes. Runtime-created
-unique indexes still lack full historical cross-RowID owner construction and
-remain tracked by backlog 000164.
+Unique creation validates current cold/cold, cold/hot, and hot/hot logical-key
+duplicates by comparing the encoded logical keys. Non-unique creation inserts
+each current hot exact key as an active entry through the ordinary MemIndex
+insertion semantics without a separate sorting or duplicate-validation pass.
+Cold non-unique entries are sorted only because the DiskTree batch interface
+requires ordered input; exact-key uniqueness follows from disjoint RowIDs and
+the RowID-bearing encoding.
+
+An untouched transaction whose snapshot predates publication may continue
+using table scan and indexes present in both its visible metadata and the
+current layout, but it cannot admit the new stable index number. A stale writer
+must also match the exact visible/current metadata version before acquiring a
+data lock or creating row, index, undo, or redo effects. These admission rules
+make build-created historical candidates unnecessary for either index kind.
 
 ## 8. Write Path
 
@@ -842,8 +841,8 @@ This works because:
 
 - `DiskTree` already contains the checkpointed cold state
 - `MemIndex` only needs to represent post-checkpoint hot changes
-- non-unique CREATE INDEX historical candidates are runtime-only and no
-  pre-crash reader remains to require them
+- a published CREATE INDEX contains only current cold and hot state, so restart
+  has no build-specific historical candidates to reconstruct
 - runtime unique-key links are not part of durable `DiskTree` state and do not
   need to be reconstructed as historical visibility structures after restart
 - no pre-crash active snapshot survives restart, so recovery does not need to
