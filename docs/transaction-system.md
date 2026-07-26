@@ -240,7 +240,8 @@ own the lock manager; acquisition and release receive the engine's
 `LockManager` component guard at the lifecycle boundary. Transaction-owned
 locks are released on commit, rollback, no-op discard, or fatal transaction
 discard. Session-owned logical locks are released when the session state is
-dropped.
+dropped. See [Lock System](./lock-system.md) for the resource and mode model,
+the implemented manager structures, and the pre-RFC redesign study.
 
 Foreground table access enters through lock-aware `Statement` APIs and a
 positive transaction-lifetime `TransactionTableBinding`. A binding hit is
