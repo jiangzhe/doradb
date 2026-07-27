@@ -2469,8 +2469,9 @@ pub(crate) mod tests {
     use crate::session::{
         Session,
         tests::{
-            SessionTestExt, TerminalAttachmentOutcome, finish_trx_rollback_for_test,
-            install_terminal_attachment_test_hook, session_registry_len,
+            SessionTestExt, TerminalAttachmentOutcome, TerminalAttachmentTestHookGuard,
+            finish_trx_rollback_for_test, install_terminal_attachment_test_hook,
+            session_registry_len,
         },
     };
     use crate::table::test_user_table_id;
@@ -2973,7 +2974,7 @@ pub(crate) mod tests {
         status: Option<Arc<SharedTrxStatus>>,
         session_owner: Option<LockOwner>,
     ) -> (
-        crate::session::tests::TerminalAttachmentTestHookGuard,
+        TerminalAttachmentTestHookGuard,
         mpsc::Receiver<TerminalBoundaryObservation>,
     ) {
         let (observed_tx, observed_rx) = mpsc::channel();

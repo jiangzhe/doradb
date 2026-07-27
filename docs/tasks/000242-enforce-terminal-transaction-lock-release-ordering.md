@@ -1,7 +1,7 @@
 ---
 id: 000242
 title: Enforce Terminal Transaction Lock-Release Ordering
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-27
 github_issue: 901
 ---
@@ -431,6 +431,45 @@ Do not edit historical task or RFC documents.
 
 ## Implementation Notes
 
+Implemented the proof-gated terminal boundary as planned:
+
+- Added the non-cloneable, transaction-id-bound
+  `ReleasedTransactionLocks` proof. Active and carried terminal cleanup mint
+  it only after owner-local lock state is empty; carried prepared/precommit
+  cleanup also consumes and drops the paired lock-manager guard first.
+- Changed `TrxAttachment::commit` and `rollback` to consume a matching proof,
+  with identity validation through `assert_validated_for`. Raw
+  `SessionRegistry` transaction-finish methods are now private to
+  `session.rs`; stale-completion tests use narrow test-only helpers.
+- Corrected ordered commit and unordered/no-op commit ordering, and routed
+  normal, abandoned, failed-precommit, fatal-retention, and test cleanup
+  through the same proof contract. User/system payload mismatches now fail as
+  internal invariants, while attachmentless system transactions remain
+  proof-free.
+- Added a serialized test-only attachment hook that observes the boundary
+  after transaction-lock release and before session mutation. Deterministic
+  tests cover proof identity, ordered commit, unordered commit, rollback,
+  failed precommit, and abandoned-session explicit-lock ordering.
+- Updated the live lock and transaction-system documents to describe the
+  implemented invariant. A catalog-history test also now releases its
+  intentionally cloned layout/index runtime pins before `DROP TABLE`; the
+  corrected terminal timing exposed that test-only lifetime race without
+  requiring a production behavior change.
+
+Verification completed with six focused terminal-boundary tests, strict
+workspace clippy, and the standard workspace pass of 1,551 tests. The exposed
+catalog-history race passed 100/100 focused stress iterations after the
+test-only pin correction. The mandatory resolve-time style audit passed all
+five branch-diff Rust files against `origin/main`. The alternate `libaio` pass
+was not run, as planned, because no storage-I/O path changed.
+
+Prepare-aware waiting for cold-row `ColumnDeletionBuffer` ownership was
+identified during review and deferred to
+`docs/backlogs/000168-add-cold-row-prepare-waiting.md`. That work is one
+prerequisite for any future attempt to release logical locks during redo
+persistence, but it does not by itself prove failed-precommit rollback safe
+against concurrent DDL or runtime teardown.
+
 ## Impacts
 
 ### Runtime modules
@@ -561,10 +600,17 @@ Do not edit historical task or RFC documents.
 
 ## Open Questions
 
-None for implementation.
+No unresolved question blocks this implementation.
 
 The future lock-system redesign may replace `ReleasedTransactionLocks` with a
 general closed transaction-scope proof. That redesign must preserve the
 accepted ordering and should adapt the attachment boundary rather than remove
 it. DDL and maintenance operation ownership remains a separate prerequisite
 task.
+
+Prepare-aware cold-row ownership waiting and its required retry/failure
+semantics are tracked in
+`docs/backlogs/000168-add-cold-row-prepare-waiting.md`. Moving logical-lock
+release before durable commit/status publication remains out of scope until
+that work and failed-precommit rollback safety against DDL and runtime
+lifecycle changes are both designed and verified.
