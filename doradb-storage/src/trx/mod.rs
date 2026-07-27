@@ -2488,7 +2488,7 @@ pub(crate) mod tests {
     use std::io::Error as IoError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
     use std::thread::{scope, sleep, spawn};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -3431,14 +3431,14 @@ pub(crate) mod tests {
                             kind: RowRedoKind::Delete(Some(PageID::new(0))),
                         },
                     );
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             let err = res.unwrap_err();
 
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             with_transaction_inner(&trx, "check_statement_rollback_effects", |inner| {
                 let table_redo = inner.effects.redo.dml.get(&TableID::new(12)).unwrap();
@@ -3518,7 +3518,7 @@ pub(crate) mod tests {
                     )
                     .await?;
                     assert_eq!(lock_entry_count(&engine, owner), 1);
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             assert_eq!(
@@ -3526,7 +3526,7 @@ pub(crate) mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
 
             let first_owner = first_owner.get().unwrap();
@@ -3955,8 +3955,7 @@ pub(crate) mod tests {
             );
 
             let (reached_tx, reached_rx) = mpsc::channel();
-            let terminal_barrier = Arc::new(Barrier::new(2));
-            let hook_barrier = Arc::clone(&terminal_barrier);
+            let (release_tx, release_rx) = flume::bounded(1);
             let hook =
                 install_terminal_attachment_test_hook(Arc::new(move |observed_trx_id, outcome| {
                     if observed_trx_id != trx_id {
@@ -3965,10 +3964,11 @@ pub(crate) mod tests {
                     reached_tx
                         .send(outcome)
                         .expect("terminal hook should report its boundary");
-                    hook_barrier.wait();
+                    let _ = release_rx.recv();
                 }));
 
             scope(|scope| {
+                let release_tx = release_tx;
                 let rollback = scope.spawn(move || smol::block_on(trx.rollback()));
                 let outcome = reached_rx
                     .recv_timeout(Duration::from_secs(5))
@@ -3977,7 +3977,9 @@ pub(crate) mod tests {
                 let transaction_lock_entries =
                     lock_entry_count(&engine, LockOwner::Transaction(trx_id));
 
-                terminal_barrier.wait();
+                release_tx
+                    .send(())
+                    .expect("terminal hook should remain available for release");
                 rollback.join().unwrap().unwrap();
 
                 assert_eq!(outcome, TerminalAttachmentOutcome::Rollback);

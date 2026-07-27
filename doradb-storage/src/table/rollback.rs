@@ -633,7 +633,7 @@ mod tests {
                         false,
                     )
                     .await;
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             assert_eq!(
@@ -641,7 +641,7 @@ mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             trx.rollback().await.unwrap();
 
@@ -751,7 +751,7 @@ mod tests {
                         false,
                     )
                     .await;
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             assert_eq!(
@@ -759,7 +759,7 @@ mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             trx.rollback().await.unwrap();
 

@@ -7,7 +7,7 @@ use crate::catalog::{
 use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{
     DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, MultiDomainResultExt,
-    OperationError, OperationResult, Result,
+    OperationResult, Result,
 };
 use crate::id::{SessionID, TableID, TrxID};
 use crate::lock::{
@@ -114,15 +114,6 @@ impl SessionDdlContext {
     /// Creates DDL admission context from a pinned idle session.
     #[inline]
     pub(crate) fn new(session: &SessionPin) -> OperationResult<Self> {
-        if session
-            .in_trx()
-            .change_context(OperationError::NotSupported)
-            .attach_with(|| "phase=inspect_session_lifecycle")?
-        {
-            return Err(
-                Report::new(OperationError::NotSupported).attach("implicit commit due to DDL")
-            );
-        }
         let id = session.id();
         let pool_guards = session.pool_guards();
         Ok(Self {
@@ -427,15 +418,6 @@ impl Session {
             .pin()
             .attach("operation=checkpoint_catalog")
             .disclose()?;
-        if session
-            .in_trx()
-            .attach("operation=checkpoint_catalog")
-            .disclose()?
-        {
-            return Err(Report::new(OperationError::NotSupported)
-                .attach("catalog checkpoint requires an idle session")
-                .disclose());
-        }
         session
             .engine
             .catalog()
@@ -458,15 +440,6 @@ impl Session {
             .pin()
             .attach("operation=checkpoint_catalog_and_truncate_redo_log")
             .disclose()?;
-        if session
-            .in_trx()
-            .attach("operation=checkpoint_catalog_and_truncate_redo_log")
-            .disclose()?
-        {
-            return Err(Report::new(OperationError::NotSupported)
-                .attach("combined catalog checkpoint and redo truncation requires an idle session")
-                .disclose());
-        }
         session
             .engine
             .trx_sys
@@ -487,15 +460,6 @@ impl Session {
             .pin()
             .attach("operation=truncate_redo_log")
             .disclose()?;
-        if session
-            .in_trx()
-            .attach("operation=truncate_redo_log")
-            .disclose()?
-        {
-            return Err(Report::new(OperationError::NotSupported)
-                .attach("redo log truncation requires an idle session")
-                .disclose());
-        }
         session.engine.trx_sys.truncate_redo_log().await.disclose()
     }
 
@@ -581,9 +545,6 @@ impl Session {
         max_rows: usize,
     ) -> Result<FreezeOutcome> {
         let session = self.pin().attach("operation=freeze_table").disclose()?;
-        ensure_idle_maintenance_session(&session)
-            .attach("operation=freeze_table")
-            .disclose()?;
         let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach_with(|| format!("operation=freeze_table, table_id={table_id}"))
@@ -600,9 +561,6 @@ impl Session {
     #[inline]
     pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
         let session = self.pin().attach("operation=checkpoint_table").disclose()?;
-        ensure_idle_maintenance_session(&session)
-            .attach("operation=checkpoint_table")
-            .disclose()?;
         let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
             .await
             .attach_with(|| format!("operation=checkpoint_table, table_id={table_id}"))
@@ -622,9 +580,6 @@ impl Session {
     pub async fn wait_for_checkpoint_retry(&mut self, reason: CheckpointDelayReason) -> Result<()> {
         let session = self
             .pin()
-            .attach("operation=wait_for_checkpoint_retry")
-            .disclose()?;
-        ensure_idle_maintenance_session(&session)
             .attach("operation=wait_for_checkpoint_retry")
             .disclose()?;
         let table_id = match reason {
@@ -682,9 +637,6 @@ impl Session {
             .pin()
             .attach("operation=wait_for_gc_horizon")
             .disclose()?;
-        ensure_idle_maintenance_session(&session)
-            .attach("operation=wait_for_gc_horizon")
-            .disclose()?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::GcHorizon).await
     }
 
@@ -695,9 +647,6 @@ impl Session {
     pub async fn wait_for_purge_completion_after(&self, ts: TrxID) -> Result<TrxID> {
         let session = self
             .pin()
-            .attach("operation=wait_for_purge_completion")
-            .disclose()?;
-        ensure_idle_maintenance_session(&session)
             .attach("operation=wait_for_purge_completion")
             .disclose()?;
         wait_for_maintenance_boundary(&session, ts, MaintenanceBoundary::PurgeCompletion).await
@@ -738,9 +687,6 @@ impl Session {
     ) -> Result<MemIndexCleanupOutcome> {
         let session = self
             .pin()
-            .attach("operation=cleanup_secondary_mem_indexes")
-            .disclose()?;
-        ensure_idle_maintenance_session(&session)
             .attach("operation=cleanup_secondary_mem_indexes")
             .disclose()?;
         let access = ScopedTableRuntimeAccess::acquire(&session, table_id)
@@ -833,12 +779,6 @@ impl SessionPin {
             .begin_trx(|| engine.trx_sys.begin_trx(engine, &self.state))
     }
 
-    /// Returns whether the pinned session is in an active transaction.
-    #[inline]
-    pub(crate) fn in_trx(&self) -> LifecycleResult<bool> {
-        self.state.in_trx()
-    }
-
     /// Resolve a live user table from authoritative current catalog state.
     #[inline]
     pub(crate) async fn resolve_user_table(
@@ -882,14 +822,6 @@ impl SessionPin {
     /// Releases an explicit session-lifetime table lock from this pinned session.
     #[inline]
     pub(crate) fn unlock_table(&self, table_id: TableID) -> OperationResult<()> {
-        if self
-            .in_trx()
-            .change_context(OperationError::LockUnavailable)
-            .attach_with(|| "phase=inspect_session_lifecycle")?
-        {
-            return Err(Report::new(OperationError::NotSupported)
-                .attach("unlock table while session has an active transaction"));
-        }
         let owner = LockOwner::Session(self.id());
         let lock_manager = self.engine.lock_manager();
         lock_manager.release(LockResource::TableData(table_id), owner);
@@ -1184,6 +1116,7 @@ impl SessionState {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn in_trx(&self) -> LifecycleResult<bool> {
         match &*self.lifecycle.lock() {
@@ -1573,20 +1506,6 @@ impl TrxAttachment {
     }
 }
 
-#[inline]
-fn ensure_idle_maintenance_session(session: &SessionPin) -> OperationResult<()> {
-    if session
-        .in_trx()
-        .change_context(OperationError::NotSupported)
-        .attach_with(|| "phase=inspect_session_lifecycle")?
-    {
-        return Err(
-            Report::new(OperationError::NotSupported).attach("maintenance requires idle session")
-        );
-    }
-    Ok(())
-}
-
 async fn wait_for_maintenance_boundary(
     session: &SessionPin,
     ts: TrxID,
@@ -1820,9 +1739,6 @@ pub(crate) mod tests {
     pub(crate) async fn wait_for_purge_handoff(session: &Session, ts: TrxID) -> Result<()> {
         let session = session
             .pin()
-            .attach("operation=wait_for_purge_handoff")
-            .disclose()?;
-        ensure_idle_maintenance_session(&session)
             .attach("operation=wait_for_purge_handoff")
             .disclose()?;
         let trx_sys = &session.engine.trx_sys;

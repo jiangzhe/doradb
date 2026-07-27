@@ -1195,7 +1195,7 @@ pub(crate) mod tests {
                         true,
                     );
                     set_test_force_stmt_index_rollback_error(true);
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             set_test_force_stmt_index_rollback_error(false);

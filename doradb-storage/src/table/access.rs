@@ -6588,7 +6588,7 @@ mod tests {
                     .await
                     .disclose()?;
                     assert!(matches!(res, UpdateRowInplace::RetryInTransition(_)));
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             assert_eq!(
@@ -6596,7 +6596,7 @@ mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             trx.rollback().await.unwrap();
 
@@ -6637,7 +6637,7 @@ mod tests {
                     .await
                     .disclose()?;
                     assert!(matches!(res, DeleteInternal::RetryInTransition));
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             assert_eq!(
@@ -6645,7 +6645,7 @@ mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             trx.rollback().await.unwrap();
         });
@@ -7557,7 +7557,7 @@ mod tests {
                                 idx: 1,
                                 val: Val::from("changed"),
                             }])),
-                            11 => Err(Report::new(OperationError::NotSupported).disclose()),
+                            11 => Err(Report::new(OperationError::InvalidDmlInput).disclose()),
                             _ => unreachable!(),
                         }
                     })
@@ -7571,7 +7571,7 @@ mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             assert_eq!(scan_table_pairs(&mut trx, table_id).await, expected);
             for id in [0, 1, 10, 11] {
@@ -8796,7 +8796,7 @@ mod tests {
                     drop(root_lease);
                     drop(lock_row);
                     drop(page_guard);
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             assert_eq!(
@@ -8804,7 +8804,7 @@ mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             trx.rollback().await.unwrap();
         });
@@ -9418,7 +9418,7 @@ mod tests {
                     hook_guard = Some(install_storage_backend_test_hook(hook.clone()));
                     read_hook = Some(hook);
 
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
 
