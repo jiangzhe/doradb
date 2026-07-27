@@ -4668,7 +4668,7 @@ mod tests {
 
     async fn assert_secondary_mem_entries_absent(
         engine: &Engine,
-        session: &Session,
+        session: &mut Session,
         table_id: TableID,
         unique_key: &SelectKey,
         non_unique_key: &SelectKey,
@@ -6029,7 +6029,7 @@ mod tests {
 
             assert_secondary_mem_entries_absent(
                 &engine,
-                &session,
+                &mut session,
                 table_id,
                 &unique_key,
                 &non_unique_key,
@@ -6046,7 +6046,7 @@ mod tests {
             ));
             assert_secondary_mem_entries_absent(
                 &engine,
-                &session,
+                &mut session,
                 table_id,
                 &unique_key,
                 &non_unique_key,
@@ -6062,7 +6062,7 @@ mod tests {
             );
             assert_secondary_mem_entries_absent(
                 &engine,
-                &session,
+                &mut session,
                 table_id,
                 &unique_key,
                 &non_unique_key,
@@ -6077,7 +6077,7 @@ mod tests {
             expect_delete_committed(table_id, &mut session, &unique_key).await;
             assert_secondary_mem_entries_absent(
                 &engine,
-                &session,
+                &mut session,
                 table_id,
                 &unique_key,
                 &non_unique_key,

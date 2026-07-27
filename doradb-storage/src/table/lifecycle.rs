@@ -974,7 +974,7 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
 
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
             table_for_internal_assertion(&engine, table_id)
                 .start_drop_lifecycle()
                 .unwrap()

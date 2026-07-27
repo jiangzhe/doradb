@@ -2234,7 +2234,8 @@ mod tests {
         Session,
         tests::{
             SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
-            wait_for_checkpoint_root_ready,
+            wait_for_checkpoint_root_ready, wait_for_purge_handoff,
+            wait_for_trx_change_since_async,
         },
     };
     use crate::table::checkpoint_workflow::FrozenPageValidationState;
@@ -2363,7 +2364,7 @@ mod tests {
         page_ids
     }
 
-    async fn hot_page_id_for_key(table: &Table, session: &Session, key: &SelectKey) -> PageID {
+    async fn hot_page_id_for_key(table: &Table, session: &mut Session, key: &SelectKey) -> PageID {
         let guards = session.pool_guards();
         let index = bound_unique_index(table, &guards, key.index_no);
         let (row_id, _) = index
@@ -2400,17 +2401,13 @@ mod tests {
         access.delete_row();
     }
 
-    async fn wait_session_idle(engine: &Engine, session: &Session) {
+    async fn wait_session_idle(engine: &Engine, session: &mut Session) {
         loop {
             let observed_epoch = engine.inner().session_registry.trx_change_epoch();
             if !session.in_trx().unwrap() {
                 return;
             }
-            engine
-                .inner()
-                .session_registry
-                .wait_for_trx_change_since_async(observed_epoch)
-                .await;
+            wait_for_trx_change_since_async(&engine.inner().session_registry, observed_epoch).await;
         }
     }
 
@@ -2797,11 +2794,9 @@ mod tests {
             insert_rows(table_id, &mut session, 0, row_count, &name).await;
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
             let frozen_page_count = table_for_internal_assertion(&engine, table_id)
                 .checkpoint_workflow
                 .frozen_page_ids()
@@ -2887,7 +2882,7 @@ mod tests {
             let redo_cts = session.last_cts();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             wait_for_checkpoint_purge(&session, redo_cts).await;
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
             assert_eq!(page_ids.len(), 1);
@@ -3111,7 +3106,7 @@ mod tests {
                 .file()
                 .active_root_unchecked()
                 .clone();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             set_test_force_secondary_sidecar_error(true);
             let _reset = ResetSidecarHook;
@@ -3281,7 +3276,7 @@ mod tests {
                 .put_committed(RowID::new(0), marker_ts)
                 .unwrap();
             session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_eq!(
@@ -3337,7 +3332,7 @@ mod tests {
                 .put_committed(missing_row_id, marker_ts)
                 .unwrap();
             session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let err = session.checkpoint_table(table_id).await.unwrap_err();
             assert_eq!(
@@ -3519,7 +3514,7 @@ mod tests {
             let marker2 = table.deletion_buffer().get(row_id2).unwrap();
             let marker2_ts = delete_marker_ts(marker2);
             session.wait_for_gc_horizon_after(marker2_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_delete_codec(table_file_path, entry.leaf_block_id, 0);
@@ -3589,7 +3584,7 @@ mod tests {
             let marker2 = table.deletion_buffer().get(row_id2).unwrap();
             let marker2_ts = delete_marker_ts(marker2);
             session.wait_for_gc_horizon_after(marker2_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_block_id, 0);
@@ -3623,10 +3618,8 @@ mod tests {
             let batch =
                 assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             assert!(!batch.is_empty());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
 
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(
@@ -3660,10 +3653,8 @@ mod tests {
             let batch = assert_freeze_created(session.freeze_table(table_id, 1).await.unwrap());
             assert_eq!(batch.page_count(), 1);
 
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             assert_checkpoint_published(&mut session, table_id).await;
             assert_eq!(
                 table.file().active_root_unchecked().heap_redo_start_ts,
@@ -3692,10 +3683,8 @@ mod tests {
             let successor_create_ts = *create_timestamps.last().unwrap();
             assert!(successor_create_ts > batch.frozen_ts());
 
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             assert_checkpoint_published(&mut session, table_id).await;
             assert_eq!(
                 table.file().active_root_unchecked().heap_redo_start_ts,
@@ -3716,10 +3705,8 @@ mod tests {
 
             let table = table_for_internal_assertion(&engine, table_id);
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             let checkpoint_ts = assert_checkpoint_published(&mut session, table_id).await;
             assert_eq!(
                 table.file().active_root_unchecked().heap_redo_start_ts,
@@ -3745,10 +3732,8 @@ mod tests {
             let create_timestamps =
                 hot_page_create_timestamps(&table, &session.pool_guards()).await;
             assert_eq!(create_timestamps.len(), 1);
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
 
             let checkpoint_ts = assert_checkpoint_published(&mut session, table_id).await;
             let watermark = engine
@@ -3952,7 +3937,7 @@ mod tests {
                 } else {
                     Vec::new()
                 };
-                wait_for_checkpoint_root_ready(&session, table_id).await;
+                wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
                 let (entered_tx, entered_rx) = flume::bounded(1);
                 let (_release_tx, release_rx) = flume::bounded::<()>(1);
@@ -3986,7 +3971,7 @@ mod tests {
                     let states = row_page_states(&table, &session.pool_guards()).await;
                     assert!(states.iter().all(|state| *state == RowPageState::Active));
                 }
-                wait_session_idle(&engine, &session).await;
+                wait_session_idle(&engine, &mut session).await;
                 drop(table);
                 drop(session);
                 engine.shutdown().unwrap();
@@ -4014,7 +3999,7 @@ mod tests {
             let mut later_key = None;
             for key_value in 0..200 {
                 let key = single_key(key_value);
-                let page_id = hot_page_id_for_key(&table, &setup, &key).await;
+                let page_id = hot_page_id_for_key(&table, &mut setup, &key).await;
                 if page_id == first_page_id && first_key.is_none() {
                     first_key = Some(key);
                 } else if page_id == later_page_id && later_key.is_none() {
@@ -4137,7 +4122,7 @@ mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let hook = Arc::new(FailingFirstWriteHook::new(table_file_path));
             let _install = install_storage_backend_test_hook(hook.clone());
@@ -4166,11 +4151,9 @@ mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let res = {
                 let _guard = ForcePostPublishCheckpointErrorGuard::new();
@@ -4195,10 +4178,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 8, "commit-fail").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
             let root_before = table.file().active_root_unchecked().clone();
 
@@ -4301,10 +4282,8 @@ mod tests {
             insert_rows(table_id, &mut session, 0, 120, "effective-delay").await;
 
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
                 Rc::new(RefCell::new(None));
             let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
@@ -4687,7 +4666,7 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut first_session = engine.new_session().unwrap();
-            wait_for_checkpoint_root_ready(&first_session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut first_session, table_id).await;
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
@@ -4745,11 +4724,12 @@ mod tests {
                     .await
                     .unwrap(),
             );
+            let target_ts = checkpoint_session.last_cts();
             checkpoint_session
-                .wait_for_gc_horizon_after(checkpoint_session.last_cts())
+                .wait_for_gc_horizon_after(target_ts)
                 .await
                 .unwrap();
-            wait_for_checkpoint_root_ready(&checkpoint_session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
@@ -4801,10 +4781,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             insert_rows(table_id, &mut session, 0, 8, "drop-before-admission").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
 
             let table = table_for_internal_assertion(&engine, table_id);
             let mut attempt = table
@@ -4880,8 +4858,9 @@ mod tests {
 
             release_tx.send_async(()).await.unwrap();
             assert_freeze_created(freeze.await.unwrap());
+            drop(table);
             drop_table.await.unwrap();
-            assert_checkpoint_workflow_closed(&table);
+            assert!(engine.catalog().get_table_now(table_id).is_none());
         });
     }
 
@@ -5078,11 +5057,12 @@ mod tests {
                     .await
                     .unwrap(),
             );
+            let target_ts = checkpoint_session.last_cts();
             checkpoint_session
-                .wait_for_gc_horizon_after(checkpoint_session.last_cts())
+                .wait_for_gc_horizon_after(target_ts)
                 .await
                 .unwrap();
-            wait_for_checkpoint_root_ready(&checkpoint_session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
@@ -5143,8 +5123,9 @@ mod tests {
                     .await
                     .unwrap(),
             );
+            let target_ts = checkpoint_session.last_cts();
             checkpoint_session
-                .wait_for_gc_horizon_after(checkpoint_session.last_cts())
+                .wait_for_gc_horizon_after(target_ts)
                 .await
                 .unwrap();
 
@@ -5224,7 +5205,7 @@ mod tests {
             let suffix_key = {
                 let mut suffix_key = None;
                 for key in 3..200 {
-                    if hot_page_id_for_key(&table, &frozen_foreground, &single_key(key)).await
+                    if hot_page_id_for_key(&table, &mut frozen_foreground, &single_key(key)).await
                         == frozen_page_ids[1]
                     {
                         suffix_key = Some(key);
@@ -5313,7 +5294,7 @@ mod tests {
                 assert!(hook_prefix_delete_done_rx.try_recv().is_err());
             });
             let suffix_page_id =
-                hot_page_id_for_key(&table, &frozen_foreground, &single_key(1000)).await;
+                hot_page_id_for_key(&table, &mut frozen_foreground, &single_key(1000)).await;
             assert_eq!(
                 hot_page_state(&table, &frozen_foreground.pool_guards(), suffix_page_id).await,
                 RowPageState::Active
@@ -5405,7 +5386,7 @@ mod tests {
             let redo_cts = session.last_cts();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             wait_for_checkpoint_purge(&session, redo_cts).await;
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let table = table_for_internal_assertion(&engine, table_id);
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
@@ -5479,7 +5460,7 @@ mod tests {
             let redo_cts = session.last_cts();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             wait_for_checkpoint_purge(&session, redo_cts).await;
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let table = table_for_internal_assertion(&engine, table_id);
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
@@ -5530,11 +5511,9 @@ mod tests {
             insert_rows(table_id, &mut session, 1, 20, "blocked").await;
             let batch =
                 assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let table = table_for_internal_assertion(&engine, table_id);
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
@@ -5596,11 +5575,9 @@ mod tests {
             insert_rows(table_id, &mut session, 1, 20, "blocked").await;
             let batch =
                 assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let table = table_for_internal_assertion(&engine, table_id);
             let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
@@ -5682,8 +5659,9 @@ mod tests {
                     .await
                     .unwrap(),
             );
+            let target_ts = checkpoint_session.last_cts();
             checkpoint_session
-                .wait_for_gc_horizon_after(checkpoint_session.last_cts())
+                .wait_for_gc_horizon_after(target_ts)
                 .await
                 .unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
@@ -6171,7 +6149,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut checkpoint_session = engine.new_session().unwrap();
             insert_rows(table_id, &mut checkpoint_session, 0, 8, "silent").await;
-            wait_for_checkpoint_root_ready(&checkpoint_session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
 
             assert_drop_waits_for_no_page_publication(
                 &engine,
@@ -6198,11 +6176,12 @@ mod tests {
                     .unwrap(),
             );
             assert_checkpoint_published(&mut checkpoint_session, table_id).await;
-            wait_for_checkpoint_root_ready(&checkpoint_session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
 
             expect_delete_committed(table_id, &mut checkpoint_session, &single_key(0)).await;
+            let target_ts = checkpoint_session.last_cts();
             checkpoint_session
-                .wait_for_gc_horizon_after(checkpoint_session.last_cts())
+                .wait_for_gc_horizon_after(target_ts)
                 .await
                 .unwrap();
             assert_drop_waits_for_no_page_publication(
@@ -6242,10 +6221,8 @@ mod tests {
             );
             drop(metadata_lease);
 
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             assert_checkpoint_published(&mut session, table_id).await;
             insert_rows(table_id, &mut session, 100, 1, "active").await;
             let metadata_lease = table.begin_metadata_change().await.unwrap();
@@ -6323,7 +6300,7 @@ mod tests {
         .await;
         let insert_cts = checkpoint_session.last_cts();
         wait_for_checkpoint_purge(&checkpoint_session, insert_cts).await;
-        wait_for_checkpoint_root_ready(&checkpoint_session, table_id).await;
+        wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
 
         let table = table_for_internal_assertion(&engine, table_id);
         let mut reader_session = engine.new_session().unwrap();
@@ -6345,8 +6322,7 @@ mod tests {
             panic!("checkpoint should publish, got {outcome:?}");
         };
 
-        checkpoint_session
-            .wait_for_purge_handoff_for_test(redo_cts)
+        wait_for_purge_handoff(&checkpoint_session, redo_cts)
             .await
             .unwrap();
         for page_id in &retired_page_ids {
@@ -6390,7 +6366,7 @@ mod tests {
                 evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut writer = engine.new_session().unwrap();
-            wait_for_checkpoint_root_ready(&writer, table_id).await;
+            wait_for_checkpoint_root_ready(&mut writer, table_id).await;
             let mut trx = writer.begin_trx().unwrap();
             trx_insert_row_by_id(
                 &mut trx,
@@ -6469,11 +6445,9 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut setup = engine.new_session().unwrap();
             insert_rows(table_id, &mut setup, 1, 2, "before").await;
-            setup
-                .wait_for_gc_horizon_after(setup.last_cts())
-                .await
-                .unwrap();
-            wait_for_checkpoint_root_ready(&setup, table_id).await;
+            let target_ts = setup.last_cts();
+            setup.wait_for_gc_horizon_after(target_ts).await.unwrap();
+            wait_for_checkpoint_root_ready(&mut setup, table_id).await;
 
             let mut writer1_session = engine.new_session().unwrap();
             let mut writer1 = writer1_session.begin_trx().unwrap();
@@ -6678,10 +6652,8 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut setup = engine.new_session().unwrap();
             insert_rows(table_id, &mut setup, 1, 200, &"p".repeat(1024)).await;
-            setup
-                .wait_for_gc_horizon_after(setup.last_cts())
-                .await
-                .unwrap();
+            let target_ts = setup.last_cts();
+            setup.wait_for_gc_horizon_after(target_ts).await.unwrap();
 
             let mut hold_session = engine.new_session().unwrap();
             let hold = hold_session.begin_trx().unwrap();
@@ -6695,7 +6667,9 @@ mod tests {
             let delayed_page_id = page_ids[delayed_page_idx];
             let mut delayed_key = None;
             for key in (1..201).rev() {
-                if hot_page_id_for_key(&table, &setup, &single_key(key)).await == delayed_page_id {
+                if hot_page_id_for_key(&table, &mut setup, &single_key(key)).await
+                    == delayed_page_id
+                {
                     delayed_key = Some(key);
                     break;
                 }
@@ -6709,7 +6683,7 @@ mod tests {
                 .wait_for_gc_horizon_after(hold.sts().saturating_sub(1))
                 .await
                 .unwrap();
-            wait_for_checkpoint_root_ready(&setup, table_id).await;
+            wait_for_checkpoint_root_ready(&mut setup, table_id).await;
 
             let analysis_counts = Rc::new(RefCell::new(vec![0usize; page_ids.len()]));
             let hook_page_ids = page_ids.clone();
@@ -6911,11 +6885,9 @@ mod tests {
                 .file()
                 .active_root_unchecked()
                 .clone();
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
-            wait_for_checkpoint_root_ready(&session, table_id).await;
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
             let res = {
                 let _guard = ForceLwcBuildErrorGuard::new();
@@ -6960,7 +6932,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut checkpoint_session = engine.new_session().unwrap();
 
-            wait_for_checkpoint_root_ready(&checkpoint_session, table_id).await;
+            wait_for_checkpoint_root_ready(&mut checkpoint_session, table_id).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let _metadata_lease = table.begin_metadata_change().await.unwrap();
 

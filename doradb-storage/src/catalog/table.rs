@@ -3060,7 +3060,7 @@ mod tests {
                 .unwrap()
             );
 
-            let session = engine.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let session_owner = LockOwner::Session(session.id());
             let mut lock_fut = Box::pin(session.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
@@ -3577,7 +3577,7 @@ mod tests {
                 LockDebugEntryState::Granted,
             ));
 
-            let lock_session = engine.new_session().unwrap();
+            let mut lock_session = engine.new_session().unwrap();
             let lock_owner = LockOwner::Session(lock_session.id());
             let mut lock_fut = Box::pin(lock_session.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
