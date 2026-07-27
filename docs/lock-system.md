@@ -250,7 +250,7 @@ Examples:
 
 ```text
 session X -> transaction IX     allowed
-transaction IX -> session X     conflict
+transaction IX -> session X     manager conflict if evaluated
 session S -> transaction IX     conflict
 transaction IX -> statement S   conflict
 ```
@@ -258,6 +258,10 @@ transaction IX -> statement S   conflict
 The rule is evaluated against every exact claim, not only the family's
 strongest physical mode. Another waiter in the same family cannot exist because
 the family retains exclusive lock-mutation authority while a request waits.
+The transaction-to-Session example is not a reachable public request: active
+transaction lifecycle admission returns `ExistingTransaction` before the
+Session can call the manager. It remains useful as the manager-level
+directional rule for internal modeling and invariant tests.
 
 ## Implemented Baseline
 
@@ -310,6 +314,40 @@ cleanup does not release a pre-existing explicit session grant. DDL performs a
 separate preflight rejection because the shared identity cannot otherwise
 distinguish its temporary claim from an explicit session claim. This purpose
 overloading motivates the working design's distinct DDL and maintenance scopes.
+
+### Session and transaction admission
+
+The public session lock, DDL, and mutating maintenance APIs already use
+`&mut Session`. `Session` is `Send` and `!Sync`. These type-level constraints
+serialize calls through one public session handle, but `begin_trx()` returns a
+detached `Transaction`, so the mutable borrow ends while that transaction
+remains active.
+
+The session registry closes that coexistence gap. Both normal and read-only
+runtime-backed public Session admission require `SessionLifecycle::RunningIdle`.
+`RunningActive` returns `LifecycleError::ExistingTransaction` with the session
+id, transaction id, and transaction-entry state. `Session::id()` remains a
+local observation, and `Drop` retains its nonblocking abandonment behavior.
+
+The implemented authority transition is:
+
+```text
+RunningIdle
+    -> begin_trx returns a detached Transaction
+RunningActive
+    -> commit, rollback, or abandoned cleanup releases transaction locks
+RunningIdle
+```
+
+An explicit session claim acquired before `begin_trx()` may remain held while
+the transaction owns its own claims. The Session cannot acquire, release, or
+observe runtime state again until transaction completion restores
+`RunningIdle`.
+
+DDL is an internal nesting exception, not a second public execution owner. A
+DDL call first obtains a Session pin while idle and retains its `&mut Session`
+borrow while that pin creates and completes a private catalog transaction.
+Later public Session admission cannot occur during that call.
 
 ### Wait and cancellation behavior
 
@@ -376,12 +414,13 @@ The redesign must preserve:
 6. DDL rejects explicit same-session table locks in the current behavior.
 7. Cleanup remains proportional to one exact owner's held resources.
 
-The redesign intentionally narrows one current behavior. Concurrent lock
-mutations in one session family are unsupported, so duplicate pending
-acquisitions no longer share a waiter. The proposed public session
-`lock_table()` and `unlock_table()` methods require `&mut self`, matching the
-existing transaction, DDL, and maintenance mutation APIs. A future parallel
-executor must route family lock mutations through one serial coordinator.
+The redesign intentionally narrows one current manager behavior. Concurrent
+lock mutations in one session family are unsupported, so duplicate pending
+acquisitions no longer share a waiter. Public session `lock_table()` and
+`unlock_table()` already require `&mut self`, and public admission already
+rejects every runtime-backed Session operation while its detached transaction
+is active. A future parallel executor must route family lock mutations through
+one serial coordinator.
 
 ### Proof-bound terminal cleanup ordering
 
@@ -476,7 +515,7 @@ obtain it, which proves that an earlier acquisition future completed or was
 cancelled. `LockScopeState` does not add an internal mutex, reference count, or
 close-drain lease to repair a violation of that ownership contract.
 
-The proposed explicit session-lock API reflects the contract:
+The implemented explicit session-lock API already reflects the contract:
 
 ```rust
 impl Session {
@@ -490,20 +529,42 @@ impl Session {
 }
 ```
 
-The current explicit-lock `&self` receivers are a migration input, not a
-behavior the redesign preserves. Transaction lock mutation already uses
-`&mut self`; DDL and maintenance operations already use exclusive session
-access. Operations that neither mutate session or database state nor acquire,
-convert, or release logical locks may retain `&self`. Lock-bearing observations
-such as table runtime inspection still require `&mut self`.
+Transaction lock mutation also uses `&mut self`; DDL and mutating maintenance
+operations use exclusive Session access. These receivers serialize calls
+through one handle, but do not by themselves exclude the detached
+`Transaction` returned by `begin_trx()`. Registry admission supplies that
+missing proof: every runtime-backed public Session operation, including an
+immutable diagnostic, requires `RunningIdle` and fails with
+`LifecycleError::ExistingTransaction` while the transaction is active,
+checked out, terminal, abandoned, or being cleaned up.
+
+The lifecycle transfers public family authority as follows:
+
+```text
+RunningIdle: Session may admit one public operation
+    -> begin_trx
+RunningActive: Transaction and its checkout/terminal/cleanup carriers own it
+    -> release transaction claims
+    -> finish transaction lifecycle
+RunningIdle: Session admission resumes
+```
+
+An already-admitted internal Session pin may create a private DDL catalog
+transaction while the outer `&mut Session` call remains borrowed. The normal
+path is sequential, but cancellation of the whole DDL future can queue
+transaction cleanup while DDL scope guards unwind. The later exact-family
+redesign must define a cleanup handoff that serializes those two paths before
+it relies on the single-family mutation invariant; idle-only public admission
+does not solve that internal cancellation boundary.
 
 The public `Session` handle remains movable between threads but is not
 shareable: its local closed flag uses `Cell<bool>`, making the type `Send` and
 `!Sync`. Consequently, an async lock-free read borrowing `&Session` is not a
-`Send` future. This is separate from the lock-serialization proof: mutable
-access, not the `!Sync` marker, provides exclusive family lock-mutation
-authority. If Doradb later adds parallel execution within one session, workers
-must submit lock mutations through one family coordinator.
+`Send` future. This is separate from the lock-serialization proof. Mutable
+access serializes one handle, registry admission excludes its detached
+transaction, and the future DDL cleanup handoff must cover internal nesting. If
+Doradb later adds parallel execution within one session, workers must submit
+lock mutations through one family coordinator.
 
 ### Dual indexing
 
@@ -1262,10 +1323,13 @@ independent parallel lock mutation within one family are outside this design.
 
 Session, transaction, statement, DDL, and maintenance work in one family may
 hold claims at the same time, but their lock-manager transitions are
-serialized. The proposed session explicit lock and unlock APIs require mutable
-access. Parallel workers may use protection acquired by their coordinator, but
-must send new acquisitions, conversions, releases, and cleanup through that
-single family execution owner.
+serialized. Session explicit lock and unlock already require mutable access,
+and public Session admission is idle-only while a detached transaction exists.
+Parallel workers may use protection acquired by their coordinator, but must
+send new acquisitions, conversions, releases, and cleanup through that single
+family execution owner. Internal DDL cancellation still requires the explicit
+cleanup handoff described below before the redesign may depend on this
+invariant.
 
 ### No lock escalation or weak-lock fast path
 
@@ -1376,16 +1440,36 @@ behavior and testability.
 
 Migration must:
 
-- change public session `lock_table()` and `unlock_table()` receivers from
-  `&self` to `&mut self`;
-- retain `&self` only for lock-free observation and make `Session` `Send` but
-  `!Sync`;
+- preserve the implemented `&mut self` session lock mutation APIs and
+  `Session: Send + !Sync` boundary;
+- preserve idle-only public Session admission while a transaction is active or
+  undergoing terminal/abandoned cleanup;
 - serialize lock mutation across all scopes in one family before removing
   duplicate-waiter support from the manager;
 - retain cancellation safety while pending state moves from shared waiters to
   one call-local guard; and
 - decide whether the public/internal error name `LockOwnerGroupConflict`
   remains after `LockOwnerGroup` itself is removed.
+
+### 8. Nested DDL transaction cancellation
+
+DDL obtains an idle Session pin and then starts a private catalog transaction
+inside the same `&mut Session` call. Normal execution serializes DDL-scope and
+transaction-scope mutations, but dropping the outer future can abandon the
+transaction and queue asynchronous rollback while DDL guards synchronously
+release their claims.
+
+Before the exact-family manager assumes one mutation owner per family, the RFC
+must define an ownership handoff that guarantees:
+
+- statement and pending-acquisition cancellation finishes first;
+- DDL-scope cleanup and nested transaction cleanup cannot overlap;
+- transaction claims still close before the Session becomes idle; and
+- the Session remains unavailable until all transferred cleanup completes.
+
+This handoff is a separate design stage. The implemented idle-only public
+admission is necessary, but does not by itself serialize these internal cleanup
+paths.
 
 ## Suggested Implementation Stages
 
@@ -1395,7 +1479,10 @@ These stages are a planning aid, not yet an accepted RFC plan.
 
 - Introduce `LockOwner { family, scope }`.
 - Add DDL and maintenance operation ids.
-- Change session explicit lock and unlock mutation to mutable access.
+- Preserve idle-only public Session admission and the existing mutable
+  explicit-lock APIs.
+- Define the DDL operation-guard/nested-transaction cleanup handoff before
+  declaring family cleanup serialized.
 - Serialize lock mutation across every scope in one family.
 - Add uniquely owned `LockScopeState` claim maps.
 - Route statement, transaction, session, DDL, and maintenance cleanup through
@@ -1448,8 +1535,10 @@ At minimum:
 1. Compatibility and coverage matrices for both resources.
 2. Directional same-family matrices.
 3. Session `X` covering transaction `IX`.
-4. Transaction `IX` rejecting later session `X`.
-5. `S` and `IX` rejected in both arrival orders.
+4. An active transaction rejects every runtime-backed public Session operation
+   with `LifecycleError::ExistingTransaction` before lock-manager mutation.
+5. Session `S` rejects a later transaction `IX`; the reverse public Session
+   request is rejected at lifecycle admission before reaching the manager.
 6. Exact covered reacquisition returns existing.
 7. Immediate conversion succeeds only with empty queue and external
    compatibility.
@@ -1458,11 +1547,12 @@ At minimum:
 9. Fresh-versus-existing rollback retains older claims.
 10. Statement-to-transaction handoff has no protection gap.
 11. Session explicit lock and unlock require mutable access.
-12. Lock-free session observations accept immutable access, while lock-bearing
-    observations require mutable access.
+12. Lock-free session observations accept immutable access but still require
+    idle lifecycle admission, while lock-bearing observations require mutable
+    access.
 13. `Session` remains `Send` and is not `Sync`.
 14. Session, transaction, statement, DDL, and maintenance lock mutations in one
-    family never overlap.
+    family never overlap after the DDL cleanup handoff is implemented.
 
 ### Queue and cancellation tests
 
@@ -1492,6 +1582,8 @@ At minimum:
 7. Explicit unlock followed by relock uses a new claim id.
 8. Transaction claims are absent before the session becomes idle.
 9. Abandoned session explicit cleanup runs after transaction scope cleanup.
+10. Cancelling DDL cannot overlap DDL-scope cleanup with nested transaction
+    cleanup, and public Session admission stays closed through both.
 
 ### Invariant and model tests
 

@@ -2223,9 +2223,7 @@ mod tests {
     };
     use crate::conf::TrxSysConfig;
     use crate::engine::Engine;
-    use crate::error::{
-        Error, FatalError, LifecycleError, OperationError, RuntimeError, RuntimeOrFatalError,
-    };
+    use crate::error::{Error, FatalError, LifecycleError, RuntimeError, RuntimeOrFatalError};
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
     use crate::io::install_storage_backend_test_hook;
@@ -2233,8 +2231,8 @@ mod tests {
     use crate::session::{
         Session,
         tests::{
-            SessionTestExt, assert_checkpoint_published, wait_for_checkpoint_purge,
-            wait_for_checkpoint_root_ready, wait_for_purge_handoff,
+            SessionTestExt, assert_checkpoint_published, assert_existing_transaction_error,
+            wait_for_checkpoint_purge, wait_for_checkpoint_root_ready, wait_for_purge_handoff,
             wait_for_trx_change_since_async,
         },
     };
@@ -4378,17 +4376,11 @@ mod tests {
             );
 
             let checkpoint_trx = session.begin_trx().unwrap();
+            let checkpoint_trx_id = checkpoint_trx.trx_id();
             assert!(session.in_trx().unwrap());
             let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
-            );
+            assert_existing_transaction_error(&err, session.id(), checkpoint_trx_id, "active");
             let report = format!("{err:?}");
-            assert!(
-                report.contains("maintenance requires idle session"),
-                "{report}"
-            );
             assert!(report.contains("operation=checkpoint_table"), "{report}");
             assert!(session.in_trx().unwrap());
 

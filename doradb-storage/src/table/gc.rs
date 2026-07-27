@@ -700,9 +700,7 @@ mod tests {
     use super::finish_secondary_mem_index_cleanup;
     use crate::catalog::IndexNo;
     use crate::catalog::tests::wait_for_dropped_table_floor;
-    use crate::error::{
-        DataIntegrityError, LifecycleError, OperationError, RuntimeError, RuntimeOrFatalError,
-    };
+    use crate::error::{DataIntegrityError, LifecycleError, RuntimeError, RuntimeOrFatalError};
     use crate::id::{RowID, TrxID};
     use crate::index::IndexMask;
     use crate::session::Session;
@@ -1028,11 +1026,11 @@ mod tests {
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
                 .unwrap_err();
-            let operation_error = err.report().downcast_ref::<OperationError>().copied();
+            let lifecycle_error = err.report().downcast_ref::<LifecycleError>().copied();
             let was_in_trx = session.in_trx().unwrap();
 
             let internal_err = table_for_internal_assertion(&engine, table_id)
-                .cleanup_secondary_mem_indexes(&session.pin().unwrap(), true)
+                .cleanup_secondary_mem_indexes(&session.pin_running_for_test(), true)
                 .await
                 .unwrap_err();
             let RuntimeOrFatalError::Runtime(internal_err) = internal_err else {
@@ -1040,7 +1038,7 @@ mod tests {
             };
 
             trx.rollback().await.unwrap();
-            assert_eq!(operation_error, Some(OperationError::NotSupported));
+            assert_eq!(lifecycle_error, Some(LifecycleError::ExistingTransaction));
             assert_eq!(*internal_err.current_context(), RuntimeError::TableAccess);
             assert_eq!(
                 internal_err.downcast_ref::<LifecycleError>().copied(),

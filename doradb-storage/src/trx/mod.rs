@@ -2470,8 +2470,8 @@ pub(crate) mod tests {
         Session,
         tests::{
             SessionTestExt, TerminalAttachmentOutcome, TerminalAttachmentTestHookGuard,
-            finish_trx_rollback_for_test, install_terminal_attachment_test_hook,
-            session_registry_len,
+            assert_existing_transaction_error, finish_trx_rollback_for_test,
+            install_terminal_attachment_test_hook, session_registry_len,
         },
     };
     use crate::table::test_user_table_id;
@@ -2488,7 +2488,7 @@ pub(crate) mod tests {
     use std::io::Error as IoError;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, mpsc};
     use std::thread::{scope, sleep, spawn};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -3934,6 +3934,60 @@ pub(crate) mod tests {
 
             drop(hook);
             session.begin_trx().unwrap().rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_admission_waits_for_terminal_lifecycle_finish() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_session_admission_terminal_boundary").await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+            assert!(
+                try_acquire_transaction_lock(
+                    &mut trx,
+                    LockResource::TableData(TableID::new(91_513)),
+                    LockMode::IntentExclusive,
+                )
+                .unwrap()
+            );
+
+            let (reached_tx, reached_rx) = mpsc::channel();
+            let terminal_barrier = Arc::new(Barrier::new(2));
+            let hook_barrier = Arc::clone(&terminal_barrier);
+            let hook =
+                install_terminal_attachment_test_hook(Arc::new(move |observed_trx_id, outcome| {
+                    if observed_trx_id != trx_id {
+                        return;
+                    }
+                    reached_tx
+                        .send(outcome)
+                        .expect("terminal hook should report its boundary");
+                    hook_barrier.wait();
+                }));
+
+            scope(|scope| {
+                let rollback = scope.spawn(move || smol::block_on(trx.rollback()));
+                let outcome = reached_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("rollback should reach the terminal attachment boundary");
+                let admission = session.list_table_ids();
+                let transaction_lock_entries =
+                    lock_entry_count(&engine, LockOwner::Transaction(trx_id));
+
+                terminal_barrier.wait();
+                rollback.join().unwrap().unwrap();
+
+                assert_eq!(outcome, TerminalAttachmentOutcome::Rollback);
+                assert_eq!(transaction_lock_entries, 0);
+                let err = admission.unwrap_err();
+                assert_existing_transaction_error(&err, session_id, trx_id, "rolling_back");
+            });
+
+            drop(hook);
+            assert!(session.list_table_ids().is_ok());
         });
     }
 

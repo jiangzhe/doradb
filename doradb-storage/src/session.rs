@@ -252,7 +252,10 @@ impl Drop for ScopedTableRuntimeAccess<'_> {
 /// the registry-owned state for one operation, and release registry/admission
 /// guards before async work. A session may move between threads but cannot be
 /// shared between them. Lock-free observations use shared access; state
-/// mutation and every logical-lock transition require mutable access.
+/// mutation and every logical-lock transition require mutable access. Every
+/// runtime-backed public operation requires the registry lifecycle to be idle;
+/// a detached active transaction makes the Session unavailable until terminal
+/// or abandoned cleanup finishes.
 pub struct Session {
     id: SessionID,
     engine: WeakEngineRef,
@@ -280,7 +283,7 @@ impl Session {
         self.id
     }
 
-    /// Returns a pinned operation view of this session.
+    /// Returns a pinned operation view of this idle session.
     #[inline]
     pub(crate) fn pin(&self) -> LifecycleResult<SessionPin> {
         if self.closed.get() {
@@ -294,7 +297,7 @@ impl Session {
         let admission = engine
             .acquire_admission()
             .attach_with(|| format!("session_id={}", self.id))?;
-        let state = engine.session_registry.pin_running(self.id)?;
+        let state = engine.session_registry.pin_idle(self.id)?;
         drop(admission);
         Ok(SessionPin { engine, state })
     }
@@ -312,7 +315,7 @@ impl Session {
         engine.ensure_admission_open_for_query().attach_with(|| {
             format!("session_id={}, phase=check_engine_query_admission", self.id)
         })?;
-        let state = engine.session_registry.pin_running(self.id)?;
+        let state = engine.session_registry.pin_idle(self.id)?;
         Ok(SessionQueryPin {
             engine,
             _state: state,
@@ -931,15 +934,15 @@ impl SessionRegistry {
         Session::new(WeakEngineRef::new(engine), id)
     }
 
-    /// Pin a running session state for one operation.
+    /// Pin an idle session state for one public operation.
     #[inline]
-    pub(crate) fn pin_running(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
+    pub(crate) fn pin_idle(&self, id: SessionID) -> LifecycleResult<Arc<SessionState>> {
         let state = self.session_state(id).ok_or_else(|| {
             Report::new(LifecycleError::SessionUnavailable)
                 .attach(format!("session_id={id}, reason=session_missing"))
         })?;
         state
-            .ensure_running()
+            .ensure_idle()
             .attach_with(|| format!("session_id={id}"))?;
         Ok(state)
     }
@@ -1170,9 +1173,10 @@ impl SessionState {
     }
 
     #[inline]
-    fn ensure_running(&self) -> LifecycleResult<()> {
+    fn ensure_idle(&self) -> LifecycleResult<()> {
         match &*self.lifecycle.lock() {
-            SessionLifecycle::RunningIdle | SessionLifecycle::RunningActive { .. } => Ok(()),
+            SessionLifecycle::RunningIdle => Ok(()),
+            SessionLifecycle::RunningActive { entry } => Err(self.active_transaction_err(entry)),
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
             | SessionLifecycle::Closed => Err(Report::new(LifecycleError::SessionUnavailable)
@@ -1638,8 +1642,7 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
-        DataIntegrityError, Error, ErrorKind, FatalError, LifecycleError, OperationError,
-        RuntimeError,
+        DataIntegrityError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
     };
     use crate::io::install_storage_backend_test_hook;
     use crate::log::LogSync;
@@ -1647,6 +1650,7 @@ pub(crate) mod tests {
     use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
     use crate::table::tests::{
         FailingFirstWriteHook, assert_freeze_created, lightweight_test_engine_config,
+        lock_entry_count,
     };
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
@@ -2085,11 +2089,40 @@ pub(crate) mod tests {
         )
     }
 
+    fn test_session_runtime(session: &Session) -> LifecycleResult<(EngineRef, Arc<SessionState>)> {
+        if session.closed.get() {
+            return Err(Report::new(LifecycleError::SessionUnavailable)
+                .attach(format!("session_id={}", session.id)));
+        }
+        let engine = session
+            .engine
+            .upgrade()
+            .attach_with(|| format!("session_id={}, phase=upgrade_engine_runtime", session.id))?;
+        engine.ensure_admission_open_for_query().attach_with(|| {
+            format!(
+                "session_id={}, phase=check_engine_query_admission",
+                session.id
+            )
+        })?;
+        let state = engine
+            .session_registry
+            .session_state(session.id)
+            .ok_or_else(|| {
+                Report::new(LifecycleError::SessionUnavailable)
+                    .attach(format!("session_id={}, reason=session_missing", session.id))
+            })?;
+        state
+            .in_trx()
+            .attach_with(|| format!("session_id={}", session.id))?;
+        Ok((engine, state))
+    }
+
     pub(crate) trait SessionTestExt {
         fn in_trx(&self) -> Result<bool>;
         fn pool_guards(&self) -> PoolGuards;
         fn engine(&self) -> EngineRef;
         fn last_cts(&self) -> TrxID;
+        fn pin_running_for_test(&self) -> SessionPin;
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID>;
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID);
     }
@@ -2097,13 +2130,11 @@ pub(crate) mod tests {
     impl SessionTestExt for Session {
         #[inline]
         fn in_trx(&self) -> Result<bool> {
-            const OPERATION: &str = "test_query_pin_transaction_state";
-            let session = self
-                .query_pin()
+            const OPERATION: &str = "test_inspect_transaction_state";
+            let (_, state) = test_session_runtime(self)
                 .attach_with(|| format!("operation={OPERATION}"))
                 .disclose()?;
-            session
-                ._state
+            state
                 .in_trx()
                 .attach_with(|| format!("operation={OPERATION}, session_id={}", self.id))
                 .disclose()
@@ -2111,39 +2142,151 @@ pub(crate) mod tests {
 
         #[inline]
         fn pool_guards(&self) -> PoolGuards {
-            self.pin()
+            test_session_runtime(self)
                 .expect("test session must be running")
-                .state
+                .1
                 .pool_guards()
                 .clone()
         }
 
         #[inline]
         fn engine(&self) -> EngineRef {
-            self.pin().expect("test session must be running").engine
+            test_session_runtime(self)
+                .expect("test session must be running")
+                .0
         }
 
         #[inline]
         fn last_cts(&self) -> TrxID {
-            let session = self.pin().expect("test session must be running");
-            TrxID::new(session.state.last_cts.load(Ordering::SeqCst))
+            let (_, state) = test_session_runtime(self).expect("test session must be running");
+            TrxID::new(state.last_cts.load(Ordering::SeqCst))
+        }
+
+        #[inline]
+        fn pin_running_for_test(&self) -> SessionPin {
+            let (engine, state) = test_session_runtime(self).expect("test session must be running");
+            SessionPin { engine, state }
         }
 
         #[inline]
         fn load_active_insert_page(&mut self, table_id: TableID) -> Option<VersionedPageID> {
-            self.pin()
+            test_session_runtime(self)
                 .expect("test session must be running")
-                .state
+                .1
                 .load_active_insert_page(table_id)
         }
 
         #[inline]
         fn save_active_insert_page(&mut self, table_id: TableID, page_id: VersionedPageID) {
-            self.pin()
+            test_session_runtime(self)
                 .expect("test session must be running")
-                .state
+                .1
                 .save_active_insert_page(table_id, page_id);
         }
+    }
+
+    pub(crate) fn assert_existing_transaction_error(
+        err: &Error,
+        session_id: SessionID,
+        trx_id: TrxID,
+        state: &str,
+    ) {
+        assert_eq!(err.kind(), ErrorKind::Lifecycle);
+        assert_eq!(
+            err.report().downcast_ref::<LifecycleError>().copied(),
+            Some(LifecycleError::ExistingTransaction)
+        );
+        let diagnostic = format!("{:?}", err.report());
+        assert!(diagnostic.contains(&format!("session_id={session_id}")));
+        assert!(diagnostic.contains(&format!("trx_id={trx_id}")));
+        assert!(diagnostic.contains(&format!("state={state}")));
+    }
+
+    #[test]
+    fn test_active_transaction_rejects_every_runtime_backed_session_operation() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let table_id = table1(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+            let table_ids_before = engine.catalog().list_user_table_ids_now();
+
+            macro_rules! assert_rejected {
+                ($result:expr) => {
+                    match $result {
+                        Ok(_) => panic!(
+                            "active transaction unexpectedly admitted session operation: {}",
+                            stringify!($result)
+                        ),
+                        Err(err) => {
+                            assert_existing_transaction_error(&err, session_id, trx_id, "active");
+                        }
+                    }
+                };
+            }
+
+            assert_eq!(session.id(), session_id);
+            assert_rejected!(session.list_table_ids());
+            assert_rejected!(session.begin_trx());
+            assert_rejected!(session.close().await);
+            assert_rejected!(
+                session
+                    .create_table(
+                        TableSpec::new(vec![ColumnSpec::new(
+                            "id",
+                            ValKind::I32,
+                            ColumnAttributes::empty(),
+                        )]),
+                        vec![],
+                    )
+                    .await
+            );
+            assert_rejected!(
+                session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty(),),
+                    )
+                    .await
+            );
+            assert_rejected!(session.drop_index(table_id, 0).await);
+            assert_rejected!(session.drop_table(table_id).await);
+            assert_rejected!(session.checkpoint_catalog().await);
+            assert_rejected!(session.checkpoint_catalog_and_truncate_redo_log().await);
+            assert_rejected!(session.truncate_redo_log().await);
+            assert_rejected!(session.transaction_system_stats());
+            assert_rejected!(session.storage_io_stats());
+            assert_rejected!(session.buffer_pool_stats());
+            assert_rejected!(session.freeze_table(table_id, usize::MAX).await);
+            assert_rejected!(session.checkpoint_table(table_id).await);
+            assert_rejected!(
+                session
+                    .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
+                        table_id,
+                        effective_ts: TrxID::new(0),
+                        min_active_sts: TrxID::new(0),
+                    })
+                    .await
+            );
+            assert_rejected!(session.checkpoint_table_with_wait(table_id).await);
+            assert_rejected!(session.wait_for_gc_horizon_after(TrxID::new(0)).await);
+            assert_rejected!(session.wait_for_purge_completion_after(TrxID::new(0)).await);
+            assert_rejected!(session.total_row_pages(table_id).await);
+            assert_rejected!(session.cleanup_secondary_mem_indexes(table_id, true).await);
+            assert_rejected!(session.lock_table(table_id, TableLockMode::Exclusive).await);
+            assert_rejected!(session.unlock_table(table_id));
+
+            assert_eq!(lock_entry_count(&engine, LockOwner::Session(session_id)), 0);
+            assert_eq!(engine.catalog().list_user_table_ids_now(), table_ids_before);
+
+            trx.rollback().await.unwrap();
+            assert_eq!(session.list_table_ids().unwrap(), table_ids_before);
+        });
     }
 
     #[test]
@@ -2364,8 +2507,8 @@ pub(crate) mod tests {
 
             let err = session.checkpoint_catalog().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
 
             trx.rollback().await.unwrap();
@@ -2436,9 +2579,9 @@ pub(crate) mod tests {
             assert_eq!(
                 horizon_err
                     .report()
-                    .downcast_ref::<OperationError>()
+                    .downcast_ref::<LifecycleError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(LifecycleError::ExistingTransaction)
             );
             let retry_err = active_session
                 .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
@@ -2449,8 +2592,8 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                retry_err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                retry_err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
             trx.rollback().await.unwrap();
         });
@@ -2510,8 +2653,8 @@ pub(crate) mod tests {
 
             let err = session.truncate_redo_log().await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
 
             trx.rollback().await.unwrap();
@@ -2533,8 +2676,8 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
 
             trx.rollback().await.unwrap();
