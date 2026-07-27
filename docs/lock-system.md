@@ -47,23 +47,27 @@ The working design separates:
    resource.
 2. **Exact logical ownership**: one claim per session, transaction, statement,
    DDL operation, or maintenance operation.
-3. **Pending acquisition identity**: one FIFO waiter per exact owner, with
-   duplicate subscribers allowed only for that exact owner.
+3. **Serialized family execution**: one lock acquisition, release, conversion,
+   or cleanup operation at a time for all scopes in one session family.
+4. **Pending acquisition identity**: one call-local cancellation guard for the
+   family's optional FIFO waiter.
 
 The two primary indexes become:
 
 ```text
-scope/owner side                         resource side
-----------------                         -------------
+owner-lifecycle side                     manager/resource side
+--------------------                     ---------------------
 LockScopeState                           ResourceState
-└── resource -> OwnerResourceCell        └── family -> FamilyResourceState
+└── resource -> ScopeClaim               └── family -> FamilyResourceState
                                               ├── optional physical holder
                                               ├── exact claims
-                                              └── exact queued waiters
+                                              └── optional queued waiter
 ```
 
 The scope index provides targeted cleanup. The resource index provides conflict
 arbitration, FIFO queueing, physical family aggregation, and diagnostics.
+Different families remain concurrent. Within one family, the session execution
+owner retains exclusive lock-mutation authority across `.await`.
 
 The intended result is:
 
@@ -72,8 +76,8 @@ The intended result is:
 - `O(K)` work to promote `K` actual waiters;
 - cleanup proportional to one scope's indexed resources rather than the whole
   lock table; and
-- preservation of the current coverage, conversion, FIFO, cancellation, and
-  same-session semantics.
+- preservation of coverage, conversion, FIFO, cancellation, and same-session
+  claim semantics under the serialized family contract.
 
 ## Why Doradb Needs Logical Locks
 
@@ -229,9 +233,9 @@ inside the same family.
 ### Different owners in one family
 
 Same-session owners are not generally conflict-free. For a request `R` from
-exact owner `O`, every provisional or held claim and every queued waiter from a
-different owner in the same family must cover `R`. Otherwise the request
-returns the current `LockOwnerGroupConflict` error.
+exact owner `O`, every held claim from a different owner in the same family must
+cover `R`. Otherwise the request returns the current `LockOwnerGroupConflict`
+error.
 
 For table data, this produces:
 
@@ -251,8 +255,9 @@ session S -> transaction IX     conflict
 transaction IX -> statement S   conflict
 ```
 
-The rule is evaluated against every exact claim and waiter, not only the
-family's strongest physical mode.
+The rule is evaluated against every exact claim, not only the family's
+strongest physical mode. Another waiter in the same family cannot exist because
+the family retains exclusive lock-mutation authority while a request waits.
 
 ## Implemented Baseline
 
@@ -304,7 +309,7 @@ reuse `LockOwner::Session` and rely on fresh-versus-existing guards so scoped
 cleanup does not release a pre-existing explicit session grant. DDL performs a
 separate preflight rejection because the shared identity cannot otherwise
 distinguish its temporary claim from an explicit session claim. This purpose
-overloading motivates the working design's DDL and maintenance scope ids.
+overloading motivates the working design's distinct DDL and maintenance scopes.
 
 ### Wait and cancellation behavior
 
@@ -366,16 +371,23 @@ The redesign must preserve:
 1. FIFO-compatible prefix granting.
 2. A fresh compatible request waits behind an older incompatible waiter.
 3. A covering granted same-family claim may permit queue bypass.
-4. A covering queued same-family waiter validates a request but does not permit
-   bypass.
-5. Exact-owner duplicate waiters share without changing the queued mode.
-6. Stronger waiting requests do not rewrite an earlier waiter.
-7. Blocking conversion is unsupported.
-8. Cancellation after promotion but before observation cannot leak a grant.
-9. DDL rejects explicit same-session table locks in the current behavior.
-10. Cleanup wakes acquisitions with `LockWaiterReleased`.
+4. Blocking conversion is unsupported.
+5. Cancellation after promotion but before observation cannot leak a grant.
+6. DDL rejects explicit same-session table locks in the current behavior.
+7. Cleanup remains proportional to one exact owner's held resources.
+
+The redesign intentionally narrows one current behavior. Concurrent lock
+mutations in one session family are unsupported, so duplicate pending
+acquisitions no longer share a waiter. The proposed public session
+`lock_table()` and `unlock_table()` methods require `&mut self`, matching the
+existing transaction, DDL, and maintenance mutation APIs. A future parallel
+executor must route family lock mutations through one serial coordinator.
 
 ### Proof-bound terminal cleanup ordering
+
+Implemented [task 000242](./tasks/000242-enforce-terminal-transaction-lock-release-ordering.md)
+made transaction-lock release a structural prerequisite of terminal session
+completion.
 
 Every terminal user-transaction path drains its owner-local `OwnerLockState`
 before finishing the session transaction lifecycle. Transaction code mints one
@@ -419,13 +431,13 @@ The separate owner and owner-group concepts become one exact identity:
 
 ```rust
 struct LockOwner {
-    family: LockFamilyId,
-    scope: LockScopeId,
+    family: LockFamily,
+    scope: LockScope,
 }
 
-struct LockFamilyId(SessionID);
+struct LockFamily(SessionID);
 
-enum LockScopeId {
+enum LockScope {
     SessionExplicit,
     Transaction(TrxID),
     Statement {
@@ -438,29 +450,87 @@ enum LockScopeId {
 ```
 
 `LockOwner` is used for claims, waiters, cleanup, tokens, diagnostics, and
-purpose-specific policy. `LockFamilyId` is used for physical conflict
+purpose-specific policy. `LockFamily` is used for physical conflict
 aggregation and same-session policy.
 
 Constructors must enforce that transaction and statement ids belong to the
 declared session family. DDL and maintenance operation ids must be unique for
 the engine lifetime.
 
+### Serialized family ownership
+
+One logical execution owner has lock-mutation authority for a `LockFamily`.
+That authority covers every session, transaction, statement, DDL, and
+maintenance scope in the family. At most one acquisition, release, conversion,
+or scope cleanup may be active in the family, including while an acquisition
+awaits an external blocker.
+
+This is not OS-thread affinity. A lock-mutating operation holding mutable
+session access, transaction checkout, statement borrow, or operation guard may
+move between executor threads while retaining exclusive authority. Different
+families continue to execute concurrently.
+
+The outer lifecycle owns and transfers this authority. Session teardown,
+transaction completion, statement drop, and operation-guard cleanup must first
+obtain it, which proves that an earlier acquisition future completed or was
+cancelled. `LockScopeState` does not add an internal mutex, reference count, or
+close-drain lease to repair a violation of that ownership contract.
+
+The proposed explicit session-lock API reflects the contract:
+
+```rust
+impl Session {
+    pub async fn lock_table(
+        &mut self,
+        table_id: TableID,
+        mode: TableLockMode,
+    ) -> Result<()>;
+
+    pub fn unlock_table(&mut self, table_id: TableID) -> Result<()>;
+}
+```
+
+The current explicit-lock `&self` receivers are a migration input, not a
+behavior the redesign preserves. Transaction lock mutation already uses
+`&mut self`; DDL and maintenance operations already use exclusive session
+access. Operations that neither mutate session or database state nor acquire,
+convert, or release logical locks may retain `&self`. Lock-bearing observations
+such as table runtime inspection still require `&mut self`.
+
+The public `Session` handle remains movable between threads but is not
+shareable: its local closed flag uses `Cell<bool>`, making the type `Send` and
+`!Sync`. Consequently, an async lock-free read borrowing `&Session` is not a
+`Send` future. This is separate from the lock-serialization proof: mutable
+access, not the `!Sync` marker, provides exclusive family lock-mutation
+authority. If Doradb later adds parallel execution within one session, workers
+must submit lock mutations through one family coordinator.
+
 ### Dual indexing
 
 The design maintains both directions:
 
 ```text
-LockScopeState
-    owner -> resources acquired or being acquired
+session/transaction/statement/operation runtime
+└── LockScopeState(owner)
+    └── resource -> ScopeClaim
 
-ResourceState
-    resource -> families -> exact claims and waiters
+LockManager
+└── resource -> ResourceState
+    └── family -> exact claims and optional waiter
+
+active acquisition call
+└── PendingAcquireGuard -> waiter or fresh claim
 ```
 
 Neither index replaces the other:
 
-- scope state makes cleanup targeted and closes acquisition admission;
+- scope state makes granted-claim lookup and cleanup targeted;
 - resource state makes conflict checks and FIFO transitions atomic.
+
+The lifecycle object for an exact owner owns its `LockScopeState` exclusively.
+The manager does not retain another strong reference to the scope. Pending
+state belongs to the active acquisition call until it either transfers a
+granted claim into the scope or cancels.
 
 ### One physical holder, multiple exact claims
 
@@ -470,89 +540,88 @@ For one `(resource, family)`:
 FamilyResourceState
 ├── zero or one physical holder
 ├── zero or more provisional/held exact-owner claims
-└── zero or more queued exact-owner waiters
+└── zero or one queued exact-owner waiter
 ```
 
 Only the physical holder is collapsed. Exact claims retain their lifetime and
-purpose. Exact waiters retain their FIFO position.
+purpose. A waiter retains its FIFO position and excludes another lock mutation
+from the same family until it completes or is cancelled.
 
 ## Core Data Structures
 
 The following structures describe the working direction. Names and integer
 widths remain open to implementation refinement.
 
-### Scope state and owner-resource cell
+### Ownership and access path
+
+There is one `LockScopeState` for each exact `LockOwner`. It is the
+authoritative owner-side index of accepted claims, not a best-effort cache.
+Cleanup relies on it to find every held resource without scanning unrelated
+resources.
+
+The expected lifecycle owners are:
+
+| Lock scope | Owner-side location | Close boundary |
+|---|---|---|
+| `SessionExplicit` | session runtime state | session teardown; explicit unlock removes selected claims |
+| `Transaction` | transaction state and its completion carrier | after commit publication or rollback effects, before the session becomes idle |
+| `Statement` | statement or streaming-statement state | statement completion or drop |
+| `Ddl` | one DDL operation guard | DDL success or failure |
+| `Maintenance` | one maintenance operation guard | maintenance success or failure |
+
+`LockScopeState` replaces and generalizes the current owner-local
+`OwnerLockState`. In particular, it gives session explicit locks, DDL, and
+maintenance the same targeted cleanup mechanism already used by transactions
+and statements.
+
+An acquisition borrows the family execution authority and target scope
+exclusively across `.await`. A pending request is therefore not inserted into
+the scope map. Its call-local guard owns the waiter token and completion. When
+promotion is observed, the guard first adopts the provisional claim and then
+transfers the resulting claim token into the scope map. Dropping the guard
+before transfer cancels a queued waiter or releases a promoted but unobserved
+claim.
+
+Scope cleanup begins only after the active family operation has completed or
+been cancelled. It consumes the uniquely owned scope and releases its accepted
+claims. There is no concurrent closer or pending scope entry to reconcile.
+
+The normal access path is:
+
+```text
+exclusive family operation
+    -> inspect the exact scope's claim map
+    -> perform one synchronous LockManager resource transition
+    -> return a fresh claim, or create a call-local waiter guard
+    -> await WaitCompletion without manager mutexes
+    -> adopt the provisional claim
+    -> transfer the accepted claim into LockScopeState
+
+scope close
+    -> consume LockScopeState after no family operation remains
+    -> release every indexed claim
+    -> return the lifecycle-specific completion proof when required
+```
+
+### Scope-owned claims
 
 ```rust
 struct LockScopeState {
     owner: LockOwner,
-
-    // Makes close idempotent and ensures only one caller drains the scope.
-    close_gate: Mutex<()>,
-
-    inner: Mutex<LockScopeInner>,
+    claims: FastHashMap<LockResource, ScopeClaim>,
 }
 
-struct LockScopeInner {
-    lifecycle: ScopeLifecycle,
-    resources: FastHashMap<LockResource, Arc<OwnerResourceCell>>,
-}
-
-enum ScopeLifecycle {
-    Open,
-    Closing,
-    Closed,
-}
-
-struct OwnerResourceCell {
-    resource: LockResource,
-    state: Mutex<OwnerAcquireState>,
-}
-
-enum OwnerAcquireState {
-    Vacant {
-        generation: u64,
-    },
-    Pending {
-        waiter_token: WaiterToken,
-        completion: Arc<WaitCompletion>,
-        target_mode: LockMode,
-        generation: u64,
-        subscribers: FastHashSet<SubscriberID>,
-    },
-    Granted {
-        claim_token: ClaimToken,
-        mode: LockMode,
-        generation: u64,
-    },
-    Closed {
-        generation: u64,
-    },
+struct ScopeClaim {
+    claim_token: ClaimToken,
+    mode: LockMode,
 }
 ```
 
-A cell is inserted before the manager transition begins. No scope or cell mutex
-is retained across `.await`.
-
-The simplest correct first implementation retains `Vacant` cells in the scope
-map until the scope closes. This prevents an acquisition holding an older
-`Arc<OwnerResourceCell>` from creating a claim after the cell was removed from
-the reverse index. The memory and cleanup cost of retained vacant cells is an
-explicit open question.
-
-State transitions include:
-
-```text
-Vacant  -> Pending
-Vacant  -> Granted
-Pending -> Granted
-Pending -> Vacant   // last subscription cancels
-Granted -> Vacant   // explicit resource release
-any     -> Closed   // scope cleanup
-```
-
-Every transition back to `Vacant`, and every transition to `Closed`, advances
-the local generation.
+The map contains only accepted claims. Releasing or explicitly unlocking one
+resource removes its entry. Closing a scope consumes the map; lifecycle owners
+that need idempotent cleanup store the scope in an `Option` and take it once.
+The transaction close path may evolve this consumption into the closed-scope
+proof that replaces `ReleasedTransactionLocks`.
 
 ### Resource and family state
 
@@ -564,7 +633,7 @@ struct ResourceState {
     granted_counts: [u32; MODE_COUNT],
     grant_mask: ModeMask,
 
-    families: FastHashMap<LockFamilyId, FamilyResourceState>,
+    families: FastHashMap<LockFamily, FamilyResourceState>,
     wait_queue: WaitQueue,
 }
 
@@ -575,13 +644,17 @@ struct FamilyResourceState {
     claim_counts: [u32; MODE_COUNT],
     claim_mask: ModeMask,
 
-    queued_waiters: FastHashMap<LockOwner, WaiterToken>,
-    queued_waiter_counts: [u32; MODE_COUNT],
-    queued_waiter_mask: ModeMask,
+    queued_waiter: Option<FamilyWaiter>,
 }
 
 struct FamilyHolder {
     physical_mode: LockMode,
+}
+
+struct FamilyWaiter {
+    owner: LockOwner,
+    target_mode: LockMode,
+    waiter_token: WaiterToken,
 }
 
 struct ClaimRecord {
@@ -598,17 +671,19 @@ enum ClaimPhase {
 }
 ```
 
-The per-mode family counts avoid scanning all exact claims and waiters during
-directional admission or holder recomputation. The maps remain necessary for
-exact lookup, token validation, DDL policy, cleanup, and diagnostics.
+The per-mode claim counts avoid scanning all exact claims during directional
+admission or holder recomputation. The exact claim map remains necessary for
+lookup, token validation, DDL policy, cleanup, and diagnostics. The optional
+waiter provides direct token validation and diagnostics without supporting
+multiple in-flight operations in one family.
 
-`FamilyResourceState` exists while it has any queued waiter or any provisional
+`FamilyResourceState` exists while it has an optional waiter or any provisional
 or held claim. It is removed only when all three are absent:
 
 ```text
 holder == None
 claims.is_empty()
-queued_waiters.is_empty()
+queued_waiter == None
 ```
 
 ### Persistent waiter state
@@ -645,7 +720,6 @@ struct WaitCompletion {
 enum WaitOutcome {
     Waiting,
     Promoted,
-    Released,
 }
 ```
 
@@ -653,8 +727,8 @@ Promotion detaches a node from the FIFO links but does not reclaim its slab
 slot. The node remains addressable until the provisional claim is observed or
 cancelled.
 
-The completion has independent `Arc` lifetime, so subscribers can observe a
-terminal outcome after the manager reclaims the node.
+The completion has independent `Arc` lifetime, so the acquisition guard can
+listen without borrowing the queue node or retaining resource synchronization.
 
 ### Resource-qualified tokens
 
@@ -683,120 +757,106 @@ reset when a family or resource entry is removed. A stale claim token therefore
 cannot release a later claim by the same exact owner on the same resource.
 
 All identity and generation counters, including resource incarnations, claim
-ids, slab-slot generations, and local cell generations, must use checked
-arithmetic and define an explicit fatal invariant response on exhaustion.
+ids, and slab-slot generations, must use checked arithmetic and define an
+explicit fatal invariant response on exhaustion.
 
-### Per-call acquisition subscription
+### Call-local pending acquisition
 
-Each caller waiting on a shared exact-owner request retains its own
-subscription:
+One call-local guard owns a waiting acquisition:
 
 ```rust
-struct AcquireSubscription {
-    cell: Arc<OwnerResourceCell>,
-    waiter_token: WaiterToken,
-    completion: Arc<WaitCompletion>,
-    cell_generation: u64,
-    subscriber_id: SubscriberID,
-    active: bool,
+struct PendingAcquireGuard<'manager> {
+    manager: &'manager LockManager,
+    state: Option<PendingAcquireState>,
+}
+
+enum PendingAcquireState {
+    Waiting {
+        waiter_token: WaiterToken,
+        completion: Arc<WaitCompletion>,
+    },
+    Granted {
+        claim_token: ClaimToken,
+        mode: LockMode,
+    },
 }
 ```
 
-`subscriber_id` is unique among subscriptions in one pending cell generation.
-The cell generation makes reuse in a later pending generation safe. Dropping an
-active subscription removes only that subscriber; it reaches manager
-cancellation only when it removed the last subscriber.
+Observation changes the guard from `Waiting` to `Granted` before the waiter node
+is reclaimed. The guard is disarmed only after the `ScopeClaim` is inserted.
+Dropping it in `Waiting` cancels the queued or provisional waiter; dropping it
+in `Granted` releases the fresh claim. Immediate fresh grants use the same
+claim-before-transfer discipline.
 
 ## Core Operations
 
-### 1. Admit an owner resource cell
+### 1. Begin an exclusive family acquisition
 
-Acquisition first takes the scope mutex:
+The caller holds exclusive family execution authority and mutable access to the
+target `LockScopeState` for the entire operation. It first checks the scope's
+claim map.
 
-```text
-scope must be Open
-find or insert resource cell
-clone cell Arc
-release scope mutex
-```
-
-Publishing `Closing` prevents new cell insertion. An acquisition that already
-obtained a cell serializes with cleanup through the cell mutex.
-
-### 2. Reentrant exact-owner acquisition
-
-When the cell is `Granted(H)`:
+When an existing claim has mode `H`:
 
 1. If `H` covers the requested mode, return the existing claim locally.
 2. If the requested mode covers `H`, attempt immediate conversion.
 3. If neither covers the other, return `LockConversionNotSupported`.
 
-The common covered path does not enter shared resource state.
+The common covered path does not enter shared resource state. If the scope has
+no claim, acquisition enters one synchronous manager transition. Finding an
+existing queued waiter for the same family is an invariant violation because
+the waiting call still owns the family execution authority.
 
-### 3. Fresh immediate acquisition
+### 2. Fresh immediate acquisition
 
-For a `Vacant` cell:
+For a fresh request:
 
 1. Lock the resource state.
 2. Check purpose-specific policy such as DDL versus `SessionExplicit`.
-3. Validate every different-owner same-family claim and waiter using the family
-   mode counts/masks.
-4. Check external compatibility using physical-holder counts/masks.
-5. Apply FIFO policy.
-6. If immediately grantable:
+3. Assert that the family has no queued waiter or provisional claim.
+4. Validate every different-owner same-family held claim using the family
+   claim counts/mask.
+5. Check external compatibility using physical-holder counts/masks.
+6. Apply FIFO policy.
+7. If immediately grantable:
    - insert a held exact claim;
    - create or update the physical family holder;
    - update counts and masks;
-   - return a `ClaimToken`;
-   - set the cell to `Granted`.
-7. Release resource and cell synchronization before returning.
+   - return a guarded `ClaimToken`.
+8. Release resource synchronization.
+9. Transfer the guarded token and mode into the scope's claim map.
 
 A new different-owner claim that is covered by an existing family holder still
 enters shared resource state because its exact lifetime must be registered.
 It does not change external holder counts.
 
-### 4. Enqueue a waiter
+### 3. Enqueue a waiter
 
 If a fresh request cannot be granted:
 
 1. Allocate a slab node.
 2. Link it at the FIFO tail.
-3. Add it to `FamilyResourceState::queued_waiters`.
-4. Update family waiter counts/mask.
-5. Return `WaiterToken` plus `Arc<WaitCompletion>`.
-6. Set the cell to `Pending` with its first subscriber.
-7. Release all synchronous locks.
-8. Await the completion event.
+3. Install the family's single `queued_waiter`.
+4. Return `WaiterToken` plus `Arc<WaitCompletion>`.
+5. Construct a `PendingAcquireGuard`.
+6. Release all synchronous locks.
+7. Await the completion event while retaining exclusive family authority.
 
 Enqueue is `O(1)` average.
 
-### 5. Duplicate pending acquisition
-
-For an exact owner already pending mode `P` and a new request `R`:
-
-| Relationship | Result |
-|---|---|
-| `P` covers `R` | add a subscriber to the existing waiter |
-| `R` strictly covers `P` | `LockUpgradeWouldBlock` |
-| modes are incomparable | `LockConversionNotSupported` |
-
-The queued target mode never changes. Distinct owners in the same family never
-share a queue node.
-
-### 6. Wait for completion
+### 4. Wait for completion
 
 The async loop registers a listener before inspecting the outcome:
 
 ```text
 listen
     -> Waiting: await event
-    -> Promoted: observe promotion through the owner cell
-    -> Released: return LockWaiterReleased
+    -> Promoted: observe promotion through the pending guard
 ```
 
 Registering first prevents a lost wakeup.
 
-### 7. Promote the FIFO prefix
+### 5. Promote the FIFO prefix
 
 Every transition that may reduce blocking runs one central grant loop while
 holding the resource-state lock:
@@ -804,8 +864,7 @@ holding the resource-state lock:
 ```text
 while queue head is promotable:
     detach head links
-    remove exact owner from queued_waiters
-    decrement waiter aggregates
+    clear the family's queued_waiter
     install provisional exact claim
     recompute/create family holder
     update physical aggregates when needed
@@ -819,93 +878,79 @@ Notifications occur after the resource lock is released.
 Promotion eligibility checks:
 
 1. compatibility with external physical family holders;
-2. coverage by all current same-family provisional/held claims; and
-3. no queued waiter behind the head as a granted blocker.
+2. coverage by all current same-family held claims.
 
 The loop promotes the maximal compatible FIFO prefix.
 
-### 8. Observe a promoted waiter
+### 6. Observe a promoted waiter
 
-The first subscriber observing `Promoted`:
+The waiting family operation observes `Promoted`:
 
 ```text
-lock cell
-validate Pending + local generation + waiter token
 manager validates resource incarnation, node phase, owner, and provisional claim
-provisional claim -> held claim
-reclaim waiter slab node
-return ClaimToken
-cell Pending -> Granted
-unlock cell
+    -> provisional claim becomes held
+    -> pending guard changes Waiting -> Granted
+    -> reclaim waiter slab node
+    -> insert ScopeClaim into the exact scope
+    -> disarm the guard
 ```
 
 Observation does not change compatibility and does not rerun queue granting.
-Later subscribers find the cell already `Granted` and return success without
-calling the manager again.
+There is no `.await` between adopting the claim and transferring it into the
+scope. If unwinding occurs in that interval, the still-active guard releases
+the fresh claim.
 
-### 9. Cancel a subscription
+### 7. Cancel a pending acquisition
 
-Dropping one pending subscription:
+Dropping an active `PendingAcquireGuard`:
 
-1. Lock the cell.
-2. Validate local generation, waiter token, and subscriber id.
-3. Remove that subscriber.
-4. If subscribers remain, do nothing to manager state.
-5. If it was the last subscriber:
-   - cancel the queued or provisional waiter;
-   - publish `Released`;
-   - reclaim the waiter node;
-   - rerun FIFO-prefix granting;
-   - set the local cell to a new-generation `Vacant`.
+1. In `Waiting`, cancel the queued or provisional waiter, reclaim its node, and
+   rerun FIFO-prefix granting.
+2. In `Granted`, release the fresh claim and rerun granting through the normal
+   claim-release transition.
 
-If another subscriber already observed the grant, the cell is `Granted`.
-Dropping an older subscription cannot cancel or release that claim.
+The scope map is unchanged because pending and unaccepted fresh state remains
+call-local. Guard drop finishes synchronously before family execution authority
+can move to another operation or scope cleanup.
 
-Scope cleanup uses the same manager transitions but finishes with `Closed`
-instead of `Vacant`.
-
-### 10. Release an exact claim
+### 8. Release an exact claim
 
 Releasing a claim:
 
-1. Validate resource, exact owner, and global `ClaimID`.
-2. Remove the exact claim.
-3. Update family claim counts/mask.
-4. Recompute the strongest remaining family claim using the fixed mode set.
-5. Retain, downgrade, or remove the physical family holder.
-6. Update resource holder counts/mask if the physical mode changed.
-7. Rerun FIFO-prefix granting even if the physical mode did not change.
+1. Remove and take the `ScopeClaim` from the uniquely borrowed scope.
+2. Validate resource, exact owner, and global `ClaimID` in manager state.
+3. Remove the exact claim.
+4. Update family claim counts/mask.
+5. Recompute the strongest remaining family claim using the fixed mode set.
+6. Retain, downgrade, or remove the physical family holder.
+7. Update resource holder counts/mask if the physical mode changed.
+8. Rerun FIFO-prefix granting even if the physical mode did not change.
 
 The last step is required because removing a weaker same-family claim may remove
 a directional constraint that prevented the queue head from being promoted.
 
-An explicit session unlock changes its cells from `Granted` to new-generation
-`Vacant`; it does not close the reusable `SessionExplicit` scope.
+An explicit session unlock removes and releases the selected metadata and data
+claims; it does not consume the reusable `SessionExplicit` scope.
 
-### 11. Close a scope
+### 9. Consume a scope
 
-Scope close is synchronous and serialized by `close_gate`:
+Scope cleanup consumes the unique `LockScopeState`. The outer lifecycle must
+first complete or cancel the active family operation, so the scope contains
+only accepted claims and has no waiter to cancel.
 
 ```text
-lock close gate
-lock scope
-    Closed  -> return success
-    Closing -> internal invariant unless another closer owns the gate
-    Open    -> Closing; take all resource cells
-unlock scope
-
-for each cell:
-    Vacant  -> Closed
-    Pending -> cancel waiter -> Closed
-    Granted -> release claim -> Closed
-
-lock scope
-Closing -> Closed
-unlock scope
-unlock close gate
+take the scope once from its lifecycle owner
+    -> drain its claim map
+    -> release each exact claim
+    -> produce any lifecycle-specific completion proof
 ```
 
 No global resource scan is required.
+
+Scope-level close is intentionally neither shared nor independently
+idempotent. A lifecycle object that has multiple sequential cleanup paths
+stores `Option<LockScopeState>` and takes it once. Parallel close callers are
+outside the serialized family contract.
 
 Lifecycle ordering is:
 
@@ -933,51 +978,51 @@ publish commit status
 
 The current proof-gated attachment boundary enforces this rule for ordered
 commit, no-op discard, rollback, failed precommit, fatal cleanup, and abandoned
-session cleanup.
+session cleanup. A future transaction-scope implementation may consume
+`LockScopeState` to mint the same proof; it must not weaken that boundary.
 
-### 12. Immediate exact-owner conversion
+### 10. Immediate exact-owner conversion
 
 Given an exact-owner held mode `H` and requested mode `R`:
 
 1. If `H` covers `R`, return existing.
 2. If `R` covers `H`:
-   - every other same-family claim and waiter must cover `R`;
+   - every other same-family claim must cover `R`;
    - the resource queue must be empty;
    - `R` must be immediately compatible with external family holders after
      excluding this family's current holder;
    - otherwise return `LockUpgradeWouldBlock`;
-   - if valid, update the claim mode and physical holder atomically.
+   - if valid, update the manager claim, physical holder, and scope mode.
 3. If neither covers the other, return `LockConversionNotSupported`.
 
 The claim keeps its global `ClaimID` across a successful in-place conversion.
 Release of that claim releases its current mode.
 
 Different exact owners cannot strengthen an earlier owner's claim. They can
-only add a claim covered by every existing same-family claim and waiter.
+only add a claim covered by every existing same-family claim.
 
-### 13. Queue bypass
+### 11. Queue bypass
 
 A fresh compatible request normally waits behind a non-empty queue.
 
 It may bypass only when:
 
-- an existing provisional or held same-family claim covers it;
-- every other same-family claim and queued waiter passes directional admission;
+- an existing held same-family claim covers it;
+- every other same-family claim passes directional admission;
   and
 - external family holders remain compatible.
 
-A covering same-family queued waiter does not permit bypass. The new exact
-owner receives its own tail position.
+No same-family waiter can coexist with the request.
 
-### 14. DDL and explicit session locks
+### 12. DDL and explicit session locks
 
 The working design preserves the current rule:
 
-> DDL rejects a target resource when its family has a provisional/held or
-> queued `SessionExplicit` owner on that table.
+> DDL rejects a target resource when its family has a held `SessionExplicit`
+> owner on that table.
 
-This is checked inside the same resource-state critical section that admits the
-DDL claim or waiter:
+This is checked inside the same resource-state critical section that admits
+the DDL claim or waiter:
 
 ```text
 explicit_owner = LockOwner {
@@ -986,11 +1031,11 @@ explicit_owner = LockOwner {
 }
 
 reject when claims contains explicit_owner
-reject when queued_waiters contains explicit_owner
 ```
 
 The check is exact-owner `O(1)` average and does not inspect only the physical
-holder mode.
+holder mode. A queued or provisional session-explicit request cannot coexist
+with DDL because both require the family's exclusive execution authority.
 
 Metadata and data resources are acquired in normal order. If later acquisition
 or table validation fails, only exact claims newly created by that DDL scope are
@@ -1025,9 +1070,8 @@ Let:
 
 - `M` be the fixed mode count, currently four;
 - `K` be the number of waiters actually promoted by a transition;
-- `T_scope` be the number of cells retained by one scope;
-- `C_family` and `W_family` be exact claims and waiters retained for diagnostics
-  and exact lookup.
+- `H_scope` be the number of accepted claims held by one scope; and
+- `C_family` be the number of exact claims in one family/resource state.
 
 Hash-map costs below are average costs. `M` is constant.
 
@@ -1043,10 +1087,10 @@ Hash-map costs below are average costs. `M` is constant.
 | Unlink queued waiter by token | `O(1)` |
 | Observe provisional grant | `O(1)` average |
 | Release exact claim | `O(M + K * M)` |
-| Cancel final subscriber | `O(M + K * M)` |
+| Cancel one pending acquisition | `O(M + K * M)` |
 | Promote `K` waiters | `O(K * M)`, effectively `O(K)` |
-| Close one scope | `O(T_scope + total promoted work)` |
-| Resource debug snapshot | `O(C_family + W_family)` per family |
+| Consume one scope | `O(H_scope + total promoted work)` |
+| Resource debug snapshot | `O(C_family + 1)` per family |
 
 The design removes scans over all physical holders for compatibility and
 removes queue rebuilding for exact cancellation. Actual promotions remain real
@@ -1061,36 +1105,36 @@ Big-O improvement does not guarantee lower latency:
 - hash maps and slab nodes allocate unless optimized;
 - FIFO may intentionally leave compatible work waiting behind an older
   incompatible request;
-- scope cleanup is proportional to retained cells, including `Vacant` cells in
-  the simplest design; and
+- scope cleanup is proportional to currently accepted claims; and
 - notification scheduling can dominate small manager transitions.
 
 Benchmarks must validate representation choices.
 
 ## Concurrency and Synchronization Rules
 
-The working lock order is:
+The owner side uses exclusive logical ownership rather than mutexes:
 
 ```text
-scope map mutex
-    released before
-owner-resource cell mutex
-    -> resource shard lock
+exclusive family execution authority
+    -> mutable exact-scope claim map
+    -> one synchronous resource-state transition
 ```
 
 Rules:
 
-1. Never hold a mutex across `.await`.
-2. Resource transitions never acquire an owner cell.
-3. Queue promotion changes manager state and notifies through
-   `WaitCompletion`; the async observer later updates its cell.
-4. A caller holding a cell may enter one synchronous manager transition.
-5. Notifications occur after releasing resource synchronization.
-6. Scope close takes the scope map only to close admission and take cells, then
-   drains cells without the scope mutex.
-7. Resource state may be removed when empty, so tokens must validate resource
+1. At most one lock-mutating operation may be active in a family, including
+   while awaiting a waiter completion.
+2. Scope state is uniquely borrowed or transferred; it has no internal mutex.
+3. Scope cleanup begins only after the active family operation completes or its
+   call-local guard cancels synchronously.
+4. Never hold a resource-state mutex across `.await`.
+5. Resource transitions never acquire or mutate owner-side scope state.
+6. Queue promotion changes manager state and notifies through
+   `WaitCompletion`; the exclusive async caller later updates its scope.
+7. Notifications occur after releasing resource synchronization.
+8. Resource state may be removed when empty, so tokens must validate resource
    incarnation.
-8. Counter/mask updates and their maps are one atomic resource-state
+9. Counter/mask updates and their maps are one atomic resource-state
    transition.
 
 The implementation should add debug assertions for:
@@ -1100,7 +1144,8 @@ The implementation should add debug assertions for:
 - exactly one physical holder count per family with claims;
 - holder absence when claims are empty;
 - physical mode covering every exact claim;
-- queue link and `queued_waiters` bijection;
+- queue link and singular `queued_waiter` agreement;
+- at most one queued waiter for a family;
 - provisional node and provisional claim agreement;
 - unique global claim ids among live claims; and
 - empty family state before removal.
@@ -1125,17 +1170,19 @@ before releasing the source statement claim.
 
 DDL and maintenance use unique operation scopes, so closing a failed operation
 releases only its own claims. Transaction and statement mutations are already
-serialized by their runtime ownership. Concurrent `SessionExplicit`
-acquisitions need a final policy for fresh-claim rollback; this is listed as an
-open question below.
+serialized by their runtime ownership. The redesign extends that serialization
+to session explicit and cross-scope family mutations. While a multi-resource
+helper is active, no later family operation can depend on one of its fresh
+claims, so failure rollback may release exactly the claims created by that
+helper without acquisition refcounts.
 
 ## Diagnostics
 
-The manager should retain two inspection views.
+Diagnostics should expose both indexes without changing their ownership.
 
 ### Physical resource view
 
-For each resource:
+The lock manager can report, for each resource:
 
 - resource incarnation;
 - physical family holders and modes;
@@ -1143,9 +1190,9 @@ For each resource:
 - FIFO queue order;
 - waiter phase and target mode.
 
-### Exact logical view
+### Exact logical resource view
 
-For each family/resource:
+The lock manager can also report, for each family/resource:
 
 - exact owner scope and purpose;
 - claim mode;
@@ -1153,12 +1200,18 @@ For each family/resource:
 - claim id;
 - queued waiter token and mode.
 
-For each scope:
+### Owner scope view
 
-- lifecycle;
-- indexed resources;
-- cell state and local generation;
-- subscriber count for pending cells.
+A live `LockScopeState` can report:
+
+- exact owner;
+- accepted resource claims;
+- claim modes and tokens.
+
+The baseline does not require `LockManager` to strongly own or globally
+enumerate scope states. If future system-wide inspection requires enumeration,
+the observability design may add a weak scope registry or aggregate snapshots
+through the lifecycle owners.
 
 Debug snapshots should clearly separate physical holders from logical claims.
 Counting only the physical family holder is insufficient to prove that a
@@ -1174,7 +1227,7 @@ column deletion buffer.
 
 ### No persisted lock state
 
-All holders, claims, waiters, tokens, and scope cells are volatile. Recovery
+All holders, claims, waiters, tokens, and scope indexes are volatile. Recovery
 runs before foreground owners exist and reconstructs no lock state.
 
 ### Immediate-only conversion
@@ -1201,9 +1254,18 @@ compatibility until a separate semantic decision changes it.
 
 ### Single-process, session-family model
 
-`LockFamilyId(SessionID)` assumes one engine process and one logical execution
+`LockFamily(SessionID)` assumes one engine process and one logical execution
 family per session. Distributed ownership, cross-process lock recovery, and
-cooperating parallel-worker families are outside this design.
+independent parallel lock mutation within one family are outside this design.
+
+### Serialized family lock mutation
+
+Session, transaction, statement, DDL, and maintenance work in one family may
+hold claims at the same time, but their lock-manager transitions are
+serialized. The proposed session explicit lock and unlock APIs require mutable
+access. Parallel workers may use protection acquired by their coordinator, but
+must send new acquisitions, conversions, releases, and cleanup through that
+single family execution owner.
 
 ### No lock escalation or weak-lock fast path
 
@@ -1220,56 +1282,7 @@ No deadlock policy is designed here. See
 
 These questions remain in scope for pre-RFC design work.
 
-### 1. Vacant cell retention
-
-The simplest safe model retains every touched resource cell until scope close.
-For a long-lived session that repeatedly locks and unlocks many tables, cleanup
-and memory become `O(resources ever touched)`, not `O(current claims)`.
-
-Alternatives:
-
-- retain vacant cells and accept the bound;
-- compact only session scopes after a threshold;
-- add a `Detached` state and remove a cell under the scope mutex while stale
-  `Arc` users are forced to retry; or
-- store cells in a generational owner-local slab.
-
-The RFC must choose one baseline and state its complexity.
-
-### 2. Concurrent same-scope acquisition rollback
-
-Duplicate pending acquisitions by the same exact owner share one waiter and one
-eventual claim. If one multi-resource operation fails while another concurrent
-operation depends on that claim, a per-call fresh guard cannot blindly release
-it.
-
-The main case is `SessionExplicit`, whose public acquisition API uses `&self`.
-Possible policies:
-
-- serialize session explicit lock mutations per table;
-- add logical acquisition intents/refcounts above the one exact claim;
-- define table validation and paired metadata/data acquisition as one
-  shareable operation state; or
-- narrow the public concurrency contract.
-
-Transaction, statement, DDL, and maintenance scopes already have stronger
-serialization or unique operation identity.
-
-### 3. Scope close and operation lifetime
-
-The outer session pin, transaction checkout, statement borrow, or operation
-scope should prevent cleanup from releasing a successfully returned claim while
-protected work is still using it.
-
-The RFC must audit every close caller and decide whether outer lifecycle
-ownership is sufficient. If it is not, `LockScopeState` needs an in-flight
-operation lease or a close-drain counter in addition to its resource cells.
-
-The success linearization point should be the transition to `Granted` while the
-scope is open. Pending acquisitions cancelled by close return
-`LockWaiterReleased` or a new closing-specific error.
-
-### 4. Token allocation strategy
+### 1. Token allocation strategy
 
 The working design uses:
 
@@ -1281,7 +1294,7 @@ An alternative uses global waiter ids in addition to slab slots. The RFC should
 choose the smallest representation that still proves stale-token safety across
 resource and family removal/recreation.
 
-### 5. Family aggregate representation
+### 2. Family aggregate representation
 
 Per-mode counts and masks make directional checks constant in `MODE_COUNT`.
 The exact maps still carry overhead for the common family with only a
@@ -1296,9 +1309,9 @@ Candidates include:
   operation map.
 
 Benchmark and complexity evidence should decide this, not expected owner count
-alone.
+alone. The family waiter remains a single inline `Option` under every candidate.
 
-### 6. Resource sharding
+### 3. Resource sharding
 
 The current `FastDashMap` supplies resource-level shard synchronization. The
 RFC should decide whether to retain it or introduce explicit partitions with:
@@ -1310,23 +1323,25 @@ RFC should decide whether to retain it or introduce explicit partitions with:
 
 Partition count, hash quality, and hot-resource contention need measurement.
 
-### 7. Purpose-specific family policy
+### 4. Purpose-specific family policy
 
 DDL versus `SessionExplicit` is one policy exception. Maintenance and future
 internal operation scopes may need equally explicit rules.
 
 The RFC should specify:
 
-- whether a session explicit request may begin after DDL has already been
-  admitted;
 - whether maintenance claims may share an explicit session claim solely by
   directional coverage;
-- whether operation scopes are serialized by the session API or enforced by
-  manager policy; and
+- which other pairs of already-held scope purposes require policy beyond
+  directional coverage; and
 - whether purpose conflicts use the existing `LockOwnerGroupConflict` error or
   a clearer family/purpose error.
 
-### 8. Downgrade API
+Family execution serialization is not a purpose policy. It determines when
+requests run; these checks determine whether a new exact claim may coexist with
+claims retained by earlier scopes.
+
+### 5. Downgrade API
 
 Internal release can downgrade a family holder when its strongest claim
 disappears. There is no explicit public or transaction downgrade operation.
@@ -1340,11 +1355,12 @@ Future need should determine whether to add:
 
 A downgrade must rerun FIFO granting and update the exact claim atomically.
 
-### 9. Observability boundary
+### 6. Observability boundary
 
 Internal debug snapshots are required. It remains open whether the first RFC
 also adds:
 
+- global enumeration of live scope states and, if needed, a weak registry;
 - per-mode holder/waiter counters;
 - queue length and wait-duration metrics;
 - cancellation and stale-token counters;
@@ -1352,25 +1368,36 @@ also adds:
 - structured wait tracing; or
 - user-visible lock inspection.
 
-### 10. Migration and compatibility
+### 7. Migration and compatibility
 
 The implementation cannot switch physical ownership, tokens, and cleanup in one
 unreviewable patch. The RFC must specify intermediate states that preserve
 behavior and testability.
 
-It must also decide whether the public/internal error name
-`LockOwnerGroupConflict` remains during migration after `LockOwnerGroup` itself
-is removed.
+Migration must:
+
+- change public session `lock_table()` and `unlock_table()` receivers from
+  `&self` to `&mut self`;
+- retain `&self` only for lock-free observation and make `Session` `Send` but
+  `!Sync`;
+- serialize lock mutation across all scopes in one family before removing
+  duplicate-waiter support from the manager;
+- retain cancellation safety while pending state moves from shared waiters to
+  one call-local guard; and
+- decide whether the public/internal error name `LockOwnerGroupConflict`
+  remains after `LockOwnerGroup` itself is removed.
 
 ## Suggested Implementation Stages
 
 These stages are a planning aid, not yet an accepted RFC plan.
 
-### Stage A: identity and scope lifecycle
+### Stage A: identity and exclusive scope ownership
 
 - Introduce `LockOwner { family, scope }`.
 - Add DDL and maintenance operation ids.
-- Add `LockScopeState` and reusable cells.
+- Change session explicit lock and unlock mutation to mutable access.
+- Serialize lock mutation across every scope in one family.
+- Add uniquely owned `LockScopeState` claim maps.
 - Route statement, transaction, session, DDL, and maintenance cleanup through
   scope indexes.
 - Preserve proof-bound transaction-lock cleanup before session completion.
@@ -1382,14 +1409,15 @@ These stages are a planning aid, not yet an accepted RFC plan.
 - Add generational waiter nodes.
 - Keep nodes alive through provisional state.
 - Add independent `WaitCompletion`.
-- Implement local generation and stale completion rejection.
-- Preserve duplicate exact-owner subscriber behavior.
+- Add the call-local pending acquisition guard.
+- Remove current duplicate-waiter behavior after all family mutations are
+  serialized.
 
-### Stage C: shared exact-claim family registry
+### Stage C: exact-claim family registry
 
-- Store exact claims and queued waiters per family.
+- Store exact claims and one optional queued waiter per family.
 - Collapse physical grants to one holder per family/resource.
-- Add per-family mode counts and masks.
+- Add per-family claim counts and masks.
 - Make provisional claims fully granted for arbitration.
 - Preserve directional same-family admission and queue bypass.
 - Make DDL purpose checks atomic with resource admission.
@@ -1406,7 +1434,6 @@ These stages are a planning aid, not yet an accepted RFC plan.
 
 - Measure hot shared metadata resources, cancellation, scope cleanup, and queue
   promotion.
-- Decide vacant-cell compaction.
 - Decide exact claim inline versus map representation.
 - Decide resource partitioning.
 - Consider a weak metadata-lock fast path only if the shared design remains a
@@ -1426,36 +1453,43 @@ At minimum:
 6. Exact covered reacquisition returns existing.
 7. Immediate conversion succeeds only with empty queue and external
    compatibility.
-8. DDL rejects held, provisional, and queued `SessionExplicit` claims.
+8. DDL rejects held `SessionExplicit` claims; family serialization prevents a
+   queued or provisional session-explicit request from coexisting with DDL.
 9. Fresh-versus-existing rollback retains older claims.
 10. Statement-to-transaction handoff has no protection gap.
+11. Session explicit lock and unlock require mutable access.
+12. Lock-free session observations accept immutable access, while lock-bearing
+    observations require mutable access.
+13. `Session` remains `Send` and is not `Sync`.
+14. Session, transaction, statement, DDL, and maintenance lock mutations in one
+    family never overlap.
 
 ### Queue and cancellation tests
 
-1. Duplicate acquisitions share only one exact-owner waiter.
-2. Cancelling one subscriber retains the waiter.
-3. Last cancellation removes a queued waiter and returns the cell to `Vacant`.
-4. Last cancellation removes a provisional claim and returns the cell to
-   `Vacant`.
-5. One observer adopts the claim; cancellation of another subscriber does not
-   release it.
-6. Cancelling the head reconsiders the next waiter.
-7. Physical downgrade promotes newly compatible waiters.
-8. Removing a same-family claim with unchanged physical mode reconsiders the
+1. One family may retain at most one queued waiter.
+2. Dropping a waiting acquisition guard unlinks a queued waiter.
+3. Dropping a promoted acquisition guard removes its provisional claim.
+4. Observation changes the guard to a fresh held claim before reclaiming the
+   waiter node.
+5. Transferring the claim into its scope disarms the guard.
+6. Unwinding before transfer releases the fresh claim.
+7. Cancelling the head reconsiders the next waiter.
+8. Physical downgrade promotes newly compatible waiters.
+9. Removing a same-family claim with unchanged physical mode reconsiders the
    queue.
-9. Distinct same-family waiters separated by an external waiter retain FIFO
-   order.
-10. A covering waiter does not permit bypass; a covering claim does.
+10. A covering same-family claim permits bypass when all other admission checks
+    pass.
 
 ### Token and lifecycle race tests
 
 1. Stale waiter slot generation cannot affect a reused slot.
 2. Stale waiter token cannot affect a recreated resource incarnation.
 3. Stale claim id cannot release a later claim.
-4. Scope close before manager begin prevents enqueue.
-5. Scope close after manager begin cancels or releases the cell.
-6. Repeated scope close is idempotent.
-7. Explicit unlock followed by relock uses a new local generation and claim id.
+4. Acquisition cancellation finishes before family authority moves to another
+   operation.
+5. Scope consumption requires no active pending acquisition.
+6. Sequential lifecycle cleanup takes and consumes the scope at most once.
+7. Explicit unlock followed by relock uses a new claim id.
 8. Transaction claims are absent before the session becomes idle.
 9. Abandoned session explicit cleanup runs after transaction scope cleanup.
 
@@ -1466,12 +1500,13 @@ simple reference model that stores exact claims and FIFO waiters in vectors.
 After every operation, verify:
 
 - physical mode;
-- grant and waiter masks/counts;
+- physical and claim masks/counts;
 - exact claims;
 - queue order;
+- singular family-waiter agreement;
 - provisional state;
 - notifications;
-- scope cells; and
+- scope claim maps; and
 - token validity.
 
 ### Benchmarks
@@ -1485,7 +1520,7 @@ Useful benchmark shapes include:
 5. Cancellation at queue head, middle, and tail.
 6. Promotion of a long compatible FIFO prefix.
 7. Session explicit lock/unlock churn across many tables.
-8. Scope cleanup with many active and vacant cells.
+8. Scope cleanup with many active claims.
 
 Measure:
 
@@ -1495,7 +1530,7 @@ Measure:
 - queue promotion latency;
 - cancellation latency;
 - scope cleanup latency;
-- memory per resource/family/claim/waiter/cell; and
+- memory per resource/family/claim/waiter/scope entry; and
 - debug-assertion overhead in test builds.
 
 ## Normative Invariants Proposed for the RFC
@@ -1504,19 +1539,23 @@ The eventual RFC should accept, reject, or refine each invariant explicitly:
 
 1. One exact owner identifies each session, transaction, statement, DDL
    operation, or maintenance operation.
-2. Every exact owner has one closeable scope-owned reverse index.
-3. A resource cell is indexed before manager acquisition begins.
-4. No new cell is admitted after scope `Closing`.
-5. One physical holder exists per `(resource, family)`.
-6. Zero or more exact claims contribute to one physical holder.
-7. Zero or more exact queued waiters may exist per family.
-8. Duplicate acquisitions share only for the same exact owner.
+2. At most one lock acquisition, release, conversion, or cleanup operation is
+   active in a family.
+3. Every exact owner has one uniquely owned scope index containing only
+   accepted claims.
+4. Pending waiter or fresh-claim state remains call-local until transferred
+   into the exact scope.
+5. A family has at most one queued waiter.
+6. Scope cleanup consumes the scope only after its active family operation has
+   completed or cancelled.
+7. One physical holder exists per `(resource, family)`.
+8. Zero or more exact claims contribute to one physical holder.
 9. A waiter node survives promotion until observation or cancellation.
 10. Provisional claims are fully granted for arbitration.
 11. Tokens remain unambiguous across resource and family recreation.
-12. Stale tokens and stale local generations have no effect.
+12. Stale resource, waiter, and claim tokens have no effect.
 13. Different-owner same-family admission is directional and validates every
-    claim and waiter.
+    held claim.
 14. Incomparable modes are rejected and never joined.
 15. Only immediate exact-owner conversion may strengthen a family holder.
 16. Every blocker or queue-barrier removal reruns FIFO-prefix granting.

@@ -525,10 +525,8 @@ mod tests {
 
             let key = single_key(3i32);
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            session
-                .wait_for_gc_horizon_after(session.last_cts())
-                .await
-                .unwrap();
+            let target_ts = session.last_cts();
+            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
             let mut trx_delete = session.begin_trx().unwrap();
             let res = trx_delete_row_by_id(&mut trx_delete, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
