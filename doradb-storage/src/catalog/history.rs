@@ -774,6 +774,8 @@ mod tests {
             drop(initial);
             drop(after_create);
             drop(after_drop_index);
+            drop(index);
+            drop(layout);
             drop(table);
             let mut drop_reader_session = engine.new_session().unwrap();
             let drop_reader = drop_reader_session.begin_trx().unwrap();

@@ -76,6 +76,32 @@ pub(crate) const MAX_COMMIT_TS: TrxID = TrxID::new(1 << 63);
 /// Minimum active transaction id derived from a snapshot timestamp.
 pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = TrxID::new((1 << 63) + 1);
 
+/// Proof that one transaction's owner-local logical lock state was drained.
+///
+/// The proof is deliberately single-use and is minted only by terminal
+/// transaction cleanup after the retained lock-manager guard is also dropped.
+pub(crate) struct ReleasedTransactionLocks {
+    trx_id: TrxID,
+}
+
+impl ReleasedTransactionLocks {
+    #[inline]
+    fn new(trx_id: TrxID) -> Self {
+        ReleasedTransactionLocks { trx_id }
+    }
+
+    /// Consumes and validates this proof at the terminal session boundary.
+    #[inline]
+    pub(crate) fn assert_validated_for(self, attachment_trx_id: TrxID) {
+        assert!(
+            self.trx_id == attachment_trx_id,
+            "released transaction-lock proof mismatch at terminal attachment boundary: \
+             proof_trx_id={}, attachment_trx_id={attachment_trx_id}",
+            self.trx_id
+        );
+    }
+}
+
 /// Public active transaction facade.
 pub struct Transaction {
     trx_id: TrxID,
@@ -1674,14 +1700,27 @@ impl TrxInner {
 
     /// Releases every transaction-owned logical lock.
     #[inline]
-    pub(crate) fn release_transaction_locks(&mut self, attachment: &TrxAttachment) -> usize {
-        if !self.active {
-            return 0;
-        }
+    pub(crate) fn release_transaction_locks(
+        &mut self,
+        attachment: &TrxAttachment,
+    ) -> ReleasedTransactionLocks {
+        let trx_id = self.trx_id();
+        assert!(
+            self.active,
+            "terminal transaction-lock release requires an active core: trx_id={trx_id}"
+        );
         self.clear_table_bindings();
-        self.lock_state.as_mut().map_or(0, |lock_state| {
-            lock_state.release_all(attachment.engine().lock_manager())
-        })
+        let lock_state = self.lock_state.as_mut().unwrap_or_else(|| {
+            panic!("terminal transaction-lock release requires owner state: trx_id={trx_id}")
+        });
+        assert!(
+            lock_state.owner() == LockOwner::Transaction(trx_id),
+            "terminal transaction-lock owner mismatch: trx_id={trx_id}, owner={}",
+            lock_state.owner()
+        );
+        lock_state.release_all(attachment.engine().lock_manager());
+        lock_state.assert_cleared();
+        ReleasedTransactionLocks::new(trx_id)
     }
 
     /// Drops every transaction table binding before the active STS can advance.
@@ -1704,8 +1743,12 @@ impl TrxInner {
 
     /// Rolls back the attached session without taking the attachment.
     #[inline]
-    pub(crate) fn finish_session_rollback(&mut self, attachment: &TrxAttachment) {
-        attachment.rollback();
+    pub(crate) fn finish_session_rollback(
+        &mut self,
+        attachment: &TrxAttachment,
+        released: ReleasedTransactionLocks,
+    ) {
+        attachment.rollback(released);
         self.active = false;
     }
 
@@ -1716,8 +1759,8 @@ impl TrxInner {
         attachment: &TrxAttachment,
     ) -> FatalRollbackRetention {
         let retention = self.effects.take_for_fatal_retention();
-        self.release_transaction_locks(attachment);
-        self.finish_session_rollback(attachment);
+        let released = self.release_transaction_locks(attachment);
+        self.finish_session_rollback(attachment, released);
         retention
     }
 
@@ -1901,7 +1944,7 @@ impl PreparedTrx {
 
     /// Releases and drops transaction-owned locks for an unordered discard path.
     #[inline]
-    pub(crate) fn release_transaction_locks(&mut self) -> usize {
+    pub(self) fn release_transaction_locks(&mut self) -> Option<ReleasedTransactionLocks> {
         release_carried_transaction_locks(&mut self.lock_state, &mut self.lock_manager)
     }
 }
@@ -2035,7 +2078,7 @@ impl PrecommitTrx {
     pub(crate) fn commit(mut self) -> CommittedTrx {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
         // release the prepare notifier in transaction status
-        let committed = match self.payload.take() {
+        match self.payload.take() {
             Some(PrecommitTrxPayload::User {
                 status,
                 sts,
@@ -2045,10 +2088,7 @@ impl PrecommitTrx {
             }) => {
                 let index_gc = index_undo.commit_for_gc();
                 status.commit_prepared(self.cts);
-                if let Some(s) = self.attachment.take() {
-                    s.commit(self.cts);
-                }
-                CommittedTrx {
+                let committed = CommittedTrx {
                     cts: self.cts,
                     payload: Some(CommittedTrxPayload::User {
                         sts,
@@ -2056,26 +2096,69 @@ impl PrecommitTrx {
                         row_undo,
                         index_gc,
                     }),
+                };
+                let released = self.release_transaction_locks();
+                match (self.attachment.take(), released) {
+                    (Some(attachment), Some(released)) => {
+                        attachment.commit(released, self.cts);
+                    }
+                    (Some(_), None) => {
+                        panic!(
+                            "user precommit attachment requires released transaction-lock proof: \
+                             cts={}",
+                            self.cts
+                        );
+                    }
+                    (None, Some(_)) => {
+                        panic!(
+                            "released transaction-lock proof requires user precommit attachment: \
+                             cts={}",
+                            self.cts
+                        );
+                    }
+                    (None, None) => {
+                        panic!(
+                            "user precommit requires attachment and transaction-lock state: cts={}",
+                            self.cts
+                        );
+                    }
                 }
+                committed
             }
             Some(PrecommitTrxPayload::System(payload)) => {
-                debug_assert!(self.attachment.is_none());
+                assert!(
+                    self.attachment.is_none(),
+                    "system precommit must not carry a session attachment: cts={}",
+                    self.cts
+                );
+                assert!(
+                    self.release_transaction_locks().is_none(),
+                    "system precommit must not produce a transaction-lock proof: cts={}",
+                    self.cts
+                );
                 CommittedTrx {
                     cts: self.cts,
                     payload: Some(CommittedTrxPayload::System(payload)),
                 }
             }
             None => {
-                debug_assert!(self.attachment.is_none());
+                assert!(
+                    self.attachment.is_none(),
+                    "empty system precommit must not carry a session attachment: cts={}",
+                    self.cts
+                );
+                assert!(
+                    self.release_transaction_locks().is_none(),
+                    "empty system precommit must not produce a transaction-lock proof: cts={}",
+                    self.cts
+                );
                 // A system transaction without GC pages has no purge payload.
                 CommittedTrx {
                     cts: self.cts,
                     payload: None,
                 }
             }
-        };
-        self.release_transaction_locks();
-        committed
+        }
     }
 
     /// Rollback this transaction after it entered prepare but before redo durability succeeded.
@@ -2107,10 +2190,8 @@ impl PrecommitTrx {
             }
             payload.record_rollback_for_purge(attachment);
         }
-        self.release_transaction_locks();
-        if let Some(s) = self.attachment.take() {
-            s.rollback();
-        }
+        let released = self.release_transaction_locks();
+        self.finish_carried_session_rollback(released);
         if let Some(payload) = self.payload.take() {
             payload.finish_successful_rollback();
         }
@@ -2130,10 +2211,8 @@ impl PrecommitTrx {
 
     #[inline]
     fn finish_failed_precommit_with_retention(&mut self, engine: Option<EngineRef>) {
-        self.release_transaction_locks();
-        if let Some(s) = self.attachment.take() {
-            s.rollback();
-        }
+        let released = self.release_transaction_locks();
+        self.finish_carried_session_rollback(released);
         if let Some(payload) = self.payload.take() {
             payload.release_prepare_waiters();
             if let Some(engine) = engine {
@@ -2153,17 +2232,55 @@ impl PrecommitTrx {
     /// Discard an attachmentless rejected precommit transaction.
     #[inline]
     pub(crate) fn discard_rejected(mut self) {
-        debug_assert!(self.attachment.is_none());
+        assert!(
+            self.attachment.is_none(),
+            "rejected system precommit must not carry a session attachment: cts={}",
+            self.cts
+        );
         if let Some(payload) = self.payload.take() {
-            debug_assert!(matches!(payload, PrecommitTrxPayload::System(_)));
+            assert!(
+                matches!(payload, PrecommitTrxPayload::System(_)),
+                "rejected precommit discard requires system payload: cts={}",
+                self.cts
+            );
         }
         self.redo_bin.take();
-        self.release_transaction_locks();
+        assert!(
+            self.release_transaction_locks().is_none(),
+            "rejected system precommit must not produce a transaction-lock proof: cts={}",
+            self.cts
+        );
     }
 
     #[inline]
-    fn release_transaction_locks(&mut self) -> usize {
+    fn release_transaction_locks(&mut self) -> Option<ReleasedTransactionLocks> {
         release_carried_transaction_locks(&mut self.lock_state, &mut self.lock_manager)
+    }
+
+    #[inline]
+    fn finish_carried_session_rollback(&mut self, released: Option<ReleasedTransactionLocks>) {
+        match (self.attachment.take(), released) {
+            (Some(attachment), Some(released)) => attachment.rollback(released),
+            (None, None) => {
+                assert!(
+                    !matches!(self.payload, Some(PrecommitTrxPayload::User { .. })),
+                    "user precommit requires attachment and transaction-lock state: cts={}",
+                    self.cts
+                );
+            }
+            (Some(_), None) => {
+                panic!(
+                    "precommit attachment requires released transaction-lock proof: cts={}",
+                    self.cts
+                );
+            }
+            (None, Some(_)) => {
+                panic!(
+                    "released transaction-lock proof requires precommit attachment: cts={}",
+                    self.cts
+                );
+            }
+        }
     }
 }
 
@@ -2284,15 +2401,28 @@ fn transaction_entry_state_err(trx_id: TrxID, state: TrxEntryState) -> Report<Li
 fn release_carried_transaction_locks(
     lock_state: &mut Option<OwnerLockState>,
     lock_manager: &mut Option<QuiescentGuard<LockManager>>,
-) -> usize {
+) -> Option<ReleasedTransactionLocks> {
     match (lock_state.take(), lock_manager.take()) {
-        (Some(mut lock_state), Some(lock_manager)) => lock_state.release_all(&lock_manager),
-        (None, None) => 0,
-        (Some(_), None) => {
-            panic!("transaction lock state requires a lock manager guard")
+        (Some(mut lock_state), Some(lock_manager)) => {
+            let owner = lock_state.owner();
+            let LockOwner::Transaction(trx_id) = owner else {
+                panic!("carried terminal lock state requires a transaction owner: owner={owner}")
+            };
+            lock_state.release_all(&lock_manager);
+            lock_state.assert_cleared();
+            drop(lock_state);
+            drop(lock_manager);
+            Some(ReleasedTransactionLocks::new(trx_id))
+        }
+        (None, None) => None,
+        (Some(lock_state), None) => {
+            panic!(
+                "carried transaction lock state requires a lock-manager guard: owner={}",
+                lock_state.owner()
+            )
         }
         (None, Some(_)) => {
-            panic!("transaction lock manager guard requires lock state")
+            panic!("carried transaction lock-manager guard requires owner lock state")
         }
     }
 }
@@ -2336,7 +2466,14 @@ pub(crate) mod tests {
     };
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::row::ops::SelectKey;
-    use crate::session::{Session, tests::SessionTestExt};
+    use crate::session::{
+        Session,
+        tests::{
+            SessionTestExt, TerminalAttachmentOutcome, TerminalAttachmentTestHookGuard,
+            finish_trx_rollback_for_test, install_terminal_attachment_test_hook,
+            session_registry_len,
+        },
+    };
     use crate::table::test_user_table_id;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::sys::tests::{
@@ -2349,6 +2486,7 @@ pub(crate) mod tests {
     use smol::Timer;
     use std::cell::Cell;
     use std::io::Error as IoError;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
     use std::thread::{scope, sleep, spawn};
@@ -2528,10 +2666,11 @@ pub(crate) mod tests {
             );
 
             engine.inner().trx_sys.record_rollback_for_purge(gc_no, sts);
-            engine
-                .inner()
-                .session_registry
-                .finish_trx_rollback(trx.session_id, trx.trx_id);
+            finish_trx_rollback_for_test(
+                &engine.inner().session_registry,
+                trx.session_id,
+                trx.trx_id,
+            );
             drop(trx);
             engine.shutdown().unwrap();
         });
@@ -2680,10 +2819,17 @@ pub(crate) mod tests {
             trx_sys.record_rollback_for_purge(gc_no, sts);
         }
         prepared.redo_bin.take();
-        if let Some(attachment) = prepared.attachment.take() {
-            attachment.rollback();
+        let released = prepared.release_transaction_locks();
+        match (prepared.attachment.take(), released) {
+            (Some(attachment), Some(released)) => attachment.rollback(released),
+            (Some(_), None) => {
+                panic!("production prepared attachment requires transaction-lock proof")
+            }
+            (None, Some(_)) => {
+                panic!("production prepared transaction-lock proof requires attachment")
+            }
+            (None, None) => {}
         }
-        prepared.release_transaction_locks();
     }
 
     #[inline]
@@ -2810,6 +2956,67 @@ pub(crate) mod tests {
             .iter()
             .filter(|entry| entry.owner == owner)
             .count()
+    }
+
+    #[derive(Debug)]
+    struct TerminalBoundaryObservation {
+        outcome: TerminalAttachmentOutcome,
+        transaction_lock_entries: usize,
+        session_active: bool,
+        status_ts: Option<TrxID>,
+        session_lock_entries: usize,
+    }
+
+    fn install_terminal_boundary_observer(
+        engine: EngineRef,
+        session_id: SessionID,
+        target_trx_id: TrxID,
+        status: Option<Arc<SharedTrxStatus>>,
+        session_owner: Option<LockOwner>,
+    ) -> (
+        TerminalAttachmentTestHookGuard,
+        mpsc::Receiver<TerminalBoundaryObservation>,
+    ) {
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let hook = Arc::new(move |trx_id, outcome| {
+            if trx_id != target_trx_id {
+                return;
+            }
+            let snapshot = debug_snapshot(engine.lock_manager());
+            let transaction_lock_entries = snapshot
+                .entries
+                .iter()
+                .filter(|entry| entry.owner == LockOwner::Transaction(trx_id))
+                .count();
+            let session_lock_entries = session_owner.map_or(0, |owner| {
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.owner == owner)
+                    .count()
+            });
+            observed_tx
+                .send(TerminalBoundaryObservation {
+                    outcome,
+                    transaction_lock_entries,
+                    session_active: engine
+                        .session_registry
+                        .resolve_trx(session_id, trx_id)
+                        .is_ok(),
+                    status_ts: status.as_ref().map(|status| status.ts()),
+                    session_lock_entries,
+                })
+                .expect("terminal attachment observer should report the boundary");
+        });
+        (install_terminal_attachment_test_hook(hook), observed_rx)
+    }
+
+    fn recv_terminal_boundary(
+        observed_rx: &mpsc::Receiver<TerminalBoundaryObservation>,
+    ) -> TerminalBoundaryObservation {
+        observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("terminal attachment boundary should be observed")
     }
 
     fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
@@ -3597,11 +3804,191 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_released_transaction_lock_proof_validates_identity() {
+        let proof_trx_id = TrxID::new(91_501);
+        ReleasedTransactionLocks::new(proof_trx_id).assert_validated_for(proof_trx_id);
+
+        let attachment_trx_id = TrxID::new(91_502);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            ReleasedTransactionLocks::new(proof_trx_id).assert_validated_for(attachment_trx_id);
+        }))
+        .expect_err("mismatched transaction-lock proof must panic");
+        let diagnostic = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&'static str>().copied())
+            .expect("proof mismatch panic should contain a string diagnostic");
+        assert!(diagnostic.contains("terminal attachment boundary"));
+        assert!(diagnostic.contains(&format!("proof_trx_id={proof_trx_id}")));
+        assert!(diagnostic.contains(&format!("attachment_trx_id={attachment_trx_id}")));
+    }
+
+    #[test]
+    fn test_ordered_commit_releases_locks_before_session_finish() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_ordered_commit_release_boundary").await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+            assert!(
+                try_acquire_transaction_lock(
+                    &mut trx,
+                    LockResource::TableData(TableID::new(91_510)),
+                    LockMode::IntentExclusive,
+                )
+                .unwrap()
+            );
+            add_pseudo_redo_log_entry(&mut trx).await;
+            let status = with_transaction_inner(&trx, "observe_ordered_commit_status", |inner| {
+                inner.ctx().status()
+            })
+            .unwrap();
+            let (hook, observed_rx) = install_terminal_boundary_observer(
+                engine.new_ref().unwrap(),
+                session_id,
+                trx_id,
+                Some(status),
+                None,
+            );
+
+            let cts = trx.commit().await.unwrap();
+            let observed = recv_terminal_boundary(&observed_rx);
+            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Commit);
+            assert_eq!(observed.transaction_lock_entries, 0);
+            assert!(observed.session_active);
+            assert_eq!(observed.status_ts, Some(cts));
+            assert!(!session.in_trx().unwrap());
+
+            drop(hook);
+            session.begin_trx().unwrap().rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_unordered_commit_releases_locks_before_session_finish() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_unordered_commit_release_boundary").await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+            assert!(
+                try_acquire_transaction_lock(
+                    &mut trx,
+                    LockResource::TableData(TableID::new(91_511)),
+                    LockMode::IntentShared,
+                )
+                .unwrap()
+            );
+            let (hook, observed_rx) = install_terminal_boundary_observer(
+                engine.new_ref().unwrap(),
+                session_id,
+                trx_id,
+                None,
+                None,
+            );
+
+            assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
+            let observed = recv_terminal_boundary(&observed_rx);
+            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Rollback);
+            assert_eq!(observed.transaction_lock_entries, 0);
+            assert!(observed.session_active);
+            assert!(!session.in_trx().unwrap());
+
+            drop(hook);
+            session.begin_trx().unwrap().rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_rollback_releases_locks_before_session_finish() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_rollback_release_boundary").await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+            assert!(
+                try_acquire_transaction_lock(
+                    &mut trx,
+                    LockResource::TableData(TableID::new(91_512)),
+                    LockMode::IntentExclusive,
+                )
+                .unwrap()
+            );
+            let (hook, observed_rx) = install_terminal_boundary_observer(
+                engine.new_ref().unwrap(),
+                session_id,
+                trx_id,
+                None,
+                None,
+            );
+
+            trx.rollback().await.unwrap();
+            let observed = recv_terminal_boundary(&observed_rx);
+            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Rollback);
+            assert_eq!(observed.transaction_lock_entries, 0);
+            assert!(observed.session_active);
+            assert!(!session.in_trx().unwrap());
+
+            drop(hook);
+            session.begin_trx().unwrap().rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_abandoned_session_releases_transaction_locks_before_explicit_locks() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_abandoned_session_release_boundary").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let session_owner = LockOwner::Session(session_id);
+            session
+                .lock_table(table_id, TableLockMode::Shared)
+                .await
+                .unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+            assert!(
+                try_acquire_transaction_lock(
+                    &mut trx,
+                    LockResource::TableData(table_id),
+                    LockMode::IntentShared,
+                )
+                .unwrap()
+            );
+            let (hook, observed_rx) = install_terminal_boundary_observer(
+                engine.new_ref().unwrap(),
+                session_id,
+                trx_id,
+                None,
+                Some(session_owner),
+            );
+
+            drop(session);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
+            trx.rollback().await.unwrap();
+
+            let observed = recv_terminal_boundary(&observed_rx);
+            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Rollback);
+            assert_eq!(observed.transaction_lock_entries, 0);
+            assert!(observed.session_active);
+            assert!(observed.session_lock_entries > 0);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
+            assert_eq!(lock_entry_count(&engine, session_owner), 0);
+            drop(hook);
+        });
+    }
+
+    #[test]
     fn test_transaction_locks_release_on_precommit_abort() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_lock_abort").await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
             let owner = lock_owner(&trx).unwrap();
             assert!(
                 try_acquire_transaction_lock(
@@ -3615,9 +4002,21 @@ pub(crate) mod tests {
 
             let prepared = prepare_transaction(trx).unwrap();
             let precommit = prepared.fill_cts(TrxID::new(91_241));
+            let (hook, observed_rx) = install_terminal_boundary_observer(
+                engine.new_ref().unwrap(),
+                session.id(),
+                trx_id,
+                None,
+                None,
+            );
             assert!(precommit.rollback_failed_precommit().await);
+            let observed = recv_terminal_boundary(&observed_rx);
+            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Rollback);
+            assert_eq!(observed.transaction_lock_entries, 0);
+            assert!(observed.session_active);
             assert_eq!(lock_entry_count(&engine, owner), 0);
             assert!(!session.in_trx().unwrap());
+            drop(hook);
         });
     }
 

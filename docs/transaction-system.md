@@ -407,6 +407,23 @@ commit effects by themselves. A transaction that only acquired logical locks
 still uses the readonly/no-op commit discard path, which releases those locks
 without assigning a commit timestamp.
 
+Terminal user-session completion is structurally gated by
+`ReleasedTransactionLocks`. Transaction code can mint this non-cloneable,
+transaction-id-bound proof only after draining the transaction's owner-local
+lock state; prepared and precommit cleanup also drops its retained lock-manager
+guard first. `TrxAttachment::commit()` and `TrxAttachment::rollback()` consume
+and validate the proof before the session registry may make the session idle or
+closed.
+
+For ordered commit, shared committed status is published before transaction
+locks are released, and session completion follows lock release. For rollback
+and readonly/no-op discard, rollback effects and required purge bookkeeping
+precede lock release, and the rollback-style session transition follows it. If
+the public session was abandoned, that final transition closes the session and
+releases explicit session-owned locks only after transaction-owned locks are
+gone. Attachmentless system transactions neither produce nor consume this
+proof.
+
 During engine shutdown, foreground admission closes first. Blocking shutdown
 then inspects session-owned transaction entries instead of relying on public
 transaction strong references. Live active entries keep shutdown waiting until
