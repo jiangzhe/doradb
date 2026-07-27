@@ -1706,6 +1706,7 @@ mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::error::LifecycleError;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::index::IndexBatchStream;
@@ -2641,8 +2642,8 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
             assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             trx.rollback().await.unwrap();
@@ -2840,8 +2841,8 @@ mod tests {
             let before = index_ddl_snapshot(&engine, table_id, &table);
             let err = session.drop_index(table_id, 0).await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
             assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             trx.rollback().await.unwrap();

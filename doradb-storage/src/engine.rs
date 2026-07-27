@@ -938,7 +938,10 @@ mod tests {
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::root::STORAGE_LAYOUT_FILE_NAME;
-    use crate::session::tests::{SessionTestExt, finish_trx_commit_for_test, session_registry_len};
+    use crate::session::tests::{
+        SessionTestExt, assert_existing_transaction_error, finish_trx_commit_for_test,
+        session_registry_len,
+    };
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
     use crate::trx::tests::add_pseudo_redo_log_entry;
     use smol::Timer;
@@ -2300,6 +2303,7 @@ mod tests {
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
             let owner = LockOwner::Transaction(trx.trx_id());
 
             trx.lock_table(table_id, TableLockMode::Shared)
@@ -2310,6 +2314,8 @@ mod tests {
             let checkout = trx.checkout().unwrap();
             drop(trx);
             assert!(session.in_trx().unwrap());
+            let err = session.list_table_ids().unwrap_err();
+            assert_existing_transaction_error(&err, session.id(), trx_id, "checked_out_abandoned");
             assert!(lock_entry_count(&engine, owner) > 0);
 
             drop(checkout);
@@ -2318,6 +2324,7 @@ mod tests {
                 "checkout return did not schedule abandoned transaction cleanup",
             );
             assert_eq!(lock_entry_count(&engine, owner), 0);
+            assert!(session.list_table_ids().is_ok());
 
             let replacement = session.begin_trx().unwrap();
             replacement.rollback().await.unwrap();

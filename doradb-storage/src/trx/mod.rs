@@ -2470,8 +2470,8 @@ pub(crate) mod tests {
         Session,
         tests::{
             SessionTestExt, TerminalAttachmentOutcome, TerminalAttachmentTestHookGuard,
-            finish_trx_rollback_for_test, install_terminal_attachment_test_hook,
-            session_registry_len,
+            assert_existing_transaction_error, finish_trx_rollback_for_test,
+            install_terminal_attachment_test_hook, session_registry_len,
         },
     };
     use crate::table::test_user_table_id;
@@ -3431,14 +3431,14 @@ pub(crate) mod tests {
                             kind: RowRedoKind::Delete(Some(PageID::new(0))),
                         },
                     );
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             let err = res.unwrap_err();
 
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
             with_transaction_inner(&trx, "check_statement_rollback_effects", |inner| {
                 let table_redo = inner.effects.redo.dml.get(&TableID::new(12)).unwrap();
@@ -3518,7 +3518,7 @@ pub(crate) mod tests {
                     )
                     .await?;
                     assert_eq!(lock_entry_count(&engine, owner), 1);
-                    Err(Report::new(OperationError::NotSupported).disclose())
+                    Err(Report::new(OperationError::InvalidDmlInput).disclose())
                 })
                 .await;
             assert_eq!(
@@ -3526,7 +3526,7 @@ pub(crate) mod tests {
                     .report()
                     .downcast_ref::<OperationError>()
                     .copied(),
-                Some(OperationError::NotSupported)
+                Some(OperationError::InvalidDmlInput)
             );
 
             let first_owner = first_owner.get().unwrap();
@@ -3934,6 +3934,62 @@ pub(crate) mod tests {
 
             drop(hook);
             session.begin_trx().unwrap().rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_admission_waits_for_terminal_lifecycle_finish() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_session_admission_terminal_boundary").await;
+            let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_id = trx.trx_id();
+            assert!(
+                try_acquire_transaction_lock(
+                    &mut trx,
+                    LockResource::TableData(TableID::new(91_513)),
+                    LockMode::IntentExclusive,
+                )
+                .unwrap()
+            );
+
+            let (reached_tx, reached_rx) = mpsc::channel();
+            let (release_tx, release_rx) = flume::bounded(1);
+            let hook =
+                install_terminal_attachment_test_hook(Arc::new(move |observed_trx_id, outcome| {
+                    if observed_trx_id != trx_id {
+                        return;
+                    }
+                    reached_tx
+                        .send(outcome)
+                        .expect("terminal hook should report its boundary");
+                    let _ = release_rx.recv();
+                }));
+
+            scope(|scope| {
+                let release_tx = release_tx;
+                let rollback = scope.spawn(move || smol::block_on(trx.rollback()));
+                let outcome = reached_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("rollback should reach the terminal attachment boundary");
+                let admission = session.list_table_ids();
+                let transaction_lock_entries =
+                    lock_entry_count(&engine, LockOwner::Transaction(trx_id));
+
+                release_tx
+                    .send(())
+                    .expect("terminal hook should remain available for release");
+                rollback.join().unwrap().unwrap();
+
+                assert_eq!(outcome, TerminalAttachmentOutcome::Rollback);
+                assert_eq!(transaction_lock_entries, 0);
+                let err = admission.unwrap_err();
+                assert_existing_transaction_error(&err, session_id, trx_id, "rolling_back");
+            });
+
+            drop(hook);
+            assert!(session.list_table_ids().is_ok());
         });
     }
 

@@ -273,8 +273,6 @@ pub(crate) enum OperationError {
     SchemaChanged,
     #[error("index not found")]
     IndexNotFound,
-    #[error("not supported")]
-    NotSupported,
     #[error("duplicate key")]
     DuplicateKey,
     #[error("write conflict")]
@@ -283,8 +281,6 @@ pub(crate) enum OperationError {
     InvalidDmlInput,
     #[error("invalid metadata")]
     InvalidMetadata,
-    #[error("lock is unavailable")]
-    LockUnavailable,
     #[error("lock upgrade would block")]
     LockUpgradeWouldBlock,
     #[error("lock conversion is not supported")]

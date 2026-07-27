@@ -1763,8 +1763,8 @@ mod tests {
     };
     use crate::engine::Engine;
     use crate::error::{
-        DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError, IoError, OperationError,
-        RuntimeError,
+        DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError, IoError, LifecycleError,
+        OperationError, RuntimeError,
     };
     use crate::id::TrxID;
     use crate::io::install_storage_backend_test_hook;
@@ -3003,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_table_lock_failure_releases_fresh_metadata() {
+    fn test_session_table_lock_rejects_active_transaction_before_acquisition() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
@@ -3025,8 +3025,8 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::LockOwnerGroupConflict)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
             assert!(!has_lock_resource(
                 &engine,
@@ -3269,8 +3269,8 @@ mod tests {
 
             let err = session.unlock_table(table_id).unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
 
             same_session_trx.commit().await.unwrap();
@@ -3339,8 +3339,8 @@ mod tests {
 
             let err = session.drop_table(table_id).await.unwrap_err();
             assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::NotSupported)
+                err.report().downcast_ref::<LifecycleError>().copied(),
+                Some(LifecycleError::ExistingTransaction)
             );
             assert_table_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
 
