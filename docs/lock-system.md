@@ -375,28 +375,41 @@ The redesign must preserve:
 9. DDL rejects explicit same-session table locks in the current behavior.
 10. Cleanup wakes acquisitions with `LockWaiterReleased`.
 
-### Known cleanup-ordering defect
+### Proof-bound terminal cleanup ordering
 
-Rollback paths already release transaction locks before finishing the session
-transaction lifecycle. Two successful paths currently invert that order:
+Every terminal user-transaction path drains its owner-local `OwnerLockState`
+before finishing the session transaction lifecycle. Transaction code mints one
+non-cloneable, transaction-id-bound `ReleasedTransactionLocks` proof only after
+the local state is empty. Prepared and precommit paths also consume and drop
+their retained lock-manager guard before minting the proof.
 
-- ordered commit calls `TrxAttachment::commit()` before releasing the carried
-  transaction lock state; and
-- unordered no-op discard calls `TrxAttachment::rollback()` before releasing
-  the carried transaction lock state.
+`TrxAttachment::commit()` and `TrxAttachment::rollback()` consume a matching
+proof before they can make a running session idle or close an abandoned
+session. Raw session-registry finish operations are private to the session
+module, so production terminal cleanup cannot bypass this boundary.
 
-The attachment transition can mark a running session idle, or close an
-abandoned session and release its explicit locks, while transaction-owned
-claims still exist. The required order is:
+The implemented order is:
 
 ```text
-publish the commit decision or finish rollback effects
+ordered commit:
+    publish the committed status
     -> release transaction-owned logical locks
     -> finish the session transaction lifecycle
+
+rollback or no-op discard:
+    finish rollback effects and required purge bookkeeping
+    -> release transaction-owned logical locks
+    -> finish the session rollback-style lifecycle
+
+abandoned session:
+    release transaction-owned logical locks
+    -> close the session
+    -> release explicit session-owned logical locks
 ```
 
-This is a current implementation defect to fix independently of representation
-choices. The redesign must preserve the corrected order.
+The proof covers the current owner-local cache contract, not the future scope
+representation. A redesign may evolve it into a closed-scope proof, but must
+preserve this terminal ordering.
 
 ## Working Design Overview
 
@@ -918,8 +931,9 @@ publish commit status
     -> release abandoned-session explicit claims if required
 ```
 
-The current ordered-commit and no-op-discard paths need a narrow ordering fix to
-match this rule.
+The current proof-gated attachment boundary enforces this rule for ordered
+commit, no-op discard, rollback, failed precommit, fatal cleanup, and abandoned
+session cleanup.
 
 ### 12. Immediate exact-owner conversion
 
@@ -1359,7 +1373,7 @@ These stages are a planning aid, not yet an accepted RFC plan.
 - Add `LockScopeState` and reusable cells.
 - Route statement, transaction, session, DDL, and maintenance cleanup through
   scope indexes.
-- Fix transaction-lock cleanup before session completion.
+- Preserve proof-bound transaction-lock cleanup before session completion.
 - Preserve the current vector/deque resource representation temporarily.
 
 ### Stage B: tokenized waiter and claim lifecycle

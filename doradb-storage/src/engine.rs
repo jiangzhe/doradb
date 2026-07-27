@@ -938,7 +938,7 @@ mod tests {
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::root::STORAGE_LAYOUT_FILE_NAME;
-    use crate::session::tests::{SessionTestExt, session_registry_len};
+    use crate::session::tests::{SessionTestExt, finish_trx_commit_for_test, session_registry_len};
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
     use crate::trx::tests::add_pseudo_redo_log_entry;
     use smol::Timer;
@@ -2482,7 +2482,8 @@ mod tests {
             assert_eq!(session.last_cts(), TrxID::new(0));
 
             let replacement = session.begin_trx().unwrap();
-            engine.inner().session_registry.finish_trx_commit(
+            finish_trx_commit_for_test(
+                &engine.inner().session_registry,
                 session.id(),
                 stale_trx_id,
                 TrxID::new(91_241),

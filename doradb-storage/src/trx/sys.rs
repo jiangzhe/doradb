@@ -1435,8 +1435,8 @@ impl TransactionSystem {
         inner.effects_mut().clear_for_rollback();
         inner.clear_table_bindings();
         self.record_rollback_for_purge(gc_no, sts);
-        inner.release_transaction_locks(attachment);
-        inner.finish_session_rollback(attachment);
+        let released = inner.release_transaction_locks(attachment);
+        inner.finish_session_rollback(attachment, released);
         entry.finish(TrxEntryState::Terminal);
         status.finish_terminal();
         Ok(())
@@ -1461,10 +1461,31 @@ impl TransactionSystem {
             panic!("prepared no-op cleanup requires user transaction state")
         };
         self.record_rollback_for_purge(gc_no, sts);
-        if let Some(s) = trx.attachment.take() {
-            s.rollback();
+        let released = trx.release_transaction_locks();
+        match (trx.attachment.take(), released) {
+            (Some(attachment), Some(released)) => attachment.rollback(released),
+            (Some(_), None) => {
+                panic!(
+                    "unordered user attachment requires released transaction-lock proof: \
+                     trx_id={}",
+                    status.ts()
+                );
+            }
+            (None, Some(_)) => {
+                panic!(
+                    "released transaction-lock proof requires unordered user attachment: \
+                     trx_id={}",
+                    status.ts()
+                );
+            }
+            (None, None) => {
+                panic!(
+                    "unordered user transaction requires attachment and transaction-lock state: \
+                     trx_id={}",
+                    status.ts()
+                );
+            }
         }
-        trx.release_transaction_locks();
         status.finish_terminal();
     }
 

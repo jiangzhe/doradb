@@ -24,7 +24,10 @@ use crate::table::{
     CheckpointDelayReason, CheckpointOutcome, CheckpointRetryObservation, FreezeOutcome,
     MemIndexCleanupOutcome, Table,
 };
-use crate::trx::{StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState};
+use crate::trx::{
+    ReleasedTransactionLocks, StartedTransaction, Transaction, TrxCleanupReason, TrxEntry,
+    TrxEntryState,
+};
 use error_stack::{Report, ResultExt};
 use futures::future::select_all;
 use parking_lot::Mutex;
@@ -966,14 +969,14 @@ impl SessionRegistry {
 
     /// Apply session cleanup after a transaction commits.
     #[inline]
-    pub(crate) fn finish_trx_commit(&self, id: SessionID, trx_id: TrxID, cts: TrxID) {
+    fn finish_trx_commit(&self, id: SessionID, trx_id: TrxID, cts: TrxID) {
         self.modify_session(id, |state| state.finish_trx_commit(trx_id, cts));
         self.notify_trx_changed();
     }
 
     /// Apply session cleanup after a transaction rolls back.
     #[inline]
-    pub(crate) fn finish_trx_rollback(&self, id: SessionID, trx_id: TrxID) {
+    fn finish_trx_rollback(&self, id: SessionID, trx_id: TrxID) {
         self.modify_session(id, |state| state.finish_trx_rollback(trx_id));
         self.notify_trx_changed();
     }
@@ -1549,7 +1552,13 @@ impl TrxAttachment {
 
     /// Mark the owning session committed.
     #[inline]
-    pub(crate) fn commit(&self, cts: TrxID) {
+    pub(crate) fn commit(&self, released: ReleasedTransactionLocks, cts: TrxID) {
+        released.assert_validated_for(self.trx_id);
+        #[cfg(test)]
+        tests::run_terminal_attachment_test_hook(
+            self.trx_id,
+            tests::TerminalAttachmentOutcome::Commit,
+        );
         self.engine
             .session_registry
             .finish_trx_commit(self.session_id, self.trx_id, cts);
@@ -1557,7 +1566,13 @@ impl TrxAttachment {
 
     /// Mark the owning session rolled back.
     #[inline]
-    pub(crate) fn rollback(&self) {
+    pub(crate) fn rollback(&self, released: ReleasedTransactionLocks) {
+        released.assert_validated_for(self.trx_id);
+        #[cfg(test)]
+        tests::run_terminal_attachment_test_hook(
+            self.trx_id,
+            tests::TerminalAttachmentOutcome::Rollback,
+        );
         self.engine
             .session_registry
             .finish_trx_rollback(self.session_id, self.trx_id);
@@ -1699,7 +1714,7 @@ pub(crate) mod tests {
     use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
-    use std::sync::mpsc;
+    use std::sync::{OnceLock, mpsc};
     use std::task::{Context, Poll};
     use std::thread;
     use std::time::Duration;
@@ -1708,6 +1723,87 @@ pub(crate) mod tests {
     const TRUNCATE_TEST_LOG_BLOCK_SIZE: usize = 4096;
     const TRUNCATE_TEST_LOG_FILE_MAX_SIZE: usize =
         REDO_DEFAULT_DATA_START_OFFSET + 4 * TRUNCATE_TEST_LOG_BLOCK_SIZE;
+
+    /// Terminal attachment transition observed after transaction-lock release.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum TerminalAttachmentOutcome {
+        /// The attachment will finish the session with a commit timestamp.
+        Commit,
+        /// The attachment will finish the session with rollback-style cleanup.
+        Rollback,
+    }
+
+    type TerminalAttachmentTestHook =
+        Arc<dyn Fn(TrxID, TerminalAttachmentOutcome) + Send + Sync + 'static>;
+
+    fn terminal_attachment_test_hook_slot() -> &'static Mutex<Option<TerminalAttachmentTestHook>> {
+        static HOOK: OnceLock<Mutex<Option<TerminalAttachmentTestHook>>> = OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    fn terminal_attachment_test_hook_install_lock() -> &'static Mutex<()> {
+        static INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        INSTALL_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Guard that restores the previous terminal attachment hook on drop.
+    pub(crate) struct TerminalAttachmentTestHookGuard {
+        previous: Option<TerminalAttachmentTestHook>,
+        _install_guard: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TerminalAttachmentTestHookGuard {
+        #[inline]
+        fn drop(&mut self) {
+            *terminal_attachment_test_hook_slot().lock() = self.previous.take();
+        }
+    }
+
+    /// Installs a serialized test-only terminal attachment observation hook.
+    #[inline]
+    pub(crate) fn install_terminal_attachment_test_hook(
+        hook: TerminalAttachmentTestHook,
+    ) -> TerminalAttachmentTestHookGuard {
+        let install_guard = terminal_attachment_test_hook_install_lock().lock();
+        let mut slot = terminal_attachment_test_hook_slot().lock();
+        let previous = slot.replace(hook);
+        TerminalAttachmentTestHookGuard {
+            previous,
+            _install_guard: install_guard,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn run_terminal_attachment_test_hook(
+        trx_id: TrxID,
+        outcome: TerminalAttachmentOutcome,
+    ) {
+        let hook = terminal_attachment_test_hook_slot().lock().clone();
+        if let Some(hook) = hook {
+            hook(trx_id, outcome);
+        }
+    }
+
+    /// Finishes a stale transaction directly for session-registry tests.
+    #[inline]
+    pub(crate) fn finish_trx_commit_for_test(
+        registry: &SessionRegistry,
+        session_id: SessionID,
+        trx_id: TrxID,
+        cts: TrxID,
+    ) {
+        registry.finish_trx_commit(session_id, trx_id, cts);
+    }
+
+    /// Finishes a synthetic failed transaction directly for registry tests.
+    #[inline]
+    pub(crate) fn finish_trx_rollback_for_test(
+        registry: &SessionRegistry,
+        session_id: SessionID,
+        trx_id: TrxID,
+    ) {
+        registry.finish_trx_rollback(session_id, trx_id);
+    }
 
     type TotalRowPagesAfterAccessHook =
         Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
