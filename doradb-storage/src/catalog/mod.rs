@@ -946,7 +946,7 @@ impl UserTableCacheEntry {
     #[inline]
     pub(crate) async fn rollback_index_entry(
         &mut self,
-        entry: IndexUndo,
+        entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {

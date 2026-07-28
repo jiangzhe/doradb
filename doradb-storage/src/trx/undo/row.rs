@@ -128,27 +128,32 @@ impl RowUndoLogs {
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
     ) -> Result<()> {
-        while let Some(entry) = self.0.pop() {
-            if is_catalog_table(entry.table_id) {
-                let table = table_cache.must_get_catalog_table(entry.table_id);
-                if let Err((err, entry)) = table.mem.rollback_row_undo(entry, guards, |_| {}).await
-                {
-                    self.0.push(entry);
-                    return Err(err);
-                }
-            } else {
-                let table = table_cache.must_get_user_table(entry.table_id).await;
-                if let Err((err, entry)) = table
-                    .mem
-                    .rollback_row_undo(entry, guards, |row_id| {
-                        table.deletion_buffer().remove(row_id);
-                    })
-                    .await
-                {
-                    self.0.push(entry);
-                    return Err(err);
+        while !self.0.is_empty() {
+            {
+                // Keep the current entry vector-owned across every await. Its
+                // stable Box continues to own any pointer reachable from the
+                // row undo chain if this future is cancelled or fails. Pop it
+                // only after rollback synchronously unlinks that chain entry.
+                let entry = self
+                    .0
+                    .last_mut()
+                    .expect("non-empty row undo buffer must have a last entry");
+                #[cfg(test)]
+                super::test_hooks::maybe_pause_row_rollback().await;
+                if is_catalog_table(entry.table_id) {
+                    let table = table_cache.must_get_catalog_table(entry.table_id);
+                    table.mem.rollback_row_undo(entry, guards, |_| {}).await?;
+                } else {
+                    let table = table_cache.must_get_user_table(entry.table_id).await;
+                    table
+                        .mem
+                        .rollback_row_undo(entry, guards, |row_id| {
+                            table.deletion_buffer().remove(row_id);
+                        })
+                        .await?;
                 }
             }
+            self.0.pop();
         }
         Ok(())
     }

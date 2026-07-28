@@ -1360,13 +1360,13 @@ impl<'a> RowWriteAccess<'a> {
     pub(crate) fn rollback_first_undo(
         &mut self,
         metadata: &TableMetadata,
-        mut owned_entry: OwnedRowUndo,
+        owned_entry: &mut OwnedRowUndo,
     ) {
         let dirty = self.dirty;
         let head = self.guard.as_mut().expect("undo head");
         let entry = &mut head.next.main.entry;
         debug_assert!({
-            let input_ref = &*owned_entry;
+            let input_ref = &**owned_entry;
             std::ptr::addr_eq(entry.as_ref(), input_ref)
         });
         // Roll back the hot row page by applying the inverse of the first undo
@@ -1725,7 +1725,7 @@ pub(crate) mod tests {
         }
 
         let rollback_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10));
-        let rollback_undo =
+        let mut rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             rollback_status,
@@ -1734,15 +1734,15 @@ pub(crate) mod tests {
         // Statement rollback and full transaction rollback share this row
         // restoration boundary, so exercise two independent rollback passes.
         test_row_write_access(&page, &row_ver, &dirty, 0)
-            .rollback_first_undo(&metadata, rollback_undo);
-        let trx_rollback_undo =
+            .rollback_first_undo(&metadata, &mut rollback_undo);
+        let mut trx_rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 11)),
             trx_rollback_undo.leak(),
         )));
         test_row_write_access(&page, &row_ver, &dirty, 0)
-            .rollback_first_undo(&metadata, trx_rollback_undo);
+            .rollback_first_undo(&metadata, &mut trx_rollback_undo);
 
         let purge_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(101), RowUndoKind::Lock);
@@ -1790,7 +1790,7 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), 4);
 
         let rollback_status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 10));
-        let rollback_undo =
+        let mut rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             rollback_status,
@@ -1801,11 +1801,11 @@ pub(crate) mod tests {
         {
             let mut access = test_row_write_access(&page, &row_ver, &dirty, 0);
             assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 1);
-            access.rollback_first_undo(&metadata, rollback_undo);
+            access.rollback_first_undo(&metadata, &mut rollback_undo);
         }
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
-        let trx_rollback_undo =
+        let mut trx_rollback_undo =
             OwnedRowUndo::new(TableID::new(1), None, RowID::new(100), RowUndoKind::Lock);
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(
             Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 11)),
@@ -1814,7 +1814,7 @@ pub(crate) mod tests {
         let prepared_version = row_ver.frozen_mutation_version();
         // Then model the identical boundary reached by transaction rollback.
         test_row_write_access(&page, &row_ver, &dirty, 0)
-            .rollback_first_undo(&metadata, trx_rollback_undo);
+            .rollback_first_undo(&metadata, &mut trx_rollback_undo);
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
 
         let purge_undo =
