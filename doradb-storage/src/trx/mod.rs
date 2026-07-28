@@ -41,7 +41,7 @@ use crate::error::{
 use crate::id::{SessionID, TableID, TrxID};
 use crate::io::Completion;
 use crate::lock::{
-    FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
+    FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, LockScope, OwnerLockState,
     StmtNo, TableLockMode,
 };
 use crate::log::block_group::TrxLog;
@@ -243,9 +243,7 @@ impl Transaction {
             .checkout()
             .attach("operation=execute_statement")
             .disclose()?;
-        let trx_id = checkout.inner().trx_id();
-        let stmt_no = checkout.inner_mut().next_stmt_no();
-        let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
+        let stmt_owner = checkout.inner_mut().next_statement_owner();
         enum ExecOutcome<T> {
             Success(T),
             StatementError(Error),
@@ -291,9 +289,7 @@ impl Transaction {
             .checkout()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=stage_catalog_statement")?;
-        let trx_id = checkout.inner().trx_id();
-        let stmt_no = checkout.inner_mut().next_stmt_no();
-        let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
+        let stmt_owner = checkout.inner_mut().next_statement_owner();
         {
             let (inner, attachment) = checkout.inner_and_attachment_mut();
             let mut stmt = Statement::new(inner, attachment, stmt_owner);
@@ -736,7 +732,7 @@ impl<'r> TrxRuntime<'r> {
         #[cfg(debug_assertions)]
         {
             let resource = LockResource::TableData(table_id);
-            let owner = LockOwner::Transaction(self.ctx.trx_id());
+            let owner = LockOwner::transaction(self.attachment.session_id(), self.ctx.trx_id());
             let held = self.engine().lock_manager().owner_holds(
                 resource,
                 owner,
@@ -1518,15 +1514,13 @@ impl TrxInner {
     /// Create a checked-in mutable transaction core.
     #[inline]
     pub(crate) fn new(trx_id: TrxID, sts: TrxID, gc_no: usize, session_id: SessionID) -> Self {
-        let owner_group = LockOwnerGroup::Session(session_id);
         TrxInner {
             ctx: TrxContext::new(trx_id, sts, gc_no),
             effects: TrxEffects::empty(),
             table_bindings: FastHashMap::default(),
-            lock_state: Some(OwnerLockState::new_grouped(
-                LockOwner::Transaction(trx_id),
-                owner_group,
-            )),
+            lock_state: Some(OwnerLockState::new(LockOwner::transaction(
+                session_id, trx_id,
+            ))),
             next_stmt_no: 1,
             active: true,
         }
@@ -1619,6 +1613,12 @@ impl TrxInner {
             )
         });
         stmt_no
+    }
+
+    #[inline]
+    fn next_statement_owner(&mut self) -> LockOwner {
+        let stmt_no = self.next_stmt_no();
+        self.checked_lock_state().owner().statement(stmt_no)
     }
 
     /// Returns this transaction's current status timestamp.
@@ -1714,7 +1714,7 @@ impl TrxInner {
             panic!("terminal transaction-lock release requires owner state: trx_id={trx_id}")
         });
         assert!(
-            lock_state.owner() == LockOwner::Transaction(trx_id),
+            lock_state.owner().scope() == LockScope::Transaction(trx_id),
             "terminal transaction-lock owner mismatch: trx_id={trx_id}, owner={}",
             lock_state.owner()
         );
@@ -2405,7 +2405,7 @@ fn release_carried_transaction_locks(
     match (lock_state.take(), lock_manager.take()) {
         (Some(mut lock_state), Some(lock_manager)) => {
             let owner = lock_state.owner();
-            let LockOwner::Transaction(trx_id) = owner else {
+            let LockScope::Transaction(trx_id) = owner.scope() else {
                 panic!("carried terminal lock state requires a transaction owner: owner={owner}")
             };
             lock_state.release_all(&lock_manager);
@@ -2461,9 +2461,7 @@ pub(crate) mod tests {
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
-    use crate::lock::tests::{
-        LockDebugEntryState, debug_snapshot, try_acquire, try_acquire_grouped,
-    };
+    use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::row::ops::SelectKey;
     use crate::session::{
@@ -2938,12 +2936,7 @@ pub(crate) mod tests {
             return Ok(true);
         }
         let owner = lock_state.owner();
-        let acquired = match lock_state.owner_group() {
-            Some(owner_group) => {
-                try_acquire_grouped(lock_manager, resource, mode, owner, owner_group).disclose()?
-            }
-            None => try_acquire(lock_manager, resource, mode, owner).disclose()?,
-        };
+        let acquired = try_acquire(lock_manager, resource, mode, owner).disclose()?;
         if acquired {
             lock_state.cache_granted(resource, mode);
         }
@@ -2986,7 +2979,7 @@ pub(crate) mod tests {
             let transaction_lock_entries = snapshot
                 .entries
                 .iter()
-                .filter(|entry| entry.owner == LockOwner::Transaction(trx_id))
+                .filter(|entry| entry.owner == LockOwner::transaction(session_id, trx_id))
                 .count();
             let session_lock_entries = session_owner.map_or(0, |owner| {
                 snapshot
@@ -3532,9 +3525,9 @@ pub(crate) mod tests {
             let first_owner = first_owner.get().unwrap();
             let second_owner = second_owner.get().unwrap();
             let error_owner = error_owner.get().unwrap();
-            assert_eq!(first_owner, LockOwner::Statement(trx.trx_id(), 1));
-            assert_eq!(second_owner, LockOwner::Statement(trx.trx_id(), 2));
-            assert_eq!(error_owner, LockOwner::Statement(trx.trx_id(), 3));
+            assert_eq!(first_owner, trx_owner.statement(1));
+            assert_eq!(second_owner, trx_owner.statement(2));
+            assert_eq!(error_owner, trx_owner.statement(3));
             assert_eq!(lock_entry_count(&engine, first_owner), 0);
             assert_eq!(lock_entry_count(&engine, second_owner), 0);
             assert_eq!(lock_entry_count(&engine, error_owner), 0);
@@ -3575,7 +3568,7 @@ pub(crate) mod tests {
                     engine.lock_manager(),
                     metadata,
                     LockMode::Shared,
-                    LockOwner::Session(SessionID::new(91_221))
+                    LockOwner::session_explicit(SessionID::new(91_221))
                 )
                 .unwrap()
             );
@@ -3587,7 +3580,7 @@ pub(crate) mod tests {
             );
             engine
                 .lock_manager()
-                .release_owner(LockOwner::Session(SessionID::new(91_221)));
+                .release_owner(LockOwner::session_explicit(SessionID::new(91_221)));
 
             trx.rollback().await.unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 0);
@@ -3649,7 +3642,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("trx_lock_table_cancel_state").await;
             let table_id = catalog_tests::table2(&engine).await;
-            let blocker = LockOwner::Transaction(TrxID::new(91_401));
+            let blocker = LockOwner::transaction(SessionID::new(91_401), TrxID::new(91_401));
             let data = LockResource::TableData(table_id);
             assert!(
                 try_acquire(engine.lock_manager(), data, LockMode::Exclusive, blocker).unwrap()
@@ -3709,7 +3702,7 @@ pub(crate) mod tests {
             assert!(try_acquire_transaction_lock(&mut trx, metadata, LockMode::Shared).unwrap());
             assert!(cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
 
-            let blocker = LockOwner::Transaction(TrxID::new(91_402));
+            let blocker = LockOwner::transaction(SessionID::new(91_402), TrxID::new(91_402));
             assert!(
                 try_acquire(engine.lock_manager(), data, LockMode::Exclusive, blocker).unwrap()
             );
@@ -3975,7 +3968,7 @@ pub(crate) mod tests {
                     .expect("rollback should reach the terminal attachment boundary");
                 let admission = session.list_table_ids();
                 let transaction_lock_entries =
-                    lock_entry_count(&engine, LockOwner::Transaction(trx_id));
+                    lock_entry_count(&engine, LockOwner::transaction(session_id, trx_id));
 
                 release_tx
                     .send(())
@@ -4000,7 +3993,7 @@ pub(crate) mod tests {
             let table_id = catalog_tests::table2(&engine).await;
             let mut session = engine.new_session().unwrap();
             let session_id = session.id();
-            let session_owner = LockOwner::Session(session_id);
+            let session_owner = LockOwner::session_explicit(session_id);
             session
                 .lock_table(table_id, TableLockMode::Shared)
                 .await

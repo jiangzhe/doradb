@@ -10,9 +10,7 @@ use crate::error::{
     OperationResult, Result,
 };
 use crate::id::{SessionID, TableID, TrxID};
-use crate::lock::{
-    FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, TableLockMode,
-};
+use crate::lock::{FreshLockGuard, LockManager, LockMode, LockOwner, LockResource, TableLockMode};
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::ChangeNotifier;
 use crate::quiescent::QuiescentGuard;
@@ -104,10 +102,8 @@ pub(crate) struct SessionDdlContext {
     pub(crate) engine: EngineRef,
     /// Pool guards retained for DDL work.
     pub(crate) pool_guards: PoolGuards,
-    /// Session-level lock owner.
+    /// Exact DDL-operation lock owner.
     pub(crate) owner: LockOwner,
-    /// Session-level lock owner group.
-    pub(crate) owner_group: LockOwnerGroup,
 }
 
 impl SessionDdlContext {
@@ -116,11 +112,11 @@ impl SessionDdlContext {
     pub(crate) fn new(session: &SessionPin) -> OperationResult<Self> {
         let id = session.id();
         let pool_guards = session.pool_guards();
+        let operation_id = session.engine.next_ddl_operation_id();
         Ok(Self {
             engine: session.engine.clone(),
             pool_guards,
-            owner: LockOwner::Session(id),
-            owner_group: LockOwnerGroup::Session(id),
+            owner: LockOwner::ddl(id, operation_id),
         })
     }
 }
@@ -173,7 +169,9 @@ struct ScopedTableRuntimeAccess<'lock> {
 impl<'lock> ScopedTableRuntimeAccess<'lock> {
     /// Acquires ordered metadata S/data IS admission and resolves a live table.
     async fn acquire(session: &'lock SessionPin, table_id: TableID) -> OperationResult<Self> {
-        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id).await?;
+        let owner =
+            LockOwner::maintenance(session.id(), session.engine.next_maintenance_operation_id());
+        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id, owner).await?;
         let table = session.resolve_user_table(table_id).await?;
         Ok(Self {
             table: Some(table),
@@ -187,7 +185,9 @@ impl<'lock> ScopedTableRuntimeAccess<'lock> {
         session: &'lock SessionPin,
         table_id: TableID,
     ) -> OperationResult<Option<Self>> {
-        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id).await?;
+        let owner =
+            LockOwner::maintenance(session.id(), session.engine.next_maintenance_operation_id());
+        let (metadata_lock, data_lock) = Self::acquire_locks(session, table_id, owner).await?;
         let Some(table) = session.engine.catalog().current_live_user_table(table_id) else {
             return Ok(None);
         };
@@ -206,13 +206,12 @@ impl<'lock> ScopedTableRuntimeAccess<'lock> {
     async fn acquire_locks(
         session: &'lock SessionPin,
         table_id: TableID,
+        owner: LockOwner,
     ) -> OperationResult<(Option<FreshLockGuard<'lock>>, Option<FreshLockGuard<'lock>>)> {
-        let owner = LockOwner::Session(session.id());
-        let owner_group = LockOwnerGroup::Session(session.id());
         session
             .engine
             .lock_manager()
-            .acquire_grouped_table_locks(table_id, LockMode::IntentShared, owner, owner_group)
+            .acquire_table_locks(table_id, LockMode::IntentShared, owner)
             .await
     }
 
@@ -804,10 +803,9 @@ impl SessionPin {
         let session_id = self.id();
         let engine = &self.engine;
         let lock_manager = engine.lock_manager();
-        let owner = LockOwner::Session(session_id);
-        let owner_group = LockOwnerGroup::Session(session_id);
+        let owner = LockOwner::session_explicit(session_id);
         let (mut metadata_guard, mut data_guard) = lock_manager
-            .acquire_grouped_table_locks(table_id, mode, owner, owner_group)
+            .acquire_table_locks(table_id, mode, owner)
             .await?;
         engine.catalog().validate_user_table_live(table_id).await?;
         if let Some(guard) = data_guard.as_mut() {
@@ -822,7 +820,7 @@ impl SessionPin {
     /// Releases an explicit session-lifetime table lock from this pinned session.
     #[inline]
     pub(crate) fn unlock_table(&self, table_id: TableID) -> OperationResult<()> {
-        let owner = LockOwner::Session(self.id());
+        let owner = LockOwner::session_explicit(self.id());
         let lock_manager = self.engine.lock_manager();
         lock_manager.release(LockResource::TableData(table_id), owner);
         lock_manager.release(LockResource::TableMetadata(table_id), owner);
@@ -1372,7 +1370,8 @@ impl SessionState {
 
     #[inline]
     fn release_session_locks(&self) {
-        self.lock_manager.release_owner(LockOwner::Session(self.id));
+        self.lock_manager
+            .release_owner(LockOwner::session_explicit(self.id));
     }
 }
 
@@ -1440,6 +1439,12 @@ impl TrxAttachment {
     #[inline]
     pub(crate) fn engine(&self) -> &EngineRef {
         &self.engine
+    }
+
+    /// Returns the authoritative session identity for transaction lock ownership.
+    #[inline]
+    pub(crate) fn session_id(&self) -> SessionID {
+        self.session_id
     }
 
     /// Returns the cloned session pool guards retained by this transaction.
@@ -1564,12 +1569,13 @@ pub(crate) mod tests {
         DataIntegrityError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
     };
     use crate::io::install_storage_backend_test_hook;
+    use crate::lock::tests::LockDebugEntryState;
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
     use crate::stats::{BufferPoolCounters, BufferPoolRuntimeStats, TransactionSystemStats};
     use crate::table::tests::{
-        FailingFirstWriteHook, assert_freeze_created, lightweight_test_engine_config,
-        lock_entry_count,
+        FailingFirstWriteHook, assert_freeze_created, has_lock_entry,
+        lightweight_test_engine_config, lock_entry_count, maintenance_lock_owner,
     };
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
@@ -2197,7 +2203,10 @@ pub(crate) mod tests {
             assert_rejected!(session.lock_table(table_id, TableLockMode::Exclusive).await);
             assert_rejected!(session.unlock_table(table_id));
 
-            assert_eq!(lock_entry_count(&engine, LockOwner::Session(session_id)), 0);
+            assert_eq!(
+                lock_entry_count(&engine, LockOwner::session_explicit(session_id)),
+                0
+            );
             assert_eq!(engine.catalog().list_user_table_ids_now(), table_ids_before);
 
             trx.rollback().await.unwrap();
@@ -2464,6 +2473,85 @@ pub(crate) mod tests {
             wait_for_dropped_table_floor(&engine, table_id).await;
 
             engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_explicit_table_lock_retains_separate_maintenance_claim() {
+        smol::block_on(async {
+            for (table_mode, explicit_data_mode) in [
+                (TableLockMode::Shared, LockMode::Shared),
+                (TableLockMode::Exclusive, LockMode::Exclusive),
+            ] {
+                let root = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(lightweight_test_engine_config(
+                    root.path().to_path_buf(),
+                    "explicit-maintenance-owner",
+                ))
+                .await
+                .unwrap();
+                let table_id = table2(&engine).await;
+                let mut session = engine.new_session().unwrap();
+                let session_id = session.id();
+                let explicit_owner = LockOwner::session_explicit(session_id);
+                session.lock_table(table_id, table_mode).await.unwrap();
+
+                let (entered_tx, entered_rx) = flume::bounded(1);
+                let (release_tx, release_rx) = flume::bounded(1);
+                set_test_total_row_pages_after_access_hook(move || async move {
+                    entered_tx.send_async(()).await.unwrap();
+                    release_rx.recv_async().await.unwrap();
+                });
+
+                let mut count = Box::pin(session.total_row_pages(table_id));
+                assert!(futures::poll!(count.as_mut()).is_pending());
+                entered_rx.recv_async().await.unwrap();
+
+                let metadata = LockResource::TableMetadata(table_id);
+                let data = LockResource::TableData(table_id);
+                let maintenance_owner = maintenance_lock_owner(
+                    &engine,
+                    session_id,
+                    metadata,
+                    LockMode::Shared,
+                    LockDebugEntryState::Granted,
+                )
+                .expect("maintenance owner should retain metadata S");
+                assert_ne!(maintenance_owner, explicit_owner);
+                assert!(matches!(
+                    maintenance_owner.scope(),
+                    crate::lock::LockScope::Maintenance(_)
+                ));
+                assert!(has_lock_entry(
+                    &engine,
+                    explicit_owner,
+                    metadata,
+                    LockMode::Shared,
+                    LockDebugEntryState::Granted,
+                ));
+                assert!(has_lock_entry(
+                    &engine,
+                    explicit_owner,
+                    data,
+                    explicit_data_mode,
+                    LockDebugEntryState::Granted,
+                ));
+                assert!(has_lock_entry(
+                    &engine,
+                    maintenance_owner,
+                    data,
+                    LockMode::IntentShared,
+                    LockDebugEntryState::Granted,
+                ));
+
+                release_tx.send_async(()).await.unwrap();
+                assert_eq!(count.await.unwrap(), 0);
+                assert_eq!(lock_entry_count(&engine, maintenance_owner), 0);
+                assert_eq!(lock_entry_count(&engine, explicit_owner), 2);
+
+                session.unlock_table(table_id).unwrap();
+                engine.shutdown().unwrap();
+            }
         });
     }
 

@@ -6,7 +6,7 @@ use crate::id::TableID;
 use crate::index::{
     BTreeKeyEncoder, IndexBatchStream, IndexLookupCandidate, OwnedSecondaryIndexCandidateStream,
 };
-use crate::lock::{LockOwner, OwnerLockState};
+use crate::lock::OwnerLockState;
 use crate::row::ops::SelectMvcc;
 use crate::table::{DmlValidator, Table, TableRuntimeLayout};
 use crate::trx::{TableAdmissionRequest, Transaction, TrxCheckout, TrxRuntime};
@@ -260,14 +260,8 @@ impl<'trx> StreamStmt<'trx> {
             .checkout()
             .attach_with(|| format!("operation={INDEX_SCAN_STREAM_OPERATION}"))
             .disclose()?;
-        let trx_id = checkout.inner().trx_id();
-        let stmt_no = checkout.inner_mut().next_stmt_no();
-        let stmt_owner = LockOwner::Statement(trx_id, stmt_no);
-        let owner_group = checkout.inner().checked_lock_state().owner_group();
-        let stmt_locks = match owner_group {
-            Some(owner_group) => OwnerLockState::new_grouped(stmt_owner, owner_group),
-            None => OwnerLockState::new(stmt_owner),
-        };
+        let stmt_owner = checkout.inner_mut().next_statement_owner();
+        let stmt_locks = OwnerLockState::new(stmt_owner);
         let mut stmt_state = StreamStmtState::new(checkout, stmt_locks);
         let (table, layout) = stmt_state
             .admit_user_table(table_id, TableAdmissionRequest::IndexRead { index_no })

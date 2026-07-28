@@ -1149,7 +1149,7 @@ pub(crate) async fn create_table_for_session(
     let table_id = engine.catalog().next_table_id();
     let _metadata_lock = engine
         .lock_manager()
-        .acquire_create_table_metadata_lock(table_id, ctx.owner, ctx.owner_group)
+        .acquire_create_table_metadata_lock(table_id, ctx.owner)
         .await
         .attach_with(|| format!("operation=create_table, table_id={table_id}"))
         .disclose()?;
@@ -1301,7 +1301,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
         .attach("operation=drop_table")
         .disclose()?;
     let _table_locks = lock_manager
-        .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
+        .acquire_table_ddl_locks(table_id, ctx.owner)
         .await
         .attach_with(|| format!("operation=drop_table, table_id={table_id}"))
         .disclose()?;
@@ -1766,7 +1766,7 @@ mod tests {
         DiscloseError, DiscloseResultExt, Error, ErrorKind, FatalError, IoError, LifecycleError,
         OperationError, RuntimeError,
     };
-    use crate::id::TrxID;
+    use crate::id::{SessionID, TrxID};
     use crate::io::install_storage_backend_test_hook;
     use crate::lock::tests::{LockDebugEntryState, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
@@ -2573,7 +2573,7 @@ mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
-            let owner = LockOwner::Session(session.id());
+            let session_id = session.id();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
@@ -2595,14 +2595,14 @@ mod tests {
             );
             assert_no_user_table_publication(&engine, table_id);
             assert!(engine.inner().poisoner.poison_error().is_none());
-            assert!(!has_lock_resource(
+            assert!(!has_ddl_lock_resource(
                 &engine,
-                owner,
+                session_id,
                 LockResource::TableMetadata(table_id),
             ));
-            assert!(!has_lock_resource(
+            assert!(!has_ddl_lock_resource(
                 &engine,
-                owner,
+                session_id,
                 LockResource::TableData(table_id),
             ));
             assert!(!session.in_trx().unwrap());
@@ -2657,7 +2657,7 @@ mod tests {
             .await
             .unwrap();
             let mut session = engine.new_session().unwrap();
-            let owner = LockOwner::Session(session.id());
+            let session_id = session.id();
             let table_id = engine.catalog().curr_next_table_id();
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             let (table_spec, index_specs) = drop_table_test_spec();
@@ -2673,14 +2673,14 @@ mod tests {
             );
             assert_no_user_table_publication(&engine, table_id);
             assert!(engine.inner().poisoner.poison_error().is_none());
-            assert!(!has_lock_resource(
+            assert!(!has_ddl_lock_resource(
                 &engine,
-                owner,
+                session_id,
                 LockResource::TableMetadata(table_id),
             ));
-            assert!(!has_lock_resource(
+            assert!(!has_ddl_lock_resource(
                 &engine,
-                owner,
+                session_id,
                 LockResource::TableData(table_id),
             ));
             assert!(!session.in_trx().unwrap());
@@ -2987,7 +2987,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::LockOwnerGroupConflict)
+                Some(OperationError::LockFamilyConflict)
             );
             assert!(!has_lock_entry(
                 &engine,
@@ -3009,7 +3009,7 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
-            let session_owner = LockOwner::Session(session.id());
+            let session_owner = LockOwner::session_explicit(session.id());
             let mut trx = session.begin_trx().unwrap();
 
             trx_insert_row_by_id(
@@ -3049,7 +3049,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
-            let blocker = LockOwner::Transaction(TrxID::new(91_301));
+            let blocker = LockOwner::transaction(SessionID::new(91_301), TrxID::new(91_301));
             assert!(
                 try_acquire(
                     engine.lock_manager(),
@@ -3061,7 +3061,7 @@ mod tests {
             );
 
             let mut session = engine.new_session().unwrap();
-            let session_owner = LockOwner::Session(session.id());
+            let session_owner = LockOwner::session_explicit(session.id());
             let mut lock_fut = Box::pin(session.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
                 futures::poll!(lock_fut.as_mut()),
@@ -3107,7 +3107,7 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
-            let session_owner = LockOwner::Session(session.id());
+            let session_owner = LockOwner::session_explicit(session.id());
             session
                 .lock_table(table_id, TableLockMode::Shared)
                 .await
@@ -3121,7 +3121,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::LockOwnerGroupConflict)
+                Some(OperationError::LockFamilyConflict)
             );
             assert!(!has_lock_resource(
                 &engine,
@@ -3153,7 +3153,7 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
-            let blocker = LockOwner::Transaction(TrxID::new(91_302));
+            let blocker = LockOwner::transaction(SessionID::new(91_302), TrxID::new(91_302));
             assert!(
                 try_acquire(
                     engine.lock_manager(),
@@ -3216,7 +3216,7 @@ mod tests {
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
-            let session_owner = LockOwner::Session(session.id());
+            let session_owner = LockOwner::session_explicit(session.id());
             session
                 .lock_table(table_id, TableLockMode::Exclusive)
                 .await
@@ -3432,7 +3432,7 @@ mod tests {
                 let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
                 let table_id = create_table2_for_test(&engine).await;
                 let mut session = engine.new_session().unwrap();
-                let owner = LockOwner::Session(session.id());
+                let owner = LockOwner::session_explicit(session.id());
                 let table = table_for_internal_assertion(&engine, table_id);
 
                 session.lock_table(table_id, table_mode).await.unwrap();
@@ -3440,7 +3440,7 @@ mod tests {
                 let err = session.drop_table(table_id).await.unwrap_err();
                 assert_eq!(
                     err.report().downcast_ref::<OperationError>().copied(),
-                    Some(OperationError::LockOwnerGroupConflict)
+                    Some(OperationError::LockFamilyConflict)
                 );
                 let rendered = err.to_string();
                 assert_eq!(rendered.matches("operation=drop_table").count(), 1);
@@ -3563,12 +3563,18 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
             let mut drop_session = engine.new_session().unwrap();
-            let drop_owner = LockOwner::Session(drop_session.id());
+            let drop_session_id = drop_session.id();
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
+            let drop_owner = ddl_lock_owner(
+                &engine,
+                drop_session_id,
+                LockResource::TableMetadata(table_id),
+            )
+            .expect("drop DDL owner should hold metadata X");
             assert!(has_lock_entry(
                 &engine,
                 drop_owner,
@@ -3578,7 +3584,7 @@ mod tests {
             ));
 
             let mut lock_session = engine.new_session().unwrap();
-            let lock_owner = LockOwner::Session(lock_session.id());
+            let lock_owner = LockOwner::session_explicit(lock_session.id());
             let mut lock_fut = Box::pin(lock_session.lock_table(table_id, TableLockMode::Shared));
             assert!(matches!(
                 futures::poll!(lock_fut.as_mut()),
@@ -3660,12 +3666,18 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let (root_lease, publish_lease) = begin_checkpoint_publish_for_test(&table);
             let mut drop_session = engine.new_session().unwrap();
-            let drop_owner = LockOwner::Session(drop_session.id());
+            let drop_session_id = drop_session.id();
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
+            let drop_owner = ddl_lock_owner(
+                &engine,
+                drop_session_id,
+                LockResource::TableMetadata(table_id),
+            )
+            .expect("drop DDL owner should hold metadata X");
             assert!(has_lock_entry(
                 &engine,
                 drop_owner,
@@ -3728,7 +3740,7 @@ mod tests {
             assert_dropped_table_runtime(engine.catalog(), table_id);
 
             let mut lock_session = engine.new_session().unwrap();
-            let session_owner = LockOwner::Session(lock_session.id());
+            let session_owner = LockOwner::session_explicit(lock_session.id());
             let err = lock_session
                 .lock_table(table_id, TableLockMode::Shared)
                 .await
@@ -3821,19 +3833,19 @@ mod tests {
                 .create_table(other_spec, other_indexes)
                 .await
                 .unwrap();
-            let owner = LockOwner::Session(session.id());
+            let session_id = session.id();
 
             assert!(Path::new(&table_file_path).exists());
             session.drop_table(table_id).await.unwrap();
 
-            assert!(!has_lock_resource(
+            assert!(!has_ddl_lock_resource(
                 &engine,
-                owner,
+                session_id,
                 LockResource::TableMetadata(table_id),
             ));
-            assert!(!has_lock_resource(
+            assert!(!has_ddl_lock_resource(
                 &engine,
-                owner,
+                session_id,
                 LockResource::TableData(table_id),
             ));
             assert!(engine.catalog().get_table(table_id).await.is_none());

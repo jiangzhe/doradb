@@ -339,6 +339,18 @@ impl_id! {
 }
 
 impl_id! {
+    /// Engine-local identity for one DDL operation.
+    pub(crate) struct DdlOperationID;
+    methods pub(crate)
+}
+
+impl_id! {
+    /// Engine-local identity for one scoped maintenance operation.
+    pub(crate) struct MaintenanceOperationID;
+    methods pub(crate)
+}
+
+impl_id! {
     /// Runtime buffer-managed page identity.
     ///
     /// This id is reserved for mutable or cached pages owned by the buffer layer.
