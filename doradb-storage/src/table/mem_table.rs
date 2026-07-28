@@ -38,7 +38,6 @@ use crate::trx::{MIN_SNAPSHOT_TS, RetiredRowPageBatch, TrxRuntime};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use std::mem::take;
-use std::result::Result as StdResult;
 use std::sync::Arc;
 
 struct NoTrxIndexRefresh {
@@ -416,10 +415,10 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     #[inline]
     pub(crate) async fn rollback_row_undo<F>(
         &self,
-        entry: OwnedRowUndo,
+        entry: &mut OwnedRowUndo,
         guards: &PoolGuards,
         on_cold_row_rollback: F,
-    ) -> StdResult<(), (Report<RuntimeError>, OwnedRowUndo)>
+    ) -> RuntimeResult<()>
     where
         F: FnOnce(RowID),
     {
@@ -431,10 +430,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             on_cold_row_rollback(entry.row_id);
             return Ok(());
         }
-        let page_guard = match self.get_row_page_versioned_shared(guards, page_id).await {
-            Ok(page_guard) => page_guard,
-            Err(err) => return Err((err, entry)),
-        };
+        let page_guard = self.get_row_page_versioned_shared(guards, page_id).await?;
         let Some(page_guard) = page_guard else {
             return Ok(());
         };

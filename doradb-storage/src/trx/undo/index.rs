@@ -47,14 +47,27 @@ impl IndexUndoLogs {
         guards: &PoolGuards,
         ts: TrxID,
     ) -> Result<()> {
-        while let Some(entry) = self.0.pop() {
-            if is_catalog_table(entry.table_id) {
-                let table = table_cache.must_get_catalog_table(entry.table_id);
-                table.rollback_index_entry(entry, guards, ts).await?;
-            } else {
-                let table = table_cache.must_get_user_entry_mut(entry.table_id).await;
-                table.rollback_index_entry(entry, guards, ts).await?;
+        while !self.0.is_empty() {
+            {
+                // Keep the current entry vector-owned across every await. If
+                // this rollback future is cancelled or fails, the entry stays
+                // available for transaction rollback or fatal retention.
+                // Successful rollback returns before the synchronous pop below.
+                let entry = self
+                    .0
+                    .last()
+                    .expect("non-empty index undo buffer must have a last entry");
+                #[cfg(test)]
+                super::test_hooks::maybe_pause_index_rollback().await;
+                if is_catalog_table(entry.table_id) {
+                    let table = table_cache.must_get_catalog_table(entry.table_id);
+                    table.rollback_index_entry(entry, guards, ts).await?;
+                } else {
+                    let table = table_cache.must_get_user_entry_mut(entry.table_id).await;
+                    table.rollback_index_entry(entry, guards, ts).await?;
+                }
             }
+            self.0.pop();
         }
         Ok(())
     }

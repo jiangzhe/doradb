@@ -84,21 +84,21 @@ pub(crate) trait IndexRollback {
     /// Rolls back one secondary-index undo entry against this table runtime.
     async fn rollback_index_entry(
         &self,
-        entry: IndexUndo,
+        entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {
         let table = self.mem_table();
         let index_pool_guard = table.index_pool_guard(guards);
-        match entry.kind {
+        match &entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
-                if merge_old_deleted {
+                if *merge_old_deleted {
                     // This insert reused a delete-masked unique entry for the
                     // same RowID, usually from repeated hot key changes in one
                     // transaction. Rollback restores the masked old owner
                     // instead of removing the entry.
                     let res = self
-                        .unique_mask_as_deleted(index_pool_guard, &key, entry.row_id, ts)
+                        .unique_mask_as_deleted(index_pool_guard, key, entry.row_id, ts)
                         .await?;
                     assert!(res);
                 } else {
@@ -106,24 +106,24 @@ pub(crate) trait IndexRollback {
                     // aborts, remove only that claim; older owners are restored
                     // by separate update/defer-delete undo entries.
                     let res = self
-                        .unique_compare_delete(index_pool_guard, &key, entry.row_id, true, ts)
+                        .unique_compare_delete(index_pool_guard, key, entry.row_id, true, ts)
                         .await?;
                     assert!(res);
                 }
             }
             IndexUndoKind::InsertNonUnique(key, merge_old_deleted) => {
-                if merge_old_deleted {
+                if *merge_old_deleted {
                     // Same exact `(key, row_id)` was unmasked during a hot
                     // key-change cycle. Rollback masks it back to deleted.
                     let res = self
-                        .non_unique_mask_as_deleted(index_pool_guard, &key, entry.row_id, ts)
+                        .non_unique_mask_as_deleted(index_pool_guard, key, entry.row_id, ts)
                         .await?;
                     assert!(res);
                 } else {
                     // Remove the exact non-unique claim inserted by the
                     // aborted transaction.
                     let res = self
-                        .non_unique_compare_delete(index_pool_guard, &key, entry.row_id, true, ts)
+                        .non_unique_compare_delete(index_pool_guard, key, entry.row_id, true, ts)
                         .await?;
                     assert!(res);
                 }
@@ -136,19 +136,13 @@ pub(crate) trait IndexRollback {
                 // stale marker is safe: it remains invisible to reads and normal
                 // index purge or a later foreground update can remove it.
                 let new_row_id = entry.row_id;
-                let restored_row_id = if deleted {
+                let restored_row_id = if *deleted {
                     old_row_id.deleted()
                 } else {
-                    old_row_id
+                    *old_row_id
                 };
                 let res = self
-                    .unique_compare_exchange(
-                        index_pool_guard,
-                        &key,
-                        new_row_id,
-                        restored_row_id,
-                        ts,
-                    )
+                    .unique_compare_exchange(index_pool_guard, key, new_row_id, restored_row_id, ts)
                     .await?;
                 debug_assert!(res.is_ok());
             }
@@ -157,11 +151,11 @@ pub(crate) trait IndexRollback {
                 // entries but leave them physically present for rollback and
                 // old snapshots. Aborting the transaction unmasks the exact
                 // owner that was deferred for deletion.
-                if unique {
+                if *unique {
                     let res = self
                         .unique_compare_exchange(
                             index_pool_guard,
-                            &key,
+                            key,
                             entry.row_id.deleted(),
                             entry.row_id,
                             ts,
@@ -170,7 +164,7 @@ pub(crate) trait IndexRollback {
                     assert!(res.is_ok());
                 } else {
                     let res = self
-                        .non_unique_mask_as_active(index_pool_guard, &key, entry.row_id, ts)
+                        .non_unique_mask_as_active(index_pool_guard, key, entry.row_id, ts)
                         .await?;
                     assert!(res);
                 }
@@ -300,7 +294,7 @@ impl Table {
     pub(crate) async fn rollback_index_entry_with_layout(
         &self,
         layout: &TableRuntimeLayout,
-        entry: IndexUndo,
+        entry: &IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
     ) -> RuntimeResult<()> {

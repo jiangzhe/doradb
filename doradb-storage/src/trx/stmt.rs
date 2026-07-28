@@ -893,6 +893,7 @@ pub(crate) mod tests {
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::session::{SessionState, tests as session_tests};
     use crate::trx::sys::tests as sys_tests;
+    use crate::trx::undo::test_hooks::{pause_next_index_rollback, pause_next_row_rollback};
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
     use error_stack::Report;
@@ -1052,6 +1053,48 @@ pub(crate) mod tests {
         });
 
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_cancelled_undo_rollback_retains_current_entries() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_cancelled_undo_rollback").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let checkout = trx
+                .checkout()
+                .expect("test transaction should be available for checkout");
+            let sts = checkout.inner().sts();
+            let pool_guards = checkout.attachment().pool_guards().clone();
+            let mut table_cache = TableCache::new(engine.catalog());
+            let table_id = TableID::new(99_999_998);
+            let row_id = RowID::new(23);
+            let mut effects = StmtEffects::empty();
+            effects.push_delete_index_undo(table_id, row_id, SelectKey::new(0, vec![]), true);
+            effects.push_row_undo(OwnedRowUndo::new(
+                table_id,
+                None,
+                row_id,
+                RowUndoKind::Delete,
+            ));
+
+            pause_next_index_rollback();
+            let mut index_rollback =
+                Box::pin(effects.rollback_index(&mut table_cache, &pool_guards, sts));
+            assert!(futures::poll!(index_rollback.as_mut()).is_pending());
+            drop(index_rollback);
+            assert_eq!(effects.index_undo.len(), 1);
+
+            pause_next_row_rollback();
+            let mut row_rollback = Box::pin(effects.rollback_row(&mut table_cache, &pool_guards));
+            assert!(futures::poll!(row_rollback.as_mut()).is_pending());
+            drop(row_rollback);
+            assert_eq!(effects.row_undo.len(), 1);
+
+            drop(effects.take_for_fatal_retention());
+            drop(checkout);
+            trx.rollback().await.unwrap();
+        });
     }
 
     #[test]
