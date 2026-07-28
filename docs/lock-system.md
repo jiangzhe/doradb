@@ -36,10 +36,12 @@ resources:
 - `TableData(table_id)` coordinates table-wide operations with row writers and
   maintenance.
 
-The current manager represents session-, transaction-, and statement-owned
-locks as separate physical grants. Each resource stores grants in a `Vec` and
-waiters in a `VecDeque`. This is functionally small and cancellation-aware, but
-many operations scan all grants or rebuild the whole queue.
+The current manager represents session-explicit, transaction, statement, DDL,
+and maintenance owners as canonical exact owners with one session family and
+one scope. Each exact owner still produces a separate physical grant. Each
+resource stores grants in a `Vec` and waiters in a `VecDeque`. This is
+functionally small and cancellation-aware, but many operations scan all grants
+or rebuild the whole queue.
 
 The working design separates:
 
@@ -234,8 +236,7 @@ inside the same family.
 
 Same-session owners are not generally conflict-free. For a request `R` from
 exact owner `O`, every held claim from a different owner in the same family must
-cover `R`. Otherwise the request returns the current `LockOwnerGroupConflict`
-error.
+cover `R`. Otherwise the request returns `LockFamilyConflict`.
 
 For table data, this produces:
 
@@ -255,13 +256,15 @@ session S -> transaction IX     conflict
 transaction IX -> statement S   conflict
 ```
 
-The rule is evaluated against every exact claim, not only the family's
-strongest physical mode. Another waiter in the same family cannot exist because
-the family retains exclusive lock-mutation authority while a request waits.
-The transaction-to-Session example is not a reachable public request: active
-transaction lifecycle admission returns `ExistingTransaction` before the
-Session can call the manager. It remains useful as the manager-level
-directional rule for internal modeling and invariant tests.
+The rule is evaluated against every granted and waiting exact claim, not only
+the family's strongest physical mode. The current manager still supports
+duplicate waiters and does not serialize all family mutation. The later working
+design would establish exclusive family lock-mutation authority before
+removing those defenses. The transaction-to-Session example is not a reachable
+public request: active transaction lifecycle admission returns
+`ExistingTransaction` before the Session can call the manager. It remains
+useful as the manager-level directional rule for internal modeling and
+invariant tests.
 
 ## Implemented Baseline
 
@@ -277,14 +280,16 @@ struct ResourceState {
 
 struct GrantedLock {
     owner: LockOwner,
-    owner_group: Option<LockOwnerGroup>,
     mode: LockMode,
 }
 ```
 
-Session, transaction, and statement owners from one session may therefore
-produce three granted entries for the same resource even though they are one
-external conflict participant.
+`LockOwner` contains a canonical `LockFamily(SessionID)` and an exact
+`LockScope`: `SessionExplicit`, `Transaction`, `Statement`, `Ddl`, or
+`Maintenance`. Owners from one family may therefore produce multiple granted
+entries for the same resource even though they are one external conflict
+participant. The resource side does not yet physically aggregate those
+entries.
 
 ### Owner-local cache
 
@@ -293,7 +298,6 @@ Transactions and statements use:
 ```rust
 struct OwnerLockState {
     owner: LockOwner,
-    owner_group: Option<LockOwnerGroup>,
     held: FastHashMap<LockResource, LockMode>,
 }
 ```
@@ -308,12 +312,18 @@ This cache is already useful:
 Session explicit locks do not yet have the equivalent cache and still use a
 global `release_owner()` scan during session cleanup.
 
-DDL and maintenance also have no distinct exact-owner identity today. They
-reuse `LockOwner::Session` and rely on fresh-versus-existing guards so scoped
-cleanup does not release a pre-existing explicit session grant. DDL performs a
-separate preflight rejection because the shared identity cannot otherwise
-distinguish its temporary claim from an explicit session claim. This purpose
-overloading motivates the working design's distinct DDL and maintenance scopes.
+DDL and maintenance allocate distinct typed operation ids from one shared
+engine-local sequence. One public DDL call retains one `Ddl` owner through its
+`SessionDdlContext`; one `ScopedTableRuntimeAccess` retains one `Maintenance`
+owner. Their operation cleanup still uses fresh-lock and scoped guards rather
+than an authoritative `LockScopeState`.
+
+Maintenance always records its own exact claims even when a covering
+`SessionExplicit` claim admits it. Releasing maintenance therefore cannot
+consume the explicit claim. DDL has an additional purpose preflight: a held
+same-family `SessionExplicit` claim on the target table returns
+`LockFamilyConflict`, even if directional coverage would otherwise admit the
+DDL request. This check is not yet atomic with resource acquisition.
 
 ### Session and transaction admission
 
@@ -479,10 +489,7 @@ struct LockFamily(SessionID);
 enum LockScope {
     SessionExplicit,
     Transaction(TrxID),
-    Statement {
-        trx_id: TrxID,
-        stmt_no: StmtNo,
-    },
+    Statement(TrxID, StmtNo),
     Ddl(DdlOperationID),
     Maintenance(MaintenanceOperationID),
 }
@@ -1387,19 +1394,17 @@ RFC should decide whether to retain it or introduce explicit partitions with:
 
 Partition count, hash quality, and hot-resource contention need measurement.
 
-### 4. Purpose-specific family policy
+### 4. Additional purpose-specific family policy
 
-DDL versus `SessionExplicit` is one policy exception. Maintenance and future
-internal operation scopes may need equally explicit rules.
+DDL versus `SessionExplicit` is an implemented policy exception. Maintenance
+uses ordinary directional coverage and retains a distinct exact claim. Future
+internal operation scopes may need additional explicit rules.
 
 The RFC should specify:
 
-- whether maintenance claims may share an explicit session claim solely by
-  directional coverage;
 - which other pairs of already-held scope purposes require policy beyond
   directional coverage; and
-- whether purpose conflicts use the existing `LockOwnerGroupConflict` error or
-  a clearer family/purpose error.
+- how purpose checks become atomic with family/resource admission.
 
 Family execution serialization is not a purpose policy. It determines when
 requests run; these checks determine whether a new exact claim may coexist with
@@ -1440,6 +1445,8 @@ behavior and testability.
 
 Migration must:
 
+- preserve the implemented canonical `LockFamily` plus exact `LockScope`
+  identity and `LockFamilyConflict` error;
 - preserve the implemented `&mut self` session lock mutation APIs and
   `Session: Send + !Sync` boundary;
 - preserve idle-only public Session admission while a transaction is active or
@@ -1447,9 +1454,7 @@ Migration must:
 - serialize lock mutation across all scopes in one family before removing
   duplicate-waiter support from the manager;
 - retain cancellation safety while pending state moves from shared waiters to
-  one call-local guard; and
-- decide whether the public/internal error name `LockOwnerGroupConflict`
-  remains after `LockOwnerGroup` itself is removed.
+  one call-local guard.
 
 ### 8. Nested DDL transaction cancellation
 
@@ -1475,12 +1480,17 @@ paths.
 
 These stages are a planning aid, not yet an accepted RFC plan.
 
-### Stage A: identity and exclusive scope ownership
+### Stage A: canonical identity (implemented)
 
 - Introduce `LockOwner { family, scope }`.
 - Add DDL and maintenance operation ids.
 - Preserve idle-only public Session admission and the existing mutable
   explicit-lock APIs.
+- Preserve the current vector/deque resource representation, guard-owned
+  operation cleanup, duplicate waiters, and exact-owner release.
+
+### Stage B: exclusive scope ownership
+
 - Define the DDL operation-guard/nested-transaction cleanup handoff before
   declaring family cleanup serialized.
 - Serialize lock mutation across every scope in one family.
@@ -1488,9 +1498,8 @@ These stages are a planning aid, not yet an accepted RFC plan.
 - Route statement, transaction, session, DDL, and maintenance cleanup through
   scope indexes.
 - Preserve proof-bound transaction-lock cleanup before session completion.
-- Preserve the current vector/deque resource representation temporarily.
 
-### Stage B: tokenized waiter and claim lifecycle
+### Stage C: tokenized waiter and claim lifecycle
 
 - Add resource-incarnation and global claim ids.
 - Add generational waiter nodes.
@@ -1500,7 +1509,7 @@ These stages are a planning aid, not yet an accepted RFC plan.
 - Remove current duplicate-waiter behavior after all family mutations are
   serialized.
 
-### Stage C: exact-claim family registry
+### Stage D: exact-claim family registry
 
 - Store exact claims and one optional queued waiter per family.
 - Collapse physical grants to one holder per family/resource.
@@ -1509,7 +1518,7 @@ These stages are a planning aid, not yet an accepted RFC plan.
 - Preserve directional same-family admission and queue bypass.
 - Make DDL purpose checks atomic with resource admission.
 
-### Stage D: aggregate compatibility and intrusive FIFO
+### Stage E: aggregate compatibility and intrusive FIFO
 
 - Add physical holder counts and masks.
 - Replace granted-vector scans.
@@ -1517,7 +1526,7 @@ These stages are a planning aid, not yet an accepted RFC plan.
 - Centralize all blocker-removal transitions through the FIFO-prefix grant loop.
 - Add invariant-rich physical and exact debug snapshots.
 
-### Stage E: benchmark-led refinement
+### Stage F: benchmark-led refinement
 
 - Measure hot shared metadata resources, cancellation, scope cleanup, and queue
   promotion.

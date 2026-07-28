@@ -285,8 +285,8 @@ pub(crate) enum OperationError {
     LockUpgradeWouldBlock,
     #[error("lock conversion is not supported")]
     LockConversionNotSupported,
-    #[error("lock owner group conflict")]
-    LockOwnerGroupConflict,
+    #[error("lock family conflict")]
+    LockFamilyConflict,
     #[error("lock waiter released")]
     LockWaiterReleased,
 }

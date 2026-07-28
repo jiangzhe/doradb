@@ -794,7 +794,7 @@ pub(crate) async fn create_index_for_session(
     // Keep these DDL locks alive through root publish and runtime layout
     // install so foreground readers/writers cannot observe a partial index.
     let _table_locks = lock_manager
-        .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
+        .acquire_table_ddl_locks(table_id, ctx.owner)
         .await
         .attach_with(|| format!("operation=create_index, table_id={table_id}"))
         .disclose()?;
@@ -1019,7 +1019,7 @@ pub(crate) async fn drop_index_for_session(
         .attach("operation=drop_index")
         .disclose()?;
     let _table_locks = lock_manager
-        .acquire_table_ddl_locks(table_id, ctx.owner, ctx.owner_group)
+        .acquire_table_ddl_locks(table_id, ctx.owner)
         .await
         .attach_with(|| format!("operation=drop_index, table_id={table_id}"))
         .disclose()?;

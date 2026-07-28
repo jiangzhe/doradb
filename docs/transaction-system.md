@@ -285,8 +285,10 @@ their last table/layout/index use. The table runtime owner is explicitly
 released before fresh lock guards. These calls preserve ordinary `IX` DML and
 explicit `S` table-reader concurrency while excluding same-table DROP and
 serializing page freeze/transition against full-table mutation `X`. Grants
-already covered by an explicit session lock are preserved when maintenance
-returns; only fresh grants are released.
+admitted by a covering explicit session lock are still recorded under a
+distinct `Maintenance(operation_id)` owner. Returning from the scoped access
+releases only that maintenance owner's fresh grants and preserves the exact
+`SessionExplicit` claims.
 
 Checkpoint retry never keeps that scope across its indefinite sleep. One
 recheck registers the relevant lifecycle, transaction-terminal, GC-horizon,

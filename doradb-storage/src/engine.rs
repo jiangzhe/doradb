@@ -16,7 +16,7 @@ use crate::error::{
     ConfigError, DiscloseError, DiscloseResultExt, LifecycleError, LifecycleResult, Result,
 };
 use crate::file::fs::{FileSystem, FileSystemWorkers};
-use crate::id::SessionID;
+use crate::id::{DdlOperationID, MaintenanceOperationID, SessionID};
 use crate::lock::LockManager;
 use crate::obs;
 use crate::poison::EnginePoisoner;
@@ -685,6 +685,8 @@ pub(crate) struct EngineInner {
     pub(crate) session_registry: SessionRegistry,
     /// Monotonically increasing engine-local session identity source.
     next_session_id: AtomicU64,
+    /// Shared engine-local identity source for DDL and maintenance lock scopes.
+    next_lock_operation_id: AtomicU64,
     lifecycle: EngineLifecycle,
 }
 
@@ -716,6 +718,23 @@ impl EngineInner {
     #[inline]
     pub(crate) fn next_session_id(&self) -> SessionID {
         SessionID::new(self.next_session_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Allocates an engine-local DDL lock operation identity.
+    #[inline]
+    pub(crate) fn next_ddl_operation_id(&self) -> DdlOperationID {
+        DdlOperationID::new(self.next_lock_operation_id())
+    }
+
+    /// Allocates an engine-local maintenance lock operation identity.
+    #[inline]
+    pub(crate) fn next_maintenance_operation_id(&self) -> MaintenanceOperationID {
+        MaintenanceOperationID::new(self.next_lock_operation_id())
+    }
+
+    #[inline]
+    fn next_lock_operation_id(&self) -> u64 {
+        self.next_lock_operation_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Enter one short engine operation while runtime admission is open.
@@ -911,6 +930,7 @@ async fn bootstrap_inner(config: EngineConfig) -> Result<Engine> {
         lock_manager,
         session_registry: SessionRegistry::new(),
         next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
+        next_lock_operation_id: AtomicU64::new(1),
         lifecycle: EngineLifecycle::new(),
     };
     Ok(Engine {
@@ -1335,6 +1355,48 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_operation_ids_share_one_engine_local_sequence() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
+
+            let ddl1 = engine.inner().next_ddl_operation_id();
+            let maintenance1 = engine.inner().next_maintenance_operation_id();
+            let ddl2 = engine.inner().next_ddl_operation_id();
+            let maintenance2 = engine.inner().next_maintenance_operation_id();
+
+            assert_eq!(
+                [
+                    ddl1.as_u64(),
+                    maintenance1.as_u64(),
+                    ddl2.as_u64(),
+                    maintenance2.as_u64(),
+                ],
+                [1, 2, 3, 4]
+            );
+        });
+    }
+
+    #[test]
+    fn test_lock_operation_id_sequences_are_engine_local() {
+        smol::block_on(async {
+            let first_root = TempDir::new().unwrap();
+            let first = Engine::bootstrap(test_engine_config_for(first_root.path()))
+                .await
+                .unwrap();
+            let second_root = TempDir::new().unwrap();
+            let second = Engine::bootstrap(test_engine_config_for(second_root.path()))
+                .await
+                .unwrap();
+
+            assert_eq!(first.inner().next_ddl_operation_id().as_u64(), 1);
+            assert_eq!(second.inner().next_maintenance_operation_id().as_u64(), 1);
+        });
+    }
+
+    #[test]
     fn test_engine_lock_manager_is_shared_across_runtime_handles() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1343,7 +1405,7 @@ mod tests {
                 .unwrap();
             let engine_ref = engine.new_ref().unwrap();
             let resource = LockResource::TableMetadata(TableID::new(10));
-            let owner = LockOwner::Session(SessionID::new(10));
+            let owner = LockOwner::session_explicit(SessionID::new(10));
 
             assert!(
                 try_acquire(engine.lock_manager(), resource, LockMode::Exclusive, owner).unwrap()
@@ -1353,7 +1415,7 @@ mod tests {
                     engine_ref.lock_manager(),
                     resource,
                     LockMode::Shared,
-                    LockOwner::Session(SessionID::new(11))
+                    LockOwner::session_explicit(SessionID::new(11))
                 )
                 .unwrap()
             );
@@ -1363,7 +1425,7 @@ mod tests {
                     engine.lock_manager(),
                     resource,
                     LockMode::Shared,
-                    LockOwner::Session(SessionID::new(11))
+                    LockOwner::session_explicit(SessionID::new(11))
                 )
                 .unwrap()
             );
@@ -1385,7 +1447,7 @@ mod tests {
                     engine.lock_manager(),
                     resource,
                     LockMode::Exclusive,
-                    LockOwner::Session(session.id())
+                    LockOwner::session_explicit(session.id())
                 )
                 .unwrap()
             );
@@ -1396,9 +1458,61 @@ mod tests {
                     engine.lock_manager(),
                     resource,
                     LockMode::Shared,
-                    LockOwner::Session(SessionID::new(91_201))
+                    LockOwner::session_explicit(SessionID::new(91_201))
                 )
                 .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn test_session_drop_releases_only_explicit_scope() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                .await
+                .unwrap();
+            let session = engine.new_session().unwrap();
+            let session_id = session.id();
+            let resource = LockResource::TableData(TableID::new(91_204));
+            let explicit_owner = LockOwner::session_explicit(session_id);
+            let maintenance_owner =
+                LockOwner::maintenance(session_id, MaintenanceOperationID::new(91_204));
+
+            assert!(
+                try_acquire(
+                    engine.lock_manager(),
+                    resource,
+                    LockMode::Exclusive,
+                    explicit_owner,
+                )
+                .unwrap()
+            );
+            assert!(
+                try_acquire(
+                    engine.lock_manager(),
+                    resource,
+                    LockMode::IntentShared,
+                    maintenance_owner,
+                )
+                .unwrap()
+            );
+
+            drop(session);
+
+            assert!(!engine.lock_manager().owner_holds(
+                resource,
+                explicit_owner,
+                LockMode::IntentShared,
+            ));
+            assert!(engine.lock_manager().owner_holds(
+                resource,
+                maintenance_owner,
+                LockMode::IntentShared,
+            ));
+            assert_eq!(
+                engine.lock_manager().release(resource, maintenance_owner),
+                1
             );
         });
     }
@@ -1411,7 +1525,7 @@ mod tests {
                 .await
                 .unwrap();
             let resource = LockResource::TableMetadata(TableID::new(91_202));
-            let blocking_owner = LockOwner::Session(SessionID::new(91_203));
+            let blocking_owner = LockOwner::session_explicit(SessionID::new(91_203));
             assert!(
                 try_acquire(
                     engine.lock_manager(),
@@ -1423,7 +1537,7 @@ mod tests {
             );
 
             let session = engine.new_session().unwrap();
-            let waiting_owner = LockOwner::Session(session.id());
+            let waiting_owner = LockOwner::session_explicit(session.id());
             let manager = engine.lock_manager().clone();
             let wait_task = smol::spawn(async move {
                 manager
@@ -2272,8 +2386,9 @@ mod tests {
                 .unwrap();
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
             let mut trx = session.begin_trx().unwrap();
-            let owner = LockOwner::Transaction(trx.trx_id());
+            let owner = LockOwner::transaction(session_id, trx.trx_id());
 
             trx.lock_table(table_id, TableLockMode::Shared)
                 .await
@@ -2302,9 +2417,10 @@ mod tests {
                 .unwrap();
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
             let mut trx = session.begin_trx().unwrap();
             let trx_id = trx.trx_id();
-            let owner = LockOwner::Transaction(trx.trx_id());
+            let owner = LockOwner::transaction(session_id, trx.trx_id());
 
             trx.lock_table(table_id, TableLockMode::Shared)
                 .await

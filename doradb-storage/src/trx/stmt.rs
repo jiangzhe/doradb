@@ -268,15 +268,11 @@ impl<'stmt> Statement<'stmt> {
         attachment: &'stmt TrxAttachment,
         owner: LockOwner,
     ) -> Self {
-        let owner_group = inner.checked_lock_state().owner_group();
         Statement {
             inner,
             attachment,
             effects: StmtEffects::empty(),
-            stmt_locks: match owner_group {
-                Some(owner_group) => OwnerLockState::new_grouped(owner, owner_group),
-                None => OwnerLockState::new(owner),
-            },
+            stmt_locks: OwnerLockState::new(owner),
             disable_dml_validation: false,
         }
     }
@@ -894,7 +890,7 @@ pub(crate) mod tests {
     };
     use crate::id::TrxID;
     use crate::lock::LockManager;
-    use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
+    use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::session::{SessionState, tests as session_tests};
     use crate::trx::sys::tests as sys_tests;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
@@ -989,12 +985,7 @@ pub(crate) mod tests {
             return Ok(true);
         }
         let owner = lock_state.owner();
-        let acquired = match lock_state.owner_group() {
-            Some(owner_group) => {
-                try_acquire_grouped(lock_manager, resource, mode, owner, owner_group).disclose()?
-            }
-            None => try_acquire(lock_manager, resource, mode, owner).disclose()?,
-        };
+        let acquired = try_acquire(lock_manager, resource, mode, owner).disclose()?;
         if acquired {
             lock_state.cache_granted(resource, mode);
         }

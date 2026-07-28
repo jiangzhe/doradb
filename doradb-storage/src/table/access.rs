@@ -8227,20 +8227,21 @@ mod tests {
                 .unwrap();
 
             let mut freeze_session = engine.new_session().unwrap();
-            let freeze_owner = LockOwner::Session(freeze_session.id());
+            let freeze_session_id = freeze_session.id();
             let freeze = freeze_session.freeze_table(table_id, usize::MAX);
             let release_writer = async {
-                wait_for_lock_entry(
+                let freeze_owner = wait_for_maintenance_lock_entry(
                     &engine,
-                    freeze_owner,
+                    freeze_session_id,
                     LockResource::TableData(table_id),
                     LockMode::IntentShared,
                     LockDebugEntryState::Waiting,
                 )
                 .await;
                 writer.commit().await.unwrap();
+                freeze_owner
             };
-            let (freeze_result, ()) = futures::join!(freeze, release_writer);
+            let (freeze_result, freeze_owner) = futures::join!(freeze, release_writer);
             assert!(matches!(freeze_result, Ok(FreezeOutcome::Frozen { .. })));
             wait_for_no_lock_resource(&engine, freeze_owner, LockResource::TableData(table_id))
                 .await;
@@ -8371,7 +8372,7 @@ mod tests {
                 evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
             let table_id = create_table2_for_test(&engine).await;
             let resource = LockResource::TableMetadata(table_id);
-            let blocker = LockOwner::Session(SessionID::new(91_225));
+            let blocker = LockOwner::session_explicit(SessionID::new(91_225));
             engine
                 .lock_manager()
                 .acquire(resource, LockMode::Exclusive, blocker)

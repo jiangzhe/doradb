@@ -1161,7 +1161,7 @@ pub(crate) mod tests {
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::ActiveRoot;
     use crate::file::{FileKind, SparseFile};
-    use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
+    use crate::id::{BlockID, PageID, RowID, SessionID, TableID, TrxID};
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex,
         IndexBatchStream, IndexInsert, IndexMask, RowLocation,
@@ -1170,7 +1170,7 @@ pub(crate) mod tests {
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
     };
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
-    use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::lock::{LockFamily, LockMode, LockOwner, LockResource, LockScope};
     use crate::quiescent::QuiescentGuard;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::{Session, tests::SessionTestExt};
@@ -2239,6 +2239,69 @@ pub(crate) mod tests {
             .entries
             .iter()
             .any(|entry| entry.owner == owner && entry.resource == resource)
+    }
+
+    pub(crate) fn ddl_lock_owner(
+        engine: &Engine,
+        session_id: SessionID,
+        resource: LockResource,
+    ) -> Option<LockOwner> {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.owner.family() == LockFamily::new(session_id)
+                    && matches!(entry.owner.scope(), LockScope::Ddl(_))
+                    && entry.resource == resource
+            })
+            .map(|entry| entry.owner)
+    }
+
+    pub(crate) fn has_ddl_lock_resource(
+        engine: &Engine,
+        session_id: SessionID,
+        resource: LockResource,
+    ) -> bool {
+        ddl_lock_owner(engine, session_id, resource).is_some()
+    }
+
+    pub(crate) fn maintenance_lock_owner(
+        engine: &Engine,
+        session_id: SessionID,
+        resource: LockResource,
+        mode: LockMode,
+        state: LockDebugEntryState,
+    ) -> Option<LockOwner> {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.owner.family() == LockFamily::new(session_id)
+                    && matches!(entry.owner.scope(), LockScope::Maintenance(_))
+                    && entry.resource == resource
+                    && entry.mode == mode
+                    && entry.state == state
+            })
+            .map(|entry| entry.owner)
+    }
+
+    pub(crate) async fn wait_for_maintenance_lock_entry(
+        engine: &Engine,
+        session_id: SessionID,
+        resource: LockResource,
+        mode: LockMode,
+        state: LockDebugEntryState,
+    ) -> LockOwner {
+        // Timer audit: lock-manager diagnostic state inspection.
+        for _ in 0..100 {
+            if let Some(owner) = maintenance_lock_owner(engine, session_id, resource, mode, state) {
+                return owner;
+            }
+            Timer::after(Duration::from_millis(1)).await;
+        }
+        panic!(
+            "maintenance lock entry not observed: session_id={session_id}, resource={resource:?}, mode={mode:?}, state={state:?}"
+        );
     }
 
     pub(crate) async fn wait_for_no_lock_resource(

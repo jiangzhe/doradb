@@ -55,7 +55,9 @@ silently extend the frozen prefix or move its original fence.
 Freeze runs from an idle session under scoped `TableMetadata(S)` and
 `TableData(IS)` locks. It revalidates the live table before claiming the
 workflow and retains the locks through frozen-state publication. A covering
-explicit session lock is preserved when the scoped grants are released.
+explicit session lock admits a separate exact `Maintenance(operation_id)`
+claim; releasing the scoped maintenance grants preserves the exact
+`SessionExplicit` claims.
 
 The freeze path:
 

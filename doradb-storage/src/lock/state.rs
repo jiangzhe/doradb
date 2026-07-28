@@ -1,5 +1,5 @@
 use crate::error::OperationResult;
-use crate::lock::{LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
+use crate::lock::{LockGrant, LockManager, LockMode, LockOwner, LockResource};
 use crate::map::FastHashMap;
 
 /// Owner-local logical lock cache.
@@ -9,7 +9,6 @@ use crate::map::FastHashMap;
 /// whole lock table.
 pub(crate) struct OwnerLockState {
     owner: LockOwner,
-    owner_group: Option<LockOwnerGroup>,
     held: FastHashMap<LockResource, LockMode>,
 }
 
@@ -19,17 +18,6 @@ impl OwnerLockState {
     pub(crate) fn new(owner: LockOwner) -> Self {
         OwnerLockState {
             owner,
-            owner_group: None,
-            held: FastHashMap::default(),
-        }
-    }
-
-    /// Create an empty cache for one logical owner inside an owner group.
-    #[inline]
-    pub(crate) fn new_grouped(owner: LockOwner, owner_group: LockOwnerGroup) -> Self {
-        OwnerLockState {
-            owner,
-            owner_group: Some(owner_group),
             held: FastHashMap::default(),
         }
     }
@@ -38,12 +26,6 @@ impl OwnerLockState {
     #[inline]
     pub(crate) fn owner(&self) -> LockOwner {
         self.owner
-    }
-
-    /// Returns the owner group represented by this state, if any.
-    #[inline]
-    pub(crate) fn owner_group(&self) -> Option<LockOwnerGroup> {
-        self.owner_group
     }
 
     /// Returns whether the cached lock mode covers the requested mode.
@@ -72,16 +54,7 @@ impl OwnerLockState {
         if self.cached_covers(resource, mode) {
             return Ok(());
         }
-        match self.owner_group {
-            Some(owner_group) => {
-                lock_manager
-                    .acquire_grouped(resource, mode, self.owner, owner_group)
-                    .await?;
-            }
-            None => {
-                lock_manager.acquire(resource, mode, self.owner).await?;
-            }
-        }
+        lock_manager.acquire(resource, mode, self.owner).await?;
         self.cache_granted(resource, mode);
         Ok(())
     }
@@ -97,18 +70,9 @@ impl OwnerLockState {
         if self.cached_covers(resource, mode) {
             return Ok(LockGrant::Existing);
         }
-        match self.owner_group {
-            Some(owner_group) => {
-                lock_manager
-                    .acquire_grouped_with_grant(resource, mode, self.owner, owner_group)
-                    .await
-            }
-            None => {
-                lock_manager
-                    .acquire_with_grant(resource, mode, self.owner)
-                    .await
-            }
-        }
+        lock_manager
+            .acquire_with_grant(resource, mode, self.owner)
+            .await
     }
 
     /// Records a lock grant in the owner-local cache.
@@ -185,11 +149,7 @@ mod tests {
     }
 
     fn trx(id: u64) -> LockOwner {
-        LockOwner::Transaction(TrxID::new(id))
-    }
-
-    fn group(id: u64) -> LockOwnerGroup {
-        LockOwnerGroup::Session(SessionID::new(id))
+        LockOwner::transaction(SessionID::new(id), TrxID::new(id))
     }
 
     fn has_entry(
@@ -197,13 +157,11 @@ mod tests {
         resource: LockResource,
         mode: LockMode,
         owner: LockOwner,
-        owner_group: Option<LockOwnerGroup>,
     ) -> bool {
         debug_snapshot(manager).entries.iter().any(|entry| {
             entry.resource == resource
                 && entry.mode == mode
                 && entry.owner == owner
-                && entry.owner_group == owner_group
                 && entry.state == LockDebugEntryState::Granted
         })
     }
@@ -240,13 +198,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(owner_entry_count(&manager, owner), 1);
-            assert!(has_entry(
-                &manager,
-                resource,
-                LockMode::Exclusive,
-                owner,
-                None
-            ));
+            assert!(has_entry(&manager, resource, LockMode::Exclusive, owner));
 
             assert_eq!(state.release_all(&manager), 1);
             state.assert_cleared();
@@ -271,36 +223,28 @@ mod tests {
             );
 
             assert!(!state.cached_covers(resource, LockMode::Shared));
-            assert!(has_entry(&manager, resource, LockMode::Shared, owner, None));
+            assert!(has_entry(&manager, resource, LockMode::Shared, owner));
             assert_eq!(state.release_all(&manager), 0);
-            assert!(has_entry(&manager, resource, LockMode::Shared, owner, None));
+            assert!(has_entry(&manager, resource, LockMode::Shared, owner));
             assert_eq!(manager.release(resource, owner), 1);
         });
     }
 
     #[test]
-    fn grouped_owner_lock_state_records_grouped_grants() {
+    fn owner_lock_state_records_canonical_owner_grants() {
         smol::block_on(async {
             let manager = LockManager::new();
-            let owner = trx(3);
-            let owner_group = group(30);
+            let owner = LockOwner::transaction(SessionID::new(30), TrxID::new(3));
             let resource = table_metadata(30);
-            let mut state = OwnerLockState::new_grouped(owner, owner_group);
+            let mut state = OwnerLockState::new(owner);
 
             state
                 .acquire(&manager, resource, LockMode::Shared)
                 .await
                 .unwrap();
 
-            assert_eq!(state.owner_group(), Some(owner_group));
             assert!(state.cached_covers(resource, LockMode::Shared));
-            assert!(has_entry(
-                &manager,
-                resource,
-                LockMode::Shared,
-                owner,
-                Some(owner_group)
-            ));
+            assert!(has_entry(&manager, resource, LockMode::Shared, owner));
 
             assert_eq!(state.release_all(&manager), 1);
             state.assert_cleared();
@@ -331,8 +275,7 @@ mod tests {
                 &manager,
                 resource,
                 LockMode::IntentExclusive,
-                owner,
-                None
+                owner
             ));
 
             assert_eq!(state.release_all(&manager), 1);
@@ -373,8 +316,7 @@ mod tests {
                 &manager,
                 uncached_data,
                 LockMode::IntentShared,
-                owner,
-                None
+                owner
             ));
             assert_eq!(manager.release(uncached_data, owner), 1);
         });

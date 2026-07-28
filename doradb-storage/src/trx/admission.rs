@@ -379,8 +379,8 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{Error, OperationError};
-    use crate::lock::LockOwner;
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
+    use crate::lock::{LockOwner, LockScope};
     use crate::table::TableTerminal;
     use crate::value::Val;
     use std::future::Future;
@@ -474,8 +474,9 @@ mod tests {
             let (_temp_dir, engine) = test_engine("admission_first_read_binding").await;
             let table_id = table2(&engine).await;
             let mut session = engine.new_session().unwrap();
+            let session_id = session.id();
             let mut trx = session.begin_trx().unwrap();
-            let trx_owner = LockOwner::Transaction(trx.trx_id());
+            let trx_owner = LockOwner::transaction(session_id, trx.trx_id());
             let metadata = LockResource::TableMetadata(table_id);
 
             trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
@@ -504,7 +505,7 @@ mod tests {
                     .iter()
                     .all(|entry| {
                         entry.resource != metadata
-                            || !matches!(entry.owner, LockOwner::Statement(..))
+                            || !matches!(entry.owner.scope(), LockScope::Statement(..))
                     })
             );
 
@@ -531,8 +532,9 @@ mod tests {
                 let (_temp_dir, engine) = test_engine(log_file_stem).await;
                 let table_id = table2(&engine).await;
                 let mut old_session = engine.new_session().unwrap();
+                let old_session_id = old_session.id();
                 let mut old_trx = old_session.begin_trx().unwrap();
-                let trx_owner = LockOwner::Transaction(old_trx.trx_id());
+                let trx_owner = LockOwner::transaction(old_session_id, old_trx.trx_id());
                 let metadata = LockResource::TableMetadata(table_id);
 
                 let mut ddl_session = engine.new_session().unwrap();
@@ -576,7 +578,8 @@ mod tests {
                         .all(|entry| entry.owner != trx_owner)
                 );
                 assert!(snapshot.entries.iter().all(|entry| {
-                    entry.resource != metadata || !matches!(entry.owner, LockOwner::Statement(..))
+                    entry.resource != metadata
+                        || !matches!(entry.owner.scope(), LockScope::Statement(..))
                 }));
 
                 old_trx.rollback().await.unwrap();
@@ -600,8 +603,9 @@ mod tests {
                 let (_temp_dir, engine) = test_engine(log_file_stem).await;
                 let table_id = table2(&engine).await;
                 let mut old_session = engine.new_session().unwrap();
+                let old_session_id = old_session.id();
                 let mut old_trx = old_session.begin_trx().unwrap();
-                let trx_owner = LockOwner::Transaction(old_trx.trx_id());
+                let trx_owner = LockOwner::transaction(old_session_id, old_trx.trx_id());
 
                 let mut ddl_session = engine.new_session().unwrap();
                 let new_index_no = ddl_session
@@ -789,8 +793,9 @@ mod tests {
             let table = engine.catalog().get_table_now(table_id).unwrap();
 
             let mut bound_session = engine.new_session().unwrap();
+            let bound_session_id = bound_session.id();
             let mut bound_trx = bound_session.begin_trx().unwrap();
-            let bound_owner = LockOwner::Transaction(bound_trx.trx_id());
+            let bound_owner = LockOwner::transaction(bound_session_id, bound_trx.trx_id());
             bound_trx
                 .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
                 .await
@@ -860,8 +865,9 @@ mod tests {
             let metadata_resource = LockResource::TableMetadata(table_id);
             let table = engine.catalog().get_table_now(table_id).unwrap();
             let mut bound_session = engine.new_session().unwrap();
+            let bound_session_id = bound_session.id();
             let mut bound_trx = bound_session.begin_trx().unwrap();
-            let bound_owner = LockOwner::Transaction(bound_trx.trx_id());
+            let bound_owner = LockOwner::transaction(bound_session_id, bound_trx.trx_id());
             bound_trx
                 .exec(async |stmt| stmt.table_scan_mvcc(table_id, &[0], |_| true).await)
                 .await
@@ -925,9 +931,10 @@ mod tests {
             let (_temp_dir, engine) = test_engine("admission_untouched_drop_index").await;
             let table_id = table2(&engine).await;
             let mut old_session = engine.new_session().unwrap();
+            let old_session_id = old_session.id();
             let mut old_trx = old_session.begin_trx().unwrap();
             let old_sts = old_trx.sts();
-            let old_owner = LockOwner::Transaction(old_trx.trx_id());
+            let old_owner = LockOwner::transaction(old_session_id, old_trx.trx_id());
 
             let mut ddl_session = engine.new_session().unwrap();
             ddl_session.drop_index(table_id, 0).await.unwrap();
@@ -978,7 +985,7 @@ mod tests {
                     .iter()
                     .all(|entry| entry.owner != old_owner
                         && (entry.resource != LockResource::TableMetadata(table_id)
-                            || !matches!(entry.owner, LockOwner::Statement(..))))
+                            || !matches!(entry.owner.scope(), LockScope::Statement(..))))
             );
 
             old_trx.rollback().await.unwrap();
@@ -995,9 +1002,10 @@ mod tests {
             let (_temp_dir, engine) = test_engine("admission_untouched_drop_table").await;
             let table_id = table2(&engine).await;
             let mut old_session = engine.new_session().unwrap();
+            let old_session_id = old_session.id();
             let mut old_trx = old_session.begin_trx().unwrap();
             let old_sts = old_trx.sts();
-            let old_owner = LockOwner::Transaction(old_trx.trx_id());
+            let old_owner = LockOwner::transaction(old_session_id, old_trx.trx_id());
 
             let mut ddl_session = engine.new_session().unwrap();
             ddl_session.drop_table(table_id).await.unwrap();
@@ -1039,7 +1047,7 @@ mod tests {
                     .iter()
                     .all(|entry| entry.owner != old_owner
                         && (entry.resource != LockResource::TableMetadata(table_id)
-                            || !matches!(entry.owner, LockOwner::Statement(..))))
+                            || !matches!(entry.owner.scope(), LockScope::Statement(..))))
             );
 
             old_trx.rollback().await.unwrap();
