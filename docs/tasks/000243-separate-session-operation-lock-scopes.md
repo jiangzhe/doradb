@@ -1,7 +1,7 @@
 ---
 id: 000243
 title: Separate Session Operation Lock Scopes
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-28
 github_issue: 906
 ---
@@ -51,7 +51,7 @@ Issue Labels:
 
 Source Backlogs:
 
-- `docs/backlogs/000169-separate-session-operation-lock-scopes.md`
+- `docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md`
 
 Related Designs:
 
@@ -611,6 +611,45 @@ The completed production tree must have:
 
 ## Implementation Notes
 
+- Implemented canonical `LockOwner { family, scope }` identity for
+  session-explicit, transaction, statement, DDL, and maintenance claims.
+  Removed `LockOwnerGroup`, grouped acquisition plumbing, owner-group debug
+  state, and `OperationError::LockOwnerGroupConflict`; family coverage,
+  covering queue bypass, exact-owner reentrancy/conversion, cancellation, and
+  FIFO promotion retain their prior behavior under `LockFamilyConflict`.
+- Added one shared engine-local atomic sequence for typed DDL and maintenance
+  operation ids. `SessionDdlContext` retains one exact DDL owner per public
+  operation, while every bounded `ScopedTableRuntimeAccess` attempt receives
+  one exact maintenance owner. Explicit unlock/session cleanup, DDL guards,
+  maintenance guards, and transaction/statement cleanup now release only
+  their exact scopes.
+- Preserved the explicit-session DDL rejection policy and verified that
+  maintenance records a separate claim when a covering explicit shared or
+  exclusive claim exists. Session cleanup intentionally leaves synthetic
+  operation claims untouched, and operation cleanup preserves the explicit
+  claim.
+- Updated the lock, transaction, and checkpoint living documents to describe
+  canonical identity as implemented while retaining vectors/deques, guard
+  cleanup, global explicit-owner scans, concurrent family mutation, and
+  unaggregated physical claims as the current baseline.
+- Implementation review made two representation refinements from the plan.
+  `DdlOperationID` and `MaintenanceOperationID` use the shared `impl_id!`
+  boilerplate in `crate::id` while remaining crate-private and without
+  serialization or bit-packing implementations. Statement scope uses the
+  compact `Statement(TrxID, StmtNo)` tuple variant while preserving
+  transaction-qualified exact identity and diagnostics.
+- Verification passed the branch-diff style audit for 14 Rust files, the
+  deterministic public-error audit with no CSV change, the 1,559-test
+  workspace suite, and the 1,484-test alternate `libaio` suite. The
+  explicit-lock/maintenance coexistence regression passed 100/100 stress
+  iterations. Focused line coverage was 4,054/4,180 (96.99%) overall:
+  1,664/1,697 (98.06%) for `doradb-storage/src/lock` and 2,390/2,483
+  (96.25%) for `doradb-storage/src/session.rs`.
+- Resolution archived source backlog 000169 as implemented and created no new
+  follow-up because the remaining work is already tracked by backlogs 000115,
+  000167, 000170, and 000171. This task declares no parent RFC; accepted
+  RFC-0016 remains an unchanged related historical design.
+
 ## Impacts
 
 ### Production code
@@ -830,6 +869,6 @@ Deferred follow-ups remain explicit:
    serialized family mutation, physical family aggregation, tokens, and
    optimized resource representation.
 4. Backlog 000167 continues to own logical-lock deadlock handling.
-5. `$task-resolve` should close source backlog 000169 as implemented only after
-   code, tests, review, documentation, and behavioral verification complete,
-   while preserving the downstream prerequisite chain.
+5. Source backlog 000169 was closed as implemented during task resolution
+   after code, tests, review, documentation, and behavioral verification
+   completed; the downstream prerequisite chain remains unchanged.
