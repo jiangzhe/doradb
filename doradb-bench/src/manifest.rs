@@ -192,18 +192,10 @@ impl Manifest {
                     )));
                 }
             }
-            Workload::IndexScan => {
-                if self.index != IndexMode::NonUnique {
+            Workload::IndexScan | Workload::IndexStream => {
+                if self.index == IndexMode::None {
                     return Err(BenchError::message(format!(
-                        "{workload} workload requires prepared index mode non-unique; found {}",
-                        self.index
-                    )));
-                }
-            }
-            Workload::IndexStream => {
-                if self.index != IndexMode::Unique {
-                    return Err(BenchError::message(format!(
-                        "{workload} workload requires prepared index mode unique; found {}",
+                        "{workload} workload requires prepared index mode unique or non-unique; found {}",
                         self.index
                     )));
                 }
@@ -532,7 +524,7 @@ rows_inserted = 0
         assert!(
             manifest
                 .validate_workload_compatible(Workload::IndexScan)
-                .is_err()
+                .is_ok()
         );
 
         let mut manifest = Manifest::new(7, IndexMode::NonUnique);
@@ -567,7 +559,7 @@ rows_inserted = 0
     }
 
     #[test]
-    fn stream_and_index_ddl_enforce_distinct_manifest_contracts() {
+    fn range_scans_and_index_ddl_enforce_distinct_manifest_contracts() {
         let empty_unique = Manifest::new(7, IndexMode::Unique);
         assert!(
             empty_unique
@@ -582,6 +574,22 @@ rows_inserted = 0
                 .validate_workload_compatible(Workload::IndexStream)
                 .is_ok()
         );
+
+        let mut loaded_non_unique = Manifest::new(7, IndexMode::NonUnique);
+        loaded_non_unique.record_insert_success(3).unwrap();
+        for workload in [Workload::IndexScan, Workload::IndexStream] {
+            assert!(
+                loaded_non_unique
+                    .validate_workload_compatible(workload)
+                    .is_ok()
+            );
+        }
+
+        let mut loaded_none = Manifest::new(7, IndexMode::None);
+        loaded_none.record_insert_success(3).unwrap();
+        for workload in [Workload::IndexScan, Workload::IndexStream] {
+            assert!(loaded_none.validate_workload_compatible(workload).is_err());
+        }
 
         for index in [IndexMode::None, IndexMode::Unique, IndexMode::NonUnique] {
             let mut manifest = Manifest::new(7, index);

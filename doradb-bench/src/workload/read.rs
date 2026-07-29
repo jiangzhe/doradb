@@ -1,8 +1,11 @@
-use crate::cli::{ReadArgs, SeededReadArgs, WorkerIterationArgs, Workload, validate_batch_size};
+use crate::cli::{
+    IndexScanArgs, IndexStreamArgs, ReadArgs, SeededReadArgs, Workload, validate_batch_size,
+};
 use crate::error::{BenchError, Result};
 use crate::manifest::{KeyRange, Manifest};
 use crate::workload::util::{
-    effective_batch_size, generate_random_read_keys, generate_sequential_read_keys,
+    RandomScanRangeGenerator, effective_batch_size, generate_random_read_keys,
+    generate_sequential_read_keys,
 };
 use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
 use doradb_storage::id::TableID;
@@ -202,17 +205,18 @@ impl WorkloadRunner for TableScanRunner {
     }
 }
 
-/// Resolved exact-key index-scan configuration.
+/// Resolved materialized index-range-scan configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IndexScanConfig {
     common: CommonConfig,
     num: u64,
     seed: u64,
     loaded_range: KeyRange,
+    range_len: u64,
 }
 
 impl WorkloadConfig for IndexScanConfig {
-    type Args = SeededReadArgs;
+    type Args = IndexScanArgs;
 
     const WORKLOAD: Workload = Workload::IndexScan;
 
@@ -220,11 +224,13 @@ impl WorkloadConfig for IndexScanConfig {
         let common = resolve_read_common(manifest, args.read())?;
         let num = required_operation_count(args.read(), Self::WORKLOAD)?;
         manifest.validate_workload_compatible(Self::WORKLOAD)?;
+        let loaded_range = manifest.loaded_key_range()?;
         Ok(Self {
             common,
             num,
             seed: args.seed(),
-            loaded_range: manifest.loaded_key_range()?,
+            loaded_range,
+            range_len: resolve_scan_range(args.range_override(), loaded_range)?,
         })
     }
 
@@ -247,13 +253,18 @@ impl WorkloadConfig for IndexScanConfig {
     fn seed(&self) -> u64 {
         self.seed
     }
+
+    fn scan_range(&self) -> Option<u64> {
+        Some(self.range_len)
+    }
 }
 
-/// Executes seeded exact-key non-unique index scans for one session.
+/// Executes seeded materialized index range scans for one session.
 #[derive(Clone, Copy)]
 pub(crate) struct IndexScanRunner {
     seed: u64,
     loaded_range: KeyRange,
+    range_len: u64,
     batch_size: u64,
     table_id: TableID,
 }
@@ -265,37 +276,51 @@ impl WorkloadRunner for IndexScanRunner {
         Self {
             seed: config.seed,
             loaded_range: config.loaded_range,
+            range_len: config.range_len,
             batch_size: config.common.batch_size,
             table_id,
         }
     }
 
     async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
-        let keys = generate_random_read_keys(self.seed, self.loaded_range, plan)?;
-        index_scan_keys(session, self.batch_size, self.table_id, &keys).await
+        index_scan_ranges(
+            session,
+            self.batch_size,
+            self.table_id,
+            self.seed,
+            self.loaded_range,
+            self.range_len,
+            plan,
+        )
+        .await
     }
 }
 
-/// Resolved public index-stream configuration.
+/// Resolved public index-range-stream configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IndexStreamConfig {
     common: CommonConfig,
     num: u64,
+    seed: u64,
     loaded_range: KeyRange,
+    range_len: u64,
 }
 
 impl WorkloadConfig for IndexStreamConfig {
-    type Args = WorkerIterationArgs;
+    type Args = IndexStreamArgs;
 
     const WORKLOAD: Workload = Workload::IndexStream;
 
     fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
         let common = resolve_worker_common(manifest, args)?;
         manifest.validate_workload_compatible(Self::WORKLOAD)?;
+        let loaded_range = manifest.loaded_key_range()?;
         Ok(Self {
             common,
             num: args.iterations(),
-            loaded_range: manifest.loaded_key_range()?,
+            seed: args.seed(),
+            loaded_range,
+            range_len: resolve_scan_range(args.range_override(), loaded_range)?,
         })
     }
 
@@ -310,23 +335,51 @@ impl WorkloadConfig for IndexStreamConfig {
     fn output_loaded_range(&self) -> KeyRange {
         self.loaded_range
     }
+
+    fn random(&self) -> bool {
+        true
+    }
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    fn scan_range(&self) -> Option<u64> {
+        Some(self.range_len)
+    }
 }
 
-/// Executes full public index-stream iterations for one session.
+/// Executes public index range streams for one session.
 #[derive(Clone, Copy)]
 pub(crate) struct IndexStreamRunner {
+    seed: u64,
+    loaded_range: KeyRange,
+    range_len: u64,
     table_id: TableID,
 }
 
 impl WorkloadRunner for IndexStreamRunner {
     type Config = IndexStreamConfig;
 
-    fn new(_config: &Self::Config, table_id: TableID) -> Self {
-        Self { table_id }
+    fn new(config: &Self::Config, table_id: TableID) -> Self {
+        Self {
+            seed: config.seed,
+            loaded_range: config.loaded_range,
+            range_len: config.range_len,
+            table_id,
+        }
     }
 
     async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
-        index_stream_iterations(session, self.table_id, plan.rows).await
+        index_stream_iterations(
+            session,
+            self.table_id,
+            self.seed,
+            self.loaded_range,
+            self.range_len,
+            plan,
+        )
+        .await
     }
 }
 
@@ -344,7 +397,7 @@ fn resolve_read_common(manifest: &Manifest, args: &ReadArgs) -> Result<CommonCon
     )
 }
 
-fn resolve_worker_common(manifest: &Manifest, args: &WorkerIterationArgs) -> Result<CommonConfig> {
+fn resolve_worker_common(manifest: &Manifest, args: &IndexStreamArgs) -> Result<CommonConfig> {
     let worker = args.worker();
     CommonConfig::resolve(
         &manifest.defaults,
@@ -355,6 +408,17 @@ fn resolve_worker_common(manifest: &Manifest, args: &WorkerIterationArgs) -> Res
         worker.log_sync(),
         worker.include_stats(),
     )
+}
+
+fn resolve_scan_range(range_override: Option<u64>, loaded_range: KeyRange) -> Result<u64> {
+    let range_len = range_override.unwrap_or(loaded_range.len);
+    if range_len > loaded_range.len {
+        return Err(BenchError::message(format!(
+            "--range ({range_len}) must not exceed loaded key range length ({})",
+            loaded_range.len
+        )));
+    }
+    Ok(range_len)
 }
 
 fn required_operation_count(args: &ReadArgs, workload: Workload) -> Result<u64> {
@@ -473,41 +537,49 @@ async fn table_scan_batch(
     Ok(summary)
 }
 
-async fn index_scan_keys(
+async fn index_scan_ranges(
     session: &mut Session,
     batch_size: u64,
     table_id: TableID,
-    keys: &[u64],
+    seed: u64,
+    loaded_range: KeyRange,
+    range_len: u64,
+    plan: &SessionPlan,
 ) -> Result<SessionSummary> {
-    if keys.is_empty() {
+    if plan.rows == 0 {
         return Ok(SessionSummary::default());
     }
-    let batch_size = effective_batch_size(batch_size, keys.len() as u64)?;
+    let batch_size = effective_batch_size(batch_size, plan.rows)?;
+    let mut ranges = RandomScanRangeGenerator::new(seed, loaded_range, range_len, plan)?;
+    let mut remaining = plan.rows;
     let mut summary = SessionSummary::default();
-    for batch in keys.chunks(batch_size) {
-        summary.merge(index_scan_key_batch(session, table_id, batch).await?);
+    while remaining > 0 {
+        let batch_len = remaining.min(batch_size as u64);
+        let mut bounds = Vec::with_capacity(batch_len as usize);
+        for _ in 0..batch_len {
+            let range = ranges.next_range()?;
+            bounds.push((range.start, range.end()?));
+        }
+        summary.merge(index_scan_range_batch(session, table_id, &bounds).await?);
+        remaining -= batch_len;
     }
     Ok(summary)
 }
 
-async fn index_scan_key_batch(
+async fn index_scan_range_batch(
     session: &mut Session,
     table_id: TableID,
-    keys: &[u64],
+    bounds: &[(u64, u64)],
 ) -> Result<SessionSummary> {
     let mut trx = session.begin_trx()?;
     let mut summary = SessionSummary::default();
-    for key in keys {
-        let select_key = SelectKey::new(0, vec![Val::from(*key)]);
+    for (start, end) in bounds {
+        let lower = [Val::from(*start)];
+        let upper = [Val::from(*end)];
         let scan = trx
             .exec(async |stmt| {
-                stmt.table_index_lookup_mvcc(
-                    table_id,
-                    select_key.index_no,
-                    &select_key.vals,
-                    &[0, 1],
-                )
-                .await
+                stmt.table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], &[0, 1])
+                    .await
             })
             .await;
         match scan {
@@ -534,15 +606,22 @@ async fn index_scan_key_batch(
 async fn index_stream_iterations(
     session: &mut Session,
     table_id: TableID,
-    iterations: u64,
+    seed: u64,
+    loaded_range: KeyRange,
+    range_len: u64,
+    plan: &SessionPlan,
 ) -> Result<SessionSummary> {
+    let mut ranges = RandomScanRangeGenerator::new(seed, loaded_range, range_len, plan)?;
     let mut summary = SessionSummary::default();
-    for _ in 0..iterations {
+    for _ in 0..plan.rows {
+        let range = ranges.next_range()?;
+        let lower = [Val::from(range.start)];
+        let upper = [Val::from(range.end()?)];
         let mut trx = session.begin_trx()?;
         let scan_result = async {
             let mut stream = trx
                 .stream_stmt()
-                .table_index_scan_mvcc(table_id, 0, .., &[0, 1])
+                .table_index_scan_mvcc(table_id, 0, &lower[..]..&upper[..], &[0, 1])
                 .await?;
             let mut rows = 0u64;
             while stream.next().await?.is_some() {
@@ -659,10 +738,13 @@ mod tests {
             IndexStreamConfig::resolve(&loaded_manifest(IndexMode::Unique, 1), &args).unwrap();
         assert_eq!(config.operation_count(), 1);
         assert_eq!(config.loaded_range, KeyRange { start: 0, len: 3 });
+        assert_eq!(config.scan_range(), Some(3));
+        assert_eq!(config.seed(), 0);
+        assert!(config.random());
     }
 
     #[test]
-    fn index_scan_config_enforces_manifest_compatibility() {
+    fn index_range_configs_resolve_explicit_range_and_index_compatibility() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
             "--root",
@@ -671,6 +753,65 @@ mod tests {
             "index-scan",
             "--num",
             "1",
+            "--range",
+            "2",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::IndexScan(args),
+        } = cli.command
+        else {
+            panic!("expected index-scan workload");
+        };
+        for index in [IndexMode::Unique, IndexMode::NonUnique] {
+            let config = IndexScanConfig::resolve(&loaded_manifest(index, 1), &args).unwrap();
+            assert_eq!(config.scan_range(), Some(2));
+            assert_eq!(config.seed(), 7);
+        }
+        assert!(IndexScanConfig::resolve(&loaded_manifest(IndexMode::None, 1), &args).is_err());
+
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "--root",
+            "root",
+            "run",
+            "index-stream",
+            "--num",
+            "2",
+            "--range",
+            "2",
+            "--seed",
+            "9",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::IndexStream(args),
+        } = cli.command
+        else {
+            panic!("expected index-stream workload");
+        };
+        for index in [IndexMode::Unique, IndexMode::NonUnique] {
+            let config = IndexStreamConfig::resolve(&loaded_manifest(index, 1), &args).unwrap();
+            assert_eq!(config.scan_range(), Some(2));
+            assert_eq!(config.seed(), 9);
+        }
+        assert!(IndexStreamConfig::resolve(&loaded_manifest(IndexMode::None, 1), &args).is_err());
+    }
+
+    #[test]
+    fn index_range_configs_reject_range_larger_than_loaded_span() {
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "--root",
+            "root",
+            "run",
+            "index-scan",
+            "--num",
+            "1",
+            "--range",
+            "4",
         ])
         .unwrap();
         let Command::Run {

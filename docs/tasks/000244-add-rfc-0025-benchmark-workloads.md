@@ -1,7 +1,7 @@
 ---
 id: 000244
 title: Add RFC-0025 Benchmark Workloads
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-29
 github_issue: 910
 ---
@@ -15,7 +15,7 @@ measure RFC-0025's session-operation coordination overhead:
 
 - a no-op `Transaction::exec` loop;
 - repeated no-effect transaction begin/commit;
-- a long-lived public `StreamStmt` index scan;
+- bounded materialized and long-lived public `StreamStmt` index scans;
 - successful create/drop table DDL; and
 - successful create/drop index DDL.
 
@@ -36,7 +36,7 @@ insert/lookup/scan workloads, single- and multi-session runs, and successful
 DDL measurements.
 
 The current `doradb-bench` already supplies sequential and random inserts,
-sequential and random unique lookups, table scans, exact non-unique index scans,
+sequential and random unique lookups, table scans, secondary-index scans,
 transaction batch sizing, `LogSync::None`, thread/session scaling, public
 storage statistics, and fixed Markdown/CSV results. It does not supply:
 
@@ -71,9 +71,12 @@ RFC Relationship:
 Related Backlogs:
 - `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
 - `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`
+- `docs/backlogs/000173-fix-btree-physical-deletion-layout-and-amortize-reclamation.md`
 
-The related backlogs are context only. This task does not consume or close
-either item.
+The first two related backlogs are context only. This task does not consume or
+close either item. Backlog 000173 records a storage-engine issue discovered
+during table-DDL stress validation and remains open as intentionally deferred
+work.
 
 Issue Labels:
 - type:perf
@@ -91,11 +94,16 @@ Issue Labels:
 2. Add `run trx-noop --num N`.
    - Partition `N` no-effect begin/commit cycles across sessions.
    - Count one committed transaction as one operation.
-3. Add `run index-stream [--num N]`.
-   - Default `N` to one full scan iteration.
-   - Require a prepared unique index and loaded rows.
-   - Use one `StreamStmt::table_index_scan_mvcc` per iteration, retain its one
-     checkout for the stream lifetime, and call `next()` until exhaustion.
+3. Add `run index-stream [--num N] [--range ROWS] [--seed SEED]` and extend
+   `index-scan` with the same range-selection controls.
+   - Default `N` to one stream iteration and omitted `--range` to the full
+     loaded logical-key span.
+   - Accept prepared unique and non-unique indexes with loaded rows.
+   - Generate one deterministic random half-open key range per iteration, with
+     every session respecting the resolved range length.
+   - Use `table_index_scan_mvcc` for materialized index scans and one
+     `StreamStmt::table_index_scan_mvcc` per stream iteration, retaining its
+     checkout for the stream lifetime and calling `next()` until exhaustion.
    - Count scan iterations as operations and emitted rows as
      `rows_returned`.
 4. Add `run table-ddl [--num N]`.
@@ -148,8 +156,9 @@ Issue Labels:
    - Add a worker-count argument structure for the two required-count
      workloads. `stmt-noop` and `trx-noop` require a positive
      `--num`.
-   - Add a worker-iteration argument structure for stream and DDL workloads.
-     Missing `--num` resolves to one.
+   - Add dedicated index-scan and index-stream arguments for optional positive
+     `--range` and deterministic `--seed`; missing stream `--num` resolves to
+     one.
    - Keep `WorkerArgs` behavior unchanged: run-level threads and sessions
      inherit manifest defaults, explicit threads without sessions use the
      thread count for sessions, and `threads <= sessions` remains required.
@@ -162,14 +171,15 @@ Issue Labels:
 2. Extend manifest compatibility and range resolution.
    - `stmt-noop`, `trx-noop`, and `table-ddl` accept every prepared
      index mode and do not require loaded data.
-   - `index-stream` requires `index = "unique"` and a nonempty loaded key
-     range. A unique index gives deterministic one-row-per-key setup when data
-     is loaded with the supported insert workloads.
+   - `index-scan` and `index-stream` require a unique or non-unique prepared
+     index and a nonempty loaded key range.
+   - Resolve omitted `--range` to the full loaded key span and reject an
+     explicit range larger than that span.
    - `index-ddl` requires `index = "none"` so the benchmark owns the only
      secondary-index lifecycle on the prepared table. Loaded data is optional:
      an empty table measures lifecycle overhead, while an explicit prior
      `insert-seq` run includes index-build work.
-   - Preserve existing lookup/index-scan compatibility rules.
+   - Preserve existing lookup compatibility rules.
    - For no-data workloads, report the manifest's current allocated range,
      including an empty `[0, 0)` range, without applying the read-workload
      nonempty-data check.
@@ -212,10 +222,18 @@ Issue Labels:
        assigned operation;
      - do not execute an empty statement solely to make the transaction
        visible.
+   - `index-scan`:
+     - retain transaction batching while choosing new deterministic random
+       bounds for every assigned scan;
+     - replace exact-key `table_index_lookup_mvcc` calls with bounded
+       `table_index_scan_mvcc` calls and materialize each result;
+     - count actual returned rows and preserve found/not-found accounting.
    - `index-stream`:
      - begin one transaction per scan iteration;
+     - deterministically choose a new half-open logical-key range for every
+       iteration from all starts where the resolved range length fits;
      - create `trx.stream_stmt()` and call
-       `table_index_scan_mvcc(table_id, 0, .., &[0, 1])`;
+       `table_index_scan_mvcc(table_id, 0, lower..upper, &[0, 1])`;
      - exhaust the returned stream with `next().await`, incrementing
        `rows_returned`;
      - drop the exhausted stream and commit the transaction;
@@ -249,13 +267,13 @@ Issue Labels:
 5. Preserve output and manifest mutation behavior.
    - Extend exhaustive workload matches in `runner.rs` and `output.rs`.
    - Keep `benchmark-result.md`, `benchmark-result.csv`, and optional
-     `benchmark-internal-stats.csv` at their current paths and with their
-     current schemas.
+     `benchmark-internal-stats.csv` at their current paths. Add the resolved
+     range to Markdown/stdout and the result CSV for index range workloads.
    - Record the configured DDL cycle count as `num` and the completed create
      plus drop calls as `operations`.
-   - Keep `index-stream` average latency defined per full stream iteration.
-     `rows_returned` provides the fixed item count needed to compare per-item
-     behavior without changing the output schema.
+   - Keep `index-scan` and `index-stream` average latency defined per completed
+     range scan. `rows_returned` provides the actual item count needed to
+     compare per-item behavior.
    - Keep stats snapshots outside the measured workers as today.
    - Retain the existing rule that only successful insert variants write
      updated manifest runtime counters after benchmark outputs succeed.
@@ -265,8 +283,9 @@ Issue Labels:
      definitions.
    - State that `stmt-noop` amortizes one begin/commit per nonempty
      session; RFC measurements should use a large `--num`.
-   - State that `index-stream` reports latency per full stream and must compare
-     runs with the same loaded-row count.
+   - State that both index workloads support unique and non-unique indexes,
+     choose deterministic random bounds per iteration, and report actual row
+     cardinality for non-unique data with duplicates or gaps.
    - State that successful DDL changes catalog history even after logical drop.
      Paired DDL trials should use equivalently fresh prepared roots and normally
      one cycle per invocation.
@@ -312,6 +331,47 @@ Issue Labels:
 
 ## Implementation Notes
 
+- Added `stmt-noop`, `trx-noop`, `index-stream`, `table-ddl`, and `index-ddl`
+  with the planned compatibility rules, operation accounting, worker controls,
+  stable output artifacts, and insert-only manifest mutation.
+- Extended `index-scan` and `index-stream` with optional `--range` and seeded
+  per-iteration bounds, support for both unique and non-unique indexes, bounded
+  `table_index_scan_mvcc` execution, and a resolved range field in Markdown and
+  CSV results.
+- Refactored all benchmark workloads onto one movable `WorkloadRunner`
+  boundary. Each workload module owns its associated configuration and runner
+  construction, `workload/util.rs` owns deterministic generation and
+  partitioning helpers, and DDL uses the same session executor and cleanup
+  path as non-DDL workloads. The originally discussed `SessionRunner` name was
+  changed to `WorkloadRunner` to describe the abstraction more precisely.
+- Centralized session close and engine shutdown error merging. The first
+  operational error remains authoritative, while session close and engine
+  shutdown are still attempted; this includes stats capture and stats-session
+  close failures.
+- Strengthened the internal mutable CoW and recursive rewrite future contracts
+  with the required `Send` and `Sync` bounds so workload session futures can
+  move across executor threads without unsafe implementations or public API
+  changes.
+- Updated benchmark documentation and RFC-0025's successful-path measurement
+  mapping. The benchmark still supplies workload shapes rather than repeated
+  run orchestration or performance thresholds.
+- Validation passed:
+  - `tools/style_audit.rs --diff-base origin/main` (15 Rust files);
+  - `rtk cargo fmt --all -- --check`;
+  - `rtk cargo clippy --workspace --all-targets -- -D warnings`;
+  - `rtk cargo nextest run -p doradb-bench` (94 tests);
+  - `rtk cargo nextest run --workspace` (1578 tests);
+  - `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`
+    (1485 tests); and
+  - release-mode prepare/load/run smokes for all five new workloads, including
+    multi-session no-op and stream runs and exact DDL operation counts, plus
+    bounded multi-session index-scan and index-stream runs over unique and
+    non-unique indexes.
+- Long-history table-DDL validation exposed pre-existing B-tree physical-delete
+  layout fragmentation during catalog replay. The benchmark task does not
+  change storage behavior, so the correctness repair and amortized reclamation
+  policy are deferred to
+  `docs/backlogs/000173-fix-btree-physical-deletion-layout-and-amortize-reclamation.md`.
 
 ## Impacts
 
@@ -324,7 +384,7 @@ Issue Labels:
   - typed workload dispatch, generic session lifecycle, movable executor
     scheduling, and result accounting.
 - `doradb-bench/src/output.rs`
-  - exhaustive workload rendering with the existing artifact schema.
+  - exhaustive workload rendering and resolved range output.
 - `doradb-bench/src/workload/`
   - shared `WorkloadRunner` and workload-configuration contracts, per-command
     resolved configs and runners, and deterministic workload utilities.
@@ -337,23 +397,25 @@ Issue Labels:
 - `docs/rfcs/0025-session-coordinated-cancellation-cleanup-ownership.md`
   - program-prerequisite link and phase-to-workload mapping.
 
-No public interface, dependency, storage format, runtime configuration, or
-storage behavior changes.
+No `doradb-storage` public interface, dependency, storage format, runtime
+configuration, or storage behavior changes.
 
 ## Test Cases
 
 1. CLI parsing recognizes all five exact workload names.
 2. `stmt-noop` and `trx-noop` reject missing or zero `--num`.
 3. `index-stream`, `table-ddl`, and `index-ddl` default omitted `--num` to one
-   and reject explicit zero through `NonZeroU64`.
+   and reject explicit zero through `NonZeroU64`; index range workloads also
+   reject zero `--range`.
 4. New workloads accept worker, log-sync, and stats controls but reject
-   irrelevant batch-size, value-size, seed, and random flags.
+   irrelevant batch-size, value-size, seed, range, and random flags.
 5. Worker/session defaults resolve exactly as for existing workloads and reject
    `threads > sessions`.
 6. Manifest compatibility accepts no-op and table-DDL workloads with empty
    `none`, `unique`, and `non-unique` roots.
-7. `index-stream` rejects no loaded rows, `index = "none"`, and
-   `index = "non-unique"`, and accepts loaded unique data.
+7. `index-scan` and `index-stream` reject no loaded rows and `index = "none"`,
+   accept loaded unique and non-unique data, default to the full loaded key
+   span, and reject an oversized explicit range.
 8. `index-ddl` accepts `index = "none"` with and without loaded rows and
    rejects prepared unique/non-unique indexes.
 9. Statement-noop lifecycle smoke runs exactly the requested aggregate number
@@ -364,11 +426,11 @@ storage behavior changes.
 11. Transaction-noop reports exactly the requested aggregate transaction count;
     with internal stats enabled, commit-count deltas agree with successful
     operations.
-12. Index-stream over a known unique dataset reports the requested scan
-    iterations and `loaded_rows * iterations` returned rows for both one and
-    multiple sessions.
+12. Index-scan and index-stream over known gap-free unique and non-unique
+    datasets report the requested iterations and `range * iterations` returned
+    rows for both one and multiple sessions.
 13. Index-stream fully exhausts each stream before transaction commit and does
-    not materialize the whole result as the existing `index-scan` path does.
+    not materialize the result as the `index-scan` path does.
 14. One table-DDL cycle reports two operations, leaves the original benchmark
     table loaded, and leaves no created table runtime in
     `Session::list_table_ids`.
@@ -385,25 +447,28 @@ storage behavior changes.
     explicit thread/session precedence, range resolution, seed metadata, DDL
     overflow rejection, and insert-only manifest updates.
 20. Deterministic workload utilities preserve key uniqueness/replacement,
-    repeatability, range wrapping, overflow rejection, payload sizing, session
-    partitioning, and effective batch sizing.
-19. Existing insert, lookup, table-scan, and index-scan lifecycle tests remain
-    unchanged in behavior and output schema.
-20. Output tests cover all new workload display names, configured `num`,
-    operation counts, row counts, and stable zero-valued unrelated counters.
-21. RFC synchronization names task 000244 as a program prerequisite without
+    repeatability, range wrapping, random scan bounds, overflow rejection,
+    payload sizing, session partitioning, and effective batch sizing.
+21. Existing insert, lookup, and table-scan lifecycle tests remain unchanged
+    in behavior.
+22. Output tests cover all new workload display names, configured `num`,
+    resolved scan range, operation counts, row counts, and stable zero-valued
+    unrelated counters.
+23. RFC synchronization names task 000244 as a program prerequisite without
     populating or resolving any numbered phase's `Task Doc`, `Task Issue`,
     phase status, or implementation summary.
-22. Recursive secondary DiskTree and column block-index rewrite futures satisfy
+24. Recursive secondary DiskTree and column block-index rewrite futures satisfy
     `Send` for every production mutable CoW file and existing test double.
 
 ## Open Questions
 
-None.
+No blocking questions remain for this task.
 
 Checkpoint benchmark design remains intentionally deferred to RFC-0025 Phase 6
 and `docs/backlogs/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`.
 Detached-operation and concurrent-cleanup measurements remain deferred until
 the relevant RFC-0025 ownership and worker semantics exist. A future suite
 runner or statistics aggregator requires separate user direction and is not
-implied by this task.
+implied by this task. B-tree physical-delete layout repair and adaptive
+reclamation remain tracked by
+`docs/backlogs/000173-fix-btree-physical-deletion-layout-and-amortize-reclamation.md`.

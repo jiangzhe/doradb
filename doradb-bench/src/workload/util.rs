@@ -8,6 +8,64 @@ const PAYLOAD_SALT: u64 = 0x4d2b_f14a_17b8_7d83;
 const RANDOM_KEY_SALT: u64 = 0xd1b5_4a32_d192_ed03;
 const UNIQUE_KEY_SALT: u64 = 0x94d0_49bb_1331_11eb;
 const READ_RANDOM_SALT: u64 = 0x3f8a_e42c_6d13_0b57;
+const READ_RANGE_SALT: u64 = 0xa76f_c213_9b48_05de;
+
+/// Deterministic random ranges for one session's scan iterations.
+pub(super) struct RandomScanRangeGenerator {
+    state: u64,
+    loaded_range: KeyRange,
+    range_len: u64,
+    valid_starts: u64,
+}
+
+impl RandomScanRangeGenerator {
+    /// Build a generator for one session plan.
+    pub(super) fn new(
+        seed: u64,
+        loaded_range: KeyRange,
+        range_len: u64,
+        plan: &SessionPlan,
+    ) -> Result<Self> {
+        validate_loaded_range(loaded_range)?;
+        if range_len == 0 {
+            return Err(BenchError::message("--range must be positive"));
+        }
+        if range_len > loaded_range.len {
+            return Err(BenchError::message(format!(
+                "--range ({range_len}) must not exceed loaded key range length ({})",
+                loaded_range.len
+            )));
+        }
+        loaded_range.end()?;
+        Ok(Self {
+            state: seed_state(
+                seed,
+                plan.key_start,
+                plan.session_index as u64,
+                READ_RANGE_SALT,
+            ),
+            loaded_range,
+            range_len,
+            valid_starts: loaded_range.len - range_len + 1,
+        })
+    }
+
+    /// Generate the next half-open logical-key range.
+    pub(super) fn next_range(&mut self) -> Result<KeyRange> {
+        let offset = splitmix64(&mut self.state) % self.valid_starts;
+        let start = self
+            .loaded_range
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| BenchError::message("random scan range start overflow"))?;
+        let range = KeyRange {
+            start,
+            len: self.range_len,
+        };
+        range.end()?;
+        Ok(range)
+    }
+}
 
 /// Partition one aggregate operation range into deterministic session plans.
 pub(crate) fn build_session_plans(range: KeyRange, sessions: usize) -> Result<Vec<SessionPlan>> {
@@ -383,6 +441,64 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, different);
         assert!(first.iter().all(|key| *key < loaded_range().len));
+    }
+
+    #[test]
+    fn random_scan_ranges_are_seeded_and_bounded() {
+        let loaded_range = KeyRange { start: 10, len: 8 };
+        let plan = SessionPlan {
+            session_index: 1,
+            key_start: 4,
+            rows: 16,
+        };
+        let mut first = RandomScanRangeGenerator::new(11, loaded_range, 3, &plan).unwrap();
+        let mut second = RandomScanRangeGenerator::new(11, loaded_range, 3, &plan).unwrap();
+        let mut different = RandomScanRangeGenerator::new(12, loaded_range, 3, &plan).unwrap();
+        let first_ranges = (0..plan.rows)
+            .map(|_| first.next_range().unwrap())
+            .collect::<Vec<_>>();
+        let second_ranges = (0..plan.rows)
+            .map(|_| second.next_range().unwrap())
+            .collect::<Vec<_>>();
+        let different_ranges = (0..plan.rows)
+            .map(|_| different.next_range().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ranges, second_ranges);
+        assert_ne!(first_ranges, different_ranges);
+        assert!(first_ranges.iter().all(|range| {
+            range.len == 3
+                && range.start >= loaded_range.start
+                && range.end().unwrap() <= loaded_range.end().unwrap()
+        }));
+        assert!(
+            first_ranges
+                .iter()
+                .any(|range| range.end().unwrap() == loaded_range.end().unwrap())
+        );
+    }
+
+    #[test]
+    fn full_random_scan_range_has_one_valid_start() {
+        let loaded_range = KeyRange { start: 10, len: 8 };
+        let plan = SessionPlan {
+            session_index: 2,
+            key_start: 7,
+            rows: 2,
+        };
+        let mut ranges = RandomScanRangeGenerator::new(19, loaded_range, 8, &plan).unwrap();
+        assert_eq!(ranges.next_range().unwrap(), loaded_range);
+        assert_eq!(ranges.next_range().unwrap(), loaded_range);
+    }
+
+    #[test]
+    fn random_scan_range_rejects_invalid_lengths() {
+        let plan = SessionPlan {
+            session_index: 0,
+            key_start: 0,
+            rows: 1,
+        };
+        assert!(RandomScanRangeGenerator::new(0, loaded_range(), 0, &plan).is_err());
+        assert!(RandomScanRangeGenerator::new(0, loaded_range(), 4, &plan).is_err());
     }
 
     #[test]

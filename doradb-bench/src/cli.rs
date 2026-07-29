@@ -184,14 +184,14 @@ pub enum WorkloadArgs {
     LookupRand(SeededReadArgs),
     /// Run full table-scan iterations over visible rows.
     TableScan(ReadArgs),
-    /// Run exact-key non-unique secondary-index scans over loaded keys.
-    IndexScan(SeededReadArgs),
+    /// Run bounded secondary-index scans over loaded keys.
+    IndexScan(IndexScanArgs),
     /// Execute no-op statements inside one transaction per nonempty session.
     StmtNoop(WorkerCountArgs),
     /// Begin and commit transactions without executing statements.
     TrxNoop(WorkerCountArgs),
-    /// Run full unique-index scans through the public stream facade.
-    IndexStream(WorkerIterationArgs),
+    /// Run bounded secondary-index scans through the public stream facade.
+    IndexStream(IndexStreamArgs),
     /// Create and drop an empty user table per iteration.
     TableDdl(WorkerIterationArgs),
     /// Create and drop a non-unique logical-key index per iteration.
@@ -401,6 +401,68 @@ impl SeededReadArgs {
     /// Return the deterministic read generator seed.
     pub(super) fn seed(&self) -> u64 {
         self.seed
+    }
+}
+
+/// Arguments for materialized secondary-index range scans.
+#[derive(Clone, Debug, Args)]
+pub struct IndexScanArgs {
+    #[command(flatten)]
+    read: SeededReadArgs,
+    /// Logical-key values per scan; defaults to the full loaded range.
+    #[arg(long)]
+    range: Option<NonZeroU64>,
+}
+
+impl IndexScanArgs {
+    /// Return shared seeded read arguments.
+    pub(super) fn read(&self) -> &ReadArgs {
+        self.read.read()
+    }
+
+    /// Return the deterministic range-selection seed.
+    pub(super) fn seed(&self) -> u64 {
+        self.read.seed()
+    }
+
+    /// Return an explicitly configured logical-key range length.
+    pub(super) fn range_override(&self) -> Option<u64> {
+        self.range.map(NonZeroU64::get)
+    }
+}
+
+/// Arguments for streaming secondary-index range scans.
+#[derive(Clone, Debug, Args)]
+pub struct IndexStreamArgs {
+    #[command(flatten)]
+    iterations: WorkerIterationArgs,
+    /// Logical-key values per stream; defaults to the full loaded range.
+    #[arg(long)]
+    range: Option<NonZeroU64>,
+    /// Reproducibility seed for range selection.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
+impl IndexStreamArgs {
+    /// Return shared worker arguments.
+    pub(super) fn worker(&self) -> &WorkerArgs {
+        self.iterations.worker()
+    }
+
+    /// Return the aggregate iteration count.
+    pub(super) fn iterations(&self) -> u64 {
+        self.iterations.iterations()
+    }
+
+    /// Return the deterministic range-selection seed.
+    pub(super) fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Return an explicitly configured logical-key range length.
+    pub(super) fn range_override(&self) -> Option<u64> {
+        self.range.map(NonZeroU64::get)
     }
 }
 
@@ -648,6 +710,8 @@ mod tests {
                     "3",
                     "--batch-size",
                     "2",
+                    "--range",
+                    "2",
                 ],
                 Workload::IndexScan,
             ),
@@ -663,9 +727,8 @@ mod tests {
                 WorkloadArgs::LookupSeq(args) | WorkloadArgs::TableScan(args) => {
                     args.common().batch_size_override()
                 }
-                WorkloadArgs::LookupRand(args) | WorkloadArgs::IndexScan(args) => {
-                    args.read().common().batch_size_override()
-                }
+                WorkloadArgs::LookupRand(args) => args.read().common().batch_size_override(),
+                WorkloadArgs::IndexScan(args) => args.read().common().batch_size_override(),
                 _ => panic!("expected read workload"),
             };
             assert_eq!(batch_size, Some(2));
@@ -733,7 +796,18 @@ mod tests {
                     .unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
 
-            for option in ["--batch-size", "--value-size", "--seed", "--rand"] {
+            let irrelevant = if name == "index-stream" {
+                &["--batch-size", "--value-size", "--rand"][..]
+            } else {
+                &[
+                    "--batch-size",
+                    "--value-size",
+                    "--seed",
+                    "--range",
+                    "--rand",
+                ][..]
+            };
+            for &option in irrelevant {
                 let mut args = vec![
                     "doradb-bench",
                     "run",
@@ -750,6 +824,22 @@ mod tests {
                 let err = Cli::try_parse_from(args).unwrap_err();
                 assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
             }
+        }
+
+        for name in ["index-scan", "index-stream"] {
+            let err = Cli::try_parse_from([
+                "doradb-bench",
+                "run",
+                name,
+                "--root",
+                "root",
+                "--num",
+                "1",
+                "--range",
+                "0",
+            ])
+            .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
         }
     }
 
@@ -989,13 +1079,11 @@ mod tests {
                 args.common().worker()
             }
             WorkloadArgs::LookupSeq(args) | WorkloadArgs::TableScan(args) => args.common().worker(),
-            WorkloadArgs::LookupRand(args) | WorkloadArgs::IndexScan(args) => {
-                args.read().common().worker()
-            }
+            WorkloadArgs::LookupRand(args) => args.read().common().worker(),
+            WorkloadArgs::IndexScan(args) => args.read().common().worker(),
             WorkloadArgs::StmtNoop(args) | WorkloadArgs::TrxNoop(args) => args.worker(),
-            WorkloadArgs::IndexStream(args)
-            | WorkloadArgs::TableDdl(args)
-            | WorkloadArgs::IndexDdl(args) => args.worker(),
+            WorkloadArgs::IndexStream(args) => args.worker(),
+            WorkloadArgs::TableDdl(args) | WorkloadArgs::IndexDdl(args) => args.worker(),
         }
     }
 
@@ -1005,15 +1093,13 @@ mod tests {
                 Some(args.operation_count())
             }
             WorkloadArgs::LookupSeq(args) | WorkloadArgs::TableScan(args) => args.operation_count(),
-            WorkloadArgs::LookupRand(args) | WorkloadArgs::IndexScan(args) => {
-                args.read().operation_count()
-            }
+            WorkloadArgs::LookupRand(args) => args.read().operation_count(),
+            WorkloadArgs::IndexScan(args) => args.read().operation_count(),
             WorkloadArgs::StmtNoop(args) | WorkloadArgs::TrxNoop(args) => {
                 Some(args.operation_count())
             }
-            WorkloadArgs::IndexStream(args)
-            | WorkloadArgs::TableDdl(args)
-            | WorkloadArgs::IndexDdl(args) => Some(args.iterations()),
+            WorkloadArgs::IndexStream(args) => Some(args.iterations()),
+            WorkloadArgs::TableDdl(args) | WorkloadArgs::IndexDdl(args) => Some(args.iterations()),
         }
     }
 }

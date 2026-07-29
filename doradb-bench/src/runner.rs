@@ -110,26 +110,28 @@ where
     let loaded_range = config.output_loaded_range();
 
     let engine = open_engine(storage_root, common.log_sync).await?;
-    let stats_state = if common.include_stats {
-        let stats_session = engine.new_session()?;
-        let before = InternalStatsSnapshot::capture(&stats_session)?;
-        Some((stats_session, before))
-    } else {
-        None
-    };
-    let started = Instant::now();
-    let worker_result = run_session_workers::<R>(&engine, &config, table_id);
-    let elapsed = started.elapsed();
-    let metrics = if let Some((mut stats_session, before)) = stats_state {
-        let after = InternalStatsSnapshot::capture(&stats_session)?;
-        stats_session.close().await?;
-        internal_metrics(&before, &after)
-    } else {
-        Vec::new()
-    };
-    engine.shutdown()?;
-
-    let summary = worker_result?;
+    let operation_result = async {
+        let stats_state = if common.include_stats {
+            let stats_session = engine.new_session()?;
+            let before = InternalStatsSnapshot::capture(&stats_session)?;
+            Some((stats_session, before))
+        } else {
+            None
+        };
+        let started = Instant::now();
+        let summary = run_session_workers::<R>(&engine, &config, table_id)?;
+        let elapsed = started.elapsed();
+        let metrics = if let Some((mut stats_session, before)) = stats_state {
+            let after = InternalStatsSnapshot::capture(&stats_session)?;
+            stats_session.close().await?;
+            internal_metrics(&before, &after)
+        } else {
+            Vec::new()
+        };
+        Ok((summary, elapsed, metrics))
+    }
+    .await;
+    let (summary, elapsed, metrics) = finish_engine(&engine, operation_result)?;
 
     let result = BenchmarkResult::new(
         summary.operations,
@@ -144,6 +146,7 @@ where
         workload: R::Config::WORKLOAD,
         storage_root: storage_root.to_path_buf(),
         num: config.operation_count(),
+        range: config.scan_range(),
         value_size: common.value_size,
         batch_size: common.batch_size,
         rand: config.random(),
@@ -188,6 +191,15 @@ async fn open_engine(storage_root: &Path, log_sync: LogSyncMode) -> Result<Engin
             .trx(TrxSysConfig::default().log_sync(log_sync.as_storage())),
     )
     .await?)
+}
+
+fn finish_engine<T>(engine: &Engine, operation_result: Result<T>) -> Result<T> {
+    let shutdown_result = engine.shutdown();
+    match (operation_result, shutdown_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err.into()),
+    }
 }
 
 fn run_session_workers<R: WorkloadRunner>(
@@ -310,6 +322,19 @@ mod tests {
 
         smol::block_on(cleanup(root.clone())).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn finish_engine_shuts_down_after_operation_error() {
+        let temp = TempDir::new().unwrap();
+        let engine =
+            smol::block_on(open_engine(temp.path(), LogSyncMode::Fsync)).expect("open engine");
+
+        let err = finish_engine::<()>(&engine, Err(BenchError::message("operation failed")))
+            .expect_err("operation error");
+
+        assert_eq!(err.to_string(), "operation failed");
+        assert!(engine.new_session().is_err());
     }
 
     #[test]

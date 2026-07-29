@@ -171,7 +171,8 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
   explicitly detaching it.
 - [D16] `docs/tasks/000244-add-rfc-0025-benchmark-workloads.md` - program
   prerequisite benchmark workloads for statement/transaction lifecycle,
-  caller-driven streams, and successful table/index DDL.
+  bounded materialized and caller-driven index scans, and successful
+  table/index DDL.
 
 ### Code References
 
@@ -1278,14 +1279,20 @@ expansion rather than assuming approval from this RFC. [D15] [U7]
 
 ## Implementation Phases
 
-Program prerequisite: task
+Implemented program prerequisite (2026-07-29): task
 `docs/tasks/000244-add-rfc-0025-benchmark-workloads.md` supplies the
 successful-path workload shapes before Phase 1 begins. `stmt-noop` and
-`trx-noop` provide Phase 1/2 lifecycle evidence, `index-stream`
-provides Phase 2's long-lived stream evidence, `table-ddl` provides Phase 4
+`trx-noop` provide Phase 1/2 lifecycle evidence, while bounded `index-scan` and
+`index-stream` workloads provide Phase 2's materialized and long-lived stream
+evidence over unique or non-unique indexes. `table-ddl` provides Phase 4
 evidence, and `index-ddl` provides Phase 5 evidence. Existing insert, lookup,
-and table/index scan workloads remain the row/index/page-loop baselines. This
-prerequisite does not implement or resolve a numbered phase. [D16] [C16]
+and table-scan workloads remain the row/index/page-loop baselines. The
+workloads use one movable session executor, preserve the artifact and manifest
+contracts, and record the resolved logical-key range in benchmark output. This
+prerequisite does not implement or resolve a numbered phase. Long-history
+table-DDL validation found a separate physical-delete layout issue tracked by
+`docs/backlogs/000173-fix-btree-physical-deletion-layout-and-amortize-reclamation.md`;
+it does not change the successful-path baseline availability. [D16] [C16]
 
 - **Phase 1: Session Operation Coordinator Foundation**
   - Scope: Add crate-private `OperationID`, a plain session-local monotonic
@@ -1358,8 +1365,9 @@ prerequisite does not implement or resolve a numbered phase. [D16] [C16]
     phase. Preserve the hard successful `Transaction::exec` and `StreamStmt`
     cost budgets.
   - Measurement Evidence: Compare `stmt-noop` and `trx-noop`
-    against their Phase 1 baselines, and use `index-stream` with a fixed loaded
-    row count to enforce the no-per-item stream budget. [D16] [C16] [U5]
+    against their Phase 1 baselines, and use `index-stream` with fixed loaded
+    data and `--range` to enforce the no-per-item stream budget across unique
+    and non-unique index modes. [D16] [C16] [U5]
   - Prerequisites: Phase 1 entry/lease/claim transitions are available, and task
     000174 worker-owned terminal rollback plus task 000242 transaction-lock
     release proof remain intact. [D11] [D12]
@@ -1644,6 +1652,7 @@ purpose, ownership, gate, and ordering contracts above.
 - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 - `docs/backlogs/000123-adaptive-background-worker-runtime.md`
 - `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`
+- `docs/backlogs/000173-fix-btree-physical-deletion-layout-and-amortize-reclamation.md`
 - `docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md`
 - `docs/process/coding-guidance.md`
 - `docs/rfcs/0019-weak-public-runtime-handles.md`

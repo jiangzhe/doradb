@@ -87,10 +87,11 @@ requires `prepare --index unique`.
 `table-scan [--num N]` runs full visible-row table scans. `--num` defaults to
 `1` and means full scan iterations. It works with all prepared index modes.
 
-`index-scan --num N [--seed SEED]` runs exact-key scans through the single
-non-unique secondary index on `logical_key`, using deterministic seeded
-replacement key selection over the loaded logical key range. It requires
-`prepare --index non-unique`.
+`index-scan --num N [--range ROWS] [--seed SEED]` runs materialized
+`Transaction::exec` scans through the single secondary index on `logical_key`.
+It accepts `prepare --index unique` and `prepare --index non-unique`.
+`--range` is the number of consecutive logical-key values per scan and defaults
+to the full loaded key range.
 
 `stmt-noop --num N` runs exactly `N` no-op `Transaction::exec` calls. Each
 nonempty session uses one long-lived transaction and commits after its assigned
@@ -106,14 +107,22 @@ and the log thread, so `transaction.commit_count` and
 `transaction.trx_count` internal-stat deltas remain zero; the final
 `operations` counter is the authoritative successful-cycle count.
 
-`index-stream [--num N]` runs full unique-index scan iterations through one
-public `StreamStmt::table_index_scan_mvcc` stream per transaction. Each stream
-retains its statement checkout while the caller repeatedly invokes `next()`,
-and the transaction commits only after the stream reports exhaustion. It
-requires `prepare --index unique` and loaded rows. `--num` defaults to `1`;
-`operations` counts full streams and `rows_returned` counts emitted rows.
-Latency is therefore reported per full stream. Compare runs only when they use
-the same loaded-row count.
+`index-stream [--num N] [--range ROWS] [--seed SEED]` runs the same bounded
+secondary-index scans through one public `StreamStmt::table_index_scan_mvcc`
+stream per transaction. It accepts prepared unique and non-unique indexes.
+Each stream retains its statement checkout while the caller repeatedly invokes
+`next()`, and the transaction commits only after the stream reports exhaustion.
+`--range` defaults to the full loaded key range, and `--num` defaults to `1`.
+`operations` counts streams and `rows_returned` counts emitted rows. Latency is
+therefore reported per stream.
+
+For both index range workloads, every iteration selects a new deterministic
+random start from all positions where the configured logical-key span fits.
+Each session uses the same resolved `--range`; `--seed`, the session plan, and
+the iteration position determine its bounds. With unique or gap-free
+sequentially loaded data, a range of `ROWS` returns `ROWS` rows. Non-unique
+random inserts may contain duplicates or gaps, so `--range` remains a
+logical-key span and `rows_returned` records the actual result cardinality.
 
 `table-ddl [--num N]` creates and drops one empty two-column user table per
 cycle. It accepts every prepared index mode and does not alter the prepared
@@ -131,8 +140,9 @@ two operations.
 workloads it means rows per commit. For read workloads it means lookup requests,
 index-scan requests, or full table-scan iterations per read transaction. It is
 applied per session. `--num` remains the aggregate row or request count across
-all sessions. The five lifecycle/stream/DDL workloads do not accept
-`--batch-size`, `--value-size`, or `--seed`.
+all sessions. `index-stream`, the no-op workloads, and the DDL workloads do not
+accept `--batch-size` or `--value-size`; only `index-stream` among those
+workloads accepts `--seed`.
 
 ## Controls
 
@@ -145,10 +155,11 @@ all sessions. The five lifecycle/stream/DDL workloads do not accept
 | `--num`, `-n` | `run insert-seq`, `insert-rand`, `lookup-seq`, `lookup-rand`, `index-scan` | Required | Aggregate row, lookup, or scan request count across all sessions. |
 | `--num`, `-n` | `run table-scan` | `1` | Aggregate full table-scan iterations across all sessions. |
 | `--num`, `-n` | `run stmt-noop`, `trx-noop` | Required | Aggregate statement calls or no-effect transaction cycles across all sessions. |
-| `--num`, `-n` | `run index-stream`, `table-ddl`, `index-ddl` | `1` | Aggregate full-stream iterations or create/drop cycles across all sessions. |
+| `--num`, `-n` | `run index-stream`, `table-ddl`, `index-ddl` | `1` | Aggregate stream iterations or create/drop cycles across all sessions. |
+| `--range` | `run index-scan`, `index-stream` | Full loaded key range | Positive number of consecutive logical-key values scanned by every iteration. The value must not exceed the loaded key-range length. |
 | `--value-size`, `-v` | `prepare`, `run insert-seq`, `insert-rand` | `prepare`: `128`; `run`: manifest default | Generated payload size in bytes. Run overrides apply only to insert workloads. |
 | `--batch-size`, `-b` | `prepare`, insert and non-stream read workloads | `prepare`: `1`; `run`: manifest default | Operations per transaction. For inserts this means rows per commit; for reads this means lookup/index-scan requests or table-scan iterations per read transaction. |
-| `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, or randomized read key selection. |
+| `--seed` | `run insert-seq`, `insert-rand`, `lookup-rand`, `index-scan`, `index-stream` | `0` | `u64` reproducibility input for payload bytes, randomized insert order, randomized read key selection, or randomized scan bounds. |
 | `--log-sync` | `run ...` | `fsync` | Redo-log durability sync method. `fsync` and `fdatasync` submit the matching native file-sync operation; `none` skips durable sync and is crash-unsafe. |
 | `--include-stats` | `run ...` | `false` | Captures and prints internal transaction-system, storage-IO, and buffer-pool stats. Omit this for prerequisite runs such as data loading before a measured read workload. |
 
@@ -176,9 +187,14 @@ Read workloads draw candidate keys from the loaded logical range
 `--threads 1 --sessions 1`; multi-session or multi-threaded runs guarantee
 deterministic per-session plans.
 
-For a fresh storage root and the same command sequence, `--seed`, prepared index
-mode, session count, row count, and value size, generated keys and payloads
-should be reproducible.
+For index range workloads, a resolved range of length `R` selects its start
+uniformly from the inclusive offsets `0..=runtime.next_key-R`, then scans the
+half-open interval `[start, start+R)`. Omitting `--range` resolves `R` to the
+full loaded span and therefore has one valid start.
+
+For a fresh storage root and the same command sequence, `--seed`, `--range`,
+prepared index mode, session count, row count, and value size, generated keys,
+payloads, and scan bounds should be reproducible.
 
 When `--sessions` is greater than `--threads`, each session still runs as an
 independent async benchmark client. The requested worker threads drive those
@@ -198,9 +214,9 @@ errors are written to stderr.
 `run` prints these stdout sections in this order:
 
 - `Configuration`: workload, randomized-key-selection mode, storage root,
-  internal-stats mode, row/request count, value size, batch size, seed,
-  prepared index mode, loaded key range, threads, sessions, log sync mode, and
-  table id.
+  internal-stats mode, row/request count, resolved scan range when applicable,
+  value size, batch size, seed, prepared index mode, loaded key range, threads,
+  sessions, log sync mode, and table id.
 - `Internal Stats`, only with `--include-stats`: public transaction-system,
   storage-IO, and buffer-pool stats deltas when available.
 - `Final Result`: operation count, inserted rows, found count, not-found count,
@@ -209,8 +225,9 @@ errors are written to stderr.
 
 For DDL, the configuration's `num` remains the requested cycle count while
 `operations` counts the successful create and drop calls and is therefore
-twice `num`. For `index-stream`, `num` and `operations` count full scans while
-`rows_returned` counts stream items; average latency remains defined per full
+twice `num`. For `index-scan` and `index-stream`, `num` and `operations` count
+range scans while `range` records their logical-key width and `rows_returned`
+counts actual result rows or stream items. Average latency remains defined per
 scan. Unrelated counters remain zero for all new workloads. Any storage error
 terminates the command instead of producing a partially successful result.
 
@@ -249,7 +266,7 @@ doradb-bench --root target/doradb-bench/table-scan cleanup
 ```bash
 doradb-bench --root target/doradb-bench/index-scan prepare --index non-unique
 doradb-bench --root target/doradb-bench/index-scan run insert-seq --num 10000 --value-size 128
-doradb-bench --root target/doradb-bench/index-scan run index-scan --num 10000 --seed 3
+doradb-bench --root target/doradb-bench/index-scan run index-scan --num 10000 --range 100 --seed 3
 doradb-bench --root target/doradb-bench/index-scan cleanup
 ```
 
@@ -274,13 +291,13 @@ rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-no
 rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-noop run trx-noop --num 100000 --threads 4 --sessions 16 --log-sync none
 ```
 
-Prepare and load an equivalently sized unique-index root before each paired
-stream trial:
+Prepare and load an equivalently sized unique- or non-unique-index root before
+each paired stream trial:
 
 ```bash
 rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream prepare --index unique
 rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run insert-seq --num 100000 --batch-size 1000 --log-sync none
-rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run index-stream --num 100 --threads 1 --sessions 1 --log-sync none
+rtk cargo run --release -p doradb-bench -- --root target/doradb-bench/rfc0025-stream run index-stream --num 100 --range 1000 --seed 1 --threads 1 --sessions 1 --log-sync none
 ```
 
 Existing workloads should cover batch size one and a large batch, plus

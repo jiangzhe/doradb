@@ -75,6 +75,11 @@ pub(super) trait WorkloadConfig: Sized {
         0
     }
 
+    /// Return the resolved logical-key width for range-scan workloads.
+    fn scan_range(&self) -> Option<u64> {
+        None
+    }
+
     /// Apply a successful workload's runtime manifest changes.
     fn update_manifest(&self, _manifest: &mut Manifest) -> Result<bool> {
         Ok(false)
