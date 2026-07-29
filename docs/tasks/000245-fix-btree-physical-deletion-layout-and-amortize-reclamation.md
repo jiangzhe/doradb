@@ -1,7 +1,7 @@
 ---
 id: 000245
 title: Fix B-tree Physical Deletion Layout and Amortize Reclamation
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-29
 github_issue: 912
 ---
@@ -315,6 +315,60 @@ Issue Labels:
     - Layout rebuilding never authorizes removal of retained delete overlays.
 
 ## Implementation Notes
+
+Implemented exact, derived fragmentation accounting without changing the B-tree
+page layout. `BTreeNode::reclaimable_space` and
+`SpaceStatistics::reclaimable_space` now report `used_space -
+effective_space`, while physical deletion remains a cheap slot-array mutation
+that leaves removed payload bytes for later reclamation.
+
+Added `BTreePrepareInsert` and a single live-mutation preparation policy.
+Contiguous fits remain allocation-only, fragmentation-blocked mutations rebuild
+at or below the half-page packed-occupancy target, and higher-occupancy nodes
+request a structural split. `self_compact` now rebuilds the complete retained
+layout, including fences, lower-fence child value, timestamp, values, delete
+bits, and search hints. The policy is applied to leaf insertion, bottom-up and
+top-down parent/child split preparation, root revalidation, and fragmented
+separator-key replacement. Fresh-node packing retains the existing
+contiguous-space predicate.
+
+Review found that packed-capacity exhaustion on a node with fewer than three
+slots could still return `SplitRequired` without an interior separator and
+panic later in `split_separator`. `prepare_insert` now validates the separator
+before returning `SplitRequired`. Fragmentation-only low-count nodes continue
+to rebuild; genuinely packed-capacity-exhausted low-count input, which remains
+outside this task's oversized-input scope, fails immediately at the mutation
+boundary with a diagnostic assertion instead of entering invalid split
+machinery. A focused regression test covers this invariant.
+
+Semantic deletion authorization remains with catalog recovery, rollback,
+transaction index purge, and proof-bound `MemIndex` cleanup. Their production
+interfaces and MVCC checks were not changed. `docs/index-design.md` now records
+the boundary between authorization, cheap physical removal, layout-only
+reclamation, and structural splitting. No new deferred work was created;
+broader compaction-policy work remains in backlog 000092.
+
+Verification completed:
+
+- After the final review fix, 56 focused `doradb-storage` B-tree tests passed,
+  including the new separator-invariant regression.
+- Before that focused review fix, the full workspace suite passed 1,584 tests
+  and the alternate `libaio` suite passed 1,491 tests.
+- Workspace formatting, strict all-target clippy, diff checking, and the
+  mandatory style audit passed; the resolve-time audit checked three
+  branch-diff Rust files.
+- An implementation-focused coverage run for the changed B-tree node/tree and
+  space-statistics modules reported 91.56% overall before the final review
+  patch.
+- An optimized 2,000-cycle table-DDL history completed 4,000 operations with
+  zero failures in 7.161604638 seconds. Reopening the same root for one more
+  cycle completed two operations with zero failures in 3.912945 milliseconds.
+
+The implementation added focused node/tree policy tests rather than new
+caller-specific rollback, purge, cleanup, and recovery tests. Those unchanged
+semantic paths were revalidated by the existing workspace and `libaio` suites;
+the optimized table-DDL run supplied end-to-end catalog replay and reopen
+coverage beyond the reproduced failure threshold.
 
 ## Impacts
 
