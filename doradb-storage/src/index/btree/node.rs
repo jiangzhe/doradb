@@ -856,13 +856,19 @@ impl BTreeNode {
         }
 
         let reclaimable_bytes = self.reclaimable_space();
-        if required_space > self.free_space_after_compaction() {
+        let separator_idx = self.find_separator();
+        let has_valid_separator = separator_idx > 0 && separator_idx < self.count();
+        let free_space_after_compaction = self.free_space_after_compaction();
+        if required_space > free_space_after_compaction {
+            assert!(
+                has_valid_separator,
+                "B-tree packed capacity exhausted without a valid split separator: required_space={required_space}, free_space_after_compaction={free_space_after_compaction}, count={}",
+                self.count()
+            );
             return BTreePrepareInsert::SplitRequired { reclaimable_bytes };
         }
 
         let packed_post_mutation_space = self.effective_space() + required_space;
-        let separator_idx = self.find_separator();
-        let has_valid_separator = separator_idx > 0 && separator_idx < self.count();
         if packed_post_mutation_space > BTREE_NODE_RECLAIM_TARGET_SPACE && has_valid_separator {
             return BTreePrepareInsert::SplitRequired { reclaimable_bytes };
         }
@@ -2659,6 +2665,24 @@ mod tests {
         );
         assert_eq!(high_occupancy.reclaimable_space(), reclaimable_bytes);
         assert_eq!(high_occupancy.count(), keys.len() - 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "B-tree packed capacity exhausted without a valid split separator")]
+    fn test_btree_node_prepare_insert_rejects_unsplittable_packed_capacity() {
+        let mut node =
+            BTreeNodeBox::alloc(0, TrxID::new(10), &[], BTreeU64::INVALID_VALUE, &[], false);
+        for id in 1u32..=2 {
+            let key = long_test_key(id, 30_000);
+            assert!(node.can_insert::<BTreeU64>(&key));
+            node.insert(&key, BTreeU64::from(u64::from(id)));
+        }
+        assert_eq!(node.count(), 2);
+        assert_eq!(node.reclaimable_space(), 0);
+
+        let pending_key = long_test_key(3, 10_000);
+        assert!(node.space_needed::<BTreeU64>(&pending_key) > node.free_space_after_compaction());
+        node.prepare_insert::<BTreeU64>(&pending_key);
     }
 
     #[test]
