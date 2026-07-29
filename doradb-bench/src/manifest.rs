@@ -1,5 +1,5 @@
 use crate::cli::{
-    DEFAULT_BATCH_SIZE, DEFAULT_VALUE_SIZE, IndexMode, RunDefaults, Workload, validate_batch_size,
+    DEFAULT_BATCH_SIZE, DEFAULT_VALUE_SIZE, IndexMode, Workload, validate_batch_size,
     validate_value_size, validate_workers,
 };
 use crate::error::{BenchError, Result};
@@ -45,7 +45,9 @@ impl DefaultsManifest {
         value_size: usize,
         batch_size: u64,
     ) -> Result<Self> {
-        RunDefaults::new(threads, sessions, value_size, batch_size)?;
+        validate_workers(threads, sessions)?;
+        validate_value_size(value_size)?;
+        validate_batch_size(batch_size)?;
         Ok(Self {
             threads,
             sessions,
@@ -58,15 +60,6 @@ impl DefaultsManifest {
         validate_workers(self.threads, self.sessions)?;
         validate_value_size(self.value_size)?;
         validate_batch_size(self.batch_size)
-    }
-
-    pub(super) fn run_defaults(&self) -> RunDefaults {
-        RunDefaults {
-            threads: self.threads,
-            sessions: self.sessions,
-            value_size: self.value_size,
-            batch_size: self.batch_size,
-        }
     }
 }
 
@@ -172,15 +165,25 @@ impl Manifest {
                 "read workload requires loaded benchmark data; run insert-seq or insert-rand first",
             ));
         }
-        Ok(KeyRange {
+        Ok(self.allocated_key_range())
+    }
+
+    /// Return the allocated logical key range without requiring loaded rows.
+    pub(super) fn allocated_key_range(&self) -> KeyRange {
+        KeyRange {
             start: 0,
             len: self.runtime.next_key,
-        })
+        }
     }
 
     pub(super) fn validate_workload_compatible(&self, workload: Workload) -> Result<()> {
         match workload {
-            Workload::InsertSeq | Workload::InsertRand | Workload::TableScan => {}
+            Workload::InsertSeq
+            | Workload::InsertRand
+            | Workload::TableScan
+            | Workload::StmtNoop
+            | Workload::TrxNoop
+            | Workload::TableDdl => {}
             Workload::LookupSeq | Workload::LookupRand => {
                 if self.index != IndexMode::Unique {
                     return Err(BenchError::message(format!(
@@ -197,8 +200,31 @@ impl Manifest {
                     )));
                 }
             }
+            Workload::IndexStream => {
+                if self.index != IndexMode::Unique {
+                    return Err(BenchError::message(format!(
+                        "{workload} workload requires prepared index mode unique; found {}",
+                        self.index
+                    )));
+                }
+            }
+            Workload::IndexDdl => {
+                if self.index != IndexMode::None {
+                    return Err(BenchError::message(format!(
+                        "{workload} workload requires prepared index mode none; found {}",
+                        self.index
+                    )));
+                }
+            }
         }
-        if !matches!(workload, Workload::InsertSeq | Workload::InsertRand) {
+        if matches!(
+            workload,
+            Workload::LookupSeq
+                | Workload::LookupRand
+                | Workload::TableScan
+                | Workload::IndexScan
+                | Workload::IndexStream
+        ) {
             self.loaded_key_range()?;
         }
         Ok(())
@@ -521,5 +547,57 @@ rows_inserted = 0
                 .validate_workload_compatible(Workload::LookupSeq)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn no_data_workloads_accept_supported_empty_manifests() {
+        for index in [IndexMode::None, IndexMode::Unique, IndexMode::NonUnique] {
+            let manifest = Manifest::new(7, index);
+            for workload in [Workload::StmtNoop, Workload::TrxNoop, Workload::TableDdl] {
+                assert!(
+                    manifest.validate_workload_compatible(workload).is_ok(),
+                    "workload={workload}, index={index}"
+                );
+            }
+            assert_eq!(
+                manifest.allocated_key_range(),
+                KeyRange { start: 0, len: 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn stream_and_index_ddl_enforce_distinct_manifest_contracts() {
+        let empty_unique = Manifest::new(7, IndexMode::Unique);
+        assert!(
+            empty_unique
+                .validate_workload_compatible(Workload::IndexStream)
+                .is_err()
+        );
+
+        let mut loaded_unique = Manifest::new(7, IndexMode::Unique);
+        loaded_unique.record_insert_success(3).unwrap();
+        assert!(
+            loaded_unique
+                .validate_workload_compatible(Workload::IndexStream)
+                .is_ok()
+        );
+
+        for index in [IndexMode::None, IndexMode::Unique, IndexMode::NonUnique] {
+            let mut manifest = Manifest::new(7, index);
+            assert_eq!(
+                manifest
+                    .validate_workload_compatible(Workload::IndexDdl)
+                    .is_ok(),
+                index == IndexMode::None
+            );
+            manifest.record_insert_success(2).unwrap();
+            assert_eq!(
+                manifest
+                    .validate_workload_compatible(Workload::IndexDdl)
+                    .is_ok(),
+                index == IndexMode::None
+            );
+        }
     }
 }

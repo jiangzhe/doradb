@@ -801,6 +801,36 @@ mod tests {
     }
 
     #[test]
+    fn new_workload_names_and_ddl_counters_use_existing_output_schema() {
+        let names = [
+            (Workload::StmtNoop, "stmt-noop"),
+            (Workload::TrxNoop, "trx-noop"),
+            (Workload::IndexStream, "index-stream"),
+            (Workload::TableDdl, "table-ddl"),
+            (Workload::IndexDdl, "index-ddl"),
+        ];
+        for (workload, expected) in names {
+            assert_eq!(workload.to_string(), expected);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let mut config = sample_config(temp.path());
+        config.workload = Workload::TableDdl;
+        config.num = 2;
+        config.loaded_key_end = 0;
+        let csv = render_result_csv(
+            &config,
+            &BenchmarkResult::new(4, 0, 0, 0, 0, Duration::from_nanos(100), 0),
+        );
+        let row = csv.lines().nth(1).unwrap().split(',').collect::<Vec<_>>();
+        assert_eq!(row[0], "table-ddl");
+        assert_eq!(row[4], "2");
+        assert_eq!(row[15], "4");
+        assert_eq!(&row[16..20], &["0", "0", "0", "0"]);
+        assert_eq!(row[23], "0");
+    }
+
+    #[test]
     fn configuration_omits_removed_fields() {
         let temp = TempDir::new().unwrap();
         let pairs = configuration_pairs(&sample_config(temp.path()));

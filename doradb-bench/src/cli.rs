@@ -126,6 +126,11 @@ pub(super) enum Workload {
     LookupRand,
     TableScan,
     IndexScan,
+    StmtNoop,
+    TrxNoop,
+    IndexStream,
+    TableDdl,
+    IndexDdl,
 }
 
 impl fmt::Display for Workload {
@@ -137,6 +142,11 @@ impl fmt::Display for Workload {
             Self::LookupRand => f.write_str("lookup-rand"),
             Self::TableScan => f.write_str("table-scan"),
             Self::IndexScan => f.write_str("index-scan"),
+            Self::StmtNoop => f.write_str("stmt-noop"),
+            Self::TrxNoop => f.write_str("trx-noop"),
+            Self::IndexStream => f.write_str("index-stream"),
+            Self::TableDdl => f.write_str("table-ddl"),
+            Self::IndexDdl => f.write_str("index-ddl"),
         }
     }
 }
@@ -176,40 +186,20 @@ pub enum WorkloadArgs {
     TableScan(ReadArgs),
     /// Run exact-key non-unique secondary-index scans over loaded keys.
     IndexScan(SeededReadArgs),
-}
-
-impl WorkloadArgs {
-    pub(super) fn resolve(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-    ) -> Result<LoadConfig> {
-        match self {
-            WorkloadArgs::InsertSeq(args) => {
-                args.resolve_insert_seq(storage_root, manifest_index, defaults)
-            }
-            WorkloadArgs::InsertRand(args) => {
-                args.resolve_insert_rand(storage_root, manifest_index, defaults)
-            }
-            WorkloadArgs::LookupSeq(args) => {
-                args.resolve_lookup_seq(storage_root, manifest_index, defaults)
-            }
-            WorkloadArgs::LookupRand(args) => {
-                args.resolve_lookup_rand(storage_root, manifest_index, defaults)
-            }
-            WorkloadArgs::TableScan(args) => {
-                args.resolve_table_scan(storage_root, manifest_index, defaults)
-            }
-            WorkloadArgs::IndexScan(args) => {
-                args.resolve_index_scan(storage_root, manifest_index, defaults)
-            }
-        }
-    }
+    /// Execute no-op statements inside one transaction per nonempty session.
+    StmtNoop(WorkerCountArgs),
+    /// Begin and commit transactions without executing statements.
+    TrxNoop(WorkerCountArgs),
+    /// Run full unique-index scans through the public stream facade.
+    IndexStream(WorkerIterationArgs),
+    /// Create and drop an empty user table per iteration.
+    TableDdl(WorkerIterationArgs),
+    /// Create and drop a non-unique logical-key index per iteration.
+    IndexDdl(WorkerIterationArgs),
 }
 
 #[derive(Clone, Debug, Args)]
-struct WorkerArgs {
+pub(super) struct WorkerArgs {
     /// Operating-system worker threads.
     #[arg(long, short = 't')]
     threads: Option<NonZeroUsize>,
@@ -224,18 +214,74 @@ struct WorkerArgs {
     include_stats: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ResolvedCommon {
-    threads: usize,
-    sessions: usize,
-    value_size: usize,
-    batch_size: u64,
-    log_sync: LogSyncMode,
-    include_stats: bool,
+impl WorkerArgs {
+    /// Return an explicitly configured executor thread count.
+    pub(super) fn thread_override(&self) -> Option<usize> {
+        self.threads.map(NonZeroUsize::get)
+    }
+
+    /// Return an explicitly configured public session count.
+    pub(super) fn session_override(&self) -> Option<usize> {
+        self.sessions.map(NonZeroUsize::get)
+    }
+
+    /// Return the configured redo-log durability mode.
+    pub(super) fn log_sync(&self) -> LogSyncMode {
+        self.log_sync
+    }
+
+    /// Return whether internal engine statistics should be captured.
+    pub(super) fn include_stats(&self) -> bool {
+        self.include_stats
+    }
+}
+
+/// Worker controls plus a required aggregate operation count.
+#[derive(Clone, Debug, Args)]
+pub struct WorkerCountArgs {
+    #[command(flatten)]
+    worker: WorkerArgs,
+    /// Total operations across all sessions.
+    #[arg(long, short = 'n')]
+    num: NonZeroU64,
+}
+
+impl WorkerCountArgs {
+    /// Return shared worker arguments.
+    pub(super) fn worker(&self) -> &WorkerArgs {
+        &self.worker
+    }
+
+    /// Return the required aggregate operation count.
+    pub(super) fn operation_count(&self) -> u64 {
+        self.num.get()
+    }
+}
+
+/// Worker controls plus an optional aggregate iteration count.
+#[derive(Clone, Debug, Args)]
+pub struct WorkerIterationArgs {
+    #[command(flatten)]
+    worker: WorkerArgs,
+    /// Total iterations across all sessions.
+    #[arg(long, short = 'n')]
+    num: Option<NonZeroU64>,
+}
+
+impl WorkerIterationArgs {
+    /// Return shared worker arguments.
+    pub(super) fn worker(&self) -> &WorkerArgs {
+        &self.worker
+    }
+
+    /// Return the aggregate iteration count, defaulting to one.
+    pub(super) fn iterations(&self) -> u64 {
+        self.num.map_or(1, NonZeroU64::get)
+    }
 }
 
 #[derive(Clone, Debug, Args)]
-struct LoadCommonArgs {
+pub(super) struct LoadCommonArgs {
     #[command(flatten)]
     worker: WorkerArgs,
     /// Generated payload size in bytes.
@@ -247,23 +293,24 @@ struct LoadCommonArgs {
 }
 
 impl LoadCommonArgs {
-    fn resolve(&self, defaults: RunDefaults) -> Result<ResolvedCommon> {
-        let workers = resolve_workers(&self.worker, defaults)?;
-        Ok(ResolvedCommon {
-            threads: workers.threads,
-            sessions: workers.sessions,
-            value_size: self
-                .value_size
-                .map_or(defaults.value_size, NonZeroUsize::get),
-            batch_size: self.batch_size.map_or(defaults.batch_size, NonZeroU64::get),
-            log_sync: self.worker.log_sync,
-            include_stats: self.worker.include_stats,
-        })
+    /// Return shared worker arguments.
+    pub(super) fn worker(&self) -> &WorkerArgs {
+        &self.worker
+    }
+
+    /// Return an explicitly configured generated payload size.
+    pub(super) fn value_size_override(&self) -> Option<usize> {
+        self.value_size.map(NonZeroUsize::get)
+    }
+
+    /// Return an explicitly configured transaction batch size.
+    pub(super) fn batch_size_override(&self) -> Option<u64> {
+        self.batch_size.map(NonZeroU64::get)
     }
 }
 
 #[derive(Clone, Debug, Args)]
-struct ReadCommonArgs {
+pub(super) struct ReadCommonArgs {
     #[command(flatten)]
     worker: WorkerArgs,
     /// Read operations per transaction.
@@ -272,16 +319,14 @@ struct ReadCommonArgs {
 }
 
 impl ReadCommonArgs {
-    fn resolve(&self, defaults: RunDefaults) -> Result<ResolvedCommon> {
-        let workers = resolve_workers(&self.worker, defaults)?;
-        Ok(ResolvedCommon {
-            threads: workers.threads,
-            sessions: workers.sessions,
-            value_size: defaults.value_size,
-            batch_size: self.batch_size.map_or(defaults.batch_size, NonZeroU64::get),
-            log_sync: self.worker.log_sync,
-            include_stats: self.worker.include_stats,
-        })
+    /// Return shared worker arguments.
+    pub(super) fn worker(&self) -> &WorkerArgs {
+        &self.worker
+    }
+
+    /// Return an explicitly configured read batch size.
+    pub(super) fn batch_size_override(&self) -> Option<u64> {
+        self.batch_size.map(NonZeroU64::get)
     }
 }
 
@@ -299,52 +344,19 @@ pub struct InsertArgs {
 }
 
 impl InsertArgs {
-    fn resolve_insert_seq(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-    ) -> Result<LoadConfig> {
-        self.resolve_insert(storage_root, manifest_index, defaults, false)
+    /// Return shared insert arguments.
+    pub(super) fn common(&self) -> &LoadCommonArgs {
+        &self.common
     }
 
-    fn resolve_insert_rand(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-    ) -> Result<LoadConfig> {
-        self.resolve_insert(storage_root, manifest_index, defaults, true)
+    /// Return the aggregate row count.
+    pub(super) fn operation_count(&self) -> u64 {
+        self.num.get()
     }
 
-    fn resolve_insert(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-        random: bool,
-    ) -> Result<LoadConfig> {
-        let common = self.common.resolve(defaults)?;
-        let insert = InsertConfig {
-            num: self.num.get(),
-            seed: self.seed,
-        };
-        let workload = if random {
-            WorkloadConfig::InsertRand(insert)
-        } else {
-            WorkloadConfig::InsertSeq(insert)
-        };
-        Ok(LoadConfig {
-            storage_root,
-            index: manifest_index,
-            threads: common.threads,
-            sessions: common.sessions,
-            value_size: common.value_size,
-            batch_size: common.batch_size,
-            log_sync: common.log_sync,
-            include_stats: common.include_stats,
-            workload,
-        })
+    /// Return the deterministic generator seed.
+    pub(super) fn seed(&self) -> u64 {
+        self.seed
     }
 }
 
@@ -359,54 +371,14 @@ pub struct ReadArgs {
 }
 
 impl ReadArgs {
-    fn resolve_lookup_seq(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-    ) -> Result<LoadConfig> {
-        let common = self.common.resolve(defaults)?;
-        Ok(LoadConfig {
-            storage_root,
-            index: manifest_index,
-            threads: common.threads,
-            sessions: common.sessions,
-            value_size: common.value_size,
-            batch_size: common.batch_size,
-            log_sync: common.log_sync,
-            include_stats: common.include_stats,
-            workload: WorkloadConfig::LookupSeq {
-                num: self.required_num(Workload::LookupSeq)?,
-            },
-        })
+    /// Return shared read arguments.
+    pub(super) fn common(&self) -> &ReadCommonArgs {
+        &self.common
     }
 
-    fn resolve_table_scan(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-    ) -> Result<LoadConfig> {
-        let common = self.common.resolve(defaults)?;
-        Ok(LoadConfig {
-            storage_root,
-            index: manifest_index,
-            threads: common.threads,
-            sessions: common.sessions,
-            value_size: common.value_size,
-            batch_size: common.batch_size,
-            log_sync: common.log_sync,
-            include_stats: common.include_stats,
-            workload: WorkloadConfig::TableScan {
-                num: self.num.map_or(1, NonZeroU64::get),
-            },
-        })
-    }
-
-    fn required_num(&self, workload: Workload) -> Result<u64> {
-        self.num
-            .map(NonZeroU64::get)
-            .ok_or_else(|| BenchError::message(format!("{workload} workload requires --num")))
+    /// Return the optional aggregate read or scan count.
+    pub(super) fn operation_count(&self) -> Option<u64> {
+        self.num.map(NonZeroU64::get)
     }
 }
 
@@ -421,168 +393,15 @@ pub struct SeededReadArgs {
 }
 
 impl SeededReadArgs {
-    fn resolve_lookup_rand(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-    ) -> Result<LoadConfig> {
-        let common = self.read.common.resolve(defaults)?;
-        Ok(LoadConfig {
-            storage_root,
-            index: manifest_index,
-            threads: common.threads,
-            sessions: common.sessions,
-            value_size: common.value_size,
-            batch_size: common.batch_size,
-            log_sync: common.log_sync,
-            include_stats: common.include_stats,
-            workload: WorkloadConfig::LookupRand {
-                num: self.read.required_num(Workload::LookupRand)?,
-                seed: self.seed,
-            },
-        })
+    /// Return shared read arguments.
+    pub(super) fn read(&self) -> &ReadArgs {
+        &self.read
     }
 
-    fn resolve_index_scan(
-        &self,
-        storage_root: PathBuf,
-        manifest_index: IndexMode,
-        defaults: RunDefaults,
-    ) -> Result<LoadConfig> {
-        let common = self.read.common.resolve(defaults)?;
-        Ok(LoadConfig {
-            storage_root,
-            index: manifest_index,
-            threads: common.threads,
-            sessions: common.sessions,
-            value_size: common.value_size,
-            batch_size: common.batch_size,
-            log_sync: common.log_sync,
-            include_stats: common.include_stats,
-            workload: WorkloadConfig::IndexScan {
-                num: self.read.required_num(Workload::IndexScan)?,
-                seed: self.seed,
-            },
-        })
+    /// Return the deterministic read generator seed.
+    pub(super) fn seed(&self) -> u64 {
+        self.seed
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct RunDefaults {
-    pub(super) threads: usize,
-    pub(super) sessions: usize,
-    pub(super) value_size: usize,
-    pub(super) batch_size: u64,
-}
-
-impl RunDefaults {
-    pub(super) fn new(
-        threads: usize,
-        sessions: usize,
-        value_size: usize,
-        batch_size: u64,
-    ) -> Result<Self> {
-        validate_workers(threads, sessions)?;
-        validate_value_size(value_size)?;
-        validate_batch_size(batch_size)?;
-        Ok(Self {
-            threads,
-            sessions,
-            value_size,
-            batch_size,
-        })
-    }
-}
-
-impl Default for RunDefaults {
-    fn default() -> Self {
-        Self {
-            threads: 1,
-            sessions: 1,
-            value_size: DEFAULT_VALUE_SIZE,
-            batch_size: DEFAULT_BATCH_SIZE,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct LoadConfig {
-    pub(super) storage_root: PathBuf,
-    pub(super) index: IndexMode,
-    pub(super) threads: usize,
-    pub(super) sessions: usize,
-    pub(super) value_size: usize,
-    pub(super) batch_size: u64,
-    pub(super) log_sync: LogSyncMode,
-    pub(super) include_stats: bool,
-    pub(super) workload: WorkloadConfig,
-}
-
-impl LoadConfig {
-    pub(super) fn workload(&self) -> Workload {
-        self.workload.workload()
-    }
-
-    pub(super) fn operation_count(&self) -> u64 {
-        self.workload.operation_count()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum WorkloadConfig {
-    InsertSeq(InsertConfig),
-    InsertRand(InsertConfig),
-    LookupSeq { num: u64 },
-    LookupRand { num: u64, seed: u64 },
-    TableScan { num: u64 },
-    IndexScan { num: u64, seed: u64 },
-}
-
-impl WorkloadConfig {
-    fn workload(&self) -> Workload {
-        match self {
-            Self::InsertSeq(_) => Workload::InsertSeq,
-            Self::InsertRand(_) => Workload::InsertRand,
-            Self::LookupSeq { .. } => Workload::LookupSeq,
-            Self::LookupRand { .. } => Workload::LookupRand,
-            Self::TableScan { .. } => Workload::TableScan,
-            Self::IndexScan { .. } => Workload::IndexScan,
-        }
-    }
-
-    fn operation_count(&self) -> u64 {
-        match self {
-            Self::InsertSeq(config) | Self::InsertRand(config) => config.num,
-            Self::LookupSeq { num }
-            | Self::LookupRand { num, .. }
-            | Self::TableScan { num }
-            | Self::IndexScan { num, .. } => *num,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct InsertConfig {
-    pub(super) num: u64,
-    pub(super) seed: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkerSettings {
-    threads: usize,
-    sessions: usize,
-}
-
-fn resolve_workers(worker: &WorkerArgs, defaults: RunDefaults) -> Result<WorkerSettings> {
-    let threads = worker.threads.map_or(defaults.threads, NonZeroUsize::get);
-    let sessions = match (worker.threads, worker.sessions) {
-        (_, Some(sessions)) => sessions.get(),
-        (Some(threads), None) => threads.get(),
-        (None, None) => defaults.sessions,
-    };
-    validate_workers(threads, sessions)?;
-    Ok(WorkerSettings { threads, sessions })
 }
 
 pub(super) fn validate_workers(threads: usize, sessions: usize) -> Result<()> {
@@ -706,162 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_sessions_default_and_thread_limit() {
-        let args = WorkloadArgs::InsertSeq(InsertArgs {
-            common: LoadCommonArgs {
-                worker: WorkerArgs {
-                    threads: Some(NonZeroUsize::new(2).unwrap()),
-                    sessions: None,
-                    log_sync: LogSyncMode::Fsync,
-                    include_stats: false,
-                },
-                value_size: None,
-                batch_size: None,
-            },
-            num: NonZeroU64::new(1).unwrap(),
-            seed: 0,
-        });
-        let config = args
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::None,
-                RunDefaults::default(),
-            )
-            .unwrap();
-        assert_eq!(config.sessions, 2);
-
-        let WorkloadArgs::InsertSeq(mut insert) = args else {
-            panic!("expected insert-seq workload");
-        };
-        insert.common.worker.sessions = Some(NonZeroUsize::new(1).unwrap());
-        assert!(
-            WorkloadArgs::InsertSeq(insert)
-                .resolve(
-                    PathBuf::from("root"),
-                    IndexMode::None,
-                    RunDefaults::default()
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn resolve_run_defaults_from_manifest() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "run",
-            "insert-seq",
-            "--root",
-            "root",
-            "--num",
-            "1",
-        ])
-        .unwrap();
-        let Command::Run { workload } = cli.command else {
-            panic!("expected run command");
-        };
-        let config = workload
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::None,
-                test_defaults(2, 4, 256, 8),
-            )
-            .unwrap();
-        assert_eq!(config.threads, 2);
-        assert_eq!(config.sessions, 4);
-        assert_eq!(config.value_size, 256);
-        assert_eq!(config.batch_size, 8);
-        assert!(!config.include_stats);
-    }
-
-    #[test]
-    fn resolve_run_sessions_only_uses_manifest_threads() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "run",
-            "insert-seq",
-            "--root",
-            "root",
-            "--num",
-            "1",
-            "--sessions",
-            "3",
-        ])
-        .unwrap();
-        let Command::Run { workload } = cli.command else {
-            panic!("expected run command");
-        };
-        let config = workload
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::None,
-                test_defaults(2, 4, 128, 1),
-            )
-            .unwrap();
-        assert_eq!(config.threads, 2);
-        assert_eq!(config.sessions, 3);
-    }
-
-    #[test]
-    fn resolve_insert_seq_inherits_manifest_sizing_defaults() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "run",
-            "insert-seq",
-            "--root",
-            "root",
-            "--num",
-            "1",
-        ])
-        .unwrap();
-        let Command::Run { workload } = cli.command else {
-            panic!("expected run command");
-        };
-        let config = workload
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::None,
-                test_defaults(1, 1, 512, 4),
-            )
-            .unwrap();
-        assert_eq!(config.workload(), Workload::InsertSeq);
-        assert_eq!(config.value_size, 512);
-        assert_eq!(config.batch_size, 4);
-        assert_eq!(config.log_sync, LogSyncMode::Fsync);
-    }
-
-    #[test]
-    fn resolve_insert_rand_workload() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "run",
-            "insert-rand",
-            "--root",
-            "root",
-            "--num",
-            "1",
-            "--seed",
-            "7",
-        ])
-        .unwrap();
-        let Command::Run { workload } = cli.command else {
-            panic!("expected run command");
-        };
-        let config = workload
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::None,
-                RunDefaults::default(),
-            )
-            .unwrap();
-        assert_eq!(config.workload(), Workload::InsertRand);
-        let WorkloadConfig::InsertRand(insert) = config.workload else {
-            panic!("expected insert-rand workload");
-        };
-        assert_eq!(insert.seed, 7);
-    }
-
-    #[test]
     fn parse_insert_short_flags() {
         let cli = Cli::try_parse_from([
             "doradb-bench",
@@ -883,27 +546,18 @@ mod tests {
             "fdatasync",
         ])
         .unwrap();
-        let Command::Run { workload } = cli.command else {
+        let Command::Run {
+            workload: WorkloadArgs::InsertRand(insert),
+        } = cli.command
+        else {
             panic!("expected run command");
         };
-        let config = workload
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::Unique,
-                RunDefaults::default(),
-            )
-            .unwrap();
-        assert_eq!(config.storage_root, PathBuf::from("root"));
-        let WorkloadConfig::InsertRand(insert) = config.workload else {
-            panic!("expected insert-rand workload");
-        };
-        assert_eq!(insert.num, 10);
-        assert_eq!(config.value_size, 32);
-        assert_eq!(config.batch_size, 4);
-        assert_eq!(config.index, IndexMode::Unique);
-        assert_eq!(config.threads, 2);
-        assert_eq!(config.sessions, 4);
-        assert_eq!(config.log_sync, LogSyncMode::Fdatasync);
+        assert_eq!(insert.operation_count(), 10);
+        assert_eq!(insert.common().value_size_override(), Some(32));
+        assert_eq!(insert.common().batch_size_override(), Some(4));
+        assert_eq!(insert.common().worker().thread_override(), Some(2));
+        assert_eq!(insert.common().worker().session_override(), Some(4));
+        assert_eq!(insert.common().worker().log_sync(), LogSyncMode::Fdatasync);
     }
 
     #[test]
@@ -1004,16 +658,98 @@ mod tests {
             let Command::Run { workload: load } = cli.command else {
                 panic!("expected run command");
             };
-            let config = load
-                .resolve(
-                    PathBuf::from("root"),
-                    IndexMode::Unique,
-                    RunDefaults::default(),
-                )
-                .unwrap();
-            assert_eq!(config.workload(), workload);
-            assert!(config.operation_count() > 0);
-            assert_eq!(config.batch_size, 2);
+            assert_eq!(parsed_workload(&load), workload);
+            let batch_size = match &load {
+                WorkloadArgs::LookupSeq(args) | WorkloadArgs::TableScan(args) => {
+                    args.common().batch_size_override()
+                }
+                WorkloadArgs::LookupRand(args) | WorkloadArgs::IndexScan(args) => {
+                    args.read().common().batch_size_override()
+                }
+                _ => panic!("expected read workload"),
+            };
+            assert_eq!(batch_size, Some(2));
+        }
+    }
+
+    #[test]
+    fn parse_coordinator_and_ddl_workloads() {
+        let cases = [
+            ("stmt-noop", Some("3"), Workload::StmtNoop, 3),
+            ("trx-noop", Some("3"), Workload::TrxNoop, 3),
+            ("index-stream", None, Workload::IndexStream, 1),
+            ("table-ddl", None, Workload::TableDdl, 1),
+            ("index-ddl", Some("2"), Workload::IndexDdl, 2),
+        ];
+
+        for (name, num, expected, expected_num) in cases {
+            let mut args = vec![
+                "doradb-bench",
+                "run",
+                name,
+                "--root",
+                "root",
+                "--threads",
+                "1",
+                "--sessions",
+                "2",
+                "--log-sync",
+                "none",
+                "--include-stats",
+            ];
+            if let Some(num) = num {
+                args.extend(["--num", num]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Run { workload } = cli.command else {
+                panic!("expected run command");
+            };
+            assert_eq!(parsed_workload(&workload), expected);
+            assert_eq!(parsed_operation_count(&workload), Some(expected_num));
+            let worker = parsed_worker(&workload);
+            assert_eq!(worker.thread_override(), Some(1));
+            assert_eq!(worker.session_override(), Some(2));
+            assert_eq!(worker.log_sync(), LogSyncMode::None);
+            assert!(worker.include_stats());
+        }
+    }
+
+    #[test]
+    fn new_workloads_validate_counts_and_reject_irrelevant_controls() {
+        for name in ["stmt-noop", "trx-noop"] {
+            let err =
+                Cli::try_parse_from(["doradb-bench", "run", name, "--root", "root"]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+        for name in [
+            "stmt-noop",
+            "trx-noop",
+            "index-stream",
+            "table-ddl",
+            "index-ddl",
+        ] {
+            let err =
+                Cli::try_parse_from(["doradb-bench", "run", name, "--root", "root", "--num", "0"])
+                    .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+
+            for option in ["--batch-size", "--value-size", "--seed", "--rand"] {
+                let mut args = vec![
+                    "doradb-bench",
+                    "run",
+                    name,
+                    "--root",
+                    "root",
+                    "--num",
+                    "1",
+                    option,
+                ];
+                if option != "--rand" {
+                    args.push("2");
+                }
+                let err = Cli::try_parse_from(args).unwrap_err();
+                assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+            }
         }
     }
 
@@ -1078,6 +814,50 @@ mod tests {
                 "3",
                 "--include-stats",
             ],
+            vec![
+                "doradb-bench",
+                "run",
+                "stmt-noop",
+                "--root",
+                "root",
+                "--num",
+                "3",
+                "--include-stats",
+            ],
+            vec![
+                "doradb-bench",
+                "run",
+                "trx-noop",
+                "--root",
+                "root",
+                "--num",
+                "3",
+                "--include-stats",
+            ],
+            vec![
+                "doradb-bench",
+                "run",
+                "index-stream",
+                "--root",
+                "root",
+                "--include-stats",
+            ],
+            vec![
+                "doradb-bench",
+                "run",
+                "table-ddl",
+                "--root",
+                "root",
+                "--include-stats",
+            ],
+            vec![
+                "doradb-bench",
+                "run",
+                "index-ddl",
+                "--root",
+                "root",
+                "--include-stats",
+            ],
         ];
 
         for args in cases {
@@ -1085,41 +865,12 @@ mod tests {
             let Command::Run { workload } = cli.command else {
                 panic!("expected run command");
             };
-            let config = workload
-                .resolve(
-                    PathBuf::from("root"),
-                    IndexMode::Unique,
-                    RunDefaults::default(),
-                )
-                .unwrap();
-            assert!(config.include_stats);
+            assert!(parsed_worker(&workload).include_stats());
         }
     }
 
     #[test]
-    fn read_workloads_inherit_batch_default_and_reject_value_size() {
-        let cli = Cli::try_parse_from([
-            "doradb-bench",
-            "run",
-            "lookup-seq",
-            "--root",
-            "root",
-            "--num",
-            "3",
-        ])
-        .unwrap();
-        let Command::Run { workload } = cli.command else {
-            panic!("expected run command");
-        };
-        let config = workload
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::Unique,
-                test_defaults(1, 1, 128, 6),
-            )
-            .unwrap();
-        assert_eq!(config.batch_size, 6);
-
+    fn read_workloads_reject_value_size() {
         let err = Cli::try_parse_from([
             "doradb-bench",
             "run",
@@ -1133,38 +884,6 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn lookup_workloads_require_num_but_table_scan_defaults_to_one() {
-        let cli =
-            Cli::try_parse_from(["doradb-bench", "run", "lookup-seq", "--root", "root"]).unwrap();
-        let Command::Run { workload } = cli.command else {
-            panic!("expected run command");
-        };
-        assert!(
-            workload
-                .resolve(
-                    PathBuf::from("root"),
-                    IndexMode::Unique,
-                    RunDefaults::default()
-                )
-                .is_err()
-        );
-
-        let cli =
-            Cli::try_parse_from(["doradb-bench", "run", "table-scan", "--root", "root"]).unwrap();
-        let Command::Run { workload } = cli.command else {
-            panic!("expected run command");
-        };
-        let config = workload
-            .resolve(
-                PathBuf::from("root"),
-                IndexMode::None,
-                RunDefaults::default(),
-            )
-            .unwrap();
-        assert_eq!(config.operation_count(), 1);
     }
 
     #[test]
@@ -1248,17 +967,53 @@ mod tests {
         assert!(cli.resolve_root_with_env(Some(PathBuf::new())).is_err());
     }
 
-    fn test_defaults(
-        threads: usize,
-        sessions: usize,
-        value_size: usize,
-        batch_size: u64,
-    ) -> RunDefaults {
-        RunDefaults {
-            threads,
-            sessions,
-            value_size,
-            batch_size,
+    fn parsed_workload(args: &WorkloadArgs) -> Workload {
+        match args {
+            WorkloadArgs::InsertSeq(_) => Workload::InsertSeq,
+            WorkloadArgs::InsertRand(_) => Workload::InsertRand,
+            WorkloadArgs::LookupSeq(_) => Workload::LookupSeq,
+            WorkloadArgs::LookupRand(_) => Workload::LookupRand,
+            WorkloadArgs::TableScan(_) => Workload::TableScan,
+            WorkloadArgs::IndexScan(_) => Workload::IndexScan,
+            WorkloadArgs::StmtNoop(_) => Workload::StmtNoop,
+            WorkloadArgs::TrxNoop(_) => Workload::TrxNoop,
+            WorkloadArgs::IndexStream(_) => Workload::IndexStream,
+            WorkloadArgs::TableDdl(_) => Workload::TableDdl,
+            WorkloadArgs::IndexDdl(_) => Workload::IndexDdl,
+        }
+    }
+
+    fn parsed_worker(args: &WorkloadArgs) -> &WorkerArgs {
+        match args {
+            WorkloadArgs::InsertSeq(args) | WorkloadArgs::InsertRand(args) => {
+                args.common().worker()
+            }
+            WorkloadArgs::LookupSeq(args) | WorkloadArgs::TableScan(args) => args.common().worker(),
+            WorkloadArgs::LookupRand(args) | WorkloadArgs::IndexScan(args) => {
+                args.read().common().worker()
+            }
+            WorkloadArgs::StmtNoop(args) | WorkloadArgs::TrxNoop(args) => args.worker(),
+            WorkloadArgs::IndexStream(args)
+            | WorkloadArgs::TableDdl(args)
+            | WorkloadArgs::IndexDdl(args) => args.worker(),
+        }
+    }
+
+    fn parsed_operation_count(args: &WorkloadArgs) -> Option<u64> {
+        match args {
+            WorkloadArgs::InsertSeq(args) | WorkloadArgs::InsertRand(args) => {
+                Some(args.operation_count())
+            }
+            WorkloadArgs::LookupSeq(args) | WorkloadArgs::TableScan(args) => args.operation_count(),
+            WorkloadArgs::LookupRand(args) | WorkloadArgs::IndexScan(args) => {
+                args.read().operation_count()
+            }
+            WorkloadArgs::StmtNoop(args) | WorkloadArgs::TrxNoop(args) => {
+                Some(args.operation_count())
+            }
+            WorkloadArgs::IndexStream(args)
+            | WorkloadArgs::TableDdl(args)
+            | WorkloadArgs::IndexDdl(args) => Some(args.iterations()),
         }
     }
 }
