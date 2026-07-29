@@ -26,6 +26,8 @@ pub(crate) const BTREE_NODE_FOOTER_SIZE: usize = BLOCK_INTEGRITY_TRAILER_SIZE;
 pub(crate) const BTREE_NODE_USABLE_SIZE: usize = PAGE_SIZE - BTREE_NODE_FOOTER_SIZE;
 
 const BTREE_HINTS_MIN_KEYS: usize = BTREE_HINTS_LEN * 8;
+/// Maximum packed post-mutation occupancy eligible for layout reclamation.
+pub(crate) const BTREE_NODE_RECLAIM_TARGET_SPACE: usize = BTREE_NODE_USABLE_SIZE / 2;
 const INLINE_PREFIX_LEN: usize = 16;
 const KEY_HEAD_LEN: usize = 4;
 const BTREE_BODY_USABLE_LEN: usize = BTREE_NODE_USABLE_SIZE - mem::size_of::<BTreeHeader>();
@@ -652,7 +654,17 @@ impl BTreeNode {
             self.header_hints_enabled(),
         );
         tmp_node.extend_slots_from::<V>(self, 0, self.count());
-        debug_assert!(self.free_space_after_compaction() == tmp_node.free_space());
+        tmp_node.update_hints();
+        assert_eq!(
+            self.free_space_after_compaction(),
+            tmp_node.free_space(),
+            "B-tree self-compaction free-space invariant violated"
+        );
+        assert_eq!(
+            tmp_node.reclaimable_space(),
+            0,
+            "B-tree self-compaction left reclaimable payload bytes"
+        );
         mem::swap(self, &mut *tmp_node);
     }
 
@@ -669,10 +681,10 @@ impl BTreeNode {
         self.header.sub_count(1);
         self.header
             .sub_start_offset(mem::size_of::<BTreeSlot>() as u16);
-        // Note: we do not release payload of the deleted key, because
-        // it requires relocate payloads of other keys.
-        // But we decrease effective space so if we want more space,
-        // we know exactly how much remains after compaction.
+        // Keep physical deletion cheap: the slot bytes become contiguous free
+        // space, while the encoded payload stays in place as dead space. By
+        // subtracting the slot and payload from effective space, the removed
+        // payload contributes exactly `payload_len` to reclaimable space.
         self.header
             .sub_effective_space((payload_len + mem::size_of::<BTreeSlot>()) as u32);
     }
@@ -761,6 +773,21 @@ impl BTreeNode {
         self.count() / 2 + 1
     }
 
+    /// Return the separator index required by the current split algorithm.
+    ///
+    /// Live mutation preparation must handle fragmentation-blocked low-count
+    /// nodes before this structural boundary is reached.
+    #[inline]
+    pub(crate) fn split_separator(&self) -> usize {
+        let separator_idx = self.find_separator();
+        assert!(
+            separator_idx > 0 && separator_idx < self.count(),
+            "B-tree split separator invariant violated: separator_idx={separator_idx}, count={}",
+            self.count()
+        );
+        separator_idx
+    }
+
     /// Create a new slot with given key and value.
     #[inline]
     fn new_slot_with_value<V: BTreeValue>(&mut self, key: &[u8], value: V) -> BTreeSlot {
@@ -804,12 +831,57 @@ impl BTreeNode {
         BTreeSlot::new(k.len() as u16, self.header.end_offset(), head)
     }
 
-    /// Returns whether the node has space for the insert.
+    /// Returns whether a new entry fits in the current contiguous free region.
+    ///
+    /// This predicate is for fresh or already-packed nodes. Live mutation
+    /// paths must use [`Self::prepare_insert`] so fragmented payload space is
+    /// distinguished from true packed-capacity exhaustion.
     #[inline]
     pub(in crate::index) fn can_insert<V: BTreeValue>(&self, key: &[u8]) -> bool {
         let space_needed = self.space_needed::<V>(key);
-        // todo: compact if neccessary.
         space_needed <= self.free_space()
+    }
+
+    /// Prepare contiguous space for a live insertion.
+    ///
+    /// Fragmented nodes are rebuilt only when the packed post-insert occupancy
+    /// is at most half a page. A node that cannot provide the separator
+    /// required by the current split algorithm is rebuilt whenever packing can
+    /// satisfy the mutation, regardless of occupancy.
+    #[inline]
+    pub(crate) fn prepare_insert<V: BTreeValue>(&mut self, key: &[u8]) -> BTreePrepareInsert {
+        let required_space = self.space_needed::<V>(key);
+        if required_space <= self.free_space() {
+            return BTreePrepareInsert::Ready;
+        }
+
+        let reclaimable_bytes = self.reclaimable_space();
+        if required_space > self.free_space_after_compaction() {
+            return BTreePrepareInsert::SplitRequired { reclaimable_bytes };
+        }
+
+        let packed_post_mutation_space = self.effective_space() + required_space;
+        let separator_idx = self.find_separator();
+        let has_valid_separator = separator_idx > 0 && separator_idx < self.count();
+        if packed_post_mutation_space > BTREE_NODE_RECLAIM_TARGET_SPACE && has_valid_separator {
+            return BTreePrepareInsert::SplitRequired { reclaimable_bytes };
+        }
+
+        assert!(
+            reclaimable_bytes > 0,
+            "B-tree insertion reclamation requires dead payload bytes: required_space={required_space}, free_space={}, effective_space={}",
+            self.free_space(),
+            self.effective_space()
+        );
+        self.self_compact::<V>();
+        assert!(
+            required_space <= self.free_space(),
+            "B-tree reclaimed insertion space is insufficient: required_space={required_space}, free_space={}",
+            self.free_space()
+        );
+        BTreePrepareInsert::Reclaimed {
+            reclaimed_bytes: reclaimable_bytes,
+        }
     }
 
     /// Returns how many bytes a new key value pair is needed.
@@ -834,10 +906,22 @@ impl BTreeNode {
         BTREE_NODE_USABLE_SIZE - self.free_space()
     }
 
+    /// Returns dead payload bytes that a layout-only rebuild can reclaim.
+    #[inline]
+    pub(crate) fn reclaimable_space(&self) -> usize {
+        let used_space = self.used_space();
+        let effective_space = self.effective_space();
+        assert!(
+            used_space >= effective_space,
+            "B-tree space accounting invariant violated: used_space={used_space}, effective_space={effective_space}"
+        );
+        used_space - effective_space
+    }
+
     /// Returns free space after compaction.
     #[inline]
     pub(crate) fn free_space_after_compaction(&self) -> usize {
-        BTREE_NODE_USABLE_SIZE - self.header.effective_space() as usize
+        BTREE_NODE_USABLE_SIZE - self.effective_space()
     }
 
     /// Returns slice of slots.
@@ -1649,7 +1733,8 @@ impl BTreeNode {
     /// When merging children, there might be cases that lower fence of
     /// a child is changed(as moved to left neighbor), then we need to
     /// regenerate separator key and update it in parent node.
-    /// Returns false if there is no space to update key in-place.
+    /// Returns false when neither current contiguous space nor policy-eligible
+    /// layout reclamation can support an out-of-place replacement.
     #[inline]
     pub(crate) fn prepare_update_key<V: BTreeValue>(&mut self, idx: usize, key: &[u8]) -> bool {
         debug_assert!(idx < self.header.count() as usize);
@@ -1662,10 +1747,27 @@ impl BTreeNode {
         if kl <= slot.len() as usize {
             return true;
         }
-        if kl + V::ENCODED_LEN <= self.free_space() {
+        let required_space = kl + V::ENCODED_LEN;
+        if required_space <= self.free_space() {
             return true;
         }
-        false
+        if required_space > self.free_space_after_compaction() {
+            return false;
+        }
+
+        let old_payload_len = self.payload_len(idx, V::ENCODED_LEN);
+        let packed_post_mutation_space = self.effective_space() - old_payload_len + required_space;
+        if packed_post_mutation_space > BTREE_NODE_RECLAIM_TARGET_SPACE {
+            return false;
+        }
+
+        self.self_compact::<V>();
+        assert!(
+            required_space <= self.free_space(),
+            "B-tree reclaimed separator-update space is insufficient: required_space={required_space}, free_space={}",
+            self.free_space()
+        );
+        true
     }
 
     /// Update key in-place.
@@ -1884,6 +1986,23 @@ impl BTreeNodeBox {
 
 /// Result of searching a node: found index or insertion position.
 pub(crate) type SearchKey = StdResult<usize, usize>;
+
+/// Result of preparing a live B-tree node for an insertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BTreePrepareInsert {
+    /// The mutation already fits in contiguous free space.
+    Ready,
+    /// A layout-only rebuild reclaimed dead payload bytes.
+    Reclaimed {
+        /// Number of dead payload bytes removed by the rebuild.
+        reclaimed_bytes: usize,
+    },
+    /// Structural splitting is preferred or packed capacity is exhausted.
+    SplitRequired {
+        /// Dead payload bytes currently present in the node.
+        reclaimable_bytes: usize,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeProbe<'a> {
@@ -2149,6 +2268,26 @@ mod tests {
         QuiescentBox::new(
             FixedBufferPool::with_capacity(PoolRole::Index, 64usize * 1024 * 1024).unwrap(),
         )
+    }
+
+    fn long_test_key(id: u32, len: usize) -> Vec<u8> {
+        assert!(len >= mem::size_of::<u32>());
+        let mut key = vec![id as u8; len];
+        key[..mem::size_of::<u32>()].copy_from_slice(&id.to_be_bytes());
+        key
+    }
+
+    fn fill_long_key_node(node: &mut BTreeNode, key_len: usize) -> Vec<Vec<u8>> {
+        let mut keys = Vec::new();
+        loop {
+            let id = u32::try_from(keys.len() + 1).unwrap();
+            let key = long_test_key(id, key_len);
+            if !node.can_insert::<BTreeU64>(&key) {
+                return keys;
+            }
+            node.insert_at::<BTreeU64>(node.count(), &key, BTreeU64::from(u64::from(id)));
+            keys.push(key);
+        }
     }
 
     #[test]
@@ -2417,6 +2556,239 @@ mod tests {
             );
             assert_eq!(node.search_key(b"a"), Err(0));
         })
+    }
+
+    #[test]
+    fn test_btree_node_delete_accounts_exact_reclaimable_payload() {
+        let mut inline =
+            BTreeNodeBox::alloc(0, TrxID::new(7), &[], BTreeU64::INVALID_VALUE, &[], false);
+        inline.insert(b"a", BTreeU64::from(1));
+        inline.insert(b"b", BTreeU64::from(2));
+        assert_eq!(inline.used_space(), inline.effective_space());
+        assert_eq!(inline.reclaimable_space(), 0);
+
+        let inline_end_offset = inline.header.end_offset();
+        let inline_used_space = inline.used_space();
+        assert_eq!(
+            inline.delete(b"a", BTreeU64::from(1), true),
+            BTreeDelete::Ok
+        );
+        assert_eq!(inline.header.end_offset(), inline_end_offset);
+        assert_eq!(
+            inline.used_space(),
+            inline_used_space - mem::size_of::<BTreeSlot>()
+        );
+        assert_eq!(inline.reclaimable_space(), BTreeU64::ENCODED_LEN);
+        assert_eq!(inline.search_key(b"b"), Ok(0));
+        assert_eq!(inline.value::<BTreeU64>(0), BTreeU64::from(2));
+
+        let mut outline =
+            BTreeNodeBox::alloc(0, TrxID::new(8), &[], BTreeU64::INVALID_VALUE, &[], false);
+        let key1 = long_test_key(1, 128);
+        let key2 = long_test_key(2, 128);
+        outline.insert(&key1, BTreeU64::from(1));
+        outline.insert(&key2, BTreeU64::from(2));
+        let outline_end_offset = outline.header.end_offset();
+        assert_eq!(
+            outline.delete(&key1, BTreeU64::from(1), true),
+            BTreeDelete::Ok
+        );
+        assert_eq!(outline.header.end_offset(), outline_end_offset);
+        assert_eq!(
+            outline.reclaimable_space(),
+            key1.len() + BTreeU64::ENCODED_LEN
+        );
+        assert_eq!(outline.search_key(&key2), Ok(0));
+        assert_eq!(outline.value::<BTreeU64>(0), BTreeU64::from(2));
+    }
+
+    #[test]
+    fn test_btree_node_prepare_insert_policy_and_reclamation() {
+        let mut low_count =
+            BTreeNodeBox::alloc(0, TrxID::new(9), &[], BTreeU64::INVALID_VALUE, &[], false);
+        let keys = fill_long_key_node(&mut low_count, 4096);
+        while low_count.count() > 2 {
+            let last_idx = low_count.count() - 1;
+            low_count.delete_at(last_idx, BTreeU64::ENCODED_LEN);
+        }
+        let pending_key = long_test_key(10_000, 4096);
+        let reclaimable_bytes = low_count.reclaimable_space();
+        assert!(!low_count.can_insert::<BTreeU64>(&pending_key));
+        assert!(
+            low_count.space_needed::<BTreeU64>(&pending_key)
+                <= low_count.free_space_after_compaction()
+        );
+        assert_eq!(low_count.find_separator(), low_count.count());
+        assert_eq!(
+            low_count.prepare_insert::<BTreeU64>(&pending_key),
+            BTreePrepareInsert::Reclaimed {
+                reclaimed_bytes: reclaimable_bytes
+            }
+        );
+        assert_eq!(low_count.reclaimable_space(), 0);
+        assert!(low_count.can_insert::<BTreeU64>(&pending_key));
+        for (idx, key) in keys[..2].iter().enumerate() {
+            assert_eq!(low_count.search_key(key), Ok(idx));
+            assert_eq!(
+                low_count.value::<BTreeU64>(idx),
+                BTreeU64::from((idx + 1) as u64)
+            );
+        }
+
+        assert_eq!(
+            low_count.prepare_insert::<BTreeU64>(&pending_key),
+            BTreePrepareInsert::Ready
+        );
+
+        let mut high_occupancy =
+            BTreeNodeBox::alloc(0, TrxID::new(10), &[], BTreeU64::INVALID_VALUE, &[], false);
+        let keys = fill_long_key_node(&mut high_occupancy, 4096);
+        let pending_key = long_test_key(20_000, 4096);
+        assert_eq!(
+            high_occupancy.prepare_insert::<BTreeU64>(&pending_key),
+            BTreePrepareInsert::SplitRequired {
+                reclaimable_bytes: 0
+            }
+        );
+        let last_idx = high_occupancy.count() - 1;
+        high_occupancy.delete_at(last_idx, BTreeU64::ENCODED_LEN);
+        let reclaimable_bytes = high_occupancy.reclaimable_space();
+        assert_eq!(
+            high_occupancy.prepare_insert::<BTreeU64>(&pending_key),
+            BTreePrepareInsert::SplitRequired { reclaimable_bytes }
+        );
+        assert_eq!(high_occupancy.reclaimable_space(), reclaimable_bytes);
+        assert_eq!(high_occupancy.count(), keys.len() - 1);
+    }
+
+    #[test]
+    fn test_btree_node_reclamation_is_amortized_across_deletes() {
+        let mut node =
+            BTreeNodeBox::alloc(0, TrxID::new(10), &[], BTreeU64::INVALID_VALUE, &[], false);
+        for id in [1u32, 10_000] {
+            let key = long_test_key(id, 1000);
+            node.insert(&key, BTreeU64::from(u64::from(id)));
+        }
+
+        let mut rebuilds = 0usize;
+        let mut reclaimed_bytes = 0usize;
+        let mut deleted_payload_bytes = 0usize;
+        for id in 100u32..300 {
+            let key = long_test_key(id, 1000);
+            match node.prepare_insert::<BTreeU64>(&key) {
+                BTreePrepareInsert::Ready => (),
+                BTreePrepareInsert::Reclaimed {
+                    reclaimed_bytes: bytes,
+                } => {
+                    rebuilds += 1;
+                    reclaimed_bytes += bytes;
+                }
+                BTreePrepareInsert::SplitRequired { .. } => {
+                    panic!("low-occupancy churn should reclaim instead of split")
+                }
+            }
+            let idx = node.search_key(&key).unwrap_err();
+            node.insert_at(idx, &key, BTreeU64::from(u64::from(id)));
+            assert_eq!(
+                node.delete(&key, BTreeU64::from(u64::from(id)), true),
+                BTreeDelete::Ok
+            );
+            deleted_payload_bytes += key.len() + BTreeU64::ENCODED_LEN;
+        }
+
+        assert!(rebuilds > 0);
+        assert!(rebuilds < 200);
+        assert_eq!(
+            reclaimed_bytes + node.reclaimable_space(),
+            deleted_payload_bytes
+        );
+        assert_eq!(node.count(), 2);
+    }
+
+    #[test]
+    fn test_btree_node_reclaims_fragmented_separator_update() {
+        let mut node = BTreeNodeBox::alloc(1, TrxID::new(11), &[], BTreeU64::from(99), &[], false);
+        let keys = fill_long_key_node(&mut node, 4096);
+        assert!(keys.len() > 7);
+        while node.count() > 7 {
+            let last_idx = node.count() - 1;
+            node.delete_at(last_idx, BTreeU64::ENCODED_LEN);
+        }
+
+        let old_key = &keys[2];
+        let new_key = long_test_key(3, 5000);
+        let idx = node.search_key(old_key).unwrap();
+        let reclaimable_before = node.reclaimable_space();
+        assert!(reclaimable_before > 0);
+        assert!(!node.can_insert::<BTreeU64>(&new_key));
+        assert!(node.prepare_update_key::<BTreeU64>(idx, &new_key));
+        assert_eq!(node.reclaimable_space(), 0);
+
+        node.update_key::<BTreeU64>(idx, &new_key);
+        assert_eq!(node.key(idx), BTreeKey::from(new_key.as_slice()));
+        assert_eq!(node.value::<BTreeU64>(idx), BTreeU64::from(3));
+        assert_eq!(
+            node.reclaimable_space(),
+            old_key.len() + BTreeU64::ENCODED_LEN
+        );
+    }
+
+    #[test]
+    fn test_btree_node_self_compact_preserves_layout_state_and_hints() {
+        let lower_fence = b"tenant/0000";
+        let upper_fence = b"tenant/9999";
+        let mut node = BTreeNodeBox::alloc(
+            1,
+            TrxID::new(12),
+            lower_fence,
+            BTreeU64::from(7),
+            upper_fence,
+            true,
+        );
+        for i in 0u64..300 {
+            let key = format!("tenant/{i:04}");
+            let idx = node.count();
+            node.insert_at::<BTreeU64>(idx, key.as_bytes(), BTreeU64::from(i));
+        }
+        assert!(node.update_hints());
+        let deleted_key = b"tenant/0042";
+        assert_eq!(
+            node.update(
+                deleted_key,
+                BTreeU64::from(42),
+                BTreeU64::from(42).deleted()
+            ),
+            BTreeUpdate::Ok(BTreeU64::from(42))
+        );
+        for i in (200u64..220).rev() {
+            let key = format!("tenant/{i:04}");
+            assert_eq!(
+                node.delete(key.as_bytes(), BTreeU64::from(i), true),
+                BTreeDelete::Ok
+            );
+        }
+        assert!(node.update_hints());
+        let retained_probe_before = node.search_key(deleted_key);
+        let missing_probe_before = node.search_key(b"tenant/0210");
+        assert!(node.reclaimable_space() > 0);
+
+        node.self_compact::<BTreeU64>();
+
+        assert_eq!(node.height(), 1);
+        assert_eq!(node.ts(), TrxID::new(12));
+        assert_eq!(&node.lower_fence_key()[..], lower_fence);
+        assert_eq!(node.lower_fence_value(), BTreeU64::from(7));
+        assert_eq!(&node.upper_fence_key()[..], upper_fence);
+        assert!(node.header_hints_enabled());
+        assert_eq!(node.reclaimable_space(), 0);
+        assert_eq!(node.search_key(deleted_key), retained_probe_before);
+        assert_eq!(node.search_key(b"tenant/0210"), missing_probe_before);
+        let deleted_idx = node.search_key(deleted_key).unwrap();
+        assert_eq!(
+            node.value::<BTreeU64>(deleted_idx),
+            BTreeU64::from(42).deleted()
+        );
+        assert!(node.validate_persisted_layout::<BTreeU64>());
     }
 
     #[test]
