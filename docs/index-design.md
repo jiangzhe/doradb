@@ -38,6 +38,22 @@ This pattern appears in both indexing layers:
 This design keeps foreground writes memory-first while letting checkpoint
 publish new durable roots atomically.
 
+### Mutable B-tree deletion and layout ownership
+
+The caller that owns an index entry also owns the semantic proof that permits
+physical removal. Catalog recovery and no-transaction catalog updates require
+exact catalog ownership, transaction rollback and index GC retain their undo
+and visibility proofs, and full-scan `MemIndex` cleanup retains its captured
+root and delete-state revalidation.
+
+Once authorized, generic B-tree deletion only removes the slot and records the
+unmoved key/value payload as reclaimable bytes through effective-space
+accounting. A later generic mutation prepares node space: it either uses
+existing contiguous space, performs a layout-only rebuild when the amortized
+reclamation policy allows it, or chooses a structural split. Rebuilding
+preserves every retained value and delete bit; it never authorizes removal or
+reinterprets a delete overlay.
+
 ## 3. Document Map
 
 Use the following documents as the living source of truth:

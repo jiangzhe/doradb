@@ -337,8 +337,10 @@ impl<P: BufferPool> GenericBTree<P> {
                     return Ok(BTreeInsertMutation::Existing(old_value));
                 }
             };
-            if !node.can_insert::<V>(key) {
-                debug_assert!(node.count() > 1);
+            if matches!(
+                node.prepare_insert::<V>(key),
+                BTreePrepareInsert::SplitRequired { .. }
+            ) {
                 if p_guard.is_none() {
                     // Root is leaf and full, should split.
                     self.split_root::<V>(pool_guard, node, true, ts).await?;
@@ -478,7 +480,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let node = g.page();
             preview.nodes += 1;
             preview.total_space += BTREE_NODE_USABLE_SIZE;
-            preview.used_space += BTREE_NODE_USABLE_SIZE - node.free_space();
+            preview.used_space += node.used_space();
             preview.effective_space += node.effective_space();
         }
         Ok(preview)
@@ -633,7 +635,7 @@ impl<P: BufferPool> GenericBTree<P> {
         // Construct separator key.
         let (sep_idx, sep_key) = {
             let node = c_guard.page();
-            let sep_idx = node.find_separator();
+            let sep_idx = node.split_separator();
             (sep_idx, node.create_sep_key(sep_idx, true))
         };
         // Try to gain exclusive lock to avoid dead lock.
@@ -641,7 +643,10 @@ impl<P: BufferPool> GenericBTree<P> {
             Valid(()) => {
                 let mut p_guard = p_guard.must_exclusive();
                 // Check if parent is full, trigger top-down split of parent node.
-                if !p_guard.page().can_insert::<BTreeU64>(&sep_key) {
+                if matches!(
+                    p_guard.page_mut().prepare_insert::<BTreeU64>(&sep_key),
+                    BTreePrepareInsert::SplitRequired { .. }
+                ) {
                     let page_id = p_guard.page_id();
                     if page_id != self.root {
                         let lower_fence_key = p_guard.page().lower_fence_key();
@@ -706,15 +711,18 @@ impl<P: BufferPool> GenericBTree<P> {
         let c_lower_fence_key = c_guard.page().lower_fence_key();
         let c_optimistic_guard = c_guard.downgrade();
         let mut p_guard = p_guard.lock_exclusive_async().await.unwrap();
-        let p_node = p_guard.page();
+        let p_page_id = p_guard.page_id();
+        let p_node = p_guard.page_mut();
         match p_node.search_key(&c_lower_fence_key) {
             Ok(idx) => {
                 let page_id = p_node.value_as_page_id(idx);
                 if page_id == c_page_id {
                     // Tree structure remains the same.
                     // Check if parent is full.
-                    if !p_node.can_insert::<BTreeU64>(sep_key) {
-                        let p_page_id = p_guard.page_id();
+                    if matches!(
+                        p_node.prepare_insert::<BTreeU64>(sep_key),
+                        BTreePrepareInsert::SplitRequired { .. }
+                    ) {
                         if p_page_id != self.root {
                             // Parent is full, trigger top-down split of parent node.
                             let p_lower_fence_key = p_node.lower_fence_key();
@@ -781,17 +789,23 @@ impl<P: BufferPool> GenericBTree<P> {
                             .await
                             .unwrap();
                         let c_node = c_guard.page_mut();
-                        if c_node.can_insert::<BTreeU64>(sep_key) {
+                        if !matches!(
+                            c_node.prepare_insert::<BTreeU64>(sep_key),
+                            BTreePrepareInsert::SplitRequired { .. }
+                        ) {
                             // The node to split can insert original separator key,
                             // maybe other thread restructure this tree.
                             return Ok(BTreeSplit::Inconsistent);
                         }
                         // Now we calculate current separator key for child node.
                         debug_assert!(!c_node.is_leaf());
-                        let sep_idx = c_node.find_separator();
+                        let sep_idx = c_node.split_separator();
                         // Separator key can not be truncated because it's branch node.
                         let sep_key = c_node.create_sep_key(sep_idx, false);
-                        if !p_node.can_insert::<BTreeU64>(&sep_key) {
+                        if matches!(
+                            p_node.prepare_insert::<BTreeU64>(&sep_key),
+                            BTreePrepareInsert::SplitRequired { .. }
+                        ) {
                             // parent node is full
                             if p_page_id != self.root {
                                 // not root, split it in a single run.
@@ -805,7 +819,10 @@ impl<P: BufferPool> GenericBTree<P> {
                             // split root.
                             self.split_root::<BTreeU64>(pool_guard, p_node, false, ts)
                                 .await?;
-                            if !p_node.can_insert::<BTreeU64>(&sep_key) {
+                            if matches!(
+                                p_node.prepare_insert::<BTreeU64>(&sep_key),
+                                BTreePrepareInsert::SplitRequired { .. }
+                            ) {
                                 return Ok(BTreeSplit::Inconsistent);
                             }
                         }
@@ -834,7 +851,7 @@ impl<P: BufferPool> GenericBTree<P> {
         let ts = root.ts().max(ts);
         let height = root.height() as u16;
         let hints_enabled = root.header_hints_enabled();
-        let sep_idx = root.find_separator();
+        let sep_idx = root.split_separator();
         let lower_fence_key = root.lower_fence_key();
         let lower_fence_value = root.lower_fence_value();
         // Only truncate separator key if it's leaf.
@@ -904,7 +921,11 @@ impl<P: BufferPool> GenericBTree<P> {
         sep_key: &[u8],
         ts: TrxID,
     ) {
-        debug_assert!(c_node.find_separator() == sep_idx);
+        assert_eq!(
+            c_node.split_separator(),
+            sep_idx,
+            "B-tree child separator changed while exclusively latched"
+        );
 
         let ts = ts.max(p_node.ts()).max(c_node.ts());
         let c_height = c_node.height() as u16;
@@ -1606,9 +1627,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
             // Single-node compaction.
             if let Some(mut g) = self.coupling.node.take() {
                 let node = g.page_mut();
-                if node.used_space() != node.effective_space()
-                    && node.effective_space() < self.low_space
-                {
+                if node.reclaimable_space() != 0 && node.effective_space() < self.low_space {
                     if self.height == 0 {
                         node.self_compact::<V>();
                     } else {
@@ -1841,7 +1860,7 @@ async fn revalidate_child_separator_for_split(
     let c_guard = c_guard.lock_exclusive_async().await?;
     let c_node = c_guard.page();
     let new_sep_idx = c_node.find_separator();
-    if new_sep_idx != sep_idx {
+    if new_sep_idx != sep_idx || new_sep_idx == 0 || new_sep_idx >= c_node.count() {
         return None;
     }
     let new_sep_key = c_node.create_sep_key(new_sep_idx, true);
@@ -2835,6 +2854,79 @@ mod tests {
                     );
                 }
             }
+        })
+    }
+
+    #[test]
+    fn test_btree_low_count_delete_insert_churn_reclaims_without_split() {
+        smol::block_on(async {
+            let pool = owned_index_pool(16 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, true, TrxID::new(300))
+                .await
+                .expect("test btree construction should succeed");
+            let lower_key = wide_test_key(1);
+            let upper_key = wide_test_key(10_000);
+            assert!(
+                tree.insert(
+                    &pool_guard,
+                    &lower_key,
+                    BTreeU64::from(1),
+                    false,
+                    TrxID::new(301),
+                )
+                .await
+                .unwrap()
+                .is_ok()
+            );
+            assert!(
+                tree.insert(
+                    &pool_guard,
+                    &upper_key,
+                    BTreeU64::from(10_000),
+                    false,
+                    TrxID::new(301),
+                )
+                .await
+                .unwrap()
+                .is_ok()
+            );
+
+            let packed_stats = tree.collect_space_statistics(&pool_guard).await.unwrap();
+            assert_eq!(packed_stats.reclaimable_space(), 0);
+            for i in 100u64..200 {
+                let key = wide_test_key(i);
+                assert!(
+                    tree.insert(&pool_guard, &key, BTreeU64::from(i), false, TrxID::new(302),)
+                        .await
+                        .unwrap()
+                        .is_ok()
+                );
+                assert_eq!(
+                    tree.delete(&pool_guard, &key, BTreeU64::from(i), true, TrxID::new(303),)
+                        .await
+                        .unwrap(),
+                    BTreeDelete::Ok
+                );
+            }
+
+            assert_eq!(tree.height(), 0);
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&pool_guard, &lower_key)
+                    .await
+                    .unwrap(),
+                Some(BTreeU64::from(1))
+            );
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&pool_guard, &upper_key)
+                    .await
+                    .unwrap(),
+                Some(BTreeU64::from(10_000))
+            );
+            let stats = tree.collect_space_statistics(&pool_guard).await.unwrap();
+            assert_eq!(stats.nodes, 1);
+            assert!(stats.reclaimable_space() > 0);
+            assert!(stats.reclaimable_space() < BTREE_NODE_USABLE_SIZE);
         })
     }
 

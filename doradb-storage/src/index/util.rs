@@ -51,6 +51,21 @@ pub(crate) struct SpaceStatistics {
     pub(crate) effective_space: usize,
 }
 
+impl SpaceStatistics {
+    /// Return dead payload bytes reclaimable by node layout rebuilding.
+    #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal btree stats"))]
+    pub(crate) fn reclaimable_space(&self) -> usize {
+        assert!(
+            self.used_space >= self.effective_space,
+            "B-tree aggregate space accounting invariant violated: used_space={}, effective_space={}",
+            self.used_space,
+            self.effective_space
+        );
+        self.used_space - self.effective_space
+    }
+}
+
 pub(super) struct ParentPosition<G> {
     pub(super) g: G,
     // -1 means lower fence in btree node.
