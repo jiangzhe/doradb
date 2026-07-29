@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use doradb_storage::{Engine, EngineConfig};
     use std::fs;
     use std::path::Path;
     use std::process::{Command, Output};
@@ -37,6 +38,31 @@ mod tests {
             );
         }
         stderr
+    }
+
+    fn internal_metric(root: &Path, name: &str) -> u128 {
+        fs::read_to_string(root.join("benchmark-internal-stats.csv"))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (metric, value) = line.split_once(',')?;
+                (metric == name).then(|| value.parse().unwrap())
+            })
+            .unwrap_or_else(|| panic!("missing internal metric {name}"))
+    }
+
+    fn loaded_table_count(root: &Path) -> usize {
+        smol::block_on(async {
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root))
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_count = session.list_table_ids().unwrap().len();
+            session.close().await.unwrap();
+            engine.shutdown().unwrap();
+            table_count
+        })
     }
 
     #[test]
@@ -107,14 +133,15 @@ mod tests {
         assert_eq!(columns[1], "false");
         assert_eq!(columns[2], "false");
         assert_eq!(columns[4], "3");
-        assert_eq!(columns[5], "64");
-        assert_eq!(columns[6], "2");
-        assert_eq!(columns[8], "none");
-        assert_eq!(columns[10], "3");
-        assert_eq!(columns[13], "fsync");
-        assert_eq!(columns[15], "3");
+        assert_eq!(columns[5], "");
+        assert_eq!(columns[6], "64");
+        assert_eq!(columns[7], "2");
+        assert_eq!(columns[9], "none");
+        assert_eq!(columns[11], "3");
+        assert_eq!(columns[14], "fsync");
         assert_eq!(columns[16], "3");
-        assert_eq!(columns[23], "0");
+        assert_eq!(columns[17], "3");
+        assert_eq!(columns[24], "0");
 
         let cleanup_stdout = assert_success(run_bench(&root, &["cleanup"]));
         assert!(cleanup_stdout.contains("removed storage_root="));
@@ -241,26 +268,227 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_non_unique_index_scan() {
+    fn lifecycle_index_range_workloads_support_both_index_modes() {
+        let temp = TempDir::new().unwrap();
+        for index in ["unique", "non-unique"] {
+            let root = temp.path().join(index);
+            assert_success(run_bench(&root, &["prepare", "--index", index]));
+            assert_success(run_bench(
+                &root,
+                &["run", "insert-seq", "--num", "8", "--value-size", "16"],
+            ));
+            let manifest_before = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
+
+            let scan_stdout = assert_success(run_bench(
+                &root,
+                &[
+                    "run",
+                    "index-scan",
+                    "--num",
+                    "4",
+                    "--range",
+                    "3",
+                    "--seed",
+                    "3",
+                    "--batch-size",
+                    "2",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "2",
+                ],
+            ));
+            assert!(scan_stdout.contains("workload: index-scan"));
+            assert!(scan_stdout.contains("range: 3"));
+            assert!(scan_stdout.contains("operations: 4"));
+            assert!(scan_stdout.contains("found: 4"));
+            assert!(scan_stdout.contains("not_found: 0"));
+            assert!(scan_stdout.contains("rows_returned: 12"));
+            assert!(scan_stdout.contains("failures: 0"));
+
+            let stream_stdout = assert_success(run_bench(
+                &root,
+                &[
+                    "run",
+                    "index-stream",
+                    "--num",
+                    "4",
+                    "--range",
+                    "3",
+                    "--seed",
+                    "5",
+                    "--threads",
+                    "2",
+                    "--sessions",
+                    "2",
+                ],
+            ));
+            assert!(stream_stdout.contains("workload: index-stream"));
+            assert!(stream_stdout.contains("rand: true"));
+            assert!(stream_stdout.contains("range: 3"));
+            assert!(stream_stdout.contains("seed: 5"));
+            assert!(stream_stdout.contains("operations: 4"));
+            assert!(stream_stdout.contains("rows_returned: 12"));
+            assert_eq!(
+                fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap(),
+                manifest_before
+            );
+
+            if index == "unique" {
+                let full_stdout =
+                    assert_success(run_bench(&root, &["run", "index-scan", "--num", "1"]));
+                assert!(full_stdout.contains("range: 8"));
+                assert!(full_stdout.contains("rows_returned: 8"));
+
+                let stderr =
+                    assert_failure(run_bench(&root, &["run", "index-stream", "--range", "9"]));
+                assert!(stderr.contains("--range (9) must not exceed loaded key range length (8)"));
+            } else {
+                assert_success(run_bench(
+                    &root,
+                    &["run", "insert-rand", "--num", "8", "--seed", "9"],
+                ));
+                for workload in ["index-scan", "index-stream"] {
+                    let stdout = assert_success(run_bench(
+                        &root,
+                        &[
+                            "run", workload, "--num", "2", "--range", "3", "--seed", "11",
+                        ],
+                    ));
+                    assert!(stdout.contains("operations: 2"));
+                    assert!(stdout.contains("failures: 0"));
+                }
+            }
+
+            assert_success(run_bench(&root, &["cleanup"]));
+        }
+    }
+
+    #[test]
+    fn lifecycle_stmt_and_trx_noop() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("bench");
 
-        assert_success(run_bench(&root, &["prepare", "--index", "non-unique"]));
-        assert_success(run_bench(
-            &root,
-            &["run", "insert-seq", "--num", "4", "--value-size", "16"],
-        ));
+        assert_success(run_bench(&root, &["prepare", "--index", "none"]));
+        let manifest_before = fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap();
 
-        let scan_stdout = assert_success(run_bench(
+        let stmt_stdout = assert_success(run_bench(
             &root,
-            &["run", "index-scan", "--num", "6", "--seed", "3"],
+            &[
+                "run",
+                "stmt-noop",
+                "--num",
+                "5",
+                "--threads",
+                "2",
+                "--sessions",
+                "3",
+                "--log-sync",
+                "none",
+            ],
         ));
-        assert!(scan_stdout.contains("workload: index-scan"));
-        assert!(scan_stdout.contains("operations: 6"));
-        assert!(scan_stdout.contains("not_found: 0"));
-        assert!(scan_stdout.contains("failures: 0"));
+        assert!(stmt_stdout.contains("workload: stmt-noop"));
+        assert!(stmt_stdout.contains("operations: 5"));
+        assert!(stmt_stdout.contains("inserted_rows: 0"));
+        assert!(stmt_stdout.contains("rows_returned: 0"));
+        assert!(stmt_stdout.contains("loaded_key_range: [0, 0)"));
+        assert_eq!(
+            fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap(),
+            manifest_before
+        );
+
+        let trx_stdout = assert_success(run_bench(
+            &root,
+            &[
+                "run",
+                "trx-noop",
+                "--num",
+                "4",
+                "--threads",
+                "2",
+                "--sessions",
+                "3",
+                "--log-sync",
+                "none",
+                "--include-stats",
+            ],
+        ));
+        assert!(trx_stdout.contains("workload: trx-noop"));
+        assert!(trx_stdout.contains("operations: 4"));
+        assert_eq!(internal_metric(&root, "transaction.commit_count"), 0);
+        assert_eq!(
+            fs::read_to_string(root.join("benchmark-manifest.toml")).unwrap(),
+            manifest_before
+        );
 
         assert_success(run_bench(&root, &["cleanup"]));
+    }
+
+    #[test]
+    fn lifecycle_table_and_index_ddl_cycles() {
+        let temp = TempDir::new().unwrap();
+        let table_root = temp.path().join("table-ddl");
+
+        assert_success(run_bench(&table_root, &["prepare", "--index", "unique"]));
+        let table_manifest_before =
+            fs::read_to_string(table_root.join("benchmark-manifest.toml")).unwrap();
+        let table_stdout = assert_success(run_bench(
+            &table_root,
+            &["run", "table-ddl", "--threads", "1", "--sessions", "2"],
+        ));
+        assert!(table_stdout.contains("workload: table-ddl"));
+        assert!(table_stdout.contains("num: 1"));
+        assert!(table_stdout.contains("operations: 2"));
+        assert_eq!(loaded_table_count(&table_root), 1);
+        assert_eq!(
+            fs::read_to_string(table_root.join("benchmark-manifest.toml")).unwrap(),
+            table_manifest_before
+        );
+        assert_success(run_bench(
+            &table_root,
+            &["run", "insert-seq", "--num", "2", "--value-size", "16"],
+        ));
+        let scan_stdout = assert_success(run_bench(&table_root, &["run", "table-scan"]));
+        assert!(scan_stdout.contains("rows_returned: 2"));
+        assert_success(run_bench(&table_root, &["cleanup"]));
+
+        let index_root = temp.path().join("index-ddl");
+        assert_success(run_bench(&index_root, &["prepare", "--index", "none"]));
+        let empty_index_stdout = assert_success(run_bench(&index_root, &["run", "index-ddl"]));
+        assert!(empty_index_stdout.contains("operations: 2"));
+        assert_success(run_bench(
+            &index_root,
+            &["run", "insert-seq", "--num", "3", "--value-size", "16"],
+        ));
+        let index_manifest_before =
+            fs::read_to_string(index_root.join("benchmark-manifest.toml")).unwrap();
+        let index_stdout = assert_success(run_bench(
+            &index_root,
+            &[
+                "run",
+                "index-ddl",
+                "--num",
+                "2",
+                "--threads",
+                "2",
+                "--sessions",
+                "2",
+            ],
+        ));
+        assert!(index_stdout.contains("workload: index-ddl"));
+        assert!(index_stdout.contains("num: 2"));
+        assert!(index_stdout.contains("operations: 4"));
+        assert!(index_stdout.contains("loaded_key_range: [0, 3)"));
+        assert_eq!(
+            fs::read_to_string(index_root.join("benchmark-manifest.toml")).unwrap(),
+            index_manifest_before
+        );
+
+        let second_stdout = assert_success(run_bench(&index_root, &["run", "index-ddl"]));
+        assert!(second_stdout.contains("operations: 2"));
+        let scan_stdout = assert_success(run_bench(&index_root, &["run", "table-scan"]));
+        assert!(scan_stdout.contains("rows_returned: 3"));
+        assert_success(run_bench(&index_root, &["cleanup"]));
     }
 
     #[test]
@@ -278,7 +506,17 @@ mod tests {
         assert!(stderr.contains("lookup-seq workload requires prepared index mode unique"));
 
         let stderr = assert_failure(run_bench(&root, &["run", "index-scan", "--num", "1"]));
-        assert!(stderr.contains("index-scan workload requires prepared index mode non-unique"));
+        assert!(
+            stderr
+                .contains("index-scan workload requires prepared index mode unique or non-unique")
+        );
+
+        let stderr = assert_failure(run_bench(&root, &["run", "index-stream"]));
+        assert!(
+            stderr.contains(
+                "index-stream workload requires prepared index mode unique or non-unique"
+            )
+        );
 
         assert_success(run_bench(&root, &["cleanup"]));
     }
@@ -292,6 +530,12 @@ mod tests {
 
         let stderr = assert_failure(run_bench(&root, &["run", "lookup-seq", "--num", "1"]));
         assert!(stderr.contains("read workload requires loaded benchmark data"));
+
+        let stderr = assert_failure(run_bench(&root, &["run", "index-stream"]));
+        assert!(stderr.contains("read workload requires loaded benchmark data"));
+
+        let stderr = assert_failure(run_bench(&root, &["run", "index-ddl"]));
+        assert!(stderr.contains("index-ddl workload requires prepared index mode none"));
 
         assert_success(run_bench(&root, &["cleanup"]));
     }

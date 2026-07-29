@@ -38,7 +38,7 @@ pub(crate) const SUPER_BLOCK_ID: BlockID = BlockID::new(0);
 pub(crate) const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
-pub(crate) trait MutableCowFile {
+pub(crate) trait MutableCowFile: Send + Sync {
     /// Allocate one unpublished block id from the mutable root.
     fn allocate_block(&mut self) -> ResourceResult<BlockID>;
 

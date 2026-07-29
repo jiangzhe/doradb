@@ -38,6 +38,7 @@ pub(super) struct OutputConfig {
     pub(super) workload: Workload,
     pub(super) storage_root: PathBuf,
     pub(super) num: u64,
+    pub(super) range: Option<u64>,
     pub(super) value_size: usize,
     pub(super) batch_size: u64,
     pub(super) rand: bool,
@@ -304,6 +305,7 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         "include_stats",
         "storage_root",
         "num",
+        "range",
         "value_size",
         "batch_size",
         "seed",
@@ -330,6 +332,10 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
         config.include_stats.to_string(),
         config.storage_root.display().to_string(),
         config.num.to_string(),
+        config
+            .range
+            .map(|range| range.to_string())
+            .unwrap_or_default(),
         config.value_size.to_string(),
         config.batch_size.to_string(),
         config.seed.to_string(),
@@ -358,7 +364,7 @@ fn render_result_csv(config: &OutputConfig, result: &BenchmarkResult) -> String 
 }
 
 fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
-    vec![
+    let mut pairs = vec![
         ("workload".to_owned(), config.workload.to_string()),
         ("rand".to_owned(), config.rand.to_string()),
         ("include_stats".to_owned(), config.include_stats.to_string()),
@@ -367,6 +373,11 @@ fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
             config.storage_root.display().to_string(),
         ),
         ("num".to_owned(), config.num.to_string()),
+    ];
+    if let Some(range) = config.range {
+        pairs.push(("range".to_owned(), range.to_string()));
+    }
+    pairs.extend([
         ("value_size".to_owned(), config.value_size.to_string()),
         ("batch_size".to_owned(), config.batch_size.to_string()),
         ("seed".to_owned(), config.seed.to_string()),
@@ -379,7 +390,8 @@ fn configuration_pairs(config: &OutputConfig) -> Vec<(String, String)> {
         ("sessions".to_owned(), config.sessions.to_string()),
         ("log_sync".to_owned(), config.log_sync.to_string()),
         ("table_id".to_owned(), config.table_id.to_string()),
-    ]
+    ]);
+    pairs
 }
 
 fn push_transaction_metrics(
@@ -640,6 +652,7 @@ mod tests {
             workload: Workload::InsertSeq,
             storage_root: root.to_path_buf(),
             num: 10,
+            range: None,
             value_size: 16,
             batch_size: 1,
             rand: false,
@@ -798,6 +811,60 @@ mod tests {
         assert!(csv.lines().next().unwrap().starts_with("workload,rand"));
         assert!(csv.contains("include_stats"));
         assert!(!csv.contains("manifest_schema_version"));
+    }
+
+    #[test]
+    fn new_workload_names_and_ddl_counters_use_output_schema() {
+        let names = [
+            (Workload::StmtNoop, "stmt-noop"),
+            (Workload::TrxNoop, "trx-noop"),
+            (Workload::IndexStream, "index-stream"),
+            (Workload::TableDdl, "table-ddl"),
+            (Workload::IndexDdl, "index-ddl"),
+        ];
+        for (workload, expected) in names {
+            assert_eq!(workload.to_string(), expected);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let mut config = sample_config(temp.path());
+        config.workload = Workload::TableDdl;
+        config.num = 2;
+        config.loaded_key_end = 0;
+        let csv = render_result_csv(
+            &config,
+            &BenchmarkResult::new(4, 0, 0, 0, 0, Duration::from_nanos(100), 0),
+        );
+        let row = csv.lines().nth(1).unwrap().split(',').collect::<Vec<_>>();
+        assert_eq!(row[0], "table-ddl");
+        assert_eq!(row[4], "2");
+        assert_eq!(row[5], "");
+        assert_eq!(row[16], "4");
+        assert_eq!(&row[17..21], &["0", "0", "0", "0"]);
+        assert_eq!(row[24], "0");
+    }
+
+    #[test]
+    fn range_scan_outputs_include_resolved_range() {
+        let temp = TempDir::new().unwrap();
+        let mut config = sample_config(temp.path());
+        config.workload = Workload::IndexStream;
+        config.range = Some(3);
+        config.rand = true;
+        config.seed = 7;
+        let csv = render_result_csv(
+            &config,
+            &BenchmarkResult::new(2, 0, 0, 0, 6, Duration::from_nanos(100), 0),
+        );
+        let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
+        let row = csv.lines().nth(1).unwrap().split(',').collect::<Vec<_>>();
+        assert_eq!(header[5], "range");
+        assert_eq!(row[5], "3");
+        assert!(
+            configuration_pairs(&config)
+                .iter()
+                .any(|(name, value)| name == "range" && value == "3")
+        );
     }
 
     #[test]

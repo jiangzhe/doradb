@@ -1,181 +1,349 @@
-use crate::cli::IndexMode;
-use crate::error::{BenchError, Result};
-use crate::workload::{SessionPlan, bounded_random, seed_state, splitmix64};
+use crate::cli::{IndexMode, InsertArgs, Workload};
+use crate::error::Result;
+use crate::manifest::{KeyRange, Manifest};
+use crate::workload::util::{effective_batch_size, generate_insert_keys, generate_payload};
+use crate::workload::{CommonConfig, SessionPlan, SessionSummary, WorkloadConfig, WorkloadRunner};
+use doradb_storage::id::TableID;
+use doradb_storage::{Session, Val};
 
-const PAYLOAD_SALT: u64 = 0x4d2b_f14a_17b8_7d83;
-const RANDOM_KEY_SALT: u64 = 0xd1b5_4a32_d192_ed03;
-const UNIQUE_KEY_SALT: u64 = 0x94d0_49bb_1331_11eb;
+/// Resolved sequential-insert configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InsertSeqConfig {
+    common: CommonConfig,
+    index: IndexMode,
+    num: u64,
+    seed: u64,
+    execution_range: KeyRange,
+    output_loaded_range: KeyRange,
+}
 
-pub(super) fn generate_keys(
-    rand: bool,
+impl WorkloadConfig for InsertSeqConfig {
+    type Args = InsertArgs;
+
+    const WORKLOAD: Workload = Workload::InsertSeq;
+
+    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
+        let (common, num, seed, execution_range, output_loaded_range) =
+            resolve_insert_config(manifest, args)?;
+        manifest.validate_workload_compatible(Self::WORKLOAD)?;
+        Ok(Self {
+            common,
+            index: manifest.index,
+            num,
+            seed,
+            execution_range,
+            output_loaded_range,
+        })
+    }
+
+    fn common(&self) -> &CommonConfig {
+        &self.common
+    }
+
+    fn operation_count(&self) -> u64 {
+        self.num
+    }
+
+    fn execution_range(&self) -> KeyRange {
+        self.execution_range
+    }
+
+    fn output_loaded_range(&self) -> KeyRange {
+        self.output_loaded_range
+    }
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    fn update_manifest(&self, manifest: &mut Manifest) -> Result<bool> {
+        manifest.record_insert_success(self.num)?;
+        Ok(true)
+    }
+}
+
+/// Executes sequential-key inserts for one session.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertSeqRunner {
     index: IndexMode,
     seed: u64,
-    plan: &SessionPlan,
-) -> Result<Vec<u64>> {
-    if !rand {
-        return sequential_keys(plan);
+    value_size: usize,
+    batch_size: u64,
+    table_id: TableID,
+}
+
+impl WorkloadRunner for InsertSeqRunner {
+    type Config = InsertSeqConfig;
+
+    fn new(config: &Self::Config, table_id: TableID) -> Self {
+        Self {
+            index: config.index,
+            seed: config.seed,
+            value_size: config.common.value_size,
+            batch_size: config.common.batch_size,
+            table_id,
+        }
     }
-    match index {
-        IndexMode::None | IndexMode::NonUnique => random_keys_with_replacement(seed, plan),
-        IndexMode::Unique => unique_random_keys(seed, plan),
+
+    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+        let keys = generate_insert_keys(false, self.index, self.seed, plan)?;
+        insert_keys(
+            session,
+            self.table_id,
+            &keys,
+            self.seed,
+            self.value_size,
+            self.batch_size,
+        )
+        .await
     }
 }
 
-pub(super) fn payload_bytes(key: u64, seed: u64, value_size: usize) -> Vec<u8> {
-    let mut state = seed_state(seed, key, value_size as u64, PAYLOAD_SALT);
-    let mut payload = Vec::with_capacity(value_size);
-    while payload.len() < value_size {
-        let bytes = splitmix64(&mut state).to_le_bytes();
-        let remaining = value_size - payload.len();
-        let take = remaining.min(bytes.len());
-        payload.extend_from_slice(&bytes[..take]);
-    }
-    payload
+/// Resolved random-insert configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InsertRandConfig {
+    common: CommonConfig,
+    index: IndexMode,
+    num: u64,
+    seed: u64,
+    execution_range: KeyRange,
+    output_loaded_range: KeyRange,
 }
 
-fn sequential_keys(plan: &SessionPlan) -> Result<Vec<u64>> {
-    let rows = usize::try_from(plan.rows)
-        .map_err(|_| BenchError::message("session row count exceeds addressable memory"))?;
-    let mut keys = Vec::with_capacity(rows);
-    for offset in 0..plan.rows {
-        keys.push(
-            plan.key_start
-                .checked_add(offset)
-                .ok_or_else(|| BenchError::message("sequential key overflow"))?,
-        );
+impl WorkloadConfig for InsertRandConfig {
+    type Args = InsertArgs;
+
+    const WORKLOAD: Workload = Workload::InsertRand;
+
+    fn resolve(manifest: &Manifest, args: &Self::Args) -> Result<Self> {
+        let (common, num, seed, execution_range, output_loaded_range) =
+            resolve_insert_config(manifest, args)?;
+        manifest.validate_workload_compatible(Self::WORKLOAD)?;
+        Ok(Self {
+            common,
+            index: manifest.index,
+            num,
+            seed,
+            execution_range,
+            output_loaded_range,
+        })
     }
-    Ok(keys)
+
+    fn common(&self) -> &CommonConfig {
+        &self.common
+    }
+
+    fn operation_count(&self) -> u64 {
+        self.num
+    }
+
+    fn execution_range(&self) -> KeyRange {
+        self.execution_range
+    }
+
+    fn output_loaded_range(&self) -> KeyRange {
+        self.output_loaded_range
+    }
+
+    fn random(&self) -> bool {
+        true
+    }
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    fn update_manifest(&self, manifest: &mut Manifest) -> Result<bool> {
+        manifest.record_insert_success(self.num)?;
+        Ok(true)
+    }
 }
 
-fn random_keys_with_replacement(seed: u64, plan: &SessionPlan) -> Result<Vec<u64>> {
-    let rows = usize::try_from(plan.rows)
-        .map_err(|_| BenchError::message("session row count exceeds addressable memory"))?;
-    if rows == 0 {
-        return Ok(Vec::new());
-    }
-    let mut state = seed_state(
-        seed,
-        plan.key_start,
-        plan.session_index as u64,
-        RANDOM_KEY_SALT,
-    );
-    let mut keys = Vec::with_capacity(rows);
-    for _ in 0..plan.rows {
-        let offset = splitmix64(&mut state) % plan.rows;
-        keys.push(
-            plan.key_start
-                .checked_add(offset)
-                .ok_or_else(|| BenchError::message("random key overflow"))?,
-        );
-    }
-    Ok(keys)
+/// Executes seeded random-key inserts for one session.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertRandRunner {
+    index: IndexMode,
+    seed: u64,
+    value_size: usize,
+    batch_size: u64,
+    table_id: TableID,
 }
 
-fn unique_random_keys(seed: u64, plan: &SessionPlan) -> Result<Vec<u64>> {
-    let mut keys = sequential_keys(plan)?;
-    let mut state = seed_state(
-        seed,
-        plan.key_start,
-        plan.session_index as u64,
-        UNIQUE_KEY_SALT,
-    );
-    for idx in (1..keys.len()).rev() {
-        let swap_idx = bounded_random(&mut state, idx + 1);
-        keys.swap(idx, swap_idx);
+impl WorkloadRunner for InsertRandRunner {
+    type Config = InsertRandConfig;
+
+    fn new(config: &Self::Config, table_id: TableID) -> Self {
+        Self {
+            index: config.index,
+            seed: config.seed,
+            value_size: config.common.value_size,
+            batch_size: config.common.batch_size,
+            table_id,
+        }
     }
-    Ok(keys)
+
+    async fn run(&self, session: &mut Session, plan: &SessionPlan) -> Result<SessionSummary> {
+        let keys = generate_insert_keys(true, self.index, self.seed, plan)?;
+        insert_keys(
+            session,
+            self.table_id,
+            &keys,
+            self.seed,
+            self.value_size,
+            self.batch_size,
+        )
+        .await
+    }
+}
+
+fn resolve_insert_config(
+    manifest: &Manifest,
+    args: &InsertArgs,
+) -> Result<(CommonConfig, u64, u64, KeyRange, KeyRange)> {
+    let common_args = args.common();
+    let worker = common_args.worker();
+    let common = CommonConfig::resolve(
+        &manifest.defaults,
+        worker.thread_override(),
+        worker.session_override(),
+        common_args.value_size_override(),
+        common_args.batch_size_override(),
+        worker.log_sync(),
+        worker.include_stats(),
+    )?;
+    let num = args.operation_count();
+    let execution_range = manifest.key_range(num)?;
+    let output_loaded_range = KeyRange {
+        start: 0,
+        len: execution_range.end()?,
+    };
+    Ok((
+        common,
+        num,
+        args.seed(),
+        execution_range,
+        output_loaded_range,
+    ))
+}
+
+async fn insert_keys(
+    session: &mut Session,
+    table_id: TableID,
+    keys: &[u64],
+    seed: u64,
+    value_size: usize,
+    batch_size: u64,
+) -> Result<SessionSummary> {
+    if keys.is_empty() {
+        return Ok(SessionSummary::default());
+    }
+    let batch_size = effective_batch_size(batch_size, keys.len() as u64)?;
+    let mut inserted = 0u64;
+    for batch in keys.chunks(batch_size) {
+        insert_batch(session, table_id, batch, seed, value_size).await?;
+        inserted += batch.len() as u64;
+    }
+    Ok(SessionSummary {
+        operations: inserted,
+        inserted_rows: inserted,
+        ..SessionSummary::default()
+    })
+}
+
+async fn insert_batch(
+    session: &mut Session,
+    table_id: TableID,
+    keys: &[u64],
+    seed: u64,
+    value_size: usize,
+) -> Result<()> {
+    let mut trx = session.begin_trx()?;
+    for key in keys {
+        let payload = generate_payload(*key, seed, value_size);
+        let row = vec![Val::from(*key), Val::from(&payload[..])];
+        if let Err(err) = trx
+            .exec(async |stmt| stmt.table_insert_mvcc(table_id, row).await.map(|_| ()))
+            .await
+        {
+            trx.rollback().await?;
+            return Err(err.into());
+        }
+    }
+    trx.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use crate::cli::{Cli, Command, LogSyncMode, WorkloadArgs};
+    use crate::manifest::DefaultsManifest;
+    use clap::Parser;
 
     #[test]
-    fn random_insert_none_is_deterministic() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 10,
-            rows: 64,
+    fn insert_config_inherits_defaults_and_resolves_ranges() {
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "--root",
+            "root",
+            "run",
+            "insert-rand",
+            "--num",
+            "10",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::InsertRand(args),
+        } = cli.command
+        else {
+            panic!("expected insert-rand workload");
         };
-        let first = generate_keys(true, IndexMode::None, 42, &plan).unwrap();
-        let second = generate_keys(true, IndexMode::None, 42, &plan).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn random_insert_none_can_generate_duplicates() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 10,
-            rows: 64,
-        };
-        let keys = generate_keys(true, IndexMode::None, 2, &plan).unwrap();
-        let unique: HashSet<_> = keys.iter().copied().collect();
-        assert!(unique.len() < keys.len());
-    }
-
-    #[test]
-    fn random_insert_non_unique_can_generate_duplicates() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 10,
-            rows: 64,
-        };
-        let keys = generate_keys(true, IndexMode::NonUnique, 2, &plan).unwrap();
-        let unique: HashSet<_> = keys.iter().copied().collect();
-        assert!(unique.len() < keys.len());
-    }
-
-    #[test]
-    fn random_insert_none_rejects_key_overflow() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: u64::MAX,
-            rows: 2,
-        };
-        assert!(generate_keys(true, IndexMode::None, 0, &plan).is_err());
-    }
-
-    #[test]
-    fn random_insert_unique_is_seeded_duplicate_free_coverage() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 10,
-            rows: 64,
-        };
-        let first = generate_keys(true, IndexMode::Unique, 42, &plan).unwrap();
-        let second = generate_keys(true, IndexMode::Unique, 42, &plan).unwrap();
-        let different = generate_keys(true, IndexMode::Unique, 43, &plan).unwrap();
-        assert_eq!(first, second);
-        assert_ne!(first, different);
-
-        let unique: HashSet<_> = first.iter().copied().collect();
-        assert_eq!(unique.len(), first.len());
-        for key in 10..74 {
-            assert!(unique.contains(&key));
-        }
-    }
-
-    #[test]
-    fn sequential_insert_uses_ordered_keys() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 10,
-            rows: 4,
-        };
-        assert_eq!(
-            generate_keys(false, IndexMode::None, 42, &plan).unwrap(),
-            vec![10, 11, 12, 13]
+        let manifest = Manifest::new_with_defaults(
+            1,
+            IndexMode::Unique,
+            DefaultsManifest::new(2, 4, 256, 8).unwrap(),
         );
+        let config = InsertRandConfig::resolve(&manifest, &args).unwrap();
+
+        assert_eq!(config.common.threads, 2);
+        assert_eq!(config.common.sessions, 4);
+        assert_eq!(config.common.value_size, 256);
+        assert_eq!(config.common.batch_size, 8);
+        assert_eq!(config.common.log_sync, LogSyncMode::Fsync);
+        assert_eq!(config.execution_range, KeyRange { start: 0, len: 10 });
+        assert_eq!(config.output_loaded_range, KeyRange { start: 0, len: 10 });
+        assert!(config.random());
+        assert_eq!(config.seed(), 7);
     }
 
     #[test]
-    fn payload_generation_is_deterministic_and_sized() {
-        let first = payload_bytes(7, 11, 31);
-        let second = payload_bytes(7, 11, 31);
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 31);
-        assert_ne!(first, payload_bytes(8, 11, 31));
+    fn insert_config_updates_manifest_after_success() {
+        let cli = Cli::try_parse_from([
+            "doradb-bench",
+            "--root",
+            "root",
+            "run",
+            "insert-seq",
+            "--num",
+            "4",
+        ])
+        .unwrap();
+        let Command::Run {
+            workload: WorkloadArgs::InsertSeq(args),
+        } = cli.command
+        else {
+            panic!("expected insert-seq workload");
+        };
+        let mut manifest = Manifest::new(1, IndexMode::None);
+        manifest.record_insert_success(5).unwrap();
+        let config = InsertSeqConfig::resolve(&manifest, &args).unwrap();
+
+        assert_eq!(config.execution_range, KeyRange { start: 5, len: 4 });
+        assert_eq!(config.output_loaded_range, KeyRange { start: 0, len: 9 });
+        assert!(config.update_manifest(&mut manifest).unwrap());
+        assert_eq!(manifest.runtime.next_key, 9);
+        assert_eq!(manifest.runtime.rows_inserted, 9);
     }
 }

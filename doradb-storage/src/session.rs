@@ -1442,6 +1442,7 @@ impl TrxAttachment {
     }
 
     /// Returns the authoritative session identity for transaction lock ownership.
+    #[cfg(debug_assertions)]
     #[inline]
     pub(crate) fn session_id(&self) -> SessionID {
         self.session_id

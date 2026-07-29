@@ -169,6 +169,10 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
   `Executor::spawn`/`run`/`is_empty`, `Send` task requirements, cooperative task
   polling, and the distinction between cancelling a dropped `Task` handle and
   explicitly detaching it.
+- [D16] `docs/tasks/000244-add-rfc-0025-benchmark-workloads.md` - program
+  prerequisite benchmark workloads for statement/transaction lifecycle,
+  bounded materialized and caller-driven index scans, and successful
+  table/index DDL.
 
 ### Code References
 
@@ -211,8 +215,10 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
 - [C15] `doradb-storage/src/id.rs` - distinct `SessionID`, `TrxID`,
   `DdlOperationID`, and `MaintenanceOperationID` definitions.
 - [C16] `doradb-bench/src/runner.rs` - transaction batching, statement-per-key
-  insert and lookup paths, table/index scans, thread/session scaling, and
-  `LogSync::None` support for isolating coordinator overhead.
+  insert and lookup paths, table/index scans, isolated statement/transaction
+  lifecycle, caller-driven index streams, successful DDL cycles,
+  thread/session scaling, and `LogSync::None` support for isolating coordinator
+  overhead.
 - [C17] `doradb-storage/src/trx/undo/{index,row}.rs` and
   `doradb-storage/src/table/rollback.rs` - cancellation-safe normal rollback
   loops that keep the last undo entry buffer-owned across every await and remove
@@ -1273,6 +1279,21 @@ expansion rather than assuming approval from this RFC. [D15] [U7]
 
 ## Implementation Phases
 
+Implemented program prerequisite (2026-07-29): task
+`docs/tasks/000244-add-rfc-0025-benchmark-workloads.md` supplies the
+successful-path workload shapes before Phase 1 begins. `stmt-noop` and
+`trx-noop` provide Phase 1/2 lifecycle evidence, while bounded `index-scan` and
+`index-stream` workloads provide Phase 2's materialized and long-lived stream
+evidence over unique or non-unique indexes. `table-ddl` provides Phase 4
+evidence, and `index-ddl` provides Phase 5 evidence. Existing insert, lookup,
+and table-scan workloads remain the row/index/page-loop baselines. The
+workloads use one movable session executor, preserve the artifact and manifest
+contracts, and record the resolved logical-key range in benchmark output. This
+prerequisite does not implement or resolve a numbered phase. Long-history
+table-DDL validation found a separate physical-delete layout issue tracked by
+`docs/backlogs/000173-fix-btree-physical-deletion-layout-and-amortize-reclamation.md`;
+it does not change the successful-path baseline availability. [D16] [C16]
+
 - **Phase 1: Session Operation Coordinator Foundation**
   - Scope: Add crate-private `OperationID`, a plain session-local monotonic
     allocator in `SessionState`, `(SessionID, OperationID)` operation keys,
@@ -1301,7 +1322,8 @@ expansion rather than assuming approval from this RFC. [D15] [U7]
     Task 000243's exact-owner isolation and release-order behavior are the
     migration baseline; its typed ids, global allocator, purpose-bearing scope
     variants, and per-access maintenance identity are intentionally superseded.
-    [D4] [D13] [U3]
+    Task 000244's `stmt-noop` and `trx-noop` baselines are
+    available for paired successful-path evidence. [D4] [D13] [D16] [U3]
   - Phase-local Choices: Choose the concrete entry-state enum or
     atomic-plus-mutex layout, event epoch representation, diagnostic labels,
     exhaustion error representation, and temporary adapter between legacy
@@ -1342,6 +1364,10 @@ expansion rather than assuming approval from this RFC. [D15] [U7]
     Prove that the worker receives no statement payload or statement rollback
     phase. Preserve the hard successful `Transaction::exec` and `StreamStmt`
     cost budgets.
+  - Measurement Evidence: Compare `stmt-noop` and `trx-noop`
+    against their Phase 1 baselines, and use `index-stream` with fixed loaded
+    data and `--range` to enforce the no-per-item stream budget across unique
+    and non-unique index modes. [D16] [C16] [U5]
   - Prerequisites: Phase 1 entry/lease/claim transitions are available, and task
     000174 worker-owned terminal rollback plus task 000242 transaction-lock
     release proof remain intact. [D11] [D12]
@@ -1408,6 +1434,9 @@ expansion rather than assuming approval from this RFC. [D15] [U7]
     prevent private transaction completion from overlapping DDL scope release;
     keep successful DDL on the foreground executor; and make public observer
     Drop non-cancelling before and after every gate.
+  - Measurement Evidence: Use `table-ddl` on equivalently fresh prepared roots
+    to compare successful create/drop latency without catalog-history skew.
+    [D16] [C16] [U5]
   - Prerequisites: Phase 2 supplies nested statement/transaction cancellation
     and terminal proof composition; Phase 3 supplies mandatory future transfer.
     Existing create/drop lifecycle gates and exact DDL owner isolation remain
@@ -1435,6 +1464,9 @@ expansion rather than assuming approval from this RFC. [D15] [U7]
     than cancel at every build/publication await, prevent post-commit rollback,
     and poison safely if required root publication or installation cannot
     complete.
+  - Measurement Evidence: Use `index-ddl` on equivalently fresh
+    `index = "none"` roots, with matched empty or preloaded tables, to compare
+    successful create/drop latency. [D16] [C16] [U5]
   - Prerequisites: Phase 2 transaction proof composition, Phase 3 task transfer,
     and Phase 4's owned DDL wrapper/lock-scope pattern are available.
   - Phase-local Choices: Select shared or separate create/drop index inner
@@ -1620,6 +1652,7 @@ purpose, ownership, gate, and ordering contracts above.
 - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 - `docs/backlogs/000123-adaptive-background-worker-runtime.md`
 - `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`
+- `docs/backlogs/000173-fix-btree-physical-deletion-layout-and-amortize-reclamation.md`
 - `docs/backlogs/closed/000169-separate-session-operation-lock-scopes.md`
 - `docs/process/coding-guidance.md`
 - `docs/rfcs/0019-weak-public-runtime-handles.md`
@@ -1627,5 +1660,6 @@ purpose, ownership, gate, and ordering contracts above.
 - `docs/tasks/000174-transaction-terminal-rollback-cancellation-safety.md`
 - `docs/tasks/000242-enforce-terminal-transaction-lock-release-ordering.md`
 - `docs/tasks/000243-separate-session-operation-lock-scopes.md`
+- `docs/tasks/000244-add-rfc-0025-benchmark-workloads.md`
 - `https://docs.rs/async-executor/1.13.3/async_executor/struct.Executor.html`
 - `https://docs.rs/async-task/4.7.1/async_task/struct.Task.html`

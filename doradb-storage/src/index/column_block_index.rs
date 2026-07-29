@@ -2045,7 +2045,7 @@ impl<'a> ColumnBlockIndex<'a> {
         block_id: BlockID,
         patches: &'b [ResolvedLeafPatch],
         create_ts: TrxID,
-    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<NodeRewriteResult>> + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<NodeRewriteResult>> + Send + 'b>> {
         Box::pin(async move {
             if patches.is_empty() {
                 return Ok(NodeRewriteResult {

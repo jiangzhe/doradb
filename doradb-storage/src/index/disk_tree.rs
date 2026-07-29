@@ -322,12 +322,12 @@ pub(crate) struct DiskTreeOperation {
 /// branches contain child block ids, and blocks are validated as `BTreeNode`
 /// images. This trait defines the leaf value type and how logical entries are
 /// interpreted for each durable secondary-index contract.
-pub(crate) trait DiskTreeSpec: Copy + 'static {
+pub(crate) trait DiskTreeSpec: Copy + Send + Sync + 'static {
     /// Value encoded in leaf slots.
     ///
     /// Unique trees use `BTreeU64` row-id owners. Non-unique trees use
     /// zero-width `BTreeNil` because the row id is part of the exact key.
-    type LeafValue: BTreeValue;
+    type LeafValue: BTreeValue + Send;
 
     /// Validate a full persisted block before publishing a readonly guard.
     fn validate_persisted_block(
@@ -804,7 +804,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &'b mut M,
         operations: &'b [DiskTreeOperation],
         create_ts: TrxID,
-    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BlockID>> + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BlockID>> + Send + 'b>> {
         Box::pin(async move {
             if operations.is_empty() {
                 // An empty companion batch should preserve the exact root block.
@@ -848,7 +848,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         operations: &'b [DiskTreeOperation],
         create_ts: TrxID,
         range_upper_fence: Option<&'b [u8]>,
-    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<NodeRewriteResult>> + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<NodeRewriteResult>> + Send + 'b>> {
         Box::pin(async move {
             let guard = self.read_node(block_id).await?;
             let node = guard.node();
@@ -1020,7 +1020,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &'b mut M,
         mut entry: RewriteEntry,
         create_ts: TrxID,
-    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BlockID>> + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BlockID>> + Send + 'b>> {
         Box::pin(async move {
             loop {
                 if entry.height() == 0 {
@@ -1356,7 +1356,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &'b mut M,
         entry: RewriteEntry,
         create_ts: TrxID,
-    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BranchEntry>> + 'b>> {
+    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BranchEntry>> + Send + 'b>> {
         Box::pin(async move {
             let mut allocations = RewriteAllocationGuard::new(mutable_file);
             let entry = self
@@ -1372,7 +1372,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         allocations: &'b mut RewriteAllocationGuard<'m, M>,
         entry: RewriteEntry,
         create_ts: TrxID,
-    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BranchEntry>> + 'b>>
+    ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<BranchEntry>> + Send + 'b>>
     where
         'm: 'b,
     {
