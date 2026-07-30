@@ -9344,7 +9344,11 @@ mod tests {
                     .as_ref()
                     .is_err_and(|err| *err.current_context() == FatalError::RollbackAccess)
             );
-            assert!(!session.in_trx().unwrap());
+            assert!(
+                session.in_trx().unwrap(),
+                "failed-retained operation must remain attached to the session"
+            );
+            remove_session_for_test(&engine.inner().session_registry, session.id());
         });
     }
 

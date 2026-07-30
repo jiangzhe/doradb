@@ -1440,10 +1440,12 @@ impl TransactionSystem {
             .await
         {
             drop(table_cache);
-            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
-            self.retain_fatal_rollback(retention);
+            // Publish the irreversible blocker before session rollback can
+            // detach this operation from the registry.
             entry.fail_retained();
             attachment.notify_operation_transition();
+            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
+            self.retain_fatal_rollback(retention);
             let report = err
                 .change_context(FatalError::RollbackAccess)
                 .attach(format!("{operation}: index undo rollback failed"));
@@ -1460,10 +1462,12 @@ impl TransactionSystem {
             .await
         {
             drop(table_cache);
-            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
-            self.retain_fatal_rollback(retention);
+            // Publish the irreversible blocker before session rollback can
+            // detach this operation from the registry.
             entry.fail_retained();
             attachment.notify_operation_transition();
+            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
+            self.retain_fatal_rollback(retention);
             let report = err
                 .change_context(FatalError::RollbackAccess)
                 .attach(format!("{operation}: row undo rollback failed"));

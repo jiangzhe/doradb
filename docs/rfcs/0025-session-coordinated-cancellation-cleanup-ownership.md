@@ -289,7 +289,7 @@ actor, a second physical worker, or a physical lock-manager redesign. [D1]
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000170-session-coordinated-cancellation-cleanup.md`
+- [B1] `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
 - [B2] `docs/backlogs/000124-statement-execution-cancellation-safety.md`
 - [B3] `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 - [B4] `docs/backlogs/000123-adaptive-background-worker-runtime.md`
@@ -1368,23 +1368,30 @@ it does not change the successful-path baseline availability. [D16] [C16]
     variants, and per-access maintenance identity are intentionally superseded.
     Task 000244's `stmt-noop` and `trx-noop` baselines are
     available for paired successful-path evidence. [D4] [D13] [D16] [U3]
-  - Phase-local Choices: Choose the concrete entry-state enum or
-    atomic-plus-mutex layout, diagnostic labels, exhaustion error
-    representation, and temporary adapter between legacy transaction messages
-    and session-operation messages. The operation counter remains a plain
-    session-local value under the lifecycle mutex, shutdown observation uses a
-    lazy session-local event rather than a registry epoch, and operation purpose
-    must not be recovered from the numeric id. Cold payload layout must not
-    enlarge transaction checkout to a future or largest operation variant.
+  - Phase-local Choices: Resolved as one compact
+    `SessionOperationEntryInner` mutex containing the explicit ownership state,
+    optional current `TrxID`, movable `TrxInner`, cleanup intent, and
+    outer-foreground authority. Immutable key and kind remain outside that
+    mutex. The plain session-local operation counter asserts on exhaustion.
+    Registry resolution
+    uses only `SessionOperationKey`; stale transaction identity is validated at
+    the entry mutation/claim boundary. `SessionLifecycle` lazily stores
+    `Option<Arc<EventNotifyOnDrop>>`, creates listeners only for close or the
+    first shutdown blocker, and transitions notify after releasing state locks.
+    The existing cleanup channel carries operation-keyed transaction jobs while
+    retaining the sequential worker and mandatory terminal/failed-precommit
+    variants. Operation purpose is never recovered from the numeric id, and no
+    cold future payload enlarges transaction checkout.
   - Non-goals: Do not add statement cancellation settlement, the cooperative
     executor, or DDL/maintenance task transfer in this phase. Do not change the
     physical lock manager or add a physical worker.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000246-session-operation-coordinator-foundation.md`
+  - Task Issue: `#914`
+  - Phase Status: done
+  - Implementation Summary: Implemented the stable session-operation coordinator, session-local operation identities, unified DDL and maintenance lock scopes, key-only cleanup resolution, and lazy first-blocker close and shutdown notification; preserved sequential cleanup and successful-path budgets, with paired benchmarks showing no regression. [Task Resolve Sync: docs/tasks/000246-session-operation-coordinator-foundation.md @ 2026-07-30]
   - Related Backlogs:
-    - `docs/backlogs/000170-session-coordinated-cancellation-cleanup.md`
+    - `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
+    - `docs/backlogs/000174-atomic-index-metadata-publication-and-panic-safe-shutdown.md`
 
 - **Phase 2: Statement And Public Transaction Cancellation Ownership**
   - Scope: Arm `Transaction::exec` after checkout with a cancellation guard that
@@ -1692,7 +1699,7 @@ purpose, ownership, gate, and ordering contracts above.
 
 ## References
 
-- `docs/backlogs/000170-session-coordinated-cancellation-cleanup.md`
+- `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
 - `docs/backlogs/000124-statement-execution-cancellation-safety.md`
 - `docs/backlogs/000171-exact-family-lock-system-redesign.md`
 - `docs/backlogs/000123-adaptive-background-worker-runtime.md`

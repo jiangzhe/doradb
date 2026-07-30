@@ -1,7 +1,7 @@
 ---
 id: 000246
 title: Session Operation Coordinator Foundation
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-07-29
 github_issue: 914
 ---
@@ -67,7 +67,7 @@ RFC Relationship:
 
 Source Backlogs:
 
-- `docs/backlogs/000170-session-coordinated-cancellation-cleanup.md`
+- `docs/backlogs/closed/000170-session-coordinated-cancellation-cleanup.md`
 
 Prerequisites:
 
@@ -739,6 +739,92 @@ ad hoc test timeout framework.
 
 ## Implementation Notes
 
+- Replaced the transaction-only session lifecycle with one stable
+  `SessionOperationEntry` per effectful public operation. `SessionLifecycle`
+  now keeps disposition, one idle/active/closed slot, a plain session-local
+  operation-id counter, and an optional change event under one short mutex.
+  `OperationID` is crate-private and meaningful only in
+  `SessionOperationKey(SessionID, OperationID)`; exhaustion asserts instead of
+  wrapping or adding a public error.
+- Generalized transaction ownership directly in the stable entry without an
+  outer wrapper. Public transactions and inherited DDL/maintenance private
+  transactions use `SessionOperationCheckout` and
+  `SessionOperationCompletionClaim`; the registry resolves only the stable
+  operation key, while the entry atomically validates the current `TrxID` and
+  ownership state. Stale and duplicate cleanup hints remain neutral even when
+  one outer operation hosts sequential private transactions.
+- Unified DDL and maintenance lock identity as
+  `LockScope::Operation(OperationID)`. Typed operation capabilities preserve
+  DDL-specific policy, equal raw ids remain isolated by `LockFamily(SessionID)`,
+  and maintenance retries reuse the enclosing operation owner.
+- Replaced the registry-wide notifier with an on-demand session-local
+  `EventNotifyOnDrop`. Explicit close and blocking shutdown arm or reuse the
+  first blocking session's listener before releasing the predicate;
+  transitions notify only when that session is observed. Ordinary statement
+  checkout/checkin and unobserved commit/rollback perform no event allocation,
+  atomic update, or wake. Shutdown scans lazily and stops at the first blocker.
+- Preserved worker-owned terminal rollback, abandoned cleanup, failed
+  precommit rollback, lock-release proofs, and fatal retention. Review
+  strengthened failed-precommit cleanup with an explicit
+  `FailedPrecommitRollbackOutcome`, retained all older payloads after rollback
+  access failure, preserved the initiating poison error, and published
+  `FailedRetained` before fatal rollback can detach the session entry.
+- Review-driven refinements renamed the operation authority and transaction
+  boundaries for intent (`SessionOperationCheckout`, `begin_private_trx`, and
+  `begin_public_trx`), moved terminal finalization and listener construction to
+  `SessionLifecycle`, removed unused registry/session transaction inspection
+  APIs, simplified registry finalization/removal results, and documented the
+  deliberate exhaustive abandonment match and retry races.
+- Updated transaction, lock, engine-lifetime, public-error, unsafe-baseline,
+  and RFC documentation to match the implemented identity, ownership, wake,
+  and shutdown contracts. Investigation during stress validation found an
+  orthogonal metadata-publication race and panic-unsafe component shutdown;
+  both remain deferred together in
+  `docs/backlogs/000174-atomic-index-metadata-publication-and-panic-safe-shutdown.md`.
+- Optimized paired measurements used `origin/main@e60046e` as baseline and
+  `session-op-coord@ada83c1` plus the reviewed working-tree fixes as candidate.
+  Every cell used a fresh empty `index = "none"` root, `--log-sync none`, one
+  unrecorded warm-up, seven recorded runs, and alternating baseline/candidate
+  order on the same host.
+
+  | Cell | Revision | Recorded elapsed samples (ms) |
+  | --- | --- | --- |
+  | `stmt-noop`, 1 thread / 1 session, 1,000,000 ops | baseline | 97.085, 86.600, 85.432, 85.771, 85.699, 86.741, 86.367 |
+  | `stmt-noop`, 1 thread / 1 session, 1,000,000 ops | candidate | 84.076, 83.375, 84.317, 86.895, 84.962, 84.906, 84.895 |
+  | `stmt-noop`, 4 threads / 16 sessions, 1,000,000 ops | baseline | 122.012, 123.688, 122.011, 120.229, 120.287, 123.754, 121.691 |
+  | `stmt-noop`, 4 threads / 16 sessions, 1,000,000 ops | candidate | 97.659, 120.461, 99.063, 98.827, 96.892, 110.163, 98.481 |
+  | `trx-noop`, 1 thread / 1 session, 100,000 ops | baseline | 36.081, 38.700, 40.199, 29.981, 38.819, 35.108, 38.833 |
+  | `trx-noop`, 1 thread / 1 session, 100,000 ops | candidate | 35.713, 35.182, 35.890, 36.994, 35.367, 37.328, 37.817 |
+  | `trx-noop`, 4 threads / 16 sessions, 100,000 ops | baseline | 44.451, 47.478, 47.069, 46.143, 44.510, 42.016, 45.211 |
+  | `trx-noop`, 4 threads / 16 sessions, 100,000 ops | candidate | 38.310, 39.310, 39.939, 38.658, 37.225, 40.223, 36.375 |
+
+  | Cell | Revision | Median elapsed / IQR (ms) | Median throughput (ops/s) | Median latency / IQR (ns/op) | Candidate delta |
+  | --- | --- | ---: | ---: | ---: | ---: |
+  | `stmt-noop`, 1 / 1 | baseline | 86.367 / 1.042 | 11,578,449 | 86.367 / 1.042 | - |
+  | `stmt-noop`, 1 / 1 | candidate | 84.895 / 0.887 | 11,779,196 | 84.895 / 0.886 | +1.73% throughput, -1.70% latency |
+  | `stmt-noop`, 4 / 16 | baseline | 122.011 / 3.401 | 8,195,988 | 122.011 / 3.401 | - |
+  | `stmt-noop`, 4 / 16 | candidate | 98.827 / 12.504 | 10,118,668 | 98.827 / 12.504 | +23.46% throughput, -19.00% latency |
+  | `trx-noop`, 1 / 1 | baseline | 38.700 / 3.724 | 2,583,966 | 387.002 / 37.244 | - |
+  | `trx-noop`, 1 / 1 | candidate | 35.890 / 1.961 | 2,786,325 | 358.896 / 19.614 | +7.83% throughput, -7.26% latency |
+  | `trx-noop`, 4 / 16 | baseline | 45.211 / 2.618 | 2,211,868 | 452.107 / 26.180 | - |
+  | `trx-noop`, 4 / 16 | candidate | 38.658 / 2.713 | 2,586,757 | 386.584 / 27.133 | +16.95% throughput, -14.49% latency |
+
+  No cell shows a repeatable regression outside baseline dispersion. The
+  statement result preserves the checkout/checkin budget, and the transaction
+  result confirms that lazy notification did not move equivalent shared
+  traffic elsewhere.
+- Validation passed:
+  - `tools/style_audit.rs --diff-base origin/main` (18 Rust files, including
+    formatting and strict workspace Clippy);
+  - focused session-operation, terminal rollback, shutdown-wait, stale
+    transaction identity, failed-precommit retention, and fatal rollback
+    publication regressions;
+  - 100/100 stress iterations of failed-precommit rollback-access retention;
+  - `rtk cargo nextest run --workspace` (1,594 tests);
+  - `rtk cargo nextest run -p doradb-storage --no-default-features --features libaio`
+    (1,501 tests); and
+  - `rtk git diff --check`.
+
 ## Impacts
 
 - `doradb-storage/src/id.rs`
@@ -888,3 +974,8 @@ task dispatch. Phases 4 through 6 own production whole-future transfer and
 operation-specific irreversible-gate migration. Phase 7 owns final failure,
 shutdown, diagnostics, and readiness consolidation. Backlog 000171 remains
 responsible for physical lock-family ownership and `LockScopeState`.
+
+The metadata-history/runtime-layout publication race and panic-unsafe partial
+component shutdown found during task stress validation are intentionally
+deferred to
+`docs/backlogs/000174-atomic-index-metadata-publication-and-panic-safe-shutdown.md`.
