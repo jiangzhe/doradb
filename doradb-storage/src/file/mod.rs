@@ -25,9 +25,7 @@ use crate::io::{
 };
 use error_stack::Report;
 use libc::{O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fstat, ftruncate, open, stat};
-use parking_lot::RawMutex;
-use parking_lot::lock_api::RawMutex as RawMutexAPI;
-use scopeguard::defer;
+use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
@@ -96,8 +94,8 @@ pub(crate) struct SparseFile {
     fd: RawFd,
     offset: AtomicUsize,
     max_len: AtomicUsize,
-    // protect file size change only.
-    size_lock: RawMutex,
+    // Protect file-size changes only.
+    size_lock: Mutex<()>,
 }
 
 impl AsRawFd for SparseFile {
@@ -159,7 +157,7 @@ impl SparseFile {
             fd,
             offset: AtomicUsize::new(offset),
             max_len: AtomicUsize::new(max_len),
-            size_lock: RawMutex::INIT,
+            size_lock: Mutex::new(()),
         }
     }
 
@@ -203,12 +201,7 @@ impl SparseFile {
         expect(dead_code, reason = "pending dead-code audit")
     )]
     pub(crate) fn extend_to(&self, max_len: usize) -> IoResult<()> {
-        self.size_lock.lock();
-        defer! {
-            // SAFETY: this path holds `size_lock`, so the matching unlock is
-            // paired with the successful lock above.
-            unsafe { self.size_lock.unlock(); }
-        }
+        let _size_guard = self.size_lock.lock();
         let curr_len = self.max_len.load(Ordering::Acquire);
         if max_len <= curr_len {
             return Ok(());

@@ -2,12 +2,16 @@
 ---
 [package]
 edition = "2024"
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit"] }
 ---
 
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use syn::visit::{self, Visit};
 
 const MODULES: [&str; 10] = [
     "buffer", "latch", "row", "index", "io", "trx", "lwc", "file", "log", "recovery",
@@ -35,6 +39,55 @@ struct ModuleMetrics {
     new_unchecked_count: usize,
     assume_init_count: usize,
     safety_comment_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct UnsafeCounter {
+    count: usize,
+}
+
+impl<'ast> Visit<'ast> for UnsafeCounter {
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if attr.path().is_ident("unsafe") {
+            self.count += 1;
+        }
+        visit::visit_attribute(self, attr);
+    }
+
+    fn visit_expr_unsafe(&mut self, expr: &'ast syn::ExprUnsafe) {
+        self.count += 1;
+        visit::visit_expr_unsafe(self, expr);
+    }
+
+    fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
+        self.count += usize::from(item.unsafety.is_some());
+        visit::visit_item_foreign_mod(self, item);
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        self.count += usize::from(item.unsafety.is_some());
+        visit::visit_item_impl(self, item);
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        self.count += usize::from(item.unsafety.is_some());
+        visit::visit_item_mod(self, item);
+    }
+
+    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+        self.count += usize::from(item.unsafety.is_some());
+        visit::visit_item_trait(self, item);
+    }
+
+    fn visit_signature(&mut self, signature: &'ast syn::Signature) {
+        self.count += usize::from(signature.unsafety.is_some());
+        visit::visit_signature(self, signature);
+    }
+
+    fn visit_type_bare_fn(&mut self, bare_fn: &'ast syn::TypeBareFn) {
+        self.count += usize::from(bare_fn.unsafety.is_some());
+        visit::visit_type_bare_fn(self, bare_fn);
+    }
 }
 
 fn usage() -> &'static str {
@@ -98,10 +151,11 @@ fn run() -> Result<(), String> {
             let content = fs::read_to_string(&file)
                 .map_err(|e| format!("failed to read {}: {e}", file.display()))?;
             let rel_path = normalize_path(&file);
+            let unsafe_count = count_unsafe_constructs(&file, &content)?;
             let row = FileMetrics {
                 path: rel_path,
                 module: module.to_string(),
-                unsafe_count: count_word(&content, "unsafe"),
+                unsafe_count,
                 transmute_count: count_substring(&content, "transmute"),
                 new_unchecked_count: count_substring(&content, "new_unchecked"),
                 assume_init_count: count_substring(&content, "assume_init"),
@@ -157,6 +211,14 @@ fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn count_unsafe_constructs(path: &Path, input: &str) -> Result<usize, String> {
+    let file =
+        syn::parse_file(input).map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    let mut counter = UnsafeCounter::default();
+    counter.visit_file(&file);
+    Ok(counter.count)
+}
+
 fn count_substring(input: &str, needle: &str) -> usize {
     if needle.is_empty() {
         return 0;
@@ -166,34 +228,6 @@ fn count_substring(input: &str, needle: &str) -> usize {
     while let Some(pos) = input[start..].find(needle) {
         count += 1;
         start += pos + needle.len();
-    }
-    count
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-fn count_word(input: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
-    }
-    let bytes = input.as_bytes();
-    let nbytes = needle.as_bytes();
-    if bytes.len() < nbytes.len() {
-        return 0;
-    }
-    let mut count = 0usize;
-    for i in 0..=bytes.len() - nbytes.len() {
-        if &bytes[i..i + nbytes.len()] != nbytes {
-            continue;
-        }
-        let left_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
-        let right_pos = i + nbytes.len();
-        let right_ok = right_pos == bytes.len() || !is_ident_byte(bytes[right_pos]);
-        if left_ok && right_ok {
-            count += 1;
-        }
     }
     count
 }
@@ -281,4 +315,64 @@ fn render_markdown(module_rows: &[ModuleMetrics], file_rows: &[FileMetrics], top
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_unsafe_syntax_constructs() {
+        let source = r#"
+            #[unsafe(no_mangle)]
+            unsafe fn top_level(callback: unsafe fn()) {
+                unsafe {
+                    unsafe {}
+                }
+            }
+
+            unsafe trait Dangerous {
+                unsafe fn run(&self);
+            }
+
+            struct Worker;
+
+            unsafe impl Dangerous for Worker {
+                unsafe fn run(&self) {}
+            }
+
+            unsafe extern "C" {
+                fn foreign();
+            }
+
+            unsafe mod hazardous {}
+        "#;
+
+        let count = count_unsafe_constructs(Path::new("sample.rs"), source).unwrap();
+        assert_eq!(count, 11);
+    }
+
+    #[test]
+    fn ignores_unsafe_text_and_unexpanded_macro_tokens() {
+        let source = r#"
+            /// Calling this API is unsafe when its contract is violated.
+            fn safe_function() {
+                // unsafe is only prose here.
+                let unsafe_count = "unsafe";
+                stringify!(unsafe);
+                assert_eq!(unsafe_count, "unsafe");
+            }
+        "#;
+
+        let count = count_unsafe_constructs(Path::new("sample.rs"), source).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn parse_errors_include_the_source_path() {
+        let err = count_unsafe_constructs(Path::new("broken/sample.rs"), "unsafe fn")
+            .expect_err("invalid Rust should fail parsing");
+        assert!(err.contains("broken/sample.rs"));
+        assert!(err.contains("failed to parse"));
+    }
 }

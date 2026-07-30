@@ -12,12 +12,12 @@
 | row | 3 | 6 | 0 | 0 | 0 | 6 |
 | index | 21 | 13 | 0 | 0 | 3 | 7 |
 | io | 7 | 21 | 0 | 0 | 1 | 18 |
-| trx | 14 | 6 | 0 | 0 | 0 | 4 |
+| trx | 14 | 4 | 0 | 0 | 0 | 4 |
 | lwc | 2 | 4 | 0 | 0 | 0 | 3 |
-| file | 8 | 12 | 0 | 0 | 2 | 12 |
+| file | 8 | 11 | 0 | 0 | 2 | 11 |
 | log | 6 | 0 | 0 | 0 | 0 | 0 |
 | recovery | 5 | 0 | 0 | 0 | 0 | 0 |
-| **total** | **83** | **153** | **0** | **0** | **6** | **131** |
+| **total** | **83** | **150** | **0** | **0** | **6** | **130** |
 
 ## File Hotspots (top 40)
 
@@ -30,7 +30,7 @@
 | `doradb-storage/src/buffer/evict.rs` | buffer | 9 | 9 |
 | `doradb-storage/src/io/libaio_backend.rs` | io | 8 | 8 |
 | `doradb-storage/src/buffer/arena.rs` | buffer | 7 | 7 |
-| `doradb-storage/src/file/mod.rs` | file | 7 | 7 |
+| `doradb-storage/src/file/mod.rs` | file | 6 | 6 |
 | `doradb-storage/src/index/btree/hint.rs` | index | 6 | 0 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 6 | 6 |
 | `doradb-storage/src/row/mod.rs` | row | 6 | 6 |
@@ -47,7 +47,6 @@
 | `doradb-storage/src/index/btree/node.rs` | index | 2 | 2 |
 | `doradb-storage/src/io/iouring_backend.rs` | io | 2 | 2 |
 | `doradb-storage/src/io/libaio_abi.rs` | io | 2 | 1 |
-| `doradb-storage/src/trx/mod.rs` | trx | 2 | 0 |
 | `doradb-storage/src/index/column_block_index.rs` | index | 1 | 1 |
 | `doradb-storage/src/index/row_page_index.rs` | index | 1 | 1 |
 
