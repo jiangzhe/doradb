@@ -1195,6 +1195,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
             let (mut trx, _session_state) = test_trx(&engine, TrxID::new(52));
+            let session_id = trx.operation_key.session_id();
             let trx_owner = trx_lock_owner(&mut trx).unwrap();
             try_acquire_transaction_lock(
                 &mut trx,
@@ -1261,6 +1262,7 @@ pub(crate) mod tests {
 
             let err = trx.commit().await.unwrap_err();
             assert!(err.report().downcast_ref::<InternalError>().is_none());
+            session_tests::remove_session_for_test(&engine.inner().session_registry, session_id);
         });
     }
 }

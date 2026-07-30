@@ -204,6 +204,8 @@ pub(crate) enum LifecycleError {
     SessionUnavailable,
     #[error("existing transaction")]
     ExistingTransaction,
+    #[error("existing session operation")]
+    ExistingOperation,
     #[error("transaction is discarded")]
     TransactionDiscarded,
 }

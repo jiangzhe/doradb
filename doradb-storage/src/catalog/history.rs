@@ -595,6 +595,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::id::TableID;
+    use crate::session::tests::active_operation_count;
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine};
     use crate::trx::MAX_SNAPSHOT_TS;
     use tempfile::TempDir;
@@ -1055,10 +1056,7 @@ mod tests {
                 Some(0)
             );
             assert_eq!(
-                recovered
-                    .inner()
-                    .session_registry
-                    .active_transaction_count(),
+                active_operation_count(&recovered.inner().session_registry),
                 0
             );
         });

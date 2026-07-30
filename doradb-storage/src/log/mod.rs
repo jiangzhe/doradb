@@ -949,8 +949,16 @@ impl SyncGroup {
         bufs
     }
 
+    /// Transfers failed precommit payloads to mandatory rollback ownership.
+    ///
+    /// The cleanup worker completes the shared waiter only after rollback or
+    /// fatal retention has settled every transaction in the group.
     #[inline]
-    fn fail_waiters(&mut self, trx_sys: &TransactionSystem, reason: FailedPrecommitReason) {
+    fn handoff_failed_precommit(
+        &mut self,
+        trx_sys: &TransactionSystem,
+        reason: FailedPrecommitReason,
+    ) {
         if self.trx_list.is_empty() {
             self.failure_reason.get_or_insert(reason);
             return;
@@ -1119,7 +1127,7 @@ where
 
     #[inline]
     fn fail_sync_group(&self, sync_group: &mut SyncGroup, reason: FailedPrecommitReason) {
-        sync_group.fail_waiters(self.trx_sys, reason);
+        sync_group.handoff_failed_precommit(self.trx_sys, reason);
         self.recycle_bufs(sync_group.drain_buffers());
     }
 
@@ -1174,7 +1182,7 @@ where
                     }
                 }
                 LogPrefixKind::Group { group } => {
-                    group.fail_waiters(self.trx_sys, reason.clone());
+                    group.handoff_failed_precommit(self.trx_sys, reason.clone());
                     recycle.extend(group.drain_buffers());
                     group.failure_reason.get_or_insert_with(|| reason.clone());
                 }
@@ -1486,7 +1494,7 @@ where
             // already complete.
             for entry in &mut self.prefix.entries {
                 if let LogPrefixKind::Group { group } = &mut entry.kind {
-                    group.fail_waiters(self.trx_sys, reason.clone());
+                    group.handoff_failed_precommit(self.trx_sys, reason.clone());
                     group.failure_reason.get_or_insert_with(|| reason.clone());
                 }
             }
@@ -2228,11 +2236,11 @@ fn fail_ready_prefix_waiters(
     recycle: &mut Vec<DirectBuf>,
 ) {
     for sync_group in &mut ready.written {
-        sync_group.fail_waiters(trx_sys, reason.clone());
+        sync_group.handoff_failed_precommit(trx_sys, reason.clone());
         recycle.extend(sync_group.drain_buffers());
     }
     for sync_group in &mut ready.failed {
-        sync_group.fail_waiters(trx_sys, reason.clone());
+        sync_group.handoff_failed_precommit(trx_sys, reason.clone());
         recycle.extend(sync_group.drain_buffers());
     }
 }
@@ -2453,7 +2461,7 @@ mod tests {
     use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner};
     use crate::session::tests::SessionTestExt;
     use crate::trx::MAX_SNAPSHOT_TS;
-    use crate::trx::sys::TrxCleanupMessage;
+    use crate::trx::sys::SessionOperationCleanupMessage;
     use crate::trx::sys::tests::manual_log_processor_transaction_system;
     use crate::value::Val;
     use event_listener::Event;
@@ -3020,7 +3028,7 @@ mod tests {
         trx_sys: TransactionSystem,
         poisoner: QuiescentGuard<EnginePoisoner>,
         _purge_rx: flume::Receiver<Purge>,
-        cleanup_rx: flume::Receiver<TrxCleanupMessage>,
+        cleanup_rx: flume::Receiver<SessionOperationCleanupMessage>,
     }
 
     fn manual_log_processor_harness(
@@ -3836,7 +3844,7 @@ mod tests {
             );
             assert!(matches!(
                 harness.cleanup_rx.try_recv().unwrap(),
-                TrxCleanupMessage::FailedPrecommit(_)
+                SessionOperationCleanupMessage::FailedPrecommit(_)
             ));
 
             drop(harness);

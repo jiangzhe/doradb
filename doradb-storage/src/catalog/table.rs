@@ -16,7 +16,7 @@ use crate::obs;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
-use crate::session::{SessionDdlContext, SessionPin};
+use crate::session::{SessionDdlContext, SessionOperationPin};
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::Transaction;
 use crate::value::{Val, ValKind, ValType};
@@ -1133,7 +1133,7 @@ impl Deser for TableBriefMetadata {
 
 /// Create a new user table for a session-level DDL request.
 pub(crate) async fn create_table_for_session(
-    session: SessionPin,
+    session: SessionOperationPin,
     table_spec: super::TableSpec,
     index_specs: Vec<IndexSpec>,
 ) -> Result<TableID> {
@@ -1195,7 +1195,7 @@ pub(crate) async fn create_table_for_session(
     }
 
     let mut progress = CreateTableProgress::new(table_id, uninit_table_file);
-    let mut trx = match session.begin_trx().attach("operation=create_table") {
+    let mut trx = match session.begin_private_trx().attach("operation=create_table") {
         Ok(trx) => trx,
         Err(err) => {
             let err = match progress.delete_provisional_file(&engine) {
@@ -1289,7 +1289,10 @@ pub(crate) async fn create_table_for_session(
 }
 
 /// Logically drop an existing user table for a session-level DDL request.
-pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableID) -> Result<()> {
+pub(crate) async fn drop_table_for_session(
+    session: SessionOperationPin,
+    table_id: TableID,
+) -> Result<()> {
     let ctx = SessionDdlContext::new(&session)
         .attach("operation=drop_table")
         .disclose()?;
@@ -1311,7 +1314,7 @@ pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableI
     engine.poisoner.ensure_healthy().disclose()?;
 
     let mut trx = session
-        .begin_trx()
+        .begin_private_trx()
         .attach("operation=drop_table")
         .disclose()?;
 
@@ -1771,7 +1774,7 @@ mod tests {
     use crate::lock::tests::{LockDebugEntryState, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
     use crate::log::redo::DDLRedo;
-    use crate::session::tests::SessionTestExt;
+    use crate::session::tests::{SessionTestExt, active_operation_count};
     use crate::table::TableTerminal;
     use crate::table::tests::*;
     use crate::trx::MAX_SNAPSHOT_TS;
@@ -4111,10 +4114,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
             );
-            assert_eq!(
-                engine.inner().session_registry.active_transaction_count(),
-                0
-            );
+            assert_eq!(active_operation_count(&engine.inner().session_registry), 0);
         });
     }
 

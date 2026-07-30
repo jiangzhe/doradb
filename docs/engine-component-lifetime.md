@@ -14,6 +14,9 @@ component-registry migration work.
 - Public session and transaction handles: weak, non-cloneable capabilities that
   identify engine-local state and acquire internal runtime pins only for one
   operation.
+- `SessionOperationEntry`: one registry-owned stable operation record keyed by
+  `(SessionID, OperationID)`; it contains no `EngineRef`,
+  `SessionObserverPin`, or whole operation future.
 - `ComponentRegistry`: ordered owner registry for top-level components.
 - `QuiescentBox<T>`: stable owner allocation for a runtime value.
 - `QuiescentGuard<T>`: cloneable keepalive handle into a `QuiescentBox<T>`.
@@ -137,9 +140,9 @@ The engine lifecycle has three states:
 2. `ShuttingDown`
 3. `Shutdown`
 
-Shutdown closes admission for new work and then requires active operations,
-active transactions, abandoned transaction cleanup, and internal `EngineRef`
-runtime pins to drain before owner-side component shutdown can proceed.
+Shutdown closes admission for new work and then requires active session
+operations, abandoned transaction cleanup, and internal `EngineRef` runtime
+pins to drain before owner-side component shutdown can proceed.
 `Engine::try_shutdown()` performs that check once and returns `ShutdownBusy` if
 work remains. `Engine::shutdown()` waits for the same work to drain and then
 completes final teardown.
@@ -148,13 +151,56 @@ Normal shutdown is:
 
 1. close the admission gate and flip `Running -> ShuttingDown`
 2. wait for active admission tokens to drain
-3. wait for internal runtime pins and transaction cleanup, or return
-   `ShutdownBusy` from `try_shutdown()`
-4. acquire the owner-side shutdown lock
-5. require `Arc::strong_count(inner) == 1`
-6. remove idle registry-owned sessions
-7. call `ComponentRegistry::shutdown_all()` in reverse registration order
-8. mark lifecycle state as `Shutdown`
+3. wait for scoped `EngineRef` runtime pins to drain
+4. acquire the owner-side shutdown lock and lazily traverse registered sessions
+   until the first active operation is found
+5. for blocking shutdown, install or reuse that session's event and register
+   one listener under its lifecycle mutex before inspecting its active entry
+6. release the DashMap, lifecycle, entry, and shutdown guards; queue at most
+   that blocker's exact currently claimable transaction cleanup hint, wait for
+   its local event, and repeat from the first current blocker
+7. after one complete traversal finds no active operation, require
+   `Arc::strong_count(inner) == 1`
+8. remove idle registry-owned sessions
+9. call `ComponentRegistry::shutdown_all()` in reverse registration order
+10. mark lifecycle state as `Shutdown`
+
+`Engine::try_shutdown()` uses the same first-blocker traversal without
+installing an event or listener. It queues at most that blocker's cleanup hint
+and returns `ShutdownBusy`; its attachment labels the retained engine-reference
+count and whether a blocking operation was discovered rather than presenting
+one ambiguous aggregate number.
+
+The numbered owner-teardown steps follow the coordinator drain above. Session
+disposition (`Open`, `CloseRequested`, or `Abandoned`) is separate from the
+single operation slot (`Idle`, `Active`, or `Closed`). Active foreground,
+cleanup, reserved background, completion-owned, and failed-retained labels all
+block shutdown. Cleanup queue messages carry the exact
+`(SessionOperationKey, TrxID)` pair, so stale or duplicate work cannot claim a
+replacement operation.
+
+Operation waiting uses a session-local observation-armed predicate protocol.
+`SessionLifecycle` lazily stores `Option<Arc<EventNotifyOnDrop>>`. Explicit
+close or blocking shutdown installs or reuses the event and creates its
+listener under the lifecycle mutex before releasing the inspected predicate. A
+later relevant exact-key transition clones the event under that mutex, releases
+lifecycle, entry, and explicit-lock state, and then wakes all listeners. The
+wrapper also wakes listeners if the final event owner is dropped. If the
+transition wins first, the later scan sees its result; if observation wins
+first, the transition wakes the listener. Normal open-session statement
+checkout/check-in does not touch lifecycle observation, and unobserved
+transaction completion performs no event allocation, atomic update, or wake.
+
+The lazy traversal may hold one DashMap shard read guard during the short
+`lifecycle -> entry` probe. Registry insertion or removal never occurs while
+either inner mutex is held, so there is no reverse lock edge. The iterator is
+dropped before cleanup queueing, event waiting, notification, or removal.
+
+The registry owns `Arc<SessionState>`, and an active slot owns
+`Arc<SessionOperationEntry>`. Neither object owns a strong engine runtime
+handle. `EngineRef` exists only in scoped foreground authorities, transaction
+attachments, claims, and queued cleanup jobs, preventing a
+registry-to-engine strong reference cycle.
 
 The final reverse-order shutdown step releases `StorageRootLease`. A later
 engine can therefore acquire the root immediately after explicit shutdown,
